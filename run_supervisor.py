@@ -832,6 +832,243 @@ except ImportError:
     pass  # Will be registered later by SupervisorBootstrapper
 
 # =============================================================================
+# SUPERVISOR RESTART MANAGER v101.0 - Cross-Repo Process Supervision
+# =============================================================================
+
+@dataclass
+class SupervisorManagedProcess:
+    """
+    Metadata for a supervisor-managed cross-repo process.
+
+    These are processes like JARVIS-Prime and Reactor-Core that run
+    in sibling repositories and need cross-repo restart management.
+    """
+    name: str
+    process: Optional[asyncio.subprocess.Process]
+    restart_func: Callable[[], Any]  # Async function to restart the process
+    restart_count: int = 0
+    last_restart: float = 0.0
+    max_restarts: int = 3
+    port: Optional[int] = None
+    exit_code: Optional[int] = None
+    enabled: bool = True
+
+
+class SupervisorRestartManager:
+    """
+    Cross-repo process restart manager for supervisor-level services.
+
+    Manages automatic restart of:
+    - JARVIS-Prime (local inference server)
+    - Reactor-Core (training/ML services)
+
+    Features:
+    - Named process tracking (not index-based)
+    - Exponential backoff: 1s → 2s → 4s → max configurable
+    - Per-process restart tracking
+    - Maximum restart limit with alerting
+    - Async-safe with proper locking
+    - Environment variable configuration
+
+    Environment Variables:
+        JARVIS_SUPERVISOR_MAX_RESTARTS: Maximum restart attempts (default: 3)
+        JARVIS_SUPERVISOR_MAX_BACKOFF: Maximum backoff delay in seconds (default: 60.0)
+        JARVIS_SUPERVISOR_RESTART_COOLDOWN: Stability period before count reset (default: 600.0)
+    """
+
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        """Initialize the supervisor restart manager."""
+        self.processes: Dict[str, SupervisorManagedProcess] = {}
+        self._lock = asyncio.Lock()
+        self._shutdown_requested = False
+        self._logger = logger or logging.getLogger("SupervisorRestartManager")
+
+        # Environment-driven configuration
+        self.max_restarts = int(os.getenv("JARVIS_SUPERVISOR_MAX_RESTARTS", "3"))
+        self.max_backoff = float(os.getenv("JARVIS_SUPERVISOR_MAX_BACKOFF", "60.0"))
+        self.restart_cooldown = float(os.getenv("JARVIS_SUPERVISOR_RESTART_COOLDOWN", "600.0"))
+        self.base_backoff = float(os.getenv("JARVIS_SUPERVISOR_BASE_BACKOFF", "2.0"))
+
+    def register(
+        self,
+        name: str,
+        process: Optional[asyncio.subprocess.Process],
+        restart_func: Callable[[], Any],
+        port: Optional[int] = None,
+        enabled: bool = True,
+    ) -> None:
+        """
+        Register a cross-repo process for monitoring and automatic restart.
+
+        Args:
+            name: Human-readable identifier (e.g., "jarvis-prime", "reactor-core")
+            process: The asyncio subprocess object (can be None if not yet started)
+            restart_func: Async function to restart the process
+            port: Port the process listens on (for logging)
+            enabled: Whether this process should be monitored
+        """
+        self.processes[name] = SupervisorManagedProcess(
+            name=name,
+            process=process,
+            restart_func=restart_func,
+            restart_count=0,
+            last_restart=0.0,
+            max_restarts=self.max_restarts,
+            port=port,
+            enabled=enabled,
+        )
+        if process:
+            self._logger.info(
+                f"[v101] Registered cross-repo process '{name}' (PID: {process.pid})"
+                + (f" on port {port}" if port else "")
+            )
+
+    def update_process(self, name: str, process: asyncio.subprocess.Process) -> None:
+        """Update the process reference for a registered service."""
+        if name in self.processes:
+            self.processes[name].process = process
+            self._logger.debug(f"[v101] Updated process reference for '{name}' (PID: {process.pid})")
+
+    def request_shutdown(self) -> None:
+        """Signal that shutdown is requested - stop all restart attempts."""
+        self._shutdown_requested = True
+        self._logger.info("[v101] Supervisor shutdown requested - restart manager disabled")
+
+    def reset_shutdown(self) -> None:
+        """Reset shutdown flag - allow restarts again."""
+        self._shutdown_requested = False
+
+    async def check_and_restart_all(self) -> List[str]:
+        """
+        Check all cross-repo processes and restart any that have unexpectedly exited.
+
+        Returns:
+            List of process names that were restarted
+        """
+        if self._shutdown_requested:
+            return []
+
+        restarted = []
+
+        async with self._lock:
+            for name, managed in list(self.processes.items()):
+                if not managed.enabled or managed.process is None:
+                    continue
+
+                proc = managed.process
+
+                # Check if process has exited
+                if proc.returncode is not None:
+                    managed.exit_code = proc.returncode
+
+                    # Normal exit or controlled shutdown - don't restart
+                    if proc.returncode in (0, -2, -15):
+                        self._logger.debug(
+                            f"[v101] {name} exited normally (code: {proc.returncode})"
+                        )
+                        continue
+
+                    # Unexpected exit - attempt restart
+                    success = await self._handle_unexpected_exit(name, managed)
+                    if success:
+                        restarted.append(name)
+
+        return restarted
+
+    async def _handle_unexpected_exit(
+        self, name: str, managed: SupervisorManagedProcess
+    ) -> bool:
+        """
+        Handle an unexpected cross-repo process exit with exponential backoff restart.
+
+        Args:
+            name: Process name
+            managed: SupervisorManagedProcess metadata
+
+        Returns:
+            True if restart was successful, False otherwise
+        """
+        current_time = time.time()
+
+        # Check if we've exceeded restart limit
+        if managed.restart_count >= managed.max_restarts:
+            self._logger.error(
+                f"[v101] ❌ {name} exceeded supervisor restart limit ({managed.max_restarts}). "
+                f"Last exit code: {managed.exit_code}. Manual intervention required."
+            )
+            return False
+
+        # Apply cooldown - reset count if stable for a while
+        if current_time - managed.last_restart > self.restart_cooldown:
+            if managed.restart_count > 0:
+                self._logger.info(
+                    f"[v101] {name} was stable for {self.restart_cooldown}s - "
+                    f"resetting restart count from {managed.restart_count} to 0"
+                )
+            managed.restart_count = 0
+
+        # Calculate exponential backoff
+        backoff = min(
+            self.base_backoff * (2 ** managed.restart_count),
+            self.max_backoff
+        )
+
+        managed.restart_count += 1
+        managed.last_restart = current_time
+
+        self._logger.warning(
+            f"[v101] 🔄 Supervisor restarting '{name}' in {backoff:.1f}s "
+            f"(attempt {managed.restart_count}/{managed.max_restarts}, "
+            f"exit code: {managed.exit_code})"
+        )
+
+        # Wait with backoff
+        await asyncio.sleep(backoff)
+
+        # Check if shutdown was requested during backoff
+        if self._shutdown_requested:
+            self._logger.info(f"[v101] Shutdown requested - aborting restart of '{name}'")
+            return False
+
+        # Reset global shutdown flag BEFORE restarting
+        try:
+            from backend.core.resilience.graceful_shutdown import reset_global_shutdown
+            reset_global_shutdown()
+            self._logger.debug(f"[v101] Global shutdown flag reset for '{name}' restart")
+        except ImportError:
+            pass
+        except Exception as e:
+            self._logger.debug(f"[v101] Could not reset global shutdown: {e}")
+
+        # Attempt restart
+        try:
+            await managed.restart_func()
+            self._logger.info(
+                f"[v101] ✅ {name} restart initiated successfully"
+            )
+            return True
+        except Exception as e:
+            self._logger.error(f"[v101] ❌ Failed to restart '{name}': {e}")
+            return False
+
+    def get_status(self) -> Dict[str, Dict[str, Any]]:
+        """Get status of all supervised cross-repo processes."""
+        status = {}
+        for name, managed in self.processes.items():
+            proc = managed.process
+            status[name] = {
+                "pid": proc.pid if proc else None,
+                "running": proc.returncode is None if proc else False,
+                "exit_code": managed.exit_code,
+                "restart_count": managed.restart_count,
+                "last_restart": managed.last_restart,
+                "port": managed.port,
+                "enabled": managed.enabled,
+            }
+        return status
+
+
+# =============================================================================
 # Configuration - Dynamic with Environment Overrides
 # =============================================================================
 
@@ -3945,6 +4182,9 @@ class SupervisorBootstrapper:
         self._jarvis_prime_process: Optional[asyncio.subprocess.Process] = None
         self._reactor_core_watcher = None
 
+        # v101.0: Cross-Repo Process Restart Manager
+        self._supervisor_restart_manager = SupervisorRestartManager(logger=self.logger)
+
         # v8.0: Data Flywheel (Self-Improving Learning Loop)
         self._data_flywheel = None
         self._learning_goals_manager = None
@@ -5082,6 +5322,9 @@ class SupervisorBootstrapper:
         """v80.0: Emergency shutdown when startup times out."""
         self.logger.warning("🚨 Emergency shutdown initiated")
         try:
+            # v101.0: Notify supervisor restart manager to stop restart attempts
+            self._supervisor_restart_manager.request_shutdown()
+
             # v85.0: Release ownership and stop heartbeat FIRST
             await self._release_v85_ownership()
 
@@ -8151,7 +8394,17 @@ class SupervisorBootstrapper:
     async def _check_and_heal_processes(self) -> None:
         """
         v91.0: Check process health and apply remediation if needed.
+        v101.0: Integrated with SupervisorRestartManager for reactive restarts.
         """
+        # v101.0: Check supervisor restart manager for actual process deaths
+        try:
+            restarted = await self._supervisor_restart_manager.check_and_restart_all()
+            if restarted:
+                self.logger.info(f"[v101] Cross-repo processes restarted: {', '.join(restarted)}")
+        except Exception as e:
+            self.logger.debug(f"[v101] Supervisor restart manager error: {e}")
+
+        # v91.0: ML-based predictive healing (optional, requires advanced primitives)
         if not self._self_healing_orchestrator or not self._health_predictor:
             return
 
@@ -9912,6 +10165,14 @@ class SupervisorBootstrapper:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "PYTHONPATH": str(repo_path)},
+        )
+
+        # v101.0: Register with supervisor restart manager for automatic recovery
+        self._supervisor_restart_manager.register(
+            name="jarvis-prime",
+            process=self._jarvis_prime_process,
+            restart_func=self._init_jarvis_prime_local,
+            port=self.config.jarvis_prime_port,
         )
 
         # Wait for health check
@@ -17386,6 +17647,14 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     stdout=self._reactor_stdout_file,
                     stderr=self._reactor_stderr_file,
                     start_new_session=True,  # Detach from parent process group
+                )
+
+                # v101.0: Register with supervisor restart manager for automatic recovery
+                self._supervisor_restart_manager.register(
+                    name="reactor-core",
+                    process=self._reactor_core_orchestrator_process,
+                    restart_func=self._launch_reactor_core_orchestrator,
+                    port=8090,  # Reactor-Core default port
                 )
 
                 self.logger.info(f"   ✅ Reactor-Core launched (PID: {self._reactor_core_orchestrator_process.pid})")

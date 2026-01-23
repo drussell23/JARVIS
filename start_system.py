@@ -8038,6 +8038,262 @@ def get_port_manager() -> DynamicPortManager:
     return _port_manager
 
 
+# =============================================================================
+# PROCESS RESTART MANAGER - Automatic Process Supervision & Recovery
+# =============================================================================
+
+@dataclass
+class ManagedProcess:
+    """
+    Metadata for a managed process under supervision.
+
+    Attributes:
+        name: Human-readable process identifier
+        process: The asyncio subprocess object
+        restart_func: Async callable to restart the process
+        restart_count: Number of restart attempts since last cooldown reset
+        last_restart: Timestamp of last restart attempt
+        max_restarts: Maximum restart attempts before giving up
+        port: Optional port the process listens on
+        exit_code: Last exit code (for diagnostics)
+    """
+    name: str
+    process: asyncio.subprocess.Process
+    restart_func: Callable[[], Awaitable[asyncio.subprocess.Process]]
+    restart_count: int = 0
+    last_restart: float = 0.0
+    max_restarts: int = 5
+    port: Optional[int] = None
+    exit_code: Optional[int] = None
+
+
+class ProcessRestartManager:
+    """
+    Advanced process restart manager with exponential backoff and intelligent recovery.
+
+    This manager provides robust process supervision with the following features:
+    - Named process tracking (dict-based, not fragile index-based)
+    - Exponential backoff: 1s → 2s → 4s → 8s → max configurable
+    - Per-process restart tracking with cooldown reset
+    - Maximum restart limit with alerting
+    - Global shutdown flag reset before restart
+    - Async-safe with proper locking
+    - All thresholds configurable via environment variables
+
+    Environment Variables:
+        JARVIS_MAX_RESTARTS: Maximum restart attempts (default: 5)
+        JARVIS_MAX_BACKOFF: Maximum backoff delay in seconds (default: 30.0)
+        JARVIS_RESTART_COOLDOWN: Seconds of stability before resetting restart count (default: 300.0)
+        JARVIS_BASE_BACKOFF: Initial backoff delay in seconds (default: 1.0)
+    """
+
+    def __init__(self):
+        """Initialize the restart manager with environment-driven configuration."""
+        self.processes: Dict[str, ManagedProcess] = {}
+        self._lock = asyncio.Lock()
+        self._shutdown_requested = False
+
+        # Environment-driven configuration (no hardcoding)
+        self.max_restarts = int(os.getenv("JARVIS_MAX_RESTARTS", "5"))
+        self.max_backoff = float(os.getenv("JARVIS_MAX_BACKOFF", "30.0"))
+        self.restart_cooldown = float(os.getenv("JARVIS_RESTART_COOLDOWN", "300.0"))
+        self.base_backoff = float(os.getenv("JARVIS_BASE_BACKOFF", "1.0"))
+
+        # Logger
+        self._logger = logging.getLogger("ProcessRestartManager")
+
+    def register(
+        self,
+        name: str,
+        process: asyncio.subprocess.Process,
+        restart_func: Callable[[], Awaitable[asyncio.subprocess.Process]],
+        port: Optional[int] = None,
+    ) -> None:
+        """
+        Register a process for monitoring and automatic restart.
+
+        Args:
+            name: Human-readable identifier for the process
+            process: The asyncio subprocess object
+            restart_func: Async function to restart the process (returns new process)
+            port: Optional port the process listens on (for logging)
+        """
+        self.processes[name] = ManagedProcess(
+            name=name,
+            process=process,
+            restart_func=restart_func,
+            restart_count=0,
+            last_restart=0.0,
+            max_restarts=self.max_restarts,
+            port=port,
+        )
+        self._logger.info(f"✓ Registered process '{name}' (PID: {process.pid})" +
+                         (f" on port {port}" if port else ""))
+
+    def unregister(self, name: str) -> None:
+        """Remove a process from monitoring."""
+        if name in self.processes:
+            del self.processes[name]
+            self._logger.info(f"✓ Unregistered process '{name}'")
+
+    def request_shutdown(self) -> None:
+        """Signal that shutdown is requested - stop all restart attempts."""
+        self._shutdown_requested = True
+        self._logger.info("Shutdown requested - restart manager will not restart processes")
+
+    def reset_shutdown(self) -> None:
+        """Reset shutdown flag - allow restarts again."""
+        self._shutdown_requested = False
+        self._logger.info("Shutdown flag reset - restart manager active")
+
+    async def check_and_restart_all(self) -> List[str]:
+        """
+        Check all processes and restart any that have unexpectedly exited.
+
+        Returns:
+            List of process names that were restarted
+        """
+        if self._shutdown_requested:
+            return []
+
+        restarted = []
+
+        async with self._lock:
+            for name, managed in list(self.processes.items()):
+                proc = managed.process
+
+                # Check if process has exited
+                if proc.returncode is not None:
+                    # Store exit code for diagnostics
+                    managed.exit_code = proc.returncode
+
+                    # Normal exit or controlled shutdown - don't restart
+                    # 0 = normal exit, -2 = SIGINT, -15 = SIGTERM
+                    if proc.returncode in (0, -2, -15):
+                        self._logger.info(
+                            f"Process '{name}' exited normally (code: {proc.returncode})"
+                        )
+                        continue
+
+                    # Unexpected exit - attempt restart
+                    success = await self._handle_unexpected_exit(name, managed)
+                    if success:
+                        restarted.append(name)
+
+        return restarted
+
+    async def _handle_unexpected_exit(self, name: str, managed: ManagedProcess) -> bool:
+        """
+        Handle an unexpected process exit with exponential backoff restart.
+
+        Args:
+            name: Process name
+            managed: ManagedProcess metadata
+
+        Returns:
+            True if restart was successful, False otherwise
+        """
+        current_time = time.time()
+
+        # Check if we've exceeded restart limit
+        if managed.restart_count >= managed.max_restarts:
+            self._logger.error(
+                f"❌ Process '{name}' exceeded restart limit ({managed.max_restarts}). "
+                f"Last exit code: {managed.exit_code}. Manual intervention required."
+            )
+            return False
+
+        # Apply cooldown - reset count if stable for a while
+        if current_time - managed.last_restart > self.restart_cooldown:
+            if managed.restart_count > 0:
+                self._logger.info(
+                    f"Process '{name}' was stable for {self.restart_cooldown}s - "
+                    f"resetting restart count from {managed.restart_count} to 0"
+                )
+            managed.restart_count = 0
+
+        # Calculate exponential backoff
+        backoff = min(
+            self.base_backoff * (2 ** managed.restart_count),
+            self.max_backoff
+        )
+
+        managed.restart_count += 1
+        managed.last_restart = current_time
+
+        self._logger.warning(
+            f"🔄 Restarting '{name}' in {backoff:.1f}s "
+            f"(attempt {managed.restart_count}/{managed.max_restarts}, "
+            f"exit code: {managed.exit_code})"
+        )
+
+        # Wait with backoff
+        await asyncio.sleep(backoff)
+
+        # Check if shutdown was requested during backoff
+        if self._shutdown_requested:
+            self._logger.info(f"Shutdown requested - aborting restart of '{name}'")
+            return False
+
+        # Reset global shutdown flag BEFORE restarting
+        try:
+            from backend.core.resilience.graceful_shutdown import reset_global_shutdown
+            reset_global_shutdown()
+            self._logger.info(f"   ↳ Global shutdown flag reset for '{name}' restart")
+        except ImportError:
+            self._logger.warning("   ↳ Could not import reset_global_shutdown")
+        except Exception as e:
+            self._logger.warning(f"   ↳ Failed to reset global shutdown: {e}")
+
+        # Attempt restart
+        try:
+            new_proc = await managed.restart_func()
+            managed.process = new_proc
+            self._logger.info(
+                f"✅ Process '{name}' restarted successfully (new PID: {new_proc.pid})"
+            )
+            return True
+        except Exception as e:
+            self._logger.error(f"❌ Failed to restart '{name}': {e}")
+            return False
+
+    def get_status(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get status of all managed processes.
+
+        Returns:
+            Dict mapping process names to their status info
+        """
+        status = {}
+        for name, managed in self.processes.items():
+            proc = managed.process
+            status[name] = {
+                "pid": proc.pid,
+                "running": proc.returncode is None,
+                "exit_code": managed.exit_code,
+                "restart_count": managed.restart_count,
+                "last_restart": managed.last_restart,
+                "port": managed.port,
+            }
+        return status
+
+    def __repr__(self) -> str:
+        running = sum(1 for m in self.processes.values() if m.process.returncode is None)
+        return f"<ProcessRestartManager processes={len(self.processes)} running={running}>"
+
+
+# Global restart manager instance
+_restart_manager: Optional[ProcessRestartManager] = None
+
+
+def get_restart_manager() -> ProcessRestartManager:
+    """Get the global process restart manager instance."""
+    global _restart_manager
+    if _restart_manager is None:
+        _restart_manager = ProcessRestartManager()
+    return _restart_manager
+
+
 class AsyncSystemManager:
     """
     v100.0: Ultra-robust async system manager with integrated resource optimization.
@@ -8089,6 +8345,9 @@ class AsyncSystemManager:
         self.process_state_manager.register("backend", port=self.backend_port)
         self.process_state_manager.register("frontend", port=self.frontend_port)
         self.process_state_manager.register("websocket", port=self.websocket_port)
+
+        # v101.0: Process restart manager for automatic recovery
+        self.restart_manager = get_restart_manager()
 
         logger.info(f"🔧 [v100.0] Dynamic port selection: main_api={selected_api_port}")
         self.is_m1_mac = platform.system() == "Darwin" and platform.machine() == "arm64"
@@ -9854,6 +10113,14 @@ class AsyncSystemManager:
 
         self.processes.append(process)
 
+        # v101.0: Register with restart manager for automatic recovery
+        self.restart_manager.register(
+            name="backend",
+            process=process,
+            restart_func=self.start_backend,
+            port=self.ports["main_api"],
+        )
+
         # =========================================================================
         # PARALLEL STARTUP v1.0.0 - Server starts IMMEDIATELY
         # =========================================================================
@@ -9986,6 +10253,15 @@ class AsyncSystemManager:
                     env=env,
                 )
                 self.processes.append(process)
+
+                # v101.0: Register minimal backend with restart manager
+                self.restart_manager.register(
+                    name="backend",
+                    process=process,
+                    restart_func=self.start_backend,
+                    port=self.ports["main_api"],
+                )
+
                 print(f"{Colors.GREEN}✓ Minimal backend started (PID: {process.pid}){Colors.ENDC}")
                 print(
                     f"{Colors.WARNING}⚠️  Running in minimal mode - some features limited{Colors.ENDC}"
@@ -10190,6 +10466,15 @@ class AsyncSystemManager:
             )
 
         self.processes.append(process)
+
+        # v101.0: Register standard backend with restart manager
+        self.restart_manager.register(
+            name="backend",
+            process=process,
+            restart_func=self.start_backend,
+            port=self.ports["main_api"],
+        )
+
         print(
             f"{Colors.GREEN}✓ Backend starting on port {self.ports['main_api']} (PID: {process.pid}){Colors.ENDC}"
         )
@@ -10366,6 +10651,15 @@ class AsyncSystemManager:
                 print(f"{Colors.GREEN}✓ Frontend compiled and ready in {elapsed}s (port {frontend_port}){Colors.ENDC}")
 
                 self.processes.append(process)
+
+                # v101.0: Register frontend with restart manager
+                self.restart_manager.register(
+                    name="frontend",
+                    process=process,
+                    restart_func=self.start_frontend,
+                    port=frontend_port,
+                )
+
                 return process
 
             except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
@@ -10388,6 +10682,14 @@ class AsyncSystemManager:
             print(f"{Colors.YELLOW}  Process is running but not responding - may be stuck{Colors.ENDC}")
             # Keep process running, maybe it will eventually start
             self.processes.append(process)
+
+            # v101.0: Register frontend with restart manager (timeout case)
+            self.restart_manager.register(
+                name="frontend",
+                process=process,
+                restart_func=self.start_frontend,
+                port=frontend_port,
+            )
 
             # Start background monitor to detect if it eventually comes up
             asyncio.create_task(self._monitor_frontend_startup(process, log_file, frontend_port))
@@ -10870,6 +11172,15 @@ class AsyncSystemManager:
             )
 
         self.processes.append(process)
+
+        # v101.0: Register minimal backend fallback with restart manager
+        self.restart_manager.register(
+            name="backend",
+            process=process,
+            restart_func=self.start_backend,
+            port=self.ports["main_api"],
+        )
+
         print(f"{Colors.GREEN}✓ Minimal backend started (PID: {process.pid}){Colors.ENDC}")
 
         # Wait for it to be ready
@@ -12389,7 +12700,17 @@ class AsyncSystemManager:
                 uptime_seconds = int(time.time() - monitoring_start)
                 uptime_str = f"{uptime_seconds // 60}m {uptime_seconds % 60}s"
 
-                # Check if processes are still running
+                # v101.0: Check for process restarts using restart manager
+                # This replaces the old index-based process checking with intelligent
+                # named process tracking and automatic restart with exponential backoff
+                try:
+                    restarted = await self.restart_manager.check_and_restart_all()
+                    if restarted:
+                        print(f"\n{Colors.GREEN}🔄 Processes restarted: {', '.join(restarted)}{Colors.ENDC}")
+                except Exception as e:
+                    print(f"\n{Colors.WARNING}⚠ Restart manager error: {e}{Colors.ENDC}")
+
+                # Legacy fallback: Check if any un-managed processes died
                 for i, proc in enumerate(self.processes):
                     if proc and proc.returncode is not None:
                         # Only print warnings for unexpected exits (non-zero exit codes)
@@ -13066,7 +13387,9 @@ class AsyncSystemManager:
                                 # v95.0: Try lazy initialization instead of just warning
                                 try:
                                     from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
-                                    import asyncio
+                                    # Note: asyncio is imported at module level (line 646)
+                                    # DO NOT import asyncio here - it would shadow the global import
+                                    # and cause "local variable referenced before assignment" errors
 
                                     # Try to get or create a new event loop for the async call
                                     try:
@@ -14489,6 +14812,9 @@ ANTHROPIC_API_KEY=your_claude_api_key_here
         # Set a flag to suppress exit warnings
         self._shutting_down = True
 
+        # v101.0: Notify restart manager to stop restart attempts
+        self.restart_manager.request_shutdown()
+
         # Cancel ALL pending async tasks (both tracked and untracked)
         print(f"{Colors.CYAN}🔄 [0/6] Canceling async tasks...{Colors.ENDC}")
 
@@ -15015,6 +15341,15 @@ except Exception as e:
         )
 
         self.processes.append(process)
+
+        # v101.0: Register websocket router with restart manager
+        self.restart_manager.register(
+            name="websocket",
+            process=process,
+            restart_func=self.start_websocket_router,
+            port=port,
+        )
+
         print(
             f"{Colors.GREEN}✓ WebSocket Router starting on port {port} (PID: {process.pid}){Colors.ENDC}"
         )

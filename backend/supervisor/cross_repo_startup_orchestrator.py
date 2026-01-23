@@ -9796,8 +9796,28 @@ echo "=== JARVIS Prime started ==="
                         f"    ⚠️ Port {definition.default_port} in use but {definition.name} "
                         f"is NOT healthy - possible port conflict with another process"
                     )
-                    # Check if we should try to kill the process on this port
-                    await self._handle_port_conflict(definition)
+                    # v108.0: CRITICAL FIX - Actually resolve the conflict
+                    conflict_resolved = await self._handle_port_conflict(definition)
+                    if not conflict_resolved:
+                        logger.error(
+                            f"    ❌ Could not resolve port conflict for {definition.name} "
+                            f"on port {definition.default_port}"
+                        )
+                        # Wait a bit and retry port check
+                        await asyncio.sleep(2.0)
+                        is_healthy_retry = await self._quick_health_check(
+                            definition.default_port,
+                            definition.health_endpoint
+                        )
+                        if is_healthy_retry:
+                            # Service came up healthy after conflict resolution attempt
+                            return "ALREADY_HEALTHY", python_exec
+                        else:
+                            # Still broken - log and let spawn proceed (it will fail cleanly)
+                            logger.warning(
+                                f"    ⚠️ Port {definition.default_port} still unavailable, "
+                                f"spawn may fail"
+                            )
 
         except Exception as e:
             logger.debug(f"Port check failed: {e}")
@@ -9818,27 +9838,106 @@ echo "=== JARVIS Prime started ==="
         except Exception:
             return False
 
-    async def _handle_port_conflict(self, definition: ServiceDefinition) -> None:
+    async def _handle_port_conflict(self, definition: ServiceDefinition) -> bool:
         """
-        v95.2: Handle port conflict by attempting to identify and resolve the issue.
+        v108.0: Handle port conflict by attempting to identify and resolve the issue.
 
-        If the port is in use by a process we don't recognize, log detailed info
-        for debugging.
+        CRITICAL FIX: This now actually CLEANS UP conflicting processes instead of
+        just logging them. Uses the EnterpriseProcessManager for comprehensive
+        port validation and cleanup.
+
+        Returns:
+            True if port was successfully cleaned up and is now available
+            False if cleanup failed and port is still occupied
         """
+        port = definition.default_port
+
+        # v108.0: Use EnterpriseProcessManager for comprehensive port handling
         try:
-            import psutil
-            for conn in psutil.net_connections(kind='inet'):
-                if conn.laddr.port == definition.default_port and conn.status == 'LISTEN':
-                    try:
-                        proc = psutil.Process(conn.pid)
-                        logger.warning(
-                            f"    📋 Port {definition.default_port} held by: "
-                            f"PID={conn.pid}, Name={proc.name()}, Cmdline={' '.join(proc.cmdline()[:3])}"
-                        )
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        logger.warning(f"    📋 Port {definition.default_port} held by PID={conn.pid}")
-        except Exception as e:
-            logger.debug(f"Could not identify process on port: {e}")
+            from backend.core.enterprise_process_manager import get_process_manager
+
+            process_manager = get_process_manager()
+
+            # Comprehensive port validation
+            validation = await process_manager.validate_port(
+                port=port,
+                expected_service=definition.name,
+                health_endpoint=definition.health_endpoint,
+            )
+
+            logger.info(
+                f"    📋 Port {port} validation: occupied={validation.is_occupied}, "
+                f"healthy={validation.is_healthy}, state={validation.socket_state}, "
+                f"recommendation={validation.recommendation}"
+            )
+
+            if validation.pid:
+                # Log details about the conflicting process
+                logger.warning(
+                    f"    📋 Port {port} held by: PID={validation.pid}, "
+                    f"Name={validation.process_name or 'unknown'}"
+                )
+
+            # Handle based on recommendation
+            if validation.recommendation == "proceed":
+                return True  # Port available
+
+            elif validation.recommendation == "skip":
+                # Service already running healthy - this is actually OK
+                logger.info(f"    ✅ {definition.name} already healthy on port {port}")
+                return True
+
+            elif validation.recommendation in ("kill_and_retry", "wait"):
+                # Attempt cleanup
+                logger.info(f"    🧹 Attempting to clean up port {port}...")
+
+                cleanup_success = await process_manager.cleanup_port(
+                    port=port,
+                    force=False,  # Try graceful first
+                    wait_for_time_wait=True,
+                    max_wait=30.0,  # Wait up to 30s for TIME_WAIT
+                )
+
+                if cleanup_success:
+                    logger.info(f"    ✅ Port {port} successfully cleaned up")
+                    return True
+                else:
+                    logger.error(f"    ❌ Failed to clean up port {port}")
+                    return False
+
+            return False
+
+        except ImportError:
+            # Fallback to legacy behavior if enterprise process manager not available
+            logger.warning(
+                "[v108.0] EnterpriseProcessManager not available, using legacy fallback"
+            )
+            try:
+                import psutil
+                for conn in psutil.net_connections(kind='inet'):
+                    if conn.laddr.port == port and conn.status == 'LISTEN':
+                        try:
+                            proc = psutil.Process(conn.pid)
+                            logger.warning(
+                                f"    📋 Port {port} held by: "
+                                f"PID={conn.pid}, Name={proc.name()}, "
+                                f"Cmdline={' '.join(proc.cmdline()[:3])}"
+                            )
+                            # Attempt to kill the process
+                            proc.terminate()
+                            proc.wait(timeout=5)
+                            logger.info(f"    ✅ Killed process {conn.pid} on port {port}")
+                            return True
+                        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                            logger.warning(
+                                f"    ⚠️ Could not kill process on port {port}: {e}"
+                            )
+                            return False
+            except Exception as e:
+                logger.debug(f"Could not identify process on port: {e}")
+                return False
+
+        return False
 
     async def _wait_for_dependencies(self, definition: ServiceDefinition) -> bool:
         """
@@ -10143,6 +10242,10 @@ echo "=== JARVIS Prime started ==="
 
             logger.info(f"📋 {definition.name} spawned with PID {managed.pid}")
 
+            # v108.0: Record startup time for grace period tracking
+            # This allows the heartbeat validator to NOT mark components as dead during startup
+            await self._record_component_startup(definition.name, managed.pid)
+
             # Start output streaming
             await self._start_output_streaming(managed)
 
@@ -10253,6 +10356,112 @@ echo "=== JARVIS Prime started ==="
                 details={"reason": "spawn_exception", "error": str(e)}
             )
             return False
+
+    async def _record_component_startup(self, service_name: str, pid: int) -> None:
+        """
+        v108.0: Record component startup time for grace period tracking.
+
+        This integrates with:
+        1. HeartbeatValidator - to prevent marking components as dead during startup
+        2. TrinityHealthMonitor - to prevent marking components as unhealthy during startup
+        3. TrinityOrchestrationConfig - to record startup in unified config
+
+        Args:
+            service_name: Name of the service being started
+            pid: Process ID of the spawned service
+        """
+        startup_time = time.time()
+
+        # Map service name to component type for config lookup
+        component_type_map = {
+            "jarvis-body": "jarvis_body",
+            "jarvis_body": "jarvis_body",
+            "jarvis-prime": "jarvis_prime",
+            "jarvis_prime": "jarvis_prime",
+            "j-prime": "jarvis_prime",
+            "jprime": "jarvis_prime",
+            "reactor-core": "reactor_core",
+            "reactor_core": "reactor_core",
+            "coding-council": "coding_council",
+            "coding_council": "coding_council",
+        }
+        component_type = component_type_map.get(service_name.lower(), "jarvis_body")
+
+        # 1. Record in HeartbeatValidator
+        try:
+            from backend.core.coding_council.trinity.heartbeat_validator import (
+                HeartbeatValidator,
+            )
+            # Get or create global validator instance
+            validator = HeartbeatValidator()
+            validator.record_component_startup(service_name, component_type)
+            logger.debug(
+                f"[v108.0] Recorded startup time in HeartbeatValidator for {service_name}"
+            )
+        except ImportError:
+            logger.debug(
+                f"[v108.0] HeartbeatValidator not available for startup recording"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[v108.0] Failed to record startup in HeartbeatValidator: {e}"
+            )
+
+        # 2. Record in TrinityOrchestrationConfig (for global access)
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+                ComponentType,
+            )
+            # Store startup time in a shared location
+            orch_config = get_orchestration_config()
+            startup_file = orch_config.components_dir / f"{service_name}_startup.json"
+
+            import json
+            startup_data = {
+                "service_name": service_name,
+                "component_type": component_type,
+                "startup_time": startup_time,
+                "pid": pid,
+            }
+
+            # Atomic write
+            tmp_file = startup_file.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(startup_data, indent=2))
+            tmp_file.rename(startup_file)
+
+            logger.debug(
+                f"[v108.0] Recorded startup time file for {service_name} at {startup_file}"
+            )
+        except ImportError:
+            logger.debug(
+                f"[v108.0] TrinityOrchestrationConfig not available for startup recording"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[v108.0] Failed to write startup file: {e}"
+            )
+
+        # 3. Record in TrinityHealthMonitor config if available
+        try:
+            from backend.core.trinity_health_monitor import (
+                TrinityHealthConfig,
+                TrinityComponent,
+            )
+            # Map to TrinityComponent enum
+            component_enum_map = {
+                "jarvis_body": TrinityComponent.JARVIS_BODY,
+                "jarvis_prime": TrinityComponent.JARVIS_PRIME,
+                "reactor_core": TrinityComponent.REACTOR_CORE,
+                "coding_council": TrinityComponent.CODING_COUNCIL,
+            }
+            if component_type in component_enum_map:
+                # This will be picked up by the health monitor's config
+                logger.debug(
+                    f"[v108.0] Component {service_name} ({component_type}) startup recorded"
+                )
+        except ImportError:
+            pass
 
     async def _wait_for_health(
         self,

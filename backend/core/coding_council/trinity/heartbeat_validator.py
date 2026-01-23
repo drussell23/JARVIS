@@ -1,6 +1,6 @@
 """
-v77.0: Heartbeat Validator - Gaps #2-3
-=======================================
+v108.0: Heartbeat Validator - Enterprise Edition
+=================================================
 
 Robust heartbeat validation with:
 - Gap #2: Staleness detection
@@ -8,8 +8,14 @@ Robust heartbeat validation with:
 - Component health tracking
 - Automatic dead component cleanup
 - Health score calculation
+- v108.0: Startup grace period awareness
+- v108.0: Component-specific timeout profiles
+- v108.0: Integration with TrinityOrchestrationConfig
 
-Author: JARVIS v77.0
+CRITICAL v108.0 FIX: All thresholds now come from TrinityOrchestrationConfig
+to prevent mismatched configuration values causing cascading failures.
+
+Author: JARVIS v108.0
 """
 
 from __future__ import annotations
@@ -121,16 +127,17 @@ class HeartbeatValidator:
     - Automatic cleanup of dead components
     - Event callbacks for status changes
 
-    v93.0 Enhancements:
-    - All thresholds configurable via environment variables
-    - Cross-repo heartbeat synchronization
-    - HTTP health check integration
+    v108.0 Enhancements:
+    - Startup grace period awareness - components NOT marked dead during startup
+    - Component-specific timeout profiles from TrinityOrchestrationConfig
+    - Dynamic threshold adjustment based on component type
+    - All thresholds configurable via environment variables (fallback)
     """
 
-    # v93.0: Thresholds now configurable via environment variables
-    # Environment variables: HEARTBEAT_STALE_THRESHOLD, HEARTBEAT_DEAD_THRESHOLD, etc.
-    STALE_THRESHOLD_SECONDS = _env_float("HEARTBEAT_STALE_THRESHOLD", 30.0)
-    DEAD_THRESHOLD_SECONDS = _env_float("HEARTBEAT_DEAD_THRESHOLD", 120.0)
+    # v108.0: Default thresholds - actual values come from TrinityOrchestrationConfig
+    # These are FALLBACK values only when orchestration config is not available
+    STALE_THRESHOLD_SECONDS = _env_float("HEARTBEAT_STALE_THRESHOLD", 45.0)  # Increased from 30.0
+    DEAD_THRESHOLD_SECONDS = _env_float("HEARTBEAT_DEAD_THRESHOLD", 180.0)   # Increased from 120.0
     HEALTH_DECAY_RATE = _env_float("HEARTBEAT_HEALTH_DECAY_RATE", 0.1)
     MONITOR_INTERVAL_SECONDS = _env_float("HEARTBEAT_MONITOR_INTERVAL", 5.0)
     CLEANUP_MULTIPLIER = _env_float("HEARTBEAT_CLEANUP_MULTIPLIER", 5.0)  # Dead threshold * this = cleanup
@@ -157,6 +164,140 @@ class HeartbeatValidator:
 
         # v93.0: Enable cross-repo synchronization by default
         self._cross_repo_sync_enabled = True
+
+        # v108.0: Track component startup times for grace period awareness
+        self._component_startup_times: Dict[str, float] = {}
+
+        # v108.0: Cache for component-specific thresholds
+        self._threshold_cache: Dict[str, Dict[str, float]] = {}
+
+    def get_stale_threshold(self, component_type: str) -> float:
+        """
+        v108.0: Get component-specific stale threshold.
+
+        This integrates with TrinityOrchestrationConfig for consistent values.
+        Falls back to class defaults if orchestration config is unavailable.
+
+        Args:
+            component_type: Component type string (jarvis_body, jarvis_prime, etc.)
+
+        Returns:
+            Stale threshold in seconds
+        """
+        # Check cache first
+        if component_type in self._threshold_cache:
+            return self._threshold_cache[component_type].get(
+                "stale", self.STALE_THRESHOLD_SECONDS
+            )
+
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+            )
+            orch_config = get_orchestration_config()
+            profile = orch_config.get_profile_by_name(component_type)
+
+            # Cache the thresholds
+            self._threshold_cache[component_type] = {
+                "stale": profile.heartbeat_stale,
+                "dead": profile.effective_dead_threshold,
+                "grace_period": profile.startup_grace_period,
+            }
+
+            return profile.heartbeat_stale
+
+        except ImportError:
+            logger.debug(
+                f"[HeartbeatValidator] TrinityOrchestrationConfig not available, "
+                f"using default stale threshold for {component_type}"
+            )
+            return self.STALE_THRESHOLD_SECONDS
+
+    def get_dead_threshold(self, component_type: str) -> float:
+        """
+        v108.0: Get component-specific dead threshold.
+
+        Critical: Dead threshold must ALWAYS be >= startup timeout to prevent
+        components being marked dead while still initializing.
+        """
+        if component_type in self._threshold_cache:
+            return self._threshold_cache[component_type].get(
+                "dead", self.DEAD_THRESHOLD_SECONDS
+            )
+
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+            )
+            orch_config = get_orchestration_config()
+            profile = orch_config.get_profile_by_name(component_type)
+
+            # Cache the thresholds
+            self._threshold_cache[component_type] = {
+                "stale": profile.heartbeat_stale,
+                "dead": profile.effective_dead_threshold,
+                "grace_period": profile.startup_grace_period,
+            }
+
+            return profile.effective_dead_threshold
+
+        except ImportError:
+            return self.DEAD_THRESHOLD_SECONDS
+
+    def record_component_startup(self, component_id: str, component_type: str) -> None:
+        """
+        v108.0: Record when a component starts for grace period tracking.
+
+        This should be called when a component process is spawned.
+        """
+        self._component_startup_times[component_id] = time.time()
+        logger.debug(
+            f"[HeartbeatValidator] Recorded startup time for {component_id} ({component_type})"
+        )
+
+    def is_in_startup_grace_period(self, component_id: str, component_type: str) -> bool:
+        """
+        v108.0: Check if a component is still in its startup grace period.
+
+        During startup, components should NOT be marked as dead/stale
+        even if heartbeats are missing.
+
+        Args:
+            component_id: Unique component ID
+            component_type: Component type (jarvis_body, jarvis_prime, etc.)
+
+        Returns:
+            True if component is still in grace period
+        """
+        startup_time = self._component_startup_times.get(component_id)
+
+        if startup_time is None:
+            # No recorded startup time - can't determine grace period
+            return False
+
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+            )
+            orch_config = get_orchestration_config()
+            profile = orch_config.get_profile_by_name(component_type)
+
+            elapsed = time.time() - startup_time
+            in_grace = elapsed < profile.startup_grace_period
+
+            if in_grace:
+                logger.debug(
+                    f"[HeartbeatValidator] {component_id} in startup grace period "
+                    f"({elapsed:.1f}s < {profile.startup_grace_period}s)"
+                )
+
+            return in_grace
+
+        except ImportError:
+            # Fallback: use 2x dead threshold as grace period
+            grace_period = self.DEAD_THRESHOLD_SECONDS * 2
+            elapsed = time.time() - startup_time
+            return elapsed < grace_period
 
     async def start(self) -> None:
         """Start the heartbeat monitor."""
@@ -312,14 +453,30 @@ class HeartbeatValidator:
         """
         Evaluate current status of a component.
 
+        v108.0: Now uses component-specific thresholds and startup grace period awareness.
+
         Gap #2: Staleness detection
         """
         age = time.time() - health.last_heartbeat
 
+        # v108.0: Get component-specific thresholds
+        stale_threshold = self.get_stale_threshold(health.component_type)
+        dead_threshold = self.get_dead_threshold(health.component_type)
+
         # Check staleness thresholds
-        if age > self.DEAD_THRESHOLD_SECONDS:
-            new_status = HeartbeatStatus.DEAD
-        elif age > self.STALE_THRESHOLD_SECONDS:
+        if age > dead_threshold:
+            # v108.0: CRITICAL FIX - Check startup grace period before marking dead
+            if self.is_in_startup_grace_period(health.component_id, health.component_type):
+                # Component is still starting - don't mark as dead
+                new_status = HeartbeatStatus.STALE  # Use stale instead of dead during startup
+                logger.debug(
+                    f"[HeartbeatValidator] {health.component_id} would be DEAD "
+                    f"(age={age:.1f}s > {dead_threshold}s) but in startup grace period, "
+                    f"marking as STALE instead"
+                )
+            else:
+                new_status = HeartbeatStatus.DEAD
+        elif age > stale_threshold:
             new_status = HeartbeatStatus.STALE
         else:
             new_status = HeartbeatStatus.HEALTHY
@@ -336,14 +493,21 @@ class HeartbeatValidator:
             health.status = new_status
             await self._notify_status_change(health.component_id, old_status, new_status)
 
-        # Update health score
-        health.health_score = self._calculate_health_score(health, age)
+        # Update health score (v108.0: use component-specific dead threshold)
+        health.health_score = self._calculate_health_score(health, age, dead_threshold)
 
         return new_status
 
-    def _calculate_health_score(self, health: ComponentHealth, age: float) -> float:
+    def _calculate_health_score(
+        self,
+        health: ComponentHealth,
+        age: float,
+        dead_threshold: Optional[float] = None,
+    ) -> float:
         """
         Calculate health score (0.0 to 1.0).
+
+        v108.0: Now accepts component-specific dead_threshold parameter.
 
         Based on:
         - Heartbeat age
@@ -352,9 +516,12 @@ class HeartbeatValidator:
         """
         score = 1.0
 
+        # v108.0: Use component-specific threshold if provided
+        effective_dead_threshold = dead_threshold or self.DEAD_THRESHOLD_SECONDS
+
         # Age penalty
         if age > 0:
-            age_factor = max(0, 1.0 - (age / self.DEAD_THRESHOLD_SECONDS))
+            age_factor = max(0, 1.0 - (age / effective_dead_threshold))
             score *= age_factor
 
         # Failure penalty

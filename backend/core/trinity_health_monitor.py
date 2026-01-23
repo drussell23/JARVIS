@@ -1,5 +1,5 @@
 """
-v78.0: Trinity Cross-Repo Health Monitor
+v108.0: Trinity Cross-Repo Health Monitor
 ==========================================
 
 Unified health monitoring for all three Trinity components:
@@ -14,6 +14,9 @@ Features:
 - Automatic health degradation detection
 - Recovery suggestions and automatic restart triggers
 - WebSocket broadcasting for UI updates
+- v108.0: Startup-aware health checking (uses TrinityOrchestrationConfig)
+- v108.0: Component-specific timeout profiles
+- v108.0: Grace period awareness during startup
 
 Architecture:
     ┌─────────────────────────────────────────────────────────────┐
@@ -26,8 +29,11 @@ Architecture:
     │ Internal    │ jarvis_prime.json       │ reactor_core.json  │
     └─────────────┴─────────────────────────┴────────────────────┘
 
-Author: JARVIS v78.0
-Version: 1.0.0
+CRITICAL v108.0 FIX: All timeouts now come from TrinityOrchestrationConfig
+to prevent mismatched configuration values causing cascading failures.
+
+Author: JARVIS v108.0
+Version: 2.0.0
 """
 
 from __future__ import annotations
@@ -38,10 +44,9 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -162,18 +167,25 @@ class TrinityHealthSnapshot:
 
 @dataclass
 class TrinityHealthConfig:
-    """Configuration for Trinity health monitoring."""
+    """
+    Configuration for Trinity health monitoring.
+
+    v108.0: Now integrates with TrinityOrchestrationConfig for unified configuration.
+    Component-specific timeouts and startup grace periods are pulled from the
+    orchestration config to ensure consistency across the system.
+    """
     # Directories
     trinity_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "trinity")
 
-    # Heartbeat settings
-    max_heartbeat_age_seconds: float = 15.0
-    heartbeat_warning_age_seconds: float = 10.0
+    # v108.0: Heartbeat settings now pulled from orchestration config per-component
+    # These are FALLBACK values only - actual values come from TrinityOrchestrationConfig
+    max_heartbeat_age_seconds: float = 45.0  # Increased from 15.0 for J-Prime compatibility
+    heartbeat_warning_age_seconds: float = 30.0  # Increased from 10.0
 
-    # HTTP check settings
-    http_timeout_seconds: float = 5.0
-    http_retry_attempts: int = 2
-    http_retry_delay_seconds: float = 1.0
+    # HTTP check settings - component-specific timeouts from orchestration config
+    http_timeout_seconds: float = 10.0  # Increased from 5.0 for reliability
+    http_retry_attempts: int = 3  # Increased from 2
+    http_retry_delay_seconds: float = 2.0
 
     # Monitoring intervals
     check_interval_seconds: float = 10.0
@@ -186,7 +198,7 @@ class TrinityHealthConfig:
 
     # Component endpoints (dynamically discovered if possible)
     jarvis_backend_port: int = 8010
-    jarvis_prime_port: int = 8000  # v89.0: Fixed to 8000 (was incorrectly 8002)
+    jarvis_prime_port: int = 8000
     reactor_core_port: int = 8090
 
     # Component weights for health score calculation
@@ -198,18 +210,170 @@ class TrinityHealthConfig:
         TrinityComponent.TRINITY_SYNC: 0.8,    # Important for cross-repo
     })
 
+    # v108.0: Track component startup times for grace period awareness
+    _component_startup_times: Dict[str, float] = field(default_factory=dict)
+
     @classmethod
     def from_env(cls) -> "TrinityHealthConfig":
         """Load configuration from environment variables."""
         return cls(
             trinity_dir=Path(os.getenv("TRINITY_DIR", str(Path.home() / ".jarvis" / "trinity"))),
-            max_heartbeat_age_seconds=float(os.getenv("TRINITY_MAX_HEARTBEAT_AGE", "15.0")),
-            http_timeout_seconds=float(os.getenv("TRINITY_HTTP_TIMEOUT", "5.0")),
+            max_heartbeat_age_seconds=float(os.getenv("TRINITY_MAX_HEARTBEAT_AGE", "45.0")),
+            http_timeout_seconds=float(os.getenv("TRINITY_HTTP_TIMEOUT", "10.0")),
             check_interval_seconds=float(os.getenv("TRINITY_CHECK_INTERVAL", "10.0")),
             jarvis_backend_port=int(os.getenv("JARVIS_BACKEND_PORT", "8010")),
-            jarvis_prime_port=int(os.getenv("JARVIS_PRIME_PORT", "8000")),  # v89.0: Fixed to 8000
+            jarvis_prime_port=int(os.getenv("JARVIS_PRIME_PORT", "8000")),
             reactor_core_port=int(os.getenv("REACTOR_CORE_PORT", "8090")),
         )
+
+    @classmethod
+    def from_orchestration_config(cls) -> "TrinityHealthConfig":
+        """
+        v108.0: Create config from unified TrinityOrchestrationConfig.
+
+        This ensures all timeout values are consistent across the system.
+        """
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+                ComponentType,
+            )
+            orch_config = get_orchestration_config()
+
+            # Use the most lenient heartbeat threshold for general checks
+            # Component-specific checks will use get_heartbeat_threshold()
+            body_profile = orch_config.get_profile(ComponentType.JARVIS_BODY)
+            prime_profile = orch_config.get_profile(ComponentType.JARVIS_PRIME)
+
+            return cls(
+                trinity_dir=orch_config.trinity_dir,
+                max_heartbeat_age_seconds=max(
+                    body_profile.heartbeat_stale,
+                    prime_profile.heartbeat_stale,
+                ),
+                heartbeat_warning_age_seconds=body_profile.heartbeat_stale * 0.75,
+                http_timeout_seconds=max(
+                    body_profile.health_check_timeout,
+                    prime_profile.health_check_timeout,
+                ),
+                http_retry_attempts=body_profile.retry_attempts,
+                http_retry_delay_seconds=body_profile.retry_delay,
+                check_interval_seconds=orch_config.health_check_interval,
+                jarvis_backend_port=orch_config.jarvis_body_port,
+                jarvis_prime_port=orch_config.jarvis_prime_port,
+                reactor_core_port=orch_config.reactor_core_port,
+            )
+        except ImportError:
+            logger.warning(
+                "[TrinityHealthConfig] TrinityOrchestrationConfig not available, "
+                "using environment defaults"
+            )
+            return cls.from_env()
+
+    def get_heartbeat_threshold(self, component: TrinityComponent) -> float:
+        """
+        v108.0: Get component-specific heartbeat threshold.
+
+        Critical fix: J-Prime needs longer thresholds due to ML model loading.
+        """
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+                ComponentType,
+            )
+            orch_config = get_orchestration_config()
+
+            component_map = {
+                TrinityComponent.JARVIS_BODY: ComponentType.JARVIS_BODY,
+                TrinityComponent.JARVIS_PRIME: ComponentType.JARVIS_PRIME,
+                TrinityComponent.REACTOR_CORE: ComponentType.REACTOR_CORE,
+                TrinityComponent.CODING_COUNCIL: ComponentType.CODING_COUNCIL,
+            }
+
+            if component in component_map:
+                profile = orch_config.get_profile(component_map[component])
+                return profile.heartbeat_stale
+
+        except ImportError:
+            pass
+
+        return self.max_heartbeat_age_seconds
+
+    def get_http_timeout(self, component: TrinityComponent) -> float:
+        """
+        v108.0: Get component-specific HTTP timeout.
+        """
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+                ComponentType,
+            )
+            orch_config = get_orchestration_config()
+
+            component_map = {
+                TrinityComponent.JARVIS_BODY: ComponentType.JARVIS_BODY,
+                TrinityComponent.JARVIS_PRIME: ComponentType.JARVIS_PRIME,
+                TrinityComponent.REACTOR_CORE: ComponentType.REACTOR_CORE,
+                TrinityComponent.CODING_COUNCIL: ComponentType.CODING_COUNCIL,
+            }
+
+            if component in component_map:
+                profile = orch_config.get_profile(component_map[component])
+                return profile.health_check_timeout
+
+        except ImportError:
+            pass
+
+        return self.http_timeout_seconds
+
+    def is_in_startup_grace_period(self, component: TrinityComponent) -> bool:
+        """
+        v108.0: Check if a component is in its startup grace period.
+
+        During startup, components should NOT be marked as unhealthy
+        even if heartbeats are missing or health checks fail.
+
+        Returns:
+            True if component is still in grace period
+        """
+        try:
+            from backend.core.trinity_orchestration_config import (
+                get_orchestration_config,
+                ComponentType,
+            )
+            orch_config = get_orchestration_config()
+
+            component_map = {
+                TrinityComponent.JARVIS_BODY: ComponentType.JARVIS_BODY,
+                TrinityComponent.JARVIS_PRIME: ComponentType.JARVIS_PRIME,
+                TrinityComponent.REACTOR_CORE: ComponentType.REACTOR_CORE,
+                TrinityComponent.CODING_COUNCIL: ComponentType.CODING_COUNCIL,
+            }
+
+            if component not in component_map:
+                return False
+
+            component_key = component.value
+            startup_time = self._component_startup_times.get(component_key)
+
+            if startup_time is None:
+                # No recorded startup time - could be first check
+                return False
+
+            return orch_config.is_in_startup_grace_period(
+                component_type=component_map[component],
+                startup_time=startup_time,
+            )
+
+        except ImportError:
+            return False
+
+    def record_component_startup(self, component: TrinityComponent) -> None:
+        """
+        v108.0: Record when a component starts for grace period tracking.
+        """
+        self._component_startup_times[component.value] = time.time()
+        logger.debug(f"[TrinityHealthConfig] Recorded startup time for {component.value}")
 
 
 # =============================================================================
@@ -448,18 +612,32 @@ class TrinityHealthMonitor:
         return status
 
     async def _check_jarvis_prime(self) -> ComponentHealthStatus:
-        """Check J-Prime (Mind) health via heartbeat file."""
+        """
+        Check J-Prime (Mind) health via heartbeat file.
+
+        v108.0: Now uses component-specific thresholds and startup grace period awareness.
+        J-Prime loads ML models and needs longer timeouts (300s startup, 120s stale threshold).
+        """
         status = ComponentHealthStatus(component=TrinityComponent.JARVIS_PRIME)
         checks = []
+
+        # v108.0: Get component-specific threshold
+        stale_threshold = self.config.get_heartbeat_threshold(TrinityComponent.JARVIS_PRIME)
 
         # Heartbeat file check (primary)
         # Support both naming conventions
         heartbeat_files = [
             self.config.trinity_dir / "components" / "jarvis_prime.json",
             self.config.trinity_dir / "components" / "j_prime.json",
+            self.config.trinity_dir / "heartbeats" / "jarvis_prime.json",
+            self.config.trinity_dir / "heartbeats" / "j_prime.json",
         ]
 
-        heartbeat_result = await self._check_heartbeat_file(heartbeat_files)
+        # v108.0: Pass component-specific threshold
+        heartbeat_result = await self._check_heartbeat_file(
+            heartbeat_files,
+            stale_threshold=stale_threshold,
+        )
         checks.append(heartbeat_result)
 
         if heartbeat_result.success:
@@ -467,29 +645,55 @@ class TrinityHealthMonitor:
             status.uptime_seconds = heartbeat_result.details.get("uptime_seconds", 0)
             status.metadata = heartbeat_result.details
 
-            # Check if heartbeat is getting stale
-            if status.heartbeat_age_seconds > self.config.heartbeat_warning_age_seconds:
+            # v108.0: Check against component-specific warning threshold
+            warning_threshold = stale_threshold * 0.75
+            if status.heartbeat_age_seconds and status.heartbeat_age_seconds > warning_threshold:
                 status.status = ComponentStatus.DEGRADED
             else:
                 status.status = ComponentStatus.HEALTHY
             status.consecutive_failures = 0
         else:
-            status.consecutive_failures += 1
-            status.last_error = heartbeat_result.error
-            status.status = ComponentStatus.UNHEALTHY
+            # v108.0: CRITICAL FIX - Check if in startup grace period before marking unhealthy
+            if self.config.is_in_startup_grace_period(TrinityComponent.JARVIS_PRIME):
+                status.status = ComponentStatus.STARTING
+                status.last_error = f"J-Prime starting (in grace period) - {heartbeat_result.error}"
+                self.log.debug(
+                    f"[TrinityHealthMonitor] J-Prime in startup grace period, "
+                    f"not marking as unhealthy"
+                )
+            else:
+                status.consecutive_failures += 1
+                status.last_error = heartbeat_result.error
+                status.status = ComponentStatus.UNHEALTHY
 
         status.check_results = checks
         status.last_check = time.time()
         return status
 
     async def _check_reactor_core(self) -> ComponentHealthStatus:
-        """Check Reactor-Core (Nerves) health via heartbeat file."""
+        """
+        Check Reactor-Core (Nerves) health via heartbeat file.
+
+        v108.0: Now uses component-specific thresholds and startup grace period awareness.
+        Reactor-Core has medium startup time (120s startup, 60s stale threshold).
+        """
         status = ComponentHealthStatus(component=TrinityComponent.REACTOR_CORE)
         checks = []
 
-        # Heartbeat file check
-        heartbeat_file = self.config.trinity_dir / "components" / "reactor_core.json"
-        heartbeat_result = await self._check_heartbeat_file([heartbeat_file])
+        # v108.0: Get component-specific threshold
+        stale_threshold = self.config.get_heartbeat_threshold(TrinityComponent.REACTOR_CORE)
+
+        # Heartbeat file check - check multiple locations
+        heartbeat_files = [
+            self.config.trinity_dir / "components" / "reactor_core.json",
+            self.config.trinity_dir / "heartbeats" / "reactor_core.json",
+        ]
+
+        # v108.0: Pass component-specific threshold
+        heartbeat_result = await self._check_heartbeat_file(
+            heartbeat_files,
+            stale_threshold=stale_threshold,
+        )
         checks.append(heartbeat_result)
 
         if heartbeat_result.success:
@@ -497,43 +701,81 @@ class TrinityHealthMonitor:
             status.uptime_seconds = heartbeat_result.details.get("uptime_seconds", 0)
             status.metadata = heartbeat_result.details
 
-            if status.heartbeat_age_seconds > self.config.heartbeat_warning_age_seconds:
+            # v108.0: Check against component-specific warning threshold
+            warning_threshold = stale_threshold * 0.75
+            if status.heartbeat_age_seconds and status.heartbeat_age_seconds > warning_threshold:
                 status.status = ComponentStatus.DEGRADED
             else:
                 status.status = ComponentStatus.HEALTHY
             status.consecutive_failures = 0
         else:
-            status.consecutive_failures += 1
-            status.last_error = heartbeat_result.error
-            status.status = ComponentStatus.UNHEALTHY
+            # v108.0: CRITICAL FIX - Check if in startup grace period before marking unhealthy
+            if self.config.is_in_startup_grace_period(TrinityComponent.REACTOR_CORE):
+                status.status = ComponentStatus.STARTING
+                status.last_error = f"Reactor-Core starting (in grace period) - {heartbeat_result.error}"
+                self.log.debug(
+                    f"[TrinityHealthMonitor] Reactor-Core in startup grace period, "
+                    f"not marking as unhealthy"
+                )
+            else:
+                status.consecutive_failures += 1
+                status.last_error = heartbeat_result.error
+                status.status = ComponentStatus.UNHEALTHY
 
         status.check_results = checks
         status.last_check = time.time()
         return status
 
     async def _check_coding_council(self) -> ComponentHealthStatus:
-        """Check Coding Council health via heartbeat file."""
+        """
+        Check Coding Council health via heartbeat file.
+
+        v108.0: Now uses component-specific thresholds and startup grace period awareness.
+        Coding Council has fast startup (30s startup, 30s stale threshold).
+        """
         status = ComponentHealthStatus(component=TrinityComponent.CODING_COUNCIL)
         checks = []
 
-        # Heartbeat file check
-        heartbeat_file = self.config.trinity_dir / "components" / "coding_council.json"
-        heartbeat_result = await self._check_heartbeat_file([heartbeat_file])
+        # v108.0: Get component-specific threshold
+        stale_threshold = self.config.get_heartbeat_threshold(TrinityComponent.CODING_COUNCIL)
+
+        # Heartbeat file check - check multiple locations
+        heartbeat_files = [
+            self.config.trinity_dir / "components" / "coding_council.json",
+            self.config.trinity_dir / "heartbeats" / "coding_council.json",
+        ]
+
+        # v108.0: Pass component-specific threshold
+        heartbeat_result = await self._check_heartbeat_file(
+            heartbeat_files,
+            stale_threshold=stale_threshold,
+        )
         checks.append(heartbeat_result)
 
         if heartbeat_result.success:
             status.heartbeat_age_seconds = heartbeat_result.details.get("age_seconds", 0)
             status.metadata = heartbeat_result.details
 
-            if status.heartbeat_age_seconds > self.config.heartbeat_warning_age_seconds:
+            # v108.0: Check against component-specific warning threshold
+            warning_threshold = stale_threshold * 0.75
+            if status.heartbeat_age_seconds and status.heartbeat_age_seconds > warning_threshold:
                 status.status = ComponentStatus.DEGRADED
             else:
                 status.status = ComponentStatus.HEALTHY
             status.consecutive_failures = 0
         else:
-            status.consecutive_failures += 1
-            status.last_error = heartbeat_result.error
-            status.status = ComponentStatus.UNHEALTHY
+            # v108.0: CRITICAL FIX - Check if in startup grace period before marking unhealthy
+            if self.config.is_in_startup_grace_period(TrinityComponent.CODING_COUNCIL):
+                status.status = ComponentStatus.STARTING
+                status.last_error = f"Coding Council starting (in grace period) - {heartbeat_result.error}"
+                self.log.debug(
+                    f"[TrinityHealthMonitor] Coding Council in startup grace period, "
+                    f"not marking as unhealthy"
+                )
+            else:
+                status.consecutive_failures += 1
+                status.last_error = heartbeat_result.error
+                status.status = ComponentStatus.UNHEALTHY
 
         status.check_results = checks
         status.last_check = time.time()
@@ -684,10 +926,23 @@ class TrinityHealthMonitor:
     async def _check_heartbeat_file(
         self,
         file_paths: List[Path],
+        stale_threshold: Optional[float] = None,
     ) -> HealthCheckResult:
-        """Check heartbeat file(s) for freshness."""
+        """
+        Check heartbeat file(s) for freshness.
+
+        v108.0: Now accepts component-specific stale_threshold parameter.
+
+        Args:
+            file_paths: List of potential heartbeat file paths to check
+            stale_threshold: Component-specific staleness threshold (optional)
+                             Falls back to config.max_heartbeat_age_seconds if not provided
+        """
         result = HealthCheckResult(check_type="heartbeat")
         start_time = time.time()
+
+        # v108.0: Use component-specific threshold if provided
+        effective_threshold = stale_threshold or self.config.max_heartbeat_age_seconds
 
         for file_path in file_paths:
             try:
@@ -700,20 +955,27 @@ class TrinityHealthMonitor:
                 heartbeat_ts = data.get("timestamp", 0)
                 age_seconds = time.time() - heartbeat_ts
 
-                if age_seconds < self.config.max_heartbeat_age_seconds:
+                if age_seconds < effective_threshold:
                     result.success = True
                     result.details = {
                         "file": str(file_path),
                         "age_seconds": age_seconds,
                         "uptime_seconds": data.get("uptime_seconds", 0),
                         "status": data.get("status", "unknown"),
+                        "stale_threshold": effective_threshold,  # v108.0: Include threshold for debugging
                         **{k: v for k, v in data.items() if k not in ("timestamp", "uptime_seconds", "status")},
                     }
                     result.response_time_ms = (time.time() - start_time) * 1000
                     return result
                 else:
                     # File exists but is stale
-                    result.error = f"Heartbeat stale ({age_seconds:.1f}s > {self.config.max_heartbeat_age_seconds}s)"
+                    result.error = f"Heartbeat stale ({age_seconds:.1f}s > {effective_threshold}s)"
+                    # v108.0: Store the age for callers to use in startup grace period checks
+                    result.details = {
+                        "file": str(file_path),
+                        "age_seconds": age_seconds,
+                        "stale_threshold": effective_threshold,
+                    }
 
             except json.JSONDecodeError as e:
                 result.error = f"Invalid JSON in {file_path.name}: {e}"
@@ -829,10 +1091,17 @@ _health_monitor: Optional[TrinityHealthMonitor] = None
 async def get_trinity_health_monitor(
     config: Optional[TrinityHealthConfig] = None,
 ) -> TrinityHealthMonitor:
-    """Get or create the global Trinity health monitor instance."""
+    """
+    Get or create the global Trinity health monitor instance.
+
+    v108.0: If no config is provided, uses TrinityOrchestrationConfig for unified settings.
+    """
     global _health_monitor
 
     if _health_monitor is None:
+        # v108.0: Use orchestration config if no config provided
+        if config is None:
+            config = TrinityHealthConfig.from_orchestration_config()
         _health_monitor = TrinityHealthMonitor(config=config)
 
     return _health_monitor
@@ -841,7 +1110,11 @@ async def get_trinity_health_monitor(
 async def start_trinity_health_monitoring(
     config: Optional[TrinityHealthConfig] = None,
 ) -> TrinityHealthMonitor:
-    """Start Trinity health monitoring."""
+    """
+    Start Trinity health monitoring.
+
+    v108.0: Uses TrinityOrchestrationConfig for unified settings if no config provided.
+    """
     monitor = await get_trinity_health_monitor(config)
     await monitor.start()
     return monitor
@@ -861,3 +1134,39 @@ async def get_trinity_health_snapshot() -> Optional[TrinityHealthSnapshot]:
     if _health_monitor:
         return _health_monitor.latest_snapshot
     return None
+
+
+def load_component_startup_times() -> Dict[str, float]:
+    """
+    v108.0: Load component startup times from file system.
+
+    This allows the health monitor to respect startup grace periods
+    even if it was started after the components.
+
+    Returns:
+        Dictionary mapping component names to their startup timestamps
+    """
+    startup_times: Dict[str, float] = {}
+
+    try:
+        from backend.core.trinity_orchestration_config import get_orchestration_config
+        orch_config = get_orchestration_config()
+        components_dir = orch_config.components_dir
+
+        import json
+        for startup_file in components_dir.glob("*_startup.json"):
+            try:
+                data = json.loads(startup_file.read_text())
+                service_name = data.get("service_name")
+                startup_time = data.get("startup_time")
+                if service_name and startup_time:
+                    startup_times[service_name] = startup_time
+            except Exception:
+                pass
+
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug(f"[TrinityHealthMonitor] Error loading startup times: {e}")
+
+    return startup_times

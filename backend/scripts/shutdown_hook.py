@@ -285,6 +285,28 @@ async def _close_client_sessions() -> None:
     if sessions_closed > 0:
         logger.debug(f"   Closed {sessions_closed} client session(s)")
 
+    # v107.0: Use AsyncResourceManager for comprehensive resource cleanup
+    try:
+        # Try multiple import paths for flexibility
+        graceful_shutdown_resources = None
+        for module_path in ["core.async_resource_manager", "backend.core.async_resource_manager"]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                graceful_shutdown_resources = getattr(module, "graceful_shutdown_resources", None)
+                if graceful_shutdown_resources:
+                    break
+            except ImportError:
+                continue
+
+        if graceful_shutdown_resources:
+            stats = await graceful_shutdown_resources(timeout=10.0)
+            if stats.get("total_closed", 0) > 0:
+                sessions_closed += stats["total_closed"]
+                logger.info(f"   AsyncResourceManager: closed {stats['total_closed']} resources")
+    except Exception as e:
+        logger.debug(f"   AsyncResourceManager cleanup error (non-critical): {e}")
+
 
 async def _cleanup_via_infrastructure_orchestrator(timeout: float) -> int:
     """
