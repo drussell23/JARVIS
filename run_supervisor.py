@@ -4455,6 +4455,15 @@ class SupervisorBootstrapper:
         self._heartbeat_adaptive_enabled = os.getenv("JARVIS_HEARTBEAT_ADAPTIVE", "true").lower() == "true"
         self._last_heartbeat_metrics: Dict[str, Any] = {}
 
+        # v111.0: In-Process Backend Management (Unified Monolith Mode)
+        # - Backend runs in supervisor's event loop (no subprocess spawning)
+        # - Enables shared memory and coordinated shutdown
+        # - Uvicorn server with disabled signal handlers (supervisor manages signals)
+        self._backend_server: Optional[Any] = None  # uvicorn.Server instance
+        self._backend_task: Optional[asyncio.Task] = None  # Background task running serve()
+        self._in_process_mode: bool = os.getenv("JARVIS_IN_PROCESS_MODE", "true").lower() == "true"
+        self._backend_port: int = int(os.getenv("BACKEND_PORT", "8010"))
+
         # v100.0: AGI Orchestrator (Unified Cognitive Architecture)
         # - MetaCognitiveEngine: Self-aware reasoning and introspection
         # - MultiModalPerceptionFusion: Vision + voice + text integration
@@ -5371,6 +5380,13 @@ class SupervisorBootstrapper:
             # v85.0: Release ownership and stop heartbeat FIRST
             await self._release_v85_ownership()
 
+            # v111.0: Stop in-process backend first (fast shutdown)
+            if self._in_process_mode and self._backend_server:
+                try:
+                    await self._stop_backend_in_process(timeout=5.0)  # Shorter timeout for emergency
+                except Exception:
+                    pass  # Don't block emergency shutdown
+
             # Kill all Trinity components
             await self._shutdown_trinity_components()
 
@@ -5429,6 +5445,151 @@ class SupervisorBootstrapper:
 
         except Exception as e:
             self.logger.warning(f"[v85.0] Error releasing ownership: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v111.0: In-Process Backend Management (Unified Monolith Mode)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _start_backend_in_process(self) -> bool:
+        """
+        v111.0: Start the JARVIS backend in-process using Uvicorn.
+
+        This replaces subprocess spawning with direct in-process execution,
+        enabling shared memory and coordinated shutdown.
+
+        Benefits:
+        - No IPC overhead (shared memory)
+        - Coordinated shutdown (no orphan processes)
+        - Faster startup (no process spawn overhead)
+        - Unified event loop (better async coordination)
+
+        Returns:
+            True if backend started successfully, False otherwise
+        """
+        if not self._in_process_mode:
+            self.logger.info("[v111.0] In-process mode disabled, skipping backend start")
+            return True
+
+        try:
+            self.logger.info("[v111.0] Starting backend in-process...")
+            TerminalUI.print_step("[v111.0] Starting backend in-process")
+
+            # Deferred import to avoid circular dependencies
+            import uvicorn
+            from backend.main import app
+
+            # Configure Uvicorn for in-process execution
+            config = uvicorn.Config(
+                app=app,
+                host="0.0.0.0",
+                port=self._backend_port,
+                log_level="info",
+                access_log=True,
+                # Disable reload in production mode
+                reload=False,
+                # Use the supervisor's event loop
+                loop="auto",
+            )
+
+            self._backend_server = uvicorn.Server(config)
+
+            # CRITICAL: Disable Uvicorn's signal handlers
+            # The supervisor manages signals - Uvicorn must not intercept them
+            self._backend_server.install_signal_handlers = lambda: None
+
+            # Start as background task in supervisor's event loop
+            self._backend_task = asyncio.create_task(
+                self._backend_server.serve(),
+                name="backend-uvicorn-v111"
+            )
+
+            # Wait for server to be ready with timeout
+            max_wait = float(os.getenv("BACKEND_STARTUP_TIMEOUT", "30.0"))
+            start_time = time.time()
+
+            while not self._backend_server.started:
+                if time.time() - start_time > max_wait:
+                    raise TimeoutError(f"Backend didn't start within {max_wait}s")
+
+                # Check if task failed early
+                if self._backend_task.done():
+                    exc = self._backend_task.exception()
+                    if exc:
+                        raise exc
+                    raise RuntimeError("Backend task exited unexpectedly")
+
+                await asyncio.sleep(0.1)
+
+            elapsed = time.time() - start_time
+            self.logger.info(
+                f"[v111.0] ✅ Backend started in-process on port {self._backend_port} "
+                f"in {elapsed:.1f}s"
+            )
+            TerminalUI.print_success(
+                f"[v111.0] Backend in-process: port {self._backend_port} ({elapsed:.1f}s)"
+            )
+            return True
+
+        except ImportError as e:
+            self.logger.error(f"[v111.0] ❌ Failed to import backend: {e}")
+            TerminalUI.print_error(f"[v111.0] Backend import failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        except Exception as e:
+            self.logger.error(f"[v111.0] ❌ Failed to start backend in-process: {e}")
+            TerminalUI.print_error(f"[v111.0] Backend start failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def _stop_backend_in_process(self, timeout: float = 10.0) -> None:
+        """
+        v111.0: Stop the in-process backend gracefully.
+
+        Shutdown sequence:
+        1. Signal server to exit (should_exit = True)
+        2. Wait for graceful shutdown with timeout
+        3. Cancel task if it doesn't respond
+        4. Clean up references
+
+        Args:
+            timeout: Maximum time to wait for graceful shutdown
+        """
+        if not self._backend_server:
+            return
+
+        self.logger.info("[v111.0] Stopping backend...")
+        TerminalUI.print_step("[v111.0] Stopping in-process backend")
+
+        try:
+            # Signal graceful shutdown
+            self._backend_server.should_exit = True
+
+            if self._backend_task and not self._backend_task.done():
+                try:
+                    # Wait for graceful shutdown
+                    await asyncio.wait_for(self._backend_task, timeout=timeout)
+                    self.logger.info("[v111.0] ✅ Backend stopped gracefully")
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"[v111.0] Backend didn't stop within {timeout}s, cancelling"
+                    )
+                    self._backend_task.cancel()
+                    try:
+                        await self._backend_task
+                    except asyncio.CancelledError:
+                        pass
+                    self.logger.info("[v111.0] ✅ Backend cancelled")
+
+            TerminalUI.print_success("[v111.0] Backend stopped")
+
+        except Exception as e:
+            self.logger.error(f"[v111.0] Error stopping backend: {e}")
+        finally:
+            self._backend_server = None
+            self._backend_task = None
 
     async def _run_with_deep_health(self) -> int:
         """
@@ -6301,11 +6462,33 @@ class SupervisorBootstrapper:
             # v91.0: Start advanced monitoring tasks (ML prediction, self-healing, resources)
             await self._start_advanced_monitoring_tasks()
 
+            # ═══════════════════════════════════════════════════════════════════
+            # v111.0: Start backend in-process (Unified Monolith Mode)
+            # ═══════════════════════════════════════════════════════════════════
+            # When JARVIS_IN_PROCESS_MODE=true (default), the backend runs in the
+            # supervisor's event loop instead of being spawned as a subprocess.
+            # This enables:
+            # - Shared memory (no IPC overhead)
+            # - Coordinated shutdown (no orphan processes)
+            # - Faster startup (no process spawn overhead)
+            # - Unified event loop (better async coordination)
+            # ═══════════════════════════════════════════════════════════════════
+            if self._in_process_mode:
+                backend_started = await self._start_backend_in_process()
+                if not backend_started:
+                    self.logger.error("[v111.0] Backend failed to start in-process mode")
+                    TerminalUI.print_error("[v111.0] Backend failed to start - aborting")
+                    return 1
+
             try:
                 await supervisor.run()
             finally:
                 # v91.0: Stop advanced monitoring tasks first
                 await self._stop_advanced_monitoring_tasks()
+
+                # v111.0: Stop in-process backend (Unified Monolith Mode)
+                if self._in_process_mode and self._backend_server:
+                    await self._stop_backend_in_process()
 
                 # Cleanup remote resources (VMs)
                 await self.cleanup_resources()
@@ -6378,6 +6561,11 @@ class SupervisorBootstrapper:
             # ═══════════════════════════════════════════════════════════════════
             if self._loading_server_process:
                 await self._graceful_shutdown_loading_server()
+
+            # v111.0: Ensure in-process backend is stopped (belt and suspenders)
+            # This catches cases where the inner finally didn't run
+            if self._in_process_mode and self._backend_server:
+                await self._stop_backend_in_process()
 
             # Shutdown Enterprise Systems (Resilience + Data Management)
             await self._shutdown_enterprise_systems()
