@@ -9989,6 +9989,14 @@ echo "=== JARVIS Prime started ==="
                         pending_deps.discard(dep_name)
                         continue
 
+                # v95.12: Check _services_ready set first (set by _start_services_parallel after success)
+                # This is critical because heavy services are added to _services_ready
+                # BEFORE their managed.status is set to HEALTHY in some code paths
+                if dep_name in self._services_ready:
+                    logger.info(f"  ✓ Dependency '{dep_name}' is in services_ready set")
+                    pending_deps.discard(dep_name)
+                    continue
+
                 # Check if dependency is in our managed processes
                 if dep_name in self.processes:
                     dep_managed = self.processes[dep_name]
