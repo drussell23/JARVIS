@@ -240,7 +240,7 @@ class SupervisorSingleton:
                 is_stale, state = self._is_lock_stale()
 
                 if is_stale:
-                    # Stale lock - force acquire
+                    # Stale lock - force acquire with timeout
                     logger.warning(f"[Singleton] Taking over stale lock from {state.entry_point if state else 'unknown'}")
 
                     if state and self._is_process_alive(state.pid):
@@ -249,11 +249,58 @@ class SupervisorSingleton:
                             logger.info(f"[Singleton] Sending SIGTERM to stale PID {state.pid}")
                             os.kill(state.pid, signal.SIGTERM)
                             time.sleep(2)
-                        except Exception:
-                            pass
+                            # Check if process is gone
+                            if self._is_process_alive(state.pid):
+                                logger.warning(f"[Singleton] PID {state.pid} didn't terminate, sending SIGKILL")
+                                os.kill(state.pid, signal.SIGKILL)
+                                time.sleep(1)
+                        except ProcessLookupError:
+                            logger.info(f"[Singleton] PID {state.pid} already dead")
+                        except Exception as e:
+                            logger.debug(f"[Singleton] Signal error (expected if process dead): {e}")
 
-                    # Force acquire
-                    fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+                    # v111.2: Force acquire with timeout and retry
+                    # This prevents hanging if the kernel hasn't released the lock yet
+                    lock_acquired = False
+                    max_retries = 10
+                    retry_delay = 0.5
+
+                    for attempt in range(max_retries):
+                        try:
+                            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            lock_acquired = True
+                            logger.info(f"[Singleton] Lock acquired on attempt {attempt + 1}")
+                            break
+                        except BlockingIOError:
+                            if attempt < max_retries - 1:
+                                logger.debug(f"[Singleton] Lock not yet available, retry {attempt + 1}/{max_retries}")
+                                time.sleep(retry_delay)
+                            else:
+                                logger.warning(f"[Singleton] Lock still held after {max_retries} retries")
+
+                    if not lock_acquired:
+                        # v111.2: Nuclear option - recreate lock file
+                        # This handles cases where the kernel lock is stuck
+                        logger.warning("[Singleton] Forcibly recreating lock file (stale kernel lock)")
+                        try:
+                            os.close(self._lock_fd)
+                            self._lock_fd = None
+                            # Remove stale files
+                            SUPERVISOR_LOCK_FILE.unlink(missing_ok=True)
+                            SUPERVISOR_STATE_FILE.unlink(missing_ok=True)
+                            # Recreate and acquire
+                            self._lock_fd = os.open(
+                                str(SUPERVISOR_LOCK_FILE),
+                                os.O_CREAT | os.O_RDWR,
+                                0o644
+                            )
+                            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            lock_acquired = True
+                            logger.info("[Singleton] Lock acquired after file recreation")
+                        except Exception as recreate_err:
+                            logger.error(f"[Singleton] Lock file recreation failed: {recreate_err}")
+                            return False
+
                 else:
                     # Valid lock held by another process
                     os.close(self._lock_fd)
