@@ -48,16 +48,10 @@ Version: 111.0.0 (January 2026)
 from __future__ import annotations
 
 import asyncio
-import atexit
-import inspect
 import logging
 import os
-import signal
-import sys
 import threading
 import time
-import traceback
-import weakref
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,7 +63,6 @@ from typing import (
     Dict,
     List,
     Optional,
-    Set,
     Tuple,
     TypeVar,
     Union,
@@ -82,9 +75,6 @@ from typing import (
 # This is import-safe as it doesn't require an event loop
 
 logger = logging.getLogger(__name__)
-
-# Startup timestamp using time.monotonic() - safe at module level
-_STARTUP_MONOTONIC = time.monotonic()
 
 # Type for callback functions
 CallbackT = Union[Callable[[], None], Callable[[], Awaitable[None]]]
@@ -542,8 +532,9 @@ class AsyncSystemManager:
                 results.append((cb.name, error))
                 logger.warning(f"[AsyncSystemManager] ⏱️ {callback_type} callback timed out: {cb.name}")
 
-            except asyncio.CancelledError:
-                results.append((cb.name, asyncio.CancelledError()))
+            except asyncio.CancelledError as ce:
+                # Cast to Exception for type compatibility
+                results.append((cb.name, Exception(f"Cancelled: {ce}")))
                 logger.warning(f"[AsyncSystemManager] 🚫 {callback_type} callback cancelled: {cb.name}")
                 raise  # Re-raise CancelledError
 
@@ -845,7 +836,7 @@ class AsyncSystemManager:
         shutdown_event = self._get_shutdown_event()
 
         # Wait for either shutdown event or server task completion
-        done, pending = await asyncio.wait(
+        _, pending = await asyncio.wait(
             [
                 asyncio.create_task(shutdown_event.wait()),
                 self._server_task,
@@ -921,7 +912,7 @@ class AsyncSystemManager:
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    async def __aexit__(self, exc_type: Any, _exc_val: Any, _exc_tb: Any) -> None:
         """Async context manager exit - stops the server."""
         reason = "exception" if exc_type else "context_exit"
         await self.stop(reason=reason)
