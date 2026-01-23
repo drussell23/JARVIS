@@ -10347,12 +10347,17 @@ echo "=== JARVIS Prime started ==="
                 logger.info(f"🚀 Spawning {definition.name}: {' '.join(cmd)}")
 
             # Spawn process
+            # v95.20: CRITICAL - start_new_session=True isolates child from parent's process group
+            # Without this, signals sent to parent (SIGTERM/SIGINT) propagate to ALL children,
+            # causing immediate termination of spawned services with exit code 0.
+            # This was the root cause of "Process died unexpectedly (uptime: 0.0s)"
             managed.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(definition.repo_path),
                 stdout=asyncio.subprocess.PIPE if self.config.stream_output else asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE if self.config.stream_output else asyncio.subprocess.DEVNULL,
                 env=env,
+                start_new_session=True,  # v95.20: Isolate from parent's signal propagation
             )
 
             managed.pid = managed.process.pid

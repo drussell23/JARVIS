@@ -10182,12 +10182,14 @@ class SupervisorBootstrapper:
         self.logger.info(f"🚀 Starting JARVIS-Prime local: {' '.join(cmd)}")
 
         # Start subprocess
+        # v95.20: CRITICAL - start_new_session=True isolates from parent signal propagation
         self._jarvis_prime_process = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(repo_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "PYTHONPATH": str(repo_path)},
+            start_new_session=True,  # v95.20: Prevent signal propagation from parent
         )
 
         # v101.0: Register with supervisor restart manager for automatic recovery
