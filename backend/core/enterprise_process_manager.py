@@ -468,18 +468,34 @@ class EnterpriseProcessManager:
                 return False
 
             # Layer 3: Process name sanity check
-            dangerous_names = {"systemd", "launchd", "init", "kernel", "python3", "bash", "zsh"}
-            if validation.process_name and validation.process_name.lower() in dangerous_names:
-                # Additional check: is this OUR python3 process?
-                if validation.process_name.lower() == "python3":
-                    # Check if it's running JARVIS or supervisor
-                    cmdline = await self._get_process_cmdline(validation.pid)
-                    if cmdline and any(x in cmdline.lower() for x in ["supervisor", "jarvis", "run_supervisor"]):
-                        logger.error(
-                            f"[v109.0] SAFETY: PID {validation.pid} appears to be JARVIS/supervisor "
-                            f"(cmdline contains jarvis/supervisor) - refusing to kill"
+            # v109.3: CRITICAL FIX - Only protect SYSTEM processes and the SUPERVISOR
+            # NOT jarvis-prime or other JARVIS services (which can be safely killed if stale)
+            system_processes = {"systemd", "launchd", "init", "kernel", "bash", "zsh"}
+            if validation.process_name and validation.process_name.lower() in system_processes:
+                logger.error(
+                    f"[v109.3] SAFETY: PID {validation.pid} is a system process "
+                    f"({validation.process_name}) - refusing to kill"
+                )
+                return False
+
+            # v109.3: For Python processes, only protect the SUPERVISOR, not other JARVIS services
+            if validation.process_name and validation.process_name.lower() in ("python3", "python"):
+                cmdline = await self._get_process_cmdline(validation.pid)
+                if cmdline:
+                    cmdline_lower = cmdline.lower()
+                    # Only protect "run_supervisor.py" - NOT jarvis-prime or other services
+                    # The check for current_pid/parent_pid already protects us from killing ourselves
+                    if "run_supervisor" in cmdline_lower and "jarvis_prime" not in cmdline_lower:
+                        logger.warning(
+                            f"[v109.3] SAFETY: PID {validation.pid} appears to be a supervisor process "
+                            f"(run_supervisor in cmdline) - refusing to kill. Cmdline: {cmdline[:100]}"
                         )
                         return False
+                    # Log what we're about to kill for debugging
+                    logger.info(
+                        f"[v109.3] Port cleanup: Will kill PID {validation.pid} "
+                        f"(cmdline: {cmdline[:100]}...)"
+                    )
 
             # All safety checks passed - proceed with kill
             success = await self._kill_process(

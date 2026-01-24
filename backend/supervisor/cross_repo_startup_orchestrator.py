@@ -10322,27 +10322,64 @@ echo "=== JARVIS Prime started ==="
                         f"is NOT healthy - possible port conflict with another process"
                     )
                     # v108.0: CRITICAL FIX - Actually resolve the conflict
+                    # v109.3: Enhanced with retry logic and proper failure handling
                     conflict_resolved = await self._handle_port_conflict(definition)
-                    if not conflict_resolved:
+
+                    if conflict_resolved:
+                        logger.info(
+                            f"    ✅ Port {definition.default_port} conflict resolved, proceeding with spawn"
+                        )
+                    else:
                         logger.error(
                             f"    ❌ Could not resolve port conflict for {definition.name} "
                             f"on port {definition.default_port}"
                         )
-                        # Wait a bit and retry port check
-                        await asyncio.sleep(2.0)
-                        is_healthy_retry = await self._quick_health_check(
-                            definition.default_port,
-                            definition.health_endpoint
-                        )
-                        if is_healthy_retry:
-                            # Service came up healthy after conflict resolution attempt
-                            return "ALREADY_HEALTHY", python_exec
-                        else:
-                            # Still broken - log and let spawn proceed (it will fail cleanly)
-                            logger.warning(
-                                f"    ⚠️ Port {definition.default_port} still unavailable, "
-                                f"spawn may fail"
+                        # v109.3: More aggressive retry with TIME_WAIT handling
+                        # Wait longer and check multiple times
+                        max_retries = 3
+                        retry_delay = 2.0
+
+                        for retry in range(max_retries):
+                            await asyncio.sleep(retry_delay)
+
+                            # Check if service came up healthy
+                            is_healthy_retry = await self._quick_health_check(
+                                definition.default_port,
+                                definition.health_endpoint
                             )
+                            if is_healthy_retry:
+                                logger.info(
+                                    f"    ✅ {definition.name} became healthy during retry {retry + 1}"
+                                )
+                                return "ALREADY_HEALTHY", python_exec
+
+                            # v109.3: Check if port is now free (conflict may have resolved)
+                            try:
+                                test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                                test_sock.settimeout(1)
+                                test_sock.bind(('0.0.0.0', definition.default_port))
+                                test_sock.close()
+                                logger.info(
+                                    f"    ✅ Port {definition.default_port} is now available "
+                                    f"after retry {retry + 1}"
+                                )
+                                break  # Port is free, proceed with spawn
+                            except OSError:
+                                logger.debug(
+                                    f"    ⏳ Port {definition.default_port} still unavailable "
+                                    f"(retry {retry + 1}/{max_retries})"
+                                )
+                                if retry < max_retries - 1:
+                                    retry_delay *= 1.5  # Exponential backoff
+                        else:
+                            # v109.3: CRITICAL - Don't proceed if port is still occupied
+                            # This prevents the "address already in use" error
+                            logger.error(
+                                f"    ❌ Port {definition.default_port} still unavailable after "
+                                f"{max_retries} retries - FAILING pre-spawn validation"
+                            )
+                            return False, None
 
         except Exception as e:
             logger.debug(f"Port check failed: {e}")
@@ -10434,22 +10471,51 @@ echo "=== JARVIS Prime started ==="
                 return True
 
             elif validation.recommendation in ("kill_and_retry", "wait"):
-                # Attempt cleanup
-                logger.info(f"    🧹 Attempting to clean up port {port}...")
+                # v109.3: Enhanced multi-phase cleanup with force escalation
+                logger.info(f"    🧹 [v109.3] Attempting multi-phase cleanup for port {port}...")
 
+                # Phase 1: Graceful cleanup (SIGTERM)
                 cleanup_success = await process_manager.cleanup_port(
                     port=port,
                     force=False,  # Try graceful first
                     wait_for_time_wait=True,
-                    max_wait=30.0,  # Wait up to 30s for TIME_WAIT
+                    max_wait=15.0,  # Wait up to 15s for graceful
                 )
 
                 if cleanup_success:
-                    logger.info(f"    ✅ Port {port} successfully cleaned up")
+                    logger.info(f"    ✅ Port {port} cleaned up (graceful)")
                     return True
-                else:
-                    logger.error(f"    ❌ Failed to clean up port {port}")
-                    return False
+
+                # Phase 2: Force cleanup (SIGKILL) if graceful failed
+                logger.warning(f"    ⚠️ Graceful cleanup failed, escalating to force cleanup...")
+                cleanup_success = await process_manager.cleanup_port(
+                    port=port,
+                    force=True,  # SIGKILL
+                    wait_for_time_wait=True,
+                    max_wait=15.0,
+                )
+
+                if cleanup_success:
+                    logger.info(f"    ✅ Port {port} cleaned up (forced)")
+                    return True
+
+                # Phase 3: Wait for TIME_WAIT if socket is in that state
+                logger.warning(f"    ⚠️ Force cleanup failed, checking for TIME_WAIT...")
+                socket_state = await process_manager._check_socket_state(port)
+                if socket_state.get("state") == "TIME_WAIT":
+                    logger.info(f"    ⏳ Port {port} in TIME_WAIT, waiting up to 30s for release...")
+                    start = time.time()
+                    while time.time() - start < 30.0:
+                        await asyncio.sleep(2.0)
+                        state_check = await process_manager._check_socket_state(port)
+                        if not state_check.get("occupied", True):
+                            logger.info(f"    ✅ Port {port} released from TIME_WAIT")
+                            return True
+                        logger.debug(f"    ⏳ Still waiting for TIME_WAIT on port {port}...")
+                    logger.warning(f"    ❌ TIME_WAIT did not clear in time for port {port}")
+
+                logger.error(f"    ❌ All cleanup phases failed for port {port}")
+                return False
 
             return False
 
