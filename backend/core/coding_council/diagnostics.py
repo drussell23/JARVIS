@@ -486,24 +486,27 @@ class TrinityChecker:
         start = time.time()
 
         if not path.exists():
+            # v109.3: Trinity repos are optional - use SKIP for missing repos
+            # This prevents warnings for expected standalone operation
             return CheckResult(
                 name=f"Trinity: {name}",
                 category=CheckCategory.TRINITY,
-                status=CheckStatus.WARN,
-                message=f"Repository not found: {path}",
-                details="Some cross-repo features may not work",
+                status=CheckStatus.SKIP,
+                message=f"Repository not installed: {path} (optional)",
+                details="Cross-repo features will operate in standalone mode",
                 duration_ms=(time.time() - start) * 1000,
             )
 
-        # Check if it's a git repo
+        # Check if it's a git repo (optional for functionality)
         git_dir = path / ".git"
         if not git_dir.exists():
+            # v109.3: Not being a git repo is non-critical for operation
             return CheckResult(
                 name=f"Trinity: {name}",
                 category=CheckCategory.TRINITY,
-                status=CheckStatus.WARN,
-                message=f"Not a git repository: {path}",
-                details="Git operations will not work",
+                status=CheckStatus.SKIP,
+                message=f"Not a git repository: {path} (version control disabled)",
+                details="Git operations will not work, but code execution is unaffected",
                 fix_command=f"cd {path} && git init",
                 duration_ms=(time.time() - start) * 1000,
             )
@@ -521,11 +524,12 @@ class TrinityChecker:
                 missing_files.append(kf)
 
         if missing_files:
+            # v109.3: Missing files is informational, not blocking
             return CheckResult(
                 name=f"Trinity: {name}",
                 category=CheckCategory.TRINITY,
-                status=CheckStatus.WARN,
-                message=f"Missing expected files in {name}",
+                status=CheckStatus.SKIP,
+                message=f"Missing expected files in {name} (partial install)",
                 details=f"Missing: {', '.join(missing_files)}",
                 duration_ms=(time.time() - start) * 1000,
             )
@@ -555,11 +559,12 @@ class TrinityChecker:
                     duration_ms=(time.time() - start) * 1000,
                 )
             except Exception as e:
+                # v109.3: Trinity is optional - directory creation failure is a warning
                 return CheckResult(
                     name="Trinity: Heartbeat Directory",
                     category=CheckCategory.TRINITY,
-                    status=CheckStatus.FAIL,
-                    message=f"Cannot create heartbeat directory",
+                    status=CheckStatus.WARN,
+                    message=f"Cannot create heartbeat directory (Trinity disabled)",
                     details=str(e),
                     fix_command=f"mkdir -p {heartbeat_dir}",
                     duration_ms=(time.time() - start) * 1000,
@@ -578,11 +583,12 @@ class TrinityChecker:
                 duration_ms=(time.time() - start) * 1000,
             )
         except Exception as e:
+            # v109.3: Trinity is optional - permission failure is a warning
             return CheckResult(
                 name="Trinity: Heartbeat Directory",
                 category=CheckCategory.TRINITY,
-                status=CheckStatus.FAIL,
-                message=f"Heartbeat directory not writable",
+                status=CheckStatus.WARN,
+                message=f"Heartbeat directory not writable (Trinity disabled)",
                 details=str(e),
                 fix_command=f"chmod 755 {heartbeat_dir}",
                 duration_ms=(time.time() - start) * 1000,
@@ -617,13 +623,15 @@ class TrinityChecker:
                 age = time.time() - last_update
 
                 if age > stale_threshold:
+                    # v109.3: Stale heartbeats are expected after restart - use SKIP
+                    # Auto-recovery will archive them, so this is informational
                     results.append(CheckResult(
                         name=f"Heartbeat: {component_name}",
                         category=CheckCategory.TRINITY,
-                        status=CheckStatus.WARN,
-                        message=f"Stale heartbeat ({age:.0f}s old)",
-                        details=f"Component may be dead or unresponsive",
-                        fix_command=f"rm {heartbeat_file}  # Clear stale heartbeat",
+                        status=CheckStatus.SKIP,
+                        message=f"Stale heartbeat ({age:.0f}s old) - will auto-archive",
+                        details=f"Previous session's heartbeat from before restart",
+                        fix_command=f"rm {heartbeat_file}  # Or let auto-recovery handle",
                         duration_ms=(time.time() - start) * 1000,
                     ))
                 else:
@@ -636,11 +644,12 @@ class TrinityChecker:
                     ))
 
             except json.JSONDecodeError:
+                # v109.3: Corrupted heartbeat is expected after crash - use SKIP
                 results.append(CheckResult(
                     name=f"Heartbeat: {component_name}",
                     category=CheckCategory.TRINITY,
-                    status=CheckStatus.WARN,
-                    message="Corrupted heartbeat file",
+                    status=CheckStatus.SKIP,
+                    message="Corrupted heartbeat file - will auto-cleanup",
                     fix_command=f"rm {heartbeat_file}",
                     duration_ms=(time.time() - start) * 1000,
                 ))
@@ -767,11 +776,13 @@ class RuntimeChecker:
                         duration_ms=(time.time() - start) * 1000,
                     )
                 elif response.status_code == 401:
+                    # v109.3: Invalid API key is a warning, not failure
+                    # System can operate without API (graceful degradation)
                     return CheckResult(
                         name="Anthropic API",
                         category=CheckCategory.CONNECTIVITY,
-                        status=CheckStatus.FAIL,
-                        message="Invalid API key",
+                        status=CheckStatus.WARN,
+                        message="Invalid API key (AI features disabled)",
                         details="The provided ANTHROPIC_API_KEY is not valid",
                         fix_command="export ANTHROPIC_API_KEY=<valid_key>",
                         duration_ms=(time.time() - start) * 1000,

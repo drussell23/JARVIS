@@ -2110,7 +2110,8 @@ class ClaudeVisionAnalyzer:
                             "Integrated Rust pipeline for high-performance processing"
                         )
                     except Exception as e:
-                        logger.warning(f"Could not integrate Rust pipeline: {e}")
+                        # v109.3: Rust pipeline is optional - use INFO not WARNING
+                        logger.info(f"Rust pipeline not available (optional): {e}")
 
                 # Setup Swift coordinator if on macOS
                 if (

@@ -973,9 +973,10 @@ class OptimizationRouter:
                     if cap and cap.available:
                         logger.info(f"[ROUTER] Using requested engine: {engine.name}")
                         return engine, cap
-                    logger.warning(f"[ROUTER] Requested engine {requested} not available")
+                    # v109.3: Engine not available is graceful degradation, not a warning
+                    logger.info(f"[ROUTER] Requested engine {requested} not available, using fallback")
                 except KeyError:
-                    logger.warning(f"[ROUTER] Unknown engine: {requested}")
+                    logger.info(f"[ROUTER] Unknown engine: {requested}, using fallback")
 
         # Filter to engines that support this category
         candidates = [
@@ -985,7 +986,8 @@ class OptimizationRouter:
 
         if not candidates:
             # Fall back to standard
-            logger.warning(f"[ROUTER] No specialized engine for {category.name}, using STANDARD")
+            # v109.3: Fallback to standard is normal operation
+            logger.info(f"[ROUTER] No specialized engine for {category.name}, using STANDARD")
             return OptimizationEngine.STANDARD, self._engine_cache[OptimizationEngine.STANDARD]
 
         # Filter by memory constraint
