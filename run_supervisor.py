@@ -4713,6 +4713,7 @@ class SupervisorBootstrapper:
         # - Uvicorn server with disabled signal handlers (supervisor manages signals)
         self._backend_server: Optional[Any] = None  # uvicorn.Server instance
         self._backend_task: Optional[asyncio.Task] = None  # Background task running serve()
+        self._inprocess_heartbeat_task: Optional[asyncio.Task] = None  # v111.2: Heartbeat writer
         self._in_process_mode: bool = os.getenv("JARVIS_IN_PROCESS_MODE", "true").lower() == "true"
         self._backend_port: int = int(os.getenv("BACKEND_PORT", "8010"))
 
@@ -5848,6 +5849,29 @@ class SupervisorBootstrapper:
                     f"[v111.1] ⚠️ Service registry registration failed (non-fatal): {reg_err}"
                 )
 
+            # ═══════════════════════════════════════════════════════════════════
+            # v111.2: HEARTBEAT FILE WRITER FOR HEARTBEAT VALIDATOR
+            # ═══════════════════════════════════════════════════════════════════
+            # The HeartbeatValidator monitors heartbeat FILES in ~/.jarvis/trinity/heartbeats/
+            # We must write heartbeat files for the in-process backend so the validator
+            # doesn't mark jarvis_body as "dead" and trigger recovery cascades.
+            #
+            # CRITICAL FIX: Without this, HeartbeatValidator repeatedly marks
+            # jarvis_body_{pid} as "dead" causing recovery loops that shut down the backend.
+            # ═══════════════════════════════════════════════════════════════════
+            try:
+                self._inprocess_heartbeat_task = asyncio.create_task(
+                    self._run_inprocess_heartbeat_loop(),
+                    name="inprocess-heartbeat-v111.2"
+                )
+                self.logger.info(
+                    "[v111.2] ✅ In-process heartbeat writer started (HeartbeatValidator compatibility)"
+                )
+            except Exception as hb_err:
+                self.logger.warning(
+                    f"[v111.2] ⚠️ Heartbeat writer failed to start (non-fatal): {hb_err}"
+                )
+
             return True
 
         except ImportError as e:
@@ -5885,6 +5909,24 @@ class SupervisorBootstrapper:
         TerminalUI.print_step("[v111.0] Stopping in-process backend")
 
         # ═══════════════════════════════════════════════════════════════════
+        # v111.2: STOP HEARTBEAT WRITER FIRST
+        # ═══════════════════════════════════════════════════════════════════
+        # Stop writing heartbeats before deregistering so HeartbeatValidator
+        # doesn't try to trigger recovery during shutdown.
+        # ═══════════════════════════════════════════════════════════════════
+        if hasattr(self, "_inprocess_heartbeat_task") and self._inprocess_heartbeat_task:
+            try:
+                self._inprocess_heartbeat_task.cancel()
+                await asyncio.wait_for(
+                    asyncio.shield(self._inprocess_heartbeat_task),
+                    timeout=2.0
+                )
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._inprocess_heartbeat_task = None
+            self.logger.debug("[v111.2] In-process heartbeat writer stopped")
+
+        # ═══════════════════════════════════════════════════════════════════
         # v111.1: DEREGISTER FROM SERVICE REGISTRY FIRST
         # ═══════════════════════════════════════════════════════════════════
         # Deregister jarvis-body so external services know we're shutting down
@@ -5897,6 +5939,19 @@ class SupervisorBootstrapper:
             self.logger.info("[v111.1] ✅ jarvis-body deregistered from service registry")
         except Exception as reg_err:
             self.logger.debug(f"[v111.1] Service registry deregistration: {reg_err}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v111.2: CLEAN UP HEARTBEAT FILE
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            heartbeat_dir = Path.home() / ".jarvis" / "trinity" / "heartbeats"
+            component_id = f"jarvis_body_{os.getpid()}"
+            heartbeat_file = heartbeat_dir / f"{component_id}.json"
+            if heartbeat_file.exists():
+                heartbeat_file.unlink()
+                self.logger.debug(f"[v111.2] Heartbeat file cleaned up: {heartbeat_file}")
+        except Exception as cleanup_err:
+            self.logger.debug(f"[v111.2] Heartbeat file cleanup: {cleanup_err}")
 
         try:
             # Signal graceful shutdown
@@ -5925,6 +5980,95 @@ class SupervisorBootstrapper:
         finally:
             self._backend_server = None
             self._backend_task = None
+
+    async def _run_inprocess_heartbeat_loop(self) -> None:
+        """
+        v111.2: Heartbeat file writer for in-process backend.
+
+        Writes heartbeat files to ~/.jarvis/trinity/heartbeats/ so the
+        HeartbeatValidator doesn't mark jarvis_body as "dead".
+
+        CRITICAL: Without this, the HeartbeatValidator repeatedly marks
+        jarvis_body_{pid} as dead, triggering recovery cascades that
+        shut down the in-process backend.
+
+        Heartbeat format matches what HeartbeatValidator expects:
+        {
+            "component_id": "jarvis_body_{pid}",
+            "component_type": "jarvis_body",
+            "timestamp": <unix_timestamp>,
+            "pid": <pid>,
+            "host": <hostname>,
+            "version": "v111.2",
+            "status": "running",
+            "metrics": {...}
+        }
+        """
+        import socket
+
+        heartbeat_dir = Path.home() / ".jarvis" / "trinity" / "heartbeats"
+        heartbeat_dir.mkdir(parents=True, exist_ok=True)
+
+        # Also write to cross-repo dir for Trinity synchronization
+        cross_repo_dir = Path.home() / ".jarvis" / "cross_repo"
+        cross_repo_dir.mkdir(parents=True, exist_ok=True)
+
+        component_id = f"jarvis_body_{os.getpid()}"
+        heartbeat_interval = float(os.getenv("JARVIS_HEARTBEAT_INTERVAL", "10.0"))
+        hostname = socket.gethostname()
+        start_time = time.time()
+
+        self.logger.info(
+            f"[v111.2] Heartbeat writer started: {component_id} "
+            f"(interval={heartbeat_interval}s)"
+        )
+
+        try:
+            while True:
+                try:
+                    uptime = time.time() - start_time
+
+                    heartbeat_data = {
+                        "component_id": component_id,
+                        "component_type": "jarvis_body",
+                        "timestamp": time.time(),
+                        "pid": os.getpid(),
+                        "host": hostname,
+                        "version": "v111.2",
+                        "status": "running",
+                        "metrics": {
+                            "mode": "in-process",
+                            "unified_monolith": True,
+                            "uptime_seconds": round(uptime, 1),
+                            "port": self._backend_port,
+                            "backend_started": self._backend_server is not None and
+                                              getattr(self._backend_server, "started", False),
+                        },
+                    }
+
+                    heartbeat_json = json.dumps(heartbeat_data, indent=2)
+
+                    # Write to primary heartbeat directory (atomic write)
+                    heartbeat_file = heartbeat_dir / f"{component_id}.json"
+                    tmp_file = heartbeat_file.with_suffix(".tmp")
+                    tmp_file.write_text(heartbeat_json)
+                    tmp_file.rename(heartbeat_file)
+
+                    # Also write to cross-repo directory for Trinity sync
+                    cross_repo_file = cross_repo_dir / f"{component_id}.json"
+                    tmp_cross = cross_repo_file.with_suffix(".tmp")
+                    tmp_cross.write_text(heartbeat_json)
+                    tmp_cross.rename(cross_repo_file)
+
+                except Exception as write_err:
+                    self.logger.debug(f"[v111.2] Heartbeat write error: {write_err}")
+
+                await asyncio.sleep(heartbeat_interval)
+
+        except asyncio.CancelledError:
+            # Clean up on cancellation
+            self.logger.debug("[v111.2] Heartbeat writer cancelled")
+            raise
 
     async def _run_with_deep_health(self) -> int:
         """
@@ -6218,6 +6362,27 @@ class SupervisorBootstrapper:
                 self._coord_hub = None
 
             self.perf.end("cleanup")
+
+            # ═══════════════════════════════════════════════════════════════════
+            # v111.3: Start backend in-process BEFORE cross-repo orchestration
+            # ═══════════════════════════════════════════════════════════════════
+            # CRITICAL FIX: The cross-repo orchestrator checks for jarvis-body health
+            # and assumes the backend is already running if JARVIS_IN_PROCESS_MODE=true.
+            # We MUST start the in-process backend HERE so it's actually running when
+            # the orchestrator verifies it.
+            #
+            # Previous bug: Orchestrator ran first, saw in-process mode, assumed backend
+            # was running, but _start_backend_in_process() wasn't called until later.
+            # Result: Nothing was actually listening on port 8010.
+            # ═══════════════════════════════════════════════════════════════════
+            if self._in_process_mode:
+                self.logger.info("[v111.3] Starting backend in-process BEFORE cross-repo orchestration...")
+                backend_started = await self._start_backend_in_process()
+                if not backend_started:
+                    self.logger.error("[v111.3] Backend failed to start in-process mode - aborting")
+                    TerminalUI.print_error("[v111.3] Backend startup failed")
+                    return 1
+                self.logger.info("[v111.3] ✅ Backend running - proceeding with cross-repo orchestration")
 
             # ═══════════════════════════════════════════════════════════════════
             # v10.1: Cross-Repo Startup Orchestration (MUST RUN BEFORE TrinityIntegrator)
@@ -6798,17 +6963,17 @@ class SupervisorBootstrapper:
             await self._start_advanced_monitoring_tasks()
 
             # ═══════════════════════════════════════════════════════════════════
-            # v111.0: Start backend in-process (Unified Monolith Mode)
+            # v111.3: Backend startup now happens EARLIER (before cross-repo orchestration)
             # ═══════════════════════════════════════════════════════════════════
-            # When JARVIS_IN_PROCESS_MODE=true (default), the backend runs in the
-            # supervisor's event loop instead of being spawned as a subprocess.
-            # This enables:
-            # - Shared memory (no IPC overhead)
-            # - Coordinated shutdown (no orphan processes)
-            # - Faster startup (no process spawn overhead)
-            # - Unified event loop (better async coordination)
+            # The in-process backend is now started at the v111.3 section above,
+            # BEFORE cross-repo orchestration runs. This ensures the backend is
+            # actually listening when the orchestrator verifies jarvis-body health.
+            #
+            # This section is kept for safety - if the backend wasn't started earlier
+            # for some reason, we'll start it here as a fallback.
             # ═══════════════════════════════════════════════════════════════════
-            if self._in_process_mode:
+            if self._in_process_mode and not self._backend_server:
+                self.logger.warning("[v111.3] Backend not started earlier - starting now (fallback)")
                 backend_started = await self._start_backend_in_process()
                 if not backend_started:
                     self.logger.error("[v111.0] Backend failed to start in-process mode")

@@ -454,9 +454,36 @@ class HeartbeatValidator:
         Evaluate current status of a component.
 
         v108.0: Now uses component-specific thresholds and startup grace period awareness.
+        v111.2: In-process components (same PID) are always considered healthy.
 
         Gap #2: Staleness detection
         """
+        # ═══════════════════════════════════════════════════════════════════
+        # v111.2: IN-PROCESS COMPONENT DETECTION (Unified Monolith Mode)
+        # ═══════════════════════════════════════════════════════════════════
+        # If a component's PID matches our current PID, it's running in-process
+        # with the supervisor and is inherently alive. No heartbeat file needed.
+        #
+        # This prevents the HeartbeatValidator from marking in-process components
+        # (like jarvis_body in unified monolith mode) as "dead" and triggering
+        # recovery cascades that shut down the backend.
+        # ═══════════════════════════════════════════════════════════════════
+        current_pid = os.getpid()
+        if health.pid == current_pid and health.host == os.uname().nodename:
+            # In-process component - always healthy (same process = same fate)
+            if health.status != HeartbeatStatus.HEALTHY:
+                old_status = health.status
+                health.status = HeartbeatStatus.HEALTHY
+                health.health_score = 1.0
+                health.last_heartbeat = time.time()  # Update to prevent staleness
+                # Only log transition once to avoid spam
+                if old_status != HeartbeatStatus.HEALTHY:
+                    logger.debug(
+                        f"[HeartbeatValidator] {health.component_id} is in-process "
+                        f"(PID={current_pid}) - always healthy in unified monolith mode"
+                    )
+            return HeartbeatStatus.HEALTHY
+
         age = time.time() - health.last_heartbeat
 
         # v108.0: Get component-specific thresholds
