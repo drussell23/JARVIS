@@ -2510,6 +2510,46 @@ class ManagedProcess:
     last_known_health: str = "unknown"
     last_heartbeat_sent: float = 0.0
 
+    # v108.2: Crash forensics - circular buffer of last N output lines
+    # This enables post-mortem analysis when a process crashes
+    _output_buffer: List[str] = field(default_factory=list)
+    _output_buffer_max_lines: int = 100
+    _stderr_buffer: List[str] = field(default_factory=list)
+    _stderr_buffer_max_lines: int = 50  # Separate stderr buffer for errors
+
+    def add_output_line(self, line: str, is_stderr: bool = False) -> None:
+        """
+        v108.2: Add a line to the output buffer for crash forensics.
+
+        Maintains a circular buffer of the last N lines for post-mortem analysis.
+        """
+        # Add to combined buffer
+        self._output_buffer.append(line)
+        if len(self._output_buffer) > self._output_buffer_max_lines:
+            self._output_buffer.pop(0)
+
+        # Also track stderr separately (usually contains errors)
+        if is_stderr:
+            self._stderr_buffer.append(line)
+            if len(self._stderr_buffer) > self._stderr_buffer_max_lines:
+                self._stderr_buffer.pop(0)
+
+    def get_crash_context(self, num_lines: int = 30) -> Dict[str, Any]:
+        """
+        v108.2: Get crash context for forensic analysis.
+
+        Returns the last N output lines and any error indicators.
+        """
+        return {
+            "last_output_lines": self._output_buffer[-num_lines:] if self._output_buffer else [],
+            "last_stderr_lines": self._stderr_buffer[-20:] if self._stderr_buffer else [],
+            "total_output_captured": len(self._output_buffer),
+            "total_stderr_captured": len(self._stderr_buffer),
+            "exit_code": self.process.returncode if self.process else None,
+            "pid": self.pid,
+            "uptime_seconds": time.time() - self.last_restart if self.last_restart else 0,
+        }
+
     @property
     def is_running(self) -> bool:
         """Check if process is running."""
@@ -3274,6 +3314,9 @@ class ProcessOrchestrator:
         analysis = await self._analyze_crash(managed, return_code)
         self._last_crash_analysis[service_name] = analysis
 
+        # v108.2: Get crash forensics (last output lines before crash)
+        crash_context = managed.get_crash_context(num_lines=30)
+
         # v95.11: Use appropriate log level based on analysis
         log_level = logging.ERROR if analysis.get("severity") != "low" else logging.WARNING
         logger.log(
@@ -3285,6 +3328,22 @@ class ProcessOrchestrator:
             f"  Restart count: {managed.restart_count}\n"
             f"  Analysis: {analysis.get('diagnosis', 'Unknown')}"
         )
+
+        # v108.2: Log crash forensics if available
+        if crash_context.get("last_stderr_lines"):
+            stderr_lines = crash_context["last_stderr_lines"]
+            logger.error(
+                f"[v108.2] 📋 CRASH FORENSICS for {service_name}:\n"
+                f"  Last {len(stderr_lines)} stderr lines before crash:\n" +
+                "\n".join(f"    | {line}" for line in stderr_lines[-15:])
+            )
+        elif crash_context.get("last_output_lines"):
+            output_lines = crash_context["last_output_lines"]
+            logger.warning(
+                f"[v108.2] 📋 CRASH CONTEXT for {service_name}:\n"
+                f"  Last {len(output_lines)} output lines before crash:\n" +
+                "\n".join(f"    | {line}" for line in output_lines[-10:])
+            )
 
         # Check circuit breaker
         if self._should_circuit_break(service_name):
@@ -8936,6 +8995,7 @@ echo "=== JARVIS Prime started ==="
         """
         v93.0: Stream process output with intelligent log level detection.
         v93.16: Added warning suppression for known benign library warnings.
+        v108.2: Added crash forensics buffer to capture output for post-mortem analysis.
 
         Python's logging module outputs to stderr by default, which previously
         caused all child process logs to appear as WARNING in our output.
@@ -8949,6 +9009,7 @@ echo "=== JARVIS Prime started ==="
             [REACTOR_CORE] Initializing pipeline...
         """
         prefix = f"[{managed.definition.name.upper().replace('-', '_')}]"
+        is_stderr = stream_type == "stderr"
 
         try:
             while True:
@@ -8958,6 +9019,9 @@ echo "=== JARVIS Prime started ==="
 
                 decoded = line.decode('utf-8', errors='replace').rstrip()
                 if decoded:
+                    # v108.2: Always add to crash forensics buffer (even if suppressed from logs)
+                    managed.add_output_line(f"{stream_type}: {decoded}", is_stderr=is_stderr)
+
                     # v93.16: Suppress known benign warnings
                     if self._should_suppress_line(decoded):
                         logger.debug(f"{prefix} [SUPPRESSED] {decoded}")
@@ -11339,16 +11403,39 @@ echo "=== JARVIS Prime started ==="
                 # Check if process died
                 if not managed.is_running:
                     exit_code = managed.process.returncode if managed.process else "unknown"
+
+                    # v108.2: Get crash forensics for detailed diagnosis
+                    crash_context = managed.get_crash_context(num_lines=30)
+
                     logger.error(
-                        f"    ❌ [v108.1] {service_name} process died during model loading "
+                        f"    ❌ [v108.2] {service_name} process died during model loading "
                         f"(exit code: {exit_code})"
                     )
+
+                    # v108.2: Log detailed crash forensics
+                    if crash_context.get("last_stderr_lines"):
+                        stderr_lines = crash_context["last_stderr_lines"]
+                        logger.error(
+                            f"    📋 CRASH FORENSICS ({len(stderr_lines)} stderr lines captured):\n" +
+                            "\n".join(f"      | {line}" for line in stderr_lines[-20:])
+                        )
+                    elif crash_context.get("last_output_lines"):
+                        output_lines = crash_context["last_output_lines"]
+                        logger.error(
+                            f"    📋 Last output before crash:\n" +
+                            "\n".join(f"      | {line}" for line in output_lines[-10:])
+                        )
+
                     managed.status = ServiceStatus.FAILED
                     await _emit_event(
                         "SERVICE_CRASHED",
                         service_name=service_name,
                         priority="CRITICAL",
-                        details={"reason": "process_died_during_model_loading", "exit_code": exit_code}
+                        details={
+                            "reason": "process_died_during_model_loading",
+                            "exit_code": exit_code,
+                            "crash_context": crash_context,
+                        }
                     )
                     return
 
