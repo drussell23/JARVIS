@@ -374,7 +374,8 @@ class HybridBackendClient:
             backend.health.last_check = datetime.now()
 
         except Exception as e:
-            logger.warning(f"Health check failed for {backend.name}: {e}")
+            # v109.2: Health checks can fail during startup - use INFO not WARNING
+            logger.info(f"Health check failed for {backend.name}: {e}")
             backend.health.healthy = False
             backend.health.error_count += 1
             backend.health.last_check = datetime.now()

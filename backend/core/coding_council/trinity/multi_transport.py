@@ -172,7 +172,8 @@ class RedisTransport(BaseTransport):
         try:
             import redis.asyncio as redis
         except ImportError:
-            logger.warning("[RedisTransport] redis package not installed")
+            # v109.2: Redis is optional - not a warning
+            logger.info("[RedisTransport] redis package not installed (optional)")
             self.status = TransportStatus.FAILED
             return False
 
@@ -185,7 +186,8 @@ class RedisTransport(BaseTransport):
             logger.info("[RedisTransport] Connected")
             return True
         except Exception as e:
-            logger.warning(f"[RedisTransport] Connection failed: {e}")
+            # v109.2: Connection failures during startup are expected
+            logger.info(f"[RedisTransport] Not available: {e}")
             self.status = TransportStatus.FAILED
             return False
 
@@ -278,7 +280,8 @@ class WebSocketTransport(BaseTransport):
         try:
             import websockets
         except ImportError:
-            logger.warning("[WebSocketTransport] websockets package not installed")
+            # v109.2: WebSockets is optional - not a warning
+            logger.info("[WebSocketTransport] websockets package not installed (optional)")
             self.status = TransportStatus.FAILED
             return False
 
@@ -296,7 +299,8 @@ class WebSocketTransport(BaseTransport):
 
             return True
         except Exception as e:
-            logger.warning(f"[WebSocketTransport] Connection failed: {e}")
+            # v109.2: Connection failures during startup are expected
+            logger.info(f"[WebSocketTransport] Not available: {e}")
             self.status = TransportStatus.FAILED
             return False
 

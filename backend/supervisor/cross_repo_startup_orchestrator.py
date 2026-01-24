@@ -5318,13 +5318,14 @@ class ProcessOrchestrator:
         """Build compatibility matrix between components."""
         # Define compatibility rules
         # Format: {service: {dependency: [compatible_version_patterns]}}
+        # v109.2: Updated to include 0.x development versions
         self._compatibility_matrix = {
             "reactor-core": {
-                "jarvis-prime": ["1.*", "2.*"],  # Reactor compatible with Prime 1.x or 2.x
-                "jarvis-body": ["1.*", "2.*"],
+                "jarvis-prime": ["0.*", "1.*", "2.*"],  # Reactor compatible with Prime 0.x, 1.x, 2.x
+                "jarvis-body": ["0.*", "1.*", "2.*"],
             },
             "jarvis-prime": {
-                "jarvis-body": ["1.*", "2.*"],
+                "jarvis-body": ["0.*", "1.*", "2.*"],
             },
         }
 

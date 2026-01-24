@@ -984,16 +984,26 @@ class ParallelInitializer:
             def load_claude_vision():
                 """Heavy loader for Claude Vision Analyzer."""
                 try:
+                    # v109.2: Ensure event loop exists for thread pool workers
+                    # Some components in ClaudeVisionAnalyzer may need asyncio
+                    import asyncio
+                    try:
+                        asyncio.get_running_loop()
+                    except RuntimeError:
+                        # No running loop - create one for this thread
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
                     # Use the correct module path - main file is claude_vision_analyzer_main.py
                     from vision.claude_vision_analyzer_main import ClaudeVisionAnalyzer
                     if api_key:
                         analyzer = ClaudeVisionAnalyzer(api_key)
                         logger.info("   [BACKGROUND] Claude Vision Analyzer loaded")
                         return analyzer
-                    logger.warning("   [BACKGROUND] No API key - Claude Vision unavailable")
+                    logger.info("   [BACKGROUND] No API key - Claude Vision unavailable")
                     return None
                 except Exception as e:
-                    logger.warning(f"   [BACKGROUND] Claude Vision load failed: {e}")
+                    logger.info(f"   [BACKGROUND] Claude Vision not loaded: {e}")
                     return None
 
             vision_proxy = ai_manager.register_model(

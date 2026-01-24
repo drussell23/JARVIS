@@ -681,14 +681,16 @@ async def _initialize_v85_jprime_components() -> None:
             if _jprime_fallback_chain:
                 logger.info("[CodingCouncilStartup] ✅ Multi-Model Fallback Chain ready")
         else:
-            logger.warning("[CodingCouncilStartup] J-Prime not available (no local model loaded)")
+            # v109.2: J-Prime without local model is expected in cloud mode - use INFO
+            logger.info("[CodingCouncilStartup] ℹ️  J-Prime using cloud API (no local model)")
             _jprime_engine = None
 
     except ImportError as e:
         logger.debug(f"[CodingCouncilStartup] J-Prime adapter not available: {e}")
         _jprime_engine = None
     except Exception as e:
-        logger.warning(f"[CodingCouncilStartup] J-Prime init failed: {e}")
+        # v109.2: J-Prime init failures during startup are expected
+        logger.info(f"[CodingCouncilStartup] ℹ️  J-Prime not loaded: {e}")
         _jprime_engine = None
 
     # Log summary

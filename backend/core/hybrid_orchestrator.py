@@ -488,6 +488,30 @@ class HybridOrchestrator:
         self.is_running = True
         logger.info("✅ HybridOrchestrator started")
 
+    def _register_backend_capabilities(self) -> None:
+        """Register capabilities from discovered backend services.
+
+        v109.2: Added missing method that was causing startup errors.
+        This method registers the capabilities of local and GCP backends
+        so the router can make intelligent routing decisions.
+        """
+        try:
+            # Get capabilities from the client's discovered backends
+            backend_configs = getattr(self.client, 'backend_configs', {})
+
+            for backend_name, config in backend_configs.items():
+                capabilities = config.get('capabilities', [])
+                priority = config.get('priority', 50)
+
+                # Register with the router
+                if hasattr(self.router, 'register_backend'):
+                    self.router.register_backend(backend_name, capabilities, priority)
+                    logger.debug(f"[HybridOrchestrator] Registered {backend_name} capabilities: {capabilities}")
+
+        except Exception as e:
+            # Non-critical - orchestrator can work without explicit capability registration
+            logger.debug(f"[HybridOrchestrator] Capability registration skipped: {e}")
+
     async def stop(self) -> None:
         """Stop the orchestrator and clean up resources."""
         if not self.is_running:

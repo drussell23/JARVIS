@@ -994,16 +994,23 @@ class ClaudeVisionAnalyzer:
                 # Try to get existing instance first
                 self.ocr_strategy_manager = get_ocr_strategy_manager()
                 if not self.ocr_strategy_manager:
-                    # Initialize with Claude API client
+                    # v109.2: Fixed API - use anthropic_api_key instead of api_client
+                    # Get API key from environment or existing client
+                    import os
+                    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+                    if not api_key and hasattr(self, 'client') and self.client:
+                        api_key = getattr(self.client, 'api_key', None) or ""
+
                     self.ocr_strategy_manager = initialize_ocr_strategy_manager(
-                        api_client=self.client,
+                        anthropic_api_key=api_key if api_key else None,
                         cache_ttl=300.0,  # 5 minutes
                         max_cache_entries=200,
                         enable_error_matrix=True
                     )
                 logger.info("✅ OCR Strategy Manager available for intelligent OCR with fallbacks")
             except Exception as e:
-                logger.warning(f"Failed to initialize OCR Strategy Manager: {e}")
+                # v109.2: Optional feature - demote to INFO
+                logger.info(f"ℹ️  OCR Strategy Manager not initialized: {e}")
 
         # Initialize components based on config
         self.cache = (

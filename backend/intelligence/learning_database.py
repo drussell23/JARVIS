@@ -2391,15 +2391,17 @@ class JARVISLearningDatabase:
                     self.db = await create_sqlite_connection(str(self.sqlite_path))
 
             except asyncio.TimeoutError:
-                logger.warning(
+                # v109.2: Timeout during startup is expected - use INFO not WARNING
+                logger.info(
                     "⏱️  Cloud SQL adapter initialization timeout (15s exceeded)\n"
-                    "   → Falling back to local SQLite"
+                    "   → Falling back to local SQLite (proxy may still be starting)"
                 )
                 # Use centralized connection factory with proper concurrency settings
                 self.db = await create_sqlite_connection(str(self.sqlite_path))
 
             except Exception as e:
-                logger.warning(f"⚠️  Cloud SQL adapter failed: {e}")
+                # v109.2: Cloud SQL failures during startup are expected
+                logger.info(f"ℹ️  Cloud SQL adapter not ready: {e}")
                 logger.info("📂 Falling back to SQLite")
                 # Use centralized connection factory with proper concurrency settings
                 self.db = await create_sqlite_connection(str(self.sqlite_path))
@@ -3437,17 +3439,19 @@ class JARVISLearningDatabase:
                 )
 
             except asyncio.TimeoutError:
-                logger.warning(
+                # v109.2: Timeout during startup is expected - use INFO
+                logger.info(
                     "⏱️  Cloud Database Adapter initialization timeout (15s exceeded)\n"
-                    "   This usually means Cloud SQL proxy isn't running.\n"
+                    "   Cloud SQL proxy may still be starting.\n"
                     "   → Falling back to SQLite-only storage"
                 )
                 self.cloud_adapter = None
                 return
 
             except Exception as init_error:
-                logger.warning(
-                    f"⚠️  Cloud Database Adapter initialization failed: {init_error}\n"
+                # v109.2: Cloud SQL failures during startup are expected
+                logger.info(
+                    f"ℹ️  Cloud Database Adapter not ready: {init_error}\n"
                     f"   → Falling back to SQLite-only storage"
                 )
                 self.cloud_adapter = None

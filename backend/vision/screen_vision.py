@@ -109,20 +109,27 @@ class ScreenVisionSystem:
         self.ocr_strategy_manager = None
         if OCR_STRATEGY_AVAILABLE and self.claude_analyzer:
             try:
-                # Get Claude API client from analyzer if available
-                client = getattr(self.claude_analyzer, 'client', None)
-                if client:
-                    self.ocr_strategy_manager = get_ocr_strategy_manager()
-                    if not self.ocr_strategy_manager:
-                        self.ocr_strategy_manager = initialize_ocr_strategy_manager(
-                            api_client=client,
-                            cache_ttl=300.0,  # 5 minutes
-                            max_cache_entries=200,
-                            enable_error_matrix=True
-                        )
-                    logger.info("✅ OCR Strategy Manager initialized for intelligent OCR")
+                # v109.2: Fixed API - use anthropic_api_key instead of api_client
+                import os
+                api_key = os.getenv("ANTHROPIC_API_KEY", "")
+                if not api_key:
+                    # Try to get from analyzer's client
+                    client = getattr(self.claude_analyzer, 'client', None)
+                    if client:
+                        api_key = getattr(client, 'api_key', None) or ""
+
+                self.ocr_strategy_manager = get_ocr_strategy_manager()
+                if not self.ocr_strategy_manager:
+                    self.ocr_strategy_manager = initialize_ocr_strategy_manager(
+                        anthropic_api_key=api_key if api_key else None,
+                        cache_ttl=300.0,  # 5 minutes
+                        max_cache_entries=200,
+                        enable_error_matrix=True
+                    )
+                logger.info("✅ OCR Strategy Manager initialized for intelligent OCR")
             except Exception as e:
-                logger.warning(f"Failed to initialize OCR Strategy Manager: {e}")
+                # v109.2: Optional feature - demote to INFO
+                logger.info(f"ℹ️  OCR Strategy Manager not initialized: {e}")
 
     def _initialize_update_patterns(self) -> Dict[str, List[re.Pattern]]:
         """Initialize patterns for detecting software updates"""

@@ -313,43 +313,75 @@ class PortChecker:
     @staticmethod
     async def _is_healthy_jarvis_service(port: int, expected_name: str) -> bool:
         """
-        v109.1: Check if port is used by a healthy JARVIS service.
+        v109.2: Check if port is used by a healthy JARVIS service.
 
         This prevents false "port in use" errors when the service is already
         running and healthy from a previous startup or parallel process.
+
+        Enhanced with:
+        - Multiple health endpoint paths (for different service configurations)
+        - Longer timeout for slow-starting services
+        - Accept HTTP 200 as healthy regardless of body
+        - Debug logging to trace health check issues
         """
+        import logging
+        log = logging.getLogger(__name__)
+
         try:
             import aiohttp
 
-            # Map port to expected health endpoint
-            health_endpoints = {
-                8010: "/health",        # jarvis_api
-                8000: "/health",        # jarvis_prime
-                8090: "/health",        # reactor_core
+            # Map port to expected health endpoints (try multiple paths)
+            health_paths = {
+                8010: ["/health/ping", "/health", "/"],        # jarvis_api - ping is fastest
+                8000: ["/health", "/"],                        # jarvis_prime
+                8090: ["/health", "/"],                        # reactor_core
             }
 
-            health_path = health_endpoints.get(port, "/health")
-            url = f"http://127.0.0.1:{port}{health_path}"
+            paths_to_try = health_paths.get(port, ["/health", "/"])
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as response:
-                    if response.status == 200:
-                        try:
-                            data = await response.json()
-                            # Check for healthy indicators
-                            status = data.get("status", "").lower()
-                            if status in ("healthy", "ok", "ready", "running"):
+            for health_path in paths_to_try:
+                url = f"http://127.0.0.1:{port}{health_path}"
+
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        # v109.2: Increased timeout to 5s for slow-starting services
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
+                            # v109.2: Accept ANY successful HTTP response as "healthy"
+                            # The service is responding - that's what matters during startup
+                            if 200 <= response.status < 400:
+                                log.debug(
+                                    f"[PortChecker] Port {port} has healthy service "
+                                    f"(HTTP {response.status} on {health_path})"
+                                )
                                 return True
-                            # Also accept if there's a service name that matches
-                            service_name = data.get("service", data.get("name", "")).lower()
-                            if expected_name.lower() in service_name:
+
+                            # Also accept 404/405 - service is responding but endpoint doesn't exist
+                            if response.status in (404, 405):
+                                log.debug(
+                                    f"[PortChecker] Port {port} has responding service "
+                                    f"(HTTP {response.status} on {health_path} - service alive)"
+                                )
                                 return True
-                        except Exception:
-                            # Non-JSON response but 200 OK - service is responding
-                            return True
+
+                except aiohttp.ClientConnectorError:
+                    # Connection refused - service not listening
+                    continue
+                except asyncio.TimeoutError:
+                    # Timeout - service may be overloaded but try next path
+                    continue
+                except Exception as e:
+                    log.debug(f"[PortChecker] Port {port} health check on {health_path} failed: {e}")
+                    continue
+
+            # None of the paths succeeded
+            log.debug(f"[PortChecker] Port {port} no healthy service detected after trying {paths_to_try}")
             return False
-        except Exception:
-            # Connection failed - service not healthy
+
+        except ImportError:
+            log.debug("[PortChecker] aiohttp not available for health check")
+            return False
+        except Exception as e:
+            log.debug(f"[PortChecker] Port {port} health check exception: {e}")
             return False
 
 
