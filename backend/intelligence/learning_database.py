@@ -8218,6 +8218,127 @@ class CrossRepoSync:
                 'data': data
             })
 
+    async def trigger_recovery(self, component: str) -> bool:
+        """
+        v109.4: Trigger recovery for a stale/failed component.
+
+        This method provides Trinity-compatible interface for recovery triggering,
+        integrating with the supervisor's restart coordination system.
+
+        Args:
+            component: Name of the component (e.g., 'reactor_core', 'jarvis_prime')
+
+        Returns:
+            True if recovery was initiated successfully
+        """
+        import json
+        from pathlib import Path
+        import time
+
+        self.logger.warning(f"[CrossRepoSync] 🚑 Triggering recovery for {component}...")
+
+        try:
+            # v109.4: Coordinate with supervisor via file-based IPC
+            supervisor_dir = Path.home() / ".jarvis" / "supervisor"
+            supervisor_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write recovery request for supervisor to pick up
+            recovery_request_file = supervisor_dir / "recovery_requests.json"
+
+            # Read existing requests
+            existing_requests = {}
+            if recovery_request_file.exists():
+                try:
+                    existing_requests = json.loads(recovery_request_file.read_text())
+                except Exception:
+                    existing_requests = {}
+
+            # Add our recovery request
+            requests = existing_requests.get("pending", [])
+            request_entry = {
+                "component": component,
+                "requested_at": time.time(),
+                "source": "learning_database_cross_repo_sync",
+                "reason": "staleness_detected",
+            }
+
+            # Avoid duplicate requests (within 60s)
+            duplicate = False
+            for req in requests:
+                if req.get("component") == component:
+                    if time.time() - req.get("requested_at", 0) < 60:
+                        duplicate = True
+                        break
+
+            if not duplicate:
+                requests.append(request_entry)
+
+            # Write back
+            existing_requests["pending"] = requests
+            existing_requests["last_update"] = time.time()
+
+            # Atomic write
+            tmp_file = recovery_request_file.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(existing_requests, indent=2))
+            tmp_file.rename(recovery_request_file)
+
+            self.logger.info(f"[CrossRepoSync] Recovery request written for {component}")
+
+            # v109.4: Also try direct recovery via available clients
+            repo_info = self.repos.get(component)
+            if repo_info and repo_info.get('available'):
+                client = repo_info.get('client')
+                if client:
+                    # Try to trigger reconnection
+                    if hasattr(client, 'reconnect'):
+                        try:
+                            await client.reconnect()
+                            self.logger.info(f"[CrossRepoSync] Reconnection triggered for {component}")
+                            return True
+                        except Exception as e:
+                            self.logger.debug(f"[CrossRepoSync] Reconnection failed: {e}")
+
+                    if hasattr(client, 'health_check'):
+                        try:
+                            healthy = await client.health_check()
+                            if healthy:
+                                self.logger.info(f"[CrossRepoSync] {component} recovered via health check")
+                                return True
+                        except Exception as e:
+                            self.logger.debug(f"[CrossRepoSync] Health check failed: {e}")
+
+            # v109.4: Emit recovery event to Trinity network if available
+            try:
+                from backend.core.coding_council.trinity import CrossRepoSync as TrinitySync
+                # The Trinity version handles the actual restart coordination
+                trinity_sync = TrinitySync()
+                await trinity_sync.trigger_recovery(component)
+            except ImportError:
+                self.logger.debug("[CrossRepoSync] Trinity sync not available for delegation")
+            except Exception as e:
+                self.logger.debug(f"[CrossRepoSync] Trinity delegation failed: {e}")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[CrossRepoSync] Recovery trigger failed for {component}: {e}")
+            return False
+
+    def on_event(self, handler) -> None:
+        """
+        v109.4: Register an event handler for sync events.
+
+        This provides Trinity-compatible interface for event subscription.
+
+        Args:
+            handler: Async function to call on events
+        """
+        # Store handler for future events
+        if not hasattr(self, '_event_handlers'):
+            self._event_handlers = []
+        self._event_handlers.append(handler)
+        self.logger.debug("[CrossRepoSync] Event handler registered")
+
 
 # Global instance with async initialization
 _db_instance = None
