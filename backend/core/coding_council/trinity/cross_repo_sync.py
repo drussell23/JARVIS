@@ -476,6 +476,86 @@ class CrossRepoSync:
             "repos": {r.value: self._repos[r].to_dict() for r in RepoType},
         }
 
+    async def sync_all(self) -> Dict[str, RepoState]:
+        """
+        Force synchronization of all repositories immediately.
+
+        Returns:
+            Dict mapping repo names to their states.
+        """
+        async with self._sync_lock:
+            logger.info("[CrossRepoSync] Forcing full synchronization...")
+
+            # Re-discover to get fresh status
+            await self._discover_repos()
+
+            # Write states
+            for repo_type in RepoType:
+                await self._write_repo_state(repo_type)
+
+            # Return current states
+            return {
+                r.value: self._repos[r]
+                for r in RepoType
+            }
+
+    async def trigger_recovery(self, component: str) -> bool:
+        """
+        Trigger recovery for a failed/stale component.
+
+        Args:
+            component: Name of the component/repo (e.g. 'reactor_core')
+
+        Returns:
+            True if recovery initiation was successful (does not guarantee recovery)
+        """
+        logger.warning(f"[CrossRepoSync] 🚑 Triggering recovery for {component}...")
+
+        # Map component to RepoType
+        repo_type = None
+        try:
+            # Try exact match
+            repo_type = RepoType(component)
+        except ValueError:
+            # Try searching
+            for r in RepoType:
+                if r.value == component or r.name.lower() == component.lower():
+                    repo_type = r
+                    break
+
+        if not repo_type:
+            logger.error(f"[CrossRepoSync] Unknown component for recovery: {component}")
+            return False
+
+        repo = self._repos.get(repo_type)
+        if not repo:
+            return False
+
+        # 1. Update status to reflect recovery mode
+        repo.sync_status = SyncStatus.SYNCING
+        await self._write_repo_state(repo_type)
+
+        # 2. Emit recovery event (Supervisor/HealthMonitor should listen to this)
+        event = SyncEvent(
+            event_type="recovery_triggered",
+            source_repo="coding_council",
+            target_repo=repo_type.value,
+            payload={"reason": "staleness_detected", "timestamp": time.time()}
+        )
+        await self._emit_event(event)
+
+        # 3. Attempt immediate re-discovery (passive recovery)
+        # This handles cases where it was just a temporary network blip
+        await self._discover_repos()
+
+        # 4. If still offline, we rely on the event listeners (Supervisor) to restart the process
+        if not repo.online:
+            logger.info(f"[CrossRepoSync] {component} still offline after discovery, waiting for external recovery...")
+            return True
+
+        logger.info(f"[CrossRepoSync] {component} recovered via passive discovery!")
+        return True
+
     async def graceful_degradation(self, failed_repo: RepoType) -> Dict[str, Any]:
         """
         Handle graceful degradation when a repo fails.

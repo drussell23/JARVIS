@@ -478,6 +478,10 @@ class CodingCouncilTrinityBridge:
             # It uses DEFAULT_PATHS and can be configured via environment variables
             if _is_cross_repo_enabled():
                 self._cross_repo_sync = CrossRepoSync()
+                
+                # Wire up sync events to Trinity network
+                self._cross_repo_sync.on_event(self._on_sync_event)
+                
                 await self._cross_repo_sync.start()
                 logger.info("[CodingCouncilTrinity] CrossRepoSync started")
 
@@ -487,6 +491,35 @@ class CodingCouncilTrinityBridge:
             logger.error(f"[CodingCouncilTrinity] Trinity module init failed: {e}")
             # Graceful degradation - continue without failed modules
             pass
+
+    async def _on_sync_event(self, event: SyncEvent) -> None:
+        """
+        Handle events from CrossRepoSync.
+        
+        This forwards critical sync events (like recovery triggers) to the Trinity network.
+        """
+        try:
+            logger.debug(f"[CodingCouncilTrinity] Sync event: {event.event_type} from {event.source_repo}")
+            
+            # Forward recovery requests to supervisor via MultiTransport
+            if event.event_type == "recovery_triggered":
+                logger.info(f"[CodingCouncilTrinity] Forwarding recovery request for {event.target_repo}")
+                
+                # Send high-priority message
+                if self._multi_transport:
+                    await self._multi_transport.send(
+                        topic="system.recovery",
+                        payload={
+                            "component": event.target_repo,
+                            "reason": event.payload.get("reason", "unknown"),
+                            "timestamp": event.timestamp,
+                            "source": "coding_council"
+                        },
+                        priority=MessagePriority.HIGH
+                    )
+                    
+        except Exception as e:
+            logger.error(f"[CodingCouncilTrinity] Failed to handle sync event: {e}")
 
     async def _shutdown_trinity_modules(self) -> None:
         """Shutdown Trinity modules in reverse order."""
