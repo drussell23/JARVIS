@@ -1035,14 +1035,31 @@ async def create_voice_unlock_adapter(
             except ImportError as e:
                 import_errors.append(f"...voice_unlock.voice_unlock_integration: {e}")
 
-        # Try direct module import as last resort
+        # Try direct import from sys.modules
         if VoiceUnlockIntegration is None:
             try:
-                import importlib
-                mod = importlib.import_module("voice.voice_unlock_integration")
-                VoiceUnlockIntegration = mod.VoiceUnlockIntegration
-            except (ImportError, AttributeError) as e:
-                import_errors.append(f"voice.voice_unlock_integration (direct): {e}")
+                import sys
+                if 'backend.voice.voice_unlock_integration' in sys.modules:
+                    VoiceUnlockIntegration = sys.modules['backend.voice.voice_unlock_integration'].VoiceUnlockIntegration
+                elif 'voice.voice_unlock_integration' in sys.modules:
+                    VoiceUnlockIntegration = sys.modules['voice.voice_unlock_integration'].VoiceUnlockIntegration
+            except (ImportError, AttributeError, KeyError) as e:
+                import_errors.append(f"sys.modules lookup: {e}")
+
+        # Try import with modified path
+        if VoiceUnlockIntegration is None:
+            try:
+                # Add backend to path if needed
+                import sys
+                from pathlib import Path
+                backend_path = str(Path(__file__).parent.parent.parent.parent)
+                if backend_path not in sys.path:
+                    sys.path.append(backend_path)
+                
+                from voice.voice_unlock_integration import VoiceUnlockIntegration as VUI
+                VoiceUnlockIntegration = VUI
+            except ImportError as e:
+                import_errors.append(f"path modification import: {e}")
 
         if VoiceUnlockIntegration is None:
             logger.warning(

@@ -23,8 +23,30 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from intelligence.learning_database import JARVISLearningDatabase
 from voice.speaker_verification_service import SpeakerVerificationService
-from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
 from voice_unlock.services.keychain_service import KeychainService
+
+# Fix for potential circular import or missing module in some environments
+try:
+    from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+except ImportError:
+    # Fallback implementation if module is missing
+    def is_screen_locked() -> bool:
+        """Fallback screen lock check using Quartz via ctypes or shell command."""
+        try:
+            import Quartz
+            session_dict = Quartz.CGSessionCopyCurrentDictionary()
+            return bool(session_dict and session_dict.get("CGSSessionScreenIsLocked", 0))
+        except ImportError:
+            # Shell fallback (slower but works without Quartz)
+            import subprocess
+            try:
+                result = subprocess.run(
+                    'python3 -c "import Quartz; print(Quartz.CGSessionCopyCurrentDictionary().get(\'CGSSessionScreenIsLocked\', 0))"',
+                    shell=True, capture_output=True, text=True
+                )
+                return result.stdout.strip() == "1"
+            except Exception:
+                return False  # Assume unlocked on error to prevent lockout
 
 logger = logging.getLogger(__name__)
 
