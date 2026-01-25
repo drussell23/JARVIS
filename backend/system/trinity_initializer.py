@@ -804,12 +804,36 @@ class TrinityHealthMonitor:
         - Resource exhaustion detection (memory/CPU)
     """
 
-    HEARTBEAT_TIMEOUT = 15.0  # 3 missed heartbeats (5s interval)
+    # v109.4: CRITICAL FIX - Service-specific timeouts for ML-heavy services
+    # jarvis-prime takes 55+ seconds just for ML imports, 2-3 minutes total startup
+    # Previous values (15s/30s) caused race conditions where Trinity restarted
+    # jarvis-prime while it was still initializing, causing port conflicts
+
+    # Per-service heartbeat timeouts (seconds)
+    SERVICE_HEARTBEAT_TIMEOUTS = {
+        "j_prime": 180.0,      # ML model loading takes 2-3 minutes
+        "reactor_core": 120.0,  # AGI initialization takes 1-2 minutes
+        "jarvis_body": 30.0,    # In-process, fast startup
+    }
+
+    # Per-service startup grace periods (seconds)
+    SERVICE_GRACE_PERIODS = {
+        "j_prime": 300.0,       # 5 minutes for full ML initialization
+        "reactor_core": 180.0,  # 3 minutes for AGI setup
+        "jarvis_body": 60.0,    # 1 minute in-process
+    }
+
+    # Default for unknown services
+    HEARTBEAT_TIMEOUT = 60.0  # v109.4: Increased from 15.0
     CHECK_INTERVAL = 5.0
     MAX_RESTART_ATTEMPTS = 5  # v78.1: Increased from 3 to 5
     RESTART_BACKOFF_BASE = 1.5  # v78.1: Reduced from 2.0 to 1.5
     MAX_BACKOFF_SECONDS = 60.0  # v78.1: Cap max backoff at 60 seconds
-    GRACE_PERIOD_SECONDS = 30.0  # v78.1: Grace period before first restart
+    GRACE_PERIOD_SECONDS = 120.0  # v109.4: Increased from 30.0 for ML services
+
+    # v109.4: Restart coordination lock to prevent race conditions
+    _restart_lock: Optional[asyncio.Lock] = None
+    _restart_in_progress: Dict[str, bool] = {}
 
     def __init__(self):
         self._monitoring_task: Optional[asyncio.Task] = None
@@ -832,6 +856,16 @@ class TrinityHealthMonitor:
         # v78.1: Track when we first saw each component (for grace period)
         self._component_first_seen: Dict[str, float] = {}
         self._component_last_healthy: Dict[str, float] = {}
+
+        # v109.4: Restart coordination to prevent race conditions
+        self._restart_lock = asyncio.Lock()
+        self._restart_in_progress: Dict[str, bool] = {
+            "j_prime": False,
+            "reactor_core": False,
+            "jarvis_body": False,
+        }
+        # Track last spawn time to detect "just spawned" services
+        self._last_spawn_time: Dict[str, float] = {}
 
         # Callbacks for restart triggers
         self._restart_callbacks: Dict[str, Any] = {}
@@ -987,19 +1021,48 @@ class TrinityHealthMonitor:
         timestamp = state.get("timestamp", 0)
         age = now - timestamp
 
+        # v109.4: Service-specific heartbeat timeouts
+        # ML-heavy services need MUCH longer timeouts during startup
+        base_timeout = self.SERVICE_HEARTBEAT_TIMEOUTS.get(component, self.HEARTBEAT_TIMEOUT)
+        grace_period = self.SERVICE_GRACE_PERIODS.get(component, self.GRACE_PERIOD_SECONDS)
+
+        # v109.4: Check if service was recently spawned (even more lenient)
+        last_spawn = self._last_spawn_time.get(component, 0)
+        time_since_spawn = now - last_spawn if last_spawn else float('inf')
+        recently_spawned = time_since_spawn < grace_period
+
         # v78.1: Extended timeout during startup grace period
-        effective_timeout = self.HEARTBEAT_TIMEOUT
-        if in_startup_grace:
-            # Allow longer timeout during startup (components may be slow to initialize)
-            effective_timeout = self.GRACE_PERIOD_SECONDS
+        effective_timeout = base_timeout
+        if in_startup_grace or recently_spawned:
+            # Allow MUCH longer timeout during startup (ML services need 2-3 min)
+            effective_timeout = grace_period
+            if recently_spawned:
+                logger.debug(
+                    f"[Trinity] {component} recently spawned ({time_since_spawn:.1f}s ago), "
+                    f"using extended timeout: {effective_timeout}s"
+                )
 
         if age > effective_timeout:
             # v78.1: Log differently based on startup vs normal operation
-            if in_startup_grace:
+            if in_startup_grace or recently_spawned:
                 logger.debug(
-                    f"[Trinity] {component} heartbeat stale ({age:.1f}s) but still in grace period"
+                    f"[Trinity] {component} heartbeat stale ({age:.1f}s) but still in grace period "
+                    f"(timeout: {effective_timeout}s, grace: {grace_period}s)"
                 )
                 self._component_states[component] = "starting"
+                return
+
+            # v109.4: Additional check - verify process is actually dead before declaring DOWN
+            pid = state.get("pid") or self._extract_pid_from_instance_id(
+                state.get("instance_id", "")
+            )
+            if pid and self._is_process_alive(pid):
+                # Process is alive but heartbeat is stale - log warning but don't restart
+                logger.warning(
+                    f"[Trinity] {component} heartbeat stale ({age:.1f}s) but process {pid} is alive "
+                    f"- NOT triggering restart (may be in heavy initialization)"
+                )
+                self._component_states[component] = "degraded"
                 return
 
             await self._handle_component_down(
@@ -1046,72 +1109,264 @@ class TrinityHealthMonitor:
             return False
 
     async def _handle_component_down(self, component: str, reason: str) -> None:
-        """Handle a component being down."""
-        old_state = self._component_states.get(component)
-        self._component_states[component] = "down"
+        """
+        Handle a component being down.
 
-        # Only log once per state transition
-        if old_state != "down":
-            logger.error(f"[Trinity] {component} is DOWN: {reason}")
+        v109.4: Enhanced with restart coordination locking to prevent race conditions
+        where Trinity and Supervisor both try to restart the same component.
+        """
+        # v109.4: Acquire restart lock to coordinate with supervisor
+        # Guard against None (should never happen after __init__)
+        if self._restart_lock is None:
+            self._restart_lock = asyncio.Lock()
 
-        # v78.1: Enhanced circuit breaker with reasonable backoff
-        attempts = self._restart_attempts.get(component, 0)
-        last_restart = self._last_restart_time.get(component, 0)
-        time_since_restart = time.time() - last_restart if last_restart else float('inf')
-
-        if attempts >= self.MAX_RESTART_ATTEMPTS:
-            # Calculate backoff in SECONDS (not minutes!) with a cap
-            raw_backoff = self.RESTART_BACKOFF_BASE ** attempts
-            backoff_seconds = min(raw_backoff, self.MAX_BACKOFF_SECONDS)
-
-            if time_since_restart < backoff_seconds:
-                remaining = backoff_seconds - time_since_restart
-                logger.warning(
-                    f"[Trinity] {component} restart circuit breaker OPEN "
-                    f"(attempts={attempts}/{self.MAX_RESTART_ATTEMPTS}, "
-                    f"retry in {remaining:.0f}s)"
+        async with self._restart_lock:
+            # v109.4: Check if restart is already in progress (by us or supervisor)
+            if self._restart_in_progress.get(component, False):
+                logger.debug(
+                    f"[Trinity] {component} restart already in progress, skipping duplicate trigger"
                 )
                 return
-            else:
-                # Reset attempts after backoff period
-                logger.info(f"[Trinity] {component} circuit breaker RESET after {time_since_restart:.0f}s")
-                self._restart_attempts[component] = 0
-                attempts = 0
 
-        # v78.1: Grace period for new components (don't restart too quickly)
-        if attempts == 0 and time_since_restart < self.GRACE_PERIOD_SECONDS:
-            logger.debug(
-                f"[Trinity] {component} in grace period, {self.GRACE_PERIOD_SECONDS - time_since_restart:.0f}s remaining"
-            )
-            # Still allow first restart attempt, but log it
+            # v109.4: Check supervisor restart state to avoid duplicate restarts
+            if await self._is_supervisor_restarting(component):
+                logger.info(
+                    f"[Trinity] {component} restart already triggered by supervisor, deferring"
+                )
+                self._component_states[component] = "restarting"
+                return
 
-        # Trigger restart if callback registered
-        if component in self._restart_callbacks:
-            await self._trigger_restart(component, reason)
+            old_state = self._component_states.get(component)
+            self._component_states[component] = "down"
+
+            # Only log once per state transition
+            if old_state != "down":
+                logger.error(f"[Trinity] {component} is DOWN: {reason}")
+
+            # v78.1: Enhanced circuit breaker with reasonable backoff
+            attempts = self._restart_attempts.get(component, 0)
+            last_restart = self._last_restart_time.get(component, 0)
+            time_since_restart = time.time() - last_restart if last_restart else float('inf')
+
+            if attempts >= self.MAX_RESTART_ATTEMPTS:
+                # Calculate backoff in SECONDS (not minutes!) with a cap
+                raw_backoff = self.RESTART_BACKOFF_BASE ** attempts
+                backoff_seconds = min(raw_backoff, self.MAX_BACKOFF_SECONDS)
+
+                if time_since_restart < backoff_seconds:
+                    remaining = backoff_seconds - time_since_restart
+                    logger.warning(
+                        f"[Trinity] {component} restart circuit breaker OPEN "
+                        f"(attempts={attempts}/{self.MAX_RESTART_ATTEMPTS}, "
+                        f"retry in {remaining:.0f}s)"
+                    )
+                    return
+                else:
+                    # Reset attempts after backoff period
+                    logger.info(f"[Trinity] {component} circuit breaker RESET after {time_since_restart:.0f}s")
+                    self._restart_attempts[component] = 0
+                    attempts = 0
+
+            # v109.4: Use service-specific grace periods
+            grace_period = self.SERVICE_GRACE_PERIODS.get(component, self.GRACE_PERIOD_SECONDS)
+
+            # v78.1: Grace period for new components (don't restart too quickly)
+            if attempts == 0 and time_since_restart < grace_period:
+                logger.debug(
+                    f"[Trinity] {component} in grace period, {grace_period - time_since_restart:.0f}s remaining"
+                )
+                # Still allow first restart attempt, but log it
+
+            # v109.4: Final pre-restart validation - verify process is truly dead
+            if not await self._verify_process_dead(component):
+                logger.info(
+                    f"[Trinity] {component} process still alive, deferring restart (reason was: {reason})"
+                )
+                self._component_states[component] = "degraded"
+                return
+
+            # Trigger restart if callback registered
+            if component in self._restart_callbacks:
+                await self._trigger_restart(component, reason)
+
+    async def _is_supervisor_restarting(self, component: str) -> bool:
+        """
+        v109.4: Check if the supervisor is already restarting this component.
+
+        This prevents race conditions where both Trinity and Supervisor
+        try to restart the same service simultaneously.
+        """
+        try:
+            # Check supervisor's restart state file
+            restart_state_file = Path.home() / ".jarvis" / "supervisor" / "restart_state.json"
+            if not restart_state_file.exists():
+                return False
+
+            state = read_json_safe(restart_state_file)
+            if not state:
+                return False
+
+            # Map component names
+            component_map = {
+                "j_prime": "jarvis-prime",
+                "reactor_core": "reactor-core",
+                "jarvis_body": "jarvis-body",
+            }
+            service_name = component_map.get(component, component)
+
+            # Check if supervisor is restarting this service
+            restarting_services = state.get("restarting", [])
+            return service_name in restarting_services
+
+        except Exception as e:
+            logger.debug(f"[Trinity] Could not check supervisor restart state: {e}")
+            return False
+
+    async def _verify_process_dead(self, component: str) -> bool:
+        """
+        v109.4: Verify that a component's process is actually dead before restarting.
+
+        This prevents race conditions where we restart a process that's still
+        alive but just slow to respond (e.g., ML model loading).
+
+        Returns:
+            True if process is confirmed dead (safe to restart)
+            False if process is still alive
+        """
+        try:
+            # Read the component's state file to get PID
+            components_dir = Path.home() / ".jarvis" / "trinity" / "components"
+            state_file = components_dir / f"{component}.json"
+
+            if not state_file.exists():
+                return True  # No state file = process never started or cleaned up
+
+            state = read_json_safe(state_file)
+            if not state:
+                return True  # Corrupted state = assume dead
+
+            # Try to get PID from state
+            pid = state.get("pid") or state.get("metrics", {}).get("pid")
+            if not pid:
+                # Try to extract from instance_id
+                instance_id = state.get("instance_id", "")
+                pid = self._extract_pid_from_instance_id(instance_id)
+
+            if not pid:
+                return True  # No PID = can't verify, assume dead
+
+            # Check if process is alive
+            if self._is_process_alive(pid):
+                logger.debug(f"[Trinity] {component} PID {pid} is still alive")
+                return False
+
+            logger.debug(f"[Trinity] {component} PID {pid} confirmed dead")
+            return True
+
+        except Exception as e:
+            logger.debug(f"[Trinity] Process verification error for {component}: {e}")
+            return True  # On error, assume dead to allow restart
 
     async def _trigger_restart(self, component: str, reason: str) -> None:
-        """Trigger component restart via callback."""
-        self._component_states[component] = "restarting"
-        self._restart_attempts[component] = self._restart_attempts.get(component, 0) + 1
-        self._last_restart_time[component] = time.time()
-        self._components_restarted += 1
+        """
+        Trigger component restart via callback.
 
-        # v78.1: Reset first-seen time to give restarted component a fresh grace period
-        self._component_first_seen[component] = time.time()
-
-        logger.info(
-            f"[Trinity] Triggering {component} restart "
-            f"(attempt {self._restart_attempts[component]}/{self.MAX_RESTART_ATTEMPTS})"
-        )
+        v109.4: Enhanced with restart coordination to prevent race conditions
+        with supervisor and concurrent restart attempts.
+        """
+        # v109.4: Mark restart as in progress (lock should already be held)
+        self._restart_in_progress[component] = True
 
         try:
-            callback = self._restart_callbacks[component]
-            if asyncio.iscoroutinefunction(callback):
-                await callback(reason)
-            else:
-                callback(reason)
+            self._component_states[component] = "restarting"
+            self._restart_attempts[component] = self._restart_attempts.get(component, 0) + 1
+            self._last_restart_time[component] = time.time()
+            self._components_restarted += 1
+
+            # v78.1: Reset first-seen time to give restarted component a fresh grace period
+            self._component_first_seen[component] = time.time()
+
+            # v109.4: Update spawn time for extended timeout during restart
+            self._last_spawn_time[component] = time.time()
+
+            logger.info(
+                f"[Trinity] Triggering {component} restart "
+                f"(attempt {self._restart_attempts[component]}/{self.MAX_RESTART_ATTEMPTS})"
+            )
+
+            # v109.4: Notify supervisor that Trinity is initiating a restart
+            await self._notify_supervisor_restart(component, reason)
+
+            try:
+                callback = self._restart_callbacks[component]
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(reason)
+                else:
+                    callback(reason)
+
+                logger.info(f"[Trinity] {component} restart callback completed")
+
+            except Exception as e:
+                logger.error(f"[Trinity] Restart callback failed for {component}: {e}")
+                self._component_states[component] = "down"
+
+        finally:
+            # v109.4: Clear restart in progress flag after a delay
+            # (allow time for the service to start binding ports)
+            grace_period = self.SERVICE_GRACE_PERIODS.get(component, self.GRACE_PERIOD_SECONDS)
+            asyncio.create_task(self._clear_restart_flag_delayed(component, grace_period))
+
+    async def _clear_restart_flag_delayed(self, component: str, delay: float) -> None:
+        """
+        v109.4: Clear restart in progress flag after delay.
+
+        This allows time for the service to actually start up before
+        we consider allowing another restart attempt.
+        """
+        try:
+            await asyncio.sleep(delay)
+            self._restart_in_progress[component] = False
+            logger.debug(f"[Trinity] {component} restart coordination flag cleared")
+        except asyncio.CancelledError:
+            self._restart_in_progress[component] = False
+
+    async def _notify_supervisor_restart(self, component: str, reason: str) -> None:
+        """
+        v109.4: Notify supervisor that Trinity is initiating a restart.
+
+        This prevents the supervisor from also trying to restart the same
+        service, which would cause port conflicts.
+        """
+        try:
+            # Map component names to supervisor service names
+            component_map = {
+                "j_prime": "jarvis-prime",
+                "reactor_core": "reactor-core",
+                "jarvis_body": "jarvis-body",
+            }
+            service_name = component_map.get(component, component)
+
+            # Write restart notification to supervisor's coordination directory
+            supervisor_dir = Path.home() / ".jarvis" / "supervisor"
+            supervisor_dir.mkdir(parents=True, exist_ok=True)
+
+            restart_file = supervisor_dir / "trinity_restart_notify.json"
+
+            notification = {
+                "service": service_name,
+                "component": component,
+                "reason": reason,
+                "timestamp": time.time(),
+                "trinity_restart_attempt": self._restart_attempts.get(component, 1),
+                "message": f"Trinity initiating restart for {service_name}",
+            }
+
+            write_json_atomic(restart_file, notification)
+            logger.debug(f"[Trinity] Notified supervisor of {component} restart")
+
         except Exception as e:
-            logger.error(f"[Trinity] Restart callback failed for {component}: {e}")
+            logger.debug(f"[Trinity] Could not notify supervisor: {e}")
+            # Not critical - continue with restart anyway
 
     def add_to_dead_letter_queue(self, command: Dict[str, Any], reason: str) -> None:
         """Add a failed command to the dead letter queue."""

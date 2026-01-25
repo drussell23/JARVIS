@@ -275,6 +275,20 @@ class OrchestratorConfig:
     health_check_timeout: float = field(
         default_factory=lambda: float(os.getenv("HEALTH_CHECK_TIMEOUT", "5.0"))
     )
+    # v112.0: Adaptive Health Check Timeouts
+    # During startup (first 5 mins), allow longer timeouts for heavy initialization
+    startup_health_check_timeout: float = field(
+        default_factory=lambda: float(os.getenv("STARTUP_HEALTH_CHECK_TIMEOUT", "30.0"))
+    )
+    # Normal operation timeout (fast fail)
+    normal_health_check_timeout: float = field(
+        default_factory=lambda: float(os.getenv("NORMAL_HEALTH_CHECK_TIMEOUT", "5.0"))
+    )
+    # Startup phase duration (how long to use startup timeout)
+    startup_phase_duration: float = field(
+        default_factory=lambda: float(os.getenv("STARTUP_PHASE_DURATION", "300.0"))
+    )
+
     # v93.0: Default startup timeout (applies to lightweight services)
     startup_timeout: float = field(
         default_factory=lambda: float(os.getenv("SERVICE_STARTUP_TIMEOUT", "60.0"))
@@ -2496,6 +2510,8 @@ class ManagedProcess:
     status: ServiceStatus = ServiceStatus.PENDING
     restart_count: int = 0
     last_restart: float = 0.0
+    # v112.0: Track actual start time for adaptive timeouts
+    start_time: float = 0.0
     last_health_check: float = 0.0
     consecutive_failures: int = 0
 
@@ -3343,7 +3359,7 @@ class ProcessOrchestrator:
                 f"[v108.2] 📋 CRASH CONTEXT for {service_name}:\n"
                 f"  Last {len(output_lines)} output lines before crash:\n" +
                 "\n".join(f"    | {line}" for line in output_lines[-10:])
-            )
+        )
 
         # Check circuit breaker
         if self._should_circuit_break(service_name):
@@ -9080,6 +9096,7 @@ echo "=== JARVIS Prime started ==="
     async def _check_health_detailed(
         self,
         managed: ManagedProcess,
+        timeout: Optional[float] = None,  # v112.0: Allow overriding timeout
     ) -> HealthCheckResult:
         """
         v109.1: Enterprise-grade health check with nuanced state tracking.
@@ -9102,7 +9119,8 @@ echo "=== JARVIS Prime started ==="
             session = await self._get_http_session()
             async with session.get(
                 url,
-                timeout=aiohttp.ClientTimeout(total=self.config.health_check_timeout)
+                # v112.0: Use provided timeout or default from config
+                timeout=aiohttp.ClientTimeout(total=timeout or self.config.health_check_timeout)
             ) as response:
                 if response.status != 200:
                     return HealthCheckResult(
@@ -9241,10 +9259,11 @@ echo "=== JARVIS Prime started ==="
                     )
 
         except asyncio.TimeoutError:
+            used_timeout = timeout or self.config.health_check_timeout
             return HealthCheckResult(
                 state=HealthState.TIMEOUT,
                 is_responding=False,
-                error_message=f"Timeout after {self.config.health_check_timeout}s"
+                error_message=f"Timeout after {used_timeout}s"
             )
         except aiohttp.ClientConnectorError as e:
             return HealthCheckResult(
@@ -9408,8 +9427,14 @@ echo "=== JARVIS Prime started ==="
                         )
                         return
 
+                # v112.0: Adaptive timeout based on startup phase
+                # Use max(0, ...) to handle potential system clock skew
+                time_since_start = max(0.0, time.time() - managed.start_time)
+                is_startup = time_since_start < self.config.startup_phase_duration
+                current_timeout = self.config.startup_health_check_timeout if is_startup else self.config.normal_health_check_timeout
+
                 # v109.1: HTTP health check with nuanced state tracking
-                health_result = await self._check_health_detailed(managed)
+                health_result = await self._check_health_detailed(managed, timeout=current_timeout)
                 managed.last_health_check = time.time()
 
                 if health_result.is_healthy:
@@ -9666,6 +9691,12 @@ echo "=== JARVIS Prime started ==="
                 # Send heartbeat to registry
                 if self.registry:
                     try:
+                        # v112.0: Adaptive timeout based on startup phase
+                        # Use max(0, ...) to handle potential system clock skew
+                        time_since_start = max(0.0, time.time() - managed.start_time)
+                        is_startup = time_since_start < self.config.startup_phase_duration
+                        current_timeout = self.config.startup_health_check_timeout if is_startup else self.config.normal_health_check_timeout
+
                         await asyncio.wait_for(
                             self.registry.heartbeat(
                                 service_name,
@@ -9680,7 +9711,7 @@ echo "=== JARVIS Prime started ==="
                                     "file_heartbeat_status": file_heartbeat_status,
                                 }
                             ),
-                            timeout=5.0  # Don't block on slow registry
+                            timeout=current_timeout  # v112.0: Use adaptive timeout
                         )
                         managed.last_heartbeat_sent = time.time()
                         logger.debug(
@@ -9689,7 +9720,7 @@ echo "=== JARVIS Prime started ==="
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
-                            f"[v95.0] Heartbeat timeout for {service_name} (non-fatal)"
+                            f"[v95.0] Heartbeat timeout for {service_name} (non-fatal, timeout={current_timeout}s)"
                         )
                     except Exception as hb_err:
                         logger.warning(
@@ -10864,6 +10895,8 @@ echo "=== JARVIS Prime started ==="
 
             managed.pid = managed.process.pid
             managed.port = definition.default_port  # May be updated by registry discovery
+            # v112.0: Track start time for adaptive timeouts
+            managed.start_time = time.time()
 
             logger.info(f"📋 {definition.name} spawned with PID {managed.pid}")
 
@@ -10933,6 +10966,9 @@ echo "=== JARVIS Prime started ==="
                     self._heartbeat_loop(managed)
                 )
                 managed.last_known_health = "healthy"
+
+                # v109.4: Clear Trinity restart notification now that service is healthy
+                await self._clear_trinity_restart_notification(definition.name)
 
                 return True
             else:
@@ -11106,6 +11142,128 @@ echo "=== JARVIS Prime started ==="
                 )
         except ImportError:
             pass
+
+        # 4. v109.4: Notify TrinityHealthMonitor that supervisor is spawning this service
+        # This prevents Trinity from triggering a concurrent restart
+        try:
+            await self._notify_trinity_spawn(service_name, component_type, pid, startup_time)
+        except Exception as e:
+            logger.debug(f"[v109.4] Failed to notify Trinity of spawn: {e}")
+
+    async def _notify_trinity_spawn(
+        self,
+        service_name: str,
+        component_type: str,
+        pid: int,
+        startup_time: float
+    ) -> None:
+        """
+        v109.4: Notify Trinity that supervisor is spawning/has spawned a service.
+
+        This prevents the race condition where:
+        1. Supervisor starts spawning a service
+        2. Trinity detects the service is down and triggers its own restart
+        3. Both try to start the service, causing port conflicts
+
+        Trinity will read this notification and defer to the supervisor.
+        """
+        import json
+
+        supervisor_dir = Path.home() / ".jarvis" / "supervisor"
+        supervisor_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write restart state for Trinity to read
+        restart_state_file = supervisor_dir / "restart_state.json"
+
+        # Read existing state
+        existing = {}
+        if restart_state_file.exists():
+            try:
+                existing = json.loads(restart_state_file.read_text())
+            except Exception:
+                existing = {}
+
+        # Update restarting services list
+        restarting_services = existing.get("restarting", [])
+        if service_name not in restarting_services:
+            restarting_services.append(service_name)
+
+        # Update spawn timestamps (for Trinity to know when we spawned)
+        spawn_timestamps = existing.get("spawn_timestamps", {})
+        spawn_timestamps[service_name] = startup_time
+
+        # Update PIDs
+        active_pids = existing.get("active_pids", {})
+        active_pids[service_name] = pid
+
+        # Write updated state
+        state = {
+            "restarting": restarting_services,
+            "spawn_timestamps": spawn_timestamps,
+            "active_pids": active_pids,
+            "last_update": time.time(),
+        }
+
+        # Atomic write
+        tmp_file = restart_state_file.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(state, indent=2))
+        tmp_file.rename(restart_state_file)
+
+        logger.debug(f"[v109.4] Notified Trinity of {service_name} spawn (PID {pid})")
+
+        # Also write spawn time to Trinity's component directory for direct access
+        try:
+            trinity_components_dir = Path.home() / ".jarvis" / "trinity" / "components"
+            trinity_components_dir.mkdir(parents=True, exist_ok=True)
+
+            spawn_file = trinity_components_dir / f"{component_type}_spawn.json"
+            spawn_data = {
+                "service_name": service_name,
+                "component_type": component_type,
+                "spawn_time": startup_time,
+                "pid": pid,
+                "supervisor_spawned": True,
+            }
+            tmp_spawn = spawn_file.with_suffix(".tmp")
+            tmp_spawn.write_text(json.dumps(spawn_data, indent=2))
+            tmp_spawn.rename(spawn_file)
+        except Exception:
+            pass  # Not critical
+
+    async def _clear_trinity_restart_notification(self, service_name: str) -> None:
+        """
+        v109.4: Clear Trinity restart notification after service is healthy.
+
+        Called after a service successfully starts and is healthy to allow
+        Trinity to resume normal monitoring.
+        """
+        import json
+
+        supervisor_dir = Path.home() / ".jarvis" / "supervisor"
+        restart_state_file = supervisor_dir / "restart_state.json"
+
+        if not restart_state_file.exists():
+            return
+
+        try:
+            state = json.loads(restart_state_file.read_text())
+
+            # Remove from restarting list
+            restarting = state.get("restarting", [])
+            if service_name in restarting:
+                restarting.remove(service_name)
+                state["restarting"] = restarting
+                state["last_update"] = time.time()
+
+                # Atomic write
+                tmp_file = restart_state_file.with_suffix(".tmp")
+                tmp_file.write_text(json.dumps(state, indent=2))
+                tmp_file.rename(restart_state_file)
+
+                logger.debug(f"[v109.4] Cleared Trinity restart notification for {service_name}")
+
+        except Exception as e:
+            logger.debug(f"[v109.4] Failed to clear Trinity notification: {e}")
 
     async def _wait_for_health(
         self,
