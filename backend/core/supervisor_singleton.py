@@ -2001,7 +2001,41 @@ def _setup_sighup_handler() -> None:
         except Exception as e:
             logger.debug(f"IPC socket cleanup warning: {e}")
 
-        # Step 4: Restart via execv - this REPLACES the process (atexit NOT called)
+        # Step 4: v109.5: Kill Trinity subprocesses before restart
+        # Without this, J-Prime/Reactor-Core will still be running after execv,
+        # causing "address already in use" errors when new supervisor tries to launch them.
+        try:
+            import psutil
+            current_pid = os.getpid()
+            current_proc = psutil.Process(current_pid)
+            children = current_proc.children(recursive=True)
+            if children:
+                logger.info(f"[Singleton] Terminating {len(children)} child process(es) before restart")
+                for child in children:
+                    try:
+                        child.terminate()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                # Wait briefly for graceful termination
+                _, alive = psutil.wait_procs(children, timeout=3.0)
+                # Force kill any survivors
+                for proc in alive:
+                    try:
+                        logger.debug(f"[Singleton] Force killing stubborn process PID {proc.pid}")
+                        proc.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+        except ImportError:
+            # psutil not available - try basic approach
+            try:
+                import subprocess
+                subprocess.run(['pkill', '-P', str(os.getpid())], timeout=5, capture_output=True)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"Child process cleanup warning: {e}")
+
+        # Step 5: Restart via execv - this REPLACES the process (atexit NOT called)
         python = sys.executable
         args = [python] + sys.argv
         logger.info(f"[Singleton] Executing: {' '.join(args[:5])}...")

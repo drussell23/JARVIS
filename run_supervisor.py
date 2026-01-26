@@ -7049,11 +7049,23 @@ class SupervisorBootstrapper:
                 )
 
             # v72.0: Auto-Launch Trinity Components (J-Prime + Reactor-Core)
+            # v109.5: Use Trinity's configured timeout to avoid timeout hierarchy conflict.
+            # The internal launch_timeout_sec is 120s by default; using 60s here caused
+            # the outer timeout to kill the inner operation mid-flight.
             if self._trinity_enabled and self._trinity_auto_launch_enabled:
+                # Get Trinity config to use its timeout
+                try:
+                    trinity_config = get_trinity_config()
+                    # Add buffer for retry logic and health checks
+                    trinity_timeout = trinity_config.launch_timeout_sec + 30.0
+                except Exception:
+                    # Fallback to generous timeout if config unavailable
+                    trinity_timeout = 150.0
+
                 await self._safe_phase_init(
                     "Trinity Components Launch",
                     self._launch_trinity_components(),
-                    timeout_seconds=major_init_timeout,
+                    timeout_seconds=trinity_timeout,
                 )
 
             # v77.0: Initialize Unified Coding Council (Self-Evolution Framework)
@@ -19327,7 +19339,33 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         - Heartbeat-based detection with multiple file patterns
         - Atomic log file rotation
         - v90.0: PID-validated heartbeat checking via TrueHeartbeat
+        - v109.5: Process-based double-launch prevention
         """
+        # v109.5: Check if J-Prime process is already running (prevents double-launch during retry)
+        # This is CRITICAL to avoid "address already in use" errors during retry logic
+        if self._jprime_orchestrator_process is not None:
+            try:
+                # Check if the process is still running
+                return_code = self._jprime_orchestrator_process.returncode
+                if return_code is None:
+                    # Process is still running - don't double-launch
+                    self.logger.info(
+                        f"   🧠 [v109.5] J-Prime already launched by this session "
+                        f"(PID: {self._jprime_orchestrator_process.pid})"
+                    )
+                    return self._jprime_orchestrator_process
+                else:
+                    # Process has exited - clear reference so we can relaunch
+                    self.logger.info(
+                        f"   🔄 [v109.5] Previous J-Prime exited (code={return_code}), "
+                        f"preparing to relaunch"
+                    )
+                    self._jprime_orchestrator_process = None
+            except Exception as e:
+                self.logger.debug(f"   [v109.5] J-Prime process check error: {e}")
+                # Clear reference on error - safer to allow relaunch
+                self._jprime_orchestrator_process = None
+
         # v90.0: Use TrueHeartbeat for PID-validated heartbeat checking
         # This fixes Issues #3 (Heartbeat Staleness) and #4 (Missing PID Validation)
         if _SYSTEM_PRIMITIVES_AVAILABLE and TrueHeartbeat is not None:
@@ -19564,7 +19602,29 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         - Heartbeat-based detection
         - Atomic log file rotation
         - v90.0: PID-validated heartbeat checking via TrueHeartbeat
+        - v109.5: Process-based double-launch prevention
         """
+        # v109.5: Check if Reactor-Core process is already running (prevents double-launch)
+        if self._reactor_core_orchestrator_process is not None:
+            try:
+                return_code = self._reactor_core_orchestrator_process.returncode
+                if return_code is None:
+                    # Process is still running - don't double-launch
+                    self.logger.info(
+                        f"   ⚡ [v109.5] Reactor-Core already launched by this session "
+                        f"(PID: {self._reactor_core_orchestrator_process.pid})"
+                    )
+                    return self._reactor_core_orchestrator_process
+                else:
+                    self.logger.info(
+                        f"   🔄 [v109.5] Previous Reactor-Core exited (code={return_code}), "
+                        f"preparing to relaunch"
+                    )
+                    self._reactor_core_orchestrator_process = None
+            except Exception as e:
+                self.logger.debug(f"   [v109.5] Reactor-Core process check error: {e}")
+                self._reactor_core_orchestrator_process = None
+
         # v90.0: Use TrueHeartbeat for PID-validated heartbeat checking
         if _SYSTEM_PRIMITIVES_AVAILABLE and TrueHeartbeat is not None:
             heartbeat = TrueHeartbeat("reactor_core")
