@@ -576,10 +576,10 @@ class YabaiSpatialIntelligence:
         """Scan entire workspace state"""
         try:
             # Query all Spaces
-            spaces_data = await self._query_spaces()
+            spaces_data = await self._query_spaces() or []
 
             # Query all windows
-            windows_data = await self._query_windows()
+            windows_data = await self._query_windows() or []
 
             # Build SpaceInfo objects
             new_spaces = {}
@@ -760,7 +760,7 @@ class YabaiSpatialIntelligence:
                     )
                     return []
 
-
+        return []
 
     async def _query_windows(self) -> List[Dict]:
         """
@@ -861,7 +861,7 @@ class YabaiSpatialIntelligence:
                     logger.debug("[YABAI-SI] Unable to parse yabai windows output")
                     return []
 
-
+        return []
 
     async def _handle_space_transition(self, from_space: int, to_space: int):
         """Handle Space transition"""
