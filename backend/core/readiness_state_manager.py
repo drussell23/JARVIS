@@ -527,7 +527,7 @@ class ReadinessStateManager:
 
             logger.info(
                 f"[ReadinessStateManager] Component ready: {name} "
-                f"(init_time={comp.initialization_time_ms:.0f}ms)"
+                f"(init_time={comp.initialization_time_ms or 0:.0f}ms)"
             )
 
             # Check if all critical components are ready -> system ready
