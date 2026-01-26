@@ -11,7 +11,7 @@ pydantic>=2.0.0
 # Pinned versions for compatibility:
 # - torchaudio 2.2+ removed list_audio_backends() that speechbrain uses
 # - huggingface_hub 0.22+ removed use_auth_token that speechbrain 1.0.0 uses
-torch==2.1.2
+torch==2.10.0
 torchaudio==2.1.2
 speechbrain==1.0.0
 huggingface_hub>=0.20.0,<0.22.0
