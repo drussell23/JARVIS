@@ -503,8 +503,8 @@ class CrossRepoSync:
         """
         Trigger recovery for a failed/stale component.
         
-        v93.1: Added intelligent backoff to prevent recovery storms.
-        Recovery attempts for the same component are throttled to once per 30 seconds.
+        v93.2: Enhanced with exponential backoff and max retry limits.
+        Prevents log spam and resource exhaustion during persistent failures.
 
         Args:
             component: Name of the component/repo (e.g. 'reactor_core')
@@ -518,25 +518,57 @@ class CrossRepoSync:
         if not hasattr(self, '_recovery_counts'):
             self._recovery_counts: Dict[str, int] = {}
         
-        # Check for recovery backoff (30 seconds between attempts)
-        RECOVERY_BACKOFF = 30.0
+        attempt_count = self._recovery_counts.get(component, 0)
+        
+        # Check for persistent failure (circuit breaker pattern)
+        MAX_RETRIES = 5
+        if attempt_count >= MAX_RETRIES:
+            # Only log this once per max-retry cycle to avoid spam, but we'll check fairly often
+            # We assume separate logic clears the count if it eventually comes back
+            logger.warning(
+                f"[CrossRepoSync] 🛑 Max recovery attempts ({MAX_RETRIES}) reached for {component}. "
+                f"Marking as DEGRADED and stopping auto-recovery."
+            )
+            
+            # Map component to RepoType to mark as DEGRADED
+            repo_type = None
+            for r in RepoType:
+                if r.value == component or r.name.lower() == component.lower():
+                    repo_type = r
+                    break
+            
+            if repo_type:
+                repo = self._repos.get(repo_type)
+                if repo:
+                    repo.sync_status = SyncStatus.DEGRADED
+                    await self._write_repo_state(repo_type)
+            
+            return False
+
+        # Exponential Backoff: 30s * (1.5 ^ attempt)
+        # Attempt 0: 30s
+        # Attempt 1: 45s
+        # Attempt 2: 67.5s
+        # ...
+        RECOVERY_BACKOFF = 30.0 * (1.5 ** attempt_count)
         last_attempt = self._recovery_attempts.get(component, 0)
         time_since_last = time.time() - last_attempt
         
         if time_since_last < RECOVERY_BACKOFF:
             logger.debug(
                 f"[CrossRepoSync] Skipping recovery for {component} "
-                f"(in backoff, {RECOVERY_BACKOFF - time_since_last:.1f}s remaining)"
+                f"(backoff: {time_since_last:.1f}s/{RECOVERY_BACKOFF:.1f}s, attempt {attempt_count})"
             )
             return False
         
         # Track this attempt
         self._recovery_attempts[component] = time.time()
-        self._recovery_counts[component] = self._recovery_counts.get(component, 0) + 1
-        attempt_count = self._recovery_counts[component]
+        self._recovery_counts[component] = attempt_count + 1
+        current_attempt = self._recovery_counts[component]
         
         logger.warning(
-            f"[CrossRepoSync] 🚑 Triggering recovery for {component} (attempt #{attempt_count})..."
+            f"[CrossRepoSync] 🚑 Triggering recovery for {component} "
+            f"(attempt #{current_attempt}/{MAX_RETRIES}, backoff={RECOVERY_BACKOFF:.1f}s)..."
         )
 
         # Map component to RepoType
@@ -571,7 +603,7 @@ class CrossRepoSync:
             payload={
                 "reason": "staleness_detected",
                 "timestamp": time.time(),
-                "attempt": attempt_count,
+                "attempt": current_attempt,
             }
         )
         await self._emit_event(event)

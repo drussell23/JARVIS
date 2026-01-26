@@ -1853,7 +1853,7 @@ class DynamicComponentManager:
             try:
                 # Lazy import to avoid circular dependencies
                 from .gcp_vm_manager import get_gcp_vm_manager
-                vm_manager = get_gcp_vm_manager()
+                vm_manager = await get_gcp_vm_manager()
                 
                 # Only if feature is enabled
                 if vm_manager.enabled:
