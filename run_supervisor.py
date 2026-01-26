@@ -23170,12 +23170,17 @@ async def main() -> int:
                 try:
                     health_result = await send_ipc_command('health', timeout=5.0)
                     if health_result.get('success'):
-                        health_data = health_result.get('health', {})
+                        # v116.0: Health data is in 'result' key from IPC wrapper
+                        health_data = health_result.get('result', {})
                         print(f"\n   Health Level: {health_data.get('health_level', 'unknown')}")
-                        print(f"   IPC Active:   {health_data.get('ipc_active', False)}")
-                        print(f"   HTTP Active:  {health_data.get('http_active', False)}")
-                except Exception:
-                    pass
+                        print(f"   Healthy:      {health_data.get('healthy', False)}")
+                        checks = health_data.get('checks', {})
+                        if checks:
+                            for check_name, check_result in checks.items():
+                                status = "✅" if check_result.get('healthy') else "❌"
+                                print(f"   {status} {check_name}: {check_result.get('level', 'unknown')}")
+                except Exception as e:
+                    print(f"\n   ⚠️  Could not get health details: {e}")
 
                 print(f"{'='*70}\n")
                 return 0
