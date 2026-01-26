@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-JARVIS Supervisor Singleton v1.0
-================================
+JARVIS Supervisor Singleton v113.0
+==================================
 
 Enterprise-grade singleton enforcement for the JARVIS system.
 Prevents multiple supervisors/entry points from running simultaneously.
@@ -11,6 +11,7 @@ This module provides:
 2. Process tree awareness (handles forks and child processes)
 3. Atomic file operations for reliability
 4. Graceful conflict resolution
+5. v113.0: IPC command socket for restart/takeover/status commands
 
 Usage:
     from backend.core.supervisor_singleton import acquire_supervisor_lock, release_supervisor_lock
@@ -25,8 +26,14 @@ Usage:
     finally:
         release_supervisor_lock()
 
+IPC Commands (v113.0):
+    - status: Get running supervisor status
+    - restart: Request graceful restart
+    - takeover: Request graceful takeover by new instance
+    - force-stop: Force immediate shutdown
+
 Author: JARVIS System
-Version: 1.0.0 (January 2026)
+Version: 113.0.0 (January 2026)
 """
 
 from __future__ import annotations
@@ -37,12 +44,14 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +59,23 @@ logger = logging.getLogger(__name__)
 LOCK_DIR = Path.home() / ".jarvis" / "locks"
 SUPERVISOR_LOCK_FILE = LOCK_DIR / "supervisor.lock"
 SUPERVISOR_STATE_FILE = LOCK_DIR / "supervisor.state"
+SUPERVISOR_IPC_SOCKET = LOCK_DIR / "supervisor.sock"  # v113.0: IPC socket path
 
 # Stale lock detection threshold (seconds)
 STALE_LOCK_THRESHOLD = 300  # 5 minutes without heartbeat = stale
 
 # Heartbeat interval
 HEARTBEAT_INTERVAL = 10  # seconds
+
+
+class IPCCommand(str, Enum):
+    """v113.0: IPC commands for inter-supervisor communication."""
+    STATUS = "status"           # Get running supervisor status
+    RESTART = "restart"         # Request graceful restart
+    TAKEOVER = "takeover"       # New instance requests takeover
+    FORCE_STOP = "force-stop"   # Force immediate shutdown
+    PING = "ping"               # Simple liveness check
+    SHUTDOWN = "shutdown"       # Graceful shutdown
 
 
 @dataclass
@@ -386,6 +406,198 @@ class SupervisorSingleton:
     def get_state(self) -> Optional[SupervisorState]:
         """Get current state."""
         return self._state
+    
+    # =========================================================================
+    # v113.0: IPC SERVER METHODS
+    # =========================================================================
+    
+    async def start_ipc_server(self, command_handlers: Optional[Dict[str, Callable]] = None) -> None:
+        """
+        v113.0: Start Unix domain socket IPC server for remote commands.
+        
+        Args:
+            command_handlers: Optional custom handlers for commands.
+                             Default handlers: status, ping, restart, shutdown, takeover
+        """
+        # Remove stale socket file
+        if SUPERVISOR_IPC_SOCKET.exists():
+            try:
+                SUPERVISOR_IPC_SOCKET.unlink()
+            except Exception:
+                pass
+        
+        # Set up default command handlers
+        self._command_handlers = {
+            IPCCommand.STATUS: self._handle_status,
+            IPCCommand.PING: self._handle_ping,
+            IPCCommand.RESTART: self._handle_restart,
+            IPCCommand.SHUTDOWN: self._handle_shutdown,
+            IPCCommand.TAKEOVER: self._handle_takeover,
+            IPCCommand.FORCE_STOP: self._handle_force_stop,
+        }
+        
+        # Override with custom handlers if provided
+        if command_handlers:
+            self._command_handlers.update(command_handlers)
+        
+        # Create and start server
+        try:
+            server = await asyncio.start_unix_server(
+                self._handle_ipc_connection,
+                path=str(SUPERVISOR_IPC_SOCKET),
+            )
+            self._ipc_server = server
+            
+            # Make socket world-readable for other processes
+            os.chmod(str(SUPERVISOR_IPC_SOCKET), 0o666)
+            
+            logger.info(f"[Singleton] IPC server started: {SUPERVISOR_IPC_SOCKET}")
+            
+            # Keep server running in background
+            asyncio.create_task(self._ipc_server_loop(server))
+            
+        except Exception as e:
+            logger.warning(f"[Singleton] IPC server failed to start: {e}")
+    
+    async def _ipc_server_loop(self, server) -> None:
+        """Run IPC server until shutdown."""
+        try:
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"[Singleton] IPC server ended: {e}")
+    
+    async def _handle_ipc_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Handle incoming IPC connection."""
+        try:
+            # Read command (timeout: 5s)
+            data = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+            if not data:
+                writer.close()
+                await writer.wait_closed()
+                return
+            
+            # Parse command
+            try:
+                request = json.loads(data.decode())
+                command = request.get("command", "")
+                args = request.get("args", {})
+            except json.JSONDecodeError:
+                response = {"success": False, "error": "Invalid JSON"}
+                writer.write(json.dumps(response).encode())
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+            
+            # Handle command
+            try:
+                cmd_enum = IPCCommand(command)
+                handler = self._command_handlers.get(cmd_enum)
+                
+                if handler:
+                    result = await handler(args)
+                    response = {"success": True, "result": result}
+                else:
+                    response = {"success": False, "error": f"Unknown command: {command}"}
+                    
+            except ValueError:
+                response = {"success": False, "error": f"Invalid command: {command}"}
+            except Exception as e:
+                response = {"success": False, "error": str(e)}
+            
+            # Send response
+            writer.write(json.dumps(response).encode())
+            await writer.drain()
+            
+        except asyncio.TimeoutError:
+            logger.debug("[Singleton] IPC connection timed out")
+        except Exception as e:
+            logger.debug(f"[Singleton] IPC connection error: {e}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+    
+    async def _handle_status(self, args: Dict) -> Dict[str, Any]:
+        """Handle STATUS command - return current supervisor status."""
+        state = self._state
+        if state:
+            return {
+                "running": True,
+                "pid": state.pid,
+                "entry_point": state.entry_point,
+                "started_at": state.started_at,
+                "last_heartbeat": state.last_heartbeat,
+                "uptime_seconds": (datetime.now() - datetime.fromisoformat(state.started_at)).total_seconds(),
+            }
+        return {"running": False}
+    
+    async def _handle_ping(self, args: Dict) -> Dict[str, Any]:
+        """Handle PING command - simple liveness check."""
+        return {"pong": True, "timestamp": datetime.now().isoformat()}
+    
+    async def _handle_restart(self, args: Dict) -> Dict[str, Any]:
+        """Handle RESTART command - request graceful restart."""
+        logger.info("[Singleton] Restart requested via IPC")
+        # Set restart flag and send SIGHUP to self
+        try:
+            os.kill(os.getpid(), signal.SIGHUP)
+            return {"restart_initiated": True}
+        except Exception as e:
+            return {"restart_initiated": False, "error": str(e)}
+    
+    async def _handle_shutdown(self, args: Dict) -> Dict[str, Any]:
+        """Handle SHUTDOWN command - graceful shutdown."""
+        logger.info("[Singleton] Shutdown requested via IPC")
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            return {"shutdown_initiated": True}
+        except Exception as e:
+            return {"shutdown_initiated": False, "error": str(e)}
+    
+    async def _handle_takeover(self, args: Dict) -> Dict[str, Any]:
+        """Handle TAKEOVER command - new instance wants to take over."""
+        logger.info("[Singleton] Takeover requested via IPC")
+        # Set takeover flag and initiate graceful shutdown
+        try:
+            self._takeover_requested = True
+            # Give new instance a chance to start, then shutdown
+            asyncio.create_task(self._delayed_takeover_shutdown())
+            return {"takeover_accepted": True, "message": "Shutting down in 5 seconds for takeover"}
+        except Exception as e:
+            return {"takeover_accepted": False, "error": str(e)}
+    
+    async def _handle_force_stop(self, args: Dict) -> Dict[str, Any]:
+        """Handle FORCE_STOP command - immediate shutdown."""
+        logger.warning("[Singleton] Force stop requested via IPC")
+        try:
+            os.kill(os.getpid(), signal.SIGKILL)
+            return {"force_stop_initiated": True}
+        except Exception as e:
+            return {"force_stop_initiated": False, "error": str(e)}
+    
+    async def _delayed_takeover_shutdown(self) -> None:
+        """Shutdown after delay for takeover."""
+        await asyncio.sleep(5.0)
+        if getattr(self, '_takeover_requested', False):
+            logger.info("[Singleton] Takeover: shutting down now")
+            os.kill(os.getpid(), signal.SIGTERM)
+    
+    def cleanup_ipc(self) -> None:
+        """Clean up IPC socket on shutdown."""
+        try:
+            if SUPERVISOR_IPC_SOCKET.exists():
+                state = self._read_state()
+                # Only remove if we own it
+                if state and state.pid == os.getpid():
+                    SUPERVISOR_IPC_SOCKET.unlink()
+        except Exception:
+            pass
 
 
 # Module-level convenience functions
@@ -438,14 +650,91 @@ def is_supervisor_running() -> Tuple[bool, Optional[Dict[str, Any]]]:
     return False, None
 
 
+# =========================================================================
+# v113.0: IPC CLIENT FUNCTIONS
+# =========================================================================
+
+async def send_supervisor_command(
+    command: str,
+    args: Optional[Dict[str, Any]] = None,
+    timeout: float = 5.0
+) -> Dict[str, Any]:
+    """
+    v113.0: Send IPC command to running supervisor.
+    
+    Args:
+        command: Command name (status, ping, restart, shutdown, takeover, force-stop)
+        args: Optional command arguments
+        timeout: Connection timeout in seconds
+    
+    Returns:
+        Response dict from supervisor or error dict
+    """
+    if not SUPERVISOR_IPC_SOCKET.exists():
+        return {"success": False, "error": "No supervisor IPC socket found"}
+    
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(SUPERVISOR_IPC_SOCKET)),
+            timeout=timeout
+        )
+        
+        # Send command
+        request = {"command": command, "args": args or {}}
+        writer.write(json.dumps(request).encode())
+        await writer.drain()
+        
+        # Read response
+        data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+        response = json.loads(data.decode())
+        
+        writer.close()
+        await writer.wait_closed()
+        
+        return response
+        
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Supervisor IPC timeout"}
+    except ConnectionRefusedError:
+        return {"success": False, "error": "Supervisor not responding"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_supervisor_command_sync(
+    command: str,
+    args: Optional[Dict[str, Any]] = None,
+    timeout: float = 5.0
+) -> Dict[str, Any]:
+    """
+    v113.0: Synchronous wrapper for send_supervisor_command.
+    """
+    try:
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(
+            send_supervisor_command(command, args, timeout)
+        )
+        loop.close()
+        return result
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def start_supervisor_ipc_server() -> None:
+    """v113.0: Start the IPC server on the running singleton."""
+    await get_singleton().start_ipc_server()
+
+
 # Atexit cleanup
 import atexit
 
 def _cleanup_on_exit():
-    """Clean up lock on exit."""
+    """Clean up lock and IPC socket on exit."""
     try:
-        if _singleton and _singleton.is_locked():
-            _singleton.release()
+        if _singleton:
+            if _singleton.is_locked():
+                _singleton.release()
+            _singleton.cleanup_ipc()  # v113.0: Clean up IPC socket
     except Exception:
         pass
 

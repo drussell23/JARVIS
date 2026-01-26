@@ -22809,8 +22809,12 @@ async def main() -> int:
             print(f"{'='*70}")
             print(f"\nTo stop the existing instance:")
             print(f"   kill {existing_state.get('pid', '<PID>')}")
-            print(f"\nOr use the shutdown command:")
+            print(f"\nOr use API endpoint:")
             print(f"   curl http://localhost:8010/shutdown")
+            print(f"\nv113.0 IPC Commands (from another terminal):")
+            print(f"   python3 -c \"from backend.core.supervisor_singleton import send_supervisor_command_sync; print(send_supervisor_command_sync('status'))\"")
+            print(f"   python3 -c \"from backend.core.supervisor_singleton import send_supervisor_command_sync; print(send_supervisor_command_sync('restart'))\"")
+            print(f"   python3 -c \"from backend.core.supervisor_singleton import send_supervisor_command_sync; print(send_supervisor_command_sync('shutdown'))\"")
             print(f"{'='*70}\n")
             return 1
 
@@ -22820,6 +22824,14 @@ async def main() -> int:
 
         # Start heartbeat to keep lock fresh
         await start_supervisor_heartbeat()
+        
+        # v113.0: Start IPC server for remote commands (status, restart, shutdown, takeover)
+        try:
+            from backend.core.supervisor_singleton import start_supervisor_ipc_server
+            await start_supervisor_ipc_server()
+            print("[v113.0] Supervisor IPC server started")
+        except Exception as e:
+            print(f"[v113.0] IPC server warning: {e}")  # Non-fatal, continue startup
 
     # =========================================================================
     # v95.17: Clean up orphaned semaphores from previous crashes
