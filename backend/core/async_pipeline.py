@@ -1009,9 +1009,24 @@ class AdvancedAsyncPipeline:
                 if event.event_type == EventType.ACTION_REQUESTED:
                     # Route action requests through the pipeline
                     action_data = event.data.get("action", {})
-                    if action_data.get("requires_pipeline", False):
-                        logger.info(f"[AGI-OS] Processing action via pipeline: {action_data.get('name')}")
-                        # Queue for processing
+                    command_text = action_data.get("command") or action_data.get("name")
+                    
+                    if command_text and action_data.get("requires_pipeline", False):
+                        logger.info(f"[AGI-OS] Processing action via pipeline: {command_text}")
+                        
+                        # Process autonomously
+                        asyncio.create_task(
+                            self.process_async(
+                                text=command_text,
+                                user_name=await self.get_owner_name(),
+                                priority=1, # HIGH priority for autonomous actions
+                                metadata={
+                                    "source": "agi_os_autonomous",
+                                    "event_id": event.event_id,
+                                    "autonomous": True
+                                }
+                            )
+                        )
 
             self._agi_event_stream.subscribe(EventType.ACTION_REQUESTED, handle_agi_event)
 

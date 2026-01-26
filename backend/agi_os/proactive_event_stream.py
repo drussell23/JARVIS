@@ -59,6 +59,8 @@ class EventType(Enum):
     APP_CHANGED = "app_changed"
 
     # Decision Events
+    ACTION_REQUESTED = "action_requested"
+    ACTION_SCHEDULED = "action_scheduled"
     ACTION_PROPOSED = "action_proposed"
     ACTION_APPROVED = "action_approved"
     ACTION_DENIED = "action_denied"
@@ -215,6 +217,7 @@ class ProactiveEventStream:
             EventType.NOTIFICATION_DETECTED: "Sir, you have {count} new notifications from {source}.",
             EventType.MEETING_DETECTED: "Sir, you have a meeting in {minutes} minutes: {title}",
             EventType.SECURITY_CONCERN: "Sir, security concern detected: {description}",
+            EventType.ACTION_REQUESTED: "Sir, AGI decision engine has requested execution of {action}.",
             EventType.ACTION_PROPOSED: "Sir, I'd like to {action}. {reason}",
             EventType.ACTION_APPROVED: "Understood. Proceeding with {action}.",
             EventType.ACTION_DENIED: "Very well. Cancelling {action}.",
