@@ -70,6 +70,64 @@ _original_sigterm: Optional[Callable] = None
 _original_sigint: Optional[Callable] = None
 _handlers_registered = False
 
+# v109.4: Shutdown phase tracking to prevent async operations during interpreter shutdown
+# 0 = normal operation
+# 1 = signal received (SIGTERM/SIGINT)
+# 2 = atexit handler running
+# 3 = interpreter shutdown in progress
+_shutdown_phase = 0
+
+
+def _mark_shutdown_phase(phase: int) -> None:
+    """
+    v109.4: Mark current shutdown phase for proper cleanup coordination.
+
+    This is used to prevent creating new event loops during interpreter shutdown,
+    which was causing the EXC_GUARD crash.
+    """
+    global _shutdown_phase
+    _shutdown_phase = phase
+
+
+def _is_interpreter_shutting_down() -> bool:
+    """
+    v109.4: Check if Python interpreter is shutting down.
+
+    This is a multi-method check to detect when it's unsafe to:
+    - Create new event loops
+    - Import modules (especially GCP client libraries)
+    - Use ThreadPoolExecutor
+    - Call async code
+
+    Returns:
+        True if interpreter is shutting down, False if normal operation
+    """
+    # Method 1: Check our explicit shutdown phase tracking
+    if _shutdown_phase >= 2:
+        return True
+
+    # Method 2: Check if threading module is being cleaned up
+    try:
+        threading.current_thread()
+    except RuntimeError:
+        return True
+
+    # Method 3: Check if sys.modules is being cleared (late shutdown stage)
+    try:
+        if sys.modules is None:
+            return True
+    except Exception:
+        return True
+
+    # Method 4: Check if asyncio is broken (common during shutdown)
+    try:
+        # If we can't even check for a running loop, we're in trouble
+        asyncio.get_event_loop_policy()
+    except Exception:
+        return True
+
+    return False
+
 
 # ============================================================================
 # CORE CLEANUP FUNCTIONS
@@ -645,30 +703,40 @@ def cleanup_remote_resources_sync(
 ) -> Dict[str, Any]:
     """
     Synchronous wrapper for cleanup_remote_resources.
-    
+
     This is used by signal handlers and atexit which can't use async functions directly.
     Creates a new event loop or uses ThreadPoolExecutor for safety.
+
+    v109.4: CRITICAL - Detects interpreter shutdown and falls back to minimal cleanup
+    to avoid EXC_GUARD crashes from creating event loops during atexit.
     """
     global _cleanup_completed
-    
+
     # Quick check to avoid work if already done
     if _cleanup_completed:
         return {"success": True, "vms_cleaned": 0, "method": "cached"}
-    
+
     logger.info(f"🪝 Sync cleanup triggered: {reason}")
-    
+
+    # v109.4: CRITICAL - Don't create new event loops during interpreter shutdown
+    # This was causing the EXC_GUARD crash by trying to use ThreadPoolExecutor
+    # and GCP client libraries during atexit
+    if _is_interpreter_shutting_down():
+        logger.debug("   Interpreter shutting down - using minimal sync cleanup")
+        return _minimal_sync_cleanup(reason)
+
     try:
         # Try to get existing event loop
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             # We're in an async context - can't run sync here
             logger.warning("   Cannot run sync cleanup in async context")
             return {"success": False, "vms_cleaned": 0, "errors": ["Async context"], "method": "none"}
         except RuntimeError:
             # No running loop - we can create one
             pass
-        
-        # Method 1: Create new event loop
+
+        # Method 1: Create new event loop (safe if not in interpreter shutdown)
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -684,8 +752,13 @@ def cleanup_remote_resources_sync(
                 loop.close()
         except Exception as e:
             logger.debug(f"   Event loop method failed: {e}")
-        
-        # Method 2: Use ThreadPoolExecutor
+
+            # v109.4: If event loop fails, check if interpreter is shutting down
+            if _is_interpreter_shutting_down():
+                logger.debug("   Detected interpreter shutdown after loop failure")
+                return _minimal_sync_cleanup(reason)
+
+        # Method 2: Use ThreadPoolExecutor (risky during shutdown)
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(_run_cleanup_in_new_loop, timeout, reason)
@@ -694,11 +767,17 @@ def cleanup_remote_resources_sync(
         except FuturesTimeoutError:
             logger.warning("   ThreadPoolExecutor cleanup timed out")
             return {"success": False, "vms_cleaned": 0, "errors": ["Timeout"], "method": "none"}
+        except RuntimeError as e:
+            # "cannot schedule new futures after interpreter shutdown"
+            if "interpreter shutdown" in str(e).lower() or "cannot schedule" in str(e).lower():
+                logger.debug("   ThreadPoolExecutor unavailable - interpreter shutting down")
+                return _minimal_sync_cleanup(reason)
+            logger.debug(f"   ThreadPoolExecutor method failed: {e}")
         except Exception as e:
             logger.debug(f"   ThreadPoolExecutor method failed: {e}")
-        
+
         return {"success": False, "vms_cleaned": 0, "errors": ["All methods failed"], "method": "none"}
-        
+
     except Exception as e:
         logger.error(f"❌ Sync cleanup failed: {e}")
         return {"success": False, "vms_cleaned": 0, "errors": [str(e)], "method": "none"}
@@ -714,6 +793,78 @@ def _run_cleanup_in_new_loop(timeout: float, reason: str) -> Dict[str, Any]:
         )
     finally:
         loop.close()
+
+
+def _minimal_sync_cleanup(reason: str) -> Dict[str, Any]:
+    """
+    v109.4: Minimal synchronous cleanup for interpreter shutdown.
+
+    CRITICAL: This function must NOT:
+    - Create new event loops
+    - Import GCP client libraries (they use guarded FDs which cause EXC_GUARD)
+    - Call any async code
+    - Use ThreadPoolExecutor
+
+    It only performs essential cleanup that is safe during interpreter shutdown.
+
+    This is called when _is_interpreter_shutting_down() returns True, which happens:
+    - During atexit handlers
+    - When threading module is being cleaned up
+    - When sys.modules is being cleared
+    """
+    global _cleanup_completed
+
+    results = {
+        "success": True,
+        "method": "minimal_sync",
+        "vms_cleaned": 0,
+        "terraform_destroyed": 0,
+        "errors": [],
+        "reason": reason,
+    }
+
+    logger.debug(f"   [v109.4] Minimal sync cleanup: {reason}")
+
+    # 1. Release supervisor lock (sync, no external libs, no event loops)
+    try:
+        # Don't import supervisor_singleton during atexit if possible
+        # Just try to release if it exists
+        from backend.core.supervisor_singleton import _singleton
+        if _singleton and _singleton._lock_fd is not None:
+            import fcntl
+            try:
+                fcntl.flock(_singleton._lock_fd, fcntl.LOCK_UN)
+                _singleton._lock_fd = None
+                logger.debug("   [v109.4] Supervisor lock released")
+            except Exception:
+                pass
+    except ImportError:
+        pass  # Module not available
+    except Exception as e:
+        logger.debug(f"   [v109.4] Supervisor lock release error: {e}")
+
+    # 2. Clean up multiprocessing resources (already sync, safe)
+    try:
+        cleaned = _cleanup_multiprocessing_sync_fast(timeout=1.0)
+        if cleaned > 0:
+            logger.debug(f"   [v109.4] MP cleanup: {cleaned} resources")
+    except Exception as e:
+        logger.debug(f"   [v109.4] MP cleanup error: {e}")
+
+    # 3. Mark cleanup done so other handlers skip their work
+    _cleanup_completed = True
+
+    # 4. Mark GCP as shutting down (prevents reinitialization)
+    try:
+        from backend.core.gcp_vm_manager import mark_gcp_shutdown
+        mark_gcp_shutdown()
+    except ImportError:
+        pass  # Module not available or not installed
+    except Exception:
+        pass  # Non-critical
+
+    logger.debug("   [v109.4] Minimal sync cleanup complete")
+    return results
 
 
 # ============================================================================
@@ -789,8 +940,13 @@ def _signal_handler(signum: int, frame: Any) -> None:
     This prevents semaphore leaks by cleaning up ProcessPoolExecutors
     BEFORE any async operations that might timeout or fail.
 
+    v109.4: Marks shutdown phase for proper cleanup coordination.
+
     Triggers cleanup and then calls the original handler.
     """
+    global _shutdown_phase
+    _shutdown_phase = 1  # v109.4: Mark signal phase
+
     signal_name = signal.Signals(signum).name
     logger.info(f"🛑 Received {signal_name} - triggering cleanup...")
 
@@ -800,7 +956,7 @@ def _signal_handler(signum: int, frame: Any) -> None:
 
     # Run synchronous cleanup (includes GCP resources, sessions, etc.)
     cleanup_remote_resources_sync(timeout=15.0, reason=f"Signal {signal_name}")
-    
+
     # Call original handler
     if signum == signal.SIGTERM and _original_sigterm:
         if callable(_original_sigterm) and _original_sigterm not in (signal.SIG_DFL, signal.SIG_IGN):
@@ -815,15 +971,36 @@ def _atexit_handler() -> None:
     atexit handler for final cleanup.
 
     v95.17: Enhanced with multiprocessing cleanup as final safety net.
+    v109.4: Marks atexit phase to prevent async operations during interpreter shutdown.
+
     This is the last line of defense for cleanup.
+
+    NOTE: For --restart via SIGHUP, this is NOT called because os.execv()
+    bypasses atexit entirely. This only runs for:
+    - Normal exit (sys.exit(), reaching end of main)
+    - SIGTERM (graceful shutdown)
+    - SIGINT (Ctrl+C)
     """
+    global _shutdown_phase
+    _shutdown_phase = 2  # v109.4: Mark atexit phase
+
     logger.info("🔚 atexit handler: Final cleanup check...")
+
+    # v109.4: Mark GCP as shutting down BEFORE any cleanup to prevent reinitialization
+    try:
+        from backend.core.gcp_vm_manager import mark_gcp_shutdown
+        mark_gcp_shutdown()
+    except ImportError:
+        pass  # GCP module not available
+    except Exception:
+        pass  # Non-critical
 
     # v95.17: CRITICAL - Clean up multiprocessing resources
     _cleanup_multiprocessing_sync_fast(timeout=2.0)
 
+    # v109.4: Use minimal sync cleanup since we're in atexit (interpreter shutting down)
     if not _cleanup_completed:
-        cleanup_remote_resources_sync(timeout=10.0, reason="atexit handler")
+        _minimal_sync_cleanup(reason="atexit handler")
 
 
 def cleanup_orphaned_semaphores_on_startup() -> Dict[str, Any]:

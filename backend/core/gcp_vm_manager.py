@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -101,6 +102,37 @@ logger = logging.getLogger(__name__)
 
 # Type variable for generic retry decorator
 T = TypeVar('T')
+
+
+# ============================================================================
+# v109.4: SHUTDOWN DETECTION TO PREVENT INITIALIZATION DURING ATEXIT
+# ============================================================================
+
+# When True, prevents GCP client initialization which uses guarded FDs
+# This is set by shutdown_hook.py during cleanup to prevent EXC_GUARD crashes
+_gcp_shutdown_requested = False
+
+
+def mark_gcp_shutdown() -> None:
+    """
+    v109.4: Mark that GCP resources should not be initialized.
+
+    This is called by shutdown_hook.py during cleanup to prevent
+    GCP client libraries from being initialized during interpreter
+    shutdown, which would cause EXC_GUARD crashes due to guarded
+    file descriptors used by libdispatch/GCD on macOS.
+
+    Once called, initialize() and get_gcp_vm_manager() will return
+    early without initializing GCP API clients.
+    """
+    global _gcp_shutdown_requested
+    _gcp_shutdown_requested = True
+    logger.debug("[GCPVMManager] v109.4: Shutdown requested - GCP init disabled")
+
+
+def is_gcp_shutdown_requested() -> bool:
+    """Check if GCP shutdown has been requested."""
+    return _gcp_shutdown_requested
 
 
 # ============================================================================
@@ -628,10 +660,27 @@ class GCPVMManager:
     async def initialize(self):
         """
         Initialize GCP API clients and integrations with robust error handling.
-        
+
         Uses async lock to prevent race conditions during initialization.
         Gracefully handles missing dependencies and API failures.
+
+        v109.4: Checks for shutdown state to prevent initialization during
+        interpreter shutdown, which would cause EXC_GUARD crashes.
         """
+        # v109.4: CRITICAL - Don't initialize during shutdown
+        # GCP client libraries use guarded FDs that cause EXC_GUARD crashes
+        if _gcp_shutdown_requested:
+            logger.debug("[GCPVMManager] Skipping init - shutdown in progress")
+            return
+
+        # Check for interpreter shutdown (late stage)
+        try:
+            if sys.modules is None:
+                logger.debug("[GCPVMManager] Skipping init - interpreter shutdown detected")
+                return
+        except Exception:
+            return
+
         # Quick check without lock
         if self.initialized:
             return
@@ -639,6 +688,11 @@ class GCPVMManager:
         async with self._init_lock:
             # Double-check after acquiring lock
             if self.initialized:
+                return
+
+            # v109.4: Check again after acquiring lock
+            if _gcp_shutdown_requested:
+                logger.debug("[GCPVMManager] Skipping init - shutdown detected after lock")
                 return
 
             if not COMPUTE_AVAILABLE:

@@ -1153,6 +1153,10 @@ class SupervisorSingleton:
             os.write(self._lock_fd, f"{os.getpid()}\n".encode())
 
             logger.info(f"[Singleton] ✅ Lock acquired for {entry_point} (PID: {os.getpid()})")
+
+            # v109.4: Set up SIGHUP handler for clean restart via os.execv()
+            _setup_sighup_handler()
+
             return True
 
         except Exception as e:
@@ -1429,12 +1433,17 @@ class SupervisorSingleton:
         return {"pong": True, "timestamp": datetime.now().isoformat()}
     
     async def _handle_restart(self, args: Dict) -> Dict[str, Any]:
-        """Handle RESTART command - request graceful restart."""
-        logger.info("[Singleton] Restart requested via IPC")
-        # Set restart flag and send SIGHUP to self
+        """
+        Handle RESTART command - trigger clean restart via SIGHUP/os.execv().
+
+        v109.4: Uses os.execv() to replace the process, avoiding atexit handlers
+        and the EXC_GUARD crash that occurred with async cleanup during shutdown.
+        """
+        logger.info("[Singleton] Restart requested via IPC - will use os.execv()")
         try:
+            # SIGHUP triggers _handle_sighup which calls os.execv()
             os.kill(os.getpid(), signal.SIGHUP)
-            return {"restart_initiated": True}
+            return {"restart_initiated": True, "method": "execv"}
         except Exception as e:
             return {"restart_initiated": False, "error": str(e)}
     
@@ -1917,17 +1926,140 @@ async def start_supervisor_ipc_server() -> None:
     await get_singleton().start_ipc_server()
 
 
-# Atexit cleanup
+# =============================================================================
+# v109.4: SIGHUP HANDLER FOR CLEAN RESTART VIA os.execv()
+# =============================================================================
+
+_sighup_handler_installed = False
+
+
+def _setup_sighup_handler() -> None:
+    """
+    v109.4: Set up SIGHUP handler for clean restart via os.execv().
+
+    This is the PRIMARY FIX for the EXC_GUARD crash on restart.
+
+    Why os.execv() is the right solution:
+    - os.execv() replaces the current process image with a new one
+    - atexit handlers are NOT called (process is replaced, not exited)
+    - No file descriptor cleanup race conditions
+    - Clean slate for the new process
+    - Standard Unix pattern for daemon restarts
+
+    The EXC_GUARD crash happened because:
+    1. Restart sent SIGHUP which triggered atexit handlers
+    2. atexit handlers tried to create new event loops during interpreter shutdown
+    3. GCP client libraries use guarded FDs (libdispatch/GCD on macOS)
+    4. Attempting to close guarded FDs during shutdown triggers EXC_GUARD
+
+    By using os.execv(), we bypass atexit entirely and avoid the crash.
+    """
+    global _sighup_handler_installed
+
+    if _sighup_handler_installed:
+        return
+
+    def _handle_sighup(signum, frame):
+        """
+        Handle SIGHUP for restart - use os.execv() to avoid atexit issues.
+
+        CRITICAL: This handler must NOT:
+        - Create new event loops
+        - Import modules that use guarded FDs
+        - Call async code
+        - Run complex cleanup
+
+        It simply releases the lock and replaces the process.
+        """
+        logger.info("[Singleton] SIGHUP received - initiating clean restart via os.execv()")
+
+        # Step 1: Release file lock BEFORE execv (sync, no event loop needed)
+        try:
+            if _singleton and _singleton._lock_fd is not None:
+                # Just unlock - don't close FD, let execv/kernel handle it
+                try:
+                    fcntl.flock(_singleton._lock_fd, fcntl.LOCK_UN)
+                    logger.debug("[Singleton] Lock released for restart")
+                except Exception as e:
+                    logger.debug(f"Lock unlock warning: {e}")
+                _singleton._lock_fd = None
+        except Exception as e:
+            logger.debug(f"Lock release warning during SIGHUP: {e}")
+
+        # Step 2: Clean up state file so new process starts fresh
+        try:
+            SUPERVISOR_STATE_FILE.unlink(missing_ok=True)
+            logger.debug("[Singleton] State file removed for restart")
+        except Exception as e:
+            logger.debug(f"State file cleanup warning: {e}")
+
+        # Step 3: Clean up IPC socket
+        try:
+            if SUPERVISOR_IPC_SOCKET.exists():
+                SUPERVISOR_IPC_SOCKET.unlink()
+                logger.debug("[Singleton] IPC socket removed for restart")
+        except Exception as e:
+            logger.debug(f"IPC socket cleanup warning: {e}")
+
+        # Step 4: Restart via execv - this REPLACES the process (atexit NOT called)
+        python = sys.executable
+        args = [python] + sys.argv
+        logger.info(f"[Singleton] Executing: {' '.join(args[:5])}...")
+
+        # This replaces the current process image - code after this never runs
+        os.execv(python, args)
+        # UNREACHABLE: process has been replaced
+
+    # Install the handler
+    signal.signal(signal.SIGHUP, _handle_sighup)
+    _sighup_handler_installed = True
+    logger.debug("[Singleton] v109.4: SIGHUP handler installed for clean restart")
+
+
+def setup_restart_handlers() -> None:
+    """
+    v109.4: Set up all restart-related signal handlers.
+
+    Call this after acquiring the supervisor lock.
+    """
+    _setup_sighup_handler()
+
+
+# =============================================================================
+# v109.4: ATEXIT CLEANUP (MINIMAL - most restart bypasses this via os.execv())
+# =============================================================================
+
 import atexit
 
+
 def _cleanup_on_exit():
-    """Clean up lock and IPC socket on exit."""
+    """
+    Clean up lock and IPC socket on exit.
+
+    NOTE: For --restart, this is NOT called because os.execv() bypasses atexit.
+    This only runs for normal exit, SIGTERM, or SIGINT.
+
+    v109.4: Keep this minimal to avoid EXC_GUARD crashes during interpreter shutdown.
+    """
     try:
         if _singleton:
             if _singleton.is_locked():
-                _singleton.release()
-            _singleton.cleanup_ipc()  # v113.0: Clean up IPC socket
+                # Use minimal sync release - no async, no new imports
+                try:
+                    if _singleton._lock_fd is not None:
+                        fcntl.flock(_singleton._lock_fd, fcntl.LOCK_UN)
+                        # Don't close FD during atexit - kernel will clean up
+                        _singleton._lock_fd = None
+                except Exception:
+                    pass
+
+            # Clean up IPC socket
+            try:
+                _singleton.cleanup_ipc()
+            except Exception:
+                pass
     except Exception:
         pass
+
 
 atexit.register(_cleanup_on_exit)
