@@ -12165,6 +12165,40 @@ echo "=== JARVIS Prime started ==="
                 # PHASE 3: Perform actual startup (semaphore held)
                 # ==============================================================
 
+                # v117.0: Step 0 - Check if service was PRESERVED during restart
+                # If GlobalProcessRegistry has this service (preserved via os.execv restart),
+                # validate the process is still running and skip spawning.
+                try:
+                    from backend.core.supervisor_singleton import GlobalProcessRegistry
+                    preserved_services = GlobalProcessRegistry.get_all()
+                    for pid, info in preserved_services.items():
+                        component = info.get("component", "")
+                        preserved_port = info.get("port", 0)
+                        if service_name.lower() in component.lower():
+                            # Found a preserved service entry - validate process is still alive
+                            try:
+                                os.kill(int(pid), 0)  # Check if process exists
+                                # Process is alive! Skip spawning.
+                                reason = f"PRESERVED from restart (PID: {pid}, Port: {preserved_port})"
+                                logger.info(
+                                    f"    [v117.0] ✅ {service_name} is PRESERVED from restart "
+                                    f"(PID {pid}, port {preserved_port}) - skipping spawn"
+                                )
+                                await self._end_span(service_span, status="success")
+                                await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "preserved"})
+                                return service_name, True, reason
+                            except OSError:
+                                # Process is dead, remove from registry and continue with normal startup
+                                GlobalProcessRegistry.deregister(int(pid))
+                                logger.info(
+                                    f"    [v117.0] ⚠️ Preserved {service_name} (PID {pid}) is dead, "
+                                    f"will spawn new instance"
+                                )
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"[v117.0] GlobalProcessRegistry check failed: {e}")
+
                 # Step 1: Check if already running via registry
                 if self.registry:
                     existing = await self.registry.discover_service(service_name)

@@ -1294,6 +1294,19 @@ class SupervisorSingleton:
 
             logger.info(f"[Singleton] ✅ Lock acquired for {entry_point} (PID: {os.getpid()})")
 
+            # v117.0: Load preserved services from disk (for restart recovery)
+            # If this is a restart via os.execv(), the registry file will have
+            # PIDs of Trinity services that were preserved and should NOT be re-spawned.
+            GlobalProcessRegistry.load_from_disk()
+            preserved_pids = GlobalProcessRegistry.get_all()
+            if preserved_pids:
+                logger.info(
+                    f"[Singleton] v117.0: Loaded {len(preserved_pids)} preserved services from registry: "
+                    f"{[(pid, info.get('component')) for pid, info in preserved_pids.items()]}"
+                )
+            else:
+                logger.debug("[Singleton] v117.0: No preserved services in registry (fresh start)")
+
             # v109.4: Set up SIGHUP handler for clean restart via os.execv()
             _setup_sighup_handler()
 
@@ -2264,13 +2277,11 @@ def _setup_sighup_handler() -> None:
                     f"(PIDs: {[p[0] for p in skipped_our_processes]})"
                 )
 
-            # v116.0: Clear the process registry on restart
-            # New supervisor will create fresh registry
-            try:
-                GlobalProcessRegistry.clear()
-                logger.debug("[Singleton] Process registry cleared for restart")
-            except Exception:
-                pass
+            # v117.0: DO NOT clear the registry on restart!
+            # Preserved Trinity services should remain registered so the new supervisor
+            # knows about them via load_from_disk() and doesn't spawn duplicates.
+            # Only clear registry on FRESH start (not restart via os.execv).
+            logger.debug("[Singleton] v117.0: Keeping registry for restart (preserved services remain registered)")
 
         except ImportError:
             # psutil not available - try basic approach
