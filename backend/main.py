@@ -857,7 +857,11 @@ def import_voice_system():
         voice["jarvis_router"] = jarvis_voice_router
         voice["jarvis_api"] = jarvis_api
         voice["jarvis_available"] = True
-    except ImportError:
+    except ImportError as e:
+        logger.exception(f"Failed to import JARVIS Voice API: {e}")
+        voice["jarvis_available"] = False
+    except Exception as e:
+        logger.exception(f"Unexpected error importing JARVIS Voice API: {e}")
         voice["jarvis_available"] = False
 
     return voice
@@ -4814,7 +4818,7 @@ except Exception as e:
 # Lightweight Health Check Endpoints (Non-blocking)
 # =============================================================================
 
-@app.get("/health/startup")
+@app.api_route("/health/startup", methods=["GET", "HEAD"])
 async def health_startup():
     """
     Startup progress endpoint - shows detailed initialization status.
@@ -5370,7 +5374,7 @@ async def health_ready():
 
 
 # Full Health check endpoint (comprehensive but slower)
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     """Quick health check endpoint"""
     vision_details = {}
@@ -5512,7 +5516,7 @@ async def health_check():
 # Zero-Touch Update Support: JARVIS Busy State Endpoint
 # ============================================================================
 
-@app.get("/health/busy")
+@app.api_route("/health/busy", methods=["GET", "HEAD"])
 async def health_busy():
     """
     Check if JARVIS is currently busy with active tasks.
@@ -5608,7 +5612,7 @@ async def health_busy():
 # Performance Optimizer Stats Endpoint
 # ============================================================================
 
-@app.get("/health/performance")
+@app.api_route("/health/performance", methods=["GET", "HEAD"])
 async def health_performance():
     """
     Get performance profiling statistics.
@@ -5661,7 +5665,7 @@ async def health_performance():
 # Hyper-Speed AI Loader Stats Endpoint
 # ============================================================================
 
-@app.get("/health/ai-loader")
+@app.api_route("/health/ai-loader", methods=["GET", "HEAD"])
 async def health_ai_loader():
     """
     Get AI model loading statistics and Ghost Proxy status.
@@ -6476,7 +6480,23 @@ def mount_routers():
         from api.vision_ws_endpoint import set_vision_analyzer
 
         app.include_router(vision_ws_endpoint_router, tags=["vision"])
-
+        
+        # Also mount notification vision API router (fixes 404 /vision/ws issue)
+        try:
+            from api.notification_vision_api import router as notification_vision_router
+            from api.notification_vision_api import notification_websocket
+            
+            # Mount at root level to support /notifications/ws
+            app.include_router(notification_vision_router)
+            
+            # Explicitly alias /vision/ws to the same handler (Robust fix)
+            app.add_api_websocket_route("/vision/ws", notification_websocket)
+            logger.info("✅ Notification WebSocket mounted at /notifications/ws and aliased to /vision/ws")
+        except ImportError:
+            logger.warning("Notification Vision API router could not be imported")
+        except Exception as e:
+            logger.error(f"Error mounting notification router: {e}")
+            
         # Set vision analyzer if available
         vision = components.get("vision", {})
         if vision and vision.get("analyzer"):
