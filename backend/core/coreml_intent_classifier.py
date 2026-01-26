@@ -95,6 +95,11 @@ class CoreMLIntentClassifier:
         self.inference_count = 0
         self.total_inference_time_ms = 0
         self.neural_engine_count = 0
+        
+        # Robustness: Circuit breaker for CoreML
+        self.coreml_failures = 0
+        self.max_coreml_failures = 3
+        self.coreml_disabled = False
 
         # Initialize models
         self._init_pytorch_model()
@@ -208,6 +213,7 @@ class CoreMLIntentClassifier:
 
         except Exception as e:
             logger.error(f"Error checking Neural Engine: {e}")
+            self.neural_engine_available = False
             return False
 
     async def train_async(
@@ -399,99 +405,173 @@ class CoreMLIntentClassifier:
             logger.error(f"Failed to load CoreML model: {e}")
             self.coreml_model = None
 
+        result.inference_time_ms = inference_time_ms
+        
+        return result
+
     async def predict_async(
         self,
         features: np.ndarray,
         threshold: float = 0.5
     ) -> IntentPrediction:
         """
-        Async prediction using CoreML Neural Engine.
-
-        Args:
-            features: Feature vector (feature_dim,) or batch (N, feature_dim)
-            threshold: Confidence threshold for component selection
-
-        Returns:
-            IntentPrediction with components and confidence scores
+        Async prediction using Hybrid Strategy (CoreML -> PyTorch -> Fallback).
+        
+        v10.7: "Beefed up" robustness:
+        1. Tries CoreML first (Neural Engine)
+        2. Falls back to PyTorch (CPU/MPS) if CoreML fails or missing
+        3. Circuit breaker disables CoreML after repeated failures
         """
-        if not self.is_trained or self.coreml_model is None:
-            return IntentPrediction(
-                components=set(),
-                confidence_scores={},
-                inference_time_ms=0.0,
-                used_neural_engine=False
-            )
-
         start = time.perf_counter()
+        
+        # Strategy 1: CoreML (Neural Engine)
+        if self.is_trained and self.coreml_model is not None and not self.coreml_disabled:
+            try:
+                # Run inference in thread pool (CoreML is blocking)
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    self._predict_sync_coreml,
+                    features,
+                    threshold
+                )
+                
+                inference_time_ms = (time.perf_counter() - start) * 1000
+                self.inference_count += 1
+                self.total_inference_time_ms += inference_time_ms
+                if result.used_neural_engine:
+                    self.neural_engine_count += 1
+                result.inference_time_ms = inference_time_ms
+                
+                # Reset failure count on success
+                self.coreml_failures = 0
+                return result
+                
+            except Exception as e:
+                self.coreml_failures += 1
+                logger.warning(f"⚠️ CoreML inference failed ({self.coreml_failures}/{self.max_coreml_failures}): {e}")
+                
+                if self.coreml_failures >= self.max_coreml_failures:
+                    self.coreml_disabled = True
+                    logger.error("🛑 CoreML circuit breaker tripped. Disabling CoreML for this session.")
+                
+                # Fall through to PyTorch
 
-        # Run inference in thread pool (CoreML is blocking)
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            self._predict_sync,
-            features,
-            threshold
+        # Strategy 2: PyTorch (Fallback)
+        if self.pytorch_model is not None:
+             try:
+                # Run inference in thread pool
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    self._predict_sync_pytorch,
+                    features,
+                    threshold
+                )
+                
+                inference_time_ms = (time.perf_counter() - start) * 1000
+                self.inference_count += 1
+                self.total_inference_time_ms += inference_time_ms
+                result.inference_time_ms = inference_time_ms
+                
+                return result
+             except Exception as e:
+                 logger.error(f"❌ PyTorch fallback inference failed: {e}")
+
+        # Strategy 3: Empty Fallback
+        return IntentPrediction(
+            components=set(),
+            confidence_scores={},
+            inference_time_ms=(time.perf_counter() - start) * 1000,
+            used_neural_engine=False
         )
 
-        inference_time_ms = (time.perf_counter() - start) * 1000
+    def _predict_sync_coreml(
+        self,
+        features: np.ndarray,
+        threshold: float
+    ) -> IntentPrediction:
+        """Synchronous CoreML prediction"""
+        # Ensure 2D input
+        if features.ndim == 1:
+            features = features.reshape(1, -1)
 
-        # Update statistics
-        self.inference_count += 1
-        self.total_inference_time_ms += inference_time_ms
-        if result.used_neural_engine:
-            self.neural_engine_count += 1
+        # Convert to float32 (CoreML requirement)
+        features = features.astype(np.float32)
 
-        result.inference_time_ms = inference_time_ms
+        # CoreML inference
+        input_dict = {'features': features}
+        prediction = self.coreml_model.predict(input_dict)
 
-        return result
+        # Extract probabilities
+        probabilities = prediction['probabilities'].flatten()
 
+        return self._process_probabilities(probabilities, threshold, used_neural_engine=True)
+
+    def _predict_sync_pytorch(
+        self,
+        features: np.ndarray,
+        threshold: float
+    ) -> IntentPrediction:
+        """Synchronous PyTorch prediction (Fallback)"""
+        import torch
+        
+        # Ensure 2D input
+        if features.ndim == 1:
+            features = features.reshape(1, -1)
+            
+        # Convert to tensor
+        features_tensor = torch.FloatTensor(features).to(self.device)
+        
+        # Inference
+        self.pytorch_model.eval()
+        with torch.no_grad():
+            outputs = self.pytorch_model(features_tensor)
+            probabilities = outputs.cpu().numpy().flatten()
+            
+        return self._process_probabilities(probabilities, threshold, used_neural_engine=False)
+
+    def _process_probabilities(
+        self, 
+        probabilities: np.ndarray, 
+        threshold: float,
+        used_neural_engine: bool
+    ) -> IntentPrediction:
+        """Process raw probabilities into prediction result"""
+        components = set()
+        confidence_scores = {}
+
+        for idx, prob in enumerate(probabilities):
+            if idx < len(self.component_names):
+                component_name = self.component_names[idx]
+                if prob >= threshold:
+                    components.add(component_name)
+                confidence_scores[component_name] = float(prob)
+
+        return IntentPrediction(
+            components=components,
+            confidence_scores=confidence_scores,
+            inference_time_ms=0.0,  # Set by caller
+            used_neural_engine=used_neural_engine
+        )
+
+    # Legacy method kept for backward compatibility but redirecting to new implementations
     def _predict_sync(
         self,
         features: np.ndarray,
         threshold: float
     ) -> IntentPrediction:
-        """Synchronous prediction (called in thread pool)"""
-        try:
-            # Ensure 2D input
-            if features.ndim == 1:
-                features = features.reshape(1, -1)
-
-            # Convert to float32 (CoreML requirement)
-            features = features.astype(np.float32)
-
-            # CoreML inference
-            input_dict = {'features': features}
-            prediction = self.coreml_model.predict(input_dict)
-
-            # Extract probabilities
-            probabilities = prediction['probabilities'].flatten()
-
-            # Select components above threshold
-            components = set()
-            confidence_scores = {}
-
-            for idx, prob in enumerate(probabilities):
-                if idx < len(self.component_names):
-                    component_name = self.component_names[idx]
-                    if prob >= threshold:
-                        components.add(component_name)
-                    confidence_scores[component_name] = float(prob)
-
-            return IntentPrediction(
-                components=components,
-                confidence_scores=confidence_scores,
-                inference_time_ms=0.0,  # Will be set by caller
-                used_neural_engine=self.neural_engine_available
-            )
-
-        except Exception as e:
-            logger.error(f"CoreML inference error: {e}")
-            return IntentPrediction(
-                components=set(),
-                confidence_scores={},
-                inference_time_ms=0.0,
-                used_neural_engine=False
-            )
+        """DEPRECATED: Use _predict_sync_coreml or predictions_sync_pytorch"""
+        if self.coreml_model and not self.coreml_disabled:
+            try:
+                return self._predict_sync_coreml(features, threshold)
+            except Exception:
+                pass
+        
+        if self.pytorch_model:
+            return self._predict_sync_pytorch(features, threshold)
+            
+        return IntentPrediction(set(), {}, 0.0, False)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get classifier statistics"""
