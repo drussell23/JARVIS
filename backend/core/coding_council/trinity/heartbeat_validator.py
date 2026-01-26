@@ -162,7 +162,7 @@ class HeartbeatValidator:
         self._monitor_task: Optional[asyncio.Task] = None
         self._running = False
 
-        # v93.0: Enable cross-repo synchronization by default
+    # v93.0: Enable cross-repo synchronization by default
         self._cross_repo_sync_enabled = True
 
         # v108.0: Track component startup times for grace period awareness
@@ -170,6 +170,18 @@ class HeartbeatValidator:
 
         # v108.0: Cache for component-specific thresholds
         self._threshold_cache: Dict[str, Dict[str, float]] = {}
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v113.0: GLOBAL STARTUP GRACE PERIOD
+        # ═══════════════════════════════════════════════════════════════════
+        # This is the FIX for cross-repo staleness during startup.
+        # If the supervisor process just started, ALL components get grace period
+        # even if record_component_startup() wasn't called for them.
+        # ═══════════════════════════════════════════════════════════════════
+        self._global_startup_time = time.time()
+        self._global_startup_grace_seconds = _env_float(
+            "TRINITY_GLOBAL_STARTUP_GRACE_PERIOD", 120.0  # 2 minutes grace for all
+        )
 
     def get_stale_threshold(self, component_type: str) -> float:
         """
@@ -257,10 +269,14 @@ class HeartbeatValidator:
 
     def is_in_startup_grace_period(self, component_id: str, component_type: str) -> bool:
         """
-        v108.0: Check if a component is still in its startup grace period.
+        v113.0: Check if a component is still in its startup grace period.
 
         During startup, components should NOT be marked as dead/stale
         even if heartbeats are missing.
+
+        v113.0 CRITICAL FIX: Now uses GLOBAL startup grace period as fallback
+        for cross-repo components that weren't registered via record_component_startup().
+        This fixes the reactor_core staleness issue during Trinity startup.
 
         Args:
             component_id: Unique component ID
@@ -269,10 +285,28 @@ class HeartbeatValidator:
         Returns:
             True if component is still in grace period
         """
+        # ═══════════════════════════════════════════════════════════════════
+        # v113.0: CHECK GLOBAL GRACE PERIOD FIRST (affects ALL components)
+        # ═══════════════════════════════════════════════════════════════════
+        # This is the FIX for cross-repo staleness during startup.
+        # During system startup, ALL components get a grace period, even if
+        # record_component_startup() was never called for them.
+        # ═══════════════════════════════════════════════════════════════════
+        global_elapsed = time.time() - self._global_startup_time
+        if global_elapsed < self._global_startup_grace_seconds:
+            logger.debug(
+                f"[HeartbeatValidator] {component_id} in GLOBAL startup grace period "
+                f"({global_elapsed:.1f}s < {self._global_startup_grace_seconds}s)"
+            )
+            return True
+
+        # ═══════════════════════════════════════════════════════════════════
+        # v108.0: Per-component grace period (for components that were registered)
+        # ═══════════════════════════════════════════════════════════════════
         startup_time = self._component_startup_times.get(component_id)
 
         if startup_time is None:
-            # No recorded startup time - can't determine grace period
+            # No recorded startup time and global grace expired
             return False
 
         try:
@@ -287,7 +321,7 @@ class HeartbeatValidator:
 
             if in_grace:
                 logger.debug(
-                    f"[HeartbeatValidator] {component_id} in startup grace period "
+                    f"[HeartbeatValidator] {component_id} in per-component grace period "
                     f"({elapsed:.1f}s < {profile.startup_grace_period}s)"
                 )
 

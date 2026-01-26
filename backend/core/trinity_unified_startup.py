@@ -41,9 +41,11 @@ logger = logging.getLogger(__name__)
 class StartupPhase(str, Enum):
     """Phases of the startup process."""
     INITIALIZING = "initializing"
+    LOADING = "loading"              # v113.0: Loading server startup
     INFRASTRUCTURE = "infrastructure"  # Redis, shared state
     CORE = "core"                       # JARVIS-body
     SERVICES = "services"               # J-Prime, Reactor-Core
+    FRONTEND = "frontend"            # v113.0: React frontend
     VERIFYING = "verifying"             # Cross-repo health check
     COMPLETE = "complete"
     FAILED = "failed"
@@ -103,6 +105,18 @@ class TrinityUnifiedStartup:
         self._max_parallel = int(os.getenv("TRINITY_MAX_PARALLEL_STARTUP", "2"))
         self._startup_timeout = float(os.getenv("TRINITY_STARTUP_TIMEOUT", "300.0"))
         
+        # v113.0: Loading server and frontend process tracking
+        self._loading_server_process: Optional[asyncio.subprocess.Process] = None
+        self._frontend_process: Optional[asyncio.subprocess.Process] = None
+        self._loading_server_port = int(os.getenv("JARVIS_LOADING_PORT", "3001"))
+        self._frontend_port = int(os.getenv("JARVIS_FRONTEND_PORT", "3000"))
+        
+        # v113.0: Repo paths for cross-repo startup
+        self._jarvis_repo = Path(os.getenv(
+            "JARVIS_REPO", 
+            str(Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent")
+        ))
+        
     @property
     def phase(self) -> StartupPhase:
         return self._phase
@@ -141,6 +155,18 @@ class TrinityUnifiedStartup:
             
             # Write initial state (for other processes to detect startup in progress)
             await self._write_startup_state("starting")
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # v113.0: Phase 0 - Start loading server FIRST (shows progress to user)
+            # ═══════════════════════════════════════════════════════════════════
+            self._phase = StartupPhase.LOADING
+            await self._emit_phase_change("loading")
+            
+            loading_ok = await self._start_loading_server()
+            if loading_ok:
+                logger.info("[TrinityStartup] Loading server is serving startup progress")
+            else:
+                logger.warning("[TrinityStartup] Loading server failed, continuing without progress display")
             
             # Phase 1: Infrastructure
             if not skip_infrastructure:
@@ -228,6 +254,21 @@ class TrinityUnifiedStartup:
             
             verify_success = await self._verify_trinity_health()
             
+            # ═══════════════════════════════════════════════════════════════════
+            # v113.0: Phase 5 - Start frontend and stop loading server
+            # ═══════════════════════════════════════════════════════════════════
+            self._phase = StartupPhase.FRONTEND
+            await self._emit_phase_change("frontend")
+            
+            frontend_ok = await self._start_frontend()
+            if frontend_ok:
+                logger.info(f"[TrinityStartup] Frontend ready at http://localhost:{self._frontend_port}")
+                # Stop loading server now that frontend is ready
+                await self._stop_loading_server()
+            else:
+                logger.warning("[TrinityStartup] Frontend failed to start - loading page will remain active")
+                result.errors.append("Frontend failed to start")
+            
             # Complete
             self._phase = StartupPhase.COMPLETE
             result.phase = StartupPhase.COMPLETE
@@ -242,6 +283,8 @@ class TrinityUnifiedStartup:
                 f"[TrinityStartup] Complete: {healthy_count}/{len(self._services)} services healthy "
                 f"({result.total_duration:.1f}s)"
             )
+            if frontend_ok:
+                logger.info(f"🚀 JARVIS is online at http://localhost:{self._frontend_port}")
             
             return result
             
@@ -389,6 +432,158 @@ class TrinityUnifiedStartup:
             "reactor-core": int(os.getenv("REACTOR_CORE_PORT", "8090")),
         }
         return ports.get(service_name, 8010)
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # v113.0: LOADING SERVER AND FRONTEND STARTUP
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    async def _start_loading_server(self) -> bool:
+        """
+        v113.0: Start the loading server on port 3001 for startup progress display.
+        
+        The loading server serves loading-manager.js and broadcasts startup progress
+        to connected clients via WebSocket.
+        
+        Returns:
+            True if loading server started successfully
+        """
+        logger.info(f"[TrinityStartup] Starting loading server on port {self._loading_server_port}...")
+        
+        try:
+            # Check if loading_server.py exists
+            loading_server_path = self._jarvis_repo / "backend" / "loading_server.py"
+            if not loading_server_path.exists():
+                # Fallback: use Python HTTP server
+                loading_server_path = self._jarvis_repo / "frontend" / "public"
+                if loading_server_path.exists():
+                    self._loading_server_process = await asyncio.create_subprocess_exec(
+                        "python3", "-m", "http.server", str(self._loading_server_port),
+                        cwd=str(loading_server_path),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    logger.info(f"[TrinityStartup] Loading server started (fallback mode, pid={self._loading_server_process.pid})")
+                    return True
+                else:
+                    logger.warning("[TrinityStartup] Loading server path not found")
+                    return False
+            
+            # Start the dedicated loading server
+            self._loading_server_process = await asyncio.create_subprocess_exec(
+                "python3", str(loading_server_path),
+                env={
+                    **os.environ,
+                    "LOADING_SERVER_PORT": str(self._loading_server_port),
+                },
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            
+            # Wait for it to start
+            await asyncio.sleep(1.0)
+            
+            if self._loading_server_process.returncode is None:
+                logger.info(f"[TrinityStartup] Loading server started (pid={self._loading_server_process.pid})")
+                return True
+            else:
+                logger.warning(f"[TrinityStartup] Loading server exited with code {self._loading_server_process.returncode}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"[TrinityStartup] Failed to start loading server: {e}")
+            return False
+    
+    async def _start_frontend(self) -> bool:
+        """
+        v113.0: Start the React frontend on port 3000.
+        
+        This should be called AFTER the backend is healthy.
+        
+        Returns:
+            True if frontend started successfully
+        """
+        logger.info(f"[TrinityStartup] Starting frontend on port {self._frontend_port}...")
+        
+        try:
+            frontend_dir = self._jarvis_repo / "frontend"
+            
+            if not frontend_dir.exists():
+                logger.warning(f"[TrinityStartup] Frontend directory not found: {frontend_dir}")
+                return False
+            
+            # Check if node_modules exists
+            node_modules = frontend_dir / "node_modules"
+            if not node_modules.exists():
+                logger.info("[TrinityStartup] Installing frontend dependencies...")
+                npm_install = await asyncio.create_subprocess_exec(
+                    "npm", "install",
+                    cwd=str(frontend_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(npm_install.wait(), timeout=300.0)
+                if npm_install.returncode != 0:
+                    logger.warning("[TrinityStartup] npm install failed")
+                    return False
+            
+            # Start the frontend dev server
+            env = {
+                **os.environ,
+                "PORT": str(self._frontend_port),
+                "BROWSER": "none",  # Don't auto-open browser
+                "REACT_APP_BACKEND_URL": f"http://localhost:{self._get_service_port('jarvis-body')}",
+            }
+            
+            self._frontend_process = await asyncio.create_subprocess_exec(
+                "npm", "start",
+                cwd=str(frontend_dir),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            
+            # Wait for frontend to be ready (poll health endpoint)
+            deadline = time.time() + 120.0  # 2 minute timeout for webpack
+            check_interval = 3.0
+            
+            while time.time() < deadline:
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.head(
+                            f"http://localhost:{self._frontend_port}/",
+                            timeout=aiohttp.ClientTimeout(total=5.0)
+                        ) as resp:
+                            if resp.status in (200, 304):
+                                logger.info(f"[TrinityStartup] Frontend ready (pid={self._frontend_process.pid})")
+                                return True
+                except Exception:
+                    pass
+                
+                # Check if process died
+                if self._frontend_process.returncode is not None:
+                    logger.warning(f"[TrinityStartup] Frontend exited with code {self._frontend_process.returncode}")
+                    return False
+                
+                await asyncio.sleep(check_interval)
+            
+            logger.warning("[TrinityStartup] Frontend startup timeout")
+            return False
+            
+        except Exception as e:
+            logger.error(f"[TrinityStartup] Failed to start frontend: {e}")
+            return False
+    
+    async def _stop_loading_server(self) -> None:
+        """v113.0: Stop the loading server (called after frontend is ready)."""
+        if self._loading_server_process and self._loading_server_process.returncode is None:
+            logger.info("[TrinityStartup] Stopping loading server...")
+            try:
+                self._loading_server_process.terminate()
+                await asyncio.wait_for(self._loading_server_process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self._loading_server_process.kill()
+            self._loading_server_process = None
     
     async def _write_startup_state(self, status: str) -> None:
         """Write current startup state for cross-process coordination."""
