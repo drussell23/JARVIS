@@ -538,6 +538,65 @@ class CrossRepoOrchestrator:
                 details={"error": str(e)}
             )
 
+    async def start_coordination(self) -> None:
+        """
+        v2.0: Start cross-repo coordination without starting repos.
+
+        This is the lightweight entry point used by run_supervisor.py.
+        It discovers existing repos and starts health monitoring/coordination
+        without attempting to start the repos themselves (they may already be running).
+
+        For full startup orchestration (starting all repos), use start_all_repos().
+        """
+        logger.info("=" * 70)
+        logger.info("Cross-Repo Coordination - Starting Health Monitoring")
+        logger.info("=" * 70)
+
+        try:
+            # Check existing repo health using existing infrastructure
+            for repo_id, repo in self.repos.items():
+                if repo.path and repo.path.exists():
+                    # Use existing health check method (takes repo_id string)
+                    is_healthy = await self._check_repo_health(repo_id)
+                    if is_healthy:
+                        repo.status = RepoStatus.HEALTHY
+                        logger.info(f"  ✅ {repo.name}: HEALTHY")
+                    else:
+                        repo.status = RepoStatus.UNREACHABLE
+                        logger.info(f"  ⚪ {repo.name}: UNREACHABLE (not started or not responding)")
+                else:
+                    repo.status = RepoStatus.NOT_STARTED
+                    logger.info(f"  ⚫ {repo.name}: NOT FOUND at {repo.path}")
+
+            # Start health monitoring
+            if self.config.health_check_interval > 0:
+                self._running = True
+                self._health_monitor_task = asyncio.create_task(
+                    self._health_monitor_loop(),
+                    name="cross_repo_health_monitor"
+                )
+                logger.info("✅ Cross-repo health monitoring started")
+
+            # Start auto-recovery if enabled
+            if self.config.auto_recovery_enabled:
+                self._recovery_task = asyncio.create_task(
+                    self._recovery_loop(),
+                    name="cross_repo_recovery"
+                )
+                logger.info("✅ Cross-repo auto-recovery enabled")
+
+            # Summary
+            healthy_count = sum(
+                1 for r in self.repos.values()
+                if r.status == RepoStatus.HEALTHY
+            )
+            logger.info(f"🎯 Coordination active: {healthy_count}/{len(self.repos)} repos healthy")
+            logger.info("=" * 70)
+
+        except Exception as e:
+            logger.error(f"Failed to start coordination: {e}", exc_info=True)
+            raise
+
     async def _start_jarvis_core(self) -> bool:
         """Start JARVIS Core (this repo)."""
         try:

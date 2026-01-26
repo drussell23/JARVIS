@@ -22597,12 +22597,27 @@ def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="JARVIS Supervisor - Unified System Orchestrator",
+        description="JARVIS Supervisor - Unified System Orchestrator (v116.0)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Start supervisor normally
+  # Start supervisor (intelligent auto mode - handles existing supervisors)
   python run_supervisor.py
+
+  # Check status of running supervisor
+  python run_supervisor.py --status
+
+  # Gracefully restart running supervisor (in-place restart)
+  python run_supervisor.py --restart
+
+  # Take over from existing supervisor (old shuts down, new starts)
+  python run_supervisor.py --takeover
+
+  # Shut down running supervisor
+  python run_supervisor.py --shutdown
+
+  # Force start (dangerous - use only when stuck)
+  python run_supervisor.py --force
 
   # Execute single agentic task and exit
   python run_supervisor.py --task "Open Safari and check the weather"
@@ -22612,6 +22627,16 @@ Examples:
 
   # Disable voice narration
   python run_supervisor.py --no-voice
+
+  # Start without cross-repo coordination
+  python run_supervisor.py --no-connect-repos
+
+v116.0 Intelligent Startup Behavior:
+  When a supervisor is already running, the default behavior is:
+  1. Check if existing supervisor is healthy
+  2. If healthy: Show status and available options (no duplicate startup)
+  3. If unhealthy: Automatically take over from the zombie supervisor
+  4. If unreachable: Clean up and start fresh
 """
     )
 
@@ -22638,6 +22663,57 @@ Examples:
         type=float,
         default=300.0,
         help="Task timeout in seconds (default: 300)"
+    )
+
+    # v116.0: Intelligent restart/takeover options
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Gracefully restart existing supervisor (sends restart signal)"
+    )
+
+    parser.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Request takeover from existing supervisor (it shuts down, we start)"
+    )
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force start even if another supervisor is running (USE WITH CAUTION)"
+    )
+
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Check supervisor status and exit (no startup)"
+    )
+
+    parser.add_argument(
+        "--shutdown",
+        action="store_true",
+        help="Request graceful shutdown of running supervisor and exit"
+    )
+
+    parser.add_argument(
+        "--connect-repos",
+        action="store_true",
+        default=True,
+        help="Enable cross-repo coordination (default: True)"
+    )
+
+    parser.add_argument(
+        "--no-connect-repos",
+        action="store_true",
+        help="Disable cross-repo coordination"
+    )
+
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        default=True,
+        help="Intelligent auto mode: auto-detect best action (default)"
     )
 
     return parser.parse_args()
@@ -23053,47 +23129,229 @@ async def main() -> int:
     args = parse_args()
 
     # =========================================================================
-    # v110.0: SINGLETON ENFORCEMENT - Prevent duplicate supervisors
+    # v116.0: INTELLIGENT SINGLETON MANAGEMENT - Smart startup with takeover
     # =========================================================================
-    # This prevents the critical bug where both run_supervisor.py and
-    # start_system.py run simultaneously, causing memory exhaustion and crashes.
+    # Enhanced from v110.0 to support intelligent restart/takeover modes:
+    # - --status: Just check status and exit
+    # - --shutdown: Request graceful shutdown of running supervisor
+    # - --restart: Request restart of running supervisor (no new instance)
+    # - --takeover: Gracefully take over from running supervisor
+    # - --force: Force start even if another is running (dangerous)
+    # - --auto (default): Intelligent decision based on situation
     # =========================================================================
     if _SINGLETON_AVAILABLE:
-        is_running, existing_state = is_supervisor_running()
-        if is_running and existing_state:
-            print(f"\n{'='*70}")
-            print(f"❌ JARVIS SUPERVISOR ALREADY RUNNING!")
-            print(f"{'='*70}")
-            print(f"   Entry Point: {existing_state.get('entry_point', 'unknown')}")
-            print(f"   PID:         {existing_state.get('pid', 'unknown')}")
-            print(f"   Started:     {existing_state.get('started_at', 'unknown')}")
-            print(f"   Working Dir: {existing_state.get('working_dir', 'unknown')}")
-            print(f"{'='*70}")
-            print(f"\nTo stop the existing instance:")
-            print(f"   kill {existing_state.get('pid', '<PID>')}")
-            print(f"\nOr use API endpoint:")
-            print(f"   curl http://localhost:8010/shutdown")
-            print(f"\nv113.0 IPC Commands (from another terminal):")
-            print(f"   python3 -c \"from backend.core.supervisor_singleton import send_supervisor_command_sync; print(send_supervisor_command_sync('status'))\"")
-            print(f"   python3 -c \"from backend.core.supervisor_singleton import send_supervisor_command_sync; print(send_supervisor_command_sync('restart'))\"")
-            print(f"   python3 -c \"from backend.core.supervisor_singleton import send_supervisor_command_sync; print(send_supervisor_command_sync('shutdown'))\"")
-            print(f"{'='*70}\n")
-            return 1
+        # v116.0: Use async version since we're in async context
+        from backend.core.supervisor_singleton import send_supervisor_command
 
+        async def send_ipc_command(cmd: str, timeout: float = 5.0) -> dict:
+            """Helper to send IPC command with error handling."""
+            try:
+                return await send_supervisor_command(cmd, timeout=timeout)
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+        is_running, existing_state = is_supervisor_running()
+
+        # =====================================================================
+        # Handle --status: Just show status and exit
+        # =====================================================================
+        if args.status:
+            if is_running and existing_state:
+                print(f"\n{'='*70}")
+                print(f"✅ JARVIS SUPERVISOR STATUS")
+                print(f"{'='*70}")
+                print(f"   Status:      RUNNING")
+                print(f"   Entry Point: {existing_state.get('entry_point', 'unknown')}")
+                print(f"   PID:         {existing_state.get('pid', 'unknown')}")
+                print(f"   Started:     {existing_state.get('started_at', 'unknown')}")
+                print(f"   Working Dir: {existing_state.get('working_dir', 'unknown')}")
+
+                # Get detailed health via IPC
+                try:
+                    health_result = await send_ipc_command('health', timeout=5.0)
+                    if health_result.get('success'):
+                        health_data = health_result.get('health', {})
+                        print(f"\n   Health Level: {health_data.get('health_level', 'unknown')}")
+                        print(f"   IPC Active:   {health_data.get('ipc_active', False)}")
+                        print(f"   HTTP Active:  {health_data.get('http_active', False)}")
+                except Exception:
+                    pass
+
+                print(f"{'='*70}\n")
+                return 0
+            else:
+                print(f"\n{'='*70}")
+                print(f"⚪ JARVIS SUPERVISOR STATUS")
+                print(f"{'='*70}")
+                print(f"   Status: NOT RUNNING")
+                print(f"{'='*70}\n")
+                return 1
+
+        # =====================================================================
+        # Handle --shutdown: Request graceful shutdown of running supervisor
+        # =====================================================================
+        if args.shutdown:
+            if is_running and existing_state:
+                print(f"\n🔄 Requesting graceful shutdown of supervisor (PID {existing_state.get('pid')})...")
+                result = send_supervisor_command_sync('shutdown', timeout=10.0)
+                if result.get('success') or result.get('shutdown_initiated'):
+                    print(f"✅ Shutdown initiated. Supervisor will exit gracefully.")
+                    return 0
+                else:
+                    print(f"❌ Failed to initiate shutdown: {result.get('error', 'unknown')}")
+                    return 1
+            else:
+                print(f"⚪ No supervisor running to shut down.")
+                return 0
+
+        # =====================================================================
+        # Handle --restart: Request restart of running supervisor (no new instance)
+        # =====================================================================
+        if args.restart and not args.takeover:
+            if is_running and existing_state:
+                print(f"\n🔄 Requesting restart of supervisor (PID {existing_state.get('pid')})...")
+                result = send_supervisor_command_sync('restart', timeout=10.0)
+                if result.get('success') or result.get('restart_initiated'):
+                    print(f"✅ Restart initiated. Supervisor will restart in-place.")
+                    return 0
+                else:
+                    print(f"❌ Failed to initiate restart: {result.get('error', 'unknown')}")
+                    return 1
+            else:
+                print(f"⚪ No supervisor running. Starting fresh instance...")
+                # Fall through to normal startup
+
+        # =====================================================================
+        # Handle supervisor already running
+        # =====================================================================
+        if is_running and existing_state:
+            existing_pid = existing_state.get('pid', 'unknown')
+
+            # --force: Skip all checks and force start (dangerous!)
+            if args.force:
+                print(f"\n⚠️  WARNING: --force specified. Forcefully starting despite existing supervisor.")
+                print(f"   This may cause conflicts! Existing PID: {existing_pid}")
+                print(f"   Attempting to force-stop existing instance...")
+
+                result = send_supervisor_command_sync('force-stop', timeout=5.0)
+                await asyncio.sleep(2.0)  # Give it time to die
+
+            # --takeover: Graceful takeover from existing supervisor
+            elif args.takeover:
+                print(f"\n🔄 Requesting graceful takeover from existing supervisor (PID {existing_pid})...")
+                print(f"   Sending takeover request...")
+
+                result = send_supervisor_command_sync('takeover', timeout=10.0)
+                if result.get('success') or result.get('takeover_accepted'):
+                    print(f"   ✅ Takeover accepted. Waiting for existing supervisor to shutdown...")
+
+                    # Wait for existing supervisor to shutdown
+                    max_wait = 15.0
+                    wait_interval = 0.5
+                    waited = 0.0
+
+                    while waited < max_wait:
+                        await asyncio.sleep(wait_interval)
+                        waited += wait_interval
+
+                        still_running, _ = is_supervisor_running()
+                        if not still_running:
+                            print(f"   ✅ Previous supervisor has exited. Starting new instance...")
+                            break
+
+                        if waited % 2.0 < wait_interval:  # Print every 2 seconds
+                            print(f"   ... waiting ({waited:.0f}s)")
+
+                    if waited >= max_wait:
+                        print(f"   ⚠️  Timeout waiting for previous supervisor. Attempting to proceed...")
+                else:
+                    print(f"   ⚠️  Takeover request failed: {result.get('error', 'unknown')}")
+                    print(f"   Attempting to proceed anyway...")
+
+            # --auto (default): Intelligent decision
+            else:
+                print(f"\n{'='*70}")
+                print(f"🤖 JARVIS SUPERVISOR - INTELLIGENT STARTUP")
+                print(f"{'='*70}")
+                print(f"   Detected: Supervisor already running (PID {existing_pid})")
+                print(f"   Entry Point: {existing_state.get('entry_point', 'unknown')}")
+                print(f"   Started:     {existing_state.get('started_at', 'unknown')}")
+                print(f"{'='*70}")
+
+                # Check if existing supervisor is healthy
+                print(f"\n   Checking health of existing supervisor...")
+                health_result = send_supervisor_command_sync('health', timeout=5.0)
+
+                if health_result.get('success'):
+                    health_data = health_result.get('health', {})
+                    health_level = health_data.get('health_level', 'UNKNOWN')
+                    print(f"   Health Level: {health_level}")
+
+                    if health_level in ('FULLY_READY', 'HTTP_HEALTHY', 'IPC_RESPONSIVE'):
+                        # Existing supervisor is healthy - offer options
+                        print(f"\n   ✅ Existing supervisor is healthy and responsive.")
+                        print(f"\n   Options:")
+                        print(f"   1. Use the running supervisor (no action needed)")
+                        print(f"   2. python3 run_supervisor.py --takeover  (graceful takeover)")
+                        print(f"   3. python3 run_supervisor.py --restart   (restart in-place)")
+                        print(f"   4. python3 run_supervisor.py --shutdown  (stop supervisor)")
+                        print(f"   5. python3 run_supervisor.py --force     (force start - dangerous)")
+                        print(f"\n   API Endpoints (running at http://localhost:8010):")
+                        print(f"   • GET /health/ready - Check readiness")
+                        print(f"   • GET /status       - Get status")
+                        print(f"   • POST /api/message - Send message")
+                        print(f"{'='*70}\n")
+                        return 0  # Exit cleanly - supervisor is running and healthy
+                    else:
+                        # Existing supervisor is unhealthy - auto-takeover
+                        print(f"\n   ⚠️  Existing supervisor appears unhealthy (level: {health_level})")
+                        print(f"   Initiating automatic takeover...")
+
+                        result = send_supervisor_command_sync('takeover', timeout=5.0)
+                        await asyncio.sleep(3.0)  # Give it time
+                else:
+                    # Can't reach existing supervisor - it may be zombie
+                    print(f"   ⚠️  Cannot reach existing supervisor via IPC.")
+                    print(f"   It may be a zombie process. Attempting cleanup...")
+
+                    # Try force-stop
+                    result = send_supervisor_command_sync('force-stop', timeout=2.0)
+                    await asyncio.sleep(2.0)
+
+        # =====================================================================
+        # Acquire lock and start new supervisor
+        # =====================================================================
         if not acquire_supervisor_lock("run_supervisor"):
-            print("\n❌ Could not acquire supervisor lock. Another instance may be starting.")
-            return 1
+            # One more check - maybe previous instance just died
+            await asyncio.sleep(1.0)
+            if not acquire_supervisor_lock("run_supervisor"):
+                print("\n❌ Could not acquire supervisor lock. Another instance may be starting.")
+                print("   Try: python3 run_supervisor.py --force")
+                return 1
 
         # Start heartbeat to keep lock fresh
         await start_supervisor_heartbeat()
-        
+
         # v113.0: Start IPC server for remote commands (status, restart, shutdown, takeover)
         try:
             from backend.core.supervisor_singleton import start_supervisor_ipc_server
             await start_supervisor_ipc_server()
-            print("[v113.0] Supervisor IPC server started")
+            print("[v116.0] Supervisor IPC server started")
         except Exception as e:
-            print(f"[v113.0] IPC server warning: {e}")  # Non-fatal, continue startup
+            print(f"[v116.0] IPC server warning: {e}")  # Non-fatal, continue startup
+
+        # v116.0: Initialize cross-repo coordination if enabled
+        if args.connect_repos and not args.no_connect_repos:
+            try:
+                from backend.core.cross_repo_orchestrator import CrossRepoOrchestrator
+                orchestrator = CrossRepoOrchestrator()
+                asyncio.create_task(
+                    orchestrator.start_coordination(),
+                    name="cross_repo_coordinator"
+                )
+                print("[v116.0] Cross-repo coordination initialized")
+            except Exception as e:
+                print(f"[v116.0] Cross-repo coordination warning: {e}")  # Non-fatal
 
     # =========================================================================
     # v95.17: Clean up orphaned semaphores from previous crashes
