@@ -105,6 +105,146 @@ HEALTH_CHECK_TIMEOUT = _get_env_float("JARVIS_HEALTH_CHECK_TIMEOUT", 3.0)
 IPC_TIMEOUT = _get_env_float("JARVIS_IPC_TIMEOUT", 2.0)
 HTTP_HEALTH_PORTS = [int(p) for p in os.environ.get("JARVIS_HTTP_PORTS", "8080,8000,8010").split(",")]
 
+# =============================================================================
+# v116.0: Global Process Registry for Trinity Component Tracking
+# =============================================================================
+# This registry tracks all PIDs spawned by this supervisor session.
+# It's used by the SIGHUP handler to distinguish "our" processes from orphans.
+# CRITICAL: This prevents the restart handler from killing running services.
+#
+# Design:
+# - Thread-safe set (Python's set is thread-safe for add/remove/in operations)
+# - Persisted to disk for crash recovery
+# - Cleared on supervisor start
+# - Processes register themselves when spawned
+# - SIGHUP handler checks this before killing port-holders
+# =============================================================================
+
+import threading
+
+class GlobalProcessRegistry:
+    """
+    v116.0: Global registry of spawned process PIDs.
+
+    This singleton tracks all PIDs spawned by this supervisor session to prevent
+    the SIGHUP/restart handler from killing our own running services.
+
+    Thread-safe: Uses threading.Lock for all operations.
+
+    Usage:
+        # Register a spawned process
+        GlobalProcessRegistry.register(pid, component="jarvis-prime", port=8000)
+
+        # Check if a PID belongs to us
+        if GlobalProcessRegistry.is_ours(pid):
+            # Don't kill it - it's our process
+            pass
+
+        # Deregister on process exit
+        GlobalProcessRegistry.deregister(pid)
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+    _pids: Dict[int, Dict[str, Any]] = {}  # PID -> {component, port, start_time}
+    _registry_file = LOCK_DIR / "spawned_pids.json"
+
+    @classmethod
+    def register(cls, pid: int, component: str = "unknown", port: int = 0) -> None:
+        """Register a spawned process PID."""
+        with cls._lock:
+            cls._pids[pid] = {
+                "component": component,
+                "port": port,
+                "start_time": time.time(),
+                "session_id": os.getpid()  # Parent session
+            }
+            cls._persist()
+            logger.debug(f"[ProcessRegistry] Registered PID {pid} ({component}) on port {port}")
+
+    @classmethod
+    def deregister(cls, pid: int) -> None:
+        """Remove a PID from the registry."""
+        with cls._lock:
+            if pid in cls._pids:
+                info = cls._pids.pop(pid)
+                cls._persist()
+                logger.debug(f"[ProcessRegistry] Deregistered PID {pid} ({info.get('component', 'unknown')})")
+
+    @classmethod
+    def is_ours(cls, pid: int) -> bool:
+        """Check if a PID was spawned by this supervisor session."""
+        with cls._lock:
+            return pid in cls._pids
+
+    @classmethod
+    def get_all(cls) -> Dict[int, Dict[str, Any]]:
+        """Get all registered PIDs with their metadata."""
+        with cls._lock:
+            return dict(cls._pids)
+
+    @classmethod
+    def clear(cls) -> None:
+        """Clear all registered PIDs (call on supervisor start)."""
+        with cls._lock:
+            cls._pids.clear()
+            cls._persist()
+            logger.debug("[ProcessRegistry] Cleared all registered PIDs")
+
+    @classmethod
+    def load_from_disk(cls) -> None:
+        """Load registry from disk (for recovery after crash)."""
+        try:
+            if cls._registry_file.exists():
+                with open(cls._registry_file) as f:
+                    data = json.load(f)
+
+                # Validate PIDs still exist
+                with cls._lock:
+                    for pid_str, info in data.items():
+                        pid = int(pid_str)
+                        try:
+                            os.kill(pid, 0)  # Check if process exists
+                            cls._pids[pid] = info
+                        except OSError:
+                            pass  # Process no longer exists
+
+                logger.debug(f"[ProcessRegistry] Loaded {len(cls._pids)} PIDs from disk")
+        except Exception as e:
+            logger.debug(f"[ProcessRegistry] Could not load from disk: {e}")
+
+    @classmethod
+    def _persist(cls) -> None:
+        """Persist registry to disk (called with lock held)."""
+        try:
+            cls._registry_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cls._registry_file, 'w') as f:
+                json.dump({str(k): v for k, v in cls._pids.items()}, f)
+        except Exception as e:
+            logger.debug(f"[ProcessRegistry] Could not persist: {e}")
+
+    @classmethod
+    def cleanup_dead_pids(cls) -> int:
+        """Remove PIDs that no longer exist. Returns count of removed."""
+        removed = 0
+        with cls._lock:
+            dead_pids = []
+            for pid in cls._pids:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    dead_pids.append(pid)
+
+            for pid in dead_pids:
+                cls._pids.pop(pid, None)
+                removed += 1
+
+            if removed:
+                cls._persist()
+                logger.debug(f"[ProcessRegistry] Cleaned up {removed} dead PIDs")
+
+        return removed
+
 # v115.0: Health check levels
 class HealthLevel(IntEnum):
     """Progressive health verification levels."""
@@ -2033,13 +2173,33 @@ def _setup_sighup_handler() -> None:
                 logger.debug(f"Child cleanup warning: {e}")
 
             # Step 4b: Kill any process holding Trinity ports (orphans from prev session)
+            # v116.0: CRITICAL FIX - Check GlobalProcessRegistry before killing!
+            # This prevents killing processes spawned by THIS session.
             killed_ports = []
+            skipped_our_processes = []
             try:
+                # v116.0: Get set of child PIDs we just terminated
+                terminated_child_pids = {c.pid for c in children} if children else set()
+
                 for conn in psutil.net_connections(kind='inet'):
                     if conn.laddr.port in TRINITY_PORTS and conn.pid:
                         pid = conn.pid
                         if pid in (current_pid, current_ppid):
                             continue  # Don't kill ourselves or parent
+
+                        # v116.0: Skip if this PID was already terminated as a child
+                        if pid in terminated_child_pids:
+                            logger.debug(f"[Singleton] PID {pid} already terminated as child")
+                            continue
+
+                        # v116.0: CRITICAL - Check if this is OUR process
+                        if GlobalProcessRegistry.is_ours(pid):
+                            logger.info(
+                                f"[Singleton] v116.0: SKIPPING port {conn.laddr.port} PID {pid} "
+                                f"(registered as OUR process)"
+                            )
+                            skipped_our_processes.append((pid, conn.laddr.port))
+                            continue
 
                         try:
                             proc = psutil.Process(pid)
@@ -2049,8 +2209,8 @@ def _setup_sighup_handler() -> None:
                             if any(p in cmdline.lower() for p in
                                    ['jarvis', 'uvicorn', 'trinity_orchestrator', 'reactor']):
                                 logger.info(
-                                    f"[Singleton] Killing orphan on port {conn.laddr.port}: "
-                                    f"PID {pid}"
+                                    f"[Singleton] Killing ORPHAN on port {conn.laddr.port}: "
+                                    f"PID {pid} (not in registry)"
                                 )
                                 try:
                                     os.kill(pid, signal.SIGTERM)
@@ -2064,11 +2224,26 @@ def _setup_sighup_handler() -> None:
             except Exception as e:
                 logger.debug(f"Port cleanup warning: {e}")
 
+            # v116.0: Log summary of port cleanup
             if killed_ports:
                 # Wait for ports to be released
                 import time
                 time.sleep(0.5)
-                logger.info(f"[Singleton] Freed ports: {killed_ports}")
+                logger.info(f"[Singleton] Freed orphan ports: {killed_ports}")
+
+            if skipped_our_processes:
+                logger.info(
+                    f"[Singleton] v116.0: Preserved {len(skipped_our_processes)} OUR processes "
+                    f"(PIDs: {[p[0] for p in skipped_our_processes]})"
+                )
+
+            # v116.0: Clear the process registry on restart
+            # New supervisor will create fresh registry
+            try:
+                GlobalProcessRegistry.clear()
+                logger.debug("[Singleton] Process registry cleared for restart")
+            except Exception:
+                pass
 
         except ImportError:
             # psutil not available - try basic approach

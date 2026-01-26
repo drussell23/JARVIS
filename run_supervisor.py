@@ -10262,6 +10262,7 @@ class SupervisorBootstrapper:
     ) -> None:
         """
         v102.0: Register a Trinity process in the unified process tree.
+        v116.0: Also registers in GlobalProcessRegistry for SIGHUP protection.
 
         This ensures proper tracking and cascading shutdown of Trinity components.
 
@@ -10270,6 +10271,22 @@ class SupervisorBootstrapper:
             name: Human-readable name (e.g., "J-Prime", "Reactor-Core")
             role_str: Role string - one of "jprime", "reactor", "backend", "service"
         """
+        # v116.0: CRITICAL - Register in GlobalProcessRegistry for SIGHUP protection
+        # This MUST happen regardless of process tree state to prevent the SIGHUP
+        # handler from killing our own spawned processes during restart
+        try:
+            from backend.core.supervisor_singleton import GlobalProcessRegistry
+            port_map = {"jprime": 8000, "reactor": 8090, "backend": 8010, "service": 0}
+            GlobalProcessRegistry.register(
+                pid=pid,
+                component=name,
+                port=port_map.get(role_str, 0)
+            )
+            self.logger.debug(f"[v116.0] Registered {name} (PID {pid}) in GlobalProcessRegistry")
+        except Exception as reg_err:
+            self.logger.debug(f"[v116.0] GlobalProcessRegistry registration failed for {name}: {reg_err}")
+
+        # v102.0: Process tree registration (optional - may not be initialized)
         if not hasattr(self, '_process_tree') or self._process_tree is None:
             self.logger.debug(f"[v102.0] Skipping process tree registration for {name} - tree not initialized")
             return
@@ -10310,9 +10327,20 @@ class SupervisorBootstrapper:
     async def _unregister_trinity_process_from_tree(self, pid: int, name: str) -> None:
         """
         v102.0: Unregister a Trinity process from the unified process tree.
+        v116.0: Also deregisters from GlobalProcessRegistry.
 
         Called when a Trinity process is stopped or crashes.
         """
+        # v116.0: CRITICAL - Deregister from GlobalProcessRegistry
+        # This allows the SIGHUP handler to kill orphaned processes from previous sessions
+        try:
+            from backend.core.supervisor_singleton import GlobalProcessRegistry
+            GlobalProcessRegistry.deregister(pid)
+            self.logger.debug(f"[v116.0] Deregistered {name} (PID {pid}) from GlobalProcessRegistry")
+        except Exception as dereg_err:
+            self.logger.debug(f"[v116.0] GlobalProcessRegistry deregistration failed for {name}: {dereg_err}")
+
+        # v102.0: Process tree deregistration
         if not hasattr(self, '_process_tree') or self._process_tree is None:
             return
 
@@ -19276,6 +19304,18 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     self.logger.info(f"   📄 Logs: {stdout_log}")
                     print(f"  {TerminalUI.GREEN}✓ J-Prime launched (PID: {self._jprime_orchestrator_process.pid}){TerminalUI.RESET}")
 
+                    # v116.0: Register process in GlobalProcessRegistry for SIGHUP protection
+                    try:
+                        from backend.core.supervisor_singleton import GlobalProcessRegistry
+                        GlobalProcessRegistry.register(
+                            self._jprime_orchestrator_process.pid,
+                            component="jarvis-prime",
+                            port=8000
+                        )
+                        self.logger.debug(f"   [v116.0] J-Prime PID registered in GlobalProcessRegistry")
+                    except Exception as reg_err:
+                        self.logger.debug(f"   [v116.0] Could not register J-Prime PID: {reg_err}")
+
                     launched = True
                     break
 
@@ -19411,6 +19451,18 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 self.logger.info(f"   ✅ Reactor-Core launched (PID: {self._reactor_core_orchestrator_process.pid})")
                 self.logger.info(f"   📄 Logs: {stdout_log}")
                 print(f"  {TerminalUI.GREEN}✓ Reactor-Core launched (PID: {self._reactor_core_orchestrator_process.pid}){TerminalUI.RESET}")
+
+                # v116.0: Register process in GlobalProcessRegistry for SIGHUP protection
+                try:
+                    from backend.core.supervisor_singleton import GlobalProcessRegistry
+                    GlobalProcessRegistry.register(
+                        self._reactor_core_orchestrator_process.pid,
+                        component="reactor-core",
+                        port=8090
+                    )
+                    self.logger.debug(f"   [v116.0] Reactor-Core PID registered in GlobalProcessRegistry")
+                except Exception as reg_err:
+                    self.logger.debug(f"   [v116.0] Could not register Reactor-Core PID: {reg_err}")
 
             except Exception as e:
                 # v100.1: Clean up file handles on error
