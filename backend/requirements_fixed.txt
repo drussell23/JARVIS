@@ -11,7 +11,7 @@ python-multipart==0.0.6
 spacy>=3.7.0
 
 # Voice dependencies
-sounddevice==0.4.6
+sounddevice==0.5.5
 soundfile==0.12.1
 pydub==0.25.1
 gtts==2.5.4
