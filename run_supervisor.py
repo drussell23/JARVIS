@@ -2906,10 +2906,40 @@ class ParallelProcessCleaner:
         
         if not discovered:
             return 0, []
-        
+
+        # v117.0: Filter out PRESERVED services from GlobalProcessRegistry
+        # These services were preserved during os.execv() restart and should NOT be killed
+        try:
+            from backend.core.supervisor_singleton import GlobalProcessRegistry
+            preserved_pids = set(GlobalProcessRegistry.get_all().keys())
+            if preserved_pids:
+                original_count = len(discovered)
+                # Filter out preserved services
+                preserved_removed = []
+                for pid in list(discovered.keys()):
+                    if pid in preserved_pids:
+                        info = discovered.pop(pid)
+                        preserved_removed.append((pid, info.command[:50]))
+                if preserved_removed:
+                    self.logger.info(
+                        f"[v117.0] Preserved {len(preserved_removed)} service(s) from cleanup: "
+                        f"{[(p, c) for p, c in preserved_removed]}"
+                    )
+                    # Reduced message for narrator
+                    if not discovered:
+                        self.logger.info("[v117.0] All discovered processes are preserved - skipping cleanup")
+                        return 0, list(discovered.values())
+        except ImportError:
+            pass
+        except Exception as e:
+            self.logger.debug(f"[v117.0] GlobalProcessRegistry check failed: {e}")
+
+        if not discovered:
+            return 0, []
+
         # Announce cleanup
         await self.narrator.speak("Cleaning up previous session.", wait=False)
-        
+
         # Phase 2: Parallel termination with semaphore
         perf.start("termination")
         terminated = await self._parallel_terminate(discovered)
