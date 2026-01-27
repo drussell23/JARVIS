@@ -202,6 +202,134 @@ _ensure_venv_python()
 del _os, _sys, _Path, _ensure_venv_python
 
 # =============================================================================
+# v119.2b: FAST EARLY-EXIT FOR RUNNING SUPERVISOR
+# =============================================================================
+# This check runs BEFORE heavy imports (PyTorch, transformers, GCP libs).
+# If supervisor is already running and healthy, we can exit immediately
+# without loading 2GB+ of ML libraries. Makes `python3 run_supervisor.py`
+# instant when supervisor is already running.
+# =============================================================================
+def _fast_supervisor_check():
+    """
+    v119.2b: Ultra-fast check for running supervisor before heavy imports.
+
+    Uses only standard library - no external dependencies.
+    Returns True if we handled the request and should exit.
+    """
+    import os as _os
+    import sys as _sys
+    import socket as _socket
+    import json as _json
+    from pathlib import Path as _Path
+
+    # Only run fast path if no action flags passed
+    # These flags require full initialization
+    action_flags = ['--restart', '--shutdown', '--takeover', '--force',
+                    '--status', '--cleanup', '--task', '--mode', '--help', '-h']
+    if any(flag in _sys.argv for flag in action_flags):
+        return False  # Need full initialization
+
+    # Check if IPC socket exists
+    sock_path = _Path.home() / ".jarvis" / "locks" / "supervisor.sock"
+    if not sock_path.exists():
+        return False  # No supervisor running
+
+    # Try to connect to supervisor with retry
+    data = b''
+    max_retries = 2
+    sock_timeout = 8.0  # Longer timeout - health check can take a few seconds
+
+    for attempt in range(max_retries):
+        try:
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(sock_timeout)
+            sock.connect(str(sock_path))
+
+            # Send health command
+            msg = _json.dumps({'command': 'health'}) + '\n'
+            sock.sendall(msg.encode())
+
+            # Receive response
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b'\n' in data:
+                        break
+                except _socket.timeout:
+                    break  # Partial data timeout
+
+            sock.close()
+
+            if data:
+                break  # Got data, exit retry loop
+
+        except (_socket.timeout, ConnectionRefusedError, FileNotFoundError):
+            if attempt < max_retries - 1:
+                import time as _time
+                _time.sleep(0.5)  # Brief pause before retry
+                continue
+            return False  # All retries failed
+        except Exception:
+            return False  # Unexpected error
+
+    if not data:
+        return False  # No data received
+
+    # Parse response
+    try:
+        result = _json.loads(data.decode().strip())
+    except (_json.JSONDecodeError, UnicodeDecodeError):
+        return False  # Invalid response
+
+    if not result.get('success'):
+        return False  # Health check failed
+
+    health_data = result.get('result', {})
+    health_level = health_data.get('health_level', 'UNKNOWN')
+
+    # Only fast-exit if supervisor is healthy
+    if health_level not in ('FULLY_READY', 'HTTP_HEALTHY', 'IPC_RESPONSIVE'):
+        return False  # Unhealthy - need full init for auto-recovery
+
+    # v119.2b: Show concise success message and exit
+    pid = health_data.get('pid', 'unknown')
+    uptime = health_data.get('uptime_seconds', 0)
+    uptime_str = f"{int(uptime // 60)}m {int(uptime % 60)}s" if uptime > 60 else f"{int(uptime)}s"
+
+    print(f"\n{'='*70}")
+    print(f"✅ JARVIS Supervisor (PID {pid}) is running and healthy")
+    print(f"{'='*70}")
+    print(f"   Health:  {health_level}")
+    print(f"   Uptime:  {uptime_str}")
+
+    # Show cross-repo status if available
+    checks = health_data.get('checks', {})
+    if 'http_health' in checks:
+        http_details = checks['http_health'].get('details', {}).get('response', {})
+        if http_details.get('trinity_enabled'):
+            print(f"   Trinity: Enabled")
+        if http_details.get('ready_for_inference'):
+            print(f"   J-Prime: Ready for inference")
+
+    print(f"")
+    print(f"   No action needed - supervisor is ready to use.")
+    print(f"")
+    print(f"   Commands:  --restart | --shutdown | --status")
+    print(f"{'='*70}\n")
+
+    return True  # Handled - should exit
+
+# Run fast check before heavy imports
+if _fast_supervisor_check():
+    import sys as _sys
+    _sys.exit(0)
+
+del _fast_supervisor_check
+
+# =============================================================================
 # CRITICAL: PYTHON 3.9 COMPATIBILITY PATCH - MUST BE BEFORE ANY IMPORTS!
 # =============================================================================
 # This MUST happen BEFORE any module that imports google-api-core or other
@@ -24409,18 +24537,33 @@ async def main() -> int:
                     print(f"   Health Level: {health_level}")
 
                     if health_level in ('FULLY_READY', 'HTTP_HEALTHY', 'IPC_RESPONSIVE'):
-                        # Existing supervisor is healthy - offer options
-                        print(f"\n   ✅ Existing supervisor is healthy and responsive.")
-                        print(f"\n   Options:")
-                        print(f"   1. Use the running supervisor (no action needed)")
-                        print(f"   2. python3 run_supervisor.py --takeover  (graceful takeover)")
-                        print(f"   3. python3 run_supervisor.py --restart   (restart in-place)")
-                        print(f"   4. python3 run_supervisor.py --shutdown  (stop supervisor)")
-                        print(f"   5. python3 run_supervisor.py --force     (force start - dangerous)")
-                        print(f"\n   API Endpoints (running at http://localhost:8010):")
-                        print(f"   • GET /health/ready - Check readiness")
-                        print(f"   • GET /status       - Get status")
-                        print(f"   • POST /api/message - Send message")
+                        # v119.1: Existing supervisor is healthy - use it automatically (no menu)
+                        # This makes `python3 run_supervisor.py` a true single command that just works
+                        components = health_data.get('components', {})
+                        repos_status = health_data.get('cross_repo_health', {})
+
+                        print(f"\n   ✅ JARVIS Supervisor is already running and healthy!")
+                        print(f"   ")
+
+                        # Show component status if available
+                        if components:
+                            healthy_count = sum(1 for c in components.values() if c.get('status') == 'healthy')
+                            total_count = len(components)
+                            print(f"   Components: {healthy_count}/{total_count} healthy")
+
+                        # Show cross-repo status if available
+                        if repos_status:
+                            healthy_repos = sum(1 for r in repos_status.values() if r.get('healthy', False))
+                            total_repos = len(repos_status)
+                            print(f"   Cross-Repo: {healthy_repos}/{total_repos} connected")
+
+                        print(f"   ")
+                        print(f"   No action needed - your supervisor is ready to use.")
+                        print(f"   ")
+                        print(f"   Quick commands:")
+                        print(f"   • --restart   Restart the supervisor")
+                        print(f"   • --shutdown  Stop the supervisor")
+                        print(f"   • --status    Check detailed status")
                         print(f"{'='*70}\n")
                         return 0  # Exit cleanly - supervisor is running and healthy
                     else:
