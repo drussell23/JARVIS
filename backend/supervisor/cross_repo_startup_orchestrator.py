@@ -217,6 +217,83 @@ def _get_port_from_trinity(service: str, fallback: int) -> int:
     return int(os.getenv(f"{service.upper()}_PORT", str(fallback)))
 
 
+def get_service_port_from_registry(
+    service_name: str,
+    fallback_port: Optional[int] = None,
+) -> Optional[int]:
+    """
+    v112.0: Get the actual port for a service from the distributed port registry.
+
+    This is the CRITICAL utility for cross-repo coordination. When a service
+    cannot bind to its preferred port, it allocates a fallback port and registers
+    it at ~/.jarvis/registry/ports.json. Other services use this function to
+    discover where to connect.
+
+    Port resolution order:
+    1. Check ~/.jarvis/registry/ports.json for dynamically allocated ports
+    2. Return fallback_port if provided
+    3. Return None if service not found
+
+    Args:
+        service_name: Name of the service (e.g., "jarvis-prime", "reactor-core")
+        fallback_port: Optional fallback if service not in registry
+
+    Returns:
+        The port number, or None if not found and no fallback provided
+
+    Example:
+        >>> from backend.supervisor.cross_repo_startup_orchestrator import get_service_port_from_registry
+        >>> port = get_service_port_from_registry("jarvis-prime", fallback_port=8000)
+        >>> print(f"Connecting to jarvis-prime on port {port}")
+    """
+    registry_file = Path.home() / ".jarvis" / "registry" / "ports.json"
+
+    if registry_file.exists():
+        try:
+            registry = json.loads(registry_file.read_text())
+            if service_name in registry.get("ports", {}):
+                port_info = registry["ports"][service_name]
+                allocated_port = port_info.get("port")
+                if allocated_port:
+                    if port_info.get("is_fallback"):
+                        logger.debug(
+                            f"[v112.0] get_service_port_from_registry: "
+                            f"{service_name} using fallback port {allocated_port} "
+                            f"(original was {port_info.get('original_port')})"
+                        )
+                    return allocated_port
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.debug(f"[v112.0] Could not read port registry: {e}")
+
+    return fallback_port
+
+
+def get_all_service_ports_from_registry() -> Dict[str, Dict[str, Any]]:
+    """
+    v112.0: Get all service ports from the distributed port registry.
+
+    Returns the full port mapping for all services, useful for debugging
+    and cross-repo health dashboards.
+
+    Returns:
+        Dict mapping service names to port info:
+        {
+            "jarvis-prime": {"port": 8000, "original_port": 8000, "is_fallback": False},
+            "reactor-core": {"port": 9001, "original_port": 8090, "is_fallback": True},
+        }
+    """
+    registry_file = Path.home() / ".jarvis" / "registry" / "ports.json"
+
+    if registry_file.exists():
+        try:
+            registry = json.loads(registry_file.read_text())
+            return registry.get("ports", {})
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.debug(f"[v112.0] Could not read port registry: {e}")
+
+    return {}
+
+
 @dataclass
 class OrchestratorConfig:
     """
