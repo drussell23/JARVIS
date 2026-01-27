@@ -10970,17 +10970,16 @@ class SupervisorBootstrapper:
 
     def _setup_signal_handlers(self) -> None:
         """
-        v79.0: Setup async-safe signal handlers for graceful shutdown.
+        v123.0: Setup shutdown hooks only - signal handling moved to UnifiedSignalManager.
 
-        RACE CONDITION FIX: Previous implementation called self._shutdown_event.set()
-        directly from signal handler context, which is not async-safe.
+        The UnifiedSignalManager (installed in main()) handles SIGINT/SIGTERM using
+        loop.add_signal_handler() which is the correct async-safe approach.
 
-        Now uses loop.call_soon_threadsafe() to safely set the event from signal context.
+        DO NOT use signal.signal() here as it would override the UnifiedSignalManager.
 
-        The shutdown hook module handles its own signal registration,
-        but we also set the shutdown event so the main loop can exit gracefully.
+        This method now only registers atexit handlers via shutdown_hook.
         """
-        # Import and register shutdown hook early (handles atexit + signals)
+        # Import and register shutdown hook early (handles atexit only)
         try:
             backend_path = Path(__file__).parent / "backend"
             if str(backend_path) not in sys.path:
@@ -10988,52 +10987,14 @@ class SupervisorBootstrapper:
 
             from backend.scripts.shutdown_hook import register_handlers
             register_handlers()
-            self.logger.debug("✅ Shutdown hook handlers registered")
+            self.logger.debug("✅ Shutdown hook handlers registered (atexit)")
         except Exception as e:
             self.logger.warning(f"⚠️ Could not register shutdown hook: {e}")
 
-        # v79.0: Async-safe signal handler using call_soon_threadsafe
-        def handle_signal(signum, frame):
-            """
-            Handle SIGTERM by setting shutdown event safely.
-
-            v79.0: Uses call_soon_threadsafe() to prevent race conditions
-            when signal arrives during async operations.
-            """
-            try:
-                # Try to get the running event loop
-                loop = asyncio.get_running_loop()
-
-                # Use thread-safe method to set the event
-                def _set_event():
-                    if not self._shutdown_event.is_set():
-                        self._shutdown_event.set()
-
-                loop.call_soon_threadsafe(_set_event)
-                self.logger.info(f"🛑 Received signal {signum} - initiating shutdown (async-safe)")
-
-            except RuntimeError:
-                # No running loop - fall back to direct set (pre-asyncio context)
-                self._shutdown_event.set()
-                self.logger.info(f"🛑 Received signal {signum} - initiating shutdown (sync)")
-
-        signal.signal(signal.SIGTERM, handle_signal)
-
-        # v79.0: Also handle SIGINT async-safely for cleaner KeyboardInterrupt handling
-        def handle_sigint(signum, frame):
-            """Handle SIGINT (Ctrl+C) with async-safe shutdown."""
-            try:
-                loop = asyncio.get_running_loop()
-                loop.call_soon_threadsafe(lambda: self._shutdown_event.set())
-                self.logger.info("🛑 Received SIGINT (Ctrl+C) - initiating graceful shutdown")
-            except RuntimeError:
-                self._shutdown_event.set()
-                self.logger.info("🛑 Received SIGINT - direct shutdown")
-            # Let the main loop handle the actual KeyboardInterrupt
-
-        # Only set SIGINT handler if not in interactive mode
-        if not hasattr(sys, 'ps1'):  # Not in interactive Python shell
-            signal.signal(signal.SIGINT, handle_sigint)
+        # v123.0: DO NOT install signal handlers here!
+        # Signal handling is done by UnifiedSignalManager in main()
+        # Using signal.signal() here would override the async-safe handlers
+        self.logger.debug("[v123.0] Signal handlers managed by UnifiedSignalManager")
 
     async def _register_trinity_shutdown_hooks(self) -> None:
         """
@@ -25022,4 +24983,23 @@ if __name__ == "__main__":
         if handler and handler.shutdown_count > 0:
             print(f"[v111.0] Shutdown completed (signals received: {handler.shutdown_count}, reason: {handler.shutdown_reason})")
 
-    sys.exit(exit_code)
+    # v123.3: Force exit - sys.exit() may hang if non-daemon threads are running.
+    # Use os._exit() as a guaranteed termination after attempting clean exit.
+    try:
+        sys.exit(exit_code)
+    finally:
+        # If sys.exit() raised but didn't actually exit (e.g., caught by atexit handlers
+        # that hang on non-daemon threads), force immediate termination.
+        import os as _os
+        import threading as _threading
+
+        # Count non-daemon threads
+        non_daemon_threads = [t for t in _threading.enumerate()
+                              if t.is_alive() and not t.daemon and t.name != 'MainThread']
+        if non_daemon_threads:
+            print(f"[v123.3] Warning: {len(non_daemon_threads)} non-daemon threads blocking exit: "
+                  f"{[t.name for t in non_daemon_threads]}")
+
+        # v123.3: Force termination if we got here (sys.exit didn't work)
+        print(f"[v123.3] Forcing immediate exit with os._exit({exit_code})")
+        _os._exit(exit_code)

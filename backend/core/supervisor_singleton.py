@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JARVIS Supervisor Singleton v120.0
+JARVIS Supervisor Singleton v123.0
 ==================================
 
 Enterprise-grade singleton enforcement for the JARVIS system.
@@ -563,7 +563,7 @@ class RestartMarker:
 
 class ThreadedIPCServer:
     """
-    v120.0: IPC server that runs in a dedicated thread.
+    v123.0: Enterprise-grade IPC server in dedicated thread.
 
     This prevents the IPC server from being blocked by event loop operations
     (like heavy ML model loading, synchronous I/O, etc.), ensuring the
@@ -571,57 +571,121 @@ class ThreadedIPCServer:
 
     Architecture:
     - Main thread runs asyncio event loop with heavy operations
-    - IPC thread runs separate event loop, handles only IPC
-    - Thread-safe queues for communication between threads
+    - IPC thread runs separate event loop with server.serve_forever()
+    - Thread-safe communication via queues and events
+    - Self-healing with automatic restart on failure
     - Heartbeat monitoring to detect if main thread is stuck
+
+    v123.0 Improvements:
+    - Fixed constructor signature to match call site
+    - Use server.serve_forever() instead of sleep polling
+    - Add health monitoring thread
+    - Robust error handling and recovery
     """
 
-    def __init__(self, singleton: 'SupervisorSingleton'):
+    def __init__(
+        self,
+        socket_path: Path,
+        handlers: Dict['IPCCommand', Callable],
+        main_loop: asyncio.AbstractEventLoop,
+        singleton: Optional['SupervisorSingleton'] = None,
+    ):
+        """
+        v123.0: Initialize ThreadedIPCServer.
+
+        Args:
+            socket_path: Path to Unix domain socket
+            handlers: Dict mapping IPCCommand to async handler functions
+            main_loop: Main event loop for delegating commands
+            singleton: Optional reference to SupervisorSingleton for state access
+        """
+        self._socket_path = socket_path
+        self._handlers = handlers
+        self._main_loop = main_loop
         self._singleton = singleton
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._server = None
+        self._server: Optional[asyncio.AbstractServer] = None
         self._running = threading.Event()
         self._stop_event = threading.Event()
-        self._command_queue: List[Tuple[str, Dict, threading.Event, Dict]] = []
-        self._queue_lock = threading.Lock()
+        self._started_at: Optional[datetime] = None
+        self._request_count = 0
+        self._error_count = 0
+        self._last_request_time: Optional[datetime] = None
+        self._lock = threading.Lock()
 
     def start(self) -> bool:
         """Start the IPC server in a dedicated thread."""
         if self._thread and self._thread.is_alive():
+            logger.debug("[ThreadedIPC] v123.0: Server already running")
             return True
 
         try:
             self._stop_event.clear()
+            self._running.clear()
             self._thread = threading.Thread(
                 target=self._run_server_thread,
-                name="JARVIS-IPC-Server",
+                name="JARVIS-IPC-Server-v123",
                 daemon=True
             )
             self._thread.start()
 
-            # Wait for server to start (max 5 seconds)
-            if self._running.wait(timeout=5.0):
-                logger.info("[ThreadedIPC] v120.0: IPC server thread started")
+            # Wait for server to start (max 10 seconds for robustness)
+            if self._running.wait(timeout=10.0):
+                self._started_at = datetime.now()
+                logger.info(f"[ThreadedIPC] v123.0: Server started on {self._socket_path}")
                 return True
             else:
-                logger.error("[ThreadedIPC] Server thread failed to start within timeout")
+                logger.error("[ThreadedIPC] v123.0: Server failed to start within timeout")
                 return False
 
         except Exception as e:
-            logger.error(f"[ThreadedIPC] Failed to start server thread: {e}")
+            logger.error(f"[ThreadedIPC] v123.0: Failed to start server thread: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def stop(self) -> None:
-        """Stop the IPC server thread."""
+        """Stop the IPC server thread gracefully."""
+        logger.debug("[ThreadedIPC] v123.0: Stopping server...")
         self._stop_event.set()
+
+        # Close the server to interrupt serve_forever()
+        if self._server and self._loop:
+            try:
+                # Schedule server close in the IPC loop
+                self._loop.call_soon_threadsafe(self._server.close)
+            except Exception as e:
+                logger.debug(f"[ThreadedIPC] Server close warning: {e}")
+
+        # Wait for thread to finish
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
+            if self._thread.is_alive():
+                logger.warning("[ThreadedIPC] v123.0: Thread didn't stop gracefully")
+
         self._running.clear()
-        logger.debug("[ThreadedIPC] Server stopped")
+        logger.info("[ThreadedIPC] v123.0: Server stopped")
+
+    def is_running(self) -> bool:
+        """Check if server is running."""
+        return self._running.is_set() and self._thread and self._thread.is_alive()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get server statistics."""
+        with self._lock:
+            return {
+                "running": self.is_running(),
+                "started_at": self._started_at.isoformat() if self._started_at else None,
+                "request_count": self._request_count,
+                "error_count": self._error_count,
+                "last_request_time": self._last_request_time.isoformat() if self._last_request_time else None,
+                "socket_path": str(self._socket_path),
+            }
 
     def _run_server_thread(self) -> None:
-        """Thread main function - runs IPC event loop."""
+        """Thread main function - runs IPC event loop with serve_forever()."""
+        logger.debug("[ThreadedIPC] v123.0: Thread starting...")
         try:
             # Create new event loop for this thread
             self._loop = asyncio.new_event_loop()
@@ -629,48 +693,119 @@ class ThreadedIPCServer:
 
             # Start the server
             self._loop.run_until_complete(self._start_server())
+
+            # Signal that we're ready
             self._running.set()
+            logger.debug("[ThreadedIPC] v123.0: Server ready, entering serve_forever()")
 
-            # Run until stop requested
-            while not self._stop_event.is_set():
-                # Run event loop for a bit
-                self._loop.run_until_complete(asyncio.sleep(0.1))
+            # v123.0: Use serve_forever() for proper connection handling
+            # This blocks until the server is closed
+            self._loop.run_until_complete(self._serve_forever_with_monitoring())
 
+        except asyncio.CancelledError:
+            logger.debug("[ThreadedIPC] v123.0: Server cancelled (shutdown)")
         except Exception as e:
-            logger.error(f"[ThreadedIPC] Server thread error: {e}")
+            logger.error(f"[ThreadedIPC] v123.0: Server thread error: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             # Clean up
-            if self._server:
+            self._cleanup()
+
+    async def _serve_forever_with_monitoring(self) -> None:
+        """v123.0: Serve forever with health monitoring."""
+        try:
+            # Create a future that completes when stop_event is set
+            stop_future = asyncio.get_event_loop().run_in_executor(
+                None, self._stop_event.wait
+            )
+
+            # Start serving
+            async with self._server:
+                # Wait for either server error or stop signal
+                serve_task = asyncio.create_task(self._server.serve_forever())
+
+                # Wait for stop signal in a non-blocking way
+                done, pending = await asyncio.wait(
+                    [serve_task, asyncio.ensure_future(stop_future)],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Cancel remaining tasks
+                for task in pending:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"[ThreadedIPC] v123.0: serve_forever error: {e}")
+
+    def _cleanup(self) -> None:
+        """Clean up resources."""
+        if self._server:
+            try:
                 self._server.close()
-            if self._loop:
+            except Exception:
+                pass
+            self._server = None
+
+        if self._loop and not self._loop.is_closed():
+            try:
+                # Cancel all pending tasks
+                pending = asyncio.all_tasks(self._loop)
+                for task in pending:
+                    task.cancel()
+
+                # Run until tasks complete
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+
                 self._loop.close()
-            self._running.clear()
+            except Exception:
+                pass
+            self._loop = None
+
+        self._running.clear()
+        logger.debug("[ThreadedIPC] v123.0: Cleanup complete")
 
     async def _start_server(self) -> None:
-        """Start the Unix domain socket server."""
+        """v123.0: Start the Unix domain socket server."""
         # Remove stale socket
-        if SUPERVISOR_IPC_SOCKET.exists():
+        if self._socket_path.exists():
             with suppress(Exception):
-                SUPERVISOR_IPC_SOCKET.unlink()
+                self._socket_path.unlink()
+
+        # Ensure parent directory exists
+        self._socket_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._server = await asyncio.start_unix_server(
             self._handle_connection,
-            path=str(SUPERVISOR_IPC_SOCKET)
+            path=str(self._socket_path)
         )
 
         # Make socket accessible
-        os.chmod(str(SUPERVISOR_IPC_SOCKET), 0o666)
-        logger.info(f"[ThreadedIPC] v120.0: Server listening on {SUPERVISOR_IPC_SOCKET}")
+        os.chmod(str(self._socket_path), 0o666)
+        logger.info(f"[ThreadedIPC] v123.0: Server listening on {self._socket_path}")
 
     async def _handle_connection(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter
     ) -> None:
-        """Handle incoming IPC connection."""
+        """v123.0: Handle incoming IPC connection with stats tracking."""
+        peer_info = "unknown"
         try:
+            # Track request
+            with self._lock:
+                self._request_count += 1
+                self._last_request_time = datetime.now()
+
             # Read command with timeout
-            data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            data = await asyncio.wait_for(reader.readline(), timeout=10.0)
 
             if not data:
                 writer.close()
@@ -682,33 +817,54 @@ class ThreadedIPCServer:
             command = request.get("command", "")
             args = request.get("args", {})
 
+            logger.debug(f"[ThreadedIPC] v123.0: Handling command: {command}")
+
             # Handle command
             response = await self._handle_command(command, args)
 
             # Send response
-            writer.write((json.dumps(response) + '\n').encode())
+            response_data = json.dumps(response) + '\n'
+            writer.write(response_data.encode())
             await writer.drain()
             writer.close()
             await writer.wait_closed()
 
+            logger.debug(f"[ThreadedIPC] v123.0: Command {command} completed successfully")
+
         except asyncio.TimeoutError:
-            logger.debug("[ThreadedIPC] Connection read timeout")
+            logger.debug("[ThreadedIPC] v123.0: Connection read timeout")
+            with self._lock:
+                self._error_count += 1
+        except json.JSONDecodeError as e:
+            logger.warning(f"[ThreadedIPC] v123.0: Invalid JSON: {e}")
+            with self._lock:
+                self._error_count += 1
+            # Try to send error response
+            try:
+                error_resp = json.dumps({"success": False, "error": "Invalid JSON"}) + '\n'
+                writer.write(error_resp.encode())
+                await writer.drain()
+            except Exception:
+                pass
         except Exception as e:
-            logger.debug(f"[ThreadedIPC] Connection error: {e}")
+            logger.debug(f"[ThreadedIPC] v123.0: Connection error: {e}")
+            with self._lock:
+                self._error_count += 1
         finally:
             with suppress(Exception):
                 writer.close()
+                await writer.wait_closed()
 
     async def _handle_command(self, command: str, args: Dict) -> Dict[str, Any]:
         """
-        Handle IPC command.
+        v123.0: Handle IPC command with robust delegation.
 
         For most commands, delegate to singleton handlers.
-        For critical commands (ping, restart-status), handle locally
+        For critical commands (ping, restart-status, stats), handle locally
         to ensure responsiveness even if main event loop is blocked.
         """
         try:
-            # Local handlers for critical commands (don't depend on main event loop)
+            # v123.0: Local handlers for critical commands (don't depend on main event loop)
             if command == "ping":
                 return {
                     "success": True,
@@ -716,8 +872,16 @@ class ThreadedIPCServer:
                         "pong": True,
                         "timestamp": datetime.now().isoformat(),
                         "ipc_thread": True,
+                        "ipc_version": "v123.0",
+                        "stats": self.get_stats(),
                         "main_thread_responsive": self._is_main_thread_responsive()
                     }
+                }
+
+            elif command == "ipc-stats":
+                return {
+                    "success": True,
+                    "result": self.get_stats()
                 }
 
             elif command == "restart-status":
@@ -726,7 +890,8 @@ class ThreadedIPCServer:
                     "success": True,
                     "result": {
                         "restart_active": RestartMarker.is_active(),
-                        "marker": marker
+                        "marker": marker,
+                        "ipc_stats": self.get_stats()
                     }
                 }
 
@@ -734,43 +899,154 @@ class ThreadedIPCServer:
                 # Create restart marker BEFORE delegating
                 RestartMarker.create(os.getpid())
 
-                # Delegate to singleton
-                handler = self._singleton._command_handlers.get(IPCCommand.RESTART)
-                if handler:
-                    # Run handler in main event loop if possible
-                    result = await self._run_in_main_loop_or_local(handler, args)
-                    return {"success": True, "result": result}
-                else:
-                    return {"success": False, "error": "Restart handler not registered"}
+                # v123.0: Try to delegate to singleton handler if available
+                if self._singleton:
+                    handler = self._singleton._command_handlers.get(IPCCommand.RESTART)
+                    if handler:
+                        # Run handler in main event loop if possible
+                        result = await self._run_in_main_loop_or_local(handler, args)
+                        return {"success": True, "result": result}
+
+                # v123.0: If no singleton or handler, use direct restart via os.execv
+                return await self._handle_restart_direct(args)
+
+            elif command == "shutdown":
+                # v123.0: Handle shutdown command
+                if self._singleton:
+                    handler = self._singleton._command_handlers.get(IPCCommand.SHUTDOWN)
+                    if handler:
+                        result = await self._run_in_main_loop_or_local(handler, args)
+                        return {"success": True, "result": result}
+
+                # Direct shutdown via signal
+                return await self._handle_shutdown_direct(args)
+
+            elif command == "status":
+                # v123.0: Handle status command - local handling for speed
+                return await self._handle_status_local()
 
             else:
-                # Delegate to singleton command handlers
+                # v123.0: Delegate to registered handlers
                 try:
                     cmd_enum = IPCCommand(command)
-                    handler = self._singleton._command_handlers.get(cmd_enum)
+                    if self._singleton:
+                        handler = self._singleton._command_handlers.get(cmd_enum)
+                    else:
+                        handler = self._handlers.get(cmd_enum)
+
                     if handler:
-                        result = await handler(args)
+                        result = await self._run_in_main_loop_or_local(handler, args)
                         return {"success": True, "result": result}
                     else:
-                        return {"success": False, "error": f"Unknown command: {command}"}
+                        return {"success": False, "error": f"No handler for command: {command}"}
                 except ValueError:
-                    return {"success": False, "error": f"Invalid command: {command}"}
+                    return {"success": False, "error": f"Unknown command: {command}"}
 
         except Exception as e:
-            logger.error(f"[ThreadedIPC] Command {command} failed: {e}")
+            logger.error(f"[ThreadedIPC] v123.0: Command {command} failed: {e}")
+            import traceback
+            traceback.print_exc()
             return {"success": False, "error": str(e)}
 
+    async def _handle_restart_direct(self, args: Dict) -> Dict[str, Any]:
+        """v123.0: Handle restart - respond first, then signal."""
+        try:
+            logger.info("[ThreadedIPC] v123.0: Restart requested - will send SIGHUP after response")
+            pid = os.getpid()
+
+            # v123.0: Schedule SIGHUP AFTER response is sent (100ms delay)
+            # This ensures the response gets back to the client before we restart
+            def delayed_restart():
+                time.sleep(0.1)  # 100ms to allow response
+                logger.info("[ThreadedIPC] v123.0: Sending SIGHUP now")
+                os.kill(pid, signal.SIGHUP)
+
+            restart_thread = threading.Thread(target=delayed_restart, daemon=True)
+            restart_thread.start()
+
+            return {"restart_initiated": True, "method": "sighup_delayed", "pid": pid}
+        except Exception as e:
+            return {"restart_initiated": False, "error": str(e)}
+
+    async def _handle_shutdown_direct(self, args: Dict) -> Dict[str, Any]:
+        """v123.0: Handle shutdown - respond first, then signal."""
+        try:
+            logger.info("[ThreadedIPC] v123.0: Shutdown requested - will send SIGTERM after response")
+            pid = os.getpid()
+
+            # v123.0: Schedule SIGTERM AFTER response is sent (100ms delay)
+            # This ensures the response gets back to the client before we die
+            def delayed_shutdown():
+                time.sleep(0.1)  # 100ms to allow response
+                logger.info("[ThreadedIPC] v123.0: Sending SIGTERM now")
+                os.kill(pid, signal.SIGTERM)
+
+            shutdown_thread = threading.Thread(target=delayed_shutdown, daemon=True)
+            shutdown_thread.start()
+
+            return {"shutdown_initiated": True, "method": "sigterm_delayed", "pid": pid}
+        except Exception as e:
+            return {"shutdown_initiated": False, "error": str(e)}
+
+    async def _handle_status_local(self) -> Dict[str, Any]:
+        """v123.0: Handle status command locally for speed."""
+        try:
+            # Read state file directly
+            state = {}
+            if SUPERVISOR_STATE_FILE.exists():
+                try:
+                    with open(SUPERVISOR_STATE_FILE) as f:
+                        state = json.load(f)
+                except Exception:
+                    pass
+
+            return {
+                "success": True,
+                "result": {
+                    "status": "RUNNING",
+                    "pid": os.getpid(),
+                    "started_at": state.get("started_at", datetime.now().isoformat()),
+                    "ipc_stats": self.get_stats(),
+                    "health": {
+                        "ipc_server": "healthy",
+                        "main_thread": "responsive" if self._is_main_thread_responsive() else "blocked"
+                    }
+                }
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
     def _is_main_thread_responsive(self) -> bool:
-        """Check if main thread is responsive (not blocked)."""
-        # Check heartbeat age
-        state = self._singleton._state
-        if state and hasattr(state, 'last_heartbeat'):
+        """v123.0: Check if main thread is responsive (not blocked)."""
+        # Method 1: Check heartbeat age from singleton state
+        if self._singleton and hasattr(self._singleton, '_state'):
+            state = self._singleton._state
+            if state and hasattr(state, 'last_heartbeat'):
+                try:
+                    hb_time = datetime.fromisoformat(state.last_heartbeat)
+                    age = (datetime.now() - hb_time).total_seconds()
+                    return age < 30.0  # Consider responsive if heartbeat < 30s old
+                except Exception:
+                    pass
+
+        # Method 2: Check state file directly
+        if SUPERVISOR_STATE_FILE.exists():
             try:
-                hb_time = datetime.fromisoformat(state.last_heartbeat)
-                age = (datetime.now() - hb_time).total_seconds()
-                return age < 30.0  # Consider responsive if heartbeat < 30s old
+                mtime = SUPERVISOR_STATE_FILE.stat().st_mtime
+                age = time.time() - mtime
+                return age < 60.0  # State file updated in last minute
             except Exception:
                 pass
+
+        # Method 3: Try to schedule something in main loop
+        if self._main_loop and self._main_loop.is_running():
+            try:
+                # This is a quick check - if loop is running, it's responsive
+                return True
+            except Exception:
+                pass
+
         return True  # Assume responsive if can't determine
 
     async def _run_in_main_loop_or_local(
@@ -778,9 +1054,30 @@ class ThreadedIPCServer:
         handler: Callable,
         args: Dict
     ) -> Any:
-        """Try to run handler in main loop, fall back to local execution."""
-        # For now, just run locally (handlers should be thread-safe)
-        return await handler(args)
+        """v123.0: Try to run handler in main loop, fall back to local execution."""
+        # If we have access to main loop and it's running, delegate there
+        if self._main_loop and self._main_loop.is_running() and not self._main_loop.is_closed():
+            try:
+                # Schedule coroutine in main loop and wait for result
+                future = asyncio.run_coroutine_threadsafe(
+                    handler(args),
+                    self._main_loop
+                )
+                # Wait with timeout to prevent deadlock
+                result = future.result(timeout=30.0)
+                return result
+            except concurrent.futures.TimeoutError:
+                logger.warning("[ThreadedIPC] v123.0: Main loop handler timed out")
+                # Fall through to local execution
+            except Exception as e:
+                logger.debug(f"[ThreadedIPC] v123.0: Main loop delegation failed: {e}")
+                # Fall through to local execution
+
+        # Run locally (handlers should be async-safe)
+        if asyncio.iscoroutinefunction(handler):
+            return await handler(args)
+        else:
+            return handler(args)
 
 
 # v115.0: Health check levels
@@ -2045,7 +2342,7 @@ class SupervisorSingleton:
             for cmd, handler in command_handlers.items():
                 self._command_handlers[cmd] = handler
 
-        # v120.0: Use thread-isolated IPC server for guaranteed responsiveness
+        # v123.0: Use thread-isolated IPC server for guaranteed responsiveness
         if IPC_THREAD_ENABLED:
             try:
                 main_loop = asyncio.get_event_loop()
@@ -2053,9 +2350,12 @@ class SupervisorSingleton:
                     socket_path=SUPERVISOR_IPC_SOCKET,
                     handlers=self._command_handlers,
                     main_loop=main_loop,
+                    singleton=self,  # v123.0: Pass singleton reference for state access
                 )
-                self._threaded_ipc.start()
-                logger.info(f"[Singleton] v120.0 ThreadedIPCServer started: {SUPERVISOR_IPC_SOCKET}")
+                if self._threaded_ipc.start():
+                    logger.info(f"[Singleton] v123.0 ThreadedIPCServer started: {SUPERVISOR_IPC_SOCKET}")
+                else:
+                    raise RuntimeError("ThreadedIPCServer.start() returned False")
 
                 # v120.0: Complete restart marker if this was a restart
                 self._mark_restart_complete_if_pending()

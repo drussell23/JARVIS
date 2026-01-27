@@ -12532,20 +12532,55 @@ echo "=== JARVIS Prime started ==="
     # =========================================================================
 
     def _setup_signal_handlers(self) -> None:
-        """Setup graceful shutdown signal handlers."""
+        """
+        v123.2: Setup graceful shutdown signal handlers.
+
+        CRITICAL: Do NOT register signal handlers via loop.add_signal_handler()!
+        This would REPLACE the UnifiedSignalManager's handlers from run_supervisor.py,
+        causing the main() function to never detect shutdown completion.
+
+        Instead, register a shutdown callback that will be triggered when
+        global shutdown is initiated via graceful_shutdown.py.
+        """
         if self._signals_registered:
             return
 
-        loop = asyncio.get_event_loop()
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(self._handle_shutdown(s))
+        # v123.2: Register as a shutdown observer instead of overriding signal handlers
+        try:
+            from backend.core.resilience.graceful_shutdown import register_shutdown_callback
+            register_shutdown_callback(
+                name="cross_repo_orchestrator",
+                callback=lambda: asyncio.create_task(self._handle_orchestrator_shutdown()),
             )
+            logger.info("🛡️ Orchestrator shutdown callback registered (via graceful_shutdown)")
+        except ImportError:
+            logger.debug("[v123.2] graceful_shutdown not available - shutdown callback not registered")
+        except Exception as e:
+            logger.warning(f"[v123.2] Could not register shutdown callback: {e}")
 
         self._signals_registered = True
-        logger.info("🛡️ Signal handlers registered (SIGINT, SIGTERM)")
+
+    async def _handle_orchestrator_shutdown(self) -> None:
+        """
+        v123.2: Handle orchestrator shutdown when global shutdown is triggered.
+
+        This is called as a callback when graceful_shutdown initiates shutdown,
+        NOT directly from a signal handler (to avoid overriding UnifiedSignalManager).
+        """
+        logger.info("[v123.2] Orchestrator received shutdown notification")
+
+        # Set shutdown event (signals other tasks to stop)
+        self._shutdown_event.set()
+        self._running = False
+
+        # Perform graceful service shutdown
+        try:
+            await self.shutdown_all_services()
+            logger.info("[v123.2] Orchestrator services shutdown complete")
+        except asyncio.CancelledError:
+            logger.debug("[v123.2] Orchestrator shutdown cancelled (expected)")
+        except Exception as e:
+            logger.error(f"[v123.2] Error during orchestrator shutdown: {e}")
 
     async def _handle_shutdown(self, signum: int) -> None:
         """

@@ -1059,7 +1059,12 @@ def setup_signal_handlers(
     _shutdown_lock = LazyAsyncLock()  # v93.0: Lazy lock avoids "no running event loop" issues
 
     async def _safe_shutdown(reason: ShutdownReason, sig_name: str) -> None:
-        """Execute shutdown with lock to prevent duplicates."""
+        """
+        v123.1: Execute shutdown with lock to prevent duplicates.
+
+        CRITICAL: Must call sys.exit() after shutdown completes, otherwise
+        the main event loop continues running after shutdown phases complete.
+        """
         async with _shutdown_lock:
             if _shutdown_triggered.is_set():
                 logger.debug(f"[ShutdownManager] Ignoring duplicate signal {sig_name}")
@@ -1068,7 +1073,23 @@ def setup_signal_handlers(
 
         logger.info(f"[ShutdownManager] Initiating shutdown due to {sig_name}")
         try:
-            await shutdown_manager.initiate_shutdown(reason=reason)
+            result = await shutdown_manager.initiate_shutdown(reason=reason)
+
+            # v123.1: CRITICAL - Must exit after shutdown completes
+            # Without this, the main event loop continues running
+            if result.success:
+                logger.info(f"[ShutdownManager] Shutdown successful, exiting process")
+                # Use signal-appropriate exit codes
+                if sig_name == "SIGTERM":
+                    sys.exit(143)  # 128 + 15
+                elif sig_name == "SIGINT":
+                    sys.exit(130)  # 128 + 2
+                else:
+                    sys.exit(0)
+            else:
+                logger.error(f"[ShutdownManager] Shutdown incomplete: {result.errors}")
+                sys.exit(1)
+
         except Exception as e:
             logger.error(f"[ShutdownManager] Shutdown failed: {e}")
             # Force exit on shutdown failure
