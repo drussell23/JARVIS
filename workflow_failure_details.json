@@ -1,0 +1,60 @@
+{
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/21391395943",
+  "branch": "dependabot/github_actions/lewagon/wait-on-check-action-1.5.0",
+  "commit_sha": "3c1fb0b",
+  "run_number": 1678,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run1678-20260127-092212",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1678)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 22,
+              "content": "2026-01-27T09:20:00.4624416Z   subjectPatternError: The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 34,
+              "content": "2026-01-27T09:20:01.0659770Z ##[error]The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 26,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            },
+            {
+              "line_number": 38,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 2
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
+      ],
+      "severity": "high",
+      "category": "timeout",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-01-27T09:22:12.785931"
+}
