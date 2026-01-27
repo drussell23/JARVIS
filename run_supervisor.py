@@ -11889,22 +11889,198 @@ class SupervisorBootstrapper:
             print(f"  {TerminalUI.YELLOW}⚠️ JARVIS-Prime: Not available ({e}){TerminalUI.RESET}")
 
     async def _init_jarvis_prime_local_if_needed(self) -> None:
-        """Start JARVIS-Prime local subprocess if not already running."""
-        # Check if already running
+        """
+        Start JARVIS-Prime local subprocess if not already running.
+
+        v117.0: CRITICAL FIX - Prevent duplicate spawning race condition.
+
+        The cross_repo_startup_orchestrator may have ALREADY started jarvis-prime
+        (via initialize_cross_repo_orchestration at line ~7347). We must:
+        1. Check if the orchestrator already manages jarvis-prime
+        2. Wait for it to become healthy (with longer timeout during startup)
+        3. Only spawn if orchestrator didn't start it AND it's not running
+
+        Root cause of "address already in use" error:
+        - Orchestrator starts jarvis-prime on port 8000
+        - This function runs later with only 2s timeout health check
+        - Health check fails (model still loading)
+        - We try to spawn ANOTHER jarvis-prime → port conflict!
+        """
+        port = self.config.jarvis_prime_port
+        host = self.config.jarvis_prime_host
+
+        # v117.0: STEP 1 - Check if cross_repo_orchestrator already started jarvis-prime
+        orchestrator_started = False
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                resp = await client.get(
-                    f"http://{self.config.jarvis_prime_host}:{self.config.jarvis_prime_port}/health"
+            from backend.supervisor.cross_repo_startup_orchestrator import get_orchestrator
+            orchestrator = get_orchestrator()
+
+            # Check if jarvis-prime is in the orchestrator's ready or starting set
+            if hasattr(orchestrator, '_services_ready') and "jarvis-prime" in orchestrator._services_ready:
+                self.logger.info(
+                    "[v117.0] ✅ JARVIS-Prime already started by cross_repo_orchestrator (ready)"
                 )
-                if resp.status_code == 200:
-                    self.logger.info("✅ JARVIS-Prime local already running")
-                    return
+                orchestrator_started = True
+            elif hasattr(orchestrator, '_services_starting') and "jarvis-prime" in orchestrator._services_starting:
+                self.logger.info(
+                    "[v117.0] ⏳ JARVIS-Prime being started by cross_repo_orchestrator (starting)"
+                )
+                orchestrator_started = True
+
+                # Wait for orchestrator to finish starting it (up to startup timeout)
+                wait_timeout = min(self.config.jarvis_prime_startup_timeout, 120.0)
+                self.logger.info(f"    Waiting up to {wait_timeout}s for orchestrator to finish...")
+
+                start_time = time.time()
+                while time.time() - start_time < wait_timeout:
+                    if "jarvis-prime" in orchestrator._services_ready:
+                        self.logger.info("[v117.0] ✅ JARVIS-Prime now ready via orchestrator")
+                        break
+                    await asyncio.sleep(2.0)
+                else:
+                    self.logger.warning(
+                        "[v117.0] ⚠️ Orchestrator didn't finish starting jarvis-prime in time"
+                    )
+
+        except ImportError:
+            self.logger.debug("[v117.0] cross_repo_orchestrator not available")
+        except Exception as e:
+            self.logger.debug(f"[v117.0] Orchestrator check failed: {e}")
+
+        # v117.0: STEP 2 - Check if port is already bound (regardless of orchestrator)
+        import socket
+        port_in_use = False
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(('localhost', port))
+            sock.close()
+            port_in_use = (result == 0)
         except Exception:
-            pass  # Not running, need to start
+            pass
+
+        if port_in_use:
+            # Port is bound - check if it's healthy with progressive backoff
+            self.logger.info(f"[v117.0] Port {port} is in use - checking health with extended timeout...")
+
+            # Use longer timeout during startup (models may be loading)
+            max_wait = 60.0 if not orchestrator_started else 30.0  # Shorter if orchestrator is managing
+            check_interval = 3.0
+            elapsed = 0.0
+
+            import httpx
+            while elapsed < max_wait:
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get(f"http://{host}:{port}/health")
+                        if resp.status_code == 200:
+                            self.logger.info(
+                                f"[v117.0] ✅ JARVIS-Prime already running and healthy on port {port}"
+                            )
+                            return  # Success - no need to spawn
+                except Exception as health_err:
+                    self.logger.debug(f"    Health check failed (elapsed={elapsed:.1f}s): {health_err}")
+
+                await asyncio.sleep(check_interval)
+                elapsed += check_interval
+
+            # Port bound but not healthy after waiting - likely a stale process or conflict
+            if orchestrator_started:
+                # Let orchestrator handle the restart
+                self.logger.warning(
+                    f"[v117.0] ⚠️ Port {port} bound but unhealthy - orchestrator should handle restart"
+                )
+                return
+            else:
+                # We need to clean up and start fresh
+                self.logger.warning(
+                    f"[v117.0] ⚠️ Port {port} bound but unhealthy - attempting cleanup before spawn"
+                )
+                await self._cleanup_stale_jarvis_prime_process(port)
+
+        # v117.0: STEP 3 - If orchestrator started it, don't duplicate
+        if orchestrator_started:
+            self.logger.info(
+                "[v117.0] Skipping local spawn - orchestrator is managing jarvis-prime"
+            )
+            return
+
+        # v117.0: STEP 4 - Final port availability check before spawning
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(1)
+            sock.bind(('0.0.0.0', port))
+            sock.close()
+            self.logger.info(f"[v117.0] Port {port} is available - proceeding with spawn")
+        except OSError as bind_err:
+            self.logger.error(
+                f"[v117.0] ❌ Port {port} still unavailable after cleanup: {bind_err}"
+            )
+            self.logger.error("    Cannot start jarvis-prime - port conflict unresolved")
+            return
 
         # Start local subprocess
         await self._init_jarvis_prime_local()
+
+    async def _cleanup_stale_jarvis_prime_process(self, port: int) -> bool:
+        """
+        v117.0: Clean up stale jarvis-prime process occupying the port.
+
+        This handles cases where a previous jarvis-prime is stuck or zombie.
+        """
+        self.logger.info(f"[v117.0] Cleaning up stale process on port {port}...")
+
+        try:
+            # Find processes on the port
+            result = await asyncio.create_subprocess_exec(
+                "lsof", "-i", f":{port}", "-t",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await result.communicate()
+
+            if stdout:
+                pids = [int(p.strip()) for p in stdout.decode().split() if p.strip().isdigit()]
+                current_pid = os.getpid()
+
+                for pid in pids:
+                    if pid == current_pid:
+                        continue  # Don't kill ourselves
+
+                    try:
+                        # Check if it's a jarvis-prime process
+                        proc_result = await asyncio.create_subprocess_exec(
+                            "ps", "-p", str(pid), "-o", "command=",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        ps_stdout, _ = await proc_result.communicate()
+                        cmd = ps_stdout.decode().lower()
+
+                        if "jarvis" in cmd or "prime" in cmd or "uvicorn" in cmd:
+                            self.logger.info(f"    Terminating stale process PID {pid}")
+                            os.kill(pid, signal.SIGTERM)
+                            await asyncio.sleep(1.0)
+
+                            # Force kill if still running
+                            try:
+                                os.kill(pid, 0)  # Check if still alive
+                                os.kill(pid, signal.SIGKILL)
+                                self.logger.info(f"    Force killed PID {pid}")
+                            except ProcessLookupError:
+                                pass  # Already dead
+                    except Exception as kill_err:
+                        self.logger.debug(f"    Failed to handle PID {pid}: {kill_err}")
+
+                # Wait for port to be released
+                await asyncio.sleep(2.0)
+                return True
+
+        except Exception as e:
+            self.logger.warning(f"[v117.0] Cleanup failed: {e}")
+
+        return False
 
     async def _init_jarvis_prime_local(self) -> None:
         """Start JARVIS-Prime as a local subprocess."""

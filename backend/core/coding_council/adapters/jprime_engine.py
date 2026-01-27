@@ -120,6 +120,22 @@ class CircuitState(Enum):
     HALF_OPEN = auto()  # Testing recovery
 
 
+class ServiceStatus(str, Enum):
+    """
+    v118.0: J-Prime service status for intelligent availability tracking.
+
+    This allows the Coding Council to understand J-Prime's startup phase
+    and make intelligent decisions about availability.
+    """
+    UNKNOWN = "unknown"           # Initial state, no data
+    STARTING = "starting"         # J-Prime is starting, not ready yet
+    INITIALIZING = "initializing" # Loading models, almost ready
+    HEALTHY = "healthy"           # Fully operational
+    DEGRADED = "degraded"         # Running but with reduced capacity
+    UNHEALTHY = "unhealthy"       # Service is down or unresponsive
+    ERROR = "error"               # Service reported an error
+
+
 class FallbackStrategy(Enum):
     """Multi-model fallback strategies."""
     SEQUENTIAL = auto()      # Try models in order until success
@@ -860,7 +876,7 @@ class TaskClassifier:
 
 class JPrimeClient:
     """
-    v84.0: Async HTTP client for JARVIS Prime OpenAI-compatible API.
+    v118.0: Async HTTP client for JARVIS Prime OpenAI-compatible API.
 
     Features:
     - Connection pooling
@@ -868,6 +884,9 @@ class JPrimeClient:
     - Circuit breaker integration
     - Streaming support
     - Health monitoring
+    - v118.0: Service status tracking for intelligent availability
+    - v118.0: Background health monitoring with async updates
+    - v118.0: Wait-for-ready with configurable timeout
     """
 
     def __init__(self, config: JPrimeConfig):
@@ -879,6 +898,13 @@ class JPrimeClient:
         )
         self._last_health_check = 0.0
         self._is_healthy = False
+
+        # v118.0: Service status tracking
+        self._service_status = ServiceStatus.UNKNOWN
+        self._service_status_details: Dict[str, Any] = {}
+        self._health_monitor_task: Optional[asyncio.Task] = None
+        self._availability_event = asyncio.Event()
+        self._shutdown_requested = False
 
     async def initialize(self):
         """Initialize the client."""
@@ -909,20 +935,43 @@ class JPrimeClient:
             self._session = None
 
     async def check_health(self) -> bool:
-        """Check if JARVIS Prime is healthy."""
+        """
+        v118.0: Check if JARVIS Prime is healthy with intelligent status tracking.
+
+        Returns True if:
+        - J-Prime is fully healthy, OR
+        - J-Prime is starting/initializing (will become available soon)
+
+        Updates _service_status for detailed status tracking.
+        """
         # Rate limit health checks
         if time.time() - self._last_health_check < 5.0:
             return self._is_healthy
 
         self._last_health_check = time.time()
 
-        # First check heartbeat file
+        # First check heartbeat file for quick status
         if self.config.heartbeat_file.exists():
             try:
                 with open(self.config.heartbeat_file) as f:
                     data = json.load(f)
                     heartbeat_age = time.time() - data.get("timestamp", 0)
                     if heartbeat_age < 30:
+                        # v118.0: Parse status from heartbeat file
+                        self._service_status_details = data
+                        model_loaded = data.get("model_loaded", False)
+                        inference_healthy = data.get("inference_healthy", False)
+
+                        if model_loaded and inference_healthy:
+                            self._service_status = ServiceStatus.HEALTHY
+                        elif model_loaded:
+                            self._service_status = ServiceStatus.DEGRADED
+                        else:
+                            # J-Prime is running but model not loaded yet
+                            self._service_status = ServiceStatus.INITIALIZING
+
+                        # v118.0: Consider STARTING/INITIALIZING as "potentially healthy"
+                        # This allows the engine to be used once J-Prime is ready
                         self._is_healthy = True
                         return True
             except Exception:
@@ -930,14 +979,170 @@ class JPrimeClient:
 
         # Then try HTTP health check
         try:
+            if not self._session:
+                self._is_healthy = False
+                self._service_status = ServiceStatus.UNKNOWN
+                return False
+
             url = f"{self.config.base_url}/health"
             async with self._session.get(url, timeout=5.0) as response:
-                self._is_healthy = response.status == 200
-                return self._is_healthy
+                if response.status == 200:
+                    try:
+                        data = await response.json()
+                        self._service_status_details = data
+
+                        # v118.0: Parse the health response for status
+                        status_str = data.get("status", "").lower()
+
+                        if status_str == "healthy":
+                            self._service_status = ServiceStatus.HEALTHY
+                            self._is_healthy = True
+                            # Signal availability
+                            if not self._availability_event.is_set():
+                                self._availability_event.set()
+                        elif status_str == "starting":
+                            # J-Prime is starting up - track phase
+                            phase = data.get("phase", "unknown")
+                            if phase in ("initializing", "loading_model"):
+                                self._service_status = ServiceStatus.INITIALIZING
+                            else:
+                                self._service_status = ServiceStatus.STARTING
+                            # v118.0: Starting is "potentially healthy" - don't reject
+                            self._is_healthy = True
+                        elif status_str == "degraded":
+                            self._service_status = ServiceStatus.DEGRADED
+                            self._is_healthy = True
+                        else:
+                            self._service_status = ServiceStatus.UNHEALTHY
+                            self._is_healthy = False
+
+                        return self._is_healthy
+                    except Exception:
+                        # JSON parse failed but status was 200
+                        self._is_healthy = True
+                        self._service_status = ServiceStatus.UNKNOWN
+                        return True
+                else:
+                    self._is_healthy = False
+                    self._service_status = ServiceStatus.UNHEALTHY
+                    return False
+
         except Exception as e:
             logger.debug(f"Health check failed: {e}")
             self._is_healthy = False
+            self._service_status = ServiceStatus.ERROR
             return False
+
+    async def check_health_strict(self) -> bool:
+        """
+        v118.0: Strict health check - only returns True if J-Prime is fully healthy.
+
+        Use this when you need to ensure J-Prime can actually process requests right now.
+        """
+        await self.check_health()
+        return self._service_status == ServiceStatus.HEALTHY
+
+    def get_service_status(self) -> Tuple[ServiceStatus, Dict[str, Any]]:
+        """
+        v118.0: Get detailed service status.
+
+        Returns:
+            Tuple of (status enum, details dict)
+        """
+        return self._service_status, self._service_status_details
+
+    async def wait_for_ready(
+        self,
+        timeout: float = 60.0,
+        poll_interval: float = 2.0,
+        require_healthy: bool = False,
+    ) -> bool:
+        """
+        v118.0: Wait for J-Prime to become ready.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            poll_interval: How often to check health
+            require_healthy: If True, wait for HEALTHY status; if False, accept STARTING/INITIALIZING
+
+        Returns:
+            True if J-Prime became ready within timeout
+        """
+        start_time = time.time()
+        attempt = 0
+
+        while time.time() - start_time < timeout:
+            attempt += 1
+
+            await self.check_health()
+
+            if require_healthy:
+                if self._service_status == ServiceStatus.HEALTHY:
+                    logger.info(f"[JPrimeClient] J-Prime ready after {attempt} checks "
+                               f"({time.time() - start_time:.1f}s)")
+                    return True
+            else:
+                # Accept starting/initializing/healthy
+                if self._service_status in (
+                    ServiceStatus.HEALTHY,
+                    ServiceStatus.STARTING,
+                    ServiceStatus.INITIALIZING,
+                    ServiceStatus.DEGRADED,
+                ):
+                    logger.info(f"[JPrimeClient] J-Prime available (status={self._service_status.value}) "
+                               f"after {attempt} checks ({time.time() - start_time:.1f}s)")
+                    return True
+
+            # Log progress
+            if attempt % 5 == 0:
+                logger.debug(f"[JPrimeClient] Waiting for J-Prime... "
+                            f"status={self._service_status.value}, "
+                            f"elapsed={time.time() - start_time:.1f}s")
+
+            await asyncio.sleep(poll_interval)
+
+        logger.warning(f"[JPrimeClient] Timeout waiting for J-Prime after {timeout}s "
+                      f"(final status: {self._service_status.value})")
+        return False
+
+    async def start_health_monitor(self, interval: float = 10.0) -> None:
+        """
+        v118.0: Start background health monitoring task.
+
+        This continuously monitors J-Prime health and updates _availability_event
+        when J-Prime becomes available.
+        """
+        if self._health_monitor_task and not self._health_monitor_task.done():
+            return  # Already running
+
+        async def _monitor():
+            while not self._shutdown_requested:
+                try:
+                    await self.check_health()
+
+                    # If J-Prime just became healthy, log it
+                    if self._service_status == ServiceStatus.HEALTHY:
+                        if not self._availability_event.is_set():
+                            logger.info("[JPrimeClient] J-Prime became healthy")
+                            self._availability_event.set()
+                except Exception as e:
+                    logger.debug(f"[JPrimeClient] Health monitor error: {e}")
+
+                await asyncio.sleep(interval)
+
+        self._health_monitor_task = asyncio.create_task(_monitor())
+        logger.debug("[JPrimeClient] Health monitor started")
+
+    async def stop_health_monitor(self) -> None:
+        """v118.0: Stop the background health monitor."""
+        self._shutdown_requested = True
+        if self._health_monitor_task:
+            self._health_monitor_task.cancel()
+            try:
+                await self._health_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._health_monitor_task = None
 
     async def chat_completion(
         self,
@@ -1065,7 +1270,7 @@ class JPrimeClient:
 
 class JPrimeUnifiedEngine:
     """
-    v85.0: Unified engine for JARVIS Prime local LLM inference.
+    v118.0: Unified engine for JARVIS Prime local LLM inference.
 
     Provides:
     - Aider-style code editing
@@ -1075,6 +1280,10 @@ class JPrimeUnifiedEngine:
     - Git integration
     - Adaptive fallback chain (local → local fallbacks → Claude)
     - Per-model circuit breakers and performance tracking
+    - v118.0: Intelligent service status tracking
+    - v118.0: Wait-for-ready with configurable timeout
+    - v118.0: Background health monitoring
+    - v118.0: Lazy availability checking for startup coordination
     """
 
     def __init__(self, config: Optional[JPrimeConfig] = None):
@@ -1094,6 +1303,10 @@ class JPrimeUnifiedEngine:
             "total_inference_time_ms": 0.0,
         }
 
+        # v118.0: Track service availability separately from initialization
+        self._service_available = False
+        self._last_availability_check = 0.0
+
     async def initialize(self):
         """Initialize the engine."""
         if self._initialized:
@@ -1106,19 +1319,87 @@ class JPrimeUnifiedEngine:
         self._fallback_chain = MultiModelFallbackChain(self.config)
 
         self._initialized = True
-        logger.info("JPrimeUnifiedEngine v85.0 initialized with multi-model fallback")
+
+        # v118.0: Do an initial health check to populate service status
+        # This ensures get_service_status() returns meaningful data immediately
+        try:
+            await self._client.check_health()
+            status, _ = self._client.get_service_status()
+            logger.info(f"JPrimeUnifiedEngine v118.0 initialized (status={status.value})")
+        except Exception as e:
+            logger.debug(f"Initial health check failed: {e}")
+            logger.info("JPrimeUnifiedEngine v118.0 initialized (status=unknown)")
+
+        # v118.0: Start background health monitoring
+        await self._client.start_health_monitor(interval=15.0)
 
     async def close(self):
         """Close the engine."""
         if self._client:
+            await self._client.stop_health_monitor()
             await self._client.close()
         self._initialized = False
+        self._service_available = False
 
     async def is_available(self) -> bool:
-        """Check if JARVIS Prime is available."""
+        """
+        v118.0: Check if JARVIS Prime is available.
+
+        Returns True if:
+        - Engine is initialized AND
+        - J-Prime service is reachable (including starting/initializing states)
+        """
         if not self._initialized:
             return False
+        if not self._client:
+            return False
         return await self._client.check_health()
+
+    async def is_healthy(self) -> bool:
+        """
+        v118.0: Strict health check - only True if J-Prime is fully healthy.
+        """
+        if not self._initialized or not self._client:
+            return False
+        return await self._client.check_health_strict()
+
+    def get_service_status(self) -> Tuple[ServiceStatus, Dict[str, Any]]:
+        """
+        v118.0: Get detailed service status.
+
+        Returns:
+            Tuple of (status enum, details dict)
+        """
+        if not self._client:
+            return ServiceStatus.UNKNOWN, {}
+        return self._client.get_service_status()
+
+    async def wait_for_ready(
+        self,
+        timeout: float = 60.0,
+        poll_interval: float = 2.0,
+        require_healthy: bool = False,
+    ) -> bool:
+        """
+        v118.0: Wait for J-Prime to become ready.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            poll_interval: How often to check health
+            require_healthy: If True, wait for HEALTHY; if False, accept STARTING/INITIALIZING
+
+        Returns:
+            True if J-Prime became ready within timeout
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not self._client:
+            return False
+
+        result = await self._client.wait_for_ready(timeout, poll_interval, require_healthy)
+        self._service_available = result
+        return result
 
     def _select_model(
         self,
@@ -1682,6 +1963,7 @@ __all__ = [
     "ModelTaskType",
     "CircuitState",
     "FallbackStrategy",
+    "ServiceStatus",  # v118.0: Service status tracking
     # Components
     "TaskClassifier",
     "CircuitBreaker",

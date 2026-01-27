@@ -425,7 +425,35 @@ class TrinityUnifiedStartup:
         return all_healthy
     
     def _get_service_port(self, service_name: str) -> int:
-        """Get the port for a service."""
+        """
+        v112.0: Get the port for a service with intelligent fallback resolution.
+
+        Port resolution order:
+        1. Check ~/.jarvis/registry/ports.json for dynamically allocated ports
+        2. Check environment variables
+        3. Use hardcoded defaults
+
+        This enables cross-repo coordination when ports are reallocated due to conflicts.
+        """
+        # v112.0: First check the distributed port registry
+        registry_file = Path.home() / ".jarvis" / "registry" / "ports.json"
+        if registry_file.exists():
+            try:
+                registry = json.loads(registry_file.read_text())
+                if service_name in registry.get("ports", {}):
+                    port_info = registry["ports"][service_name]
+                    allocated_port = port_info.get("port")
+                    if allocated_port:
+                        if port_info.get("is_fallback"):
+                            logger.debug(
+                                f"[v112.0] Using fallback port {allocated_port} for {service_name} "
+                                f"(original was {port_info.get('original_port')})"
+                            )
+                        return allocated_port
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.debug(f"[v112.0] Could not read port registry: {e}")
+
+        # Fallback to environment variables and defaults
         ports = {
             "jarvis-body": int(os.getenv("JARVIS_BODY_PORT", "8010")),
             "jarvis-prime": int(os.getenv("JARVIS_PRIME_PORT", "8000")),

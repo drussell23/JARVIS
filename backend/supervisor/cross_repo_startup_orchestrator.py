@@ -10456,6 +10456,51 @@ echo "=== JARVIS Prime started ==="
                 logger.info(
                     f"    🔍 Port {definition.default_port} in use - checking if {definition.name} is healthy..."
                 )
+
+                # v117.0: CRITICAL FIX - Wait longer for service that may be starting
+                # The port being bound but not healthy could mean:
+                # 1. Another jarvis-prime is starting up (models loading)
+                # 2. A stale/zombie process that needs cleanup
+                # We must distinguish between these cases before taking action
+
+                # v117.0: Check if this is likely a jarvis-prime process starting up
+                is_jarvis_prime_starting = await self._check_if_jarvis_prime_starting(
+                    definition.default_port
+                )
+
+                if is_jarvis_prime_starting:
+                    # Another jarvis-prime is starting - wait for it to become healthy
+                    logger.info(
+                        f"    ⏳ [v117.0] Detected jarvis-prime starting on port {definition.default_port} - "
+                        f"waiting for it to become healthy..."
+                    )
+
+                    # Wait up to 90 seconds for heavy ML models to load
+                    startup_wait = min(definition.startup_timeout, 90.0)
+                    check_interval = 5.0
+                    elapsed = 0.0
+
+                    while elapsed < startup_wait:
+                        is_healthy = await self._quick_health_check(
+                            definition.default_port,
+                            definition.health_endpoint
+                        )
+                        if is_healthy:
+                            logger.info(
+                                f"    ✅ [v117.0] {definition.name} became healthy after {elapsed:.1f}s - SKIPPING SPAWN"
+                            )
+                            return "ALREADY_HEALTHY", python_exec
+
+                        await asyncio.sleep(check_interval)
+                        elapsed += check_interval
+                        logger.debug(f"    ⏳ Still waiting for health... ({elapsed:.1f}s/{startup_wait}s)")
+
+                    # Timed out waiting - the process might be stuck
+                    logger.warning(
+                        f"    ⚠️ [v117.0] jarvis-prime on port {definition.default_port} didn't become healthy "
+                        f"after {startup_wait}s - may need cleanup"
+                    )
+
                 is_healthy = await self._quick_health_check(
                     definition.default_port,
                     definition.health_endpoint
@@ -10477,12 +10522,50 @@ echo "=== JARVIS Prime started ==="
                     )
                     # v108.0: CRITICAL FIX - Actually resolve the conflict
                     # v109.3: Enhanced with retry logic and proper failure handling
-                    conflict_resolved = await self._handle_port_conflict(definition)
+                    # v117.0: _handle_port_conflict returns (success: bool, fallback_port: Optional[int])
+                    conflict_result = await self._handle_port_conflict(definition)
+                    conflict_resolved, fallback_port = conflict_result
 
                     if conflict_resolved:
-                        logger.info(
-                            f"    ✅ Port {definition.default_port} conflict resolved, proceeding with spawn"
-                        )
+                        if fallback_port is not None:
+                            # v112.0: CRITICAL - Update definition with fallback port
+                            original_port = definition.default_port
+                            definition.default_port = fallback_port
+
+                            # Update script_args to use new port
+                            updated_args = []
+                            skip_next = False
+                            for i, arg in enumerate(definition.script_args):
+                                if skip_next:
+                                    skip_next = False
+                                    continue
+                                if arg == "--port":
+                                    updated_args.append("--port")
+                                    updated_args.append(str(fallback_port))
+                                    skip_next = True  # Skip the old port value
+                                elif arg.startswith("--port="):
+                                    updated_args.append(f"--port={fallback_port}")
+                                else:
+                                    updated_args.append(arg)
+
+                            # If --port wasn't in args, add it
+                            if "--port" not in definition.script_args and not any(
+                                a.startswith("--port=") for a in definition.script_args
+                            ):
+                                updated_args.extend(["--port", str(fallback_port)])
+
+                            definition.script_args = updated_args
+
+                            logger.info(
+                                f"    🔄 [v112.0] Port reallocation: {definition.name}\n"
+                                f"       Original port: {original_port}\n"
+                                f"       Fallback port: {fallback_port}\n"
+                                f"       Updated args: {' '.join(definition.script_args)}"
+                            )
+                        else:
+                            logger.info(
+                                f"    ✅ Port {definition.default_port} conflict resolved, proceeding with spawn"
+                            )
                     else:
                         logger.error(
                             f"    ❌ Could not resolve port conflict for {definition.name} "
@@ -10554,18 +10637,112 @@ echo "=== JARVIS Prime started ==="
         except Exception:
             return False
 
-    async def _handle_port_conflict(self, definition: ServiceDefinition) -> bool:
+    async def _check_if_jarvis_prime_starting(self, port: int) -> bool:
+        """
+        v117.0: Check if the process on the port is jarvis-prime that's starting up.
+
+        This helps distinguish between:
+        1. A jarvis-prime process loading models (should wait)
+        2. A completely different process hogging the port (should cleanup)
+        3. A zombie jarvis-prime that's stuck (should cleanup)
+
+        Returns True if the process appears to be a jarvis-prime starting up.
+        """
+        try:
+            # Use lsof to find process on the port
+            result = await asyncio.create_subprocess_exec(
+                "lsof", "-i", f":{port}", "-t",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await result.communicate()
+
+            if not stdout:
+                return False
+
+            pids = [p.strip() for p in stdout.decode().split() if p.strip().isdigit()]
+
+            for pid_str in pids:
+                try:
+                    pid = int(pid_str)
+
+                    # Get the command line for this process
+                    proc_result = await asyncio.create_subprocess_exec(
+                        "ps", "-p", str(pid), "-o", "command=",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    ps_stdout, _ = await proc_result.communicate()
+                    cmd = ps_stdout.decode().lower()
+
+                    # Check if it's a jarvis-prime related process
+                    jarvis_prime_indicators = [
+                        "jarvis_prime",
+                        "jarvis-prime",
+                        "run_server.py",
+                        "jprime",
+                        "jarvis_prime.server",
+                    ]
+
+                    for indicator in jarvis_prime_indicators:
+                        if indicator.lower() in cmd:
+                            logger.debug(f"[v117.0] Found jarvis-prime process PID {pid}: {cmd[:80]}...")
+
+                            # Check process age - if just started (< 3 min), likely still loading
+                            try:
+                                proc_age_result = await asyncio.create_subprocess_exec(
+                                    "ps", "-p", str(pid), "-o", "etimes=",
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                age_stdout, _ = await proc_age_result.communicate()
+                                age_seconds = int(age_stdout.decode().strip())
+
+                                if age_seconds < 180:  # Less than 3 minutes old
+                                    logger.info(
+                                        f"[v117.0] jarvis-prime process (PID {pid}) is young "
+                                        f"({age_seconds}s) - likely still starting"
+                                    )
+                                    return True
+                                else:
+                                    logger.warning(
+                                        f"[v117.0] jarvis-prime process (PID {pid}) is {age_seconds}s old "
+                                        f"but not healthy - may be stuck"
+                                    )
+                                    return False
+                            except Exception:
+                                # Can't determine age, assume starting
+                                return True
+
+                except (ValueError, ProcessLookupError):
+                    continue
+
+        except Exception as e:
+            logger.debug(f"[v117.0] Failed to check if jarvis-prime starting: {e}")
+
+        return False
+
+    async def _handle_port_conflict(
+        self, definition: ServiceDefinition
+    ) -> Tuple[bool, Optional[int]]:
         """
         v108.0: Handle port conflict by attempting to identify and resolve the issue.
         v109.0: Enhanced with diagnostic logging and PID safety validation.
+        v112.0: CRITICAL FIX - Returns fallback port when cleanup fails instead of failing entirely.
 
         CRITICAL FIX: This now actually CLEANS UP conflicting processes instead of
         just logging them. Uses the EnterpriseProcessManager for comprehensive
         port validation and cleanup.
 
+        v112.0 Enhancement: When cleanup fails, automatically finds and returns
+        an available fallback port instead of failing. This ensures startup
+        succeeds even when the preferred port is occupied by stubborn processes.
+
         Returns:
-            True if port was successfully cleaned up and is now available
-            False if cleanup failed and port is still occupied
+            Tuple[bool, Optional[int]]:
+                - (True, None): Port cleanup succeeded, use original port
+                - (True, new_port): Cleanup failed but fallback port found
+                - (False, None): All options exhausted, no ports available
         """
         port = definition.default_port
 
@@ -10613,16 +10790,17 @@ echo "=== JARVIS Prime started ==="
                         f"       Detected PID: {validation.pid}, Our PID: {current_pid}, Parent: {parent_pid}\n"
                         f"       NOT proceeding with cleanup - this would kill ourselves."
                     )
-                    return False
+                    # v112.0: Try fallback port instead of failing
+                    return await self._allocate_fallback_port(definition)
 
             # Handle based on recommendation
             if validation.recommendation == "proceed":
-                return True  # Port available
+                return True, None  # Port available, use original
 
             elif validation.recommendation == "skip":
                 # Service already running healthy - this is actually OK
                 logger.info(f"    ✅ {definition.name} already healthy on port {port}")
-                return True
+                return True, None
 
             elif validation.recommendation in ("kill_and_retry", "wait"):
                 # v109.3: Enhanced multi-phase cleanup with force escalation
@@ -10638,7 +10816,7 @@ echo "=== JARVIS Prime started ==="
 
                 if cleanup_success:
                     logger.info(f"    ✅ Port {port} cleaned up (graceful)")
-                    return True
+                    return True, None
 
                 # Phase 2: Force cleanup (SIGKILL) if graceful failed
                 logger.warning(f"    ⚠️ Graceful cleanup failed, escalating to force cleanup...")
@@ -10651,7 +10829,7 @@ echo "=== JARVIS Prime started ==="
 
                 if cleanup_success:
                     logger.info(f"    ✅ Port {port} cleaned up (forced)")
-                    return True
+                    return True, None
 
                 # Phase 3: Wait for socket release (TIME_WAIT, CLOSE_WAIT, FIN_WAIT)
                 # v109.8: Enhanced diagnostics and comprehensive socket state handling
@@ -10669,7 +10847,7 @@ echo "=== JARVIS Prime started ==="
                         state_check = await process_manager._check_socket_state(port)
                         if not state_check.get("occupied", True):
                             logger.info(f"    ✅ Port {port} released from {state_name}")
-                            return True
+                            return True, None
                         current_state = state_check.get("state", "unknown")
                         logger.debug(
                             f"    ⏳ Still waiting: port {port} in {current_state}..."
@@ -10679,8 +10857,8 @@ echo "=== JARVIS Prime started ==="
                     )
 
                 # v109.8: Final diagnostic dump for debugging
-                logger.error(
-                    f"    ❌ All cleanup phases failed for port {port}. Final diagnostics:\n"
+                logger.warning(
+                    f"    ⚠️ All cleanup phases failed for port {port}. Final diagnostics:\n"
                     f"       Socket state: {state_name}\n"
                     f"       Port occupied: {socket_state.get('occupied', 'unknown')}"
                 )
@@ -10693,16 +10871,21 @@ echo "=== JARVIS Prime started ==="
                         capture_output=True, text=True, timeout=5
                     )
                     if lsof_result.stdout:
-                        logger.error(
+                        logger.warning(
                             f"       lsof output for port {port}:\n"
                             f"{lsof_result.stdout}"
                         )
                 except Exception as diag_err:
                     logger.debug(f"       Diagnostic lsof failed: {diag_err}")
 
-                return False
+                # v112.0: CRITICAL FIX - Don't fail, allocate fallback port instead!
+                logger.info(
+                    f"    🔄 [v112.0] Port {port} cleanup failed, allocating fallback port..."
+                )
+                return await self._allocate_fallback_port(definition)
 
-            return False
+            # v112.0: Unknown recommendation - try fallback
+            return await self._allocate_fallback_port(definition)
 
         except ImportError:
             # v109.8: Enhanced legacy fallback with multi-state socket handling
@@ -10745,7 +10928,7 @@ echo "=== JARVIS Prime started ==="
                             proc.kill()
                             proc.wait(timeout=5)
                         logger.info(f"    ✅ Killed process {conn.pid} on port {port}")
-                        return True
+                        return True, None  # v112.0: Cleanup succeeded
                     except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                         logger.warning(
                             f"    ⚠️ Could not kill process on port {port}: {e}"
@@ -10765,16 +10948,176 @@ echo "=== JARVIS Prime started ==="
                                 break
                         if not still_occupied:
                             logger.info(f"    ✅ Port {port} released")
-                            return True
-                    logger.warning(f"    ❌ Port {port} did not release in time")
+                            return True, None  # v112.0: Cleanup succeeded
 
-                return False
+                # v112.0: CRITICAL FIX - Don't fail, allocate fallback port
+                logger.info(f"    🔄 [v112.0] Legacy cleanup failed, allocating fallback port...")
+                return await self._allocate_fallback_port(definition)
 
             except Exception as e:
                 logger.error(f"Could not identify process on port: {e}")
-                return False
+                # v112.0: Still try fallback even on error
+                return await self._allocate_fallback_port(definition)
 
-        return False
+    async def _allocate_fallback_port(
+        self, definition: ServiceDefinition
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        v112.0: Allocate a fallback port when the preferred port is unavailable.
+
+        This is the CRITICAL FIX for the port conflict issue. Instead of failing
+        startup when cleanup doesn't work (e.g., ESTABLISHED connections blocking
+        port release), we dynamically allocate an alternative port and update
+        the service configuration.
+
+        Features:
+        - Scans dynamic port range (default 9000-9999)
+        - Uses socket binding test for reliability (not just connect test)
+        - Updates the distributed port registry for cross-repo coordination
+        - Returns the allocated port so caller can update service args
+
+        Args:
+            definition: The service definition requesting a port
+
+        Returns:
+            Tuple[bool, Optional[int]]:
+                - (True, new_port): Fallback port allocated successfully
+                - (False, None): No ports available in range
+        """
+        import socket
+
+        original_port = definition.default_port
+        service_name = definition.name
+
+        logger.info(
+            f"    🔍 [v112.0] Scanning for fallback port for {service_name} "
+            f"(original: {original_port})..."
+        )
+
+        # Get port range from config
+        start_port, end_port = self._dynamic_port_range
+
+        # Track which ports we've tried
+        tried_ports = []
+
+        for port in range(start_port, end_port + 1):
+            # Skip the original port (already know it's unavailable)
+            if port == original_port:
+                continue
+
+            # Skip ports already allocated in this session
+            if port in self._port_allocation_map.values():
+                continue
+
+            # Test if port is actually available using socket bind
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            test_sock.settimeout(1.0)
+
+            try:
+                test_sock.bind(('0.0.0.0', port))
+                test_sock.close()
+
+                # Port is available! Allocate it.
+                self._port_allocation_map[service_name] = port
+
+                # Record the port change for monitoring
+                if original_port not in self._port_conflict_history:
+                    self._port_conflict_history[original_port] = []
+                self._port_conflict_history[original_port].append({
+                    "timestamp": time.time(),
+                    "service": service_name,
+                    "conflict_info": "cleanup_failed",
+                    "resolved_port": port,
+                })
+
+                # Update the distributed port registry for cross-repo coordination
+                await self._update_port_registry(service_name, port, original_port)
+
+                logger.info(
+                    f"    ✅ [v112.0] Allocated fallback port {port} for {service_name} "
+                    f"(original {original_port} was unavailable)\n"
+                    f"       Scanned {len(tried_ports) + 1} ports in range {start_port}-{end_port}"
+                )
+
+                return True, port
+
+            except OSError:
+                tried_ports.append(port)
+                # Port unavailable, continue scanning
+                continue
+            finally:
+                try:
+                    test_sock.close()
+                except Exception:
+                    pass
+
+        # No ports available in range
+        logger.error(
+            f"    ❌ [v112.0] CRITICAL: No available ports for {service_name}!\n"
+            f"       Scanned range: {start_port}-{end_port}\n"
+            f"       Tried {len(tried_ports)} ports, all unavailable\n"
+            f"       💡 Solutions:\n"
+            f"          1. Free up ports in range {start_port}-{end_port}\n"
+            f"          2. Adjust JARVIS_PORT_RANGE_START/END environment variables\n"
+            f"          3. Kill stale processes: lsof -i :{start_port}-{end_port}"
+        )
+        return False, None
+
+    async def _update_port_registry(
+        self, service_name: str, new_port: int, original_port: int
+    ) -> None:
+        """
+        v112.0: Update the distributed port registry for cross-repo coordination.
+
+        When a service gets a fallback port, other repos need to know about it.
+        This updates ~/.jarvis/registry/ports.json with the actual port mapping.
+
+        Args:
+            service_name: Name of the service
+            new_port: The newly allocated port
+            original_port: The originally requested port
+        """
+        registry_dir = Path.home() / ".jarvis" / "registry"
+        registry_dir.mkdir(parents=True, exist_ok=True)
+
+        registry_file = registry_dir / "ports.json"
+
+        try:
+            # Load existing registry
+            if registry_file.exists():
+                registry = json.loads(registry_file.read_text())
+            else:
+                registry = {"version": "1.0", "ports": {}, "fallbacks": []}
+
+            # Update port mapping
+            registry["ports"][service_name] = {
+                "port": new_port,
+                "original_port": original_port,
+                "allocated_at": time.time(),
+                "is_fallback": new_port != original_port,
+            }
+
+            # Track fallback history
+            if new_port != original_port:
+                registry["fallbacks"].append({
+                    "service": service_name,
+                    "original": original_port,
+                    "fallback": new_port,
+                    "timestamp": time.time(),
+                })
+
+            # Write atomically
+            temp_file = registry_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(registry, indent=2))
+            temp_file.replace(registry_file)
+
+            logger.debug(
+                f"    📝 [v112.0] Updated port registry: {service_name} -> {new_port}"
+            )
+
+        except Exception as e:
+            logger.warning(f"    ⚠️ [v112.0] Could not update port registry: {e}")
 
     async def _wait_for_dependencies(self, definition: ServiceDefinition) -> bool:
         """

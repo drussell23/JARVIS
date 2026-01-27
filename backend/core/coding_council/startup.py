@@ -651,12 +651,15 @@ async def _initialize_v79_components() -> None:
 
 async def _initialize_v85_jprime_components() -> None:
     """
-    v85.0: Initialize J-Prime local LLM engine and fallback chain.
+    v118.0: Initialize J-Prime local LLM engine with intelligent service coordination.
 
     Components:
     - JPrimeUnifiedEngine: Local LLM inference via llama-cpp-python
     - MultiModelFallbackChain: Intelligent model cascading
     - Cross-repo coordination with J-Prime heartbeat monitoring
+    - v118.0: Lazy availability checking - don't discard engine if J-Prime is starting
+    - v118.0: Background health monitoring for auto-recovery
+    - v118.0: Service status tracking for intelligent startup coordination
     """
     global _jprime_engine, _jprime_fallback_chain
 
@@ -664,39 +667,136 @@ async def _initialize_v85_jprime_components() -> None:
         logger.info("[CodingCouncilStartup] J-Prime disabled via config")
         return
 
-    logger.info("[CodingCouncilStartup] Initializing v85.0 J-Prime components...")
+    logger.info("[CodingCouncilStartup] Initializing v118.0 J-Prime components...")
 
     # Initialize J-Prime Unified Engine
     try:
-        from .adapters.jprime_engine import JPrimeUnifiedEngine, get_jprime_engine
+        from .adapters.jprime_engine import (
+            JPrimeUnifiedEngine,
+            get_jprime_engine,
+            ServiceStatus,
+        )
 
         # Use factory function for singleton pattern
         _jprime_engine = await get_jprime_engine()
 
-        if _jprime_engine and await _jprime_engine.is_available():
-            logger.info("[CodingCouncilStartup] ✅ J-Prime Unified Engine ready (local LLM)")
+        if _jprime_engine:
+            # v118.0: Get service status for intelligent logging
+            status, details = _jprime_engine.get_service_status()
 
-            # Get fallback chain reference
-            _jprime_fallback_chain = getattr(_jprime_engine, '_fallback_chain', None)
-            if _jprime_fallback_chain:
-                logger.info("[CodingCouncilStartup] ✅ Multi-Model Fallback Chain ready")
+            if status == ServiceStatus.HEALTHY:
+                logger.info("[CodingCouncilStartup] ✅ J-Prime Unified Engine ready (local LLM)")
+                # Get fallback chain reference
+                _jprime_fallback_chain = getattr(_jprime_engine, '_fallback_chain', None)
+                if _jprime_fallback_chain:
+                    logger.info("[CodingCouncilStartup] ✅ Multi-Model Fallback Chain ready")
+
+            elif status in (ServiceStatus.STARTING, ServiceStatus.INITIALIZING):
+                # v118.0: J-Prime is starting - keep the engine, it will become available
+                # Parse status info from either HTTP response or heartbeat file format
+                model_loaded = details.get("model_loaded", False)
+                model_name = details.get("model_name") or details.get("model_path", "").split("/")[-1] or "unknown"
+                healthy = details.get("healthy", False)
+
+                # HTTP response format
+                phase = details.get("phase", "")
+                step = details.get("details", {}).get("step_num", "")
+                total = details.get("details", {}).get("total_steps", "")
+
+                if phase and step:
+                    status_info = f"phase={phase}, step {step}/{total}"
+                elif model_loaded:
+                    status_info = f"model loaded ({model_name}), warming up"
+                else:
+                    status_info = f"waiting for model ({model_name.split('.')[0] if model_name else 'unknown'})"
+
+                logger.info(
+                    f"[CodingCouncilStartup] ⏳ J-Prime {status.value} ({status_info}) - "
+                    f"engine ready, will auto-connect when healthy"
+                )
+                # v118.0: IMPORTANT - Keep the engine reference! Don't set to None
+                _jprime_fallback_chain = getattr(_jprime_engine, '_fallback_chain', None)
+
+                # v118.0: Schedule background task to log when J-Prime becomes healthy
+                asyncio.create_task(_monitor_jprime_startup())
+
+            elif status == ServiceStatus.DEGRADED:
+                logger.info("[CodingCouncilStartup] ⚠️ J-Prime degraded but available")
+                _jprime_fallback_chain = getattr(_jprime_engine, '_fallback_chain', None)
+
+            else:
+                # v118.0: J-Prime not reachable at all, but keep engine for lazy reconnection
+                logger.info(
+                    f"[CodingCouncilStartup] ℹ️ J-Prime not available yet (status={status.value}) - "
+                    f"engine initialized, will auto-connect when service starts"
+                )
+                _jprime_fallback_chain = getattr(_jprime_engine, '_fallback_chain', None)
         else:
-            # v109.2: J-Prime without local model is expected in cloud mode - use INFO
-            logger.info("[CodingCouncilStartup] ℹ️  J-Prime using cloud API (no local model)")
-            _jprime_engine = None
+            logger.warning("[CodingCouncilStartup] J-Prime engine creation failed")
 
     except ImportError as e:
         logger.debug(f"[CodingCouncilStartup] J-Prime adapter not available: {e}")
         _jprime_engine = None
     except Exception as e:
         # v109.2: J-Prime init failures during startup are expected
-        logger.info(f"[CodingCouncilStartup] ℹ️  J-Prime not loaded: {e}")
+        logger.info(f"[CodingCouncilStartup] ℹ️ J-Prime not loaded: {e}")
         _jprime_engine = None
 
-    # Log summary
-    jprime_status = "✅ ready" if _jprime_engine else "❌ unavailable"
+    # Log summary with status awareness
+    if _jprime_engine:
+        try:
+            status, _ = _jprime_engine.get_service_status()
+            if status == ServiceStatus.HEALTHY:
+                jprime_status = "✅ ready"
+            elif status in (ServiceStatus.STARTING, ServiceStatus.INITIALIZING):
+                jprime_status = "⏳ starting"
+            elif status == ServiceStatus.DEGRADED:
+                jprime_status = "⚠️ degraded"
+            else:
+                jprime_status = "🔄 pending"
+        except Exception:
+            jprime_status = "✅ initialized"
+    else:
+        jprime_status = "❌ unavailable"
+
     fallback_status = "✅ ready" if _jprime_fallback_chain else "❌ unavailable"
-    logger.info(f"[CodingCouncilStartup] v85.0 J-Prime: Engine {jprime_status}, Fallback Chain {fallback_status}")
+    logger.info(f"[CodingCouncilStartup] v118.0 J-Prime: Engine {jprime_status}, Fallback Chain {fallback_status}")
+
+
+async def _monitor_jprime_startup() -> None:
+    """
+    v118.0: Background task to monitor J-Prime startup and log when it becomes healthy.
+
+    This provides visibility into J-Prime readiness without blocking the main startup.
+    """
+    global _jprime_engine
+
+    if not _jprime_engine:
+        return
+
+    try:
+        # Wait up to 120 seconds for J-Prime to become healthy
+        ready = await _jprime_engine.wait_for_ready(
+            timeout=120.0,
+            poll_interval=5.0,
+            require_healthy=True,
+        )
+
+        if ready:
+            status, details = _jprime_engine.get_service_status()
+            model_loaded = details.get("model_loaded", False)
+            logger.info(
+                f"[CodingCouncilStartup] ✅ J-Prime now healthy! "
+                f"(model_loaded={model_loaded})"
+            )
+        else:
+            status, details = _jprime_engine.get_service_status()
+            logger.warning(
+                f"[CodingCouncilStartup] J-Prime didn't become healthy within 120s "
+                f"(status={status.value})"
+            )
+    except Exception as e:
+        logger.debug(f"[CodingCouncilStartup] J-Prime startup monitor error: {e}")
 
 
 async def _initialize_ide_components() -> None:
