@@ -605,6 +605,132 @@ _venv_activator = VenvAutoActivator()
 _venv_activator.activate()
 del _venv_activator  # Clean up namespace
 
+# =============================================================================
+# v119.2b: FAST EARLY-EXIT FOR RUNNING SUPERVISOR
+# =============================================================================
+# This check runs BEFORE heavy imports. If supervisor is already running and
+# healthy, we can exit immediately without loading 2GB+ of ML libraries.
+# Makes `python3 start_system.py` instant when supervisor is already running.
+# =============================================================================
+def _fast_supervisor_check():
+    """
+    v119.2b: Ultra-fast check for running supervisor before heavy imports.
+
+    Uses only standard library - no external dependencies.
+    Returns True if we handled the request and should exit.
+    """
+    import os as _os
+    import sys as _sys
+    import socket as _socket
+    import json as _json
+    from pathlib import Path as _Path
+
+    # Only run fast path if no action flags passed
+    action_flags = ['--help', '-h', '--force', '--stop', '--restart']
+    if any(flag in _sys.argv for flag in action_flags):
+        return False  # Need full initialization
+
+    # Check if IPC socket exists
+    sock_path = _Path.home() / ".jarvis" / "locks" / "supervisor.sock"
+    if not sock_path.exists():
+        return False  # No supervisor running
+
+    # Try to connect to supervisor
+    data = b''
+    max_retries = 2
+    sock_timeout = 8.0
+
+    for attempt in range(max_retries):
+        try:
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(sock_timeout)
+            sock.connect(str(sock_path))
+
+            # Send health command
+            msg = _json.dumps({'command': 'health'}) + '\n'
+            sock.sendall(msg.encode())
+
+            # Receive response
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if b'\n' in data:
+                        break
+                except _socket.timeout:
+                    break
+
+            sock.close()
+
+            if data:
+                break
+
+        except (_socket.timeout, ConnectionRefusedError, FileNotFoundError):
+            if attempt < max_retries - 1:
+                import time as _time
+                _time.sleep(0.5)
+                continue
+            return False
+        except Exception:
+            return False
+
+    if not data:
+        return False
+
+    # Parse response
+    try:
+        result = _json.loads(data.decode().strip())
+    except (_json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+    if not result.get('success'):
+        return False
+
+    health_data = result.get('result', {})
+    health_level = health_data.get('health_level', 'UNKNOWN')
+
+    # Only fast-exit if supervisor is healthy
+    if health_level not in ('FULLY_READY', 'HTTP_HEALTHY', 'IPC_RESPONSIVE'):
+        return False  # Unhealthy - need full init
+
+    # v119.2b: Show concise success message and exit
+    pid = health_data.get('pid', 'unknown')
+    uptime = health_data.get('uptime_seconds', 0)
+    uptime_str = f"{int(uptime // 60)}m {int(uptime % 60)}s" if uptime > 60 else f"{int(uptime)}s"
+
+    print(f"\n{'='*70}")
+    print(f"✅ JARVIS Supervisor (PID {pid}) is running and healthy")
+    print(f"{'='*70}")
+    print(f"   Health:  {health_level}")
+    print(f"   Uptime:  {uptime_str}")
+
+    # Show cross-repo status if available
+    checks = health_data.get('checks', {})
+    if 'http_health' in checks:
+        http_details = checks['http_health'].get('details', {}).get('response', {})
+        if http_details.get('trinity_enabled'):
+            print(f"   Trinity: Enabled")
+        if http_details.get('ready_for_inference'):
+            print(f"   J-Prime: Ready for inference")
+
+    print(f"")
+    print(f"   No action needed - supervisor is ready to use.")
+    print(f"   Use run_supervisor.py for advanced management commands.")
+    print(f"")
+    print(f"   Commands:  python3 run_supervisor.py --restart | --shutdown | --status")
+    print(f"{'='*70}\n")
+
+    return True  # Handled - should exit
+
+# Run fast check before heavy imports
+if _fast_supervisor_check():
+    import sys as _sys
+    _sys.exit(0)
+
+del _fast_supervisor_check
+
 # ============================================================================
 # CRITICAL: Python 3.9 Compatibility Patches
 # Must be applied BEFORE any packages that use Python 3.10+ features
@@ -21954,28 +22080,62 @@ if __name__ == "__main__":
     # ============================================================================
 
     # =========================================================================
-    # v110.0: SINGLETON ENFORCEMENT - Prevent duplicate entry points
+    # v119.1: SMART SINGLETON ENFORCEMENT - Graceful when supervisor is healthy
     # =========================================================================
-    # This prevents start_system.py from running when run_supervisor.py is
-    # already active, which was causing memory exhaustion and crashes.
+    # If supervisor is already running and healthy, show success (not error).
+    # Only show error if supervisor exists but is unhealthy/unreachable.
     # =========================================================================
     if _SINGLETON_AVAILABLE:
         is_running, existing_state = is_supervisor_running()
         if is_running and existing_state:
-            print(f"\n{'='*70}")
-            print(f"❌ JARVIS SUPERVISOR ALREADY RUNNING!")
-            print(f"{'='*70}")
-            print(f"   Entry Point: {existing_state.get('entry_point', 'unknown')}")
-            print(f"   PID:         {existing_state.get('pid', 'unknown')}")
-            print(f"   Started:     {existing_state.get('started_at', 'unknown')}")
-            print(f"   Working Dir: {existing_state.get('working_dir', 'unknown')}")
-            print(f"{'='*70}")
-            print(f"\n⚠️  RECOMMENDATION: Use run_supervisor.py instead of start_system.py")
-            print(f"   The supervisor manages all services including Trinity integration.")
-            print(f"\nTo stop the existing instance:")
-            print(f"   kill {existing_state.get('pid', '<PID>')}")
-            print(f"{'='*70}\n")
-            sys.exit(1)
+            # v119.1: Check if existing supervisor is healthy via IPC
+            from backend.core.supervisor_singleton import send_supervisor_command_sync
+            try:
+                health_result = send_supervisor_command_sync('health', timeout=5.0)
+                is_healthy = (
+                    health_result.get('success') and
+                    health_result.get('result', {}).get('health_level', '') in
+                    ('FULLY_READY', 'HTTP_HEALTHY', 'IPC_RESPONSIVE')
+                )
+            except Exception:
+                is_healthy = False
+
+            if is_healthy:
+                # v119.1: Supervisor is healthy - show success and exit cleanly
+                health_data = health_result.get('result', {})
+                uptime = health_data.get('uptime_seconds', 0)
+                uptime_str = f"{int(uptime // 60)}m {int(uptime % 60)}s" if uptime > 60 else f"{int(uptime)}s"
+
+                print(f"\n{'='*70}")
+                print(f"✅ JARVIS Supervisor (PID {existing_state.get('pid')}) is running and healthy")
+                print(f"{'='*70}")
+                print(f"   Health:  {health_data.get('health_level', 'unknown')}")
+                print(f"   Uptime:  {uptime_str}")
+                print(f"   Entry:   {existing_state.get('entry_point', 'unknown')}")
+                print(f"")
+                print(f"   No action needed - supervisor is ready to use.")
+                print(f"   Use run_supervisor.py for advanced management commands.")
+                print(f"")
+                print(f"   Commands:  python3 run_supervisor.py --restart | --shutdown | --status")
+                print(f"{'='*70}\n")
+                sys.exit(0)  # Exit cleanly - success!
+            else:
+                # Supervisor exists but unhealthy - show warning
+                print(f"\n{'='*70}")
+                print(f"⚠️  JARVIS SUPERVISOR DETECTED (but unhealthy/unreachable)")
+                print(f"{'='*70}")
+                print(f"   Entry Point: {existing_state.get('entry_point', 'unknown')}")
+                print(f"   PID:         {existing_state.get('pid', 'unknown')}")
+                print(f"   Started:     {existing_state.get('started_at', 'unknown')}")
+                print(f"   Working Dir: {existing_state.get('working_dir', 'unknown')}")
+                print(f"{'='*70}")
+                print(f"\n   The existing supervisor is not responding properly.")
+                print(f"   Options:")
+                print(f"   1. python3 run_supervisor.py --restart  (restart supervisor)")
+                print(f"   2. python3 run_supervisor.py --force    (force new instance)")
+                print(f"   3. kill {existing_state.get('pid', '<PID>')}                  (stop existing)")
+                print(f"{'='*70}\n")
+                sys.exit(1)
 
         if not acquire_supervisor_lock("start_system"):
             print("\n❌ Could not acquire supervisor lock. Another instance may be starting.")
