@@ -192,36 +192,117 @@ class GlobalProcessRegistry:
             logger.debug("[ProcessRegistry] Cleared all registered PIDs")
 
     @classmethod
+    def normalize_service_name(cls, name: str) -> str:
+        """
+        v117.4: Normalize service name for consistent comparison.
+
+        Converts hyphens to underscores and lowercases.
+        Example: "jarvis-prime (spawned)" -> "jarvis_prime"
+        """
+        # Extract base name (before parentheses)
+        base = name.split("(")[0].strip()
+        return base.lower().replace("-", "_").replace(" ", "_")
+
+    @classmethod
+    def find_by_service(cls, service_name: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """
+        v117.4: Find a registered service by normalized name.
+
+        Returns (pid, info) if found, None otherwise.
+        """
+        normalized = cls.normalize_service_name(service_name)
+        with cls._lock:
+            for pid, info in cls._pids.items():
+                component = info.get("component", "")
+                if cls.normalize_service_name(component) == normalized:
+                    return pid, info
+                # Also check if one contains the other
+                norm_comp = cls.normalize_service_name(component)
+                if normalized in norm_comp or norm_comp in normalized:
+                    return pid, info
+        return None
+
+    @classmethod
     def load_from_disk(cls) -> None:
-        """Load registry from disk (for recovery after crash)."""
+        """
+        v117.4: Load registry from disk with corruption recovery.
+
+        Validates PIDs still exist before adding to memory.
+        Handles JSON corruption gracefully.
+        """
         try:
             if cls._registry_file.exists():
-                with open(cls._registry_file) as f:
-                    data = json.load(f)
+                try:
+                    with open(cls._registry_file) as f:
+                        data = json.load(f)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[ProcessRegistry] v117.4: JSON corrupted, recovering: {e}")
+                    # Attempt to backup corrupted file and start fresh
+                    backup = cls._registry_file.with_suffix('.json.corrupted')
+                    try:
+                        import shutil
+                        shutil.copy(cls._registry_file, backup)
+                    except Exception:
+                        pass
+                    cls._registry_file.unlink(missing_ok=True)
+                    return
 
-                # Validate PIDs still exist
+                # Validate PIDs still exist and sanitize data
+                loaded_count = 0
+                skipped_dead = 0
                 with cls._lock:
                     for pid_str, info in data.items():
-                        pid = int(pid_str)
+                        try:
+                            pid = int(pid_str)
+                        except (ValueError, TypeError):
+                            continue  # Skip invalid PID entries
+
                         try:
                             os.kill(pid, 0)  # Check if process exists
                             cls._pids[pid] = info
+                            loaded_count += 1
                         except OSError:
-                            pass  # Process no longer exists
+                            skipped_dead += 1  # Process no longer exists
 
-                logger.debug(f"[ProcessRegistry] Loaded {len(cls._pids)} PIDs from disk")
+                if skipped_dead > 0:
+                    logger.info(
+                        f"[ProcessRegistry] v117.4: Loaded {loaded_count} PIDs, "
+                        f"skipped {skipped_dead} dead processes"
+                    )
+                    # Persist cleaned version
+                    cls._persist()
+                else:
+                    logger.debug(f"[ProcessRegistry] Loaded {loaded_count} PIDs from disk")
         except Exception as e:
-            logger.debug(f"[ProcessRegistry] Could not load from disk: {e}")
+            logger.warning(f"[ProcessRegistry] v117.4: Load failed, starting fresh: {e}")
 
     @classmethod
     def _persist(cls) -> None:
-        """Persist registry to disk (called with lock held)."""
+        """
+        v117.4: Persist registry to disk atomically.
+
+        Uses write-to-temp + atomic rename pattern to prevent corruption.
+        Called with lock held.
+        """
         try:
             cls._registry_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(cls._registry_file, 'w') as f:
-                json.dump({str(k): v for k, v in cls._pids.items()}, f)
+
+            # v117.4: Write to temp file, then atomic rename
+            tmp_file = cls._registry_file.with_suffix('.json.tmp')
+            with open(tmp_file, 'w') as f:
+                json.dump({str(k): v for k, v in cls._pids.items()}, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data hits disk
+
+            # Atomic rename (on POSIX systems)
+            tmp_file.replace(cls._registry_file)
         except Exception as e:
             logger.debug(f"[ProcessRegistry] Could not persist: {e}")
+            # Clean up temp file if it exists
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     @classmethod
     def cleanup_dead_pids(cls) -> int:
@@ -1591,12 +1672,29 @@ class SupervisorSingleton:
 
         v109.4: Uses os.execv() to replace the process, avoiding atexit handlers
         and the EXC_GUARD crash that occurred with async cleanup during shutdown.
+
+        v117.1: Schedule SIGHUP AFTER response is sent to avoid IPC response race.
+        The previous version sent SIGHUP immediately, which triggered os.execv()
+        before the response could be transmitted, causing "Expecting value" JSON errors.
         """
         logger.info("[Singleton] Restart requested via IPC - will use os.execv()")
-        try:
-            # SIGHUP triggers _handle_sighup which calls os.execv()
+
+        # v117.1: Schedule the SIGHUP to be sent AFTER the response is transmitted
+        # This prevents the "Expecting value: line 1 column 1" error on the client
+        async def _delayed_restart():
+            """Send SIGHUP after a brief delay to allow response transmission."""
+            await asyncio.sleep(0.1)  # 100ms delay for response to be sent
+            logger.info("[Singleton] v117.1: Sending delayed SIGHUP for restart")
             os.kill(os.getpid(), signal.SIGHUP)
-            return {"restart_initiated": True, "method": "execv"}
+
+        try:
+            # Schedule the restart (non-blocking, runs after response is sent)
+            asyncio.create_task(_delayed_restart())
+            return {
+                "restart_initiated": True,
+                "method": "execv",
+                "note": "Restart will occur in ~100ms after this response"
+            }
         except Exception as e:
             return {"restart_initiated": False, "error": str(e)}
     

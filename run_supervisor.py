@@ -24121,12 +24121,44 @@ async def main() -> int:
         if args.restart and not args.takeover:
             if is_running and existing_state:
                 print(f"\n🔄 Requesting restart of supervisor (PID {existing_state.get('pid')})...")
+
+                # v117.1: Enhanced restart handling with connection drop tolerance
+                # The server sends SIGHUP 100ms after responding, which may cause
+                # connection drops during response transmission. We handle this gracefully.
                 result = await send_ipc_command('restart', timeout=10.0)
-                if result.get('success') or result.get('restart_initiated'):
-                    print(f"✅ Restart initiated. Supervisor will restart in-place.")
+
+                # Success cases: explicit success, restart_initiated, or connection dropped
+                # (connection drop means the server is restarting, which is success!)
+                error = result.get('error', '')
+                connection_dropped = (
+                    'Expecting value' in error or  # Empty response (server restarted)
+                    'Connection' in error or       # Connection reset/closed
+                    'EOF' in error or              # End of stream
+                    'BrokenPipe' in error          # Pipe broken
+                )
+
+                if result.get('success') or result.get('restart_initiated') or connection_dropped:
+                    if connection_dropped:
+                        print(f"✅ Restart initiated (connection closed - server is restarting)")
+                    else:
+                        print(f"✅ Restart initiated. Supervisor will restart in-place.")
+
+                    # v117.1: Wait for supervisor to restart and verify it's healthy
+                    print(f"   Waiting for supervisor to restart...")
+                    await asyncio.sleep(3.0)  # Give time for os.execv() and startup
+
+                    # Verify the supervisor came back up
+                    for attempt in range(5):
+                        is_back, new_state = is_supervisor_running()
+                        if is_back and new_state:
+                            print(f"✅ Supervisor restarted successfully (PID {new_state.get('pid')})")
+                            return 0
+                        await asyncio.sleep(1.0)
+
+                    print(f"⚠️ Supervisor may still be starting up. Check with --status")
                     return 0
                 else:
-                    print(f"❌ Failed to initiate restart: {result.get('error', 'unknown')}")
+                    print(f"❌ Failed to initiate restart: {error}")
                     return 1
             else:
                 print(f"⚪ No supervisor running. Starting fresh instance...")
