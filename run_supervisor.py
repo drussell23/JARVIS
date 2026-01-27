@@ -24447,8 +24447,12 @@ async def main() -> int:
                         print(f"✅ Restart initiated (connection closed - server is restarting)")
                     else:
                         print(f"✅ Restart initiated. Supervisor will restart in-place.")
+                        marker_id = result.get('marker_id')
+                        if marker_id:
+                            print(f"   Restart marker: {marker_id}")
 
-                    # v119.5: Enhanced restart verification with process + IPC health check
+                    # v120.0: Enhanced restart verification using RestartMarker
+                    # The marker tracks restart phases and allows smarter waiting
                     # Ignore SIGINT during verification (os.execv can cause spurious signals)
                     import signal as _signal
                     original_sigint = _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
@@ -24456,33 +24460,70 @@ async def main() -> int:
                     try:
                         print(f"   Waiting for supervisor to restart...")
                         original_pid = existing_state.get('pid')
-                        await asyncio.sleep(3.0)  # Give time for os.execv() and startup
 
-                        # v119.5: Verify by checking both state file AND process AND IPC
-                        for attempt in range(8):  # More attempts, longer timeout
-                            is_back, new_state = is_supervisor_running()
+                        # v120.0: Use adaptive timeout based on restart phases
+                        # Phase progression: initiated → signal_sent → execv_triggered →
+                        #                   new_process_started → completed
+                        max_wait = 60.0  # Total max wait time (heavy init can take long)
+                        phase_check_interval = 0.5
+                        ipc_check_interval = 2.0
+                        waited = 0.0
+                        last_phase = "initiated"
+                        phase_stuck_count = 0
+                        max_phase_stuck = 10  # 5 seconds stuck in same phase
 
-                            if is_back and new_state:
-                                new_pid = new_state.get('pid')
+                        # Initial wait for os.execv() to complete
+                        await asyncio.sleep(2.0)
+                        waited += 2.0
 
-                                # v119.5: With os.execv(), PID stays the same
-                                # Verify process is actually running
-                                try:
-                                    import psutil
-                                    proc = psutil.Process(new_pid)
-                                    if proc.is_running() and 'python' in proc.name().lower():
-                                        # Also verify IPC is responsive
-                                        try:
-                                            ipc_result, _ = await send_supervisor_command('ping', timeout=3.0)
-                                            if ipc_result and ipc_result.get('success'):
-                                                print(f"✅ Supervisor restarted and verified healthy (PID {new_pid})")
-                                                return 0
-                                        except Exception:
-                                            pass  # IPC not ready yet, continue waiting
-                                except Exception:
-                                    pass  # Process check failed, continue waiting
+                        while waited < max_wait:
+                            # v120.0: First try restart-status to track phase progress
+                            try:
+                                status_result, _ = await send_supervisor_command('restart-status', timeout=3.0)
+                                if status_result:
+                                    phase = status_result.get('phase', 'unknown')
+                                    is_new = status_result.get('is_new_instance', False)
+                                    restart_active = status_result.get('restart_active', True)
 
-                            await asyncio.sleep(1.0)
+                                    if phase != last_phase:
+                                        print(f"   → Restart phase: {phase}")
+                                        last_phase = phase
+                                        phase_stuck_count = 0
+
+                                    # Restart completed successfully
+                                    if not restart_active or phase == "completed" or is_new:
+                                        new_pid = status_result.get('current_pid', original_pid)
+                                        print(f"✅ Supervisor restarted successfully (PID {new_pid})")
+                                        return 0
+                            except Exception:
+                                # IPC not available - might be during restart transition
+                                pass
+
+                            # v120.0: Fallback to traditional IPC ping check
+                            try:
+                                ping_result, _ = await send_supervisor_command('ping', timeout=3.0)
+                                if ping_result and ping_result.get('success'):
+                                    # Verify it's actually a new instance
+                                    is_back, new_state = is_supervisor_running()
+                                    if is_back and new_state:
+                                        new_started = new_state.get('started_at', '')
+                                        old_started = existing_state.get('started_at', '')
+
+                                        # os.execv keeps same PID but started_at changes
+                                        if new_started != old_started:
+                                            new_pid = new_state.get('pid', original_pid)
+                                            print(f"✅ Supervisor restarted and verified healthy (PID {new_pid})")
+                                            return 0
+                            except Exception:
+                                pass  # IPC not ready yet
+
+                            phase_stuck_count += 1
+                            if phase_stuck_count >= max_phase_stuck:
+                                print(f"   ⚠️ Restart seems stuck in phase '{last_phase}'")
+                                phase_stuck_count = 0  # Reset to keep waiting
+
+                            await asyncio.sleep(phase_check_interval)
+                            waited += phase_check_interval
                     finally:
                         # Restore original SIGINT handler
                         _signal.signal(_signal.SIGINT, original_sigint)
@@ -24500,7 +24541,14 @@ async def main() -> int:
                             pass
                         return 1
 
-                    print(f"⚠️ Supervisor may still be starting up. Check with --status")
+                    # v120.0: Final status check
+                    is_back, new_state = is_supervisor_running()
+                    if is_back:
+                        print(f"⚠️ Supervisor is running but restart verification timed out.")
+                        print(f"   The supervisor may still be initializing. Check with --status")
+                    else:
+                        print(f"❌ Supervisor does not appear to be running after restart.")
+                        print(f"   Check logs for errors.")
                     return 0
                 else:
                     print(f"❌ Failed to initiate restart: {error}")

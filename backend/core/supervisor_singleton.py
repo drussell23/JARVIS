@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JARVIS Supervisor Singleton v115.0
+JARVIS Supervisor Singleton v120.0
 ==================================
 
 Enterprise-grade singleton enforcement for the JARVIS system.
@@ -15,6 +15,9 @@ This module provides:
 6. v114.0: Functional health checks (IPC ping, HTTP health, readiness state)
 7. v115.0: Advanced multi-layer health verification with async parallel checks,
            cross-repo integration, intelligent recovery, and zero-config autodiscovery
+8. v120.0: Thread-isolated IPC server for guaranteed responsiveness during heavy
+           event loop operations. Restart marker system for cross-process coordination.
+           Intelligent restart verification with adaptive timeouts.
 
 Usage:
     from backend.core.supervisor_singleton import acquire_supervisor_lock, release_supervisor_lock
@@ -36,14 +39,16 @@ IPC Commands (v113.0+):
     - force-stop: Force immediate shutdown
     - health: v115.0 - Comprehensive health report with cross-repo status
     - cross-repo-status: v115.0 - Get status of all connected repos
+    - restart-status: v120.0 - Check restart marker and initialization status
 
 Author: JARVIS System
-Version: 115.0.0 (January 2026)
+Version: 120.0.0 (January 2026)
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import fcntl
 import json
 import logging
@@ -51,15 +56,18 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from enum import Enum, IntEnum
+from functools import partial
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, Callable, List
+from typing import Optional, Dict, Any, Tuple, Callable, List, Set
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +112,19 @@ HEARTBEAT_INTERVAL = _get_env_float("JARVIS_HEARTBEAT_INTERVAL", 5.0)  # Reduced
 HEALTH_CHECK_TIMEOUT = _get_env_float("JARVIS_HEALTH_CHECK_TIMEOUT", 3.0)
 IPC_TIMEOUT = _get_env_float("JARVIS_IPC_TIMEOUT", 2.0)
 HTTP_HEALTH_PORTS = [int(p) for p in os.environ.get("JARVIS_HTTP_PORTS", "8080,8000,8010").split(",")]
+
+# =============================================================================
+# v120.0: Restart Marker System for Cross-Process Coordination
+# =============================================================================
+# The restart marker file signals that a restart is in progress.
+# This allows:
+# 1. Client to wait intelligently for restart completion
+# 2. New supervisor to know it's starting from a restart (vs fresh start)
+# 3. Cross-repo components to be notified of restart in progress
+# =============================================================================
+RESTART_MARKER_FILE = LOCK_DIR / "restart.marker"
+RESTART_TIMEOUT = _get_env_float("JARVIS_RESTART_TIMEOUT", 120.0)  # Max seconds for restart
+IPC_THREAD_ENABLED = os.environ.get("JARVIS_IPC_THREAD", "true").lower() in ("1", "true", "yes")
 
 # =============================================================================
 # v116.0: Global Process Registry for Trinity Component Tracking
@@ -326,6 +347,442 @@ class GlobalProcessRegistry:
 
         return removed
 
+
+# =============================================================================
+# v120.0: Restart Marker for Cross-Process Coordination
+# =============================================================================
+
+class RestartMarker:
+    """
+    v120.0: Atomic restart marker for coordinating supervisor restarts.
+
+    This class manages a marker file that signals restart state to:
+    1. The restart client (so it knows to wait longer)
+    2. The new supervisor (so it knows this is a restart, not fresh start)
+    3. Cross-repo components (so they can reconnect)
+
+    Marker file format (JSON):
+    {
+        "initiated_at": ISO timestamp,
+        "initiated_by_pid": PID that initiated restart,
+        "expected_new_pid": PID after os.execv (same as initiated_by_pid),
+        "phase": "initiated" | "executing" | "completed" | "failed",
+        "cross_repo_notified": ["jarvis_prime", "reactor_core"],
+        "timeout_at": ISO timestamp when restart should be considered failed
+    }
+    """
+
+    _lock = threading.Lock()
+
+    @classmethod
+    def create(cls, pid: int, timeout: float = None) -> bool:
+        """
+        Create restart marker indicating restart is starting.
+
+        Args:
+            pid: The PID initiating the restart (will be same after os.execv)
+            timeout: Max seconds to wait for restart (default: RESTART_TIMEOUT)
+
+        Returns:
+            True if marker created successfully
+        """
+        if timeout is None:
+            timeout = RESTART_TIMEOUT
+
+        with cls._lock:
+            try:
+                now = datetime.now()
+                marker_data = {
+                    "marker_id": f"restart-{pid}-{int(now.timestamp())}",
+                    "initiated_at": now.isoformat(),
+                    "initiated_by_pid": pid,
+                    "old_pid": pid,  # The PID being restarted
+                    "expected_new_pid": pid,  # os.execv keeps same PID
+                    "phase": "initiated",
+                    "cross_repo_notified": [],
+                    "timeout_at": (now.timestamp() + timeout),
+                    "version": "120.0"
+                }
+
+                # Atomic write
+                LOCK_DIR.mkdir(parents=True, exist_ok=True)
+                temp_file = RESTART_MARKER_FILE.with_suffix('.tmp')
+                temp_file.write_text(json.dumps(marker_data, indent=2))
+                temp_file.rename(RESTART_MARKER_FILE)
+
+                logger.info(f"[RestartMarker] v120.0: Created restart marker for PID {pid}")
+                return True
+
+            except Exception as e:
+                logger.error(f"[RestartMarker] Failed to create marker: {e}")
+                return False
+
+    @classmethod
+    def update_phase(cls, phase: str) -> bool:
+        """Update the restart phase (executing, completed, failed)."""
+        with cls._lock:
+            try:
+                if not RESTART_MARKER_FILE.exists():
+                    return False
+
+                data = json.loads(RESTART_MARKER_FILE.read_text())
+                data["phase"] = phase
+                data["phase_updated_at"] = datetime.now().isoformat()
+
+                temp_file = RESTART_MARKER_FILE.with_suffix('.tmp')
+                temp_file.write_text(json.dumps(data, indent=2))
+                temp_file.rename(RESTART_MARKER_FILE)
+
+                logger.debug(f"[RestartMarker] Phase updated to: {phase}")
+                return True
+
+            except Exception as e:
+                logger.error(f"[RestartMarker] Failed to update phase: {e}")
+                return False
+
+    @classmethod
+    def mark_cross_repo_notified(cls, repo_names: List[str]) -> None:
+        """Record that cross-repo components were notified."""
+        if not repo_names:
+            return
+        with cls._lock:
+            try:
+                if RESTART_MARKER_FILE.exists():
+                    data = json.loads(RESTART_MARKER_FILE.read_text())
+                    notified = set(data.get("cross_repo_notified", []))
+                    notified.update(repo_names)
+                    data["cross_repo_notified"] = list(notified)
+                    temp_file = RESTART_MARKER_FILE.with_suffix('.tmp')
+                    temp_file.write_text(json.dumps(data, indent=2))
+                    temp_file.rename(RESTART_MARKER_FILE)
+            except Exception:
+                pass
+
+    @classmethod
+    def read(cls) -> Optional[Dict[str, Any]]:
+        """Read current restart marker state."""
+        try:
+            if RESTART_MARKER_FILE.exists():
+                return json.loads(RESTART_MARKER_FILE.read_text())
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Check if a restart is currently in progress."""
+        marker = cls.read()
+        if not marker:
+            return False
+
+        # Check if timed out
+        timeout_at = marker.get("timeout_at", 0)
+        if time.time() > timeout_at:
+            # Restart timed out - clean up
+            cls.clear()
+            return False
+
+        phase = marker.get("phase", "")
+        return phase in ("initiated", "executing")
+
+    @classmethod
+    def is_restart_completion(cls, current_pid: int) -> bool:
+        """
+        Check if current startup is completing a restart.
+
+        Returns True if:
+        1. Marker exists and is active (not timed out)
+        2. Phase indicates restart is in progress but new process hasn't completed
+        3. Current PID matches expected_new_pid (with os.execv, same PID)
+
+        Phases progression:
+        - initiated: restart requested, marker created
+        - signal_sent: SIGHUP sent to supervisor
+        - execv_triggered: right before os.execv() call
+        - new_process_started: new process detected marker and started
+        - completed: restart fully complete
+        """
+        marker = cls.read()
+        if not marker:
+            return False
+
+        # Check if marker has timed out (stale restart)
+        timeout_at = marker.get("timeout_at", 0)
+        if time.time() > timeout_at:
+            logger.debug("[RestartMarker] Marker has timed out - not a restart completion")
+            return False
+
+        expected_pid = marker.get("expected_new_pid")
+        old_pid = marker.get("old_pid")
+        phase = marker.get("phase", "")
+
+        # With os.execv(), PID stays the same, so expected_new_pid == old_pid
+        # Check if phase indicates we're post-execv but not yet completed
+        restart_in_progress_phases = ("initiated", "signal_sent", "execv_triggered")
+
+        return (
+            phase in restart_in_progress_phases and
+            expected_pid == current_pid  # os.execv keeps same PID
+        )
+
+    @classmethod
+    def complete(cls) -> None:
+        """Mark restart as completed and clean up."""
+        cls.update_phase("completed")
+        cls.clear()
+
+    @classmethod
+    def fail(cls, error: str = None) -> None:
+        """Mark restart as failed."""
+        with cls._lock:
+            try:
+                if RESTART_MARKER_FILE.exists():
+                    data = json.loads(RESTART_MARKER_FILE.read_text())
+                    data["phase"] = "failed"
+                    data["error"] = error or "Unknown error"
+                    data["failed_at"] = datetime.now().isoformat()
+                    RESTART_MARKER_FILE.write_text(json.dumps(data, indent=2))
+            except Exception:
+                pass
+
+    @classmethod
+    def clear(cls) -> None:
+        """Remove restart marker."""
+        with cls._lock:
+            try:
+                if RESTART_MARKER_FILE.exists():
+                    RESTART_MARKER_FILE.unlink()
+                    logger.debug("[RestartMarker] Cleared")
+            except Exception:
+                pass
+
+
+# =============================================================================
+# v120.0: Thread-Isolated IPC Server
+# =============================================================================
+
+class ThreadedIPCServer:
+    """
+    v120.0: IPC server that runs in a dedicated thread.
+
+    This prevents the IPC server from being blocked by event loop operations
+    (like heavy ML model loading, synchronous I/O, etc.), ensuring the
+    supervisor always responds to restart/status commands.
+
+    Architecture:
+    - Main thread runs asyncio event loop with heavy operations
+    - IPC thread runs separate event loop, handles only IPC
+    - Thread-safe queues for communication between threads
+    - Heartbeat monitoring to detect if main thread is stuck
+    """
+
+    def __init__(self, singleton: 'SupervisorSingleton'):
+        self._singleton = singleton
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._server = None
+        self._running = threading.Event()
+        self._stop_event = threading.Event()
+        self._command_queue: List[Tuple[str, Dict, threading.Event, Dict]] = []
+        self._queue_lock = threading.Lock()
+
+    def start(self) -> bool:
+        """Start the IPC server in a dedicated thread."""
+        if self._thread and self._thread.is_alive():
+            return True
+
+        try:
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run_server_thread,
+                name="JARVIS-IPC-Server",
+                daemon=True
+            )
+            self._thread.start()
+
+            # Wait for server to start (max 5 seconds)
+            if self._running.wait(timeout=5.0):
+                logger.info("[ThreadedIPC] v120.0: IPC server thread started")
+                return True
+            else:
+                logger.error("[ThreadedIPC] Server thread failed to start within timeout")
+                return False
+
+        except Exception as e:
+            logger.error(f"[ThreadedIPC] Failed to start server thread: {e}")
+            return False
+
+    def stop(self) -> None:
+        """Stop the IPC server thread."""
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._running.clear()
+        logger.debug("[ThreadedIPC] Server stopped")
+
+    def _run_server_thread(self) -> None:
+        """Thread main function - runs IPC event loop."""
+        try:
+            # Create new event loop for this thread
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+
+            # Start the server
+            self._loop.run_until_complete(self._start_server())
+            self._running.set()
+
+            # Run until stop requested
+            while not self._stop_event.is_set():
+                # Run event loop for a bit
+                self._loop.run_until_complete(asyncio.sleep(0.1))
+
+        except Exception as e:
+            logger.error(f"[ThreadedIPC] Server thread error: {e}")
+        finally:
+            # Clean up
+            if self._server:
+                self._server.close()
+            if self._loop:
+                self._loop.close()
+            self._running.clear()
+
+    async def _start_server(self) -> None:
+        """Start the Unix domain socket server."""
+        # Remove stale socket
+        if SUPERVISOR_IPC_SOCKET.exists():
+            with suppress(Exception):
+                SUPERVISOR_IPC_SOCKET.unlink()
+
+        self._server = await asyncio.start_unix_server(
+            self._handle_connection,
+            path=str(SUPERVISOR_IPC_SOCKET)
+        )
+
+        # Make socket accessible
+        os.chmod(str(SUPERVISOR_IPC_SOCKET), 0o666)
+        logger.info(f"[ThreadedIPC] v120.0: Server listening on {SUPERVISOR_IPC_SOCKET}")
+
+    async def _handle_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter
+    ) -> None:
+        """Handle incoming IPC connection."""
+        try:
+            # Read command with timeout
+            data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+
+            if not data:
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            # Parse command
+            request = json.loads(data.decode().strip())
+            command = request.get("command", "")
+            args = request.get("args", {})
+
+            # Handle command
+            response = await self._handle_command(command, args)
+
+            # Send response
+            writer.write((json.dumps(response) + '\n').encode())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        except asyncio.TimeoutError:
+            logger.debug("[ThreadedIPC] Connection read timeout")
+        except Exception as e:
+            logger.debug(f"[ThreadedIPC] Connection error: {e}")
+        finally:
+            with suppress(Exception):
+                writer.close()
+
+    async def _handle_command(self, command: str, args: Dict) -> Dict[str, Any]:
+        """
+        Handle IPC command.
+
+        For most commands, delegate to singleton handlers.
+        For critical commands (ping, restart-status), handle locally
+        to ensure responsiveness even if main event loop is blocked.
+        """
+        try:
+            # Local handlers for critical commands (don't depend on main event loop)
+            if command == "ping":
+                return {
+                    "success": True,
+                    "result": {
+                        "pong": True,
+                        "timestamp": datetime.now().isoformat(),
+                        "ipc_thread": True,
+                        "main_thread_responsive": self._is_main_thread_responsive()
+                    }
+                }
+
+            elif command == "restart-status":
+                marker = RestartMarker.read()
+                return {
+                    "success": True,
+                    "result": {
+                        "restart_active": RestartMarker.is_active(),
+                        "marker": marker
+                    }
+                }
+
+            elif command == "restart":
+                # Create restart marker BEFORE delegating
+                RestartMarker.create(os.getpid())
+
+                # Delegate to singleton
+                handler = self._singleton._command_handlers.get(IPCCommand.RESTART)
+                if handler:
+                    # Run handler in main event loop if possible
+                    result = await self._run_in_main_loop_or_local(handler, args)
+                    return {"success": True, "result": result}
+                else:
+                    return {"success": False, "error": "Restart handler not registered"}
+
+            else:
+                # Delegate to singleton command handlers
+                try:
+                    cmd_enum = IPCCommand(command)
+                    handler = self._singleton._command_handlers.get(cmd_enum)
+                    if handler:
+                        result = await handler(args)
+                        return {"success": True, "result": result}
+                    else:
+                        return {"success": False, "error": f"Unknown command: {command}"}
+                except ValueError:
+                    return {"success": False, "error": f"Invalid command: {command}"}
+
+        except Exception as e:
+            logger.error(f"[ThreadedIPC] Command {command} failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _is_main_thread_responsive(self) -> bool:
+        """Check if main thread is responsive (not blocked)."""
+        # Check heartbeat age
+        state = self._singleton._state
+        if state and hasattr(state, 'last_heartbeat'):
+            try:
+                hb_time = datetime.fromisoformat(state.last_heartbeat)
+                age = (datetime.now() - hb_time).total_seconds()
+                return age < 30.0  # Consider responsive if heartbeat < 30s old
+            except Exception:
+                pass
+        return True  # Assume responsive if can't determine
+
+    async def _run_in_main_loop_or_local(
+        self,
+        handler: Callable,
+        args: Dict
+    ) -> Any:
+        """Try to run handler in main loop, fall back to local execution."""
+        # For now, just run locally (handlers should be thread-safe)
+        return await handler(args)
+
+
 # v115.0: Health check levels
 class HealthLevel(IntEnum):
     """Progressive health verification levels."""
@@ -350,6 +807,9 @@ class IPCCommand(str, Enum):
     CROSS_REPO_STATUS = "cross-repo-status"  # Cross-repo integration status
     METRICS = "metrics"         # Performance metrics
     DIAGNOSTICS = "diagnostics" # Diagnostic information
+    # v120.0: Restart coordination
+    RESTART_STATUS = "restart-status"  # Query restart marker state
+    RESTART_ABORT = "restart-abort"    # Abort pending restart
 
 
 # =============================================================================
@@ -1388,6 +1848,18 @@ class SupervisorSingleton:
             else:
                 logger.debug("[Singleton] v117.0: No preserved services in registry (fresh start)")
 
+            # v120.0: Detect if we're coming from a restart (RestartMarker exists)
+            is_restart_completion = RestartMarker.is_restart_completion(os.getpid())
+            if is_restart_completion:
+                marker_data = RestartMarker.read()
+                old_pid = marker_data.get("old_pid") if marker_data else "unknown"
+                logger.info(f"[Singleton] v120.0: Restart completion detected (old PID: {old_pid})")
+                RestartMarker.update_phase("new_process_started")
+                # Schedule marker completion after full initialization
+                self._restart_marker_pending_completion = True
+            else:
+                self._restart_marker_pending_completion = False
+
             # v109.4: Set up SIGHUP handler for clean restart via os.execv()
             _setup_sighup_handler()
 
@@ -1528,11 +2000,16 @@ class SupervisorSingleton:
 
     async def start_ipc_server(self, command_handlers: Optional[Dict[IPCCommand, Callable]] = None) -> None:
         """
-        v115.0: Start Unix domain socket IPC server for remote commands.
+        v120.0: Start IPC server with thread isolation for guaranteed responsiveness.
 
-        Supports both v113.0 legacy commands and v115.0 enhanced commands:
+        When IPC_THREAD_ENABLED (default: true), uses ThreadedIPCServer which runs
+        in a dedicated thread, immune to event loop blocking from heavy operations
+        like ML model loading or workflow engine bugs.
+
+        Supports both v113.0 legacy commands and v120.0 enhanced commands:
         - status, ping, restart, shutdown, takeover, force-stop (v113.0)
         - health, cross-repo-status, metrics, diagnostics (v115.0)
+        - restart-status, restart-abort (v120.0)
 
         Args:
             command_handlers: Optional custom handlers for commands
@@ -1544,7 +2021,7 @@ class SupervisorSingleton:
             except Exception:
                 pass
 
-        # Set up default command handlers (v113.0 + v115.0)
+        # Set up default command handlers (v113.0 + v115.0 + v120.0)
         self._command_handlers: Dict[IPCCommand, Callable] = {
             # v113.0 commands
             IPCCommand.STATUS: self._handle_status,
@@ -1558,32 +2035,79 @@ class SupervisorSingleton:
             IPCCommand.CROSS_REPO_STATUS: self._handle_cross_repo_status,
             IPCCommand.METRICS: self._handle_metrics,
             IPCCommand.DIAGNOSTICS: self._handle_diagnostics,
+            # v120.0 commands
+            IPCCommand.RESTART_STATUS: self._handle_restart_status,
+            IPCCommand.RESTART_ABORT: self._handle_restart_abort,
         }
 
         # Override with custom handlers if provided
         if command_handlers:
             for cmd, handler in command_handlers.items():
                 self._command_handlers[cmd] = handler
-        
-        # Create and start server
+
+        # v120.0: Use thread-isolated IPC server for guaranteed responsiveness
+        if IPC_THREAD_ENABLED:
+            try:
+                main_loop = asyncio.get_event_loop()
+                self._threaded_ipc = ThreadedIPCServer(
+                    socket_path=SUPERVISOR_IPC_SOCKET,
+                    handlers=self._command_handlers,
+                    main_loop=main_loop,
+                )
+                self._threaded_ipc.start()
+                logger.info(f"[Singleton] v120.0 ThreadedIPCServer started: {SUPERVISOR_IPC_SOCKET}")
+
+                # v120.0: Complete restart marker if this was a restart
+                self._mark_restart_complete_if_pending()
+                return  # ThreadedIPCServer handles everything
+            except Exception as e:
+                logger.warning(f"[Singleton] ThreadedIPCServer failed, falling back to async: {e}")
+                # Fall through to legacy async server
+
+        # Legacy async IPC server (runs in main event loop)
         try:
             server = await asyncio.start_unix_server(
                 self._handle_ipc_connection,
                 path=str(SUPERVISOR_IPC_SOCKET),
             )
             self._ipc_server = server
-            
+
             # Make socket world-readable for other processes
             os.chmod(str(SUPERVISOR_IPC_SOCKET), 0o666)
-            
-            logger.info(f"[Singleton] IPC server started: {SUPERVISOR_IPC_SOCKET}")
-            
+
+            logger.info(f"[Singleton] IPC server started (legacy async): {SUPERVISOR_IPC_SOCKET}")
+
             # Keep server running in background
             asyncio.create_task(self._ipc_server_loop(server))
-            
+
+            # v120.0: Complete restart marker if this was a restart
+            self._mark_restart_complete_if_pending()
+
         except Exception as e:
             logger.warning(f"[Singleton] IPC server failed to start: {e}")
-    
+
+    def _mark_restart_complete_if_pending(self) -> None:
+        """
+        v120.0: Complete the restart marker if we detected a restart during acquire().
+
+        This is called after the IPC server is fully started, indicating the
+        new supervisor is ready to handle commands.
+        """
+        if getattr(self, '_restart_marker_pending_completion', False):
+            try:
+                marker_data = RestartMarker.read()
+                if marker_data:
+                    old_pid = marker_data.get("old_pid", "unknown")
+                    marker_id = marker_data.get("marker_id", "unknown")
+                    logger.info(
+                        f"[Singleton] v120.0: Restart complete! "
+                        f"old_pid={old_pid} → new_pid={os.getpid()}, marker={marker_id}"
+                    )
+                RestartMarker.complete()
+                self._restart_marker_pending_completion = False
+            except Exception as e:
+                logger.warning(f"[Singleton] RestartMarker completion failed: {e}")
+
     async def _ipc_server_loop(self, server) -> None:
         """
         v119.4: Self-healing IPC server loop with automatic restart.
@@ -1723,23 +2247,46 @@ class SupervisorSingleton:
     
     async def _handle_restart(self, args: Dict) -> Dict[str, Any]:
         """
-        Handle RESTART command - trigger clean restart via SIGHUP/os.execv().
+        v120.0: Handle RESTART command with cross-process coordination.
+
+        Uses RestartMarker for atomic cross-process coordination:
+        1. Creates restart marker BEFORE sending SIGHUP
+        2. Marker contains old PID for new instance to verify
+        3. New instance updates marker phases during startup
+        4. Client can poll restart-status to track progress
 
         v109.4: Uses os.execv() to replace the process, avoiding atexit handlers
         and the EXC_GUARD crash that occurred with async cleanup during shutdown.
 
         v117.1: Schedule SIGHUP AFTER response is sent to avoid IPC response race.
-        The previous version sent SIGHUP immediately, which triggered os.execv()
-        before the response could be transmitted, causing "Expecting value" JSON errors.
         """
-        logger.info("[Singleton] Restart requested via IPC - will use os.execv()")
+        logger.info("[Singleton] v120.0: Restart requested via IPC - creating RestartMarker")
+
+        old_pid = os.getpid()
+        marker_id = None
+
+        # v120.0: Create restart marker for cross-process coordination
+        try:
+            marker_id = RestartMarker.create(old_pid)
+            logger.info(f"[Singleton] RestartMarker created: {marker_id}")
+        except Exception as e:
+            logger.warning(f"[Singleton] RestartMarker creation failed (proceeding anyway): {e}")
+
+        # v120.0: Notify cross-repo services about pending restart
+        cross_repo_notified = []
+        try:
+            # Try to notify jarvis-prime and reactor-core if configured
+            cross_repo_notified = await self._notify_cross_repo_restart(marker_id)
+            if marker_id and cross_repo_notified:
+                RestartMarker.mark_cross_repo_notified(cross_repo_notified)
+        except Exception as e:
+            logger.debug(f"[Singleton] Cross-repo notification skipped: {e}")
 
         # v117.1: Schedule the SIGHUP to be sent AFTER the response is transmitted
-        # This prevents the "Expecting value: line 1 column 1" error on the client
         async def _delayed_restart():
             """Send SIGHUP after a brief delay to allow response transmission."""
             await asyncio.sleep(0.1)  # 100ms delay for response to be sent
-            logger.info("[Singleton] v117.1: Sending delayed SIGHUP for restart")
+            logger.info("[Singleton] v120.0: Sending delayed SIGHUP for os.execv() restart")
             os.kill(os.getpid(), signal.SIGHUP)
 
         try:
@@ -1748,10 +2295,132 @@ class SupervisorSingleton:
             return {
                 "restart_initiated": True,
                 "method": "execv",
-                "note": "Restart will occur in ~100ms after this response"
+                "marker_id": marker_id,
+                "old_pid": old_pid,
+                "cross_repo_notified": cross_repo_notified,
+                "note": "Restart will occur in ~100ms. Poll restart-status for progress."
             }
         except Exception as e:
+            # Clean up marker on failure
+            if marker_id:
+                RestartMarker.fail(str(e))
             return {"restart_initiated": False, "error": str(e)}
+
+    async def _notify_cross_repo_restart(self, marker_id: Optional[str]) -> List[str]:
+        """
+        v120.0: Notify cross-repo services about pending restart.
+
+        Sends restart notification to jarvis-prime and reactor-core via their
+        IPC sockets or HTTP endpoints, allowing them to prepare for reconnection.
+        """
+        notified = []
+
+        # Cross-repo notification paths
+        cross_repo_sockets = [
+            (Path.home() / ".jarvis-prime" / "locks" / "supervisor.sock", "jarvis-prime"),
+            (Path.home() / ".reactor-core" / "locks" / "supervisor.sock", "reactor-core"),
+        ]
+
+        for sock_path, repo_name in cross_repo_sockets:
+            if sock_path.exists():
+                try:
+                    # Quick non-blocking notification
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_unix_connection(str(sock_path)),
+                        timeout=1.0
+                    )
+                    msg = json.dumps({
+                        "command": "parent-restarting",
+                        "marker_id": marker_id,
+                        "parent_pid": os.getpid()
+                    })
+                    writer.write(msg.encode() + b'\n')
+                    await asyncio.wait_for(writer.drain(), timeout=0.5)
+                    writer.close()
+                    with suppress(Exception):
+                        await writer.wait_closed()
+                    notified.append(repo_name)
+                    logger.debug(f"[Singleton] Notified {repo_name} of restart")
+                except Exception as e:
+                    logger.debug(f"[Singleton] Could not notify {repo_name}: {e}")
+
+        return notified
+
+    async def _handle_restart_status(self, args: Dict) -> Dict[str, Any]:
+        """
+        v120.0: Handle RESTART_STATUS command - query restart marker state.
+
+        Used by clients to poll restart progress after initiating a restart.
+        Returns the current state of the restart marker including phase,
+        timestamps, and whether restart has completed.
+        """
+        marker_data = RestartMarker.read()
+
+        if not marker_data:
+            return {
+                "restart_active": False,
+                "message": "No active restart in progress"
+            }
+
+        # v120.0: Detect if this is the NEW supervisor (restart completed)
+        # With os.execv(), PID stays the same, so we check startup time
+        current_pid = os.getpid()
+        old_pid = marker_data.get("old_pid")
+        phase = marker_data.get("phase", "")
+
+        # If phase is new_process_started or completed, we're the new instance
+        is_new_instance = phase in ("new_process_started", "completed")
+
+        # Also check if our state file startup time is after marker creation
+        if not is_new_instance and self._state:
+            marker_time = marker_data.get("initiated_at", "")
+            state_time = self._state.started_at or ""
+            if state_time > marker_time:
+                # Our startup time is after marker was created - we're the new instance
+                is_new_instance = True
+
+        return {
+            "restart_active": RestartMarker.is_active(),
+            "is_new_instance": is_new_instance,
+            "marker_id": marker_data.get("marker_id"),
+            "old_pid": old_pid,
+            "current_pid": current_pid,
+            "phase": marker_data.get("phase"),
+            "created_at": marker_data.get("created_at"),
+            "updated_at": marker_data.get("updated_at"),
+            "cross_repo_notified": marker_data.get("cross_repo_notified", []),
+            "error": marker_data.get("error"),
+        }
+
+    async def _handle_restart_abort(self, args: Dict) -> Dict[str, Any]:
+        """
+        v120.0: Handle RESTART_ABORT command - abort a pending restart.
+
+        Can only abort if restart hasn't progressed past the 'signal_sent' phase.
+        """
+        marker_data = RestartMarker.read()
+
+        if not marker_data:
+            return {
+                "aborted": False,
+                "error": "No active restart to abort"
+            }
+
+        phase = marker_data.get("phase", "")
+        if phase in ("signal_sent", "execv_triggered", "new_process_started"):
+            return {
+                "aborted": False,
+                "error": f"Cannot abort restart in phase '{phase}' - too late"
+            }
+
+        # Clear the marker
+        RestartMarker.clear()
+        logger.info("[Singleton] v120.0: Restart aborted via IPC")
+
+        return {
+            "aborted": True,
+            "message": "Restart marker cleared"
+        }
     
     async def _handle_shutdown(self, args: Dict) -> Dict[str, Any]:
         """Handle SHUTDOWN command - graceful shutdown."""
@@ -2281,7 +2950,7 @@ def _setup_sighup_handler() -> None:
 
     def _handle_sighup(signum, frame):
         """
-        Handle SIGHUP for restart - use os.execv() to avoid atexit issues.
+        v120.0: Handle SIGHUP for restart with RestartMarker coordination.
 
         CRITICAL: This handler must NOT:
         - Create new event loops
@@ -2289,9 +2958,15 @@ def _setup_sighup_handler() -> None:
         - Call async code
         - Run complex cleanup
 
-        It simply releases the lock and replaces the process.
+        It simply releases the lock, updates the RestartMarker, and replaces the process.
         """
         logger.info("[Singleton] SIGHUP received - initiating clean restart via os.execv()")
+
+        # v120.0: Update RestartMarker phase to signal_sent
+        try:
+            RestartMarker.update_phase("signal_sent")
+        except Exception as e:
+            logger.debug(f"RestartMarker signal_sent update failed (non-fatal): {e}")
 
         # Step 1: Release file lock BEFORE execv (sync, no event loop needed)
         try:
@@ -2460,6 +3135,14 @@ def _setup_sighup_handler() -> None:
         except Exception as e:
             logger.debug(f"Trinity cleanup warning: {e}")
 
+        # v120.0: Stop ThreadedIPCServer before execv (sync, thread-safe)
+        try:
+            if _singleton and hasattr(_singleton, '_threaded_ipc') and _singleton._threaded_ipc:
+                _singleton._threaded_ipc.stop()
+                logger.debug("[Singleton] v120.0: ThreadedIPCServer stopped for restart")
+        except Exception as e:
+            logger.debug(f"ThreadedIPCServer stop warning: {e}")
+
         # Step 5: Restart via execv - this REPLACES the process (atexit NOT called)
         # v109.6: Filter out command flags that would cause restart loop
         # Without this, the new process sees --restart and tries to IPC restart itself!
@@ -2469,6 +3152,12 @@ def _setup_sighup_handler() -> None:
         args = [python] + filtered_argv
         logger.info(f"[Singleton] Executing: {' '.join(args[:5])}...")
 
+        # v120.0: Update RestartMarker phase right before execv
+        try:
+            RestartMarker.update_phase("execv_triggered")
+        except Exception as e:
+            logger.debug(f"RestartMarker execv_triggered update failed (non-fatal): {e}")
+
         # v119.5: Add explicit error handling for os.execv()
         # In signal handlers, exceptions can be silently swallowed
         try:
@@ -2477,6 +3166,12 @@ def _setup_sighup_handler() -> None:
             # UNREACHABLE: process has been replaced
         except Exception as e:
             # os.execv() failed - this is a critical error
+            # v120.0: Update RestartMarker with failure
+            try:
+                RestartMarker.fail(f"os.execv() failed: {e}")
+            except Exception:
+                pass
+
             # Write to stderr and a fallback file since logging may not work
             import traceback
             error_msg = f"[Singleton] CRITICAL: os.execv() FAILED: {e}\n{traceback.format_exc()}"
