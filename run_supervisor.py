@@ -23727,17 +23727,18 @@ v116.0 Intelligent Startup Behavior:
         help="Run comprehensive zombie cleanup and exit (v109.7)"
     )
 
+    # v119.0: Cross-repo coordination is ENABLED BY DEFAULT
+    # Use --no-connect-repos to disable
     parser.add_argument(
         "--connect-repos",
         action="store_true",
-        default=True,
-        help="Enable cross-repo coordination (default: True)"
+        help="Enable cross-repo coordination (this is the default - flag is optional)"
     )
 
     parser.add_argument(
         "--no-connect-repos",
         action="store_true",
-        help="Disable cross-repo coordination"
+        help="Disable cross-repo coordination (repos connect by default without any flag)"
     )
 
     parser.add_argument(
@@ -24460,8 +24461,11 @@ async def main() -> int:
         except Exception as e:
             print(f"[v116.0] IPC server warning: {e}")  # Non-fatal, continue startup
 
-        # v116.0: Initialize cross-repo coordination if enabled
-        if args.connect_repos and not args.no_connect_repos:
+        # v119.0: Cross-repo coordination is ENABLED BY DEFAULT
+        # Use --no-connect-repos to disable
+        # Note: args.connect_repos with action="store_true" ignores default=True,
+        # so we only check if --no-connect-repos was passed
+        if not args.no_connect_repos:
             try:
                 from backend.core.cross_repo_orchestrator import CrossRepoOrchestrator
                 orchestrator = CrossRepoOrchestrator()
@@ -24469,9 +24473,11 @@ async def main() -> int:
                     orchestrator.start_coordination(),
                     name="cross_repo_coordinator"
                 )
-                print("[v116.0] Cross-repo coordination initialized")
+                print("[v119.0] Cross-repo coordination initialized (default: enabled)")
             except Exception as e:
-                print(f"[v116.0] Cross-repo coordination warning: {e}")  # Non-fatal
+                print(f"[v119.0] Cross-repo coordination warning: {e}")  # Non-fatal
+        else:
+            print("[v119.0] Cross-repo coordination disabled via --no-connect-repos")
 
     # =========================================================================
     # v95.17: Clean up orphaned semaphores from previous crashes
