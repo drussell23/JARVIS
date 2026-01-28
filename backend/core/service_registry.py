@@ -742,6 +742,14 @@ class ServiceInfo:
     parent_pid: int = 0             # Parent process ID
     parent_name: str = ""           # Parent process name
 
+    # v112.0: Cross-repo lifecycle coordination
+    # Tracks service transition states to prevent false deregistration during
+    # restarts, upgrades, or coordinated maintenance windows
+    lifecycle_state: str = "stable"  # stable, starting, stopping, restarting, upgrading, maintenance
+    lifecycle_transition_started: float = 0.0  # When transition began
+    lifecycle_expected_duration: float = 0.0   # Expected transition duration (seconds)
+    lifecycle_reason: str = ""       # Why service is in transition (e.g., "graceful_restart")
+
     def __post_init__(self):
         if self.registered_at == 0.0:
             self.registered_at = time.time()
@@ -1029,7 +1037,19 @@ class ServiceInfo:
         v4.0 Enhancement: Also validates process start time to detect PID reuse.
         On Unix systems, PIDs can be reused after a process terminates.
         A new process could get the same PID, causing false-positive alive checks.
+
+        v112.0 Enhancement: Increased PID reuse tolerance from 1s to 5s (configurable)
+        to handle clock skew, NTP adjustments, and floating-point precision issues.
+        The tolerance is configurable via JARVIS_PID_REUSE_TOLERANCE env var.
         """
+        # v112.0: Configurable PID reuse tolerance (default 5 seconds)
+        # Increased from 1s to handle:
+        # - NTP clock adjustments
+        # - System clock skew
+        # - Floating-point precision differences
+        # - Container/VM time synchronization delays
+        pid_tolerance = float(os.environ.get("JARVIS_PID_REUSE_TOLERANCE", "5.0"))
+
         try:
             process = psutil.Process(self.pid)
 
@@ -1041,14 +1061,23 @@ class ServiceInfo:
             # If we have a stored start time, verify it matches
             if self.process_start_time > 0.0:
                 current_start_time = process.create_time()
-                # Allow 1 second tolerance for timing differences
-                if abs(current_start_time - self.process_start_time) > 1.0:
+                time_diff = abs(current_start_time - self.process_start_time)
+
+                # v112.0: Use configurable tolerance (default 5 seconds)
+                if time_diff > pid_tolerance:
                     logger.warning(
                         f"PID reuse detected for {self.service_name}: "
-                        f"stored_start={self.process_start_time:.1f}, "
-                        f"current_start={current_start_time:.1f}"
+                        f"stored_start={self.process_start_time:.3f}, "
+                        f"current_start={current_start_time:.3f}, "
+                        f"diff={time_diff:.3f}s > tolerance={pid_tolerance}s"
                     )
                     return False
+                elif time_diff > 1.0:
+                    # v112.0: Log drift but don't fail if within tolerance
+                    logger.debug(
+                        f"[v112.0] Process start time drift for {self.service_name}: "
+                        f"{time_diff:.3f}s (within {pid_tolerance}s tolerance)"
+                    )
 
             return True
 
@@ -1870,6 +1899,43 @@ class ServiceRegistry:
             dead_pid = service.pid
             current_time = time.time()
 
+            # v112.0: CRITICAL - Registry owner (jarvis-body) is NEVER auto-deregistered
+            # The owner must only be deregistered via explicit deregister_service() call
+            # during graceful shutdown. External discover_service() calls should NEVER
+            # trigger owner deregistration, even if PID check fails transiently.
+            if service_name == self._owner_service_name:
+                logger.warning(
+                    f"⚠️  Registry owner {service_name} PID check failed (PID {dead_pid}) - "
+                    f"NOT deregistering (owner is protected). This may indicate PID reuse "
+                    f"false positive or transient process state."
+                )
+                # Clear any suspicious tracking that may have accumulated
+                if service_name in self._suspicious_services:
+                    del self._suspicious_services[service_name]
+                if service_name in self._suspicious_retry_counts:
+                    del self._suspicious_retry_counts[service_name]
+                # Return the service info anyway - let caller decide
+                # Owner is assumed to be alive unless explicitly deregistered
+                return service
+
+            # v112.0: Check if service is in lifecycle transition
+            # Services in transition (restarting, upgrading, etc.) get extra protection
+            if self.is_in_transition(service):
+                transition_elapsed = time.time() - service.lifecycle_transition_started
+                logger.info(
+                    f"⏳ Service '{service_name}' PID check failed but is in "
+                    f"'{service.lifecycle_state}' transition (elapsed: {transition_elapsed:.1f}s, "
+                    f"reason: {service.lifecycle_reason or 'not specified'}) - "
+                    f"NOT starting grace period"
+                )
+                # Clear any suspicious tracking - service is in known transition
+                if service_name in self._suspicious_services:
+                    del self._suspicious_services[service_name]
+                if service_name in self._suspicious_retry_counts:
+                    del self._suspicious_retry_counts[service_name]
+                # Return None but don't deregister - service is transitioning
+                return None
+
             # v95.1: Track suspicious services with grace period
             if service_name not in self._suspicious_services:
                 # First detection - start grace period
@@ -2020,6 +2086,240 @@ class ServiceRegistry:
             # Log but don't propagate - heartbeat failures shouldn't crash services
             logger.debug(f"Heartbeat error for {service_name}: {e} (non-fatal)")
             return False
+
+    # =========================================================================
+    # v112.0: Cross-Repo Lifecycle Coordination
+    # =========================================================================
+    # These methods enable safe coordination between JARVIS, JARVIS-Prime,
+    # and Reactor-Core during service transitions (restarts, upgrades, etc.)
+    # =========================================================================
+
+    async def signal_lifecycle_transition(
+        self,
+        service_name: str,
+        lifecycle_state: str,
+        reason: str = "",
+        expected_duration: float = 60.0
+    ) -> bool:
+        """
+        v112.0: Signal that a service is entering a lifecycle transition.
+
+        This prevents external services from accidentally triggering deregistration
+        during restarts, upgrades, or maintenance windows.
+
+        Args:
+            service_name: Service entering transition
+            lifecycle_state: One of: starting, stopping, restarting, upgrading, maintenance
+            reason: Why transition is happening (e.g., "graceful_restart", "version_upgrade")
+            expected_duration: Expected transition duration in seconds
+
+        Returns:
+            True if transition signaled successfully
+
+        Valid lifecycle_state values:
+            - "stable": Normal operation (default)
+            - "starting": Service is starting up
+            - "stopping": Service is gracefully shutting down
+            - "restarting": Service is restarting (stopping then starting)
+            - "upgrading": Service is upgrading to new version
+            - "maintenance": Service is in maintenance mode
+
+        Example:
+            # Before restarting jarvis-body
+            await registry.signal_lifecycle_transition(
+                "jarvis-body",
+                "restarting",
+                reason="graceful_restart",
+                expected_duration=120.0
+            )
+        """
+        valid_states = {"stable", "starting", "stopping", "restarting", "upgrading", "maintenance"}
+        if lifecycle_state not in valid_states:
+            logger.warning(f"[v112.0] Invalid lifecycle state '{lifecycle_state}', using 'maintenance'")
+            lifecycle_state = "maintenance"
+
+        try:
+            services = await asyncio.to_thread(self._read_registry)
+            service = services.get(service_name)
+
+            if not service:
+                logger.warning(f"[v112.0] Cannot signal transition for unknown service: {service_name}")
+                return False
+
+            # Update lifecycle fields
+            service.lifecycle_state = lifecycle_state
+            service.lifecycle_transition_started = time.time()
+            service.lifecycle_expected_duration = expected_duration
+            service.lifecycle_reason = reason
+
+            # Persist to registry
+            services[service_name] = service
+            await asyncio.to_thread(self._write_registry, services)
+
+            logger.info(
+                f"[v112.0] 🔄 Service '{service_name}' entering '{lifecycle_state}' transition "
+                f"(reason: {reason}, expected: {expected_duration}s)"
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[v112.0] Failed to signal lifecycle transition: {e}")
+            return False
+
+    async def signal_lifecycle_stable(self, service_name: str) -> bool:
+        """
+        v112.0: Signal that a service has completed its transition and is stable.
+
+        This should be called after a service successfully completes startup,
+        restart, upgrade, or exits maintenance mode.
+
+        Args:
+            service_name: Service that is now stable
+
+        Returns:
+            True if stable state signaled successfully
+        """
+        return await self.signal_lifecycle_transition(
+            service_name,
+            "stable",
+            reason="transition_complete",
+            expected_duration=0.0
+        )
+
+    def is_in_transition(self, service: 'ServiceInfo') -> bool:
+        """
+        v112.0: Check if a service is currently in a lifecycle transition.
+
+        Used to determine if a service should be given extra grace during
+        health checks and deregistration decisions.
+
+        Args:
+            service: ServiceInfo object to check
+
+        Returns:
+            True if service is in an active transition
+        """
+        if service.lifecycle_state == "stable":
+            return False
+
+        # Check if transition has expired
+        if service.lifecycle_transition_started > 0 and service.lifecycle_expected_duration > 0:
+            elapsed = time.time() - service.lifecycle_transition_started
+            if elapsed > service.lifecycle_expected_duration * 2:
+                # Transition has taken 2x longer than expected - consider it stuck
+                logger.warning(
+                    f"[v112.0] Service '{service.service_name}' transition appears stuck "
+                    f"(state: {service.lifecycle_state}, elapsed: {elapsed:.1f}s, "
+                    f"expected: {service.lifecycle_expected_duration}s)"
+                )
+                return False
+
+        return True
+
+    async def get_lifecycle_state(self, service_name: str) -> Optional[Dict[str, Any]]:
+        """
+        v112.0: Get the lifecycle state of a service for cross-repo coordination.
+
+        This is useful for external services (JARVIS-Prime, Reactor-Core) to check
+        if they should wait for a service to complete its transition.
+
+        Args:
+            service_name: Service to check
+
+        Returns:
+            Dict with lifecycle info, or None if service not found:
+            {
+                "state": "restarting",
+                "reason": "graceful_restart",
+                "started_at": 1704067200.0,
+                "expected_duration": 120.0,
+                "elapsed": 30.5,
+                "remaining": 89.5,
+                "is_transitioning": True
+            }
+        """
+        try:
+            services = await asyncio.to_thread(self._read_registry)
+            service = services.get(service_name)
+
+            if not service:
+                return None
+
+            current_time = time.time()
+            elapsed = current_time - service.lifecycle_transition_started if service.lifecycle_transition_started > 0 else 0
+            remaining = max(0, service.lifecycle_expected_duration - elapsed) if service.lifecycle_expected_duration > 0 else 0
+
+            return {
+                "state": service.lifecycle_state,
+                "reason": service.lifecycle_reason,
+                "started_at": service.lifecycle_transition_started,
+                "expected_duration": service.lifecycle_expected_duration,
+                "elapsed": elapsed,
+                "remaining": remaining,
+                "is_transitioning": self.is_in_transition(service)
+            }
+
+        except Exception as e:
+            logger.error(f"[v112.0] Failed to get lifecycle state: {e}")
+            return None
+
+    async def wait_for_service_stable(
+        self,
+        service_name: str,
+        timeout: float = 120.0,
+        poll_interval: float = 2.0
+    ) -> bool:
+        """
+        v112.0: Wait for a service to become stable (complete its transition).
+
+        This is useful for cross-repo coordination where one service needs to
+        wait for another to finish restarting before continuing.
+
+        Args:
+            service_name: Service to wait for
+            timeout: Maximum time to wait (seconds)
+            poll_interval: How often to check (seconds)
+
+        Returns:
+            True if service became stable within timeout, False otherwise
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            lifecycle = await self.get_lifecycle_state(service_name)
+
+            if lifecycle is None:
+                # Service not found - might be starting up
+                logger.debug(f"[v112.0] Waiting for '{service_name}' to register...")
+                await asyncio.sleep(poll_interval)
+                continue
+
+            if not lifecycle["is_transitioning"]:
+                # Service is stable!
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"[v112.0] ✅ Service '{service_name}' is stable "
+                    f"(waited {elapsed:.1f}s)"
+                )
+                return True
+
+            # Still transitioning
+            remaining = lifecycle["remaining"]
+            logger.debug(
+                f"[v112.0] Waiting for '{service_name}' to complete "
+                f"'{lifecycle['state']}' (remaining: {remaining:.1f}s)"
+            )
+            await asyncio.sleep(poll_interval)
+
+        # Timeout
+        lifecycle = await self.get_lifecycle_state(service_name)
+        if lifecycle:
+            logger.warning(
+                f"[v112.0] ⚠️ Timeout waiting for '{service_name}' to stabilize "
+                f"(state: {lifecycle['state']}, timeout: {timeout}s)"
+            )
+        return False
 
     def _ensure_registry_lock(self) -> asyncio.Lock:
         """
@@ -2340,9 +2640,10 @@ class ServiceRegistry:
         except Exception as e:
             logger.warning(f"[v95.1] Failed to send owner heartbeat: {e}")
 
-    async def ensure_owner_registered_immediately(self) -> bool:
+    async def ensure_owner_registered_immediately(self, start_heartbeat: bool = True) -> bool:
         """
         v95.2: PUBLIC method to ensure owner is registered immediately.
+        v112.0: Now also starts self-heartbeat loop to prevent startup window vulnerability.
 
         This should be called at the START of FastAPI lifespan to ensure
         jarvis-body is discoverable by external services (jarvis-prime, reactor-core)
@@ -2354,6 +2655,16 @@ class ServiceRegistry:
         - start_cleanup_task() is called LATE in the startup process
         - Result: jarvis-prime times out and runs in standalone mode
 
+        v112.0 Enhancement:
+        - Also starts the self-heartbeat loop immediately (if start_heartbeat=True)
+        - This closes the startup window vulnerability where external services
+          could trigger grace period tracking before heartbeats start
+        - The heartbeat loop keeps last_heartbeat fresh during FastAPI loading
+
+        Args:
+            start_heartbeat: If True, immediately start self-heartbeat loop.
+                            Default True for backwards-compatible behavior improvement.
+
         Returns:
             True if registration succeeded
         """
@@ -2361,6 +2672,20 @@ class ServiceRegistry:
             await self._ensure_owner_registered()
             await self._send_owner_heartbeat()
             logger.info(f"[v95.2] ✅ Owner '{self._owner_service_name}' registered immediately")
+
+            # v112.0: Start self-heartbeat loop immediately to prevent startup window
+            # This ensures heartbeats continue during FastAPI loading phase
+            if start_heartbeat:
+                if self._self_heartbeat_task is None or self._self_heartbeat_task.done():
+                    self._self_heartbeat_task = asyncio.create_task(
+                        self._self_heartbeat_loop(),
+                        name=f"service_registry_heartbeat_{self._owner_service_name}"
+                    )
+                    logger.info(
+                        f"[v112.0] ✅ Self-heartbeat loop started immediately "
+                        f"(interval: {self._self_heartbeat_interval}s)"
+                    )
+
             return True
         except Exception as e:
             logger.warning(f"[v95.2] Immediate owner registration failed: {e}")

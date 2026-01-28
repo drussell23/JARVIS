@@ -6915,18 +6915,30 @@ class SupervisorBootstrapper:
             self.logger.debug("[v111.2] In-process heartbeat writer stopped")
 
         # ═══════════════════════════════════════════════════════════════════
-        # v111.1: DEREGISTER FROM SERVICE REGISTRY FIRST
+        # v112.0: SIGNAL LIFECYCLE TRANSITION BEFORE DEREGISTRATION
         # ═══════════════════════════════════════════════════════════════════
-        # Deregister jarvis-body so external services know we're shutting down
-        # and don't try to connect to us during the shutdown window.
+        # Signal to external services (jarvis-prime, reactor-core) that we're
+        # entering a stopping transition. This prevents them from triggering
+        # false deregistration events during our shutdown window.
         # ═══════════════════════════════════════════════════════════════════
         try:
             from backend.core.service_registry import ServiceRegistry
             registry = ServiceRegistry()
+
+            # v112.0: Signal stopping transition first
+            await registry.signal_lifecycle_transition(
+                "jarvis-body",
+                lifecycle_state="stopping",
+                reason="graceful_shutdown",
+                expected_duration=float(timeout)  # Use shutdown timeout as expected duration
+            )
+            self.logger.info(f"[v112.0] 🔄 jarvis-body signaled 'stopping' transition (timeout: {timeout}s)")
+
+            # v111.1: Then deregister
             await registry.deregister_service("jarvis-body")
             self.logger.info("[v111.1] ✅ jarvis-body deregistered from service registry")
         except Exception as reg_err:
-            self.logger.debug(f"[v111.1] Service registry deregistration: {reg_err}")
+            self.logger.debug(f"[v112.0] Service registry lifecycle/deregistration: {reg_err}")
 
         # ═══════════════════════════════════════════════════════════════════
         # v111.2: CLEAN UP HEARTBEAT FILE

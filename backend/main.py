@@ -1887,15 +1887,28 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         registry = get_service_registry()
 
         # v95.2: Use the new public method for immediate registration
+        # v112.0: Now also starts self-heartbeat loop immediately to prevent
+        #         startup window vulnerability
         success = await registry.ensure_owner_registered_immediately()
         if success:
             logger.info("📝 [v95.2] jarvis-body registered early for cross-repo discovery")
+
+            # v112.0: Signal "starting" lifecycle transition
+            # This tells external services (jarvis-prime, reactor-core) that
+            # we're in startup mode and should be given extra grace time
+            await registry.signal_lifecycle_transition(
+                "jarvis-body",
+                lifecycle_state="starting",
+                reason="system_startup",
+                expected_duration=120.0  # Expected startup duration
+            )
+            logger.info("🔄 [v112.0] jarvis-body signaled 'starting' transition")
         else:
             logger.warning("⚠️ [v95.2] Early registration may have failed - continuing")
 
-        # Also start self-heartbeat loop
+        # Also start cleanup task (heartbeat loop already started by ensure_owner_registered_immediately)
         await registry.start_cleanup_task()
-        logger.info("💓 [v95.2] jarvis-body heartbeat loop started")
+        logger.info("💓 [v95.2] jarvis-body cleanup/heartbeat tasks started")
 
         # v2.0: INLINE READINESS - Mark service_registry as ready NOW
         # This is a CRITICAL component, marking it ready helps auto-transition
@@ -1905,6 +1918,9 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 logger.info("📊 [v2.0] service_registry marked READY (inline)")
             except Exception as rm_err:
                 logger.debug(f"Could not mark service_registry ready: {rm_err}")
+
+        # v112.0: Store registry in app.state for later use (signal stable when startup complete)
+        app.state.service_registry = registry
 
     except ImportError:
         logger.debug("Service registry not available - skipping early registration")
@@ -3726,10 +3742,18 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 logger.info("📊 [v2.0] ReadinessStateManager: READY phase (explicit fallback)")
 
             logger.info("📊 [v2.0] ReadinessStateManager: System accepting traffic")
-            
+
             elapsed = time.time() - start_time
             logger.info(f"🎉 JARVIS fully initialized in {elapsed:.1f}s - /health/ready returns 200 OK")
-            
+
+            # v112.0: Signal "stable" lifecycle state - startup complete
+            if hasattr(app.state, 'service_registry') and app.state.service_registry:
+                try:
+                    await app.state.service_registry.signal_lifecycle_stable("jarvis-body")
+                    logger.info("✅ [v112.0] jarvis-body signaled 'stable' - ready for cross-repo coordination")
+                except Exception as lifecycle_err:
+                    logger.debug(f"[v112.0] Lifecycle stable signal: {lifecycle_err}")
+
         except Exception as e:
             logger.warning(f"⚠️ [v95.3] ReadinessStateManager READY transition error: {e}")
             # Even if manager fails, don't block startup
@@ -3737,6 +3761,14 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         # No readiness manager - log startup complete without it
         elapsed = time.time() - start_time
         logger.info(f"🎉 JARVIS initialized in {elapsed:.1f}s (legacy health check mode)")
+
+        # v112.0: Signal "stable" even in legacy mode
+        if hasattr(app.state, 'service_registry') and app.state.service_registry:
+            try:
+                await app.state.service_registry.signal_lifecycle_stable("jarvis-body")
+                logger.info("✅ [v112.0] jarvis-body signaled 'stable' (legacy mode)")
+            except Exception as lifecycle_err:
+                logger.debug(f"[v112.0] Lifecycle stable signal (legacy): {lifecycle_err}")
 
     yield
 
