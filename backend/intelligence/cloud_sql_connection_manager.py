@@ -3970,20 +3970,25 @@ class CloudSQLConnectionManager:
         password: Optional[str] = None,
         max_connections: int = 3,
         force_reinit: bool = False,
-        config: Optional[ConnectionConfig] = None
+        config: Optional[ConnectionConfig] = None,
+        auto_resolve_credentials: bool = True,
     ) -> bool:
         """
         Initialize connection pool with leak detection and circuit breaker.
+
+        v132.0: Auto-resolves credentials from IntelligentCredentialResolver if
+        password is not provided and auto_resolve_credentials is True (default).
 
         Args:
             host: Database host (127.0.0.1 for proxy)
             port: Database port
             database: Database name
             user: Database user
-            password: Database password
+            password: Database password (if None, auto-resolves from credential sources)
             max_connections: Max pool size (default 3 for db-f1-micro)
             force_reinit: Force re-initialization
             config: Optional ConnectionConfig for advanced settings
+            auto_resolve_credentials: Auto-fetch credentials if not provided (default: True)
 
         Returns:
             True if pool is ready
@@ -4001,8 +4006,32 @@ class CloudSQLConnectionManager:
                 logger.error("❌ asyncpg not available")
                 return False
 
+            # v132.0: Auto-resolve credentials if not provided
+            if not password and auto_resolve_credentials:
+                logger.info("[v132.0] Auto-resolving credentials from IntelligentCredentialResolver...")
+                try:
+                    db_config = IntelligentCredentialResolver.get_database_config()
+                    if db_config:
+                        # Use resolved config values (with fallbacks to provided values)
+                        host = db_config.get("host", host)
+                        port = db_config.get("port", port)
+                        database = db_config.get("database", database)
+                        user = db_config.get("user", user)
+                        password = db_config.get("password")
+
+                        if password:
+                            logger.info(
+                                f"[v132.0] ✅ Credentials resolved: {user}@{host}:{port}/{database}"
+                            )
+                        else:
+                            logger.warning("[v132.0] Credential resolver returned config but no password")
+                    else:
+                        logger.warning("[v132.0] Credential resolver returned None config")
+                except Exception as e:
+                    logger.warning(f"[v132.0] Credential auto-resolve failed: {e}")
+
             if not password:
-                logger.error("❌ Database password required")
+                logger.error("❌ Database password required (auto-resolve also failed)")
                 return False
 
             # Apply config
