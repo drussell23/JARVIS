@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-JARVIS Supervisor Entry Point - Production Grade v5.0 (Living OS Edition)
-===========================================================================
+JARVIS Supervisor Entry Point - Production Grade v131.0 (One Command Edition)
+==============================================================================
 
 Advanced, robust, async, parallel, intelligent, and dynamic supervisor entry point.
 This is the SINGLE COMMAND needed to run JARVIS - it handles everything.
+
+v131.0 ONE COMMAND = SHUTDOWN → START:
+- 🔄 Automatic restart: Running `python3 run_supervisor.py` always gives you a fresh supervisor
+- 🛡️ Graceful shutdown: Existing supervisor is shut down cleanly before starting new one
+- ✅ Lock verification: Ensures all locks are cleaned before restarting
+- ⚡ Force cleanup fallback: If graceful fails, force cleanup ensures success
+- 🔧 Cross-repo cleanup: Cleans up JARVIS, JARVIS-Prime, and Reactor-Core stale resources
+- 🎛️ Opt-out available: Set JARVIS_SUPERVISOR_SKIP_RESTART=1 to keep old "No action needed" behavior
 
 v5.0 Living OS Features:
 - 🔥 DEV MODE: Hot reload / live reload - edit code and see changes instantly
@@ -115,7 +123,7 @@ Usage:
     python run_supervisor.py
 
 Author: JARVIS System
-Version: 7.0.0
+Version: 131.0.0
 """
 from __future__ import annotations
 
@@ -25230,35 +25238,183 @@ async def main() -> int:
                     print(f"   Health Level: {health_level}")
 
                     if health_level in ('FULLY_READY', 'HTTP_HEALTHY', 'IPC_RESPONSIVE'):
-                        # v119.1: Existing supervisor is healthy - use it automatically (no menu)
-                        # This makes `python3 run_supervisor.py` a true single command that just works
+                        # =================================================================
+                        # v131.0: ONE COMMAND = SHUTDOWN → START
+                        # =================================================================
+                        # Instead of "No action needed", we now gracefully restart.
+                        # This makes `python3 run_supervisor.py` idempotent:
+                        #   - Always results in a fresh supervisor
+                        #   - No need for separate --shutdown then start
+                        #   - Atomic operation with cleanup verification
+                        #
+                        # Opt-out: Set JARVIS_SUPERVISOR_SKIP_RESTART=1 to keep old behavior
+                        # =================================================================
+
+                        _skip_restart = os.environ.get('JARVIS_SUPERVISOR_SKIP_RESTART', '').lower() in ('1', 'true', 'yes')
+
+                        if _skip_restart:
+                            # Legacy behavior: just show status and exit
+                            components = health_data.get('components', {})
+                            repos_status = health_data.get('cross_repo_health', {})
+
+                            print(f"\n   ✅ JARVIS Supervisor is already running and healthy!")
+                            print(f"   ")
+
+                            if components:
+                                healthy_count = sum(1 for c in components.values() if c.get('status') == 'healthy')
+                                total_count = len(components)
+                                print(f"   Components: {healthy_count}/{total_count} healthy")
+
+                            if repos_status:
+                                healthy_repos = sum(1 for r in repos_status.values() if r.get('healthy', False))
+                                total_repos = len(repos_status)
+                                print(f"   Cross-Repo: {healthy_repos}/{total_repos} connected")
+
+                            print(f"   ")
+                            print(f"   No action needed - your supervisor is ready to use.")
+                            print(f"   (Set JARVIS_SUPERVISOR_SKIP_RESTART=0 to enable auto-restart)")
+                            print(f"   ")
+                            print(f"   Quick commands:")
+                            print(f"   • --restart   Restart the supervisor")
+                            print(f"   • --shutdown  Stop the supervisor")
+                            print(f"   • --status    Check detailed status")
+                            print(f"{'='*70}\n")
+                            return 0
+
+                        # =================================================================
+                        # v131.0: Execute ONE COMMAND (SHUTDOWN → START)
+                        # =================================================================
                         components = health_data.get('components', {})
                         repos_status = health_data.get('cross_repo_health', {})
 
-                        print(f"\n   ✅ JARVIS Supervisor is already running and healthy!")
-                        print(f"   ")
+                        print(f"\n{'='*70}")
+                        print(f"🔄 ONE COMMAND (SHUTDOWN → START) v131.0")
+                        print(f"{'='*70}")
+                        print(f"   Current PID: {existing_pid}")
+                        print(f"   Health:      {health_level}")
 
-                        # Show component status if available
                         if components:
                             healthy_count = sum(1 for c in components.values() if c.get('status') == 'healthy')
                             total_count = len(components)
-                            print(f"   Components: {healthy_count}/{total_count} healthy")
+                            print(f"   Components:  {healthy_count}/{total_count} healthy")
 
-                        # Show cross-repo status if available
                         if repos_status:
                             healthy_repos = sum(1 for r in repos_status.values() if r.get('healthy', False))
                             total_repos = len(repos_status)
-                            print(f"   Cross-Repo: {healthy_repos}/{total_repos} connected")
+                            print(f"   Cross-Repo:  {healthy_repos}/{total_repos} connected")
 
-                        print(f"   ")
-                        print(f"   No action needed - your supervisor is ready to use.")
-                        print(f"   ")
-                        print(f"   Quick commands:")
-                        print(f"   • --restart   Restart the supervisor")
-                        print(f"   • --shutdown  Stop the supervisor")
-                        print(f"   • --status    Check detailed status")
-                        print(f"{'='*70}\n")
-                        return 0  # Exit cleanly - supervisor is running and healthy
+                        print(f"{'='*70}")
+                        print(f"\n   Step 1/4: Sending graceful shutdown...")
+                        sys.stdout.flush()
+
+                        # Step 1: Send graceful shutdown (same as --shutdown)
+                        _shutdown_success = False
+                        _shutdown_timeout = 15.0
+                        _shutdown_start = time.time()
+
+                        try:
+                            # Use execute_command_with_cleanup for robustness
+                            cmd_result = await execute_command_with_cleanup(
+                                command='shutdown',
+                                timeout=_shutdown_timeout,
+                                auto_cleanup=False,  # We'll cleanup manually if needed
+                                verify=False
+                            )
+
+                            if cmd_result.success:
+                                print(f"   ✅ Shutdown command accepted")
+                                sys.stdout.flush()
+
+                                # Step 2: Wait for process to exit with progress
+                                print(f"\n   Step 2/4: Waiting for supervisor to exit...")
+                                sys.stdout.flush()
+
+                                _wait_start = time.time()
+                                _max_wait = 10.0
+                                _check_interval = 0.5
+
+                                while time.time() - _wait_start < _max_wait:
+                                    await asyncio.sleep(_check_interval)
+                                    _still_running, _ = is_supervisor_running()
+
+                                    if not _still_running:
+                                        _shutdown_success = True
+                                        print(f"   ✅ Supervisor exited (took {time.time() - _wait_start:.1f}s)")
+                                        sys.stdout.flush()
+                                        break
+
+                                    # Progress indicator every 2 seconds
+                                    _elapsed = time.time() - _wait_start
+                                    if int(_elapsed * 2) % 4 == 0:
+                                        print(f"   ... waiting ({_elapsed:.0f}s)")
+                                        sys.stdout.flush()
+
+                                if not _shutdown_success:
+                                    print(f"   ⚠️  Supervisor didn't exit within {_max_wait:.0f}s timeout")
+                                    sys.stdout.flush()
+                            else:
+                                print(f"   ⚠️  Shutdown command failed: {cmd_result.error}")
+                                sys.stdout.flush()
+
+                        except Exception as e:
+                            print(f"   ⚠️  Shutdown exception: {e}")
+                            sys.stdout.flush()
+
+                        # Step 3: Verify lock cleanup
+                        print(f"\n   Step 3/4: Verifying lock cleanup...")
+                        sys.stdout.flush()
+
+                        _locks_clean = await verify_lock_cleanup()
+
+                        if _locks_clean:
+                            print(f"   ✅ All locks cleaned")
+                            sys.stdout.flush()
+                        else:
+                            # Force cleanup if locks remain
+                            print(f"   ⚠️  Locks remain - forcing cleanup...")
+                            sys.stdout.flush()
+
+                            try:
+                                # Force-stop if process still exists
+                                _still_running, _ = is_supervisor_running()
+                                if _still_running:
+                                    try:
+                                        await send_ipc_command('force-stop', timeout=3.0)
+                                        await asyncio.sleep(1.0)
+                                    except Exception as e:
+                                        print(f"   ⚠️  Force-stop warning: {e}")
+                                        sys.stdout.flush()
+
+                                # Force cleanup stale locks
+                                _cleanup_result = await cleanup_stale_locks(force=True, timeout=5.0, cross_repo=True)
+
+                                if _cleanup_result.success:
+                                    print(f"   ✅ Force cleanup successful")
+                                    if _cleanup_result.cleaned_lock:
+                                        print(f"      • Lock file cleaned")
+                                    if _cleanup_result.cleaned_socket:
+                                        print(f"      • IPC socket cleaned")
+                                    if _cleanup_result.cleaned_state:
+                                        print(f"      • State file cleaned")
+                                    sys.stdout.flush()
+                                else:
+                                    print(f"   ⚠️  Force cleanup warning: {_cleanup_result.error}")
+                                    sys.stdout.flush()
+
+                            except Exception as e:
+                                print(f"   ⚠️  Cleanup exception: {e}")
+                                sys.stdout.flush()
+
+                        # Step 4: Fall through to start new supervisor
+                        print(f"\n   Step 4/4: Starting fresh supervisor...")
+                        print(f"{'='*70}")
+                        sys.stdout.flush()
+
+                        # Small delay for any lingering file handles
+                        await asyncio.sleep(0.5)
+
+                        # DON'T return - fall through to acquire lock and start new supervisor
+                        # The existing code below will handle lock acquisition and startup
                     else:
                         # Existing supervisor is unhealthy - auto-takeover
                         print(f"\n   ⚠️  Existing supervisor appears unhealthy (level: {health_level})")
