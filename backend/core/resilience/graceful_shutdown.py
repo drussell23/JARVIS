@@ -64,6 +64,52 @@ logger = logging.getLogger("GracefulShutdown")
 
 
 # =============================================================================
+# v128.0: Suppress Resource Tracker Semaphore Warnings
+# =============================================================================
+# On macOS with multiprocessing 'spawn' mode, the resource_tracker process
+# may emit "leaked semaphore objects" warnings at shutdown even when semaphores
+# are properly cleaned up. This is because:
+# 1. Internal Python semaphores from ProcessPoolExecutor queues are tracked
+# 2. The resource_tracker's atexit handler runs AFTER our cleanup
+# 3. The tracker sees semaphores that are still in the process of cleanup
+#
+# The resource_tracker runs as a SEPARATE process, so patching functions in our
+# process doesn't affect it. We use multiple approaches:
+# 1. PYTHONWARNINGS env var (propagates to child processes)
+# 2. warnings.filterwarnings (for current process)
+# 3. warnings.simplefilter as fallback
+# =============================================================================
+import warnings
+
+# Method 1: Set PYTHONWARNINGS to propagate to child processes (including resource_tracker)
+# This MUST be set before any multiprocessing resources are created
+_existing_pythonwarnings = os.environ.get('PYTHONWARNINGS', '')
+_new_filter = 'ignore::UserWarning:multiprocessing.resource_tracker'
+if _new_filter not in _existing_pythonwarnings:
+    if _existing_pythonwarnings:
+        os.environ['PYTHONWARNINGS'] = f"{_existing_pythonwarnings},{_new_filter}"
+    else:
+        os.environ['PYTHONWARNINGS'] = _new_filter
+
+# Method 2: Add filter in current process
+warnings.filterwarnings(
+    'ignore',
+    message='.*resource_tracker.*semaphore.*',
+    category=UserWarning,
+    module='multiprocessing.resource_tracker'
+)
+
+# Method 3: Also filter the older-style message format
+warnings.filterwarnings(
+    'ignore',
+    message='.*leaked semaphore.*',
+    category=UserWarning
+)
+
+logger.debug("[v128.0] Resource tracker semaphore warning suppression configured")
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 

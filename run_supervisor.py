@@ -133,6 +133,14 @@ import sys as _early_sys
 import signal as _early_signal
 import os as _early_os
 
+# v128.0: Suppress multiprocessing resource_tracker semaphore warnings
+# This MUST be set BEFORE any multiprocessing imports to affect child processes
+_existing_warnings = _early_os.environ.get('PYTHONWARNINGS', '')
+_filter = 'ignore::UserWarning:multiprocessing.resource_tracker'
+if _filter not in _existing_warnings:
+    _early_os.environ['PYTHONWARNINGS'] = f"{_existing_warnings},{_filter}" if _existing_warnings else _filter
+del _existing_warnings, _filter
+
 # Check if this is a CLI command that needs signal protection
 _cli_flags = ('--restart', '--shutdown', '--status', '--cleanup')
 _is_cli_mode = any(flag in _early_sys.argv for flag in _cli_flags)

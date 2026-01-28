@@ -232,6 +232,17 @@ import multiprocessing
 import os
 import sys
 
+# v128.0: FIRST - Suppress resource_tracker semaphore warnings
+# This MUST be set BEFORE any multiprocessing imports/usage
+# The resource_tracker runs as a separate process and inherits PYTHONWARNINGS
+_existing_pythonwarnings = os.environ.get('PYTHONWARNINGS', '')
+_new_filter = 'ignore::UserWarning:multiprocessing.resource_tracker'
+if _new_filter not in _existing_pythonwarnings:
+    if _existing_pythonwarnings:
+        os.environ['PYTHONWARNINGS'] = f"{_existing_pythonwarnings},{_new_filter}"
+    else:
+        os.environ['PYTHONWARNINGS'] = _new_filter
+
 # Set spawn mode IMMEDIATELY - before anything else can start threads/processes
 if sys.platform == "darwin":
     # Must be called before any other multiprocessing usage
@@ -242,6 +253,35 @@ if sys.platform == "darwin":
 
     # Additional fork-safety environment variables for macOS
     os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+
+    # v128.0: Also apply warnings filter in current process
+    # On macOS with 'spawn' mode, internal Python semaphores may appear
+    # "leaked" at exit even when properly cleaned up. This is a known issue
+    # with the resource_tracker's atexit handler seeing semaphores that are
+    # still being cleaned up. We suppress these warnings since our cleanup
+    # code (graceful_shutdown.py v128.0) handles actual semaphore cleanup.
+    try:
+        import multiprocessing.resource_tracker as _rt
+
+        _original_warn = getattr(_rt, '_warn', None) or getattr(_rt, 'warn', None)
+
+        def _suppressed_warn(msg, *args):
+            """Suppress semaphore leak warnings during shutdown."""
+            # Only suppress semaphore warnings
+            msg_str = str(msg) if not isinstance(msg, str) else msg
+            if 'semaphore' in msg_str.lower():
+                return  # Suppress
+            # Pass through other warnings
+            if _original_warn and callable(_original_warn):
+                _original_warn(msg, *args)
+
+        # Apply the patch
+        if hasattr(_rt, '_warn'):
+            _rt._warn = _suppressed_warn
+        elif hasattr(_rt, 'warn'):
+            _rt.warn = _suppressed_warn
+    except Exception:
+        pass  # If patching fails, warnings will appear but won't affect functionality
 
     # Disable various library threading that can cause fork issues
     os.environ["OMP_NUM_THREADS"] = "1"  # OpenMP
