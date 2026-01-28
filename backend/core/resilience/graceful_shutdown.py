@@ -2121,10 +2121,11 @@ def cleanup_all_semaphores_sync() -> Dict[str, Any]:
 
     This function:
     1. Cleans up all tracked ProcessPoolExecutors with proper worker termination
-    2. Terminates any remaining multiprocessing children
-    3. Cleans up torch multiprocessing resources
-    4. Cleans up orphaned POSIX semaphores (platform-specific)
-    5. Forces garbage collection multiple times
+    2. Finds and cleans up UNTRACKED ProcessPoolExecutors (comprehensive)
+    3. Terminates any remaining multiprocessing children
+    4. Cleans up torch multiprocessing resources
+    5. Cleans up orphaned POSIX semaphores (platform-specific)
+    6. Forces garbage collection multiple times
 
     Returns:
         Dict with cleanup statistics
@@ -2135,6 +2136,7 @@ def cleanup_all_semaphores_sync() -> Dict[str, Any]:
 
     results = {
         "executors_cleaned": 0,
+        "untracked_executors_cleaned": 0,
         "workers_terminated": 0,
         "mp_children_terminated": 0,
         "torch_children_terminated": 0,
@@ -2151,6 +2153,56 @@ def cleanup_all_semaphores_sync() -> Dict[str, Any]:
         results["workers_terminated"] = exec_result.get("semaphores_cleaned", 0)
     except Exception as e:
         results["errors"].append(f"Executor cleanup: {e}")
+
+    # Step 1b: v128.0 - Find and clean up UNTRACKED ProcessPoolExecutors
+    # This catches any executors that were created but never registered
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+
+        # Use gc to find all ProcessPoolExecutor instances
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, ProcessPoolExecutor):
+                    # Check if it has active workers
+                    processes = getattr(obj, '_processes', None)
+                    if processes:
+                        workers_cleaned = 0
+                        for pid, process in list(processes.items()):
+                            if process is not None:
+                                with suppress(Exception):
+                                    if hasattr(process, 'is_alive') and process.is_alive():
+                                        process.terminate()
+                                        process.join(timeout=0.3)
+                                        if process.is_alive():
+                                            process.kill()
+                                            process.join(timeout=0.2)
+                                    else:
+                                        process.join(timeout=0.1)
+                                    workers_cleaned += 1
+
+                        if workers_cleaned > 0:
+                            results["untracked_executors_cleaned"] += 1
+                            results["workers_terminated"] += workers_cleaned
+
+                        # Close queues
+                        for attr in ['_call_queue', '_result_queue']:
+                            queue = getattr(obj, attr, None)
+                            if queue is not None:
+                                with suppress(Exception):
+                                    if hasattr(queue, 'close'):
+                                        queue.close()
+                                    if hasattr(queue, 'cancel_join_thread'):
+                                        queue.cancel_join_thread()
+
+                        # Try to shutdown if not already
+                        with suppress(Exception):
+                            if not getattr(obj, '_shutdown', False):
+                                obj.shutdown(wait=False, cancel_futures=True)
+
+            except (ReferenceError, TypeError):
+                pass  # Object was garbage collected or is not the right type
+    except Exception as e:
+        results["errors"].append(f"Untracked executor cleanup: {e}")
 
     # Step 2: Terminate ALL multiprocessing children (not just active ones)
     try:
