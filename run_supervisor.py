@@ -25323,8 +25323,10 @@ async def main() -> int:
                         sys.stdout.flush()
 
                         # Step 1: Send graceful shutdown (same as --shutdown)
+                        # v131.1: Configurable timeouts via environment variables
                         _shutdown_success = False
-                        _shutdown_timeout = 15.0
+                        _shutdown_timeout = float(os.environ.get('JARVIS_SHUTDOWN_CMD_TIMEOUT', '20.0'))
+                        _max_wait = float(os.environ.get('JARVIS_SHUTDOWN_WAIT_TIMEOUT', '30.0'))
                         _shutdown_start = time.time()
 
                         try:
@@ -25337,16 +25339,16 @@ async def main() -> int:
                             )
 
                             if cmd_result.success:
-                                print(f"   ✅ Shutdown command accepted")
+                                print(f"   [OK] Shutdown command accepted")
                                 sys.stdout.flush()
 
                                 # Step 2: Wait for process to exit with progress
-                                print(f"\n   Step 2/4: Waiting for supervisor to exit...")
+                                print(f"\n   Step 2/4: Waiting for supervisor to exit (max {_max_wait:.0f}s)...")
                                 sys.stdout.flush()
 
                                 _wait_start = time.time()
-                                _max_wait = 10.0
                                 _check_interval = 0.5
+                                _last_progress = 0
 
                                 while time.time() - _wait_start < _max_wait:
                                     await asyncio.sleep(_check_interval)
@@ -25354,25 +25356,27 @@ async def main() -> int:
 
                                     if not _still_running:
                                         _shutdown_success = True
-                                        print(f"   ✅ Supervisor exited (took {time.time() - _wait_start:.1f}s)")
+                                        print(f"   [OK] Supervisor exited (took {time.time() - _wait_start:.1f}s)")
                                         sys.stdout.flush()
                                         break
 
-                                    # Progress indicator every 2 seconds
+                                    # Progress indicator every 5 seconds
                                     _elapsed = time.time() - _wait_start
-                                    if int(_elapsed * 2) % 4 == 0:
-                                        print(f"   ... waiting ({_elapsed:.0f}s)")
+                                    _progress_interval = int(_elapsed / 5)
+                                    if _progress_interval > _last_progress:
+                                        _last_progress = _progress_interval
+                                        print(f"   ... waiting ({_elapsed:.0f}s / {_max_wait:.0f}s)")
                                         sys.stdout.flush()
 
                                 if not _shutdown_success:
-                                    print(f"   ⚠️  Supervisor didn't exit within {_max_wait:.0f}s timeout")
+                                    print(f"   [WARN] Supervisor didn't exit within {_max_wait:.0f}s - will force cleanup")
                                     sys.stdout.flush()
                             else:
-                                print(f"   ⚠️  Shutdown command failed: {cmd_result.error}")
+                                print(f"   [WARN] Shutdown command failed: {cmd_result.error}")
                                 sys.stdout.flush()
 
                         except Exception as e:
-                            print(f"   ⚠️  Shutdown exception: {e}")
+                            print(f"   [WARN] Shutdown exception: {e}")
                             sys.stdout.flush()
 
                         # Step 3: Verify lock cleanup
@@ -25382,11 +25386,11 @@ async def main() -> int:
                         _locks_clean = await verify_lock_cleanup()
 
                         if _locks_clean:
-                            print(f"   ✅ All locks cleaned")
+                            print(f"   [OK] All locks cleaned")
                             sys.stdout.flush()
                         else:
                             # Force cleanup if locks remain
-                            print(f"   ⚠️  Locks remain - forcing cleanup...")
+                            print(f"   [INFO] Locks remain - forcing cleanup...")
                             sys.stdout.flush()
 
                             try:
@@ -25397,27 +25401,27 @@ async def main() -> int:
                                         await send_ipc_command('force-stop', timeout=3.0)
                                         await asyncio.sleep(1.0)
                                     except Exception as e:
-                                        print(f"   ⚠️  Force-stop warning: {e}")
+                                        print(f"   [WARN] Force-stop warning: {e}")
                                         sys.stdout.flush()
 
                                 # Force cleanup stale locks
                                 _cleanup_result = await cleanup_stale_locks(force=True, timeout=5.0, cross_repo=True)
 
                                 if _cleanup_result.success:
-                                    print(f"   ✅ Force cleanup successful")
+                                    print(f"   [OK] Force cleanup successful")
                                     if _cleanup_result.cleaned_lock:
-                                        print(f"      • Lock file cleaned")
+                                        print(f"      - Lock file cleaned")
                                     if _cleanup_result.cleaned_socket:
-                                        print(f"      • IPC socket cleaned")
+                                        print(f"      - IPC socket cleaned")
                                     if _cleanup_result.cleaned_state:
-                                        print(f"      • State file cleaned")
+                                        print(f"      - State file cleaned")
                                     sys.stdout.flush()
                                 else:
-                                    print(f"   ⚠️  Force cleanup warning: {_cleanup_result.error}")
+                                    print(f"   [WARN] Force cleanup warning: {_cleanup_result.error}")
                                     sys.stdout.flush()
 
                             except Exception as e:
-                                print(f"   ⚠️  Cleanup exception: {e}")
+                                print(f"   [WARN] Cleanup exception: {e}")
                                 sys.stdout.flush()
 
                         # Step 4: Fall through to start new supervisor
@@ -25425,14 +25429,14 @@ async def main() -> int:
                         print(f"{'='*70}")
                         sys.stdout.flush()
 
-                        # Small delay for any lingering file handles
-                        await asyncio.sleep(0.5)
+                        # v131.1: Longer delay for graceful resource release
+                        await asyncio.sleep(1.0)
 
                         # DON'T return - fall through to acquire lock and start new supervisor
                         # The existing code below will handle lock acquisition and startup
                     else:
                         # Existing supervisor is unhealthy - auto-takeover
-                        print(f"\n   ⚠️  Existing supervisor appears unhealthy (level: {health_level})")
+                        print(f"\n   [WARN] Existing supervisor appears unhealthy (level: {health_level})")
                         print(f"   Initiating automatic takeover...")
 
                         result = await send_ipc_command('takeover', timeout=5.0)
