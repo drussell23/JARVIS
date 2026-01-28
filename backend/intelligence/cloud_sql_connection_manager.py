@@ -5461,7 +5461,12 @@ async def get_connection_manager_async() -> CloudSQLConnectionManager:
 
 @dataclass
 class ProxyHealthMetrics:
-    """Real-time proxy health metrics for predictive monitoring."""
+    """
+    Real-time proxy health metrics for predictive monitoring.
+
+    v1.1: Added cold_start awareness to prevent false degradation warnings
+    during initial connections after proxy restart (TLS handshake overhead).
+    """
     timestamp: float = field(default_factory=time.time)
     tcp_latency_ms: Optional[float] = None
     db_latency_ms: Optional[float] = None
@@ -5471,15 +5476,38 @@ class ProxyHealthMetrics:
     recovery_attempts: int = 0
     last_successful_check: Optional[float] = None
     uptime_seconds: float = 0.0
+    is_cold_start: bool = False  # v1.1: Track if this is first connection after restart
 
-    def is_degraded(self) -> bool:
-        """Detect degradation before full failure using latency analysis."""
+    def is_degraded(self, cold_start_grace: bool = True) -> bool:
+        """
+        Detect degradation before full failure using latency analysis.
+
+        v1.1: Now aware of cold start conditions. First few connections
+        after proxy restart are expected to have higher latency due to:
+        - TLS handshake (100-500ms)
+        - Connection establishment (50-200ms)
+        - Authentication (100-300ms)
+
+        Args:
+            cold_start_grace: If True, use relaxed thresholds during cold start
+        """
         if not self.is_healthy:
             return True
+
+        # v1.1: Relaxed thresholds during cold start (first 60s after restart)
+        if cold_start_grace and (self.is_cold_start or self.uptime_seconds < 60):
+            # Cold start thresholds: Allow higher latency during warmup
+            tcp_threshold = float(os.getenv("PROXY_COLD_TCP_THRESHOLD_MS", "1000"))
+            db_threshold = float(os.getenv("PROXY_COLD_DB_THRESHOLD_MS", "5000"))
+        else:
+            # Warm connection thresholds: Expect faster responses
+            tcp_threshold = float(os.getenv("PROXY_WARM_TCP_THRESHOLD_MS", "500"))
+            db_threshold = float(os.getenv("PROXY_WARM_DB_THRESHOLD_MS", "2000"))
+
         # Predictive: High latency indicates impending failure
-        if self.tcp_latency_ms and self.tcp_latency_ms > 500:  # 500ms threshold
+        if self.tcp_latency_ms and self.tcp_latency_ms > tcp_threshold:
             return True
-        if self.db_latency_ms and self.db_latency_ms > 2000:  # 2s threshold
+        if self.db_latency_ms and self.db_latency_ms > db_threshold:
             return True
         return False
 
@@ -5625,16 +5653,28 @@ class ProxyWatchdog:
                 else:
                     self._handle_success(metrics)
 
-                # Predictive restart if degraded
-                if self._predictive_restart_enabled and metrics.is_degraded() and metrics.is_healthy:
-                    logger.warning(
-                        f"[ProxyWatchdog] ⚠️ Degraded performance detected "
-                        f"(tcp={metrics.tcp_latency_ms:.0f}ms, db={metrics.db_latency_ms}ms) - "
-                        f"scheduling preemptive restart"
-                    )
-                    # Don't restart immediately - schedule for low-activity period
-                    # For now, just log and enable aggressive monitoring
-                    self._aggressive_mode = True
+                # v1.1: Predictive restart if degraded (with cold start awareness)
+                # During cold start, we use relaxed thresholds - only warn on actual degradation
+                is_actual_degradation = metrics.is_degraded(cold_start_grace=True)
+                is_cold_start = metrics.is_cold_start or metrics.uptime_seconds < 60
+
+                if self._predictive_restart_enabled and is_actual_degradation and metrics.is_healthy:
+                    if is_cold_start:
+                        # Cold start: high latency is expected, just log info
+                        logger.info(
+                            f"[ProxyWatchdog] Cold start latency "
+                            f"(tcp={metrics.tcp_latency_ms:.0f}ms, db={metrics.db_latency_ms:.0f}ms, "
+                            f"uptime={metrics.uptime_seconds:.1f}s) - normal during warmup"
+                        )
+                    else:
+                        # Warm connection degradation: this is concerning
+                        logger.warning(
+                            f"[ProxyWatchdog] ⚠️ Degraded performance detected "
+                            f"(tcp={metrics.tcp_latency_ms:.0f}ms, db={metrics.db_latency_ms:.0f}ms) - "
+                            f"scheduling preemptive restart"
+                        )
+                        # Only enable aggressive mode for actual degradation (not cold start)
+                        self._aggressive_mode = True
 
                 # Notify subscribers
                 self._notify_subscribers(metrics)
@@ -5705,9 +5745,13 @@ class ProxyWatchdog:
                         metrics.is_healthy = True
                         metrics.last_successful_check = time.time()
 
-                        # Calculate uptime
+                        # Calculate uptime and cold start status
                         if self._proxy_start_time:
                             metrics.uptime_seconds = time.time() - self._proxy_start_time
+                            # v1.1: Mark as cold start if proxy restarted within 60s
+                            metrics.is_cold_start = metrics.uptime_seconds < 60.0
+                        else:
+                            metrics.is_cold_start = True  # No startup time = cold start
                     else:
                         metrics.failure_reason = "connection_returned_none"
                 except Exception as e:

@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -447,10 +447,14 @@ class HeartbeatValidator:
                         if component_id in validator._components:
                             last_seen = validator._components[component_id].last_heartbeat
 
+                        # v114.0: Handle both async and sync callbacks properly
                         if asyncio.iscoroutinefunction(callback):
                             await callback(component_id, last_seen)
                         else:
-                            callback(component_id, last_seen)
+                            result = callback(component_id, last_seen)
+                            # Handle case where non-async function returns a coroutine
+                            if asyncio.iscoroutine(result):
+                                await result
                     except Exception as e:
                         logger.error(f"[HeartbeatValidator] Staleness callback error: {e}")
 
@@ -654,14 +658,22 @@ class HeartbeatValidator:
 
     async def _load_all_heartbeats(self) -> None:
         """
-        v93.0: Load all heartbeats from multiple directories.
+        v114.0: Load and REFRESH all heartbeats from multiple directories.
+
+        CRITICAL FIX v114.0: Now ALWAYS refreshes timestamp from files, even for
+        existing components. This fixes the root cause of false staleness warnings
+        where in-memory timestamps became stale while files were being updated.
 
         Loads from all cross-repo directories for Trinity-wide visibility:
         - Primary heartbeat directory
         - Cross-repo shared directory
         - Legacy components directory
+
+        Priority: Files in earlier directories take precedence if timestamps are equal.
+        However, NEWER timestamps from any directory always win.
         """
-        loaded_components: Set[str] = set()
+        # Track which components we've processed (with their timestamps)
+        processed_components: Dict[str, float] = {}
 
         for heartbeat_dir in self._cross_repo_dirs:
             if not heartbeat_dir.exists():
@@ -671,14 +683,48 @@ class HeartbeatValidator:
                 for filepath in heartbeat_dir.glob("*.json"):
                     component_id = filepath.stem
 
-                    # Skip if already loaded from higher-priority directory
-                    if component_id in loaded_components:
-                        continue
+                    try:
+                        # ALWAYS read the file to check timestamp
+                        data = json.loads(filepath.read_text())
+                        file_timestamp = data.get("timestamp", 0.0)
 
-                    if component_id not in self._components:
-                        await self._load_heartbeat_from_path(filepath)
+                        # Skip if we already processed a NEWER heartbeat for this component
+                        if component_id in processed_components:
+                            if processed_components[component_id] >= file_timestamp:
+                                continue
+
+                        # v114.0 CRITICAL FIX: Update existing components if file is newer
                         if component_id in self._components:
-                            loaded_components.add(component_id)
+                            existing_timestamp = self._components[component_id].last_heartbeat
+                            if file_timestamp > existing_timestamp:
+                                # File has newer timestamp - refresh the in-memory state
+                                heartbeat = Heartbeat.from_dict(data)
+                                self._components[component_id].last_heartbeat = heartbeat.timestamp
+                                self._components[component_id].pid = heartbeat.pid
+                                self._components[component_id].host = heartbeat.host
+                                self._components[component_id].metrics = heartbeat.metrics
+                                # If it was stale/dead, reset to unknown for re-evaluation
+                                if self._components[component_id].status in (
+                                    HeartbeatStatus.STALE,
+                                    HeartbeatStatus.DEAD,
+                                    HeartbeatStatus.ZOMBIE,
+                                ):
+                                    self._components[component_id].status = HeartbeatStatus.UNKNOWN
+                                    self._components[component_id].health_score = 0.5
+                                logger.debug(
+                                    f"[HeartbeatValidator] Refreshed {component_id} timestamp: "
+                                    f"{existing_timestamp:.1f} -> {file_timestamp:.1f}"
+                                )
+                        else:
+                            # New component - load it
+                            await self._load_heartbeat_from_path(filepath)
+
+                        processed_components[component_id] = file_timestamp
+
+                    except json.JSONDecodeError:
+                        logger.debug(f"[HeartbeatValidator] Invalid JSON in {filepath}")
+                    except Exception as file_err:
+                        logger.debug(f"[HeartbeatValidator] Error reading {filepath}: {file_err}")
 
             except Exception as e:
                 logger.debug(f"[HeartbeatValidator] Failed to load heartbeats from {heartbeat_dir}: {e}")
