@@ -16,22 +16,24 @@
 - **Troubleshooting issues?** → See [README_v2.md § Troubleshooting](./README_v2.md#troubleshooting)
 - **Understanding how repos work together?** → Continue reading below
 - **🆕 Startup architecture & v107.0 improvements?** → See [STARTUP_ARCHITECTURE_V2.md](./docs/STARTUP_ARCHITECTURE_V2.md)
+- **🆕 One-command supervisor, Cloud SQL fixes, or asyncpg TLS fix?** → See [§ v131.0 & v131.1](#v1310--v1311-one-command-supervisor-shutdown--start-january-2026), [§ v116.0](#v1160-cloud-sql-credential--retry-fixes-january-2026), [§ TLS-Safe Connections](#asyncpg-tls-invalidstateerror-fix-tls-safe-connection-factories-january-2026) below
 
 ---
 
-## 🚀 NEW in v107.0: Enterprise-Grade Startup Orchestration (January 2026)
+## 🚀 NEW in v107.0+: Enterprise-Grade Startup & Database Reliability (January 2026)
 
-**Major Achievement:** JARVIS now starts reliably with **zero indefinite blocking** and connects all 3 repositories with a single command.
+**Major Achievement:** JARVIS now starts reliably with **zero indefinite blocking** and connects all 3 repositories with a single command. Later releases add one-command restart, Cloud SQL credential/retry fixes, and TLS-safe asyncpg connections.
 
 ### What's New
 
 ```
-✅ One-Command Startup:  python3 run_supervisor.py
+✅ One-Command Startup:   python3 run_supervisor.py
+✅ One-Command Restart:   Same command = shutdown (if running) then start fresh (v131.0/v131.1)
 ✅ Trinity Coordination:  JARVIS + J-Prime + Reactor-Core
-✅ Timeout Protection:    All 107 phases have timeout guards
+✅ Timeout Protection:   All 107 phases have timeout guards
 ✅ Graceful Degradation:  Startup continues even if phases fail
-✅ Adaptive Learning:     Timeouts adjust based on history
-✅ Progress Tracking:     Real-time ETA and phase status
+✅ Cloud SQL Robustness:  No false "max retries" or credential misclassification (v116.0)
+✅ TLS-Safe DB Connections: asyncpg InvalidStateError fixed via serialized handshakes
 ✅ Zero Workarounds:      ROOT CAUSE fixed, no hacks
 ```
 
@@ -258,6 +260,164 @@ export AUTONOMOUS_START_LOOPS=true        # Enable self-improvement
 export TRINITY_COORDINATION=v2            # Distributed protocol
 export LEADER_ELECTION_ENABLED=true       # Leader election
 ```
+
+---
+
+## v131.0 & v131.1: One-Command Supervisor (Shutdown → Start) (January 2026)
+
+**Major Achievement:** Running `python3 run_supervisor.py` with no flags now **always results in a fresh supervisor**. You no longer need separate `--shutdown` then start; one command performs graceful shutdown (if a supervisor is already running) and then starts a new instance.
+
+### What Changed
+
+| Before | After |
+|--------|--------|
+| Supervisor already running → "No action needed" and exit | Supervisor already running → **Graceful shutdown → verify lock cleanup → start fresh** |
+| Two steps: `python3 run_supervisor.py --shutdown` then `python3 run_supervisor.py` | **One step:** `python3 run_supervisor.py` |
+
+### Defense Layers
+
+The implementation uses three layers so a fresh supervisor starts even when IPC or the old process is unhealthy:
+
+| Layer | Condition | Action |
+|-------|-----------|--------|
+| **1. v131.0 Graceful** | IPC works, supervisor healthy | Graceful shutdown via IPC → wait → verify lock cleanup → start |
+| **2. Singleton Takeover** | IPC fails but process is alive | SIGTERM → SIGKILL → stale lock cleanup → start |
+| **3. Stale Lock Cleanup** | Process dead, locks/socket left behind | Clean lock file and IPC socket → start |
+
+### Configuration (v131.1)
+
+All timeouts and behavior are configurable via environment variables (no hardcoding):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JARVIS_SHUTDOWN_CMD_TIMEOUT` | `20` | Timeout (seconds) for sending the shutdown command over IPC |
+| `JARVIS_SHUTDOWN_WAIT_TIMEOUT` | `30` | Max time (seconds) to wait for supervisor to exit and release resources |
+| `JARVIS_SUPERVISOR_SKIP_RESTART` | *(unset)* | Set to `1` to **opt out**: skip shutdown→start and keep legacy "No action needed" when supervisor is already running and healthy |
+
+### Output and Robustness
+
+- Progress is reported every 5 seconds during long waits.
+- Output uses ASCII-safe markers (`[OK]`, `[WARN]`, `[INFO]`) for compatibility.
+- Resource release delay is 1s (configurable) to allow clean teardown.
+
+### Quick Reference
+
+```bash
+# One command: shutdown (if running) then start a fresh supervisor
+python3 run_supervisor.py
+
+# Opt out: do not restart when already running (legacy behavior)
+JARVIS_SUPERVISOR_SKIP_RESTART=1 python3 run_supervisor.py
+
+# Explicit commands (still available)
+python3 run_supervisor.py --status    # Check status and exit
+python3 run_supervisor.py --shutdown  # Shutdown only (no start)
+python3 run_supervisor.py --restart   # Ask running supervisor to restart in-place (IPC)
+```
+
+---
+
+## v116.0: Cloud SQL Credential & Retry Fixes (January 2026)
+
+**Major Achievement:** Fixed false "password authentication failed" and "max retries exceeded" errors when using Cloud SQL. The root cause was **not** bad credentials but stale retry state and misclassification of proxy vs credential failures.
+
+### Root Cause
+
+1. **Stale retry count persistence**  
+   `IntelligentCredentialResolver._retry_count` is a class variable that persisted across startup attempts in the same process. After a few failed attempts (e.g. proxy not ready), later startups hit "max retries exceeded" even with valid credentials.
+
+2. **Misleading error classification**  
+   "password authentication failed" was always treated as a **credential** failure. When the Cloud SQL proxy was not running, the same error can occur for GCP/auth reasons; counting it as a credential failure and incrementing the retry count was wrong and led to false "max retries exceeded."
+
+### Changes Made
+
+**File:** `backend/intelligence/cloud_sql_connection_manager.py`
+
+| Change | Description |
+|--------|-------------|
+| **`reset_for_new_startup()`** | Resets `_retry_count` to 0 and clears `_gcp_credentials_bootstrapped`. Called at the start of every `ensure_proxy_ready()` so each startup attempt starts with a clean slate. |
+| **Error categorization in `_check_db_level()`** | Before treating "password authentication failed" as a credential failure, the code now checks whether the **proxy is actually running**. If the proxy is **not** running, the error is classified as **proxy** (no retry count increment). Only when the proxy is running and auth still fails is it counted as a credential failure. |
+| **`ensure_proxy_ready()`** | Calls `reset_for_new_startup()` at the very beginning and `ensure_gcp_credentials()` before attempting proxy start so every run has fresh state. |
+| **`_attempt_proxy_start()`** | Resets retry count when the proxy is confirmed running or when proxy start succeeds, so previous "credential" failures that were really proxy issues don’t block future attempts. |
+
+### Benefits
+
+- No more false "max retries exceeded" from stale retry count.
+- Proxy issues are no longer misclassified as credential failures.
+- Credentials cache and cross-repo behavior remain correct; all configuration remains via environment variables and is backward compatible.
+
+---
+
+## asyncpg TLS InvalidStateError Fix: TLS-Safe Connection Factories (January 2026)
+
+**Major Achievement:** Eliminated `asyncio.exceptions.InvalidStateError: invalid state` during startup by serializing asyncpg TLS handshakes across all components. Multiple components were calling `asyncpg.connect()` or creating pools in parallel; asyncpg’s TLS upgrade protocol is not safe under concurrent use, which corrupted the internal state machine and caused the crash.
+
+### Root Cause
+
+When several components (e.g. connection manager, hybrid sync, profile consolidation, unified drivers) create asyncpg connections or pools **at the same time**, they all go through the same TLS upgrade path. A race in that path led to `set_result()` being called on an already-completed Future, triggering `InvalidStateError`.
+
+### Solution: Process-Wide Serialization
+
+Two TLS-safe factory functions were added and used everywhere Cloud SQL connections are created:
+
+| Function | Use Case | Behavior |
+|----------|----------|----------|
+| **`tls_safe_connect()`** | Single one-off connections | Uses a process-wide TLS semaphore (per host:port), retries with exponential backoff, adds a short settling delay for the TLS state machine. |
+| **`tls_safe_create_pool()`** | Connection pools | Same serialization and retry/settling behavior so pool creation and initial connections don’t race. |
+
+Both support multi-event-loop scenarios and are exported from `backend/intelligence/cloud_sql_connection_manager.py`.
+
+### Before vs After
+
+**Before (race):**
+
+```
+Component A ──> asyncpg.connect() ──┐
+Component B ──> asyncpg.connect() ──┼──> TLS Upgrade Protocol ──> InvalidStateError
+Component C ──> asyncpg.connect() ──┘
+```
+
+**After (serialized):**
+
+```
+Component A ──┐
+Component B ──┼──> tls_safe_connect() / tls_safe_create_pool() ──> Semaphore(1) ──> asyncpg ──> OK
+Component C ──┘                              (one TLS handshake at a time)
+```
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `backend/intelligence/cloud_sql_connection_manager.py` | Added `tls_safe_connect()`, `tls_safe_create_pool()` (process-wide semaphore, retry, settling). |
+| `backend/intelligence/hybrid_database_sync.py` | `ConnectionOrchestrator.initialize()` uses `tls_safe_create_pool()`. |
+| `backend/intelligence/unified_database_drivers.py` | `create_async_connection()` uses `tls_safe_connect()`. |
+| `backend/voice/profile_consolidation_service.py` | `_get_database_connection()` uses `tls_safe_connect()`. |
+| `backend/test_cloud_sql.py` | Tests use `tls_safe_connect()`. |
+| `backend/intelligence/__init__.py` | Exports TLS-safe factories for discovery. |
+
+### Usage
+
+All new or updated Cloud SQL code should use the TLS-safe factories:
+
+```python
+from intelligence.cloud_sql_connection_manager import tls_safe_connect, tls_safe_create_pool
+
+# Single connection (e.g. one-off queries or health checks)
+conn = await tls_safe_connect(
+    host='127.0.0.1', port=5432,
+    database='jarvis_learning', user='jarvis', password='...'
+)
+
+# Connection pool (e.g. long-running services)
+pool = await tls_safe_create_pool(
+    host='127.0.0.1', port=5432,
+    database='jarvis_learning', user='jarvis', password='...',
+    min_size=1, max_size=3
+)
+```
+
+Running `python3 run_supervisor.py` now brings up all database-dependent components without TLS races; connections are serialized at the TLS layer across the JARVIS ecosystem.
 
 ---
 
