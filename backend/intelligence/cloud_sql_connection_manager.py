@@ -971,6 +971,72 @@ class ProxyReadinessGate:
             if callback in self._subscribers:
                 self._subscribers.remove(callback)
 
+    # -------------------------------------------------------------------------
+    # v112.0: AgentRegistry Integration
+    # -------------------------------------------------------------------------
+
+    def setup_agent_registry_integration(
+        self,
+        agent_registry: Any  # Using Any to avoid import cycles
+    ) -> None:
+        """
+        Set up automatic AgentRegistry integration for CloudSQL dependency tracking.
+
+        v112.0: When CloudSQL proxy readiness state changes, automatically update
+        the AgentRegistry's cloudsql dependency state. This prevents CloudSQL-dependent
+        agents from being marked offline when CloudSQL is unavailable.
+
+        Args:
+            agent_registry: The AgentRegistry instance to integrate with.
+                           Must have a set_dependency_ready(name, is_ready) method.
+
+        Example:
+            from neural_mesh.registry import AgentRegistry
+            from intelligence.cloud_sql_connection_manager import get_proxy_readiness_gate
+
+            registry = AgentRegistry()
+            gate = get_proxy_readiness_gate()
+            gate.setup_agent_registry_integration(registry)
+        """
+        if not hasattr(agent_registry, 'set_dependency_ready'):
+            logger.warning(
+                "[ProxyReadinessGate v112.0] AgentRegistry instance doesn't have "
+                "set_dependency_ready method - integration skipped"
+            )
+            return
+
+        def on_cloudsql_state_change(state: ReadinessState) -> None:
+            """Callback to update AgentRegistry when CloudSQL state changes."""
+            is_ready = state == ReadinessState.READY
+            try:
+                agent_registry.set_dependency_ready("cloudsql", is_ready)
+                logger.debug(
+                    "[ProxyReadinessGate v112.0] AgentRegistry cloudsql dependency "
+                    "updated: %s (state: %s)",
+                    "READY" if is_ready else "NOT_READY", state.name
+                )
+            except Exception as e:
+                logger.warning(
+                    "[ProxyReadinessGate v112.0] Failed to update AgentRegistry: %s", e
+                )
+
+        # Subscribe to state changes
+        self.subscribe(on_cloudsql_state_change)
+
+        # Immediately set current state
+        current_is_ready = self._state == ReadinessState.READY
+        try:
+            agent_registry.set_dependency_ready("cloudsql", current_is_ready)
+            logger.info(
+                "[ProxyReadinessGate v112.0] AgentRegistry integration established. "
+                "Current CloudSQL state: %s",
+                "READY" if current_is_ready else "NOT_READY"
+            )
+        except Exception as e:
+            logger.warning(
+                "[ProxyReadinessGate v112.0] Failed to set initial AgentRegistry state: %s", e
+            )
+
     async def _notify_subscribers(self, state: ReadinessState) -> None:
         """
         Notify all subscribers of state change.

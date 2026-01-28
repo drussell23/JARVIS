@@ -126,15 +126,52 @@ class AgentRegistry:
 
         # v93.0: Startup grace period tracking
         self._startup_time = time.time()
-        # v93.0: Increased to 180s to match JARVIS_PRIME_STARTUP_TIMEOUT for ML model loading
+        # v112.0: Reduced default grace period to 60s (was 180s)
+        # Long grace periods mask heartbeat failures - agents should send heartbeats quickly
         self._startup_grace_period_seconds = float(
-            os.environ.get("AGENT_REGISTRY_STARTUP_GRACE", "180.0")
+            os.environ.get("AGENT_REGISTRY_STARTUP_GRACE", "60.0")
         )
         self._agent_registration_times: Dict[str, float] = {}  # Track when each agent registered
         # v93.0: Track which agents have transitioned out of grace period
         self._agents_transitioned_from_grace: Set[str] = set()
 
-        logger.info("AgentRegistry initialized")
+        # v112.0: Per-agent type grace periods (some agents need longer startup)
+        # Configurable via environment variables
+        self._agent_type_grace_periods: Dict[str, float] = {
+            "coordinator": float(os.environ.get("AGENT_GRACE_COORDINATOR", "90.0")),
+            "reactor_core": float(os.environ.get("AGENT_GRACE_REACTOR_CORE", "90.0")),
+            "mas-coordinator": float(os.environ.get("AGENT_GRACE_MAS_COORDINATOR", "90.0")),
+            "voice_verification": float(os.environ.get("AGENT_GRACE_VOICE", "60.0")),
+            "default": float(os.environ.get("AGENT_GRACE_DEFAULT", "45.0")),
+        }
+
+        # v112.0: Track dependency readiness states for intelligent health checking
+        self._dependency_states: Dict[str, bool] = {
+            "cloudsql": False,  # Will be updated by integration with ProxyReadinessGate
+            "service_registry": False,
+            "neural_mesh": True,  # We're the neural mesh, so we're ready by definition
+        }
+
+        # v112.0: Agents that depend on CloudSQL (don't mark offline if CloudSQL is down)
+        self._cloudsql_dependent_agents: Set[str] = {
+            "learning_agent", "memory_agent", "voice_verification",
+            "speaker_verification", "voiceprint_manager"
+        }
+
+        # v112.0: Track why agents are being given grace (for debugging)
+        self._agent_grace_reasons: Dict[str, str] = {}
+
+        # v112.0: Track last dependency state change for logging
+        self._last_dependency_log_time: Dict[str, float] = {}
+
+        # v112.0: Dead confirmation tracking - agents must miss multiple health checks before going offline
+        # This prevents transient network issues from causing false offline detections
+        self._agent_dead_confirmation_count: Dict[str, int] = {}
+        self._dead_confirmation_threshold = int(
+            os.environ.get("AGENT_DEAD_CONFIRMATION_THRESHOLD", "3")
+        )
+
+        logger.info("AgentRegistry initialized (v112.0 - dependency-aware health checks)")
 
     async def start(self) -> None:
         """Start the registry and health monitoring."""
@@ -577,6 +614,136 @@ class AgentRegistry:
         """Get current registry metrics."""
         return self._metrics
 
+    # ========================================================================
+    # v112.0: Dependency-Aware Health Checking
+    # ========================================================================
+
+    def set_dependency_ready(self, dependency_name: str, is_ready: bool) -> None:
+        """
+        Update the readiness state of a dependency.
+
+        v112.0: This is called by external systems (e.g., ProxyReadinessGate) to signal
+        when dependencies become ready or unavailable. Agents that depend on these
+        systems won't be marked offline if their dependency is down.
+
+        Args:
+            dependency_name: Name of the dependency (e.g., "cloudsql", "service_registry")
+            is_ready: Whether the dependency is ready/healthy
+
+        Example:
+            # Called by ProxyReadinessGate when CloudSQL becomes ready
+            agent_registry.set_dependency_ready("cloudsql", True)
+
+            # Called by CloudSQL health check when connection fails
+            agent_registry.set_dependency_ready("cloudsql", False)
+        """
+        old_state = self._dependency_states.get(dependency_name)
+        self._dependency_states[dependency_name] = is_ready
+
+        # Rate-limit logging - only log once per 30s per dependency
+        current_time = time.time()
+        last_log_time = self._last_dependency_log_time.get(dependency_name, 0)
+
+        if old_state != is_ready or (current_time - last_log_time) > 30.0:
+            self._last_dependency_log_time[dependency_name] = current_time
+            status_str = "READY ✅" if is_ready else "NOT READY ❌"
+            logger.info(
+                "[AgentRegistry v112.0] Dependency '%s' is now %s",
+                dependency_name, status_str
+            )
+
+            # When a dependency becomes unavailable, log which agents are affected
+            if not is_ready:
+                affected_agents = self._get_agents_depending_on(dependency_name)
+                if affected_agents:
+                    logger.info(
+                        "[AgentRegistry v112.0] Agents affected by %s outage (won't be marked offline): %s",
+                        dependency_name,
+                        ", ".join(list(affected_agents)[:10]) + ("..." if len(affected_agents) > 10 else "")
+                    )
+
+    def get_dependency_state(self, dependency_name: str) -> bool:
+        """
+        Get the current readiness state of a dependency.
+
+        Args:
+            dependency_name: Name of the dependency
+
+        Returns:
+            True if ready, False if not ready or unknown
+        """
+        return self._dependency_states.get(dependency_name, False)
+
+    def get_all_dependency_states(self) -> Dict[str, bool]:
+        """Get all dependency states."""
+        return dict(self._dependency_states)
+
+    def _get_agents_depending_on(self, dependency_name: str) -> Set[str]:
+        """
+        Get all agents that depend on a specific dependency.
+
+        Args:
+            dependency_name: Name of the dependency
+
+        Returns:
+            Set of agent names that depend on this dependency
+        """
+        if dependency_name == "cloudsql":
+            # Return intersection of CloudSQL-dependent agents and registered agents
+            return self._cloudsql_dependent_agents & set(self._agents.keys())
+        # Add more dependency mappings as needed
+        return set()
+
+    def _agent_has_unavailable_dependency(self, agent_name: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check if an agent has any unavailable dependencies.
+
+        v112.0: Used in health checking to avoid marking agents offline when their
+        dependencies are down. This provides more accurate health status.
+
+        Args:
+            agent_name: Name of the agent to check
+
+        Returns:
+            Tuple of (has_unavailable_dependency, dependency_name or None)
+        """
+        # Check CloudSQL dependency
+        if agent_name in self._cloudsql_dependent_agents:
+            if not self._dependency_states.get("cloudsql", False):
+                return True, "cloudsql"
+
+        # Check service_registry dependency (all agents depend on this)
+        if not self._dependency_states.get("service_registry", False):
+            # But only if we're not the one providing service_registry
+            if agent_name not in ("jarvis-body", "supervisor"):
+                return True, "service_registry"
+
+        return False, None
+
+    def _get_agent_grace_period(self, agent_name: str, agent_type: str) -> float:
+        """
+        Get the appropriate grace period for an agent.
+
+        v112.0: Returns per-agent-type grace period or default.
+
+        Args:
+            agent_name: Name of the agent
+            agent_type: Type of the agent
+
+        Returns:
+            Grace period in seconds
+        """
+        # Check for agent-specific grace period first
+        if agent_type in self._agent_type_grace_periods:
+            return self._agent_type_grace_periods[agent_type]
+
+        # Check if agent name contains a known type pattern
+        for type_pattern, grace_seconds in self._agent_type_grace_periods.items():
+            if type_pattern in agent_name.lower():
+                return grace_seconds
+
+        return self._agent_type_grace_periods.get("default", 45.0)
+
     def on_register(self, callback: Callable[[AgentInfo], Any]) -> None:
         """Add callback for agent registration events."""
         self._on_register_callbacks.append(callback)
@@ -665,9 +832,14 @@ class AgentRegistry:
         - Startup grace period for newly registered agents
         - System-wide startup grace period
         - Better logging with reason codes
+
+        v112.0 Enhancements:
+        - Dependency-aware health checks (don't mark offline if dependency is down)
+        - Dead confirmation threshold (multiple misses before offline)
+        - Removed artificial heartbeat reset on grace transition
+        - Per-agent-type grace periods
         """
         self._metrics.health_checks += 1
-        now = datetime.now()
         current_time = time.time()
         timeout = self.config.heartbeat_timeout_seconds
         grace_period = timeout * 0.5  # 50% grace period before going fully offline
@@ -677,10 +849,11 @@ class AgentRegistry:
         in_system_startup = system_startup_age < self._startup_grace_period_seconds
 
         # Track agents that need status changes (to avoid modifying dict during iteration)
-        status_changes: List[Tuple[str, AgentInfo, AgentStatus]] = []
+        status_changes: List[Tuple[str, AgentInfo, AgentStatus, str]] = []  # v112.0: Added reason
         degraded_agents: List[str] = []
         recovering_agents: List[str] = []
         skipped_startup_agents: List[str] = []
+        dependency_protected_agents: List[Tuple[str, str]] = []  # v112.0: (agent_name, dependency_name)
 
         for agent_name, agent_info in list(self._agents.items()):
             try:
@@ -688,38 +861,73 @@ class AgentRegistry:
 
                 # v93.0: Check startup grace period for this agent
                 agent_registration_time = self._agent_registration_times.get(agent_name, 0)
-                agent_in_grace = False
+                agent_in_startup_grace = False
+
+                # v112.0: Use per-agent-type grace period
+                agent_grace = self._get_agent_grace_period(agent_name, agent_info.agent_type)
+
                 if agent_registration_time > 0:
                     agent_age = current_time - agent_registration_time
-                    if agent_age < self._startup_grace_period_seconds:
+                    if agent_age < agent_grace:
                         # Agent is within startup grace period - skip timeout checks
                         skipped_startup_agents.append(agent_name)
-                        agent_in_grace = True
+                        agent_in_startup_grace = True
+                        self._agent_grace_reasons[agent_name] = f"startup_grace ({agent_grace:.0f}s)"
                         continue
 
                 # v93.0: Skip if in system startup grace period
                 if in_system_startup:
                     skipped_startup_agents.append(agent_name)
-                    agent_in_grace = True
+                    agent_in_startup_grace = True
+                    self._agent_grace_reasons[agent_name] = "system_startup_grace"
                     continue
 
-                # v93.0: Handle transition out of grace period
-                # When agent exits grace period, reset heartbeat to prevent immediate offline
-                if not agent_in_grace and agent_name not in self._agents_transitioned_from_grace:
+                # v112.0: REMOVED artificial heartbeat reset on grace transition
+                # The old code reset heartbeat when transitioning out of grace, which masked
+                # agents that never sent heartbeats. Now we just track the transition.
+                if not agent_in_startup_grace and agent_name not in self._agents_transitioned_from_grace:
                     self._agents_transitioned_from_grace.add(agent_name)
-                    # Reset heartbeat to give agent fresh start after grace period
-                    agent_info.last_heartbeat = datetime.now()
-                    age = 0.0  # Reset age for this check
+                    # v112.0: Clear grace reason since agent is no longer in grace
+                    self._agent_grace_reasons.pop(agent_name, None)
                     logger.debug(
-                        "[AgentRegistry] Agent %s transitioned out of startup grace period, "
-                        "reset heartbeat timer",
+                        "[AgentRegistry v112.0] Agent %s exited startup grace period (NOT resetting heartbeat)",
                         agent_name
                     )
 
+                # v112.0: Check dependency availability BEFORE marking offline
+                has_unavailable_dep, dep_name = self._agent_has_unavailable_dependency(agent_name)
+
                 if age > timeout + grace_period:
-                    # Definitely offline - past timeout + grace period
-                    if agent_info.status != AgentStatus.OFFLINE:
-                        status_changes.append((agent_name, agent_info, AgentStatus.OFFLINE))
+                    # Would normally be offline - but check dependency first
+                    if has_unavailable_dep and dep_name:
+                        # v112.0: Dependency is down - don't mark agent offline
+                        # Instead, mark as DEGRADED due to dependency
+                        if agent_info.status != AgentStatus.OFFLINE:
+                            agent_info.health = HealthStatus.DEGRADED
+                            dependency_protected_agents.append((agent_name, dep_name))
+                            self._agent_grace_reasons[agent_name] = f"dependency:{dep_name}"
+                            # Reset dead confirmation since this is a dependency issue
+                            self._agent_dead_confirmation_count[agent_name] = 0
+                    else:
+                        # v112.0: Increment dead confirmation counter
+                        current_dead_count = self._agent_dead_confirmation_count.get(agent_name, 0)
+                        self._agent_dead_confirmation_count[agent_name] = current_dead_count + 1
+
+                        if current_dead_count + 1 >= self._dead_confirmation_threshold:
+                            # Confirmed dead - mark offline
+                            if agent_info.status != AgentStatus.OFFLINE:
+                                status_changes.append((
+                                    agent_name, agent_info, AgentStatus.OFFLINE,
+                                    f"no_heartbeat_{age:.1f}s (confirmed:{current_dead_count+1})"
+                                ))
+                        else:
+                            # Not yet confirmed - keep as degraded
+                            agent_info.health = HealthStatus.DEGRADED
+                            degraded_agents.append(agent_name)
+                            logger.debug(
+                                "[AgentRegistry v112.0] Agent %s pending dead confirmation %d/%d (age: %.1fs)",
+                                agent_name, current_dead_count + 1, self._dead_confirmation_threshold, age
+                            )
 
                 elif age > timeout:
                     # Past timeout but within grace period - mark as degraded first
@@ -728,8 +936,19 @@ class AgentRegistry:
                         agent_info.health = HealthStatus.DEGRADED
                         degraded_agents.append(agent_name)
                     elif agent_info.health == HealthStatus.DEGRADED:
-                        # Second check while degraded - now mark offline
-                        status_changes.append((agent_name, agent_info, AgentStatus.OFFLINE))
+                        # v112.0: Check dependency before escalating to offline
+                        if has_unavailable_dep and dep_name:
+                            dependency_protected_agents.append((agent_name, dep_name))
+                        else:
+                            # Increment dead confirmation
+                            current_dead_count = self._agent_dead_confirmation_count.get(agent_name, 0)
+                            self._agent_dead_confirmation_count[agent_name] = current_dead_count + 1
+
+                            if current_dead_count + 1 >= self._dead_confirmation_threshold:
+                                status_changes.append((
+                                    agent_name, agent_info, AgentStatus.OFFLINE,
+                                    f"degraded_timeout_{age:.1f}s (confirmed:{current_dead_count+1})"
+                                ))
 
                 elif age > timeout / 2:
                     # Approaching timeout - mark health as degraded but keep status
@@ -738,13 +957,16 @@ class AgentRegistry:
 
                 else:
                     # Healthy heartbeat timing
+                    # v112.0: Reset dead confirmation counter on healthy heartbeat
+                    self._agent_dead_confirmation_count[agent_name] = 0
+                    self._agent_grace_reasons.pop(agent_name, None)
+
                     if agent_info.health != HealthStatus.HEALTHY or agent_info.status == AgentStatus.OFFLINE:
                         # v93.16: Allow recovery from OFFLINE when heartbeat is fresh
                         # This enables external repos (jarvis_prime, reactor_core) to recover
                         # when their heartbeat files are updated and the bridge sends heartbeats.
                         if agent_info.status == AgentStatus.OFFLINE:
                             # Recovery from offline - agent is sending heartbeats again
-                            old_status = agent_info.status
                             agent_info.status = AgentStatus.ONLINE
                             agent_info.health = HealthStatus.HEALTHY
                             recovering_agents.append(agent_name)
@@ -768,6 +990,22 @@ class AgentRegistry:
                 ", ".join(skipped_startup_agents[:5]) + ("..." if len(skipped_startup_agents) > 5 else "")
             )
 
+        # v112.0: Log dependency-protected agents
+        if dependency_protected_agents:
+            # Group by dependency for cleaner logging
+            deps_to_agents: Dict[str, List[str]] = {}
+            for agent_name, dep_name in dependency_protected_agents:
+                if dep_name not in deps_to_agents:
+                    deps_to_agents[dep_name] = []
+                deps_to_agents[dep_name].append(agent_name)
+
+            for dep_name, agents_list in deps_to_agents.items():
+                logger.debug(
+                    "[AgentRegistry v112.0] %d agents protected due to %s outage: %s",
+                    len(agents_list), dep_name,
+                    ", ".join(agents_list[:5]) + ("..." if len(agents_list) > 5 else "")
+                )
+
         # v16.0: BATCH LOG degraded agents to prevent spam
         if degraded_agents:
             if len(degraded_agents) <= 3:
@@ -786,9 +1024,9 @@ class AgentRegistry:
 
         # Apply status changes outside of iteration
         # v16.0: BATCH the offline notifications to prevent log spam
-        newly_offline_agents: List[str] = []
+        newly_offline_agents: List[Tuple[str, str]] = []  # v112.0: (agent_name, reason)
 
-        for agent_name, agent_info, new_status in status_changes:
+        for agent_name, agent_info, new_status, reason in status_changes:
             if agent_info.status != new_status:
                 old_status = agent_info.status
                 agent_info.status = new_status
@@ -799,37 +1037,40 @@ class AgentRegistry:
                     self._metrics.currently_online -= 1
                     self._metrics.currently_offline += 1
 
-                newly_offline_agents.append(agent_name)
+                newly_offline_agents.append((agent_name, reason))
                 await self._fire_status_change(agent_info, old_status)
 
         # v16.0: BATCH LOG offline agents instead of one message per agent
+        # v112.0: Include reason in logging
         if newly_offline_agents:
             if len(newly_offline_agents) <= 5:
-                # Log individually for small numbers
-                for name in newly_offline_agents:
+                # Log individually for small numbers with reason
+                for name, reason in newly_offline_agents:
                     agent_info = self._agents.get(name)
                     if agent_info:
                         age = agent_info.heartbeat_age_seconds()
                         logger.warning(
-                            "Agent %s marked offline (no heartbeat for %.1fs, timeout: %.1fs)",
+                            "Agent %s marked offline (reason: %s, age: %.1fs, timeout: %.1fs)",
                             name,
+                            reason,
                             age,
                             timeout,
                         )
             else:
                 # BATCH LOG for many offline agents (prevents the spam we saw)
+                agent_names = [name for name, _ in newly_offline_agents]
                 logger.warning(
                     "🚨 %d agents marked offline (no heartbeat for >%.1fs): %s%s",
                     len(newly_offline_agents),
                     timeout,
-                    ", ".join(newly_offline_agents[:10]),
-                    "..." if len(newly_offline_agents) > 10 else ""
+                    ", ".join(agent_names[:10]),
+                    "..." if len(agent_names) > 10 else ""
                 )
 
-                # Log the full list at debug level for diagnostics
+                # Log the full list with reasons at debug level for diagnostics
                 logger.debug(
-                    "Full list of offline agents: %s",
-                    ", ".join(newly_offline_agents)
+                    "Full list of offline agents with reasons: %s",
+                    ", ".join(f"{name}({reason})" for name, reason in newly_offline_agents)
                 )
 
     async def _save_registry(self) -> None:

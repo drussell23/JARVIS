@@ -193,6 +193,11 @@ class NeuralMeshCoordinator:
         # Create components
         self._bus = AgentCommunicationBus(self.config.communication_bus)
         self._registry = AgentRegistry(self.config.agent_registry)
+
+        # v112.0: Integrate AgentRegistry with ProxyReadinessGate for dependency tracking
+        # This ensures CloudSQL-dependent agents aren't marked offline when CloudSQL is down
+        await self._setup_proxy_readiness_integration()
+
         self._knowledge = SharedKnowledgeGraph(self.config.knowledge_graph)
 
         # Initialize knowledge graph (it has its own async init)
@@ -208,6 +213,66 @@ class NeuralMeshCoordinator:
 
         self._initialized = True
         logger.info("Neural Mesh system initialized")
+
+    async def _setup_proxy_readiness_integration(self) -> None:
+        """
+        Set up integration between AgentRegistry and ProxyReadinessGate.
+
+        v112.0: This ensures that CloudSQL-dependent agents won't be marked
+        offline when CloudSQL itself is unavailable. The ProxyReadinessGate
+        notifies the AgentRegistry whenever CloudSQL state changes.
+
+        This is a best-effort integration - if the gate is not available,
+        CloudSQL dependency tracking is disabled but the system continues.
+        """
+        if self._registry is None:
+            logger.debug(
+                "[NeuralMeshCoordinator v112.0] Registry not created yet, "
+                "skipping proxy integration"
+            )
+            return
+
+        try:
+            # Import lazily to avoid circular imports
+            # Try both import paths
+            try:
+                from intelligence.cloud_sql_connection_manager import ProxyReadinessGate
+            except ImportError:
+                from backend.intelligence.cloud_sql_connection_manager import ProxyReadinessGate
+
+            # Get singleton gate instance
+            gate = ProxyReadinessGate()
+
+            # Set up the integration
+            gate.setup_agent_registry_integration(self._registry)
+
+            logger.info(
+                "[NeuralMeshCoordinator v112.0] ProxyReadinessGate integration "
+                "established for AgentRegistry dependency tracking"
+            )
+        except ImportError as e:
+            logger.debug(
+                "[NeuralMeshCoordinator v112.0] ProxyReadinessGate not available "
+                "(import error: %s) - CloudSQL dependency tracking disabled", e
+            )
+        except Exception as e:
+            logger.warning(
+                "[NeuralMeshCoordinator v112.0] Failed to set up ProxyReadinessGate "
+                "integration: %s - CloudSQL dependency tracking disabled", e
+            )
+
+        # Also set service_registry dependency to ready (since Neural Mesh is starting)
+        # This is set here because if Neural Mesh is initializing, the service registry
+        # must be available (JARVIS body is running)
+        try:
+            self._registry.set_dependency_ready("service_registry", True)
+            logger.debug(
+                "[NeuralMeshCoordinator v112.0] service_registry dependency marked as ready"
+            )
+        except Exception as e:
+            logger.debug(
+                "[NeuralMeshCoordinator v112.0] Failed to mark service_registry ready: %s", e
+            )
 
     async def start(self) -> None:
         """

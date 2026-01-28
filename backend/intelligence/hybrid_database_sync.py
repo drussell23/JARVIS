@@ -1264,13 +1264,51 @@ class HybridDatabaseSync:
             raise
 
     async def _init_cloudsql_with_circuit_breaker(self):
-        """Initialize CloudSQL with intelligent proxy detection and circuit breaker"""
+        """
+        Initialize CloudSQL with intelligent proxy detection and circuit breaker.
+
+        v112.0 Enhancements:
+        - Integration with ProxyReadinessGate for readiness verification
+        - Uses gate as primary check, proxy_detector as fallback
+        """
         if not CONNECTION_MANAGER_AVAILABLE or not ASYNCPG_AVAILABLE:
             logger.warning("⚠️  asyncpg or connection manager not available - CloudSQL disabled")
             self.circuit_breaker.record_failure()
             return
 
-        # v5.0: Intelligent proxy detection before attempting connection
+        # v112.0: Check ProxyReadinessGate first (most authoritative)
+        try:
+            from intelligence.cloud_sql_connection_manager import get_readiness_gate, ReadinessState
+            gate = get_readiness_gate()
+            gate_state = gate.state
+
+            if gate_state == ReadinessState.UNAVAILABLE:
+                logger.debug("[HybridSync v112.0] ProxyReadinessGate says UNAVAILABLE - skipping connection")
+                self.circuit_breaker.record_failure()
+                self.metrics.cloudsql_available = False
+                return
+            elif gate_state == ReadinessState.DEGRADED_SQLITE:
+                logger.debug("[HybridSync v112.0] ProxyReadinessGate says DEGRADED_SQLITE - skipping CloudSQL")
+                self.circuit_breaker.record_failure()
+                self.metrics.cloudsql_available = False
+                return
+            elif gate_state != ReadinessState.READY:
+                # UNKNOWN state - proceed cautiously with connection attempt
+                logger.debug(f"[HybridSync v112.0] Gate state: {gate_state.name} - attempting connection cautiously")
+
+        except ImportError:
+            try:
+                from backend.intelligence.cloud_sql_connection_manager import get_readiness_gate, ReadinessState
+                gate = get_readiness_gate()
+                if gate.state not in (ReadinessState.READY, ReadinessState.UNKNOWN):
+                    logger.debug("[HybridSync v112.0] Gate not ready - skipping connection")
+                    self.circuit_breaker.record_failure()
+                    self.metrics.cloudsql_available = False
+                    return
+            except ImportError:
+                pass  # Gate not available, continue with legacy proxy detector
+
+        # v5.0: Intelligent proxy detection before attempting connection (fallback)
         if PROXY_DETECTOR_AVAILABLE:
             proxy_detector = get_proxy_detector()
             proxy_status, proxy_info = await proxy_detector.detect_proxy()
@@ -1807,6 +1845,11 @@ class HybridDatabaseSync:
         - Warms cache on reconnection
         - Periodically refreshes cache (every 5 minutes if CloudSQL healthy)
         - Clean logging - no spam when proxy not running
+
+        v112.0 Enhancements:
+        - Integration with ProxyReadinessGate for efficient waiting
+        - Uses gate's wait_for_ready() instead of polling when CloudSQL is down
+        - Notifies AgentRegistry of CloudSQL state changes (if integrated)
         """
         last_cache_refresh = datetime.now()
         cache_refresh_interval = 300  # 5 minutes
@@ -1814,8 +1857,43 @@ class HybridDatabaseSync:
         # Get proxy detector for intelligent connection management
         proxy_detector = get_proxy_detector() if PROXY_DETECTOR_AVAILABLE else None
 
+        # v112.0: Get ProxyReadinessGate for efficient waiting
+        readiness_gate = None
+        try:
+            from intelligence.cloud_sql_connection_manager import get_readiness_gate, ReadinessState
+            readiness_gate = get_readiness_gate()
+        except ImportError:
+            try:
+                from backend.intelligence.cloud_sql_connection_manager import get_readiness_gate, ReadinessState
+                readiness_gate = get_readiness_gate()
+            except ImportError:
+                logger.debug("[HybridSync v112.0] ProxyReadinessGate not available - using legacy health check")
+
         while not self._shutdown:
             try:
+                # v112.0: Use ProxyReadinessGate for efficient waiting when CloudSQL is down
+                if not self.cloudsql_healthy and readiness_gate is not None:
+                    # Check if gate says CloudSQL is ready before attempting connection
+                    gate_state = readiness_gate.state
+                    if gate_state != ReadinessState.READY:
+                        # CloudSQL not ready - use gate's wait_for_ready() with short timeout
+                        # This is more efficient than polling because the gate knows when
+                        # CloudSQL becomes ready
+                        try:
+                            result = await readiness_gate.wait_for_ready(timeout=30.0)
+                            if result.timed_out or result.state != ReadinessState.READY:
+                                # Still not ready - continue loop with backoff
+                                logger.debug(
+                                    "[HybridSync v112.0] CloudSQL not ready (state: %s), waiting...",
+                                    gate_state.name if hasattr(gate_state, 'name') else gate_state
+                                )
+                                await asyncio.sleep(10)  # Brief sleep before next check
+                                continue
+                        except Exception as gate_err:
+                            logger.debug("[HybridSync v112.0] Gate wait error: %s", gate_err)
+                            await asyncio.sleep(10)
+                            continue
+
                 # v5.0: Use intelligent delay from proxy detector
                 if proxy_detector and not self.cloudsql_healthy:
                     delay = proxy_detector.get_next_retry_delay()
@@ -1843,6 +1921,17 @@ class HybridDatabaseSync:
                         # Only log once per hour at debug level
                         continue
 
+                    # v112.0: Check ProxyReadinessGate first (more authoritative than proxy_detector)
+                    if readiness_gate is not None:
+                        gate_state = readiness_gate.state
+                        if gate_state != ReadinessState.READY:
+                            # Gate says not ready - skip connection attempt
+                            logger.debug(
+                                "[HybridSync v112.0] Skipping reconnection - gate state: %s",
+                                gate_state.name if hasattr(gate_state, 'name') else gate_state
+                            )
+                            continue
+
                     # v5.0: Check if proxy detector says we should even try
                     if proxy_detector and not proxy_detector.should_retry():
                         # Proxy detector has determined proxy isn't available (local dev mode)
@@ -1864,6 +1953,18 @@ class HybridDatabaseSync:
                 # Health check ping - use connection_manager (not cloudsql_pool which doesn't exist)
                 elif self.connection_manager is not None:
                     try:
+                        # v112.0: Check gate state before health check to avoid connection refused
+                        if readiness_gate is not None:
+                            gate_state = readiness_gate.state
+                            if gate_state != ReadinessState.READY:
+                                logger.debug(
+                                    "[HybridSync v112.0] Skipping health check - gate state: %s",
+                                    gate_state.name if hasattr(gate_state, 'name') else gate_state
+                                )
+                                self.cloudsql_healthy = False
+                                self.metrics.cloudsql_available = False
+                                continue
+
                         # Use the connection manager to verify CloudSQL connectivity
                         pool = await self.connection_manager.get_pool()
                         if pool:
@@ -1871,7 +1972,13 @@ class HybridDatabaseSync:
                                 await conn.fetchval("SELECT 1")
                             self.last_health_check = datetime.now()
                     except Exception as e:
-                        logger.warning(f"⚠️  CloudSQL health check failed: {e}")
+                        # v112.0: Don't log "Connection refused" at warning level during startup
+                        # This is expected when CloudSQL proxy isn't ready
+                        error_str = str(e)
+                        if "Connection refused" in error_str or "Errno 61" in error_str:
+                            logger.debug(f"[HybridSync v112.0] CloudSQL connection refused (proxy not ready)")
+                        else:
+                            logger.warning(f"⚠️  CloudSQL health check failed: {e}")
                         self.cloudsql_healthy = False
                         self.metrics.cloudsql_available = False
 
