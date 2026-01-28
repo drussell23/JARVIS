@@ -959,6 +959,30 @@ class IntelligentCredentialResolver:
             cls._retry_count = 0
 
     @classmethod
+    def reset_for_new_startup(cls) -> None:
+        """
+        v116.0: Reset retry count and state for a fresh startup attempt.
+
+        Call this at the START of ensure_proxy_ready() to ensure that
+        stale retry counts from previous attempts don't block new connections.
+
+        This fixes the bug where retry counts would persist across restart
+        attempts within the same process, causing false "max retries exceeded"
+        errors even when credentials are correct.
+        """
+        old_count = cls._retry_count
+        cls._retry_count = 0
+        cls._gcp_credentials_bootstrapped = False  # Re-check GCP credentials
+
+        if old_count > 0:
+            logger.info(
+                f"[CredentialResolver v116.0] 🔄 Startup reset: retry count cleared "
+                f"(was {old_count}), GCP credentials will be re-bootstrapped"
+            )
+        else:
+            logger.debug("[CredentialResolver v116.0] Startup reset: state cleared for fresh attempt")
+
+    @classmethod
     def can_retry(cls) -> bool:
         """v115.0: Check if credential retry is allowed."""
         return cls._retry_count < cls._max_credential_retries
@@ -1907,14 +1931,29 @@ class ProxyReadinessGate:
             error_str = str(e).lower()
 
             # Edge Case #11: Distinguish failure types
-            # v114.0: Credential failures now trigger cache invalidation AND config reload
+            # v116.0: Enhanced error categorization - only count as credential failure
+            # if we can verify the proxy is actually running. If proxy isn't running,
+            # "password authentication failed" is misleading - it means the proxy
+            # couldn't authenticate with GCP, not that the DB password is wrong.
             if "password authentication failed" in error_str:
-                logger.warning(f"[ReadinessGate] ❌ Credential failure: {e}")
-                # v114.0: Invalidate credential cache to force re-resolution
-                IntelligentCredentialResolver.on_authentication_failure()
-                # v114.0: Clear local config so next attempt uses fresh credentials
-                self._db_config = None
-                return False, "credentials"
+                # v116.0: Verify proxy is actually running before treating as credential failure
+                proxy_running = await self._check_proxy_running()
+                if proxy_running:
+                    # Proxy is running, so this is a genuine credential failure
+                    logger.warning(f"[ReadinessGate v116.0] ❌ Credential failure (proxy verified running): {e}")
+                    # v114.0: Invalidate credential cache to force re-resolution
+                    IntelligentCredentialResolver.on_authentication_failure()
+                    # v114.0: Clear local config so next attempt uses fresh credentials
+                    self._db_config = None
+                    return False, "credentials"
+                else:
+                    # Proxy not running - this is a proxy/GCP auth issue, not DB credentials
+                    logger.warning(
+                        f"[ReadinessGate v116.0] ⚠️ Password auth failed but proxy not running - "
+                        f"likely GCP auth issue, not DB credentials: {e}"
+                    )
+                    # Don't increment credential retry count - this is a proxy issue
+                    return False, "proxy"
             elif "connection refused" in error_str or "errno 61" in error_str:
                 logger.debug(f"[ReadinessGate] Proxy not available: {e}")
                 return False, "proxy"
@@ -2282,6 +2321,15 @@ class ProxyReadinessGate:
         """
         await self._ensure_locks()
 
+        # v116.0: CRITICAL - Reset credential retry count at startup
+        # This fixes the bug where stale retry counts from previous attempts
+        # would cause false "max retries exceeded" errors on subsequent startups
+        IntelligentCredentialResolver.reset_for_new_startup()
+
+        # v116.0: Bootstrap GCP credentials BEFORE proxy start
+        # The proxy needs valid GCP credentials to authenticate with Cloud SQL
+        IntelligentCredentialResolver.ensure_gcp_credentials()
+
         # Get timeout from env (no hardcoding)
         if timeout is None:
             timeout = float(os.environ.get("CLOUDSQL_ENSURE_READY_TIMEOUT", "60.0"))
@@ -2295,7 +2343,7 @@ class ProxyReadinessGate:
         max_delay = float(os.environ.get("CLOUDSQL_RETRY_MAX_DELAY", "10.0"))
 
         logger.info(
-            "[ReadinessGate v114.0] 🚀 ensure_proxy_ready() called "
+            "[ReadinessGate v116.0] 🚀 ensure_proxy_ready() called "
             "(timeout=%.1fs, auto_start=%s, max_attempts=%d)",
             timeout, auto_start, max_start_attempts
         )
@@ -2459,11 +2507,14 @@ class ProxyReadinessGate:
 
         # Check if already running
         if proxy_manager.is_running():
-            logger.debug("[ReadinessGate v113.0] Proxy already running")
+            logger.debug("[ReadinessGate v116.0] Proxy already running")
+            # v116.0: Reset retry count since proxy is confirmed running
+            # Any previous credential failures were likely due to proxy issues
+            IntelligentCredentialResolver.reset_retry_count()
             return True
 
         # Attempt start with retries
-        logger.info("[ReadinessGate v113.0] 🚀 Starting Cloud SQL proxy...")
+        logger.info("[ReadinessGate v116.0] 🚀 Starting Cloud SQL proxy...")
 
         try:
             success = await asyncio.wait_for(
@@ -2472,17 +2523,20 @@ class ProxyReadinessGate:
             )
 
             if success:
-                logger.info("[ReadinessGate v113.0] ✅ Proxy started successfully")
+                logger.info("[ReadinessGate v116.0] ✅ Proxy started successfully")
+                # v116.0: Reset retry count on successful proxy start
+                # Previous credential failures were likely due to proxy not running
+                IntelligentCredentialResolver.reset_retry_count()
                 return True
             else:
-                logger.warning("[ReadinessGate v113.0] ❌ Proxy start returned False")
+                logger.warning("[ReadinessGate v116.0] ❌ Proxy start returned False")
                 return False
 
         except asyncio.TimeoutError:
-            logger.warning("[ReadinessGate v113.0] ⏰ Proxy start timed out")
+            logger.warning("[ReadinessGate v116.0] ⏰ Proxy start timed out")
             return False
         except Exception as e:
-            logger.warning(f"[ReadinessGate v113.0] Proxy start error: {e}")
+            logger.warning(f"[ReadinessGate v116.0] Proxy start error: {e}")
             return False
 
     async def _signal_cross_repo_ready(self, latency_ms: Optional[float] = None) -> None:
