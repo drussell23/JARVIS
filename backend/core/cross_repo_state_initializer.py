@@ -236,6 +236,12 @@ class EventType(str, Enum):
     DEPENDENCY_READY = "infra_dependency_ready"
     DEPENDENCY_NOT_READY = "infra_dependency_not_ready"
 
+    # v114.0: Credential lifecycle events
+    CREDENTIAL_VALIDATED = "infra_credential_validated"
+    CREDENTIAL_INVALIDATED = "infra_credential_invalidated"
+    CREDENTIAL_REFRESHED = "infra_credential_refreshed"
+    CREDENTIAL_SOURCE_CHANGED = "infra_credential_source_changed"
+
 
 class StateStatus(str, Enum):
     """Status of a repository's state."""
