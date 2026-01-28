@@ -438,6 +438,20 @@ def _fast_supervisor_check():
     if health_level not in ('FULLY_READY', 'HTTP_HEALTHY', 'IPC_RESPONSIVE'):
         return False  # Unhealthy - need full init for auto-recovery
 
+    # =================================================================
+    # v131.0: ONE COMMAND = SHUTDOWN → START
+    # =================================================================
+    # By default, we now restart even if supervisor is healthy.
+    # This makes `python3 run_supervisor.py` idempotent.
+    # Set JARVIS_SUPERVISOR_SKIP_RESTART=1 to keep old behavior.
+    # =================================================================
+    _skip_restart = _os.environ.get('JARVIS_SUPERVISOR_SKIP_RESTART', '').lower() in ('1', 'true', 'yes')
+
+    if not _skip_restart:
+        # v131.0: Don't fast-exit - need full init for shutdown → start
+        return False  # Let main() handle the shutdown → start sequence
+
+    # Legacy behavior (when JARVIS_SUPERVISOR_SKIP_RESTART=1):
     # v119.2b: Show concise success message and exit
     pid = health_data.get('pid', 'unknown')
     uptime = health_data.get('uptime_seconds', 0)
@@ -460,6 +474,7 @@ def _fast_supervisor_check():
 
     print(f"")
     print(f"   No action needed - supervisor is ready to use.")
+    print(f"   (v131.0: Set JARVIS_SUPERVISOR_SKIP_RESTART=0 to enable auto-restart)")
     print(f"")
     print(f"   Commands:  --restart | --shutdown | --status")
     print(f"{'='*70}\n")
