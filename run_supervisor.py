@@ -11621,9 +11621,12 @@ class SupervisorBootstrapper:
         # v72.0: Cleanup Trinity component subprocesses
         await self._shutdown_trinity_components()
 
-        # v117.0: Cleanup all threads and executors (CRITICAL for clean exit)
-        # This must happen after component shutdowns but before final resource cleanup
-        # to ensure all thread pools, PyTorch workers, and third-party threads are stopped.
+        # v124.0: Comprehensive thread and executor cleanup (CRITICAL for clean exit)
+        # Uses the new final_thread_cleanup_async which handles:
+        # 1. Executor shutdown (ManagedThreadPoolExecutor)
+        # 2. Third-party threads (PyTorch, DB pools)
+        # 3. Force-terminate stubborn threads
+        # 4. Daemon conversion as last resort
         try:
             self.logger.info("🧵 Shutting down thread pools and executors...")
 
@@ -11637,40 +11640,39 @@ class SupervisorBootstrapper:
             except Exception as pe:
                 self.logger.debug(f"   PyTorch executor shutdown: {pe}")
 
-            from backend.core.thread_manager import (
-                shutdown_all_threads_async,
-                shutdown_third_party_threads,
+            # v124.0: Use comprehensive final_thread_cleanup_async
+            from backend.core.thread_manager import final_thread_cleanup_async
+
+            cleanup_stats = await asyncio.wait_for(
+                final_thread_cleanup_async(
+                    timeout=15.0,
+                    force_terminate=True,  # Force-terminate stubborn threads
+                    allow_daemon_conversion=False  # Don't convert to daemon yet
+                ),
+                timeout=20.0
             )
 
-            # First: Shutdown our managed threads and executors
-            thread_stats = await asyncio.wait_for(
-                shutdown_all_threads_async(timeout=10.0),
-                timeout=15.0
-            )
-            remaining = thread_stats.get("remaining_threads", 0)
-            executors_shutdown = thread_stats.get("executors_shutdown", 0)
+            executors_shutdown = cleanup_stats.get("executors_shutdown", 0)
+            force_terminated = cleanup_stats.get("threads_force_terminated", 0)
+            remaining = cleanup_stats.get("remaining_non_daemon", 0)
+
             self.logger.info(
-                f"   ✅ Managed threads: {executors_shutdown} executors shutdown, "
-                f"{remaining} threads remaining"
+                f"   ✅ Thread cleanup: {executors_shutdown} executors shutdown, "
+                f"{force_terminated} force-terminated, {remaining} remaining"
             )
 
-            # Second: Shutdown third-party threads (PyTorch, DB pools, etc.)
-            # Run in executor since this is a sync function
-            loop = asyncio.get_event_loop()
-            third_party_stats = await loop.run_in_executor(
-                None,
-                lambda: shutdown_third_party_threads(timeout=5.0)
-            )
-            third_party_remaining = third_party_stats.get("remaining_non_daemon", 0)
-            self.logger.info(
-                f"   ✅ Third-party threads: {third_party_remaining} non-daemon threads remaining"
-            )
+            if cleanup_stats.get("success"):
+                self.logger.info("✅ All threads cleanly stopped")
+            else:
+                remaining_names = cleanup_stats.get("remaining_thread_names", [])
+                self.logger.warning(
+                    f"⚠️ {remaining} non-daemon threads still running: {remaining_names[:5]}"
+                )
 
-            self.logger.info("✅ Thread cleanup complete")
         except asyncio.TimeoutError:
             self.logger.warning("⚠️ Thread cleanup timed out (some threads may still be running)")
         except ImportError:
-            self.logger.debug("[v117.0] Thread manager not available for cleanup")
+            self.logger.debug("[v124.0] Thread manager not available for cleanup")
         except Exception as e:
             self.logger.warning(f"⚠️ Thread cleanup error (non-fatal): {e}")
 
@@ -26147,7 +26149,28 @@ if __name__ == "__main__":
         if handler and handler.shutdown_count > 0:
             print(f"[v111.0] Shutdown completed (signals received: {handler.shutdown_count}, reason: {handler.shutdown_reason})")
 
-    # v123.3: Force exit - sys.exit() may hang if non-daemon threads are running.
+    # v124.0: Final thread cleanup before exit
+    # This ensures all managed threads are properly shut down before exiting.
+    try:
+        from backend.core.thread_manager import final_thread_cleanup
+        print("[v124.0] Performing final thread cleanup...")
+        cleanup_stats = final_thread_cleanup(
+            timeout=10.0,
+            force_terminate=True,
+            allow_daemon_conversion=True  # Nuclear option - convert remaining to daemon
+        )
+        remaining = cleanup_stats.get("remaining_non_daemon", 0)
+        if remaining == 0:
+            print("[v124.0] All threads cleanly stopped")
+        else:
+            remaining_names = cleanup_stats.get("remaining_thread_names", [])
+            print(f"[v124.0] {remaining} threads remaining: {remaining_names[:5]}")
+    except ImportError:
+        print("[v124.0] Thread manager not available for final cleanup")
+    except Exception as cleanup_error:
+        print(f"[v124.0] Final cleanup error (non-fatal): {cleanup_error}")
+
+    # v123.3/v124.0: Force exit - sys.exit() may hang if non-daemon threads are running.
     # Use os._exit() as a guaranteed termination after attempting clean exit.
     try:
         sys.exit(exit_code)
@@ -26161,11 +26184,11 @@ if __name__ == "__main__":
         non_daemon_threads = [t for t in _threading.enumerate()
                               if t.is_alive() and not t.daemon and t.name != 'MainThread']
         if non_daemon_threads:
-            print(f"[v123.3] Warning: {len(non_daemon_threads)} non-daemon threads blocking exit: "
+            print(f"[v124.0] Warning: {len(non_daemon_threads)} non-daemon threads blocking exit: "
                   f"{[t.name for t in non_daemon_threads]}")
 
-        # v123.3: Force termination if we got here (sys.exit didn't work)
-        print(f"[v123.3] Forcing immediate exit with os._exit({exit_code})")
+        # v124.0: Force termination if we got here (sys.exit didn't work)
+        print(f"[v124.0] Forcing immediate exit with os._exit({exit_code})")
 
         # v116.1: Flush all output before force exit to prevent corruption
         sys.stdout.flush()

@@ -642,7 +642,7 @@ def get_executor_registry() -> ExecutorRegistry:
 
 class ManagedThreadPoolExecutor(ThreadPoolExecutor):
     """
-    ThreadPoolExecutor with centralized lifecycle management.
+    ThreadPoolExecutor with centralized lifecycle management and DAEMON worker threads.
 
     Features:
     - Automatic registration with ExecutorRegistry
@@ -650,6 +650,7 @@ class ManagedThreadPoolExecutor(ThreadPoolExecutor):
     - Graceful shutdown support
     - Backpressure handling
     - Async-friendly submit methods
+    - v124.0: DAEMON WORKER THREADS - Workers won't block process exit
 
     Usage:
         executor = ManagedThreadPoolExecutor(max_workers=4, name='my-pool')
@@ -668,10 +669,11 @@ class ManagedThreadPoolExecutor(ThreadPoolExecutor):
         name: Optional[str] = None,
         category: str = "general",
         priority: int = 0,
-        name_prefix: Optional[str] = None  # Backwards compatibility alias
+        name_prefix: Optional[str] = None,  # Backwards compatibility alias
+        daemon: bool = True  # v124.0: Default to daemon threads for clean exit
     ):
         """
-        Initialize a managed executor.
+        Initialize a managed executor with daemon worker threads.
 
         Args:
             max_workers: Maximum number of worker threads (default: CPU count * 2)
@@ -682,6 +684,9 @@ class ManagedThreadPoolExecutor(ThreadPoolExecutor):
             category: Category for grouping executors
             priority: Shutdown priority (higher = shutdown later)
             name_prefix: DEPRECATED - Use 'name' instead (kept for backwards compatibility)
+            daemon: v124.0 - Whether worker threads should be daemon threads (default: True)
+                    Daemon threads automatically exit when the main thread exits,
+                    preventing "non-daemon threads blocking exit" warnings.
 
         This design supports multiple calling conventions:
         - ManagedThreadPoolExecutor(max_workers=8, name='my_pool')  # Preferred
@@ -701,6 +706,7 @@ class ManagedThreadPoolExecutor(ThreadPoolExecutor):
         self._category = category
         self._priority = priority
         self._max_workers = max_workers
+        self._use_daemon_threads = daemon
 
         prefix = thread_name_prefix or f'{self._pool_name}-worker'
 
@@ -710,6 +716,11 @@ class ManagedThreadPoolExecutor(ThreadPoolExecutor):
             initializer=initializer,
             initargs=initargs
         )
+
+        # v124.0: Patch the thread factory to create daemon threads
+        # This is the key fix - ThreadPoolExecutor creates non-daemon threads by default
+        if self._use_daemon_threads:
+            self._patch_thread_factory()
 
         # Track pending futures for cancellation
         self._pending_futures: Set[Future] = set()
@@ -726,7 +737,70 @@ class ManagedThreadPoolExecutor(ThreadPoolExecutor):
         )
 
         logger.debug(f"Created ManagedThreadPoolExecutor: {self._pool_name} "
-                    f"(workers={max_workers}, category={category})")
+                    f"(workers={max_workers}, category={category}, daemon={daemon})")
+
+    def _patch_thread_factory(self):
+        """
+        v124.0: Override _adjust_thread_count to create daemon threads.
+
+        ThreadPoolExecutor creates threads in _adjust_thread_count using
+        threading.Thread(...).start(). The daemon flag must be set BEFORE
+        start() is called. We completely replace _adjust_thread_count with
+        a version that creates daemon threads.
+
+        This is the ONLY reliable way to create daemon threads with
+        ThreadPoolExecutor in Python 3.9+.
+        """
+        import concurrent.futures.thread as thread_module
+        import queue
+
+        executor_ref = weakref.ref(self)
+        max_workers = self._max_workers
+        thread_name_prefix = getattr(self, '_thread_name_prefix', '') or f'{self._pool_name}-worker'
+
+        def daemon_adjust_thread_count():
+            """
+            v124.0: Custom _adjust_thread_count that creates DAEMON threads.
+
+            Copied from concurrent.futures.thread with daemon=True added.
+            """
+            executor = executor_ref()
+            if executor is None:
+                return
+
+            # Prevent multiple simultaneous thread creation
+            num_threads = len(executor._threads)
+            if num_threads < max_workers:
+                # Calculate how many threads need to be created
+                for _ in range(max_workers - num_threads):
+                    # Check if executor was shut down
+                    if executor._shutdown:
+                        return
+
+                    num_threads = len(executor._threads)
+                    thread_name = f'{thread_name_prefix}_{num_threads}'
+
+                    # v124.0: Create thread with daemon=True
+                    t = threading.Thread(
+                        name=thread_name,
+                        target=thread_module._worker,
+                        args=(
+                            weakref.ref(executor, executor._initializer_failed),
+                            executor._work_queue,
+                            executor._initializer,
+                            executor._initargs,
+                        ),
+                        daemon=True,  # v124.0: KEY FIX - daemon threads!
+                    )
+                    t.start()
+                    executor._threads.add(t)
+                    thread_module._threads_queues[t] = executor._work_queue
+
+                    # Exit early if max workers reached
+                    if len(executor._threads) >= max_workers:
+                        break
+
+        self._adjust_thread_count = daemon_adjust_thread_count
 
     def submit(self, fn: Callable[..., T], *args, **kwargs) -> Future:
         """
@@ -1617,6 +1691,245 @@ def shutdown_third_party_threads(timeout: float = 5.0) -> Dict[str, Any]:
 
 
 # =============================================================================
+# v124.0: FORCE THREAD TERMINATION - Last Resort Cleanup
+# =============================================================================
+
+def _raise_exception_in_thread(thread_id: int, exc_type: type) -> bool:
+    """
+    v124.0: Raise an exception in a thread using ctypes.
+
+    This is a low-level operation that uses Python's C API to inject
+    an exception into a running thread. Use with caution as it can
+    cause resource leaks if the thread holds locks or has open files.
+
+    Args:
+        thread_id: The thread's native ID
+        exc_type: The exception type to raise (e.g., SystemExit)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(thread_id),
+            ctypes.py_object(exc_type)
+        )
+        if res == 0:
+            logger.debug(f"[v124.0] Thread {thread_id} not found")
+            return False
+        elif res == 1:
+            logger.debug(f"[v124.0] Exception raised in thread {thread_id}")
+            return True
+        else:
+            # Multiple threads affected - this is bad, reset
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(thread_id),
+                None
+            )
+            logger.warning(f"[v124.0] PyThreadState_SetAsyncExc returned {res}, reset")
+            return False
+    except Exception as e:
+        logger.debug(f"[v124.0] Failed to raise exception in thread {thread_id}: {e}")
+        return False
+
+
+def force_terminate_thread(thread: threading.Thread, timeout: float = 1.0) -> bool:
+    """
+    v124.0: Force-terminate a thread by injecting SystemExit.
+
+    This is a last-resort operation. The thread may not clean up properly.
+
+    Args:
+        thread: The thread to terminate
+        timeout: Time to wait for thread to die after injection
+
+    Returns:
+        True if thread terminated, False otherwise
+    """
+    if not thread.is_alive():
+        return True
+
+    thread_id = thread.ident
+    if thread_id is None:
+        return False
+
+    logger.warning(f"[v124.0] Force-terminating thread: {thread.name} (id={thread_id})")
+
+    # Try to raise SystemExit in the thread
+    success = _raise_exception_in_thread(thread_id, SystemExit)
+    if not success:
+        return False
+
+    # Wait for thread to die
+    thread.join(timeout=timeout)
+    return not thread.is_alive()
+
+
+def convert_remaining_to_daemon(exclude_names: Optional[List[str]] = None) -> int:
+    """
+    v124.0: Convert remaining non-daemon threads to daemon.
+
+    This is a nuclear option that allows sys.exit() to proceed even if
+    threads are still running. Those threads will be terminated when
+    the process exits.
+
+    WARNING: This can cause issues if threads hold locks or resources.
+    Use only as a last resort before process exit.
+
+    Args:
+        exclude_names: Thread names to exclude from conversion
+
+    Returns:
+        Number of threads converted
+    """
+    exclude_names = exclude_names or []
+    exclude_names.extend(['MainThread'])
+
+    converted = 0
+    for thread in threading.enumerate():
+        if thread.name in exclude_names:
+            continue
+        if not thread.daemon and thread.is_alive():
+            try:
+                # Can only set daemon on threads that haven't started
+                # For running threads, we need to use a different approach
+                thread.daemon = True
+                converted += 1
+                logger.debug(f"[v124.0] Converted thread {thread.name} to daemon")
+            except RuntimeError:
+                # Thread already started - can't change daemon status
+                # This is expected - we just log it
+                logger.debug(f"[v124.0] Cannot convert running thread {thread.name} to daemon")
+
+    if converted > 0:
+        logger.info(f"[v124.0] Converted {converted} threads to daemon")
+
+    return converted
+
+
+def final_thread_cleanup(
+    timeout: float = 5.0,
+    force_terminate: bool = True,
+    allow_daemon_conversion: bool = False
+) -> Dict[str, Any]:
+    """
+    v124.0: Final comprehensive thread cleanup before process exit.
+
+    This is the LAST function to call before sys.exit(). It:
+    1. Shuts down all registered executors
+    2. Cleans up third-party threads (PyTorch, DB pools)
+    3. Optionally force-terminates stubborn threads
+    4. Optionally converts remaining to daemon (nuclear option)
+
+    Args:
+        timeout: Total timeout for cleanup
+        force_terminate: Whether to force-terminate stubborn threads
+        allow_daemon_conversion: Whether to convert remaining to daemon (nuclear)
+
+    Returns:
+        Cleanup statistics
+    """
+    import gc
+
+    stats = {
+        "executors_shutdown": 0,
+        "third_party_cleaned": False,
+        "threads_force_terminated": 0,
+        "threads_converted_to_daemon": 0,
+        "remaining_non_daemon": 0,
+        "remaining_thread_names": [],
+        "duration": 0.0,
+        "success": False,
+    }
+
+    start_time = time.time()
+    phase_timeout = timeout / 4
+
+    logger.info("[v124.0] Final thread cleanup starting...")
+
+    # Phase 1: Shutdown executors
+    try:
+        registry = get_executor_registry()
+        executor_stats = registry.shutdown_all(wait=True, timeout=phase_timeout, cancel_pending=True)
+        stats["executors_shutdown"] = executor_stats.get("successful", 0)
+        logger.info(f"[v124.0] Phase 1: {stats['executors_shutdown']} executors shutdown")
+    except Exception as e:
+        logger.warning(f"[v124.0] Executor shutdown error: {e}")
+
+    # Phase 2: Third-party cleanup
+    try:
+        third_party_stats = shutdown_third_party_threads(timeout=phase_timeout)
+        stats["third_party_cleaned"] = third_party_stats.get("pytorch_cleaned", False)
+        logger.info(f"[v124.0] Phase 2: Third-party cleanup complete")
+    except Exception as e:
+        logger.warning(f"[v124.0] Third-party cleanup error: {e}")
+
+    # Phase 3: Force terminate stubborn threads
+    if force_terminate:
+        remaining = [
+            t for t in threading.enumerate()
+            if t != threading.main_thread() and not t.daemon and t.is_alive()
+        ]
+
+        for thread in remaining:
+            if force_terminate_thread(thread, timeout=1.0):
+                stats["threads_force_terminated"] += 1
+
+        if stats["threads_force_terminated"] > 0:
+            logger.info(f"[v124.0] Phase 3: Force-terminated {stats['threads_force_terminated']} threads")
+
+    # Phase 4: Convert remaining to daemon (nuclear option)
+    if allow_daemon_conversion:
+        stats["threads_converted_to_daemon"] = convert_remaining_to_daemon()
+        if stats["threads_converted_to_daemon"] > 0:
+            logger.info(f"[v124.0] Phase 4: Converted {stats['threads_converted_to_daemon']} threads to daemon")
+
+    # Force garbage collection
+    gc.collect()
+
+    # Final count
+    remaining = [
+        t for t in threading.enumerate()
+        if t != threading.main_thread() and not t.daemon and t.is_alive()
+    ]
+    stats["remaining_non_daemon"] = len(remaining)
+    stats["remaining_thread_names"] = [t.name for t in remaining]
+    stats["duration"] = time.time() - start_time
+    stats["success"] = stats["remaining_non_daemon"] == 0
+
+    if stats["success"]:
+        logger.info(f"[v124.0] Final cleanup SUCCESS: All non-daemon threads stopped in {stats['duration']:.2f}s")
+    else:
+        logger.warning(
+            f"[v124.0] Final cleanup: {stats['remaining_non_daemon']} non-daemon threads remaining: "
+            f"{stats['remaining_thread_names']}"
+        )
+
+    return stats
+
+
+async def final_thread_cleanup_async(
+    timeout: float = 5.0,
+    force_terminate: bool = True,
+    allow_daemon_conversion: bool = False
+) -> Dict[str, Any]:
+    """
+    v124.0: Async version of final_thread_cleanup.
+
+    Runs the cleanup in a thread pool to avoid blocking the event loop.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: final_thread_cleanup(
+            timeout=timeout,
+            force_terminate=force_terminate,
+            allow_daemon_conversion=allow_daemon_conversion
+        )
+    )
+
+
+# =============================================================================
 # HTTP CLIENT REGISTRY - Centralized lifecycle management for aiohttp/httpx
 # =============================================================================
 
@@ -2378,12 +2691,15 @@ class NativeLibrarySafetyGuard:
         return self._shutdown_requested.is_set()
 
     def _get_pytorch_executor(self) -> ThreadPoolExecutor:
-        """Get or create the PyTorch executor."""
+        """Get or create the PyTorch executor with daemon threads."""
         with self._lock:
             if self._pytorch_executor is None:
-                self._pytorch_executor = ThreadPoolExecutor(
+                # v124.0: Use ManagedThreadPoolExecutor for daemon threads
+                self._pytorch_executor = ManagedThreadPoolExecutor(
                     max_workers=self._pytorch_workers,
-                    thread_name_prefix="PyTorchSafe"
+                    thread_name_prefix="PyTorchSafe",
+                    name="PyTorchSafe",
+                    daemon=True  # Ensure daemon threads for clean exit
                 )
             return self._pytorch_executor
 

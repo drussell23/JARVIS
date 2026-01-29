@@ -928,7 +928,7 @@ class PyTorchExecutor:
         logger.info("🔧 PyTorchExecutor singleton initialized")
 
     def _create_executor(self) -> ThreadPoolExecutor:
-        """Create or recreate the thread pool executor."""
+        """Create or recreate the thread pool executor with DAEMON threads."""
         with self._lock:
             if self._executor is not None:
                 try:
@@ -941,10 +941,70 @@ class PyTorchExecutor:
                 thread_name_prefix="pytorch_worker",
                 initializer=self._thread_initializer
             )
+
+            # v124.0: Make the PyTorch worker thread daemon so it doesn't block exit
+            # This is critical to prevent "non-daemon threads blocking exit" warnings
+            self._patch_executor_threads_to_daemon()
+
             self._thread_healthy = True
             self._consecutive_failures = 0
-            logger.info("🚀 PyTorch executor thread pool created")
+            logger.info("🚀 PyTorch executor thread pool created (daemon threads)")
             return self._executor
+
+    def _patch_executor_threads_to_daemon(self):
+        """
+        v124.0: Override _adjust_thread_count to create daemon threads.
+
+        ThreadPoolExecutor creates threads in _adjust_thread_count using
+        threading.Thread(...).start(). The daemon flag must be set BEFORE
+        start() is called. We completely replace _adjust_thread_count with
+        a version that creates daemon threads.
+        """
+        import concurrent.futures.thread as thread_module
+        import weakref as wkref
+
+        if self._executor is None:
+            return
+
+        executor = self._executor
+        max_workers = 1  # PyTorch executor always uses 1 worker
+        thread_name_prefix = "pytorch_worker"
+
+        def daemon_adjust_thread_count():
+            """
+            v124.0: Custom _adjust_thread_count that creates DAEMON threads.
+            """
+            num_threads = len(executor._threads)
+            if num_threads < max_workers:
+                for _ in range(max_workers - num_threads):
+                    if executor._shutdown:
+                        return
+
+                    num_threads = len(executor._threads)
+                    thread_name = f'{thread_name_prefix}_{num_threads}'
+
+                    # v124.0: Create thread with daemon=True
+                    t = threading.Thread(
+                        name=thread_name,
+                        target=thread_module._worker,
+                        args=(
+                            wkref.ref(executor, executor._initializer_failed),
+                            executor._work_queue,
+                            executor._initializer,
+                            executor._initargs,
+                        ),
+                        daemon=True,  # v124.0: KEY FIX - daemon threads!
+                    )
+                    t.start()
+                    executor._threads.add(t)
+                    thread_module._threads_queues[t] = executor._work_queue
+
+                    logger.debug(f"[v124.0] Created daemon PyTorch thread: {thread_name}")
+
+                    if len(executor._threads) >= max_workers:
+                        break
+
+        self._executor._adjust_thread_count = daemon_adjust_thread_count
 
     def _thread_initializer(self):
         """Initialize the PyTorch worker thread."""
