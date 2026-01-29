@@ -10440,6 +10440,10 @@ echo "=== JARVIS Prime started ==="
         This is intended to be called by external components like the
         SelfHealingServiceManager when they detect stale/dead services.
 
+        v125.0: Enhanced with lazy registration support. If the service isn't
+        currently in self.processes (because it never started successfully or
+        was removed), we'll try to find its definition and start it fresh.
+
         Args:
             service_name: Name of the service to restart
 
@@ -10447,12 +10451,141 @@ echo "=== JARVIS Prime started ==="
             True if restart succeeded, False otherwise
         """
         if service_name not in self.processes:
-            logger.error(f"[v93.0] Cannot restart {service_name}: not managed by this orchestrator")
-            return False
+            # v125.0: Lazy registration - try to find the service definition
+            # and start it if it's a known service
+            logger.warning(
+                f"[v125.0] Service {service_name} not in processes dict, "
+                f"attempting lazy registration"
+            )
+
+            # Try to find the service definition
+            definition = await self._get_service_definition_by_name(service_name)
+            if definition is None:
+                logger.error(
+                    f"[v125.0] Cannot restart {service_name}: "
+                    f"not managed and no definition found"
+                )
+                return False
+
+            # Create a new ManagedProcess and attempt to start
+            logger.info(
+                f"[v125.0] Found definition for {service_name}, "
+                f"creating managed process and starting"
+            )
+            managed = ManagedProcess(definition=definition)
+            self.processes[service_name] = managed
+
+            # Start the service
+            success = await self._spawn_service(managed)
+            if success:
+                # Start health monitor
+                health_monitor_task = asyncio.create_task(
+                    self._monitor_process_health(managed),
+                    name=f"crash_monitor_{service_name}"
+                )
+                managed.health_monitor_task = health_monitor_task
+                self._track_background_task(health_monitor_task)
+                logger.info(f"[v125.0] Successfully started {service_name} via lazy registration")
+            else:
+                logger.error(f"[v125.0] Failed to start {service_name} via lazy registration")
+                # Don't remove from processes - leave it there for future retry
+                managed.status = ServiceStatus.FAILED
+
+            return success
 
         managed = self.processes[service_name]
         logger.info(f"[v93.0] Restart requested for {service_name} by external component")
         return await self._auto_heal(managed)
+
+    async def _get_service_definition_by_name(self, service_name: str) -> Optional[ServiceDefinition]:
+        """
+        v125.1: Get a service definition by name with multi-tier lookup.
+
+        Intelligent lookup order:
+        1. ServiceDefinitionRegistry (canonical definitions with dynamic discovery)
+        2. Built-in definitions from _get_service_definitions()
+        3. Creates definition from config if known service
+
+        v125.1 Fixes:
+        - Uses correct registry property (self.registry)
+        - Uses correct registry method (ServiceDefinitionRegistry.get_definition())
+        - Removed invalid health_check_timeout parameter
+
+        Args:
+            service_name: Name of the service (e.g., "jarvis-prime", "reactor-core")
+
+        Returns:
+            ServiceDefinition if found, None otherwise
+        """
+        # Normalize the service name (handle both jarvis-prime and jarvis_prime)
+        normalized_name = service_name.lower().replace("_", "-")
+
+        # v125.1: Tier 1 - Try the centralized ServiceDefinitionRegistry first
+        # This is the SINGLE SOURCE OF TRUTH for service definitions
+        try:
+            definition = ServiceDefinitionRegistry.get_definition(
+                normalized_name,
+                port_override=None,  # Use default port resolution
+                path_override=None,  # Use intelligent path discovery
+                validate=True,
+            )
+            if definition:
+                logger.debug(f"[v125.1] Found {service_name} in ServiceDefinitionRegistry")
+                return definition
+        except Exception as e:
+            logger.debug(f"[v125.1] ServiceDefinitionRegistry lookup failed for {service_name}: {e}")
+
+        # v125.1: Tier 2 - Try built-in definitions from orchestrator configuration
+        try:
+            definitions = self._get_service_definitions()
+            for defn in definitions:
+                if defn.name.lower().replace("_", "-") == normalized_name:
+                    logger.debug(f"[v125.1] Found {service_name} in built-in definitions")
+                    return defn
+        except Exception as e:
+            logger.debug(f"[v125.1] Built-in definitions lookup failed for {service_name}: {e}")
+
+        # v125.1: Tier 3 - Special handling for known services with config-based creation
+        # This is the fallback when registry/discovery fails
+        if normalized_name == "jarvis-prime":
+            if hasattr(self.config, 'jarvis_prime_path') and self.config.jarvis_prime_path:
+                logger.debug(f"[v125.1] Creating jarvis-prime definition from config")
+                return ServiceDefinition(
+                    name="jarvis-prime",
+                    repo_path=self.config.jarvis_prime_path,
+                    script_name="run_server.py",
+                    fallback_scripts=["main.py", "server.py", "app.py"],
+                    default_port=self.config.jarvis_prime_default_port,
+                    depends_on=[],
+                    startup_timeout=300.0,  # ML model loading needs extra time
+                    startup_priority=20,
+                    is_critical=True,
+                    dependency_wait_timeout=120.0,
+                )
+            else:
+                logger.warning(f"[v125.1] jarvis-prime path not configured in self.config")
+
+        elif normalized_name == "reactor-core":
+            if hasattr(self.config, 'reactor_core_path') and self.config.reactor_core_path:
+                logger.debug(f"[v125.1] Creating reactor-core definition from config")
+                return ServiceDefinition(
+                    name="reactor-core",
+                    repo_path=self.config.reactor_core_path,
+                    script_name="run_reactor.py",
+                    fallback_scripts=["run_supervisor.py", "main.py", "server.py"],
+                    default_port=self.config.reactor_core_default_port,
+                    depends_on=[],  # v117.0: reactor-core can start independently
+                    soft_depends_on=["jarvis-prime"],  # Recommended but not required
+                    startup_timeout=120.0,
+                    startup_priority=30,
+                    is_critical=False,  # System can degrade without reactor-core
+                    dependency_wait_timeout=180.0,
+                )
+            else:
+                logger.warning(f"[v125.1] reactor-core path not configured in self.config")
+
+        logger.warning(f"[v125.1] No definition found for service: {service_name}")
+        return None
 
     # =========================================================================
     # v95.1: Intelligent Cross-Repo Recovery Coordination

@@ -193,6 +193,18 @@ class AgentRegistry:
             "neural_mesh": True,  # We're the neural mesh, so we're ready by definition
         }
 
+        # v125.1: Track which dependencies are OPTIONAL (unavailability doesn't cascade to agents)
+        # When a dependency is optional AND unavailable, agents that depend on it:
+        # - Will NOT be marked as DEGRADED due to dependency unavailability
+        # - Will continue operating with reduced functionality
+        # - This prevents cascade failures when infrastructure is optional
+        self._optional_dependencies: Dict[str, bool] = {
+            # CloudSQL is optional by default - agents can work without it using SQLite fallback
+            "cloudsql": os.environ.get("CLOUDSQL_OPTIONAL", "true").lower() == "true",
+            # Service registry is NOT optional - it's fundamental to agent coordination
+            "service_registry": False,
+        }
+
         # v112.0: Agents that depend on CloudSQL (don't mark offline if CloudSQL is down)
         self._cloudsql_dependent_agents: Set[str] = {
             "learning_agent", "memory_agent", "voice_verification",
@@ -755,6 +767,76 @@ class AgentRegistry:
         """Get all dependency states."""
         return dict(self._dependency_states)
 
+    def is_dependency_optional(self, dependency_name: str) -> bool:
+        """
+        v125.1: Check if a dependency is configured as optional.
+
+        Optional dependencies don't cause agent cascade degradation when unavailable.
+
+        Args:
+            dependency_name: Name of the dependency to check
+
+        Returns:
+            True if optional, False if required
+        """
+        return self._optional_dependencies.get(dependency_name, False)
+
+    def set_dependency_optional(self, dependency_name: str, is_optional: bool) -> None:
+        """
+        v125.1: Dynamically configure whether a dependency is optional.
+
+        This allows runtime configuration changes (e.g., CloudSQL becomes
+        required after initial startup, or becomes optional during recovery).
+
+        Args:
+            dependency_name: Name of the dependency
+            is_optional: True to make optional (no cascade on unavailability),
+                        False to make required (cascade to DEGRADED if unavailable)
+        """
+        old_optional = self._optional_dependencies.get(dependency_name, False)
+        self._optional_dependencies[dependency_name] = is_optional
+
+        if old_optional != is_optional:
+            logger.info(
+                "[AgentRegistry v125.1] Dependency '%s' optional status changed: %s -> %s",
+                dependency_name,
+                old_optional,
+                is_optional
+            )
+
+            # If dependency became required and is currently unavailable,
+            # agents may need to transition to DEGRADED
+            if not is_optional and not self._dependency_states.get(dependency_name, False):
+                affected_agents = self._get_agents_depending_on(dependency_name)
+                if affected_agents:
+                    logger.warning(
+                        "[AgentRegistry v125.1] Dependency '%s' is now REQUIRED but unavailable - "
+                        "affected agents may degrade: %s",
+                        dependency_name,
+                        ", ".join(list(affected_agents)[:5])
+                    )
+
+    def get_dependency_status_summary(self) -> Dict[str, Dict[str, Any]]:
+        """
+        v125.1: Get a complete summary of all dependency states and configurations.
+
+        Returns:
+            Dictionary with dependency name as key and status dict as value containing:
+            - available: bool - Whether the dependency is currently available
+            - optional: bool - Whether the dependency is optional
+            - affected_agents: int - Count of agents depending on this
+        """
+        summary = {}
+        for dep_name in set(list(self._dependency_states.keys()) + list(self._optional_dependencies.keys())):
+            affected = self._get_agents_depending_on(dep_name)
+            summary[dep_name] = {
+                "available": self._dependency_states.get(dep_name, False),
+                "optional": self._optional_dependencies.get(dep_name, False),
+                "affected_agents_count": len(affected),
+                "affected_agents": list(affected)[:10],  # Limit for readability
+            }
+        return summary
+
     def _get_agents_depending_on(self, dependency_name: str) -> Set[str]:
         """
         Get all agents that depend on a specific dependency.
@@ -773,10 +855,18 @@ class AgentRegistry:
 
     def _agent_has_unavailable_dependency(self, agent_name: str) -> Tuple[bool, Optional[str]]:
         """
-        Check if an agent has any unavailable dependencies.
+        Check if an agent has any unavailable REQUIRED dependencies.
 
         v112.0: Used in health checking to avoid marking agents offline when their
         dependencies are down. This provides more accurate health status.
+
+        v125.1: Enhanced to respect optional dependencies.
+        - When a dependency is marked as OPTIONAL (via _optional_dependencies),
+          it will NOT cause agents to be marked as having unavailable dependencies.
+        - This prevents cascade degradation when optional infrastructure (like CloudSQL)
+          is unavailable but the system can operate without it.
+        - Agents depending on optional unavailable services will continue operating
+          with potentially reduced functionality but won't be marked DEGRADED.
 
         Args:
             agent_name: Name of the agent to check
@@ -784,16 +874,40 @@ class AgentRegistry:
         Returns:
             Tuple of (has_unavailable_dependency, dependency_name or None)
         """
-        # Check CloudSQL dependency
+        # v125.1: Check CloudSQL dependency (respecting optional configuration)
         if agent_name in self._cloudsql_dependent_agents:
-            if not self._dependency_states.get("cloudsql", False):
-                return True, "cloudsql"
+            cloudsql_available = self._dependency_states.get("cloudsql", False)
+            cloudsql_optional = self._optional_dependencies.get("cloudsql", False)
 
-        # Check service_registry dependency (all agents depend on this)
+            # v125.1: Only report as unavailable if CloudSQL is:
+            # 1. Actually unavailable (not ready), AND
+            # 2. NOT configured as optional
+            if not cloudsql_available and not cloudsql_optional:
+                return True, "cloudsql"
+            # v125.1: If CloudSQL is optional and unavailable, log once but don't cascade
+            elif not cloudsql_available and cloudsql_optional:
+                # Only log once per session to avoid spam
+                if not hasattr(self, '_optional_dep_logged'):
+                    self._optional_dep_logged: Set[str] = set()
+                log_key = f"{agent_name}:cloudsql_optional"
+                if log_key not in self._optional_dep_logged:
+                    self._optional_dep_logged.add(log_key)
+                    logger.debug(
+                        "[AgentRegistry v125.1] Agent %s depends on CloudSQL but it's optional - "
+                        "agent will NOT be marked degraded (graceful degradation)",
+                        agent_name
+                    )
+                # Return False - dependency is unavailable but optional, so don't cascade
+                return False, None
+
+        # v125.1: Check service_registry dependency (all agents depend on this, never optional)
         if not self._dependency_states.get("service_registry", False):
             # But only if we're not the one providing service_registry
             if agent_name not in ("jarvis-body", "supervisor"):
-                return True, "service_registry"
+                # v125.1: Service registry is NEVER optional - it's fundamental
+                service_registry_optional = self._optional_dependencies.get("service_registry", False)
+                if not service_registry_optional:
+                    return True, "service_registry"
 
         return False, None
 
