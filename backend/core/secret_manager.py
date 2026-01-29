@@ -466,9 +466,23 @@ class SecretManager:
     """
 
     # Common secret ID mappings
+    # v117.0: Added CLOUDSQL_* aliases for unified credential access
     SECRET_ALIASES: Dict[str, List[str]] = {
         "anthropic-api-key": ["ANTHROPIC_API_KEY", "anthropic_api_key"],
-        "jarvis-db-password": ["JARVIS_DB_PASSWORD", "jarvis_db_password", "DB_PASSWORD"],
+        "jarvis-db-password": [
+            "JARVIS_DB_PASSWORD",
+            "jarvis_db_password",
+            "DB_PASSWORD",
+            "CLOUDSQL_DB_PASSWORD",  # v117.0: Unified with startup_barrier
+            "CLOUD_SQL_PASSWORD",
+        ],
+        "jarvis-db-user": [
+            "JARVIS_DB_USER",
+            "jarvis_db_user",
+            "DB_USER",
+            "CLOUDSQL_DB_USER",  # v117.0: Unified with startup_barrier
+            "CLOUD_SQL_USER",
+        ],
         "picovoice-access-key": ["PICOVOICE_ACCESS_KEY", "picovoice_access_key"],
         "openai-api-key": ["OPENAI_API_KEY", "openai_api_key"],
     }
@@ -857,6 +871,28 @@ def get_db_password() -> Optional[str]:
 async def get_db_password_async() -> Optional[str]:
     """Quick async access to database password."""
     return await get_secret_manager().get_db_password_async()
+
+
+def get_db_user() -> str:
+    """
+    v117.0: Quick access to database user.
+
+    Returns the database username from secrets or environment,
+    with 'jarvis' as the fallback default.
+    """
+    user = get_secret_manager().get_secret("jarvis-db-user")
+    return user if user else "jarvis"
+
+
+async def get_db_user_async() -> str:
+    """
+    v117.0: Quick async access to database user.
+
+    Returns the database username from secrets or environment,
+    with 'jarvis' as the fallback default.
+    """
+    user = await get_secret_manager().get_secret_async("jarvis-db-user")
+    return user if user else "jarvis"
 
 
 def get_picovoice_key() -> Optional[str]:

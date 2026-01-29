@@ -6,9 +6,10 @@ Provides:
 - Dependency graph with topological sort
 - Parallel initialization of independent components
 - CloudSQL barrier that blocks dependent components until verified ready
+- v117.0: Unified credential management via SecretManager
 
 Author: JARVIS System
-Version: 1.0.0
+Version: 1.1.0 (v117.0)
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import logging
 import os
 import socket
 import ssl
+import threading
 import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -46,11 +48,179 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Lazy Credential Provider (v117.0)
+# =============================================================================
+
+class _LazyCredentialProvider:
+    """
+    v117.0: Thread-safe lazy credential provider using SecretManager.
+
+    Credentials are fetched on first access, not at module import time.
+    This prevents initialization failures in background threads and
+    ensures credentials are retrieved from the proper source.
+    """
+
+    _instance: Optional["_LazyCredentialProvider"] = None
+    _lock = threading.Lock()
+
+    def __new__(cls) -> "_LazyCredentialProvider":
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self) -> None:
+        if self._initialized:
+            return
+        self._db_user: Optional[str] = None
+        self._db_password: Optional[str] = None
+        self._credentials_lock = threading.Lock()
+        self._secret_manager_available: Optional[bool] = None
+        self._initialized = True
+
+    def _get_secret_manager(self):
+        """Lazily import and get SecretManager to avoid circular imports."""
+        if self._secret_manager_available is False:
+            return None
+
+        try:
+            from backend.core.secret_manager import get_secret_manager
+            self._secret_manager_available = True
+            return get_secret_manager()
+        except ImportError:
+            self._secret_manager_available = False
+            logger.debug("SecretManager not available, using environment variables")
+            return None
+
+    @property
+    def db_user(self) -> str:
+        """Get database user with lazy loading and fallback."""
+        if self._db_user is not None:
+            return self._db_user
+
+        with self._credentials_lock:
+            if self._db_user is not None:
+                return self._db_user
+
+            # Try SecretManager first
+            sm = self._get_secret_manager()
+            if sm:
+                try:
+                    user = sm.get_secret("jarvis-db-user")
+                    if user:
+                        self._db_user = user
+                        logger.debug(f"Database user loaded via SecretManager")
+                        return self._db_user
+                except Exception as e:
+                    logger.debug(f"SecretManager lookup for db_user failed: {e}")
+
+            # Fallback to environment variables (check all aliases)
+            for env_var in [
+                "JARVIS_DB_USER",
+                "CLOUDSQL_DB_USER",
+                "DB_USER",
+                "CLOUD_SQL_USER",
+            ]:
+                user = os.getenv(env_var)
+                if user:
+                    self._db_user = user
+                    logger.debug(f"Database user loaded from {env_var}")
+                    return self._db_user
+
+            # Final fallback
+            self._db_user = "jarvis"
+            logger.debug("Using default database user 'jarvis'")
+            return self._db_user
+
+    @property
+    def db_password(self) -> str:
+        """Get database password with lazy loading and fallback."""
+        if self._db_password is not None:
+            return self._db_password
+
+        with self._credentials_lock:
+            if self._db_password is not None:
+                return self._db_password
+
+            # Try SecretManager first (checks GCP Secret Manager, Keychain, env vars)
+            sm = self._get_secret_manager()
+            if sm:
+                try:
+                    password = sm.get_secret("jarvis-db-password")
+                    if password:
+                        self._db_password = password
+                        logger.debug("Database password loaded via SecretManager")
+                        return self._db_password
+                except Exception as e:
+                    logger.debug(f"SecretManager lookup for db_password failed: {e}")
+
+            # Fallback to environment variables (check all aliases)
+            for env_var in [
+                "JARVIS_DB_PASSWORD",
+                "CLOUDSQL_DB_PASSWORD",
+                "DB_PASSWORD",
+                "CLOUD_SQL_PASSWORD",
+            ]:
+                password = os.getenv(env_var)
+                if password:
+                    self._db_password = password
+                    logger.debug(f"Database password loaded from {env_var}")
+                    return self._db_password
+
+            # Empty password (will likely fail auth, but we don't crash)
+            logger.warning(
+                "No database password found! Set JARVIS_DB_PASSWORD or configure "
+                "SecretManager. Authentication will likely fail."
+            )
+            self._db_password = ""
+            return self._db_password
+
+    def refresh_credentials(self) -> None:
+        """Force refresh of cached credentials."""
+        with self._credentials_lock:
+            self._db_user = None
+            self._db_password = None
+            logger.info("Credentials cache cleared, will reload on next access")
+
+
+# Global singleton
+_credential_provider = _LazyCredentialProvider()
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
+class _LazyCredentialDescriptor:
+    """
+    v117.0: Descriptor for lazy credential loading.
+
+    Works as a class attribute that returns credentials on first access,
+    compatible with Python 3.9+ without requiring @classmethod + @property.
+    """
+
+    def __init__(self, credential_type: str):
+        self._credential_type = credential_type
+
+    def __get__(self, obj, objtype=None) -> str:
+        if self._credential_type == "user":
+            return _credential_provider.db_user
+        elif self._credential_type == "password":
+            return _credential_provider.db_password
+        else:
+            raise ValueError(f"Unknown credential type: {self._credential_type}")
+
+
 class BarrierConfig:
-    """Configuration loaded from environment variables."""
+    """
+    Configuration loaded from environment variables.
+
+    v117.0: Credentials (DB_USER, DB_PASSWORD) are now loaded lazily via
+    _LazyCredentialProvider to support SecretManager integration and
+    prevent import-time failures.
+    """
 
     # Timeouts
     ENSURE_READY_TIMEOUT: Final[float] = float(os.getenv("CLOUDSQL_ENSURE_READY_TIMEOUT", "60.0"))
@@ -62,16 +232,33 @@ class BarrierConfig:
     COMPONENT_TIMEOUT: Final[float] = float(os.getenv("COMPONENT_INIT_TIMEOUT", "30.0"))
     PARALLEL_INIT_ENABLED: Final[bool] = os.getenv("PARALLEL_INIT_ENABLED", "true").lower() == "true"
 
-    # Database settings
+    # Database settings (non-credential)
     DB_HOST: Final[str] = os.getenv("CLOUDSQL_PROXY_HOST", "127.0.0.1")
     DB_PORT: Final[int] = int(os.getenv("CLOUDSQL_PROXY_PORT", "5432"))
     DB_NAME: Final[str] = os.getenv("CLOUDSQL_DB_NAME", "jarvis_db")
-    DB_USER: Final[str] = os.getenv("CLOUDSQL_DB_USER", "jarvis")
-    DB_PASSWORD: Final[str] = os.getenv("CLOUDSQL_DB_PASSWORD", "")
+
+    # v117.0: Credentials are now lazy-loaded via SecretManager
+    DB_USER = _LazyCredentialDescriptor("user")
+    DB_PASSWORD = _LazyCredentialDescriptor("password")
 
     # Latency thresholds
     LATENCY_WARNING_MS: Final[float] = float(os.getenv("CLOUDSQL_LATENCY_WARNING_MS", "100.0"))
     LATENCY_ERROR_MS: Final[float] = float(os.getenv("CLOUDSQL_LATENCY_ERROR_MS", "500.0"))
+
+    @classmethod
+    def refresh_credentials(cls) -> None:
+        """v117.0: Force refresh of cached credentials."""
+        _credential_provider.refresh_credentials()
+
+    @classmethod
+    def get_db_user(cls) -> str:
+        """v117.0: Explicit method for getting database user."""
+        return _credential_provider.db_user
+
+    @classmethod
+    def get_db_password(cls) -> str:
+        """v117.0: Explicit method for getting database password."""
+        return _credential_provider.db_password
 
 
 # =============================================================================
@@ -117,22 +304,34 @@ class VerificationPipeline:
     3. Authentication - Are credentials valid?
     4. Query Execution - Does the database respond?
     5. Latency Check - Is performance acceptable?
+
+    v117.0: Now uses lazy credential loading via SecretManager for robust
+    credential management with fallback support.
     """
 
     def __init__(
         self,
-        host: str = BarrierConfig.DB_HOST,
-        port: int = BarrierConfig.DB_PORT,
-        db_name: str = BarrierConfig.DB_NAME,
-        db_user: str = BarrierConfig.DB_USER,
-        db_password: str = BarrierConfig.DB_PASSWORD,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        db_name: Optional[str] = None,
+        db_user: Optional[str] = None,
+        db_password: Optional[str] = None,
     ):
-        self._host = host
-        self._port = port
-        self._db_name = db_name
-        self._db_user = db_user
-        self._db_password = db_password
+        # v117.0: Lazy resolution of configuration values
+        # This ensures credentials are loaded via SecretManager when accessed,
+        # not at module import time
+        self._host = host if host is not None else BarrierConfig.DB_HOST
+        self._port = port if port is not None else BarrierConfig.DB_PORT
+        self._db_name = db_name if db_name is not None else BarrierConfig.DB_NAME
+        self._db_user = db_user if db_user is not None else BarrierConfig.get_db_user()
+        self._db_password = db_password if db_password is not None else BarrierConfig.get_db_password()
         self._results: List[VerificationResult] = []
+
+        # v117.0: Log credential source for debugging (without exposing password)
+        logger.debug(
+            f"VerificationPipeline initialized: host={self._host}, port={self._port}, "
+            f"db={self._db_name}, user={self._db_user}, password={'***' if self._db_password else '(empty)'}"
+        )
 
     async def verify_tcp_connect(self, timeout: float = 5.0) -> VerificationResult:
         """Stage 1: Verify TCP port is accepting connections."""
