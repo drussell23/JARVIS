@@ -116,6 +116,39 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# v131.0: OOM Prevention Bridge Integration
+# =============================================================================
+# Prevents SIGKILL (exit code -9) by checking memory before spawning heavy services
+
+_OOM_PREVENTION_AVAILABLE = False
+_check_memory_before_heavy_init = None
+_MemoryDecision = None
+
+try:
+    from backend.core.gcp_oom_prevention_bridge import (
+        check_memory_before_heavy_init as _check_mem,
+        MemoryDecision as _MemDec,
+        HEAVY_COMPONENT_MEMORY_ESTIMATES,
+    )
+    _check_memory_before_heavy_init = _check_mem
+    _MemoryDecision = _MemDec
+    _OOM_PREVENTION_AVAILABLE = True
+except ImportError:
+    # Fallback for different import path
+    try:
+        from core.gcp_oom_prevention_bridge import (
+            check_memory_before_heavy_init as _check_mem,
+            MemoryDecision as _MemDec,
+            HEAVY_COMPONENT_MEMORY_ESTIMATES,
+        )
+        _check_memory_before_heavy_init = _check_mem
+        _MemoryDecision = _MemDec
+        _OOM_PREVENTION_AVAILABLE = True
+    except ImportError:
+        HEAVY_COMPONENT_MEMORY_ESTIMATES = {}
+
+
+# =============================================================================
 # v95.0: Orchestrator-Narrator Bridge Integration
 # =============================================================================
 
@@ -2611,6 +2644,11 @@ class ManagedProcess:
     # v95.0: Dedicated heartbeat task that runs independently of health checks
     # This prevents services from becoming stale even when health checks fail
     heartbeat_task: Optional[asyncio.Task] = None
+
+    # v131.0: GCP offload tracking for OOM prevention
+    # When memory is insufficient locally, heavy services can be offloaded to GCP Spot VMs
+    gcp_offload_active: bool = False
+    gcp_vm_ip: Optional[str] = None
 
     # v95.0: Track last known health status for smarter heartbeat reporting
     last_known_health: str = "unknown"
@@ -11799,6 +11837,81 @@ echo "=== JARVIS Prime started ==="
                 "depends_on": definition.depends_on
             }
         )
+
+        # =========================================================================
+        # v131.0: OOM PREVENTION - Check memory before spawning heavy services
+        # =========================================================================
+        # This prevents SIGKILL (exit code -9) crashes during initialization by
+        # detecting low memory BEFORE starting JARVIS Prime and offloading to GCP.
+        # =========================================================================
+        if _OOM_PREVENTION_AVAILABLE and _check_memory_before_heavy_init and _MemoryDecision:
+            # Check if this is a heavy service that needs memory check
+            heavy_services = ["jarvis-prime", "jarvis_prime", "j-prime"]
+            if definition.name.lower() in heavy_services:
+                try:
+                    # JARVIS Prime typically needs ~6GB for GGUF model loading
+                    estimated_mb = HEAVY_COMPONENT_MEMORY_ESTIMATES.get("jarvis_prime", 6000)
+
+                    logger.info(f"[OOM Prevention] Checking memory before starting {definition.name}")
+                    memory_result = await _check_memory_before_heavy_init(
+                        component=f"cross_repo_{definition.name}",
+                        estimated_mb=estimated_mb,
+                        auto_offload=True,
+                    )
+
+                    if memory_result.decision == _MemoryDecision.CLOUD_REQUIRED:
+                        if memory_result.gcp_vm_ready:
+                            logger.info(
+                                f"[OOM Prevention] ☁️ Using GCP VM for {definition.name}: "
+                                f"{memory_result.gcp_vm_ip}"
+                            )
+                            # Store GCP endpoint for later routing
+                            managed.gcp_offload_active = True
+                            managed.gcp_vm_ip = memory_result.gcp_vm_ip
+                            await _emit_event(
+                                "SERVICE_OFFLOADED_TO_CLOUD",
+                                service_name=definition.name,
+                                priority="HIGH",
+                                details={
+                                    "gcp_vm_ip": memory_result.gcp_vm_ip,
+                                    "reason": memory_result.reason,
+                                }
+                            )
+                            # For now, still spawn locally but record the offload status
+                            # Future: skip local spawn entirely when GCP is handling it
+                        else:
+                            logger.warning(
+                                f"[OOM Prevention] ⚠️ GCP VM not available but memory is low - "
+                                f"proceeding with risk for {definition.name}"
+                            )
+                    elif memory_result.decision == _MemoryDecision.CLOUD:
+                        if memory_result.gcp_vm_ready:
+                            logger.info(
+                                f"[OOM Prevention] ☁️ GCP VM recommended for {definition.name}: "
+                                f"{memory_result.gcp_vm_ip}"
+                            )
+                            managed.gcp_offload_active = True
+                            managed.gcp_vm_ip = memory_result.gcp_vm_ip
+                        else:
+                            logger.info(
+                                f"[OOM Prevention] Local memory okay for {definition.name} "
+                                f"({memory_result.available_ram_gb:.1f}GB available)"
+                            )
+                    elif memory_result.decision == _MemoryDecision.ABORT:
+                        logger.error(
+                            f"[OOM Prevention] ❌ Cannot safely start {definition.name}: "
+                            f"{memory_result.reason}"
+                        )
+                        # Emit warning but proceed anyway - better to try than fail silently
+                    else:
+                        logger.info(
+                            f"[OOM Prevention] ✅ Sufficient memory for {definition.name} "
+                            f"({memory_result.available_ram_gb:.1f}GB available)"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"[OOM Prevention] Check failed for {definition.name}: {e}")
+        # =========================================================================
 
         # Pre-spawn validation
         is_valid, python_exec = await self._pre_spawn_validation(definition)

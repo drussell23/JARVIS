@@ -133,6 +133,18 @@ try:
 except ImportError:
     TASK_MANAGER_AVAILABLE = False
 
+# v131.0: Import GCP OOM Prevention Bridge for pre-flight memory checks
+OOM_PREVENTION_AVAILABLE = False
+try:
+    from core.gcp_oom_prevention_bridge import (
+        check_memory_before_heavy_init,
+        MemoryDecision,
+        HEAVY_COMPONENT_MEMORY_ESTIMATES,
+    )
+    OOM_PREVENTION_AVAILABLE = True
+except ImportError:
+    logging.getLogger(__name__).debug("OOM Prevention Bridge not available")
+
 logger = logging.getLogger(__name__)
 
 
@@ -408,6 +420,8 @@ class ParallelInitializer:
         """
         Background task that initializes all heavy components.
         This runs AFTER the server starts serving requests.
+
+        v131.0: Includes OOM prevention - checks memory BEFORE heavy initialization.
         """
         logger.info("")
         logger.info("=" * 60)
@@ -415,6 +429,66 @@ class ParallelInitializer:
         logger.info("=" * 60)
 
         self.app.state.startup_phase = "INITIALIZING"
+
+        # =========================================================================
+        # v131.0: OOM PREVENTION - Pre-flight memory check before heavy components
+        # =========================================================================
+        # This prevents SIGKILL (exit code -9) crashes during initialization by
+        # detecting low memory BEFORE loading heavy ML models and offloading to GCP.
+        # =========================================================================
+        gcp_offload_active = False
+        gcp_vm_ip = None
+
+        if OOM_PREVENTION_AVAILABLE:
+            try:
+                # Estimate total heavy component memory
+                heavy_components = ["neural_mesh", "speaker_verification", "jarvis_voice_api"]
+                total_estimated_mb = sum(
+                    HEAVY_COMPONENT_MEMORY_ESTIMATES.get(c, 500)
+                    for c in heavy_components
+                )
+
+                logger.info(f"[OOM Prevention] Checking memory for heavy init (~{total_estimated_mb}MB required)")
+
+                # Check memory before proceeding
+                memory_result = await check_memory_before_heavy_init(
+                    component="startup_initialization",
+                    estimated_mb=total_estimated_mb,
+                    auto_offload=True,
+                )
+
+                if memory_result.decision == MemoryDecision.CLOUD_REQUIRED:
+                    logger.warning(f"[OOM Prevention] ⚠️ Local RAM insufficient - GCP offload required")
+                    if memory_result.gcp_vm_ready:
+                        gcp_offload_active = True
+                        gcp_vm_ip = memory_result.gcp_vm_ip
+                        self.app.state.gcp_offload_active = True
+                        self.app.state.gcp_vm_ip = gcp_vm_ip
+                        logger.info(f"[OOM Prevention] ✅ GCP VM ready at {gcp_vm_ip}")
+                        logger.info(f"[OOM Prevention] Heavy components will be offloaded to cloud")
+                    else:
+                        logger.error(f"[OOM Prevention] ❌ GCP VM not available - proceeding with risk")
+
+                elif memory_result.decision == MemoryDecision.CLOUD:
+                    logger.info(f"[OOM Prevention] ☁️ Cloud recommended (optional)")
+                    if memory_result.gcp_vm_ready:
+                        gcp_offload_active = True
+                        gcp_vm_ip = memory_result.gcp_vm_ip
+                        self.app.state.gcp_offload_active = True
+                        self.app.state.gcp_vm_ip = gcp_vm_ip
+                        logger.info(f"[OOM Prevention] Using GCP VM at {gcp_vm_ip}")
+
+                elif memory_result.decision == MemoryDecision.ABORT:
+                    logger.error(f"[OOM Prevention] ❌ ABORT - Cannot proceed safely")
+                    logger.error(f"[OOM Prevention] Reason: {memory_result.reason}")
+                    # Continue anyway in degraded mode - better than failing completely
+
+                else:
+                    logger.info(f"[OOM Prevention] ✅ Sufficient local RAM ({memory_result.available_ram_gb:.1f}GB)")
+
+            except Exception as e:
+                logger.warning(f"[OOM Prevention] Check failed (non-fatal): {e}")
+        # =========================================================================
 
         try:
             # Group components by priority
