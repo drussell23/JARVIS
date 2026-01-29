@@ -941,9 +941,21 @@ class UnifiedTrinityCoordinator:
         prev_state: ComponentState,
         new_state: ComponentState,
     ) -> None:
-        """Emit deduplicated notification for state change."""
+        """
+        Emit deduplicated notification for state change.
+
+        v123.5: Added intelligent notification suppression for optional components
+        that were never started. This prevents nagging "unavailable" warnings
+        for components like Reactor Core when they're simply not running.
+        """
         config = self._configs.get(component)
         name = config.display_name if config else component.value
+
+        # v123.5: Check if component was ever started (has startup time)
+        was_ever_started = component in self._health_checker._startup_times
+
+        # v123.5: Check if component is required
+        is_required = config.required if config else True
 
         # Determine level and message
         if new_state == ComponentState.HEALTHY and prev_state != ComponentState.HEALTHY:
@@ -961,11 +973,19 @@ class UnifiedTrinityCoordinator:
         elif new_state == ComponentState.UNHEALTHY:
             # Only emit if wasn't already unhealthy (dedup)
             if prev_state not in {ComponentState.UNHEALTHY, ComponentState.FAILED}:
-                await self._coalescer.emit(
-                    component,
-                    NotificationLevel.WARNING,
-                    f"⚠️ {name} is unavailable",
-                )
+                # v123.5: Suppress "unavailable" warnings for optional components
+                # that were never started. This is the ROOT FIX for nagging warnings.
+                if not is_required and not was_ever_started:
+                    # Log at debug level instead of warning
+                    logger.debug(
+                        f"[Trinity] {name} is unavailable (optional, never started - suppressing warning)"
+                    )
+                else:
+                    await self._coalescer.emit(
+                        component,
+                        NotificationLevel.WARNING,
+                        f"⚠️ {name} is unavailable",
+                    )
         elif new_state == ComponentState.FAILED:
             await self._coalescer.emit(
                 component,
