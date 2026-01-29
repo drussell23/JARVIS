@@ -16,7 +16,7 @@
 - **Troubleshooting issues?** → See [README_v2.md § Troubleshooting](./README_v2.md#troubleshooting)
 - **Understanding how repos work together?** → Continue reading below
 - **🆕 Startup architecture & v107.0 improvements?** → See [STARTUP_ARCHITECTURE_V2.md](./docs/STARTUP_ARCHITECTURE_V2.md)
-- **🆕 One-command supervisor, Cloud SQL fixes, or asyncpg TLS fix?** → See [§ v131.0 & v131.1](#v1310--v1311-one-command-supervisor-shutdown--start-january-2026), [§ v116.0](#v1160-cloud-sql-credential--retry-fixes-january-2026), [§ TLS-Safe Connections](#asyncpg-tls-invalidstateerror-fix-tls-safe-connection-factories-january-2026) below
+- **🆕 One-command supervisor, Cloud SQL, asyncpg TLS, Trinity, or Cloud ECAPA?** → See [§ v131.0 & v131.1](#v1310--v1311-one-command-supervisor-shutdown--start-january-2026), [§ v116.0 Cloud SQL](#v1160-cloud-sql-credential--retry-fixes-january-2026), [§ TLS-Safe Connections](#asyncpg-tls-invalidstateerror-fix-tls-safe-connection-factories-january-2026), [§ v117.5 Trinity](#v1175-trinity-startup-orchestration-persistent-state--distributed-lock-january-2026), [§ v132.0/v132.1](#v1320-parallel-trinity-initialization-january-2026), [§ v116.0 Cloud ECAPA](#v1160-cloud-ecapa-endpoint-priority-fix-january-2026) below
 
 ---
 
@@ -30,8 +30,9 @@
 ✅ One-Command Startup:   python3 run_supervisor.py
 ✅ One-Command Restart:   Same command = shutdown (if running) then start fresh (v131.0/v131.1)
 ✅ Trinity Coordination:  JARVIS + J-Prime + Reactor-Core
-✅ Timeout Protection:   All 107 phases have timeout guards
-✅ Graceful Degradation:  Startup continues even if phases fail
+✅ Trinity v117.5:        Persistent state, distributed lock, service adoption, unified health
+✅ Trinity v132.0/v132.1: Parallel init + fire-and-forget voice (no 15s block)
+✅ Cloud ECAPA v116.0:    Cloud Run checked first for speaker embeddings (no 120s timeout)
 ✅ Cloud SQL Robustness:  No false "max retries" or credential misclassification (v116.0)
 ✅ TLS-Safe DB Connections: asyncpg InvalidStateError fixed via serialized handshakes
 ✅ Zero Workarounds:      ROOT CAUSE fixed, no hacks
@@ -418,6 +419,104 @@ pool = await tls_safe_create_pool(
 ```
 
 Running `python3 run_supervisor.py` now brings up all database-dependent components without TLS races; connections are serialized at the TLS layer across the JARVIS ecosystem.
+
+---
+
+## v117.5: Trinity Startup Orchestration (Persistent State & Distributed Lock) (January 2026)
+
+**Major Achievement:** Trinity (JARVIS + J-Prime + Reactor-Core) startup is now robust across restarts, with persistent state, distributed locking, intelligent service adoption, and unified health aggregation. No hardcoded timeouts; all timing comes from `TrinityOrchestrationConfig`.
+
+### Task Summary
+
+| Task | Description |
+|------|-------------|
+| **1. CrossRepoStateManager** | Persistent service state at `~/.jarvis/trinity/state/services.json`. Atomic writes (temp file + rename). Tracks per service: `pid`, `port`, `status`, `updated_at`, `supervisor_pid`. 24-hour expiry for stale state. |
+| **2. Trinity verification timeout** | Component-specific timeouts from config; adaptive timeout extension when progress is detected so startup doesn’t fail during slow-but-active init. |
+| **3. Distributed startup lock** | Prevents concurrent supervisors from starting at once. Correct async context manager (`__aenter__`/`__aexit__`). Lock released on startup completion; state file used for stale lock detection. |
+| **4. Intelligent service adoption** | Before spawning a Trinity component, the system checks persistent state, then `GlobalProcessRegistry`, then service registry, then HTTP probe. If a service is already running (e.g. from a previous run), it is **adopted** instead of respawned. State is persisted when services start successfully. Works across full supervisor restarts, not only SIGHUP. |
+| **5. Unified Trinity health aggregator** | Health state is persisted immediately after each check. Dual writes: `~/.jarvis/trinity/health_status.json` (original) and `~/.jarvis/trinity/state/health.json` (shared cross-repo). Source repo is recorded for cross-repo sync. |
+
+### Benefits
+
+- **No hardcoded timeouts** – All from `TrinityOrchestrationConfig`.
+- **Persistent state** – Services can be adopted after supervisor restarts.
+- **Distributed locking** – Only one supervisor drives Trinity startup at a time.
+- **Cross-repo visibility** – Unified health in a shared state directory for all repos.
+
+---
+
+## v132.0: Parallel Trinity Initialization (January 2026)
+
+**Major Achievement:** Trinity initialization runs more work in **parallel** instead of purely sequential, so startup is faster while dependencies are still respected.
+
+### What Runs in Parallel
+
+| Layer | Description |
+|-------|-------------|
+| **Heartbeat checks** | Trinity component liveness checks run in parallel. |
+| **6 Trinity subsystems** | Six subsystems start in parallel (e.g. coordination, health, adoption). |
+| **4 core systems** | Four core systems run in parallel where safe. |
+| **11 non-critical phases** | Non-critical startup phases run in parallel. |
+
+Critical phases that depend on each other still run **sequentially** so ordering and dependencies are preserved.
+
+### Result
+
+Startup completes sooner because independent work is not serialized. Logs show lines such as:
+
+```
+[v132.0] Running 6 Trinity subsystems in PARALLEL
+```
+
+---
+
+## v132.1: Fire-and-Forget Voice Announcement (January 2026)
+
+**Major Achievement:** The Trinity status line prints **immediately**; the voice announcement no longer blocks startup. Previously, a 15-second timeout could block while waiting for the voice subsystem.
+
+### What Changed
+
+| Before v132.1 | After v132.1 |
+|---------------|--------------|
+| Status print waited for voice announcement | Status prints **instantly** (e.g. `✓ PROJECT TRINITY: Full distributed mode (3/3 components)`). |
+| Voice announcement could block up to 15s | Voice runs in a **background task**; startup continues without waiting. |
+| Log: `[v132.0] Trinity announcement timed out after 15.0s - continuing` | No timeout message; initialization proceeds right away. |
+
+### Implementation
+
+- The Trinity status line is printed as soon as the state is known.
+- The voice announcement is scheduled as a fire-and-forget background task.
+- Parallel Trinity subsystems (v132.0) start immediately after the status line.
+
+Startup is faster and no longer blocked by voice; the announcement plays in the background while the rest of initialization continues.
+
+---
+
+## v116.0: Cloud ECAPA Endpoint Priority Fix (January 2026)
+
+**Major Achievement:** Speaker verification (ECAPA-TDNN embeddings) now correctly uses the **Cloud Run** ECAPA endpoint first. Local J-Prime (:8000) and Reactor-Core (:8090) do not expose the ECAPA API; only Cloud Run does. Prioritizing local endpoints first caused 120+ second timeouts waiting for ECAPA on endpoints that never provide it.
+
+### Root Cause
+
+In `ml_engine_registry.py`, the v113.1 logic checked **local** endpoints (J-Prime, Reactor-Core) before Cloud Run. For ECAPA speaker embeddings, that was wrong: Cloud Run is the **only** place that serves the ECAPA API. The registry treated Cloud Run as a "last resort," so the system often waited on local endpoints until timeout.
+
+### Fixes Applied
+
+| Change | Description |
+|--------|-------------|
+| **`.env.gcp` – Cloud Run URL** | Corrected the Cloud Run base URL from `https://jarvis-ml-jarvis-473803.us-central1.run.app/api/ml` (wrong) to `https://jarvis-ml-888774109345.us-central1.run.app` (correct). |
+| **`ml_engine_registry.py` – v116.0 endpoint priority** | For ECAPA, Cloud Run is now checked **first** (since it is the only endpoint with the ECAPA API). Local endpoints are only used as fallback and do not provide ECAPA. |
+
+### Result
+
+- Logs show correct behavior, e.g.:
+  - `☁️ [v116.0] Cloud Run endpoint for ECAPA: https://jarvis-ml-888774109345.us-central1.run.app`
+  - `✅ Found ready endpoint: https://jarvis-ml-888774109345.us-central1.run.app`
+  - `✅ Cloud ECAPA ready on first check! Source: speechbrain, Startup: 11792ms`
+  - `✅ [ENSURE_ECAPA] Cloud mode active and verified`
+  - `✅ Speaker Verification Service ready - 1 profiles loaded (ECAPA ready)`
+- Voice biometrics use Cloud Run for ECAPA speaker embeddings without the previous 120+ second timeout.
+- Health checks confirm Cloud Run ECAPA: `ecapa_ready: true`, `startup_state: "ready"`, startup duration ~12s when using the correct endpoint.
 
 ---
 
