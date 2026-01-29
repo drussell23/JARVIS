@@ -5081,17 +5081,20 @@ async def health_ready():
         )
         
         manager = get_readiness_manager("jarvis-body")
-        
-        if manager and manager.state.phase == InitializationPhase.READY:
+
+        # v123.5: Check is_ready property which handles READY, HEALTHY, and DEGRADED phases
+        if manager and manager.state.is_ready:
             # Fast path: Manager says we're ready
             probe = manager.handle_probe(ProbeType.READINESS)
             
             # Get component status for details
+            # v123.5: Fixed attribute names to match ComponentReadiness dataclass
             component_status = {}
             for name, comp in manager.state.components.items():
                 component_status[name] = {
-                    "healthy": comp.healthy,
-                    "progress": comp.progress,
+                    "healthy": comp.is_healthy,
+                    "ready": comp.is_ready,
+                    "progress": comp.progress_percent,
                     "category": comp.category.value if comp.category else "unknown",
                 }
             
@@ -5107,7 +5110,7 @@ async def health_ready():
                     "manager_phase": manager.state.phase.value,
                     "components": component_status,
                     "event_loop": True,
-                    "manager_healthy": manager.is_healthy(),
+                    "manager_healthy": manager.is_healthy,  # v123.5: is_healthy is a property, not a method
                 },
                 "services": {
                     "ready": list(manager.state.components.keys()),
