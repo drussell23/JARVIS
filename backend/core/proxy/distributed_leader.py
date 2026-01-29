@@ -52,7 +52,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +183,10 @@ class LeaderIdentity:
     def id_string(self) -> str:
         """Get compact ID string."""
         return f"{self.hostname}:{self.pid}:{int(self.start_time)}:{self.instance_uuid}"
+
+    def to_string(self) -> str:
+        """Get compact ID string (alias for id_string for orchestrator compatibility)."""
+        return self.id_string
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -911,6 +915,69 @@ class DistributedProxyLeader:
         await self._transition_to(LeaderState.SHUTDOWN)
         logger.info("[Leader] Shutdown complete")
 
+    # Alias for orchestrator compatibility
+    async def stop(self) -> None:
+        """Stop the leader election system (alias for shutdown)."""
+        await self.shutdown()
+
+    # -------------------------------------------------------------------------
+    # Orchestrator Integration
+    # -------------------------------------------------------------------------
+
+    async def start(self) -> bool:
+        """
+        Start the leader election and background tasks.
+
+        This is the main entry point used by the orchestrator.
+
+        Returns:
+            True if startup succeeded
+        """
+        try:
+            await self._ensure_locks()
+            self._is_running = True
+
+            # Run election
+            outcome = await self.run_election()
+
+            if outcome.result == ElectionResult.WON:
+                # Start heartbeat for leader
+                await self.start_heartbeat()
+                return True
+
+            elif outcome.result == ElectionResult.EXISTING_LEADER:
+                # Start monitor for follower
+                await self.start_leader_monitor()
+                return True
+
+            else:
+                # Election failed
+                logger.warning(f"[Leader] Election failed: {outcome.result.value}")
+                return False
+
+        except Exception as e:
+            logger.error(f"[Leader] Start failed: {e}")
+            return False
+
+    def add_state_callback(
+        self,
+        callback: Callable[[LeaderState], Any]
+    ) -> None:
+        """
+        Add a callback to be notified of state changes.
+
+        The callback receives the new state (not old state like subscribe).
+        This is for orchestrator compatibility.
+
+        Args:
+            callback: Function to call with new state
+        """
+        # Wrap to adapt from (old, new) to just (new)
+        def wrapper(old: LeaderState, new: LeaderState) -> Any:
+            return callback(new)
+
+        self.subscribe(wrapper)
+
     # -------------------------------------------------------------------------
     # Status and Debugging
     # -------------------------------------------------------------------------
@@ -971,3 +1038,27 @@ async def run_leader_election(
     """
     leader = get_distributed_leader(repo_name=repo_name)
     return await leader.run_election()
+
+
+async def create_proxy_leader(
+    repo_name: Optional[str] = None,
+    config: Optional[LeaderElectionConfig] = None,
+) -> DistributedProxyLeader:
+    """
+    Factory function to create and initialize a proxy leader.
+
+    This is the recommended way to create a leader instance for the orchestrator.
+
+    Args:
+        repo_name: Name of this repository (jarvis, prime, reactor)
+        config: Optional custom configuration
+
+    Returns:
+        Initialized DistributedProxyLeader instance
+    """
+    leader = DistributedProxyLeader(config=config, repo_name=repo_name)
+    return leader
+
+
+# Type alias for state change callbacks
+LeaderStateCallback = Callable[[LeaderState], Awaitable[None]]
