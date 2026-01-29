@@ -183,6 +183,196 @@ class AsyncLock:
         return False
 
 
+class AsyncEvent:
+    """
+    v117.0: Thread-safe event that works in both sync and async contexts.
+
+    This is a drop-in replacement for asyncio.Event() that can be safely
+    instantiated in any thread (including background threads without event loops).
+
+    The asyncio.Event is lazily created on first use in an async context,
+    while a threading.Event provides immediate sync functionality.
+
+    Usage:
+        # Safe to create anywhere (even in threads without event loops)
+        event = AsyncEvent()
+
+        # Sync usage (works immediately)
+        event.set_sync()
+        if event.is_set_sync():
+            ...
+
+        # Async usage (works when event loop is available)
+        await event.wait()
+        event.set()
+    """
+
+    def __init__(self):
+        self._thread_event = threading.Event()
+        self._async_event: Optional[asyncio.Event] = None
+        self._creation_lock = threading.Lock()
+
+    def _get_async_event(self) -> Optional[asyncio.Event]:
+        """Lazily create async event (must be called from async context)."""
+        if self._async_event is None:
+            with self._creation_lock:
+                if self._async_event is None:
+                    try:
+                        # Only create if we're in an event loop
+                        asyncio.get_running_loop()
+                        self._async_event = asyncio.Event()
+                        # Sync state from thread event
+                        if self._thread_event.is_set():
+                            self._async_event.set()
+                    except RuntimeError:
+                        # No running event loop - this is fine
+                        pass
+        return self._async_event
+
+    # =========== Sync interface (always works) ===========
+
+    def set_sync(self) -> None:
+        """Set the event (sync version - always works)."""
+        self._thread_event.set()
+        # Also set async event if it exists
+        if self._async_event is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(self._async_event.set)
+            except RuntimeError:
+                pass
+
+    def clear_sync(self) -> None:
+        """Clear the event (sync version - always works)."""
+        self._thread_event.clear()
+        if self._async_event is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(self._async_event.clear)
+            except RuntimeError:
+                pass
+
+    def is_set_sync(self) -> bool:
+        """Check if event is set (sync version - always works)."""
+        return self._thread_event.is_set()
+
+    def wait_sync(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the event (sync version - always works)."""
+        return self._thread_event.wait(timeout=timeout)
+
+    # =========== Async interface (requires event loop) ===========
+
+    def set(self) -> None:
+        """Set the event (works in any context)."""
+        self._thread_event.set()
+        async_event = self._get_async_event()
+        if async_event is not None:
+            async_event.set()
+
+    def clear(self) -> None:
+        """Clear the event (works in any context)."""
+        self._thread_event.clear()
+        async_event = self._get_async_event()
+        if async_event is not None:
+            async_event.clear()
+
+    def is_set(self) -> bool:
+        """Check if event is set (works in any context)."""
+        return self._thread_event.is_set()
+
+    async def wait(self) -> bool:
+        """Wait for the event (async version)."""
+        # Try async event first
+        async_event = self._get_async_event()
+        if async_event is not None:
+            await async_event.wait()
+            return True
+        else:
+            # Fallback to polling thread event
+            while not self._thread_event.is_set():
+                await asyncio.sleep(0.01)
+            return True
+
+
+def get_or_create_event_loop_safe() -> asyncio.AbstractEventLoop:
+    """
+    v117.0: Safely get or create an event loop for the current thread.
+
+    This function handles the common case where code runs in a background
+    thread (e.g., ThreadPoolExecutor) that doesn't have an event loop.
+
+    Returns:
+        An event loop for the current thread (existing or newly created)
+    """
+    # First try to get the running loop (Python 3.10+ way)
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    # Try to get existing event loop
+    try:
+        loop = asyncio.get_event_loop()
+        if not loop.is_closed():
+            return loop
+    except RuntimeError:
+        pass
+
+    # Create new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop
+
+
+def run_coroutine_threadsafe_with_result(
+    coro,
+    timeout: Optional[float] = None,
+) -> Any:
+    """
+    v117.0: Run a coroutine from a sync context in any thread.
+
+    This handles the case where you need to call async code from sync code
+    running in a thread that may or may not have an event loop.
+
+    Args:
+        coro: The coroutine to run
+        timeout: Optional timeout in seconds
+
+    Returns:
+        The result of the coroutine
+
+    Example:
+        def sync_function():
+            # This works even in background threads
+            result = run_coroutine_threadsafe_with_result(
+                some_async_function(),
+                timeout=30
+            )
+            return result
+    """
+    try:
+        # Check if we're in an async context
+        loop = asyncio.get_running_loop()
+        # We're in an async context - can't block
+        raise RuntimeError(
+            "Cannot call run_coroutine_threadsafe_with_result from async context. "
+            "Use 'await' instead."
+        )
+    except RuntimeError:
+        pass
+
+    # Create or get event loop for this thread
+    loop = get_or_create_event_loop_safe()
+
+    # Run the coroutine
+    try:
+        return loop.run_until_complete(
+            asyncio.wait_for(coro, timeout=timeout) if timeout else coro
+        )
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"Coroutine timed out after {timeout}s")
+
+
 @dataclass
 class WarningRule:
     """

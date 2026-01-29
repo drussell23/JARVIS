@@ -1618,8 +1618,9 @@ class GlobalShutdownSignal:
         self._completed_event: Optional[asyncio.Event] = None
 
         # Callbacks to notify on shutdown
-        self._callbacks: List[Callable[[], Any]] = []
-        self._async_callbacks: List[Callable[[], Coroutine[Any, Any, None]]] = []
+        # v117.0: Store as (name, callback) tuples for better observability
+        self._callbacks: List[Tuple[Optional[str], Callable[[], Any]]] = []
+        self._async_callbacks: List[Tuple[Optional[str], Callable[[], Coroutine[Any, Any, None]]]] = []
 
         # Thread-safe lock for state changes
         self._state_lock = threading.RLock()
@@ -1729,32 +1730,40 @@ class GlobalShutdownSignal:
                 self._async_event.set()
 
             # Execute sync callbacks
-            for callback in self._callbacks:
+            # v117.0: Log callback names for observability
+            for name, callback in self._callbacks:
                 try:
+                    cb_name = name or "anonymous"
+                    logger.debug(f"[v117.0] Executing shutdown callback: {cb_name}")
                     callback()
                 except Exception as e:
-                    logger.warning(f"[v95.13] Shutdown callback error: {e}")
+                    cb_name = name or "anonymous"
+                    logger.warning(f"[v117.0] Shutdown callback error ({cb_name}): {e}")
 
             # Schedule async callbacks if event loop is running
+            # v117.0: Unpack (name, callback) tuples
             try:
                 loop = asyncio.get_running_loop()
-                for async_callback in self._async_callbacks:
-                    loop.create_task(self._run_async_callback(async_callback))
+                for name, async_callback in self._async_callbacks:
+                    loop.create_task(self._run_async_callback(name, async_callback))
             except RuntimeError:
                 # No running event loop
                 pass
 
     async def _run_async_callback(
         self,
+        name: Optional[str],
         callback: Callable[[], Coroutine[Any, Any, None]],
     ) -> None:
         """Run an async callback with error handling."""
+        cb_name = name or "anonymous"
         try:
+            logger.debug(f"[v117.0] Executing async shutdown callback: {cb_name}")
             await asyncio.wait_for(callback(), timeout=5.0)
         except asyncio.TimeoutError:
-            logger.warning(f"[v95.13] Async shutdown callback timed out")
+            logger.warning(f"[v117.0] Async shutdown callback timed out ({cb_name})")
         except Exception as e:
-            logger.warning(f"[v95.13] Async shutdown callback error: {e}")
+            logger.warning(f"[v117.0] Async shutdown callback error ({cb_name}): {e}")
 
     def complete(self) -> None:
         """Mark shutdown as completed."""
@@ -1798,16 +1807,37 @@ class GlobalShutdownSignal:
 
             logger.debug("[v95.13] Global shutdown signal reset")
 
-    def register_callback(self, callback: Callable[[], Any]) -> None:
-        """Register a synchronous callback to be called when shutdown initiates."""
-        self._callbacks.append(callback)
+    def register_callback(
+        self,
+        callback: Callable[[], Any],
+        name: Optional[str] = None,
+    ) -> None:
+        """
+        Register a synchronous callback to be called when shutdown initiates.
+
+        Args:
+            callback: Synchronous function to call on shutdown
+            name: Optional name for logging/debugging (v117.0)
+        """
+        self._callbacks.append((name, callback))
+        if name:
+            logger.debug(f"[v117.0] Registered shutdown callback: {name}")
 
     def register_async_callback(
         self,
         callback: Callable[[], Coroutine[Any, Any, None]],
+        name: Optional[str] = None,
     ) -> None:
-        """Register an async callback to be called when shutdown initiates."""
-        self._async_callbacks.append(callback)
+        """
+        Register an async callback to be called when shutdown initiates.
+
+        Args:
+            callback: Async function to call on shutdown
+            name: Optional name for logging/debugging (v117.0)
+        """
+        self._async_callbacks.append((name, callback))
+        if name:
+            logger.debug(f"[v117.0] Registered async shutdown callback: {name}")
 
     async def wait(self, timeout: Optional[float] = None) -> bool:
         """
@@ -1859,6 +1889,10 @@ class GlobalShutdownSignal:
 
     def get_status(self) -> Dict[str, Any]:
         """Get current shutdown status."""
+        # v117.0: Include callback names for observability
+        callback_names = [name or "anonymous" for name, _ in self._callbacks]
+        async_callback_names = [name or "anonymous" for name, _ in self._async_callbacks]
+
         return {
             "initiated": self._initiated,
             "completed": self._completed,
@@ -1868,6 +1902,8 @@ class GlobalShutdownSignal:
             "initiator": self._initiator,
             "callbacks_registered": len(self._callbacks),
             "async_callbacks_registered": len(self._async_callbacks),
+            "callback_names": callback_names,
+            "async_callback_names": async_callback_names,
         }
 
 
@@ -1938,7 +1974,10 @@ def reset_global_shutdown() -> None:
     get_global_shutdown().reset()
 
 
-def register_shutdown_callback(callback: Callable[[], Any]) -> None:
+def register_shutdown_callback(
+    callback: Callable[[], Any],
+    name: Optional[str] = None,
+) -> None:
     """
     Register a callback to be called when shutdown initiates.
 
@@ -1947,20 +1986,23 @@ def register_shutdown_callback(callback: Callable[[], Any]) -> None:
 
     Args:
         callback: Synchronous function to call on shutdown
+        name: Optional name for logging/debugging (v117.0)
     """
-    get_global_shutdown().register_callback(callback)
+    get_global_shutdown().register_callback(callback, name=name)
 
 
 def register_async_shutdown_callback(
     callback: Callable[[], Coroutine[Any, Any, None]],
+    name: Optional[str] = None,
 ) -> None:
     """
     Register an async callback to be called when shutdown initiates.
 
     Args:
         callback: Async function to call on shutdown
+        name: Optional name for logging/debugging (v117.0)
     """
-    get_global_shutdown().register_async_callback(callback)
+    get_global_shutdown().register_async_callback(callback, name=name)
 
 
 async def wait_for_global_shutdown(timeout: Optional[float] = None) -> bool:

@@ -59,7 +59,7 @@ except ImportError:
     CHROMADB_AVAILABLE = False
     logging.warning("ChromaDB not available - install with: pip install chromadb")
 
-from backend.core.async_safety import LazyAsyncLock
+from backend.core.async_safety import LazyAsyncLock, LazyAsyncEvent
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,8 @@ class DatabaseCircuitBreaker:
         self._successes = 0
         self._state = "closed"
         self._last_failure_time = 0.0
-        self._lock = asyncio.Lock()
+        # v117.0: Use LazyAsyncLock - thread-safe, works in background threads without event loop
+        self._lock = LazyAsyncLock()
 
     @property
     def is_open(self) -> bool:
@@ -1493,7 +1494,8 @@ class DatabaseConnectionWrapper:
         self._in_transaction: bool = False
         self._transaction_savepoint: Optional[str] = None
         self._current_connection = None
-        self._connection_lock = asyncio.Lock()
+        # v117.0: Use LazyAsyncLock - thread-safe, works in background threads without event loop
+        self._connection_lock = LazyAsyncLock()
         self._closed: bool = False
 
     @property
@@ -2270,7 +2272,8 @@ class JARVISLearningDatabase:
         # Async SQLite connection (will be initialized in async context)
         # Type is Optional during __init__ but guaranteed non-None after initialize()
         self.db: Union[aiosqlite.Connection, "DatabaseConnectionWrapper", None] = None  # type: ignore[assignment]
-        self._db_lock = asyncio.Lock()
+        # v117.0: Use LazyAsyncLock - thread-safe, works in background threads without event loop
+        self._db_lock = LazyAsyncLock()
 
         # Adaptive caching
         self.pattern_cache = AdaptiveCache(self.cache_size, self.cache_ttl)
@@ -2290,7 +2293,8 @@ class JARVISLearningDatabase:
 
         # Background task management for clean shutdown
         self._background_tasks: List[asyncio.Task] = []
-        self._shutdown_event = asyncio.Event()
+        # v117.0: Use LazyAsyncEvent - thread-safe, works in background threads without event loop
+        self._shutdown_event = LazyAsyncEvent()
 
         # Performance metrics
         self.metrics = LearningMetrics(

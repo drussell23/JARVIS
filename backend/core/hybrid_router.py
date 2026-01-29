@@ -87,9 +87,13 @@ class HybridRouter:
     """
 
     def __init__(self, config: Dict):
-        self.config = config
-        self.routing_config = config["hybrid"]["routing"]
-        self.rules = self.routing_config.get("rules", [])
+        self.config = config or {}
+
+        # v117.0: Defensive config access - prevents KeyError: 'routing' in background threads
+        # This handles malformed or incomplete config during parallel initialization
+        hybrid_config = self.config.get("hybrid", {}) or {}
+        self.routing_config = hybrid_config.get("routing", {}) or {}
+        self.rules = self.routing_config.get("rules", []) or []
         self.strategy = self.routing_config.get("strategy", "capability_based")
 
         # Compile regex patterns for performance

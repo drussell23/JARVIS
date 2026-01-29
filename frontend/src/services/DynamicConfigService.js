@@ -533,18 +533,21 @@ class DynamicConfigService {
 
   async _discoverEndpoints(baseUrl) {
     const endpoints = {};
+    // v118.0: Use /status endpoints for WebSocket availability checks
+    // WebSocket paths (/ws, /voice/jarvis/stream, /vision/ws) only accept WebSocket
+    // connections, not HTTP HEAD requests. Use the dedicated status endpoints instead.
     const commonEndpoints = [
       { path: '/health', name: 'health' },
       { path: '/health/startup', name: 'startup' },
       { path: '/voice/jarvis/status', name: 'jarvis_status' },
-      { path: '/ws', name: 'websocket' },
-      { path: '/voice/jarvis/stream', name: 'voice_stream' },
-      { path: '/vision/ws', name: 'vision_websocket' }
+      { path: '/ws/status', name: 'websocket', actualPath: '/ws' },
+      { path: '/voice/jarvis/stream/status', name: 'voice_stream', actualPath: '/voice/jarvis/stream' },
+      { path: '/vision/ws/status', name: 'vision_websocket', actualPath: '/vision/ws' }
     ];
 
     // Quick parallel check with short timeout
     const results = await Promise.allSettled(
-      commonEndpoints.map(async ({ path, name }) => {
+      commonEndpoints.map(async ({ path, name, actualPath }) => {
         try {
           const { signal, clear } = createTimeoutController(500);
           const response = await fetch(`${baseUrl}${path}`, {
@@ -553,20 +556,24 @@ class DynamicConfigService {
             mode: 'cors'
           });
           clear();
-          
+
           if (response.ok || response.status === 405) {
-            return { name, path, available: true };
+            return { name, path, actualPath, available: true };
           }
         } catch {
           // Endpoint not available
         }
-        return { name, path, available: false };
+        return { name, path, actualPath, available: false };
       })
     );
 
     for (const result of results) {
       if (result.status === 'fulfilled' && result.value.available) {
-        endpoints[result.value.name] = { path: result.value.path };
+        // Use actualPath for WebSocket endpoints (the real connection path)
+        // Use path for HTTP endpoints
+        endpoints[result.value.name] = {
+          path: result.value.actualPath || result.value.path
+        };
       }
     }
 

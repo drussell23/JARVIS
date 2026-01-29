@@ -1199,34 +1199,127 @@ class LazyAsyncLock:
 
 class LazyAsyncEvent:
     """
-    Thread-safe lazy-initialized asyncio.Event.
+    v117.0: Thread-safe lazy-initialized asyncio.Event.
+
+    Solves the "no running event loop" error when creating events at module load
+    or in background threads. Uses threading.Event for immediate sync functionality
+    and lazily creates asyncio.Event when an event loop is available.
 
     Usage:
+        # At module level (safe!)
         _event = LazyAsyncEvent()
+
+        # Sync usage (works immediately in any thread)
+        _event.set_sync()
+        if _event.is_set_sync():
+            ...
 
         # In async function
         await _event.wait()
+
+    Advanced Features:
+    - Zero asyncio primitives created at import time
+    - Thread-safe double-checked locking pattern
+    - Per-event-loop isolation (prevents cross-loop issues)
+    - Sync methods work without event loop
+    - Automatic state sync between thread and async events
     """
 
     def __init__(self):
-        self._event: Optional[asyncio.Event] = None
+        import threading
+        self._async_event: Optional[asyncio.Event] = None
+        self._thread_event = threading.Event()  # Always works, no event loop needed
+        self._creation_guard = threading.Lock()  # Thread lock, not asyncio lock!
+        self._loop_id: Optional[int] = None  # Track which event loop owns the async event
 
-    def _get_event(self) -> asyncio.Event:
-        if self._event is None:
-            self._event = asyncio.Event()
-        return self._event
+    def _get_async_event(self) -> Optional[asyncio.Event]:
+        """
+        Get or create the underlying async event with double-checked locking.
+
+        Thread-safe and event-loop aware - creates a new event if the event loop changed.
+        Returns None if no event loop is available (sync-only mode).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            current_loop_id = id(loop)
+        except RuntimeError:
+            # No running loop - can't create async event, return None
+            return None
+
+        # Double-checked locking pattern
+        if self._async_event is None or self._loop_id != current_loop_id:
+            with self._creation_guard:
+                if self._async_event is None or self._loop_id != current_loop_id:
+                    self._async_event = asyncio.Event()
+                    self._loop_id = current_loop_id
+                    # Sync state from thread event
+                    if self._thread_event.is_set():
+                        self._async_event.set()
+
+        return self._async_event
+
+    # =========== Sync interface (always works in any thread) ===========
+
+    def set_sync(self) -> None:
+        """Set the event (sync version - always works in any thread)."""
+        self._thread_event.set()
+        # Also set async event if it exists and we're in an event loop
+        if self._async_event is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(self._async_event.set)
+            except RuntimeError:
+                pass
+
+    def clear_sync(self) -> None:
+        """Clear the event (sync version - always works in any thread)."""
+        self._thread_event.clear()
+        if self._async_event is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(self._async_event.clear)
+            except RuntimeError:
+                pass
+
+    def is_set_sync(self) -> bool:
+        """Check if event is set (sync version - always works in any thread)."""
+        return self._thread_event.is_set()
+
+    def wait_sync(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the event (sync version - always works in any thread)."""
+        return self._thread_event.wait(timeout=timeout)
+
+    # =========== Async-compatible interface ===========
 
     def set(self) -> None:
-        self._get_event().set()
+        """Set the event (works in any context)."""
+        self._thread_event.set()
+        async_event = self._get_async_event()
+        if async_event is not None:
+            async_event.set()
 
     def clear(self) -> None:
-        self._get_event().clear()
+        """Clear the event (works in any context)."""
+        self._thread_event.clear()
+        async_event = self._get_async_event()
+        if async_event is not None:
+            async_event.clear()
 
     def is_set(self) -> bool:
-        return self._get_event().is_set()
+        """Check if event is set (works in any context)."""
+        return self._thread_event.is_set()
 
     async def wait(self) -> bool:
-        return await self._get_event().wait()
+        """Wait for the event (async version)."""
+        async_event = self._get_async_event()
+        if async_event is not None:
+            await async_event.wait()
+            return True
+        else:
+            # Fallback to polling thread event (shouldn't happen in async context)
+            while not self._thread_event.is_set():
+                await asyncio.sleep(0.01)
+            return True
 
 
 # =============================================================================
