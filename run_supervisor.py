@@ -16167,58 +16167,46 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             components_online = 1 + (1 if jprime_online else 0) + (1 if reactor_online else 0)
 
             # v93.16: Enhanced Trinity voice announcements using the startup narrator
-            # v132.0: Wrapped with timeout protection
-            try:
-                async def _announce_trinity_status():
-                    """Voice announcement - can be slow, has its own timeout."""
-                    try:
-                        from backend.core.supervisor.startup_narrator import get_startup_narrator
-                        trinity_narrator = get_startup_narrator()
-
-                        if components_online == 3:
-                            self.logger.info("=" * 60)
-                            self.logger.info("PROJECT TRINITY: FULL DISTRIBUTED MODE")
-                            self.logger.info("   Mind ↔ Body ↔ Nerves: All connected")
-                            self.logger.info("=" * 60)
-                            print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: Full distributed mode (3/3 components){TerminalUI.RESET}")
-
-                            startup_duration = (time.time() - self._startup_time) if hasattr(self, '_startup_time') else None
-                            await trinity_narrator.announce_trinity_complete(
-                                mind_online=jprime_online,
-                                body_online=True,
-                                nerves_online=reactor_online,
-                                startup_duration=startup_duration,
-                            )
-                        else:
-                            status_parts = ["Body ✓"]
-                            if jprime_online:
-                                status_parts.append("Mind ✓")
-                            if reactor_online:
-                                status_parts.append("Nerves ✓")
-
-                            self.logger.info(f"   Trinity components: {', '.join(status_parts)}")
-                            print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: {components_online}/3 components online{TerminalUI.RESET}")
-
-                            await trinity_narrator.announce_trinity_complete(
-                                mind_online=jprime_online,
-                                body_online=True,
-                                nerves_online=reactor_online,
-                            )
-                    except Exception as narrator_err:
-                        self.logger.debug(f"Trinity narrator unavailable: {narrator_err}")
-                        if components_online == 3:
-                            await self.narrator.speak(
-                                "PROJECT TRINITY connected. Distributed cognitive architecture active.",
-                                wait=False,
-                            )
-
-                await asyncio.wait_for(_announce_trinity_status(), timeout=_voice_timeout)
-            except asyncio.TimeoutError:
-                self.logger.warning(f"[v132.0] Trinity announcement timed out after {_voice_timeout}s - continuing")
-                # Still print status even if voice timed out
+            # v132.1: Print status IMMEDIATELY (never blocks), voice runs in BACKGROUND
+            # Previously, waiting for voice could delay startup by 15+ seconds
+            if components_online == 3:
+                self.logger.info("=" * 60)
+                self.logger.info("PROJECT TRINITY: FULL DISTRIBUTED MODE")
+                self.logger.info("   Mind ↔ Body ↔ Nerves: All connected")
+                self.logger.info("=" * 60)
+                print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: Full distributed mode (3/3 components){TerminalUI.RESET}")
+            else:
+                status_parts = ["Body ✓"]
+                if jprime_online:
+                    status_parts.append("Mind ✓")
+                if reactor_online:
+                    status_parts.append("Nerves ✓")
+                self.logger.info(f"   Trinity components: {', '.join(status_parts)}")
                 print(f"  {TerminalUI.GREEN}✓ PROJECT TRINITY: {components_online}/3 components online{TerminalUI.RESET}")
-            except Exception as e:
-                self.logger.warning(f"[v132.0] Trinity announcement error: {e}")
+
+            # v132.1: Voice announcement runs as FIRE-AND-FORGET background task
+            # This ensures voice NEVER blocks startup - it plays asynchronously
+            async def _background_voice_announcement():
+                """Voice announcement - runs in background, doesn't block startup."""
+                try:
+                    from backend.core.supervisor.startup_narrator import get_startup_narrator
+                    trinity_narrator = get_startup_narrator()
+
+                    startup_duration = (time.time() - self._startup_time) if hasattr(self, '_startup_time') else None
+                    await trinity_narrator.announce_trinity_complete(
+                        mind_online=jprime_online,
+                        body_online=True,
+                        nerves_online=reactor_online,
+                        startup_duration=startup_duration,
+                    )
+                    self.logger.debug("[v132.1] Trinity voice announcement completed")
+                except asyncio.CancelledError:
+                    pass  # Ignore cancellation during shutdown
+                except Exception as e:
+                    self.logger.debug(f"[v132.1] Trinity voice announcement error (non-blocking): {e}")
+
+            # Fire and forget - don't await, just create the task
+            asyncio.create_task(_background_voice_announcement())
 
             # v132.0: Run independent sub-initializations in PARALLEL with individual timeouts
             # This is the key improvement - previously these ran sequentially causing timeouts
