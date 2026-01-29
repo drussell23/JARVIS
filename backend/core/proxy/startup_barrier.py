@@ -468,8 +468,13 @@ class VerificationPipeline:
         """
         Stage 3: Verify database authentication.
 
-        v117.1: Enhanced with fallback to 'postgres' database if specified database
-        doesn't exist. This ensures we can verify connectivity even during initial setup.
+        v117.2: Enhanced with robust multi-database fallback chain:
+        1. Specified database (self._db_name)
+        2. 'postgres' database (always exists in PostgreSQL)
+        3. 'template1' database (system template, always exists)
+
+        This ensures we can verify connectivity even during initial setup
+        or when the application database hasn't been created yet.
         """
         start_time = time.monotonic()
 
@@ -486,16 +491,22 @@ class VerificationPipeline:
                     metadata={"skipped": "asyncpg not installed, skipping auth verify"},
                 )
 
-            # v117.1: Try specified database first, fallback to 'postgres' if not found
+            # v117.2: Build comprehensive fallback chain
             databases_to_try = [self._db_name]
-            if self._db_name != "postgres":
-                databases_to_try.append("postgres")  # postgres always exists
+            for fallback_db in ["postgres", "template1"]:
+                if fallback_db not in databases_to_try:
+                    databases_to_try.append(fallback_db)
 
             last_error: Optional[Exception] = None
             successful_db: Optional[str] = None
+            attempt_results: List[str] = []  # Track what we tried
+
+            timeout_per_db = max(timeout / len(databases_to_try), 3.0)  # Min 3s per attempt
 
             for db_name in databases_to_try:
                 try:
+                    logger.info(f"[Verification] Attempting auth to database '{db_name}'...")
+
                     conn = await asyncio.wait_for(
                         asyncpg.connect(
                             host=self._host,
@@ -504,33 +515,57 @@ class VerificationPipeline:
                             user=self._db_user,
                             password=self._db_password,
                         ),
-                        timeout=timeout / len(databases_to_try)
+                        timeout=timeout_per_db
                     )
 
                     await conn.close()
                     successful_db = db_name
+                    attempt_results.append(f"{db_name}:SUCCESS")
 
-                    # If we had to fall back to 'postgres', log this
+                    # If we had to fall back, log this clearly
                     if db_name != self._db_name:
                         logger.warning(
-                            f"[Verification] Database '{self._db_name}' not found, "
-                            f"verified connectivity using '{db_name}' instead"
+                            f"[Verification] Database '{self._db_name}' not available, "
+                            f"verified connectivity using '{db_name}' instead. "
+                            f"You may need to create the database."
                         )
+                    else:
+                        logger.info(f"[Verification] Auth to '{db_name}' successful")
 
                     break  # Success!
 
                 except asyncio.TimeoutError:
                     last_error = asyncio.TimeoutError(f"Timeout connecting to {db_name}")
+                    attempt_results.append(f"{db_name}:TIMEOUT")
+                    logger.warning(f"[Verification] Timeout connecting to '{db_name}', trying next...")
+                    continue  # v117.2: Try next database on timeout
+
                 except Exception as e:
                     error_str = str(e)
-                    # Only try next database if this one doesn't exist
+                    attempt_results.append(f"{db_name}:{type(e).__name__}")
+
+                    # Check if database doesn't exist - try next fallback
                     if "does not exist" in error_str.lower():
-                        logger.debug(f"Database '{db_name}' does not exist, trying fallback...")
+                        logger.info(f"[Verification] Database '{db_name}' does not exist, trying fallback...")
                         last_error = e
                         continue
-                    # For other errors (auth, connection), don't fallback - report immediately
+
+                    # Check if permission denied - try next fallback
+                    if "permission denied" in error_str.lower():
+                        logger.info(f"[Verification] Permission denied for '{db_name}', trying fallback...")
+                        last_error = e
+                        continue
+
+                    # For auth errors, stop immediately - credentials are wrong
+                    if "password" in error_str.lower() or "authentication" in error_str.lower():
+                        logger.error(f"[Verification] Authentication failed for user '{self._db_user}': {e}")
+                        last_error = e
+                        break
+
+                    # For other errors, log and try next
+                    logger.warning(f"[Verification] Error connecting to '{db_name}': {e}, trying next...")
                     last_error = e
-                    break
+                    continue  # v117.2: Be more lenient - try all fallbacks
 
             if successful_db:
                 latency_ms = (time.monotonic() - start_time) * 1000
@@ -543,25 +578,44 @@ class VerificationPipeline:
                         "database": successful_db,
                         "requested_database": self._db_name,
                         "used_fallback": successful_db != self._db_name,
+                        "attempts": attempt_results,
                     },
                 )
             else:
-                # All attempts failed
+                # v117.2: All attempts failed - provide detailed diagnostics
                 error_str = str(last_error) if last_error else "Unknown error"
                 if "password" in error_str.lower() or "authentication" in error_str.lower():
                     error_type = "authentication_failed"
+                    suggestion = "Check JARVIS_DB_PASSWORD or database user credentials"
                 elif "does not exist" in error_str.lower():
-                    error_type = "database_not_found"
+                    error_type = "all_databases_unavailable"
+                    suggestion = "No database accessible. Create jarvis_db or grant access to postgres/template1"
                 elif isinstance(last_error, asyncio.TimeoutError):
                     error_type = "timeout"
+                    suggestion = "Check if Cloud SQL proxy is running and accessible"
+                elif "permission denied" in error_str.lower():
+                    error_type = "permission_denied"
+                    suggestion = "Grant CONNECT permission to the jarvis user on at least one database"
                 else:
                     error_type = "connection_error"
+                    suggestion = "Check network connectivity and proxy status"
+
+                # Log detailed diagnostic info
+                logger.error(
+                    f"[Verification] Auth failed after trying {len(databases_to_try)} databases: "
+                    f"{attempt_results}. Suggestion: {suggestion}"
+                )
 
                 result = VerificationResult(
                     stage=VerificationStage.AUTHENTICATION,
                     success=False,
                     latency_ms=(time.monotonic() - start_time) * 1000,
                     error=f"{error_type}: {last_error}",
+                    metadata={
+                        "attempts": attempt_results,
+                        "suggestion": suggestion,
+                        "databases_tried": databases_to_try,
+                    },
                 )
 
         except asyncio.TimeoutError:
@@ -611,17 +665,23 @@ class VerificationPipeline:
                     metadata={"skipped": "asyncpg not installed"},
                 )
 
-            # v117.1: Try specified database first, fallback to 'postgres' if not found
+            # v117.2: Build comprehensive fallback chain (same as verify_authentication)
             databases_to_try = [self._db_name]
-            if self._db_name != "postgres":
-                databases_to_try.append("postgres")
+            for fallback_db in ["postgres", "template1"]:
+                if fallback_db not in databases_to_try:
+                    databases_to_try.append(fallback_db)
 
             last_error: Optional[Exception] = None
             successful_db: Optional[str] = None
             query_latency: float = 0.0
+            attempt_results: List[str] = []
+
+            timeout_per_db = max(timeout / (2 * len(databases_to_try)), 2.0)  # Min 2s per attempt
 
             for db_name in databases_to_try:
                 try:
+                    logger.info(f"[Verification] Attempting query on database '{db_name}'...")
+
                     conn = await asyncio.wait_for(
                         asyncpg.connect(
                             host=self._host,
@@ -630,39 +690,64 @@ class VerificationPipeline:
                             user=self._db_user,
                             password=self._db_password,
                         ),
-                        timeout=timeout / (2 * len(databases_to_try))
+                        timeout=timeout_per_db
                     )
 
                     try:
                         query_start = time.monotonic()
                         result_row = await asyncio.wait_for(
                             conn.fetchval("SELECT 1"),
-                            timeout=timeout / (2 * len(databases_to_try))
+                            timeout=timeout_per_db
                         )
                         query_latency = (time.monotonic() - query_start) * 1000
 
                         if result_row == 1:
                             successful_db = db_name
+                            attempt_results.append(f"{db_name}:SUCCESS")
                             if db_name != self._db_name:
-                                logger.debug(
-                                    f"[Verification] Query verified using fallback database '{db_name}'"
+                                logger.warning(
+                                    f"[Verification] Query verified using fallback database '{db_name}'. "
+                                    f"Database '{self._db_name}' may need to be created."
                                 )
+                            else:
+                                logger.info(f"[Verification] Query on '{db_name}' successful")
                             break
                         else:
                             last_error = ValueError(f"Unexpected query result: {result_row}")
+                            attempt_results.append(f"{db_name}:UNEXPECTED_RESULT")
                     finally:
                         await conn.close()
 
                 except asyncio.TimeoutError:
                     last_error = asyncio.TimeoutError(f"Timeout connecting to {db_name}")
+                    attempt_results.append(f"{db_name}:TIMEOUT")
+                    logger.warning(f"[Verification] Timeout on '{db_name}', trying next...")
+                    continue  # v117.2: Try next on timeout
+
                 except Exception as e:
                     error_str = str(e)
+                    attempt_results.append(f"{db_name}:{type(e).__name__}")
+
                     if "does not exist" in error_str.lower():
-                        logger.debug(f"Database '{db_name}' does not exist for query test, trying fallback...")
+                        logger.info(f"[Verification] Database '{db_name}' does not exist, trying fallback...")
                         last_error = e
                         continue
+
+                    if "permission denied" in error_str.lower():
+                        logger.info(f"[Verification] Permission denied for '{db_name}', trying fallback...")
+                        last_error = e
+                        continue
+
+                    # Auth errors are fatal
+                    if "password" in error_str.lower() or "authentication" in error_str.lower():
+                        logger.error(f"[Verification] Query auth failed: {e}")
+                        last_error = e
+                        break
+
+                    # Other errors - try next fallback
+                    logger.warning(f"[Verification] Error on '{db_name}': {e}, trying next...")
                     last_error = e
-                    break
+                    continue
 
             if successful_db:
                 result = VerificationResult(
@@ -672,15 +757,27 @@ class VerificationPipeline:
                     metadata={
                         "query_latency_ms": round(query_latency, 2),
                         "database": successful_db,
+                        "requested_database": self._db_name,
                         "used_fallback": successful_db != self._db_name,
+                        "attempts": attempt_results,
                     },
                 )
             else:
+                # v117.2: Provide detailed failure info
+                error_str = str(last_error) if last_error else "Unknown error"
+                logger.error(
+                    f"[Verification] Query execution failed on all databases: {attempt_results}. "
+                    f"Last error: {error_str}"
+                )
                 result = VerificationResult(
                     stage=VerificationStage.QUERY_EXECUTION,
                     success=False,
                     latency_ms=(time.monotonic() - start_time) * 1000,
-                    error=str(last_error) if last_error else "Query execution failed",
+                    error=f"All databases failed: {error_str}",
+                    metadata={
+                        "attempts": attempt_results,
+                        "databases_tried": databases_to_try,
+                    },
                 )
 
         except asyncio.TimeoutError:
