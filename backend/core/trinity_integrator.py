@@ -10669,11 +10669,51 @@ class TrinityUnifiedOrchestrator:
         import aiohttp
         import random
 
+        # v117.0: Use unified TrinityOrchestrationConfig for component-specific timeouts
+        # This FIXES the critical issue where TrinityIntegrator used hardcoded 60s timeout
+        # while J-Prime needs 300s to load ML models
+        try:
+            from backend.core.trinity_orchestration_config import (
+                TrinityOrchestrationConfig,
+                ComponentType,
+            )
+            orchestration_config = TrinityOrchestrationConfig()
+
+            # Map component name to ComponentType
+            component_type_map = {
+                "jarvis_prime": ComponentType.JARVIS_PRIME,
+                "jarvis-prime": ComponentType.JARVIS_PRIME,
+                "reactor_core": ComponentType.REACTOR_CORE,
+                "reactor-core": ComponentType.REACTOR_CORE,
+                "jarvis_body": ComponentType.JARVIS_BODY,
+                "jarvis-body": ComponentType.JARVIS_BODY,
+            }
+
+            # Get component-specific profile
+            comp_type = component_type_map.get(component.lower().replace("-", "_"))
+            if comp_type:
+                profile = orchestration_config.get_profile(comp_type)
+                # Use component-specific startup timeout (J-Prime: 300s, Reactor: 120s)
+                default_timeout = profile.startup_timeout
+                default_grace = profile.startup_grace_period
+                logger.info(
+                    f"[Registration v117.0] Using component-specific timeout for {component}: "
+                    f"timeout={default_timeout}s, grace={default_grace}s"
+                )
+            else:
+                default_timeout = 60.0
+                default_grace = 10.0
+        except ImportError:
+            default_timeout = 60.0
+            default_grace = 10.0
+            logger.debug("[Registration v117.0] TrinityOrchestrationConfig not available, using defaults")
+
         config = ConfigRegistry()
-        timeout = timeout or config.get("TRINITY_REGISTRATION_TIMEOUT", 60.0)
+        # v117.0: Use component-specific timeout as default instead of hardcoded 60s
+        timeout = timeout or config.get("TRINITY_REGISTRATION_TIMEOUT", default_timeout)
         poll_interval = config.get("TRINITY_REGISTRATION_POLL_INTERVAL", 0.5)
         require_explicit_default = config.get("TRINITY_REGISTRATION_REQUIRE_EXPLICIT", True)
-        grace_period = config.get("TRINITY_REGISTRATION_GRACE_PERIOD", 10.0)  # v95.12: Increased from 5s
+        grace_period = config.get("TRINITY_REGISTRATION_GRACE_PERIOD", default_grace)
         backoff_multiplier = config.get("TRINITY_REGISTRATION_RETRY_BACKOFF", 1.5)
         max_retries = config.get("TRINITY_REGISTRATION_MAX_RETRIES", 10)
 
@@ -10928,6 +10968,9 @@ class TrinityUnifiedOrchestrator:
                                     try:
                                         health_data = await resp.json()
 
+                                        # v117.0: Store health data for progress tracking
+                                        verification_result["last_health_data"] = health_data
+
                                         # Check for healthy status
                                         status = health_data.get("status", "")
                                         phase = health_data.get("phase", "")
@@ -11042,9 +11085,61 @@ class TrinityUnifiedOrchestrator:
             if current_retry >= max_retries:
                 current_interval = min(current_interval * backoff_multiplier, 10.0)
 
+            # v117.0: Adaptive timeout extension with progress detection
+            # If service is making progress (loading models), extend timeout dynamically
+            elapsed = time.time() - start_time
+            if http_discovered and verification_result.get("last_health_data"):
+                health_data = verification_result.get("last_health_data", {})
+                current_progress = health_data.get("startup_elapsed_seconds", 0)
+                current_step = health_data.get("details", {}).get("step_num", 0)
+                current_phase = health_data.get("phase", "unknown")
+
+                # Track progress for stuck detection
+                if "last_progress" not in verification_result:
+                    verification_result["last_progress"] = current_progress
+                    verification_result["last_progress_time"] = time.time()
+                    verification_result["progress_extensions"] = 0
+
+                last_progress = verification_result.get("last_progress", 0)
+                last_progress_time = verification_result.get("last_progress_time", start_time)
+
+                # Progress detected if elapsed time increased or step number increased
+                progress_made = (
+                    current_progress > last_progress + 1.0 or  # At least 1 second of model loading progress
+                    current_step > verification_result.get("last_step", 0)
+                )
+
+                if progress_made:
+                    verification_result["last_progress"] = current_progress
+                    verification_result["last_progress_time"] = time.time()
+                    verification_result["last_step"] = current_step
+
+                    # v117.0: Extend timeout if service is actively making progress
+                    # Max extension: 2x original timeout (e.g., 300s → 600s for J-Prime)
+                    max_timeout = timeout * 2
+                    time_since_last_progress = 0  # Just made progress
+
+                    if elapsed > timeout * 0.8 and verification_result.get("progress_extensions", 0) < 3:
+                        # Approaching timeout but making progress - extend
+                        extension = min(60.0, timeout * 0.25)  # 25% extension, max 60s
+                        timeout = min(timeout + extension, max_timeout)
+                        verification_result["progress_extensions"] = verification_result.get("progress_extensions", 0) + 1
+                        logger.info(
+                            f"[Registration v117.0] ⏱️  {component} making progress "
+                            f"(step={current_step}, elapsed={current_progress:.1f}s), "
+                            f"extending timeout to {timeout:.0f}s"
+                        )
+                else:
+                    # Check for stuck condition
+                    time_since_progress = time.time() - last_progress_time
+                    if time_since_progress > 30.0 and current_phase in ("loading_model", "initializing"):
+                        logger.warning(
+                            f"[Registration v117.0] ⚠️  {component} may be stuck "
+                            f"(no progress for {time_since_progress:.0f}s in phase '{current_phase}')"
+                        )
+
             # Log progress periodically
             if current_retry % 10 == 0:
-                elapsed = time.time() - start_time
                 logger.info(
                     f"[Registration] ⏳ {component} verification in progress "
                     f"({elapsed:.1f}s elapsed, {current_retry} checks, "

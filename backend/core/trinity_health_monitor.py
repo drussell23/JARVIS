@@ -532,6 +532,10 @@ class TrinityHealthMonitor:
             # Store snapshot
             self._latest_snapshot = snapshot
 
+            # v117.5: Persist health state immediately for cross-repo sync
+            # (in addition to periodic writes from _broadcast_loop)
+            await self._write_health_status()
+
             # Fire health change callbacks
             for callback in self._on_health_change:
                 try:
@@ -1054,31 +1058,52 @@ class TrinityHealthMonitor:
                 await asyncio.sleep(self.config.broadcast_interval_seconds)
 
     async def _write_health_status(self) -> None:
-        """Write current health status to file for other components to read."""
+        """
+        Write current health status to file for other components to read.
+
+        v117.5: Now writes to both:
+        1. ~/.jarvis/trinity/health_status.json (original location)
+        2. ~/.jarvis/trinity/state/health.json (shared cross-repo state directory)
+
+        This enables cross-repo health sync where any repo can read the
+        aggregated health state from the shared state directory.
+        """
         if not self._latest_snapshot:
             return
 
-        status_file = self.config.trinity_dir / "health_status.json"
+        health_data = self._latest_snapshot.to_dict()
 
-        try:
-            import tempfile
+        # v117.5: Add repo identifier for cross-repo sync
+        health_data["source_repo"] = "jarvis-body"
+        health_data["sync_version"] = "117.5"
 
-            # Atomic write
-            tmp_fd, tmp_name = tempfile.mkstemp(
-                dir=self.config.trinity_dir,
-                prefix=".health_status.",
-                suffix=".tmp"
-            )
+        status_files = [
+            self.config.trinity_dir / "health_status.json",  # Original
+            Path.home() / ".jarvis" / "trinity" / "state" / "health.json",  # Cross-repo
+        ]
 
-            with os.fdopen(tmp_fd, 'w') as tmp_file:
-                json.dump(self._latest_snapshot.to_dict(), tmp_file, indent=2)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
+        for status_file in status_files:
+            try:
+                import tempfile
 
-            os.replace(tmp_name, status_file)
+                status_file.parent.mkdir(parents=True, exist_ok=True)
 
-        except Exception as e:
-            self.log.debug(f"[TrinityHealthMonitor] Failed to write status file: {e}")
+                # Atomic write
+                tmp_fd, tmp_name = tempfile.mkstemp(
+                    dir=status_file.parent,
+                    prefix=".health_status.",
+                    suffix=".tmp"
+                )
+
+                with os.fdopen(tmp_fd, 'w') as tmp_file:
+                    json.dump(health_data, tmp_file, indent=2)
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+
+                os.replace(tmp_name, status_file)
+
+            except Exception as e:
+                self.log.debug(f"[TrinityHealthMonitor] Failed to write {status_file}: {e}")
 
 
 # =============================================================================

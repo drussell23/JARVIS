@@ -6664,6 +6664,65 @@ class ProcessOrchestrator:
 
             return self._http_session
 
+    async def _persist_service_state(
+        self,
+        service_name: str,
+        pid: int,
+        port: int,
+        status: str = "running"
+    ) -> None:
+        """
+        v117.5: Persist service state to file for cross-restart adoption.
+
+        This enables the supervisor to adopt previously running services
+        after a full process restart (not just SIGHUP restarts).
+
+        State is stored in ~/.jarvis/trinity/state/services.json with format:
+        {
+            "service_name": {
+                "pid": 12345,
+                "port": 8000,
+                "status": "running",
+                "updated_at": 1234567890.123
+            }
+        }
+
+        Args:
+            service_name: Name of the service
+            pid: Process ID
+            port: Port number
+            status: Service status (running, healthy, stopped)
+        """
+        try:
+            service_state_file = Path.home() / ".jarvis" / "trinity" / "state" / "services.json"
+            service_state_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Read existing state
+            existing_services: Dict[str, Any] = {}
+            if service_state_file.exists():
+                try:
+                    existing_services = json.loads(service_state_file.read_text())
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+            # Update with new service state
+            existing_services[service_name] = {
+                "pid": pid,
+                "port": port,
+                "status": status,
+                "updated_at": time.time(),
+                "supervisor_pid": os.getpid()
+            }
+
+            # Write atomically (write to temp, then rename)
+            temp_file = service_state_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(existing_services, indent=2))
+            temp_file.replace(service_state_file)
+
+            logger.debug(f"[v117.5] Persisted {service_name} state (PID: {pid}, Port: {port})")
+        except Exception as e:
+            logger.debug(f"[v117.5] Failed to persist {service_name} state: {e}")
+
     async def _traced_request(
         self,
         method: str,
@@ -12714,6 +12773,83 @@ echo "=== JARVIS Prime started ==="
                 # PHASE 3: Perform actual startup (semaphore held)
                 # ==============================================================
 
+                # v117.5: Step -1 - Check PERSISTENT STATE FILES for previously running services
+                # This enables service adoption across full supervisor restarts (not just SIGHUP)
+                # Services that were running before a crash/restart can be adopted instead of respawned
+                try:
+                    service_state_file = Path.home() / ".jarvis" / "trinity" / "state" / "services.json"
+                    if service_state_file.exists():
+                        persistent_services = json.loads(service_state_file.read_text())
+                        # Normalize service name for lookup (handle hyphens vs underscores)
+                        normalized_name = service_name.replace("-", "_")
+                        service_state = persistent_services.get(service_name) or persistent_services.get(normalized_name)
+
+                        if service_state and service_state.get("status") in ["running", "healthy"]:
+                            persisted_pid = service_state.get("pid", 0)
+                            persisted_port = service_state.get("port", 0)
+                            persisted_at = service_state.get("updated_at", 0)
+
+                            # Only consider services that were updated within last 24 hours
+                            if persisted_pid and persisted_port and (time.time() - persisted_at) < 86400:
+                                try:
+                                    os.kill(persisted_pid, 0)  # Check if process exists
+
+                                    # Process exists - verify it's actually responding
+                                    session = await self._get_http_session()
+                                    try:
+                                        async with session.get(
+                                            f"http://localhost:{persisted_port}{definition.health_endpoint}",
+                                            timeout=aiohttp.ClientTimeout(total=3.0)
+                                        ) as resp:
+                                            if resp.status == 200:
+                                                # Service is alive and healthy! Adopt it.
+                                                reason = f"ADOPTED from persistent state (PID: {persisted_pid}, Port: {persisted_port})"
+                                                logger.info(
+                                                    f"    [v117.5] ✅ {service_name} ADOPTED from persistent state "
+                                                    f"(PID {persisted_pid}, port {persisted_port}) - skipping spawn"
+                                                )
+
+                                                # Register in GlobalProcessRegistry for SIGHUP protection
+                                                try:
+                                                    from backend.core.supervisor_singleton import GlobalProcessRegistry
+                                                    GlobalProcessRegistry.register(
+                                                        pid=persisted_pid,
+                                                        component=f"{service_name} (adopted-persistent)",
+                                                        port=persisted_port
+                                                    )
+                                                except Exception:
+                                                    pass
+
+                                                # Register in service registry
+                                                if self.registry:
+                                                    try:
+                                                        await self.registry.register_service(
+                                                            service_name,
+                                                            pid=persisted_pid,
+                                                            port=persisted_port,
+                                                            host="localhost"
+                                                        )
+                                                    except Exception:
+                                                        pass
+
+                                                await self._end_span(service_span, status="success")
+                                                await self.publish_service_lifecycle_event(
+                                                    service_name, "ready",
+                                                    {"mode": "adopted_persistent", "port": persisted_port, "pid": persisted_pid}
+                                                )
+                                                return service_name, True, reason
+                                    except Exception as health_err:
+                                        logger.debug(
+                                            f"    [v117.5] Persistent {service_name} (PID {persisted_pid}) "
+                                            f"not responding: {health_err}"
+                                        )
+                                except OSError:
+                                    logger.debug(
+                                        f"    [v117.5] Persistent {service_name} (PID {persisted_pid}) is dead"
+                                    )
+                except Exception as e:
+                    logger.debug(f"[v117.5] Persistent state check failed: {e}")
+
                 # v117.0: Step 0 - Check if service was PRESERVED during restart
                 # If GlobalProcessRegistry has this service (preserved via os.execv restart),
                 # validate the process is still running and skip spawning.
@@ -12790,6 +12926,8 @@ echo "=== JARVIS Prime started ==="
                                     service_name, "ready",
                                     {"mode": "preserved", "port": preserved_port, "pid": int(pid)}
                                 )
+                                # v117.5: Persist state for future restarts
+                                await self._persist_service_state(service_name, int(pid), preserved_port, "running")
                                 return service_name, True, reason
 
                         except OSError:
@@ -12823,6 +12961,8 @@ echo "=== JARVIS Prime started ==="
                         # v95.5: Service already running, publish ready event
                         await self._end_span(service_span, status="success")
                         await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "existing"})
+                        # v117.5: Persist state for future restarts
+                        await self._persist_service_state(service_name, existing.pid, existing.port, "running")
                         return service_name, True, reason
 
                 # Step 2: HTTP probe using shared session
@@ -12878,6 +13018,8 @@ echo "=== JARVIS Prime started ==="
                     # v95.5: Publish ready event for Docker service
                     await self._end_span(service_span, status="success")
                     await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "docker"})
+                    # v117.5: Persist state for future restarts (PID 0 for Docker-managed)
+                    await self._persist_service_state(service_name, 0, managed.port, "running")
                     return service_name, True, f"Docker container ({docker_reason})"
 
                 # Step 4: Spawn local process
@@ -12926,6 +13068,9 @@ echo "=== JARVIS Prime started ==="
                     # v95.5: Publish ready event for local process
                     await self._end_span(service_span, status="success")
                     await self.publish_service_lifecycle_event(service_name, "ready", {"mode": "local"})
+                    # v117.5: Persist state for future restarts
+                    if managed.pid and managed.port:
+                        await self._persist_service_state(service_name, managed.pid, managed.port, "running")
                     return service_name, True, "local process"
                 else:
                     # v95.5: Publish failed event
@@ -13261,6 +13406,81 @@ echo "=== JARVIS Prime started ==="
         """
         self._running = True
 
+        # v117.0: Acquire distributed startup lock to prevent concurrent supervisor instances
+        # This solves race conditions where multiple supervisors try to start/adopt services
+        self._startup_lock_acquired = False
+        self._startup_lock_context = None
+        try:
+            from backend.core.distributed_lock_manager import get_lock_manager
+            lock_manager = await get_lock_manager()
+
+            # v117.0: Write startup state file for other potential supervisors to detect
+            startup_state_file = Path.home() / ".jarvis" / "trinity" / "state" / "orchestrator.json"
+            startup_state_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Check for existing startup state and verify if owner is still alive
+            if startup_state_file.exists():
+                try:
+                    existing_state = json.loads(startup_state_file.read_text())
+                    existing_pid = existing_state.get("pid", 0)
+                    if existing_pid and existing_pid != os.getpid():
+                        try:
+                            os.kill(existing_pid, 0)  # Check if process exists
+                            logger.warning(
+                                f"[v117.0] ⚠️ Another supervisor (PID {existing_pid}) may be running. "
+                                f"Will attempt lock acquisition..."
+                            )
+                        except OSError:
+                            # Process is dead - clean up stale state
+                            logger.info(f"[v117.0] Cleaning up stale orchestrator state (dead PID {existing_pid})")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # Write our startup state first
+            startup_state = {
+                "pid": os.getpid(),
+                "started_at": time.time(),
+                "status": "acquiring_lock",
+                "version": "117.0"
+            }
+            startup_state_file.write_text(json.dumps(startup_state, indent=2))
+
+            # Try to acquire startup lock with context manager
+            # Timeout: 30s (to wait for previous supervisor if needed)
+            # TTL: 600s (10 minutes - max expected startup time)
+            self._startup_lock_context = lock_manager.acquire(
+                "trinity_startup",
+                timeout=30.0,
+                ttl=600.0
+            )
+
+            # Enter the context manager manually so we can maintain the lock
+            # throughout the entire startup process
+            # v117.5: Use __aenter__ for async context managers (not __anext__)
+            self._startup_lock_acquired = await self._startup_lock_context.__aenter__()
+
+            if self._startup_lock_acquired:
+                logger.info("[v117.0] ✅ Startup lock acquired - proceeding with orchestration")
+                # Update state file
+                startup_state["status"] = "lock_acquired"
+                startup_state_file.write_text(json.dumps(startup_state, indent=2))
+            else:
+                logger.error("[v117.0] ❌ Could not acquire startup lock after 30s - another supervisor may be running")
+                startup_state["status"] = "lock_failed"
+                startup_state_file.write_text(json.dumps(startup_state, indent=2))
+                # v117.5: Return failure for all services when lock not acquired
+                return {"startup_lock": False, "jarvis-body": False}
+
+        except ImportError:
+            logger.debug("[v117.0] DistributedLockManager not available, proceeding without lock")
+        except StopAsyncIteration:
+            # Lock acquisition failed (context manager exhausted without yielding True)
+            logger.error("[v117.0] ❌ Lock acquisition failed - context manager exhausted")
+            # v117.5: Return failure for all services when lock failed
+            return {"startup_lock": False, "jarvis-body": False}
+        except Exception as e:
+            logger.warning(f"[v117.0] Startup lock acquisition failed: {e}, proceeding without lock")
+
         # v95.4: Initialize locks and set jarvis-body to starting status
         self._ensure_locks_initialized()
         self._jarvis_body_status = "starting"
@@ -13558,6 +13778,34 @@ echo "=== JARVIS Prime started ==="
             90 if healthy_count == total_count else 85,
             {"phase": "complete", "healthy_count": healthy_count, "total_count": total_count}
         )
+
+        # v117.0: Update orchestrator state file with completion status
+        try:
+            startup_state_file = Path.home() / ".jarvis" / "trinity" / "state" / "orchestrator.json"
+            if startup_state_file.exists():
+                orchestrator_state = {
+                    "pid": os.getpid(),
+                    "started_at": self._jarvis_body_startup_time or time.time(),
+                    "completed_at": time.time(),
+                    "status": "running" if healthy_count == total_count else "degraded",
+                    "healthy_count": healthy_count,
+                    "total_count": total_count,
+                    "services": results,
+                    "version": "117.0"
+                }
+                startup_state_file.write_text(json.dumps(orchestrator_state, indent=2))
+        except Exception as e:
+            logger.debug(f"[v117.0] Failed to update orchestrator state: {e}")
+
+        # v117.5: Release startup lock by properly exiting context manager
+        # Use __aexit__ for async context managers (not __anext__)
+        if hasattr(self, '_startup_lock_context') and self._startup_lock_context is not None:
+            try:
+                # Properly exit the async context manager
+                await self._startup_lock_context.__aexit__(None, None, None)
+                logger.info("[v117.5] ✅ Startup lock released")
+            except Exception as e:
+                logger.debug(f"[v117.5] Startup lock release note: {e}")
 
         return results
 

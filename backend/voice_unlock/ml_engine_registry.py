@@ -1762,41 +1762,44 @@ class MLEngineRegistry:
             except ImportError:
                 logger.debug("MemoryAwareStartup not available")
 
-            # Fallback: Intelligent Local Discovery & Cloud Fallback
-            # v113.1: Check for local cross-repo services (JARVIS-Prime, Reactor-Core) 
-            # instead of blindly using dead Cloud Run URL.
+            # v116.0 FIX: Cloud Run FIRST for ECAPA (local services don't have ECAPA API)
+            # ECAPA-TDNN speaker embedding is ONLY available on Cloud Run, NOT on JARVIS Prime or Reactor Core.
+            # The previous v113.1 logic was incorrect - preferring local endpoints that don't have ECAPA.
             if not self._cloud_endpoint or "None" in str(self._cloud_endpoint):
-                # 1. Check JARVIS-Prime (Port 8000)
-                try:
-                    import socket
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    result_8000 = sock.connect_ex(('127.0.0.1', 8000))
-                    sock.close()
-                    if result_8000 == 0:
-                        self._cloud_endpoint = "http://127.0.0.1:8000"
-                        logger.info(f"   ✨ Discovered local JARVIS-Prime at {self._cloud_endpoint}")
-                except Exception:
-                    pass
+                # 1. FIRST: Always try Cloud Run for ECAPA (it's the ONLY place with ECAPA API)
+                cloud_run_url = os.getenv(
+                    "ECAPA_CLOUD_RUN_URL",
+                    os.getenv(
+                        "JARVIS_CLOUD_ML_ENDPOINT",
+                        "https://jarvis-ml-888774109345.us-central1.run.app"
+                    )
+                )
+                if cloud_run_url:
+                    self._cloud_endpoint = cloud_run_url
+                    logger.info(f"   ☁️  [v116.0] Cloud Run endpoint for ECAPA: {self._cloud_endpoint}")
 
-                # 2. Check Reactor-Core (Port 8090) - Override Prime if available (specialized ML)
+                # 2. FALLBACK ONLY: Local services (but they don't have ECAPA, just general health)
+                # This is kept for completeness but won't be used for ECAPA operations
                 if not self._cloud_endpoint:
                     try:
+                        import socket
+                        # Check Reactor-Core first (specialized ML if available)
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         result_8090 = sock.connect_ex(('127.0.0.1', 8090))
                         sock.close()
                         if result_8090 == 0:
                             self._cloud_endpoint = "http://127.0.0.1:8090"
-                            logger.info(f"   ✨ Discovered local Reactor-Core at {self._cloud_endpoint}")
-                    except Exception:
-                        pass
-                
-                # 3. Last Resort: Cloud Run URL (only if needed)
-                if not self._cloud_endpoint:
-                    self._cloud_endpoint = os.getenv(
-                        "JARVIS_CLOUD_ML_ENDPOINT",
-                        "https://jarvis-ml-888774109345.us-central1.run.app"
-                    )
-                    logger.info(f"   Using cloud endpoint: {self._cloud_endpoint}")
+                            logger.warning(f"   ⚠️ Using local Reactor-Core at {self._cloud_endpoint} (no Cloud Run available)")
+                        else:
+                            # Check JARVIS-Prime
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            result_8000 = sock.connect_ex(('127.0.0.1', 8000))
+                            sock.close()
+                            if result_8000 == 0:
+                                self._cloud_endpoint = "http://127.0.0.1:8000"
+                                logger.warning(f"   ⚠️ Using local JARVIS-Prime at {self._cloud_endpoint} (no Cloud Run available)")
+                    except Exception as e:
+                        logger.debug(f"Local endpoint discovery failed: {e}")
 
             self._use_cloud = True
             logger.info("☁️  Cloud routing activated for ML operations")
@@ -1816,12 +1819,12 @@ class MLEngineRegistry:
         ecapa_wait_timeout: float = None
     ) -> Tuple[bool, str]:
         """
-        v115.0: ROBUST Cloud Backend Verification with Intelligent Polling.
+        v116.0: ROBUST Cloud Backend Verification with Intelligent Polling.
 
         CRITICAL: Verifies cloud endpoint works BEFORE marking registry as ready.
         Otherwise, voice unlock fails with 0% confidence.
 
-        ROOT CAUSE FIX v115.0:
+        ROOT CAUSE FIX v116.0 (fixes v115.0 endpoint priority bug):
         - Uses SHARED aiohttp session for all polling (prevents connection overhead)
         - Adaptive polling intervals (fast initially, slower as time passes)
         - Progressive diagnostics (more verbose logging as timeout approaches)
