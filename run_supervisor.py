@@ -25888,20 +25888,79 @@ async def main() -> int:
                     print(f"   ⚠️  Cannot reach existing supervisor via IPC.")
                     print(f"   It may be a zombie process. Attempting cleanup...")
 
-                    # Try force-stop
-                    result = await send_ipc_command('force-stop', timeout=2.0)
-                    await asyncio.sleep(2.0)
+                    # Try force-stop (may fail if no IPC server)
+                    try:
+                        result = await send_ipc_command('force-stop', timeout=2.0)
+                    except Exception as e:
+                        print(f"      IPC force-stop failed (expected for zombie): {e}")
+
+                    # v118.0: CRITICAL FIX - Force cleanup stale locks when IPC fails
+                    # This was missing and caused "Could not acquire supervisor lock" errors
+                    # when the existing supervisor was truly dead/zombie
+                    print(f"   Forcing stale lock cleanup...")
+                    try:
+                        _cleanup_result = await cleanup_stale_locks(force=True, timeout=10.0, cross_repo=True)
+                        if _cleanup_result.success:
+                            print(f"   ✓ Cleanup successful")
+                            if _cleanup_result.stale_pid:
+                                print(f"      - Cleaned stale PID: {_cleanup_result.stale_pid}")
+                            if _cleanup_result.cleaned_lock:
+                                print(f"      - Lock file cleaned")
+                            if _cleanup_result.cleaned_socket:
+                                print(f"      - IPC socket cleaned")
+                            if _cleanup_result.cleaned_state:
+                                print(f"      - State file cleaned")
+                        else:
+                            print(f"   ⚠️  Cleanup issue: {_cleanup_result.error or _cleanup_result.reason}")
+                    except Exception as cleanup_err:
+                        print(f"   ⚠️  Cleanup error: {cleanup_err}")
+
+                    await asyncio.sleep(1.0)  # Brief pause after cleanup
 
         # =====================================================================
         # Acquire lock and start new supervisor
         # =====================================================================
-        if not acquire_supervisor_lock("run_supervisor"):
-            # One more check - maybe previous instance just died
-            await asyncio.sleep(1.0)
-            if not acquire_supervisor_lock("run_supervisor"):
-                print("\n❌ Could not acquire supervisor lock. Another instance may be starting.")
-                print("   Try: python3 run_supervisor.py --force")
-                return 1
+        # v118.0: Robust lock acquisition with exponential backoff
+        lock_acquired = False
+        max_lock_attempts = 5
+        lock_backoff = 0.5
+
+        for attempt in range(max_lock_attempts):
+            if acquire_supervisor_lock("run_supervisor"):
+                lock_acquired = True
+                break
+
+            if attempt < max_lock_attempts - 1:
+                # Not last attempt - try cleanup and retry
+                if attempt == 0:
+                    print(f"\n   Lock acquisition attempt {attempt + 1}/{max_lock_attempts} failed, retrying...")
+                else:
+                    print(f"   Attempt {attempt + 1}/{max_lock_attempts} failed...")
+
+                # Progressive cleanup on each retry
+                try:
+                    _cleanup_result = await cleanup_stale_locks(
+                        force=(attempt >= 2),  # Force cleanup after 2 attempts
+                        timeout=5.0,
+                        cross_repo=(attempt >= 1)
+                    )
+                    if _cleanup_result.success and (
+                        _cleanup_result.cleaned_lock or
+                        _cleanup_result.cleaned_socket or
+                        _cleanup_result.cleaned_state
+                    ):
+                        print(f"      Cleaned stale resources, retrying...")
+                except Exception as e:
+                    print(f"      Cleanup warning: {e}")
+
+                await asyncio.sleep(lock_backoff)
+                lock_backoff = min(lock_backoff * 2, 5.0)  # Exponential backoff, max 5s
+
+        if not lock_acquired:
+            print("\n❌ Could not acquire supervisor lock after multiple attempts.")
+            print("   Another instance may be running or starting.")
+            print("   Try: python3 run_supervisor.py --force")
+            return 1
 
         # Start heartbeat to keep lock fresh
         await start_supervisor_heartbeat()

@@ -2048,6 +2048,22 @@ class SupervisorSingleton:
                     # Stale lock - force acquire with timeout
                     logger.warning(f"[Singleton] Taking over stale lock from {state.entry_point if state else 'unknown'}")
 
+                    # v118.0: Clean up stale IPC socket and state file FIRST
+                    # This prevents connection errors when trying to ping dead supervisors
+                    try:
+                        if SUPERVISOR_IPC_SOCKET.exists():
+                            SUPERVISOR_IPC_SOCKET.unlink()
+                            logger.debug("[Singleton] v118.0: Cleaned stale IPC socket")
+                    except Exception as e:
+                        logger.debug(f"[Singleton] v118.0: IPC socket cleanup: {e}")
+
+                    try:
+                        if SUPERVISOR_STATE_FILE.exists():
+                            SUPERVISOR_STATE_FILE.unlink()
+                            logger.debug("[Singleton] v118.0: Cleaned stale state file")
+                    except Exception as e:
+                        logger.debug(f"[Singleton] v118.0: State file cleanup: {e}")
+
                     if state and self._is_process_alive(state.pid):
                         # Try to terminate gracefully
                         try:
