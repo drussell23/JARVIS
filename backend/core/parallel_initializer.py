@@ -430,14 +430,26 @@ class ParallelInitializer:
                 # Run group in parallel
                 tasks = []
                 for comp in group:
-                    # Check dependencies
-                    deps_ready = all(
-                        self.components.get(d, ComponentInit(name=d)).phase == InitPhase.COMPLETE
-                        for d in comp.dependencies
-                    )
-                    if deps_ready:
+                    # v125.0: Enhanced dependency checking with failure propagation
+                    dep_status = self._check_dependency_status(comp)
+                    if dep_status == "ready":
                         tasks.append(self._init_component(comp.name))
+                    elif dep_status == "failed":
+                        # v125.0: Dependencies failed - skip this component immediately
+                        failed_deps = [
+                            d for d in comp.dependencies
+                            if self.components.get(d, ComponentInit(name=d)).phase
+                            in (InitPhase.FAILED, InitPhase.SKIPPED)
+                        ]
+                        logger.warning(
+                            f"⚠️ Skipping {comp.name} - dependency failure cascade: {failed_deps}"
+                        )
+                        await self._mark_skipped(
+                            comp.name,
+                            f"Dependency failure cascade ({', '.join(failed_deps)})"
+                        )
                     else:
+                        # Dependencies not ready yet (still running or pending)
                         logger.warning(f"Skipping {comp.name} - dependencies not ready: {comp.dependencies}")
                         await self._mark_skipped(comp.name, "Dependencies not ready")
 
@@ -446,6 +458,16 @@ class ParallelInitializer:
 
                 # Update progress
                 self._update_progress()
+
+                # v125.0: Check for infrastructure failure fast-forward
+                # If critical infrastructure components (cloud_sql_proxy, config) fail early,
+                # cascade-skip all remaining dependent components instead of waiting
+                if self._should_fast_forward_startup():
+                    logger.warning(
+                        "⚡ v125.0: Infrastructure failure detected - fast-forwarding startup"
+                    )
+                    await self._fast_forward_remaining_components()
+                    break
 
             # Check final state
             failed_critical = [
@@ -497,6 +519,118 @@ class ParallelInitializer:
                 groups[comp.priority] = []
             groups[comp.priority].append(comp)
         return groups
+
+    def _check_dependency_status(self, comp: ComponentInit) -> str:
+        """
+        v125.0: Check the status of component dependencies.
+
+        This enables intelligent dependency failure propagation:
+        - If ANY dependency has FAILED or SKIPPED, return "failed" to cascade skip
+        - If ALL dependencies are COMPLETE, return "ready" to proceed
+        - Otherwise return "not_ready" to wait
+
+        Args:
+            comp: The component to check dependencies for
+
+        Returns:
+            "ready": All dependencies complete, component can initialize
+            "failed": At least one dependency failed/skipped, component should skip
+            "not_ready": Dependencies still in progress, component should wait
+        """
+        if not comp.dependencies:
+            return "ready"
+
+        all_complete = True
+        any_failed = False
+
+        for dep_name in comp.dependencies:
+            dep_comp = self.components.get(dep_name)
+            if dep_comp is None:
+                # Unknown dependency - treat as complete (defensive)
+                logger.warning(f"[DependencyCheck] Unknown dependency '{dep_name}' for {comp.name}")
+                continue
+
+            if dep_comp.phase == InitPhase.COMPLETE:
+                continue
+            elif dep_comp.phase in (InitPhase.FAILED, InitPhase.SKIPPED):
+                any_failed = True
+                all_complete = False
+            else:
+                all_complete = False
+
+        if any_failed:
+            return "failed"
+        elif all_complete:
+            return "ready"
+        else:
+            return "not_ready"
+
+    def _should_fast_forward_startup(self) -> bool:
+        """
+        v125.0: Check if we should fast-forward startup due to infrastructure failure.
+
+        Infrastructure components are those that many other components depend on.
+        If they fail, waiting for dependent components is pointless - they will all
+        fail or skip anyway. Fast-forwarding saves time and prevents the 600s global
+        startup timeout from triggering.
+
+        Infrastructure components:
+        - cloud_sql_proxy: Database connectivity
+        - config: Configuration loading (actually handled separately)
+
+        Returns:
+            True if infrastructure failure detected and fast-forward is recommended
+        """
+        infrastructure_components = ["cloud_sql_proxy"]
+
+        for infra_name in infrastructure_components:
+            infra_comp = self.components.get(infra_name)
+            if infra_comp and infra_comp.phase in (InitPhase.FAILED, InitPhase.SKIPPED):
+                # Check if this component has dependents that are still pending
+                has_pending_dependents = False
+                for comp in self.components.values():
+                    if infra_name in comp.dependencies:
+                        if comp.phase == InitPhase.PENDING:
+                            has_pending_dependents = True
+                            break
+
+                if has_pending_dependents:
+                    logger.info(
+                        f"[v125.0] Infrastructure component '{infra_name}' failed with pending dependents"
+                    )
+                    return True
+
+        return False
+
+    async def _fast_forward_remaining_components(self):
+        """
+        v125.0: Fast-forward all remaining PENDING components to SKIPPED.
+
+        This is called when infrastructure failure is detected. Instead of waiting
+        for each component to timeout individually (which could take many minutes),
+        we immediately skip all PENDING components with a clear reason.
+
+        This prevents the 600s global startup timeout from triggering.
+        """
+        skipped_count = 0
+
+        for comp in self.components.values():
+            if comp.phase == InitPhase.PENDING:
+                await self._mark_skipped(
+                    comp.name,
+                    "Fast-forward skip (infrastructure failure)"
+                )
+                skipped_count += 1
+            elif comp.phase == InitPhase.RUNNING:
+                # Don't interrupt running components - let them timeout naturally
+                # or complete. The watchdog will handle stuck components.
+                logger.debug(f"[v125.0] Not skipping running component: {comp.name}")
+
+        if skipped_count > 0:
+            logger.warning(
+                f"⚡ v125.0: Fast-forward skipped {skipped_count} pending components"
+            )
+            self._update_progress()
 
     async def _stale_component_watchdog(self):
         """

@@ -72,6 +72,37 @@ class ProxyConfig:
         str(Path.home() / ".config/gcloud/application_default_credentials.json")
     )
 
+    # v125.0: Graceful degradation mode - allow startup without CloudSQL
+    OPTIONAL_MODE: Final[bool] = os.getenv("CLOUDSQL_OPTIONAL", "true").lower() == "true"
+    SKIP_IF_UNCONFIGURED: Final[bool] = os.getenv("CLOUDSQL_SKIP_IF_UNCONFIGURED", "true").lower() == "true"
+
+    @classmethod
+    def is_configured(cls) -> bool:
+        """v125.0: Check if CloudSQL is properly configured."""
+        has_connection_string = bool(cls.get_connection_string())
+        has_credentials = bool(cls.GCP_CREDENTIALS) and Path(cls.GCP_CREDENTIALS).exists()
+        has_binary = bool(cls.PROXY_BINARY) and Path(cls.PROXY_BINARY).exists()
+        return bool(has_connection_string and has_credentials and has_binary)
+
+    @classmethod
+    def get_configuration_issues(cls) -> List[str]:
+        """v125.0: Get list of configuration issues preventing CloudSQL startup."""
+        issues = []
+        if not cls.get_connection_string():
+            issues.append(
+                f"No connection string: Set GCP_PROJECT ('{cls.GCP_PROJECT}') and "
+                f"CLOUDSQL_INSTANCE_NAME ('{cls.GCP_INSTANCE}')"
+            )
+        if not cls.GCP_CREDENTIALS:
+            issues.append("No GOOGLE_APPLICATION_CREDENTIALS environment variable")
+        elif not Path(cls.GCP_CREDENTIALS).exists():
+            issues.append(f"Credentials file not found: {cls.GCP_CREDENTIALS}")
+        if not cls.PROXY_BINARY:
+            issues.append("No CLOUDSQL_PROXY_BINARY environment variable")
+        elif not Path(cls.PROXY_BINARY).exists():
+            issues.append(f"Proxy binary not found: {cls.PROXY_BINARY}")
+        return issues
+
     # State machine timeouts
     STARTUP_TIMEOUT: Final[float] = float(os.getenv("PROXY_STARTUP_TIMEOUT", "30.0"))
     VERIFICATION_TIMEOUT: Final[float] = float(os.getenv("PROXY_VERIFICATION_TIMEOUT", "15.0"))
@@ -1325,7 +1356,14 @@ class ProxyLifecycleController:
         await self._sleep_wake_detector.start(self._handle_wake)
 
     async def start(self) -> bool:
-        """Start the proxy and monitoring."""
+        """
+        Start the proxy and monitoring.
+
+        v125.0: Enhanced with graceful degradation support.
+        If CloudSQL is not configured and CLOUDSQL_OPTIONAL=true, the proxy
+        will transition to STOPPED (not DEAD) allowing the system to operate
+        without CloudSQL connectivity.
+        """
         logger.info("[LifecycleController] Starting proxy lifecycle...")
 
         # Ensure proper state
@@ -1340,6 +1378,38 @@ class ProxyLifecycleController:
             logger.warning(f"[LifecycleController] Cannot start from state {self._state.name}")
             return False
 
+        # v125.0: Check configuration before attempting start
+        if not ProxyConfig.is_configured():
+            issues = ProxyConfig.get_configuration_issues()
+            logger.warning(
+                f"[LifecycleController] v125.0: CloudSQL not properly configured:\n"
+                f"  - " + "\n  - ".join(issues)
+            )
+
+            if ProxyConfig.SKIP_IF_UNCONFIGURED:
+                logger.info(
+                    "[LifecycleController] v125.0: CLOUDSQL_SKIP_IF_UNCONFIGURED=true, "
+                    "operating without CloudSQL (graceful degradation)"
+                )
+                # Stay in STOPPED - not DEAD - to allow graceful degradation
+                if self._state != ProxyState.STOPPED:
+                    await self._transition_to(ProxyState.STOPPED, reason="unconfigured_graceful_skip")
+                return False  # Not started, but not a fatal error
+
+            if ProxyConfig.OPTIONAL_MODE:
+                logger.warning(
+                    "[LifecycleController] v125.0: CLOUDSQL_OPTIONAL=true, "
+                    "attempting start anyway but will gracefully degrade on failure"
+                )
+            else:
+                logger.error(
+                    "[LifecycleController] v125.0: CloudSQL required but not configured. "
+                    "Set CLOUDSQL_OPTIONAL=true or CLOUDSQL_SKIP_IF_UNCONFIGURED=true "
+                    "to allow startup without CloudSQL."
+                )
+                await self._transition_to(ProxyState.DEAD, reason="unconfigured_required")
+                return False
+
         # Transition to STARTING
         if self._state != ProxyState.STARTING:
             await self._transition_to(ProxyState.STARTING, reason="start_requested")
@@ -1348,7 +1418,15 @@ class ProxyLifecycleController:
         success = await self._start_proxy_process()
 
         if not success:
-            await self._transition_to(ProxyState.DEAD, reason="start_failed")
+            # v125.0: Graceful degradation - use STOPPED instead of DEAD if optional
+            if ProxyConfig.OPTIONAL_MODE:
+                logger.warning(
+                    "[LifecycleController] v125.0: Proxy start failed but CLOUDSQL_OPTIONAL=true, "
+                    "transitioning to STOPPED for graceful degradation"
+                )
+                await self._transition_to(ProxyState.STOPPED, reason="start_failed_optional")
+            else:
+                await self._transition_to(ProxyState.DEAD, reason="start_failed")
             return False
 
         # Transition to VERIFYING

@@ -63,6 +63,9 @@ class ComponentStatus(str, Enum):
     UNKNOWN = "unknown"          # Not yet checked
     STARTING = "starting"        # Component is initializing
     STOPPED = "stopped"          # Component intentionally stopped
+    # v125.0: New statuses for optional cross-repo components
+    UNAVAILABLE = "unavailable"  # Component not configured/installed (not an error)
+    OPTIONAL_OFFLINE = "optional_offline"  # Optional component offline (graceful degradation)
 
 
 class TrinityComponent(str, Enum):
@@ -108,6 +111,17 @@ class ComponentHealthStatus:
     def is_operational(self) -> bool:
         """Returns True if component is functional (healthy or degraded)."""
         return self.status in (ComponentStatus.HEALTHY, ComponentStatus.DEGRADED)
+
+    @property
+    def is_optional_offline(self) -> bool:
+        """v125.0: Returns True if component is optional and offline (not an error)."""
+        return self.status in (ComponentStatus.UNAVAILABLE, ComponentStatus.OPTIONAL_OFFLINE)
+
+    @property
+    def is_blocking_error(self) -> bool:
+        """v125.0: Returns True if component status represents a blocking error."""
+        # UNAVAILABLE and OPTIONAL_OFFLINE are NOT blocking errors
+        return self.status == ComponentStatus.UNHEALTHY
 
 
 @dataclass
@@ -621,6 +635,11 @@ class TrinityHealthMonitor:
 
         v108.0: Now uses component-specific thresholds and startup grace period awareness.
         J-Prime loads ML models and needs longer timeouts (300s startup, 120s stale threshold).
+
+        v125.0: Enhanced with graceful degradation for optional cross-repo components.
+        If J-Prime was never seen (no heartbeat file ever existed), it's marked
+        as OPTIONAL_OFFLINE instead of UNHEALTHY - this allows the system to operate
+        without J-Prime running.
         """
         status = ComponentHealthStatus(component=TrinityComponent.JARVIS_PRIME)
         checks = []
@@ -636,6 +655,9 @@ class TrinityHealthMonitor:
             self.config.trinity_dir / "heartbeats" / "jarvis_prime.json",
             self.config.trinity_dir / "heartbeats" / "j_prime.json",
         ]
+
+        # v125.0: Check if any heartbeat file has ever existed
+        any_file_exists = any(f.exists() for f in heartbeat_files)
 
         # v108.0: Pass component-specific threshold
         heartbeat_result = await self._check_heartbeat_file(
@@ -665,7 +687,16 @@ class TrinityHealthMonitor:
                     f"[TrinityHealthMonitor] J-Prime in startup grace period, "
                     f"not marking as unhealthy"
                 )
+            elif not any_file_exists:
+                # v125.0: No heartbeat file ever existed - component not configured/installed
+                status.status = ComponentStatus.OPTIONAL_OFFLINE
+                status.last_error = "J-Prime not running (optional cross-repo component)"
+                self.log.debug(
+                    f"[TrinityHealthMonitor] v125.0: J-Prime heartbeat never seen, "
+                    f"marking as OPTIONAL_OFFLINE for graceful degradation"
+                )
             else:
+                # v125.0: Heartbeat file existed but is now stale - actual failure
                 status.consecutive_failures += 1
                 status.last_error = heartbeat_result.error
                 status.status = ComponentStatus.UNHEALTHY
@@ -680,6 +711,11 @@ class TrinityHealthMonitor:
 
         v108.0: Now uses component-specific thresholds and startup grace period awareness.
         Reactor-Core has medium startup time (120s startup, 60s stale threshold).
+
+        v125.0: Enhanced with graceful degradation for optional cross-repo components.
+        If Reactor-Core was never seen (no heartbeat file ever existed), it's marked
+        as OPTIONAL_OFFLINE instead of UNHEALTHY - this allows the system to operate
+        without Reactor-Core running.
         """
         status = ComponentHealthStatus(component=TrinityComponent.REACTOR_CORE)
         checks = []
@@ -692,6 +728,9 @@ class TrinityHealthMonitor:
             self.config.trinity_dir / "components" / "reactor_core.json",
             self.config.trinity_dir / "heartbeats" / "reactor_core.json",
         ]
+
+        # v125.0: Check if any heartbeat file has ever existed
+        any_file_exists = any(f.exists() for f in heartbeat_files)
 
         # v108.0: Pass component-specific threshold
         heartbeat_result = await self._check_heartbeat_file(
@@ -721,7 +760,16 @@ class TrinityHealthMonitor:
                     f"[TrinityHealthMonitor] Reactor-Core in startup grace period, "
                     f"not marking as unhealthy"
                 )
+            elif not any_file_exists:
+                # v125.0: No heartbeat file ever existed - component not configured/installed
+                status.status = ComponentStatus.OPTIONAL_OFFLINE
+                status.last_error = "Reactor-Core not running (optional cross-repo component)"
+                self.log.debug(
+                    f"[TrinityHealthMonitor] v125.0: Reactor-Core heartbeat never seen, "
+                    f"marking as OPTIONAL_OFFLINE for graceful degradation"
+                )
             else:
+                # v125.0: Heartbeat file existed but is now stale - actual failure
                 status.consecutive_failures += 1
                 status.last_error = heartbeat_result.error
                 status.status = ComponentStatus.UNHEALTHY
@@ -736,6 +784,8 @@ class TrinityHealthMonitor:
 
         v108.0: Now uses component-specific thresholds and startup grace period awareness.
         Coding Council has fast startup (30s startup, 30s stale threshold).
+
+        v125.0: Enhanced with graceful degradation for optional cross-repo components.
         """
         status = ComponentHealthStatus(component=TrinityComponent.CODING_COUNCIL)
         checks = []
@@ -748,6 +798,9 @@ class TrinityHealthMonitor:
             self.config.trinity_dir / "components" / "coding_council.json",
             self.config.trinity_dir / "heartbeats" / "coding_council.json",
         ]
+
+        # v125.0: Check if any heartbeat file has ever existed
+        any_file_exists = any(f.exists() for f in heartbeat_files)
 
         # v108.0: Pass component-specific threshold
         heartbeat_result = await self._check_heartbeat_file(
@@ -776,7 +829,16 @@ class TrinityHealthMonitor:
                     f"[TrinityHealthMonitor] Coding Council in startup grace period, "
                     f"not marking as unhealthy"
                 )
+            elif not any_file_exists:
+                # v125.0: No heartbeat file ever existed - component not configured/installed
+                status.status = ComponentStatus.OPTIONAL_OFFLINE
+                status.last_error = "Coding Council not running (optional component)"
+                self.log.debug(
+                    f"[TrinityHealthMonitor] v125.0: Coding Council heartbeat never seen, "
+                    f"marking as OPTIONAL_OFFLINE for graceful degradation"
+                )
             else:
+                # v125.0: Heartbeat file existed but is now stale - actual failure
                 status.consecutive_failures += 1
                 status.last_error = heartbeat_result.error
                 status.status = ComponentStatus.UNHEALTHY
@@ -996,7 +1058,15 @@ class TrinityHealthMonitor:
         return result
 
     def _calculate_health_score(self, snapshot: TrinityHealthSnapshot) -> float:
-        """Calculate weighted health score (0.0 - 1.0)."""
+        """
+        Calculate weighted health score (0.0 - 1.0).
+
+        v125.0: Enhanced to handle optional offline components.
+        Components with status OPTIONAL_OFFLINE or UNAVAILABLE are excluded
+        from the calculation - they don't count against the health score.
+        This allows graceful degradation when optional cross-repo components
+        are not running.
+        """
         if not snapshot.components:
             return 0.0
 
@@ -1005,6 +1075,15 @@ class TrinityHealthMonitor:
 
         for component, status in snapshot.components.items():
             weight = self.config.component_weights.get(component, 0.5)
+
+            # v125.0: Skip optional offline components - they don't count against health
+            if status.status in (ComponentStatus.OPTIONAL_OFFLINE, ComponentStatus.UNAVAILABLE):
+                self.log.debug(
+                    f"[TrinityHealthMonitor] v125.0: Excluding {component.value} "
+                    f"from health score (status={status.status.value})"
+                )
+                continue
+
             total_weight += weight
 
             if status.status == ComponentStatus.HEALTHY:
@@ -1013,7 +1092,10 @@ class TrinityHealthMonitor:
                 weighted_score += weight * 0.5
             elif status.status == ComponentStatus.STARTING:
                 weighted_score += weight * 0.7
-            # UNHEALTHY, UNKNOWN, STOPPED = 0.0
+            elif status.status == ComponentStatus.STOPPED:
+                # v125.0: STOPPED is intentional - treat as neutral (0.8)
+                weighted_score += weight * 0.8
+            # UNHEALTHY, UNKNOWN = 0.0
 
         return weighted_score / total_weight if total_weight > 0 else 0.0
 
