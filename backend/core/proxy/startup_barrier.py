@@ -233,9 +233,17 @@ class BarrierConfig:
     PARALLEL_INIT_ENABLED: Final[bool] = os.getenv("PARALLEL_INIT_ENABLED", "true").lower() == "true"
 
     # Database settings (non-credential)
+    # v117.1: Dynamic database configuration with intelligent fallbacks
+    # Priority: CLOUDSQL_DB_NAME → JARVIS_DB_NAME → postgres (always exists)
     DB_HOST: Final[str] = os.getenv("CLOUDSQL_PROXY_HOST", "127.0.0.1")
     DB_PORT: Final[int] = int(os.getenv("CLOUDSQL_PROXY_PORT", "5432"))
-    DB_NAME: Final[str] = os.getenv("CLOUDSQL_DB_NAME", "jarvis_db")
+    DB_NAME: Final[str] = os.getenv(
+        "CLOUDSQL_DB_NAME",
+        os.getenv(
+            "JARVIS_DB_NAME",
+            "postgres"  # v117.1: Always exists in PostgreSQL, safe fallback
+        )
+    )
 
     # v117.0: Credentials are now lazy-loaded via SecretManager
     DB_USER = _LazyCredentialDescriptor("user")
@@ -457,7 +465,12 @@ class VerificationPipeline:
         return result
 
     async def verify_authentication(self, timeout: float = 10.0) -> VerificationResult:
-        """Stage 3: Verify database authentication."""
+        """
+        Stage 3: Verify database authentication.
+
+        v117.1: Enhanced with fallback to 'postgres' database if specified database
+        doesn't exist. This ensures we can verify connectivity even during initial setup.
+        """
         start_time = time.monotonic()
 
         try:
@@ -473,26 +486,83 @@ class VerificationPipeline:
                     metadata={"skipped": "asyncpg not installed, skipping auth verify"},
                 )
 
-            conn = await asyncio.wait_for(
-                asyncpg.connect(
-                    host=self._host,
-                    port=self._port,
-                    database=self._db_name,
-                    user=self._db_user,
-                    password=self._db_password,
-                ),
-                timeout=timeout
-            )
+            # v117.1: Try specified database first, fallback to 'postgres' if not found
+            databases_to_try = [self._db_name]
+            if self._db_name != "postgres":
+                databases_to_try.append("postgres")  # postgres always exists
 
-            await conn.close()
+            last_error: Optional[Exception] = None
+            successful_db: Optional[str] = None
 
-            latency_ms = (time.monotonic() - start_time) * 1000
-            result = VerificationResult(
-                stage=VerificationStage.AUTHENTICATION,
-                success=True,
-                latency_ms=latency_ms,
-                metadata={"user": self._db_user, "database": self._db_name},
-            )
+            for db_name in databases_to_try:
+                try:
+                    conn = await asyncio.wait_for(
+                        asyncpg.connect(
+                            host=self._host,
+                            port=self._port,
+                            database=db_name,
+                            user=self._db_user,
+                            password=self._db_password,
+                        ),
+                        timeout=timeout / len(databases_to_try)
+                    )
+
+                    await conn.close()
+                    successful_db = db_name
+
+                    # If we had to fall back to 'postgres', log this
+                    if db_name != self._db_name:
+                        logger.warning(
+                            f"[Verification] Database '{self._db_name}' not found, "
+                            f"verified connectivity using '{db_name}' instead"
+                        )
+
+                    break  # Success!
+
+                except asyncio.TimeoutError:
+                    last_error = asyncio.TimeoutError(f"Timeout connecting to {db_name}")
+                except Exception as e:
+                    error_str = str(e)
+                    # Only try next database if this one doesn't exist
+                    if "does not exist" in error_str.lower():
+                        logger.debug(f"Database '{db_name}' does not exist, trying fallback...")
+                        last_error = e
+                        continue
+                    # For other errors (auth, connection), don't fallback - report immediately
+                    last_error = e
+                    break
+
+            if successful_db:
+                latency_ms = (time.monotonic() - start_time) * 1000
+                result = VerificationResult(
+                    stage=VerificationStage.AUTHENTICATION,
+                    success=True,
+                    latency_ms=latency_ms,
+                    metadata={
+                        "user": self._db_user,
+                        "database": successful_db,
+                        "requested_database": self._db_name,
+                        "used_fallback": successful_db != self._db_name,
+                    },
+                )
+            else:
+                # All attempts failed
+                error_str = str(last_error) if last_error else "Unknown error"
+                if "password" in error_str.lower() or "authentication" in error_str.lower():
+                    error_type = "authentication_failed"
+                elif "does not exist" in error_str.lower():
+                    error_type = "database_not_found"
+                elif isinstance(last_error, asyncio.TimeoutError):
+                    error_type = "timeout"
+                else:
+                    error_type = "connection_error"
+
+                result = VerificationResult(
+                    stage=VerificationStage.AUTHENTICATION,
+                    success=False,
+                    latency_ms=(time.monotonic() - start_time) * 1000,
+                    error=f"{error_type}: {last_error}",
+                )
 
         except asyncio.TimeoutError:
             result = VerificationResult(
@@ -522,7 +592,12 @@ class VerificationPipeline:
         return result
 
     async def verify_query_execution(self, timeout: float = 10.0) -> VerificationResult:
-        """Stage 4: Verify query execution (SELECT 1)."""
+        """
+        Stage 4: Verify query execution (SELECT 1).
+
+        v117.1: Enhanced with fallback to 'postgres' database if specified database
+        doesn't exist. This ensures we can verify query capability even during initial setup.
+        """
         start_time = time.monotonic()
 
         try:
@@ -536,41 +611,77 @@ class VerificationPipeline:
                     metadata={"skipped": "asyncpg not installed"},
                 )
 
-            conn = await asyncio.wait_for(
-                asyncpg.connect(
-                    host=self._host,
-                    port=self._port,
-                    database=self._db_name,
-                    user=self._db_user,
-                    password=self._db_password,
-                ),
-                timeout=timeout / 2
-            )
+            # v117.1: Try specified database first, fallback to 'postgres' if not found
+            databases_to_try = [self._db_name]
+            if self._db_name != "postgres":
+                databases_to_try.append("postgres")
 
-            try:
-                query_start = time.monotonic()
-                result_row = await asyncio.wait_for(
-                    conn.fetchval("SELECT 1"),
-                    timeout=timeout / 2
+            last_error: Optional[Exception] = None
+            successful_db: Optional[str] = None
+            query_latency: float = 0.0
+
+            for db_name in databases_to_try:
+                try:
+                    conn = await asyncio.wait_for(
+                        asyncpg.connect(
+                            host=self._host,
+                            port=self._port,
+                            database=db_name,
+                            user=self._db_user,
+                            password=self._db_password,
+                        ),
+                        timeout=timeout / (2 * len(databases_to_try))
+                    )
+
+                    try:
+                        query_start = time.monotonic()
+                        result_row = await asyncio.wait_for(
+                            conn.fetchval("SELECT 1"),
+                            timeout=timeout / (2 * len(databases_to_try))
+                        )
+                        query_latency = (time.monotonic() - query_start) * 1000
+
+                        if result_row == 1:
+                            successful_db = db_name
+                            if db_name != self._db_name:
+                                logger.debug(
+                                    f"[Verification] Query verified using fallback database '{db_name}'"
+                                )
+                            break
+                        else:
+                            last_error = ValueError(f"Unexpected query result: {result_row}")
+                    finally:
+                        await conn.close()
+
+                except asyncio.TimeoutError:
+                    last_error = asyncio.TimeoutError(f"Timeout connecting to {db_name}")
+                except Exception as e:
+                    error_str = str(e)
+                    if "does not exist" in error_str.lower():
+                        logger.debug(f"Database '{db_name}' does not exist for query test, trying fallback...")
+                        last_error = e
+                        continue
+                    last_error = e
+                    break
+
+            if successful_db:
+                result = VerificationResult(
+                    stage=VerificationStage.QUERY_EXECUTION,
+                    success=True,
+                    latency_ms=(time.monotonic() - start_time) * 1000,
+                    metadata={
+                        "query_latency_ms": round(query_latency, 2),
+                        "database": successful_db,
+                        "used_fallback": successful_db != self._db_name,
+                    },
                 )
-                query_latency = (time.monotonic() - query_start) * 1000
-
-                if result_row == 1:
-                    result = VerificationResult(
-                        stage=VerificationStage.QUERY_EXECUTION,
-                        success=True,
-                        latency_ms=(time.monotonic() - start_time) * 1000,
-                        metadata={"query_latency_ms": round(query_latency, 2)},
-                    )
-                else:
-                    result = VerificationResult(
-                        stage=VerificationStage.QUERY_EXECUTION,
-                        success=False,
-                        latency_ms=(time.monotonic() - start_time) * 1000,
-                        error=f"Unexpected result: {result_row}",
-                    )
-            finally:
-                await conn.close()
+            else:
+                result = VerificationResult(
+                    stage=VerificationStage.QUERY_EXECUTION,
+                    success=False,
+                    latency_ms=(time.monotonic() - start_time) * 1000,
+                    error=str(last_error) if last_error else "Query execution failed",
+                )
 
         except asyncio.TimeoutError:
             result = VerificationResult(

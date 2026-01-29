@@ -490,13 +490,37 @@ class DistributedLockManager:
 
     async def _read_lock_metadata(self, lock_file: Path) -> Optional[LockMetadata]:
         """
-        v96.0: Read and parse lock metadata from file with backward compatibility.
+        v96.1: Read and parse lock metadata from file with robust error handling.
 
         Handles both old format (without v96.0 fields) and new format (with process fingerprint).
+
+        v96.1 Enhancements:
+        - Pre-check for empty files before JSON parsing
+        - Better error categorization for diagnostics
+        - More resilient against filesystem race conditions
         """
         try:
+            # v96.1: Check file size before reading to detect empty/corrupted files early
+            try:
+                file_size = (await aiofiles.os.stat(lock_file)).st_size
+                if file_size == 0:
+                    logger.debug(f"Empty lock file detected: {lock_file} (will remove)")
+                    await self._remove_lock_file(lock_file)
+                    return None
+            except FileNotFoundError:
+                return None
+            except OSError:
+                pass  # Fall through to normal read, will handle errors there
+
             async with aiofiles.open(lock_file, 'r') as f:
                 data = await f.read()
+
+                # v96.1: Additional empty check after read (race condition protection)
+                if not data or not data.strip():
+                    logger.debug(f"Lock file has no content: {lock_file} (will remove)")
+                    await self._remove_lock_file(lock_file)
+                    return None
+
                 metadata_dict = json.loads(data)
 
                 # v96.0: Handle legacy lock files without new fields
@@ -545,45 +569,91 @@ class DistributedLockManager:
 
     async def _write_lock_metadata(self, lock_file: Path, metadata: LockMetadata) -> None:
         """
-        Write lock metadata to file atomically with fsync guarantee.
+        v96.1: Write lock metadata to file atomically with enhanced durability.
 
         v1.1: Ensures parent directory exists before writing.
         v93.0: Added fsync to ensure filesystem consistency before verification.
                This prevents race conditions on slow filesystems (NFS, cloud storage).
+        v96.1: Added content verification after write to detect silent corruption.
+               Improved temp file cleanup and retry logic for robustness.
         """
-        try:
-            # Ensure directory exists (resilient to race conditions)
-            lock_dir = lock_file.parent
+        max_retries = 3
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_retries):
             try:
-                await aiofiles.os.makedirs(lock_dir, exist_ok=True)
-            except FileExistsError:
-                pass  # Another process created it - that's fine
-
-            # Write to temp file first with explicit flush
-            temp_file = lock_file.with_suffix('.lock.tmp')
-            async with aiofiles.open(temp_file, 'w') as f:
-                await f.write(json.dumps(asdict(metadata), indent=2))
-                await f.flush()
-                # v93.0: Force write to disk before rename
-                os.fsync(f.fileno())
-
-            # Atomic rename
-            await aiofiles.os.rename(temp_file, lock_file)
-
-            # v93.0: Sync directory to ensure rename is durable
-            try:
-                dir_fd = os.open(str(lock_dir), os.O_RDONLY | os.O_DIRECTORY)
+                # Ensure directory exists (resilient to race conditions)
+                lock_dir = lock_file.parent
                 try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except (OSError, AttributeError):
-                # O_DIRECTORY not supported on some platforms - fall back to brief sleep
-                await asyncio.sleep(0.001)
+                    await aiofiles.os.makedirs(lock_dir, exist_ok=True)
+                except FileExistsError:
+                    pass  # Another process created it - that's fine
 
-        except Exception as e:
-            logger.error(f"Error writing lock metadata {lock_file}: {e}")
-            raise
+                # v96.1: Serialize the content first to catch any serialization errors
+                content = json.dumps(asdict(metadata), indent=2)
+                if not content or len(content) < 10:
+                    raise ValueError(f"Invalid metadata serialization: {content[:50]}")
+
+                # Write to temp file first with explicit flush
+                temp_file = lock_file.with_suffix(f'.lock.tmp.{os.getpid()}')
+
+                try:
+                    async with aiofiles.open(temp_file, 'w') as f:
+                        await f.write(content)
+                        await f.flush()
+                        # v93.0: Force write to disk before rename
+                        os.fsync(f.fileno())
+
+                    # v96.1: Verify temp file was written correctly before rename
+                    temp_size = (await aiofiles.os.stat(temp_file)).st_size
+                    if temp_size != len(content.encode('utf-8')):
+                        raise IOError(
+                            f"Temp file size mismatch: expected {len(content.encode('utf-8'))}, "
+                            f"got {temp_size}"
+                        )
+
+                    # Atomic rename
+                    await aiofiles.os.rename(temp_file, lock_file)
+
+                except Exception:
+                    # Clean up temp file on failure
+                    try:
+                        await aiofiles.os.remove(temp_file)
+                    except (FileNotFoundError, OSError):
+                        pass
+                    raise
+
+                # v93.0: Sync directory to ensure rename is durable
+                try:
+                    dir_fd = os.open(str(lock_dir), os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except (OSError, AttributeError):
+                    # O_DIRECTORY not supported on some platforms - fall back to brief sleep
+                    await asyncio.sleep(0.001)
+
+                # v96.1: Verify final file was written correctly
+                final_size = (await aiofiles.os.stat(lock_file)).st_size
+                if final_size == 0:
+                    raise IOError("Lock file is empty after write - filesystem issue detected")
+
+                # Success - exit retry loop
+                return
+
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Lock write attempt {attempt + 1} failed: {e}, retrying..."
+                    )
+                    await asyncio.sleep(0.01 * (attempt + 1))  # Brief exponential backoff
+                continue
+
+        # All retries failed
+        logger.error(f"Error writing lock metadata {lock_file} after {max_retries} attempts: {last_error}")
+        raise last_error or IOError(f"Failed to write lock file: {lock_file}")
 
     async def _remove_lock_file(self, lock_file: Path) -> None:
         """
