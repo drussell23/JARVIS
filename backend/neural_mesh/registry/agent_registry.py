@@ -662,7 +662,12 @@ class AgentRegistry:
     # v112.0: Dependency-Aware Health Checking
     # ========================================================================
 
-    def set_dependency_ready(self, dependency_name: str, is_ready: bool) -> None:
+    def set_dependency_ready(
+        self,
+        dependency_name: str,
+        is_ready: bool,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         Update the readiness state of a dependency.
 
@@ -670,19 +675,41 @@ class AgentRegistry:
         when dependencies become ready or unavailable. Agents that depend on these
         systems won't be marked offline if their dependency is down.
 
+        v117.0: Added optional metadata parameter for enhanced observability.
+
         Args:
             dependency_name: Name of the dependency (e.g., "cloudsql", "service_registry")
             is_ready: Whether the dependency is ready/healthy
+            metadata: Optional metadata about the state change (source, timestamp, reason, etc.)
 
         Example:
             # Called by ProxyReadinessGate when CloudSQL becomes ready
             agent_registry.set_dependency_ready("cloudsql", True)
 
+            # Called with metadata for enhanced tracking
+            agent_registry.set_dependency_ready("cloudsql", True, {
+                "source": "distributed_proxy_orchestrator",
+                "ready_at": time.time(),
+            })
+
             # Called by CloudSQL health check when connection fails
-            agent_registry.set_dependency_ready("cloudsql", False)
+            agent_registry.set_dependency_ready("cloudsql", False, {
+                "reason": "connection_timeout",
+                "last_error": "Connection refused",
+            })
         """
         old_state = self._dependency_states.get(dependency_name)
         self._dependency_states[dependency_name] = is_ready
+
+        # v117.0: Store metadata for observability
+        if metadata:
+            if not hasattr(self, '_dependency_metadata'):
+                self._dependency_metadata: Dict[str, Dict[str, Any]] = {}
+            self._dependency_metadata[dependency_name] = {
+                "is_ready": is_ready,
+                "updated_at": time.time(),
+                **metadata,
+            }
 
         # Rate-limit logging - only log once per 30s per dependency
         current_time = time.time()
@@ -691,9 +718,15 @@ class AgentRegistry:
         if old_state != is_ready or (current_time - last_log_time) > 30.0:
             self._last_dependency_log_time[dependency_name] = current_time
             status_str = "READY ✅" if is_ready else "NOT READY ❌"
+
+            # v117.0: Include metadata source in log if available
+            source_info = ""
+            if metadata and "source" in metadata:
+                source_info = f" (source: {metadata['source']})"
+
             logger.info(
-                "[AgentRegistry v112.0] Dependency '%s' is now %s",
-                dependency_name, status_str
+                "[AgentRegistry v117.0] Dependency '%s' is now %s%s",
+                dependency_name, status_str, source_info
             )
 
             # When a dependency becomes unavailable, log which agents are affected
@@ -701,7 +734,7 @@ class AgentRegistry:
                 affected_agents = self._get_agents_depending_on(dependency_name)
                 if affected_agents:
                     logger.info(
-                        "[AgentRegistry v112.0] Agents affected by %s outage (won't be marked offline): %s",
+                        "[AgentRegistry v117.0] Agents affected by %s outage (won't be marked offline): %s",
                         dependency_name,
                         ", ".join(list(affected_agents)[:10]) + ("..." if len(affected_agents) > 10 else "")
                     )

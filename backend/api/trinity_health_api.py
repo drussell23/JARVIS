@@ -49,9 +49,22 @@ router = APIRouter(prefix="/health", tags=["trinity"])
 # =============================================================================
 
 def _get_readiness_manager_safe(component_name: str = "jarvis-body") -> Optional[Any]:
-    """Safely get readiness manager if available."""
+    """
+    Safely get readiness manager if available.
+
+    v123.5: CRITICAL FIX - Use consistent import paths to ensure singleton integrity.
+    The import path MUST match what main.py uses, otherwise Python treats them as
+    different modules with separate singleton dictionaries, causing 503 errors.
+    """
     try:
-        from backend.core.readiness_state_manager import get_readiness_manager
+        # v123.5: Try the same import path as main.py first (core.* without backend prefix)
+        # This is critical for singleton integrity - Python module caching is path-based
+        try:
+            from core.readiness_state_manager import get_readiness_manager
+        except ImportError:
+            # Fallback: Try with backend prefix (different working directory)
+            from backend.core.readiness_state_manager import get_readiness_manager
+
         return get_readiness_manager(component_name)
     except ImportError:
         return None
@@ -231,7 +244,12 @@ async def liveness_probe() -> Response:
     manager = _get_readiness_manager_safe()
 
     if manager:
-        from backend.core.readiness_state_manager import ProbeType
+        # v123.5: Consistent import path for singleton integrity
+        try:
+            from core.readiness_state_manager import ProbeType
+        except ImportError:
+            from backend.core.readiness_state_manager import ProbeType
+
         response = manager.handle_probe(ProbeType.LIVENESS)
 
         return JSONResponse(
@@ -276,7 +294,12 @@ async def readiness_probe() -> Response:
     manager = _get_readiness_manager_safe()
 
     if manager:
-        from backend.core.readiness_state_manager import ProbeType
+        # v123.5: Consistent import path for singleton integrity
+        try:
+            from core.readiness_state_manager import ProbeType
+        except ImportError:
+            from backend.core.readiness_state_manager import ProbeType
+
         response = manager.handle_probe(ProbeType.READINESS)
 
         logger.debug(
@@ -317,7 +340,12 @@ async def startup_probe() -> Response:
     manager = _get_readiness_manager_safe()
 
     if manager:
-        from backend.core.readiness_state_manager import ProbeType
+        # v123.5: Consistent import path for singleton integrity
+        try:
+            from core.readiness_state_manager import ProbeType
+        except ImportError:
+            from backend.core.readiness_state_manager import ProbeType
+
         response = manager.handle_probe(ProbeType.STARTUP)
 
         return JSONResponse(
