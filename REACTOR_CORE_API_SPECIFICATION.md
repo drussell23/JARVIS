@@ -325,7 +325,7 @@ class TrinityExperienceReceiver(FileSystemEventHandler):
 
 ## 4️⃣ Health & Status API
 
-### `GET /api/health`
+### `GET /health`
 
 Check Reactor Core health.
 
@@ -404,7 +404,7 @@ Reactor Core must update `~/.jarvis/cross_repo/reactor_state.json`:
 - [ ] `POST /api/training/cancel/{job_id}` endpoint
 - [ ] `POST /api/models/deploy` endpoint
 - [ ] `POST /api/models/rollback` endpoint
-- [ ] `GET /api/health` endpoint
+- [ ] `GET /health` endpoint
 - [ ] `GET /api/resources` endpoint
 - [ ] File watcher for `~/.jarvis/trinity/events/`
 - [ ] Experience buffer management
@@ -496,8 +496,8 @@ curl -N http://localhost:8090/api/training/stream/test-123
 ## 🐛 Troubleshooting
 
 ### Training doesn't start
-- **Check:** Reactor Core health: `curl http://localhost:8090/api/health`
-- **Check:** JARVIS can reach Reactor Core: `curl http://localhost:8090/api/health`
+- **Check:** Reactor Core health: `curl http://localhost:8090/health`
+- **Check:** JARVIS can reach Reactor Core: `curl http://localhost:8090/health`
 - **Check:** Experience files in `~/.jarvis/trinity/events/`
 - **Check:** Reactor Core logs for errors
 

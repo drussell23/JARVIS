@@ -212,7 +212,7 @@ Cross-Repo Startup Orchestration v1.0
 # Check all repos are running
 curl http://localhost:5001/health      # JARVIS Core
 curl http://localhost:8002/health      # J-Prime
-curl http://localhost:8090/api/health  # Reactor Core
+curl http://localhost:8090/health       # Reactor Core
 
 # All should return HTTP 200 with {"status": "healthy"}
 ```
@@ -348,7 +348,7 @@ Reactor Core must implement the following API endpoints as specified in `REACTOR
 - [ ] POST /api/training/cancel/{job_id}
 - [ ] POST /api/models/deploy
 - [ ] POST /api/models/rollback
-- [ ] GET /api/health
+- [ ] GET /health
 - [ ] GET /api/resources
 - [ ] File watcher for experience ingestion
 - [ ] Training pipeline execution

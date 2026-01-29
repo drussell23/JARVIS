@@ -222,7 +222,7 @@ async def register_service():
     await register_current_service(
         service_name="reactor-core",
         port=8090,
-        health_endpoint="/api/health"
+        health_endpoint="/health"
     )
 
 @router.post("/training/start")

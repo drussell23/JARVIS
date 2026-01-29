@@ -834,6 +834,10 @@ class ServiceDefinition:
     # Services listed here must be healthy before this service starts
     depends_on: List[str] = field(default_factory=list)
 
+    # v117.0: Soft dependencies - services that are recommended but not required
+    # Service will start even if soft dependencies aren't healthy, but logs a warning
+    soft_depends_on: List[str] = field(default_factory=list)
+
     # v95.0: Startup priority (lower = starts first, same priority = parallel)
     # Default priorities: jarvis-body=10, jarvis-prime=20, reactor-core=30
     startup_priority: int = 50
@@ -2219,7 +2223,8 @@ class ServiceDefinitionRegistry:
             "default_port_env": "REACTOR_CORE_PORT",
             "default_port": 8090,
             "health_endpoint": "/health",
-            "startup_timeout": 90.0,
+            # v117.0: Increased startup timeout to handle slow startup scenarios
+            "startup_timeout": 120.0,
             "repo_path_env": "REACTOR_CORE_PATH",
             # v95.6: Use dynamic discovery instead of hardcoded path
             "default_repo_path": None,  # Discovered dynamically
@@ -2230,11 +2235,16 @@ class ServiceDefinitionRegistry:
                 "REACTOR_PORT": str(os.getenv("REACTOR_CORE_PORT", 8090)),
             },
             "use_uvicorn": False,
-            # v95.0: Dependency and priority configuration
-            "depends_on": ["jarvis-prime"],  # reactor-core depends on jarvis-prime for AGI
+            # v117.0: Enhanced dependency configuration with soft dependency support
+            # reactor-core CAN start without jarvis-prime but works better with it
+            # Setting to empty list allows reactor-core to start independently
+            # It will connect to jarvis-prime when available via Trinity protocol
+            "depends_on": [],  # v117.0: Removed hard dependency - reactor-core can run standalone
             "startup_priority": 30,  # Start third (after jarvis-prime)
             "is_critical": False,  # System can degrade without this
-            "dependency_wait_timeout": 180.0,  # Wait longer for jarvis-prime to load models
+            "dependency_wait_timeout": 180.0,  # Wait longer if dependencies are re-added
+            # v117.0: Soft dependency - recommend but don't require
+            "soft_depends_on": ["jarvis-prime"],  # Will log warning if not available
         },
     }
 
@@ -2358,6 +2368,8 @@ class ServiceDefinitionRegistry:
             uvicorn_app=canonical.get("uvicorn_app"),
             # v95.0: Dependency and priority configuration
             depends_on=canonical.get("depends_on", []),
+            # v117.0: Soft dependencies - recommended but not required
+            soft_depends_on=canonical.get("soft_depends_on", []),
             startup_priority=canonical.get("startup_priority", 50),
             is_critical=canonical.get("is_critical", True),
             dependency_wait_timeout=canonical.get("dependency_wait_timeout", 120.0),
@@ -11500,6 +11512,23 @@ echo "=== JARVIS Prime started ==="
                     details={"reason": "dependencies_not_ready"}
                 )
                 return False
+
+        # v117.0: Check soft dependencies - warn but don't block
+        soft_deps = getattr(definition, 'soft_depends_on', None)
+        if soft_deps:
+            for soft_dep in soft_deps:
+                if soft_dep in self.processes:
+                    dep_managed = self.processes[soft_dep]
+                    if dep_managed.status != ServiceStatus.HEALTHY:
+                        logger.warning(
+                            f"[v117.0] Soft dependency '{soft_dep}' not healthy for {definition.name} - "
+                            f"proceeding anyway (status: {dep_managed.status.value if dep_managed.status else 'unknown'})"
+                        )
+                else:
+                    logger.warning(
+                        f"[v117.0] Soft dependency '{soft_dep}' not found for {definition.name} - "
+                        f"proceeding anyway"
+                    )
 
         # v95.0: Emit service spawning event
         await _emit_event(

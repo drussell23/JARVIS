@@ -540,10 +540,13 @@ def export_config_to_env(config: Optional[TrinityConfig] = None) -> Dict[str, st
 
         "JARVIS_HOST": config.jarvis_endpoint.host,
         "JARVIS_PORT": str(config.jarvis_endpoint.port),
+        "JARVIS_HEALTH_PATH": config.jarvis_endpoint.health_path,
         "JARVIS_PRIME_HOST": config.jarvis_prime_endpoint.host,
         "JARVIS_PRIME_PORT": str(config.jarvis_prime_endpoint.port),
+        "JARVIS_PRIME_HEALTH_PATH": config.jarvis_prime_endpoint.health_path,
         "REACTOR_CORE_HOST": config.reactor_core_endpoint.host,
         "REACTOR_CORE_PORT": str(config.reactor_core_endpoint.port),
+        "REACTOR_CORE_HEALTH_PATH": config.reactor_core_endpoint.health_path,
 
         "TRINITY_HEARTBEAT_INTERVAL": str(config.health.heartbeat_interval),
         "TRINITY_HEARTBEAT_TIMEOUT": str(config.health.heartbeat_timeout),
@@ -563,6 +566,110 @@ def export_config_to_env(config: Optional[TrinityConfig] = None) -> Dict[str, st
     os.environ.update(env_vars)
 
     return env_vars
+
+
+# =============================================================================
+# v117.0: UNIFIED HEALTH ENDPOINT ACCESS
+# =============================================================================
+
+
+def get_health_url(service_name: str, config: Optional[TrinityConfig] = None) -> str:
+    """
+    v117.0: Get the health check URL for a service by name.
+
+    This is the SINGLE SOURCE OF TRUTH for health endpoints.
+    All components should use this instead of hardcoding URLs.
+
+    Args:
+        service_name: Service identifier (jarvis, jarvis-prime, reactor-core, etc.)
+        config: Optional config, uses global if not provided
+
+    Returns:
+        Full health check URL (e.g., "http://localhost:8090/health")
+
+    Example:
+        >>> get_health_url("reactor-core")
+        "http://localhost:8090/health"
+        >>> get_health_url("jarvis-prime")
+        "http://localhost:8000/health"
+    """
+    if config is None:
+        config = get_config()
+
+    # Normalize service name (handle various formats)
+    normalized = service_name.lower().replace("_", "-").replace(" ", "-")
+
+    service_map = {
+        "jarvis": config.jarvis_endpoint,
+        "jarvis-body": config.jarvis_endpoint,
+        "jarvis_body": config.jarvis_endpoint,
+        "body": config.jarvis_endpoint,
+        "jarvis-prime": config.jarvis_prime_endpoint,
+        "jarvis_prime": config.jarvis_prime_endpoint,
+        "prime": config.jarvis_prime_endpoint,
+        "jprime": config.jarvis_prime_endpoint,
+        "reactor-core": config.reactor_core_endpoint,
+        "reactor_core": config.reactor_core_endpoint,
+        "reactor": config.reactor_core_endpoint,
+    }
+
+    endpoint = service_map.get(normalized)
+    if endpoint is None:
+        raise ValueError(
+            f"Unknown service: {service_name}. "
+            f"Valid services: {', '.join(sorted(set(service_map.keys())))}"
+        )
+
+    return endpoint.health_url
+
+
+def get_all_health_urls(config: Optional[TrinityConfig] = None) -> Dict[str, str]:
+    """
+    v117.0: Get all service health URLs as a dictionary.
+
+    Returns:
+        Dictionary mapping canonical service name to health URL
+    """
+    if config is None:
+        config = get_config()
+
+    return {
+        "jarvis": config.jarvis_endpoint.health_url,
+        "jarvis-prime": config.jarvis_prime_endpoint.health_url,
+        "reactor-core": config.reactor_core_endpoint.health_url,
+    }
+
+
+def get_service_endpoint(service_name: str, config: Optional[TrinityConfig] = None) -> ServiceEndpoint:
+    """
+    v117.0: Get the ServiceEndpoint for a service by name.
+
+    Args:
+        service_name: Service identifier
+        config: Optional config, uses global if not provided
+
+    Returns:
+        ServiceEndpoint dataclass with host, port, health_path, and derived URLs
+    """
+    if config is None:
+        config = get_config()
+
+    normalized = service_name.lower().replace("_", "-").replace(" ", "-")
+
+    service_map = {
+        "jarvis": config.jarvis_endpoint,
+        "jarvis-body": config.jarvis_endpoint,
+        "jarvis-prime": config.jarvis_prime_endpoint,
+        "prime": config.jarvis_prime_endpoint,
+        "reactor-core": config.reactor_core_endpoint,
+        "reactor": config.reactor_core_endpoint,
+    }
+
+    endpoint = service_map.get(normalized)
+    if endpoint is None:
+        raise ValueError(f"Unknown service: {service_name}")
+
+    return endpoint
 
 
 # =============================================================================

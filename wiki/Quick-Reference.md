@@ -19,7 +19,7 @@ python backend/main.py
 ENABLE_GCP=true ./start_system.py
 
 # Check system status
-curl http://localhost:8000/api/health
+curl http://localhost:8000/health
 
 # View logs
 tail -f jarvis_startup.log
@@ -189,7 +189,7 @@ MINIMAL_MODE=true ./start_system.py
 
 ### Health Check
 ```bash
-curl http://localhost:8000/api/health
+curl http://localhost:8000/health
 ```
 
 ### Voice Command
@@ -285,7 +285,7 @@ backend/core/hybrid_config.yaml   # Hybrid routing config
 ### System Status
 ```bash
 # Overall health
-curl http://localhost:8000/api/health | jq
+curl http://localhost:8000/health | jq
 
 # Component status
 curl http://localhost:8000/api/components/status | jq

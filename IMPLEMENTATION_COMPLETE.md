@@ -95,7 +95,7 @@ tail -f logs/jarvis*.log | grep -E "Training|Coordinator"
 # Check all repos health
 curl http://localhost:5001/health      # JARVIS
 curl http://localhost:8002/health      # J-Prime  
-curl http://localhost:8090/api/health  # Reactor Core
+curl http://localhost:8090/health       # Reactor Core
 ```
 
 ---
@@ -188,7 +188,7 @@ See `REACTOR_CORE_API_SPECIFICATION.md` for:
 - [ ] POST /api/training/cancel/{job_id}
 - [ ] POST /api/models/deploy
 - [ ] POST /api/models/rollback
-- [ ] GET /api/health
+- [ ] GET /health
 - [ ] GET /api/resources
 
 ---

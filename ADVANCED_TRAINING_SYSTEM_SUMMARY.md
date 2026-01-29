@@ -161,7 +161,7 @@ POST /api/models/rollback - Rollback to previous version
 
 #### Health & Resources:
 ```
-GET /api/health     - Health check
+GET /health         - Health check
 GET /api/resources  - Resource usage (memory, CPU, GPU)
 ```
 
@@ -266,7 +266,7 @@ Phase 2: External Repos (Parallel)
 │   ├─ If not running → Launch ~/Documents/repos/jarvis-prime/main.py
 │   └─ Wait for health check (30s timeout)
 └─ Reactor-Core
-    ├─ Probe http://localhost:8090/api/health
+    ├─ Probe http://localhost:8090/health
     ├─ If not running → Launch ~/Documents/repos/reactor-core/main.py
     └─ Wait for health check (60s timeout)
 
@@ -660,7 +660,7 @@ job = await orchestrator.trigger_training(
 tail -f logs/jarvis*.log | grep -E "Training|Coordinator|Reactor"
 
 # Check Reactor Core status
-curl http://localhost:8090/api/health
+curl http://localhost:8090/health
 
 # Stream training status
 curl -N http://localhost:8090/api/training/stream/{job_id}

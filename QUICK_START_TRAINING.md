@@ -79,7 +79,7 @@ tail -f logs/jarvis*.log | grep -E "Training|Coordinator"
 # Check all repos health
 curl http://localhost:5001/health      # JARVIS
 curl http://localhost:8002/health      # J-Prime
-curl http://localhost:8090/api/health  # Reactor Core
+curl http://localhost:8090/health       # Reactor Core
 
 # Stream training status (once Reactor Core implements it)
 curl -N http://localhost:8090/api/training/stream/{job_id}
@@ -92,7 +92,7 @@ curl -N http://localhost:8090/api/training/stream/{job_id}
 ### Training doesn't start
 1. **Check Reactor Core running:**
    ```bash
-   curl http://localhost:8090/api/health
+   curl http://localhost:8090/health
    ```
 
 2. **Check experience files:**
