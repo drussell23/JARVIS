@@ -270,100 +270,33 @@ async def liveness_probe() -> Response:
     )
 
 
-@router.get("/ready")
-async def readiness_probe() -> Response:
-    """
-    v94.0: Kubernetes-style READINESS probe.
-
-    This is the KEY FIX for health check false positives.
-
-    Returns:
-        200 OK: Service is fully initialized and ready for traffic
-        503 Service Unavailable: Service is still initializing
-
-    Why This Matters:
-        - Before: Health checks returned 200 immediately when FastAPI started
-        - Problem: Orchestrator thought service was ready during initialization
-        - Now: Returns 503 during initialization, 200 only when truly ready
-
-    Use Case:
-        - Load balancer health checks
-        - Service discovery readiness
-        - Startup sequencing in orchestration
-    """
-    manager = _get_readiness_manager_safe()
-
-    if manager:
-        # v123.5: Consistent import path for singleton integrity
-        try:
-            from core.readiness_state_manager import ProbeType
-        except ImportError:
-            from backend.core.readiness_state_manager import ProbeType
-
-        response = manager.handle_probe(ProbeType.READINESS)
-
-        logger.debug(
-            f"[TrinityHealth] Readiness probe: "
-            f"status_code={response.status_code}, "
-            f"phase={response.phase.value}, "
-            f"ready={response.success}"
-        )
-
-        return JSONResponse(
-            status_code=response.status_code,
-            content=response.to_dict(),
-        )
-
-    # Fallback: Check basic health indicators
-    # This is less accurate but provides backwards compatibility
-    return await _fallback_readiness_check()
+# v119.0: REMOVED - This endpoint conflicts with the more comprehensive
+# /health/ready in main.py which has legacy fallbacks. The main.py version
+# should be the active one to avoid 503 errors during startup.
+#
+# If you need strict ReadinessStateManager-only behavior, use /health/startup
+# which still uses the manager but has different semantics (startup vs readiness).
+#
+# @router.get("/ready")
+# async def readiness_probe() -> Response:
+#     """
+#     v94.0: Kubernetes-style READINESS probe.
+#     ...
+#     """
+#     pass
 
 
-@router.get("/startup")
-async def startup_probe() -> Response:
-    """
-    v94.0: Kubernetes-style STARTUP probe.
-
-    Returns:
-        200 OK: Initial startup is complete
-        503 Service Unavailable: Still starting up
-
-    Difference from Readiness:
-        - Startup probe only checks initial startup
-        - Once it returns 200, it stays 200 (startup is done)
-        - Readiness can flip back to 503 if service becomes unhealthy
-
-    Use Case:
-        - Slow-starting containers
-        - Prevent liveness probes from killing during long startup
-    """
-    manager = _get_readiness_manager_safe()
-
-    if manager:
-        # v123.5: Consistent import path for singleton integrity
-        try:
-            from core.readiness_state_manager import ProbeType
-        except ImportError:
-            from backend.core.readiness_state_manager import ProbeType
-
-        response = manager.handle_probe(ProbeType.STARTUP)
-
-        return JSONResponse(
-            status_code=response.status_code,
-            content=response.to_dict(),
-        )
-
-    # Fallback
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "ok",
-            "ready": True,
-            "phase": "unknown",
-            "message": "Startup assumed complete (readiness manager not available)",
-            "timestamp": time.time(),
-        },
-    )
+# v119.0: REMOVED - This endpoint conflicts with the more comprehensive
+# /health/startup in main.py which provides detailed progress info and
+# always returns 200. The main.py version is what the supervisor polls.
+#
+# @router.get("/startup")
+# async def startup_probe() -> Response:
+#     """
+#     v94.0: Kubernetes-style STARTUP probe.
+#     ...
+#     """
+#     pass
 
 
 @router.get("/ping")
