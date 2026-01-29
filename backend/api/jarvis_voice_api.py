@@ -4131,36 +4131,69 @@ coreml_engine: Optional[CoreMLVoiceEngineBridge] = None
 
 if COREML_AVAILABLE:
     try:
-        # Check if CoreML models exist before initializing
-        vad_model_path = "models/vad_model.mlmodelc"
-        speaker_model_path = "models/speaker_model.mlmodelc"
+        # v117.0: Resolve model paths relative to project root, not CWD
+        # This fixes the "model is not found at URL" error when CWD != project directory
+        project_root = os.path.dirname(backend_dir)  # backend_dir is already defined above
 
-        # Initialize with adaptive thresholds
-        coreml_engine = create_coreml_engine(
-            vad_model_path=vad_model_path,
-            speaker_model_path=speaker_model_path,
-            config={
-                "vad_threshold": 0.5,  # Adapts 0.2-0.9
-                "speaker_threshold": 0.7,  # Adapts 0.4-0.95
-                "enable_adaptive": True,
-                "learning_rate": 0.01,
-                "adaptation_window": 100,
-            },
+        # Check environment variables first (for custom model locations)
+        vad_model_path = os.environ.get(
+            "COREML_VAD_MODEL_PATH",
+            os.path.join(project_root, "models", "vad_model.mlmodelc")
+        )
+        speaker_model_path = os.environ.get(
+            "COREML_SPEAKER_MODEL_PATH",
+            os.path.join(project_root, "models", "speaker_model.mlmodelc")
         )
 
-        # Start background queue worker
-        import asyncio
+        # v117.0: Also check for .mlpackage format (newer CoreML format)
+        if not os.path.exists(vad_model_path):
+            vad_mlpackage = os.path.join(project_root, "models", "vad_model.mlpackage")
+            if os.path.exists(vad_mlpackage):
+                vad_model_path = vad_mlpackage
+                logger.info(f"[CoreML] Using .mlpackage format for VAD model")
 
-        asyncio.create_task(coreml_engine.process_voice_queue_worker())
+        if not os.path.exists(speaker_model_path):
+            speaker_mlpackage = os.path.join(project_root, "models", "speaker_model.mlpackage")
+            if os.path.exists(speaker_mlpackage):
+                speaker_model_path = speaker_mlpackage
+                logger.info(f"[CoreML] Using .mlpackage format for speaker model")
 
-        logger.info("[CoreML] CoreML Voice Engine initialized successfully")
-        logger.info(f"[CoreML] VAD model: {vad_model_path}")
-        logger.info(f"[CoreML] Speaker model: {speaker_model_path}")
+        # v117.0: Check if models exist before attempting to load
+        models_exist = os.path.exists(vad_model_path) and os.path.exists(speaker_model_path)
+
+        if not models_exist:
+            logger.info(f"[CoreML] VAD model path: {vad_model_path} (exists: {os.path.exists(vad_model_path)})")
+            logger.info(f"[CoreML] Speaker model path: {speaker_model_path} (exists: {os.path.exists(speaker_model_path)})")
+            logger.warning("[CoreML] CoreML models not found - running without CoreML voice engine")
+            logger.info("[CoreML] To enable: Run 'python backend/voice/coreml/download_silero_vad.py'")
+            coreml_engine = None
+        else:
+            # Initialize with adaptive thresholds
+            coreml_engine = create_coreml_engine(
+                vad_model_path=vad_model_path,
+                speaker_model_path=speaker_model_path,
+                config={
+                    "vad_threshold": 0.5,  # Adapts 0.2-0.9
+                    "speaker_threshold": 0.7,  # Adapts 0.4-0.95
+                    "enable_adaptive": True,
+                    "learning_rate": 0.01,
+                    "adaptation_window": 100,
+                },
+            )
+
+            # Start background queue worker
+            import asyncio
+
+            asyncio.create_task(coreml_engine.process_voice_queue_worker())
+
+            logger.info("[CoreML] CoreML Voice Engine initialized successfully")
+            logger.info(f"[CoreML] VAD model: {vad_model_path}")
+            logger.info(f"[CoreML] Speaker model: {speaker_model_path}")
 
     except FileNotFoundError as e:
         logger.warning(f"[CoreML] CoreML models not found: {e}")
         logger.warning("[CoreML] CoreML voice detection disabled - models required")
-        logger.info("[CoreML] Hint: Run 'cd backend/voice/coreml && cmake . && make' to compile")
+        logger.info("[CoreML] Hint: Run 'python backend/voice/coreml/download_silero_vad.py' to get models")
         coreml_engine = None
     except RuntimeError as e:
         # v113.0: Handle library compilation issues gracefully

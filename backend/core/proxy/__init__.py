@@ -69,6 +69,8 @@ from .distributed_leader import (
     LeaderHeartbeat,
     LeaderIdentity,
     LeaderState,
+    StaleFileCleanupResult,
+    cleanup_stale_files,
     create_proxy_leader,
 )
 
@@ -173,6 +175,8 @@ __all__ = [
     "ElectionOutcome",
     "FileLock",
     "LeaderStateCallback",
+    "StaleFileCleanupResult",
+    "cleanup_stale_files",
     "create_proxy_leader",
     # Layer 2: Startup Barrier
     "AsyncStartupBarrier",

@@ -147,18 +147,33 @@ def create_python_coreml_vad(model_path: Optional[str] = None) -> Optional[Pytho
     Factory function to create Python CoreML VAD engine.
 
     Args:
-        model_path: Path to .mlmodelc file (default: models/vad_model.mlmodelc)
+        model_path: Path to .mlmodelc file (default: auto-detected from project root)
 
     Returns:
         PythonCoreMLVAD instance or None if failed
     """
     try:
         if model_path is None:
-            # Auto-detect model path
-            model_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "..", "models", "vad_model.mlmodelc"
-            )
+            # v117.0: Auto-detect model path relative to project root
+            # This file is at: backend/voice/coreml/python_coreml_vad.py
+            # Project root is 3 levels up
+            coreml_dir = os.path.dirname(os.path.abspath(__file__))
+            voice_dir = os.path.dirname(coreml_dir)
+            backend_dir = os.path.dirname(voice_dir)
+            project_root = os.path.dirname(backend_dir)
+
+            # Check environment variable first
+            model_path = os.environ.get("COREML_VAD_MODEL_PATH")
+
+            if not model_path:
+                # Try .mlmodelc format first
+                model_path = os.path.join(project_root, "models", "vad_model.mlmodelc")
+
+                # Fall back to .mlpackage format
+                if not os.path.exists(model_path):
+                    mlpackage_path = os.path.join(project_root, "models", "vad_model.mlpackage")
+                    if os.path.exists(mlpackage_path):
+                        model_path = mlpackage_path
 
         vad = PythonCoreMLVAD(model_path)
         return vad

@@ -562,7 +562,14 @@ class DistributedProxyLeader:
         old_state: LeaderState,
         new_state: LeaderState
     ) -> None:
-        """Notify all subscribers of state change."""
+        """
+        v117.0: Notify all subscribers of state change.
+
+        IMPORTANT: This now AWAITS async callbacks to ensure they complete
+        before returning. This fixes the race condition where callbacks
+        were created as tasks but not awaited, causing events to be set
+        after the caller had already moved on.
+        """
         with self._subscriber_lock:
             subscribers = list(self._subscribers)
 
@@ -570,9 +577,16 @@ class DistributedProxyLeader:
             try:
                 result = callback(old_state, new_state)
                 if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+                    # v117.0: AWAIT the callback instead of fire-and-forget
+                    # This ensures the callback completes before we return
+                    try:
+                        await asyncio.wait_for(result, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[Leader] Subscriber callback timed out")
+                    except Exception as e:
+                        logger.debug(f"[Leader] Subscriber callback error: {e}")
             except Exception as e:
-                logger.debug(f"[Leader] Subscriber error: {e}")
+                logger.debug(f"[Leader] Subscriber invocation error: {e}")
 
     def subscribe(self, callback: Callable[[LeaderState, LeaderState], Any]) -> None:
         """Subscribe to state changes."""
@@ -1000,6 +1014,296 @@ class DistributedProxyLeader:
 
 
 # =============================================================================
+# v117.0: STALE FILE CLEANUP SYSTEM
+# =============================================================================
+
+@dataclass
+class StaleFileCleanupResult:
+    """Result of stale file cleanup operation."""
+    stale_locks_removed: int = 0
+    stale_heartbeats_removed: int = 0
+    corrupted_files_removed: int = 0
+    orphaned_files_removed: int = 0
+    errors: List[str] = field(default_factory=list)
+    cleanup_duration_ms: float = 0.0
+
+    @property
+    def total_removed(self) -> int:
+        return (
+            self.stale_locks_removed +
+            self.stale_heartbeats_removed +
+            self.corrupted_files_removed +
+            self.orphaned_files_removed
+        )
+
+    @property
+    def had_errors(self) -> bool:
+        return len(self.errors) > 0
+
+
+async def cleanup_stale_files(
+    config: Optional[LeaderElectionConfig] = None,
+    max_heartbeat_age_seconds: Optional[float] = None,
+    dry_run: bool = False,
+) -> StaleFileCleanupResult:
+    """
+    v117.0: Clean up stale lock/state files on startup.
+
+    This function should be called BEFORE creating a leader instance to ensure
+    clean state. It handles:
+
+    1. Stale lock files (locks held by dead processes)
+    2. Stale heartbeat files (no update in X seconds)
+    3. Corrupted JSON files (invalid format)
+    4. Orphaned state files (state without matching heartbeat)
+
+    Args:
+        config: Leader election config (uses defaults if None)
+        max_heartbeat_age_seconds: Override for max heartbeat age (default: 2x lease)
+        dry_run: If True, report what would be cleaned without actually removing
+
+    Returns:
+        StaleFileCleanupResult with details of what was cleaned
+    """
+    start_time = time.monotonic()
+    result = StaleFileCleanupResult()
+
+    cfg = config or LeaderElectionConfig()
+    max_age = max_heartbeat_age_seconds or (cfg.lease_duration * 2)
+
+    logger.info(f"[StaleCleanup] Starting cleanup in {cfg.state_dir} (dry_run={dry_run})")
+
+    # Ensure state directory exists
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get all files in the state directory
+    try:
+        all_files = list(cfg.state_dir.iterdir())
+    except Exception as e:
+        result.errors.append(f"Failed to list state directory: {e}")
+        return result
+
+    current_time = time.time()
+
+    for file_path in all_files:
+        try:
+            if not file_path.is_file():
+                continue
+
+            file_name = file_path.name
+
+            # Handle lock files
+            if file_name.endswith('.lock'):
+                is_stale = await _check_lock_file_stale(file_path, cfg)
+                if is_stale:
+                    if not dry_run:
+                        file_path.unlink(missing_ok=True)
+                        logger.info(f"[StaleCleanup] Removed stale lock: {file_name}")
+                    else:
+                        logger.info(f"[StaleCleanup] Would remove stale lock: {file_name}")
+                    result.stale_locks_removed += 1
+
+            # Handle JSON state/heartbeat files
+            elif file_name.endswith('.json'):
+                cleanup_type = await _check_json_file(
+                    file_path, current_time, max_age, cfg
+                )
+
+                if cleanup_type == "corrupted":
+                    if not dry_run:
+                        file_path.unlink(missing_ok=True)
+                        logger.info(f"[StaleCleanup] Removed corrupted file: {file_name}")
+                    else:
+                        logger.info(f"[StaleCleanup] Would remove corrupted: {file_name}")
+                    result.corrupted_files_removed += 1
+
+                elif cleanup_type == "stale_heartbeat":
+                    if not dry_run:
+                        file_path.unlink(missing_ok=True)
+                        logger.info(f"[StaleCleanup] Removed stale heartbeat: {file_name}")
+                    else:
+                        logger.info(f"[StaleCleanup] Would remove stale heartbeat: {file_name}")
+                    result.stale_heartbeats_removed += 1
+
+                elif cleanup_type == "orphaned":
+                    if not dry_run:
+                        file_path.unlink(missing_ok=True)
+                        logger.info(f"[StaleCleanup] Removed orphaned file: {file_name}")
+                    else:
+                        logger.info(f"[StaleCleanup] Would remove orphaned: {file_name}")
+                    result.orphaned_files_removed += 1
+
+        except Exception as e:
+            error_msg = f"Error processing {file_path.name}: {e}"
+            logger.warning(f"[StaleCleanup] {error_msg}")
+            result.errors.append(error_msg)
+
+    result.cleanup_duration_ms = (time.monotonic() - start_time) * 1000
+
+    logger.info(
+        f"[StaleCleanup] Complete: removed {result.total_removed} files "
+        f"(locks={result.stale_locks_removed}, heartbeats={result.stale_heartbeats_removed}, "
+        f"corrupted={result.corrupted_files_removed}, orphaned={result.orphaned_files_removed}) "
+        f"in {result.cleanup_duration_ms:.1f}ms"
+    )
+
+    return result
+
+
+async def _check_lock_file_stale(
+    lock_path: Path,
+    config: LeaderElectionConfig,
+) -> bool:
+    """
+    Check if a lock file is stale (held by a dead process).
+
+    A lock is considered stale if:
+    1. The process that created it is no longer running
+    2. The file hasn't been modified in 2x lease duration
+    3. We can acquire an exclusive lock on it (no one holds it)
+    """
+    try:
+        # Check file age
+        stat = lock_path.stat()
+        file_age = time.time() - stat.st_mtime
+
+        # If file is recent, not stale
+        if file_age < config.lease_duration:
+            return False
+
+        # Try to read lock metadata if it contains PID info
+        lock_content = None
+        try:
+            with open(lock_path, 'r') as f:
+                lock_content = f.read().strip()
+        except Exception:
+            pass
+
+        if lock_content:
+            # Try to parse as JSON with PID
+            try:
+                lock_data = json.loads(lock_content)
+                if 'pid' in lock_data:
+                    pid = int(lock_data['pid'])
+                    hostname = lock_data.get('hostname', '')
+
+                    # Only check if same host
+                    if hostname == socket.gethostname():
+                        # Check if process is still running
+                        if _is_process_running(pid):
+                            return False  # Process still alive, not stale
+                        else:
+                            return True  # Process dead, stale
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Try to acquire lock - if we can, it's stale
+        try:
+            with open(lock_path, 'r+') as f:
+                # Non-blocking exclusive lock attempt
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # We got the lock, so it's stale
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                return True
+        except (IOError, OSError):
+            # Can't acquire lock, someone holds it
+            return False
+
+    except FileNotFoundError:
+        return False  # File gone, nothing to clean
+    except Exception as e:
+        logger.debug(f"[StaleCleanup] Error checking lock {lock_path}: {e}")
+        # If very old (5x lease), force cleanup
+        try:
+            stat = lock_path.stat()
+            if time.time() - stat.st_mtime > config.lease_duration * 5:
+                return True
+        except Exception:
+            pass
+        return False
+
+
+def _is_process_running(pid: int) -> bool:
+    """Check if a process with given PID is running."""
+    try:
+        os.kill(pid, 0)  # Signal 0 = check if process exists
+        return True
+    except OSError:
+        return False
+
+
+async def _check_json_file(
+    file_path: Path,
+    current_time: float,
+    max_age: float,
+    config: LeaderElectionConfig,
+) -> Optional[str]:
+    """
+    Check a JSON file for staleness or corruption.
+
+    Returns:
+        None if file is valid and fresh
+        "corrupted" if file has invalid JSON
+        "stale_heartbeat" if heartbeat file is too old
+        "orphaned" if state file has no corresponding heartbeat
+    """
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+
+        if not content.strip():
+            return "corrupted"
+
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return "corrupted"
+
+        # Check heartbeat files
+        if 'heartbeat' in file_path.name.lower() or 'last_heartbeat' in data:
+            # Get timestamp from various possible fields
+            timestamp = None
+            for field in ['last_heartbeat', 'timestamp', 'updated_at', 'time']:
+                if field in data:
+                    ts = data[field]
+                    if isinstance(ts, (int, float)):
+                        timestamp = ts
+                        break
+                    elif isinstance(ts, str):
+                        try:
+                            # Try ISO format
+                            dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                            timestamp = dt.timestamp()
+                            break
+                        except ValueError:
+                            pass
+
+            if timestamp:
+                age = current_time - timestamp
+                if age > max_age:
+                    return "stale_heartbeat"
+
+        # Check state files for orphaned states
+        elif 'state' in file_path.name.lower():
+            # Check if corresponding heartbeat exists and is fresh
+            heartbeat_path = config.heartbeat_file_path
+            if not heartbeat_path.exists():
+                # No heartbeat file = orphaned state
+                # But only if the state file itself is old
+                stat = file_path.stat()
+                if current_time - stat.st_mtime > max_age:
+                    return "orphaned"
+
+        return None
+
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.debug(f"[StaleCleanup] Error checking {file_path}: {e}")
+        return "corrupted"
+
+
+# =============================================================================
 # MODULE-LEVEL SINGLETON
 # =============================================================================
 
@@ -1043,21 +1347,69 @@ async def run_leader_election(
 async def create_proxy_leader(
     repo_name: Optional[str] = None,
     config: Optional[LeaderElectionConfig] = None,
-) -> DistributedProxyLeader:
+    cleanup_stale: bool = True,
+    cleanup_dry_run: bool = False,
+) -> Tuple[DistributedProxyLeader, Optional[StaleFileCleanupResult]]:
     """
-    Factory function to create and initialize a proxy leader.
+    v117.0: Factory function to create and initialize a proxy leader.
 
     This is the recommended way to create a leader instance for the orchestrator.
+    By default, it cleans up stale files before creating the leader to ensure
+    clean state after crashes or improper shutdowns.
 
     Args:
         repo_name: Name of this repository (jarvis, prime, reactor)
         config: Optional custom configuration
+        cleanup_stale: If True (default), clean up stale files before creating leader
+        cleanup_dry_run: If True, report what would be cleaned without actually removing
 
     Returns:
-        Initialized DistributedProxyLeader instance
+        Tuple of (DistributedProxyLeader instance, cleanup result or None)
+
+    Example:
+        # Standard usage with cleanup
+        leader, cleanup = await create_proxy_leader(repo_name="jarvis")
+
+        # Skip cleanup (not recommended)
+        leader, _ = await create_proxy_leader(repo_name="jarvis", cleanup_stale=False)
+
+        # Dry run to see what would be cleaned
+        leader, cleanup = await create_proxy_leader(
+            repo_name="jarvis",
+            cleanup_dry_run=True
+        )
+        if cleanup and cleanup.total_removed > 0:
+            logger.info(f"Would have cleaned {cleanup.total_removed} files")
     """
-    leader = DistributedProxyLeader(config=config, repo_name=repo_name)
-    return leader
+    cfg = config or LeaderElectionConfig()
+
+    cleanup_result: Optional[StaleFileCleanupResult] = None
+
+    if cleanup_stale:
+        try:
+            cleanup_result = await cleanup_stale_files(
+                config=cfg,
+                dry_run=cleanup_dry_run,
+            )
+
+            if cleanup_result.had_errors:
+                logger.warning(
+                    f"[Factory] Stale cleanup had {len(cleanup_result.errors)} errors: "
+                    f"{cleanup_result.errors[:3]}"  # Show first 3
+                )
+
+            if cleanup_result.total_removed > 0 and not cleanup_dry_run:
+                logger.info(
+                    f"[Factory] Cleaned {cleanup_result.total_removed} stale files "
+                    f"before creating leader"
+                )
+
+        except Exception as e:
+            logger.warning(f"[Factory] Stale cleanup failed (continuing anyway): {e}")
+            cleanup_result = StaleFileCleanupResult(errors=[str(e)])
+
+    leader = DistributedProxyLeader(config=cfg, repo_name=repo_name)
+    return leader, cleanup_result
 
 
 # Type alias for state change callbacks

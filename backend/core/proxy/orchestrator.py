@@ -41,6 +41,7 @@ from .distributed_leader import (
     DistributedProxyLeader,
     ElectionResult,
     LeaderState,
+    StaleFileCleanupResult,
     create_proxy_leader,
 )
 from .health_aggregator import (
@@ -282,23 +283,66 @@ class UnifiedProxyOrchestrator:
             await self._transition_to(OrchestratorState.ELECTING_LEADER)
             phase = self._start_phase("leader_election")
 
-            self._leader = await create_proxy_leader(repo_name=self._repo_name)
-            await self._leader.start()
+            # v117.0: Create leader and register callback BEFORE starting
+            # This fixes race condition where election completes before callback is registered
+            # Factory now returns (leader, cleanup_result) tuple and auto-cleans stale files
+            self._leader, cleanup_result = await create_proxy_leader(repo_name=self._repo_name)
 
-            # Wait for election result
+            if cleanup_result and cleanup_result.total_removed > 0:
+                logger.info(
+                    f"[Orchestrator] Cleaned {cleanup_result.total_removed} stale files "
+                    f"before leader election"
+                )
+
+            # Set up election completion tracking BEFORE starting
             election_complete = asyncio.Event()
+            election_state_captured: List[LeaderState] = []
 
             async def on_leader_state_change(new_state: LeaderState) -> None:
+                """Callback for state changes - registered BEFORE start()."""
+                logger.debug(f"[Orchestrator] Leader state callback fired: {new_state}")
                 if new_state in {LeaderState.LEADER, LeaderState.FOLLOWER}:
+                    election_state_captured.append(new_state)
                     election_complete.set()
 
+            # v117.0: CRITICAL - Register callback BEFORE starting election
             self._leader.add_state_callback(on_leader_state_change)
 
-            try:
-                await asyncio.wait_for(election_complete.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                self._complete_phase(phase, False, "Election timeout")
-                await self._transition_to(OrchestratorState.FAILED, "election_timeout")
+            # Now start the election
+            logger.debug("[Orchestrator] Starting leader election...")
+            election_success = await self._leader.start()
+
+            # v117.0: Check if election already completed during start()
+            if election_complete.is_set():
+                logger.debug("[Orchestrator] Election completed synchronously during start()")
+            elif election_success:
+                # Election started but callback not fired yet - wait with timeout
+                try:
+                    # v117.0: Increased timeout and made configurable
+                    election_timeout = float(os.getenv("ORCHESTRATOR_ELECTION_TIMEOUT", "60.0"))
+                    await asyncio.wait_for(election_complete.wait(), timeout=election_timeout)
+                except asyncio.TimeoutError:
+                    # v117.0: Check state directly before failing - callback might have been missed
+                    current_state = self._leader.state
+                    if current_state in (LeaderState.LEADER, LeaderState.FOLLOWER):
+                        logger.warning(
+                            f"[Orchestrator] Election callback may have been missed, "
+                            f"but state is valid: {current_state}"
+                        )
+                        election_state_captured.append(current_state)
+                    else:
+                        logger.error(
+                            f"[Orchestrator] Election timeout - state={current_state}, "
+                            f"callback_fired={len(election_state_captured) > 0}"
+                        )
+                        self._complete_phase(phase, False, "Election timeout")
+                        await self._transition_to(OrchestratorState.FAILED, "election_timeout")
+                        return False
+            else:
+                # Election failed completely
+                logger.error("[Orchestrator] Election start() returned False")
+                self._complete_phase(phase, False, "Election start failed")
+                await self._transition_to(OrchestratorState.FAILED, "election_start_failed")
                 return False
 
             is_leader = self._leader.state == LeaderState.LEADER
