@@ -7208,23 +7208,31 @@ class ProcessOrchestrator:
                 url,
                 timeout=aiohttp.ClientTimeout(total=self.config.docker_health_timeout)
             ) as response:
-                if response.status != 200:
-                    return False, f"HTTP {response.status}"
-
+                # v119.0: Read body even for non-200 to detect starting state
                 try:
                     data = await response.json()
-                    status = data.get("status", "unknown")
-
-                    if status == "healthy":
-                        return True, "healthy"
-                    elif status == "starting":
-                        elapsed = data.get("model_load_elapsed_seconds", 0)
-                        return False, f"starting (model loading: {elapsed:.0f}s)"
-                    else:
-                        return False, status
                 except Exception:
-                    # Couldn't parse JSON, but got 200 - assume healthy
-                    return True, "healthy (no JSON)"
+                    data = {}
+
+                if response.status != 200:
+                    # v119.0: Check if 503 indicates starting (not unhealthy)
+                    if response.status == 503:
+                        status = data.get("status", "").lower()
+                        phase = data.get("phase", "").lower()
+                        if status == "starting" or phase in ("starting", "initializing"):
+                            elapsed = data.get("model_load_elapsed_seconds", 0)
+                            return False, f"starting (model loading: {elapsed:.0f}s)"
+                    return False, f"HTTP {response.status}"
+
+                status = data.get("status", "unknown")
+
+                if status == "healthy":
+                    return True, "healthy"
+                elif status == "starting":
+                    elapsed = data.get("model_load_elapsed_seconds", 0)
+                    return False, f"starting (model loading: {elapsed:.0f}s)"
+                else:
+                    return False, status
 
         except asyncio.TimeoutError:
             return False, "timeout"
@@ -8368,22 +8376,31 @@ echo "=== JARVIS Prime started ==="
                 url,
                 timeout=aiohttp.ClientTimeout(total=10.0)
             ) as response:
-                if response.status != 200:
-                    return False, f"HTTP {response.status}"
-
+                # v119.0: Read body even for non-200 to detect starting state
                 try:
                     data = await response.json()
-                    status = data.get("status", "unknown")
-
-                    if status == "healthy":
-                        return True, "healthy"
-                    elif status == "starting":
-                        elapsed = data.get("model_load_elapsed_seconds", 0)
-                        return False, f"starting (model loading: {elapsed:.0f}s)"
-                    else:
-                        return False, status
                 except Exception:
-                    return True, "healthy (no JSON)"
+                    data = {}
+
+                if response.status != 200:
+                    # v119.0: Check if 503 indicates starting (not unhealthy)
+                    if response.status == 503:
+                        status = data.get("status", "").lower()
+                        phase = data.get("phase", "").lower()
+                        if status == "starting" or phase in ("starting", "initializing"):
+                            elapsed = data.get("model_load_elapsed_seconds", 0)
+                            return False, f"starting (model loading: {elapsed:.0f}s)"
+                    return False, f"HTTP {response.status}"
+
+                status = data.get("status", "unknown")
+
+                if status == "healthy":
+                    return True, "healthy"
+                elif status == "starting":
+                    elapsed = data.get("model_load_elapsed_seconds", 0)
+                    return False, f"starting (model loading: {elapsed:.0f}s)"
+                else:
+                    return False, status
 
         except asyncio.TimeoutError:
             return False, "timeout"
@@ -9422,16 +9439,62 @@ echo "=== JARVIS Prime started ==="
                 # v112.0: Use provided timeout or default from config
                 timeout=aiohttp.ClientTimeout(total=timeout or self.config.health_check_timeout)
             ) as response:
+                # v119.0: CRITICAL FIX - Read response body even for non-200 status codes
+                # /health/startup returns 503 with JSON body during startup, which is NORMAL
+                # The body contains phase info to distinguish "starting" from "unhealthy"
+                try:
+                    data = await response.json()
+                except Exception:
+                    data = {}
+
                 if response.status != 200:
+                    # v119.0: Check if this is a startup-phase 503 (NOT a failure!)
+                    # The endpoint returns 503 while starting but includes phase info
+                    phase = data.get("phase", "").lower() if data.get("phase") else ""
+                    status = data.get("status", "").lower() if data.get("status") else ""
+                    message = data.get("message", "")
+
+                    # v119.0: 503 on startup endpoints with starting phase = STARTING, not UNHEALTHY
+                    if response.status == 503:
+                        # Check for starting indicators in response
+                        is_starting_phase = phase in ("starting", "initializing", "not_started", "loading")
+                        is_not_ready_status = status in ("not_ready", "starting", "initializing")
+                        has_starting_message = "starting" in message.lower() or "%" in message  # Progress %
+
+                        if is_starting_phase or is_not_ready_status or has_starting_message:
+                            # This is EXPECTED during startup - NOT a failure!
+                            startup_progress = None
+                            if "%" in message:
+                                try:
+                                    # Extract progress percentage from message like "Starting up (45% complete)"
+                                    import re
+                                    match = re.search(r"(\d+)%", message)
+                                    if match:
+                                        startup_progress = int(match.group(1))
+                                except Exception:
+                                    pass
+
+                            return HealthCheckResult(
+                                state=HealthState.STARTING,
+                                is_responding=True,
+                                status_text=f"HTTP 503 (startup in progress)",
+                                phase=phase,
+                                startup_step=message,
+                                startup_progress=startup_progress,
+                                raw_data=data
+                            )
+
+                    # Non-503 or 503 without starting indicators = unhealthy
                     return HealthCheckResult(
                         state=HealthState.UNHEALTHY,
                         is_responding=True,
                         status_text=f"HTTP {response.status}",
-                        error_message=f"Non-200 status code: {response.status}"
+                        error_message=f"Non-200 status code: {response.status} (phase={phase}, status={status})"
                     )
 
+                # 200 OK - continue with detailed analysis
                 try:
-                    data = await response.json()
+                    # data already loaded above
 
                     # Extract common fields
                     status = data.get("status", "").lower() if data.get("status") else ""
