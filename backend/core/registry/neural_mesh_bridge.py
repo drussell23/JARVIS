@@ -70,7 +70,8 @@ class BridgeMetrics:
     capability_queries_unified: int = 0
     capability_queries_mesh: int = 0
     event_propagations: int = 0
-    last_sync_time: Optional[float] = None
+    heartbeats_forwarded: int = 0  # v118.0: Track forwarded heartbeats
+    last_sync_time: Optional[float] = 0.0  # v118.0: Initialize to 0 for first sync check
     last_sync_duration_ms: float = 0.0
 
 
@@ -537,15 +538,31 @@ class NeuralMeshBridge:
         self._mesh_coordinator.registry.on_unregister(on_unregister)
 
     async def _sync_loop(self) -> None:
-        """Background sync loop."""
+        """
+        Background sync loop.
+
+        v118.0: Now also syncs heartbeats to prevent agents from going offline.
+        """
+        heartbeat_interval = 5.0  # v118.0: Forward heartbeats every 5 seconds
+
         while self._running:
             try:
-                await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+                # v118.0: Use shorter sleep for heartbeat forwarding
+                await asyncio.sleep(heartbeat_interval)
 
                 if not self._running:
                     break
 
-                await self.sync_all()
+                # v118.0: CRITICAL - Forward heartbeats first (more frequent)
+                # This prevents agents from timing out in unified registry
+                hb_count = await self._sync_heartbeats_mesh_to_unified()
+                if hb_count > 0:
+                    self.logger.debug(f"[v118.0] Forwarded {hb_count} heartbeats mesh→unified")
+
+                # Full sync less frequently (every SYNC_INTERVAL_SECONDS)
+                last_sync = self._metrics.last_sync_time or 0.0
+                if time.time() - last_sync >= SYNC_INTERVAL_SECONDS:
+                    await self.sync_all()
 
             except asyncio.CancelledError:
                 break
@@ -642,6 +659,58 @@ class NeuralMeshBridge:
         result.duration_ms = (time.time() - start_time) * 1000
 
         return result
+
+    async def _sync_heartbeats_mesh_to_unified(self) -> int:
+        """
+        v118.0: CRITICAL FIX - Forward heartbeats from mesh to unified registry.
+
+        This ensures that agents registered in the mesh also maintain heartbeats
+        in the unified registry, preventing them from being marked as offline.
+
+        Returns:
+            Number of heartbeats successfully forwarded
+        """
+        if not self._mesh_coordinator or not self._unified_registry:
+            return 0
+
+        heartbeats_forwarded = 0
+
+        try:
+            mesh_agents = await self._mesh_coordinator.registry.get_all_agents()
+
+            for agent in mesh_agents:
+                try:
+                    # Get the corresponding unified agent ID
+                    # Agents synced from mesh use agent_name as the ID
+                    unified_id = agent.metadata.get("unified_agent_id", agent.agent_name)
+
+                    # Forward heartbeat to unified registry
+                    # This keeps the agent alive in both registries
+                    success = await self._unified_registry.heartbeat(
+                        unified_id,
+                        load=getattr(agent, "load", 0.0),
+                        task_queue_size=getattr(agent, "task_queue_size", 0),
+                        health_score=getattr(agent, "health_score", 1.0),
+                    )
+
+                    if success:
+                        heartbeats_forwarded += 1
+                    else:
+                        # Agent might not exist in unified registry - sync it
+                        if agent.agent_name not in self._synced_from_mesh:
+                            await self._sync_single_mesh_to_unified(agent)
+                            heartbeats_forwarded += 1
+
+                except Exception as e:
+                    self.logger.debug(f"Heartbeat forward failed for {agent.agent_name}: {e}")
+
+            if heartbeats_forwarded > 0:
+                self._metrics.heartbeats_forwarded += heartbeats_forwarded
+
+        except Exception as e:
+            self.logger.error(f"Heartbeat sync error: {e}")
+
+        return heartbeats_forwarded
 
     async def _sync_single_unified_to_mesh(self, unified_agent: Any) -> bool:
         """Sync a single agent from unified to mesh."""

@@ -1180,12 +1180,51 @@ async def get_agent_registry() -> UnifiedAgentRegistry:
             _registry = UnifiedAgentRegistry()
             await _registry.start()
 
+            # v118.0: CRITICAL - Also start the NeuralMeshBridge for heartbeat forwarding
+            # This ensures agents in the mesh registry also send heartbeats to unified registry
+            try:
+                from backend.core.registry.neural_mesh_bridge import get_registry_bridge
+                # Fire-and-forget: start bridge in background
+                asyncio.create_task(
+                    _start_registry_bridge_safe(),
+                    name="registry_bridge_startup"
+                )
+            except ImportError:
+                pass  # Bridge not available
+
         return _registry
+
+
+async def _start_registry_bridge_safe() -> None:
+    """
+    v118.0: Safely start the registry bridge in background.
+
+    This is fire-and-forget to avoid blocking registry initialization.
+    """
+    try:
+        from backend.core.registry.neural_mesh_bridge import get_registry_bridge
+        await get_registry_bridge()
+        logging.getLogger("UnifiedAgentRegistry").info(
+            "[v118.0] NeuralMeshBridge started - heartbeat forwarding enabled"
+        )
+    except Exception as e:
+        logging.getLogger("UnifiedAgentRegistry").debug(
+            f"[v118.0] NeuralMeshBridge startup skipped: {e}"
+        )
 
 
 async def shutdown_agent_registry() -> None:
     """Shutdown the global agent registry."""
     global _registry
+
+    # v118.0: Also shutdown the bridge
+    try:
+        from backend.core.registry.neural_mesh_bridge import shutdown_registry_bridge
+        await shutdown_registry_bridge()
+    except ImportError:
+        pass
+    except Exception:
+        pass
 
     if _registry:
         await _registry.stop()
