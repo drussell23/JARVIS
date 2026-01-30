@@ -245,9 +245,11 @@ HEAVY_COMPONENT_MEMORY_ESTIMATES = {
     "agi_hub": 4000,           # AGI Hub with ML models
     "neural_mesh": 2000,       # Neural mesh system
     "jarvis_prime": 6000,      # Full JARVIS Prime (GGUF model)
-    "reactor_core": 1000,      # Reactor Core ML models
+    "reactor_core": 3000,      # v132.3: Reactor Core ML/autonomy (increased from 1000)
     "vision_system": 1500,     # Computer vision components
     "startup_initialization": 3000,  # Total startup initialization
+    "vosk": 2000,              # v132.3: Vosk speech recognition models
+    "whisper": 2000,           # v132.3: General whisper estimate
 
     # ML Models
     "whisper_large": 3000,     # Whisper large model

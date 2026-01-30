@@ -2655,6 +2655,12 @@ class ManagedProcess:
     gcp_offload_active: bool = False
     gcp_vm_ip: Optional[str] = None
 
+    # v132.3: Enhanced OOM tracking for crash recovery
+    _oom_detected: bool = False               # Set when SIGKILL (-9) detected
+    _gcp_offload_endpoint: Optional[str] = None  # GCP endpoint after OOM restart
+    degradation_tier: Optional[Any] = None    # Graceful degradation tier
+    oom_abort_reason: Optional[str] = None    # Reason if OOM prevention aborted
+
     # v95.0: Track last known health status for smarter heartbeat reporting
     last_known_health: str = "unknown"
     last_heartbeat_sent: float = 0.0
@@ -3506,7 +3512,8 @@ class ProcessOrchestrator:
                 return_code = managed.process.returncode
 
                 if return_code is not None:
-                    # Process has crashed!
+                    # v132.3: Process has exited - could be crash, OOM, or graceful shutdown
+                    # _handle_process_crash properly distinguishes between these cases
                     await self._handle_process_crash(managed, return_code)
 
             except asyncio.CancelledError:
@@ -3536,9 +3543,43 @@ class ProcessOrchestrator:
         crash_time = time.time()
         uptime = crash_time - (managed.last_restart or crash_time)
 
+        # v132.3: Check if this is a graceful exit (exit code 0)
+        is_graceful_exit = return_code == 0
+
         # v95.11: Check if this is a graceful shutdown, not a crash
         is_sigterm = return_code == -15 or return_code == 143
         is_shutdown_mode = self._shutdown_event.is_set() or self._shutdown_completed
+
+        # v132.3: Check for OOM kill (SIGKILL from kernel)
+        is_oom_kill = return_code == -9 or return_code == 137
+
+        # v132.3: Handle graceful exit (exit code 0) - NOT a crash
+        if is_graceful_exit:
+            # Check if process logs indicate intentional shutdown
+            crash_context = managed.get_crash_context(num_lines=10)
+            last_lines = crash_context.get("last_output_lines", []) + crash_context.get("last_stderr_lines", [])
+            last_lines_text = " ".join(last_lines).lower()
+
+            shutdown_indicators = ["shutdown", "shutting down", "exiting", "goodbye", "terminated gracefully"]
+            intentional_shutdown = any(ind in last_lines_text for ind in shutdown_indicators)
+
+            if intentional_shutdown or is_shutdown_mode:
+                logger.info(
+                    f"[v132.3] Service {service_name} exited gracefully (code 0) "
+                    f"(PID: {managed.pid}, uptime: {uptime:.1f}s)"
+                )
+                managed.status = ServiceStatus.STOPPED
+                managed.process = None
+                return
+            else:
+                # Exit code 0 but no shutdown indicators - might be unexpected
+                logger.info(
+                    f"[v132.3] Service {service_name} exited with code 0 (non-error) "
+                    f"(PID: {managed.pid}, uptime: {uptime:.1f}s) - treating as graceful stop"
+                )
+                managed.status = ServiceStatus.STOPPED
+                managed.process = None
+                return
 
         if is_sigterm and is_shutdown_mode:
             # This is expected during graceful shutdown - don't log as crash
@@ -3550,6 +3591,16 @@ class ProcessOrchestrator:
             managed.status = ServiceStatus.STOPPED
             managed.process = None
             return
+
+        # v132.3: Handle OOM kill - trigger GCP offload for restart
+        if is_oom_kill:
+            logger.warning(
+                f"[v132.3] 🔴 OOM DETECTED: Service {service_name} killed by SIGKILL "
+                f"(PID: {managed.pid}, uptime: {uptime:.1f}s, exit code: {return_code})"
+            )
+            # Flag for GCP-assisted restart
+            managed._oom_detected = True
+            # Continue to crash handling but will trigger GCP offload
 
         # v95.11: Check for startup-phase termination (very short uptime + SIGTERM)
         # This might indicate the service was killed before fully starting
@@ -3654,13 +3705,72 @@ class ProcessOrchestrator:
         managed.last_restart = time.time()
         managed.status = ServiceStatus.RESTARTING
 
+        # v132.3: If OOM was detected, trigger GCP offload before restart
+        oom_detected = getattr(managed, "_oom_detected", False)
+        gcp_offload_active = False
+
+        if oom_detected:
+            logger.info(f"[v132.3] 🚀 OOM detected - initiating GCP Spot VM offload for {service_name}")
+            try:
+                # v132.3: Use module-level imports if available, fallback to dynamic import
+                if _OOM_PREVENTION_AVAILABLE and _check_memory_before_heavy_init and _MemoryDecision:
+                    check_memory_before_heavy_init = _check_memory_before_heavy_init
+                    MemoryDecision = _MemoryDecision
+                else:
+                    try:
+                        from backend.core.gcp_oom_prevention_bridge import (
+                            check_memory_before_heavy_init,
+                            MemoryDecision,
+                        )
+                    except ImportError:
+                        from core.gcp_oom_prevention_bridge import (
+                            check_memory_before_heavy_init,
+                            MemoryDecision,
+                        )
+
+                # Check memory and trigger GCP offload
+                mem_result = await check_memory_before_heavy_init(
+                    component=service_name,
+                    estimated_mb=4096,  # Conservative estimate for crashed service
+                    auto_offload=True,
+                )
+
+                if mem_result.gcp_vm_ready and mem_result.gcp_vm_ip:
+                    logger.info(
+                        f"[v132.3] ✅ GCP Spot VM ready for {service_name}: {mem_result.gcp_vm_ip}"
+                    )
+                    gcp_offload_active = True
+                    # Store GCP endpoint for the service to use
+                    managed._gcp_offload_endpoint = mem_result.gcp_vm_ip
+                elif mem_result.decision == MemoryDecision.ABORT:
+                    logger.error(
+                        f"[v132.3] ❌ Memory critical, GCP unavailable - cannot safely restart {service_name}"
+                    )
+                    managed.status = ServiceStatus.FAILED
+                    return
+                else:
+                    logger.warning(
+                        f"[v132.3] ⚠️ GCP offload not available - attempting local restart with caution"
+                    )
+                    # Clear OOM flag to allow local retry
+                    managed._oom_detected = False
+            except ImportError:
+                logger.warning(f"[v132.3] GCP OOM bridge not available - attempting local restart")
+            except Exception as e:
+                logger.warning(f"[v132.3] GCP offload failed: {e} - attempting local restart")
+
         try:
             # Use the existing _spawn_service method which handles the full spawn lifecycle
             success = await self._spawn_service(managed)
             if success:
-                logger.info(f"[v95.9] ✅ {service_name} restarted successfully")
+                if gcp_offload_active:
+                    logger.info(f"[v132.3] ✅ {service_name} restarted with GCP offload support")
+                else:
+                    logger.info(f"[v95.9] ✅ {service_name} restarted successfully")
                 # Reset circuit breaker on successful restart
                 self._crash_circuit_breakers[service_name] = False
+                # Clear OOM flag
+                managed._oom_detected = False
             else:
                 logger.error(f"[v95.9] ❌ {service_name} restart failed")
         except Exception as e:
@@ -11850,12 +11960,25 @@ echo "=== JARVIS Prime started ==="
         # detecting low memory BEFORE starting JARVIS Prime and offloading to GCP.
         # =========================================================================
         if _OOM_PREVENTION_AVAILABLE and _check_memory_before_heavy_init and _MemoryDecision:
-            # Check if this is a heavy service that needs memory check
-            heavy_services = ["jarvis-prime", "jarvis_prime", "j-prime"]
+            # v132.3: Extended heavy services list - includes all memory-intensive processes
+            heavy_services = [
+                "jarvis-prime", "jarvis_prime", "j-prime",  # JARVIS Prime (LLM/GGUF models)
+                "reactor-core", "reactor_core", "r-core",   # Reactor Core (ML/autonomy)
+                "vosk", "whisper", "speech-recognition",    # Speech models
+                "llm-service", "model-server",              # Model servers
+            ]
             if definition.name.lower() in heavy_services:
                 try:
-                    # JARVIS Prime typically needs ~6GB for GGUF model loading
-                    estimated_mb = HEAVY_COMPONENT_MEMORY_ESTIMATES.get("jarvis_prime", 6000)
+                    # v132.3: Dynamic memory estimation based on service type
+                    service_lower = definition.name.lower()
+                    if "prime" in service_lower:
+                        estimated_mb = HEAVY_COMPONENT_MEMORY_ESTIMATES.get("jarvis_prime", 6000)
+                    elif "reactor" in service_lower:
+                        estimated_mb = HEAVY_COMPONENT_MEMORY_ESTIMATES.get("reactor_core", 4000)
+                    elif "vosk" in service_lower or "whisper" in service_lower:
+                        estimated_mb = HEAVY_COMPONENT_MEMORY_ESTIMATES.get("vosk", 2000)
+                    else:
+                        estimated_mb = HEAVY_COMPONENT_MEMORY_ESTIMATES.get(service_lower, 3000)
 
                     logger.info(f"[OOM Prevention] Checking memory before starting {definition.name}")
                     memory_result = await _check_memory_before_heavy_init(
