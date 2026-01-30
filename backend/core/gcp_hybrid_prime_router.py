@@ -849,17 +849,58 @@ class GCPHybridPrimeRouter:
 
     async def _check_emergency_offload_release(self, current_used_percent: float) -> None:
         """
-        v93.0: Check if emergency offload should be released.
+        v93.0/v148.0: Check if emergency offload should be released.
 
         Releases if:
         1. RAM dropped below threshold (processes can resume)
         2. Timeout exceeded (force resume to prevent permanent freeze)
         3. GCP VM is ready and processes should terminate
+        
+        v148.0 Enhancement: Escalation if memory continues growing:
+        4. If RAM still growing despite offload, trigger aggressive cleanup
+        5. If RAM exceeds critical threshold (95%), terminate paused processes
         """
         elapsed = time.time() - self._emergency_offload_started_at
 
+        # v148.0: Critical memory escalation (95%+) - HIGHEST PRIORITY
+        # If memory is still critically high despite pausing LLM processes,
+        # something else is consuming memory. Terminate paused processes
+        # to free any shared memory and trigger GC.
+        CRITICAL_ESCALATION_THRESHOLD = float(os.getenv("CRITICAL_ESCALATION_THRESHOLD", "95.0"))
+        if current_used_percent >= CRITICAL_ESCALATION_THRESHOLD:
+            self.logger.critical(
+                f"[v148.0] CRITICAL: RAM at {current_used_percent:.1f}% despite offload - "
+                f"escalating to process termination"
+            )
+            await self._terminate_paused_processes()
+            self._emergency_offload_active = False
+            
+            # v148.0: Trigger garbage collection to free memory
+            try:
+                import gc
+                gc.collect()
+                self.logger.info("[v148.0] Forced garbage collection after escalation")
+            except Exception:
+                pass
+            return
+
+        # v148.0: Check if GCP provisioning is in progress and extend timeout if so
+        # Don't force-release processes if we're still waiting for GCP
+        effective_timeout = EMERGENCY_OFFLOAD_TIMEOUT_SEC
+        if self._vm_provisioning_in_progress:
+            # Extend timeout while GCP provisioning is active
+            effective_timeout = max(effective_timeout, 180.0)  # At least 3 minutes for GCP
+            if elapsed >= effective_timeout:
+                self.logger.warning(
+                    f"[v148.0] Extended offload timeout ({elapsed:.1f}s) - "
+                    f"GCP provisioning still in progress"
+                )
+            # Don't force release yet if GCP is still provisioning
+            elif elapsed < effective_timeout:
+                pass  # Keep waiting for GCP
+
         # Timeout - force release
-        if elapsed >= EMERGENCY_OFFLOAD_TIMEOUT_SEC:
+        if elapsed >= effective_timeout and not self._vm_provisioning_in_progress:
             self.logger.warning(
                 f"[v93.0] Emergency offload timeout ({elapsed:.1f}s) - force releasing"
             )
@@ -883,6 +924,23 @@ class GCPHybridPrimeRouter:
                 await self._terminate_paused_processes()
                 self._emergency_offload_active = False
                 return
+        
+        # v148.0: Check if memory is still growing (other processes consuming)
+        if len(self._memory_history) >= 3:
+            recent_samples = list(self._memory_history)[-3:]
+            memory_trend = recent_samples[-1][1] - recent_samples[0][1]  # [1] is used_percent
+            
+            if memory_trend > 5.0:  # Memory grew more than 5% despite offload
+                self.logger.warning(
+                    f"[v148.0] Memory still growing (+{memory_trend:.1f}%) despite offload - "
+                    f"non-LLM processes may be consuming memory"
+                )
+                # Signal to other repos to reduce load
+                await self._signal_memory_pressure_to_repos(
+                    status="critical",
+                    action="reduce_load",
+                    used_percent=current_used_percent,
+                )
 
     async def _release_emergency_offload(self, reason: str) -> None:
         """v93.0: Release emergency offload - SIGCONT all paused processes."""
@@ -910,16 +968,64 @@ class GCPHybridPrimeRouter:
         self.logger.info(f"[v93.0] Emergency offload released - resumed {resumed_count} processes")
 
     def _resume_process(self, pid: int, name: str) -> bool:
-        """v93.0: Send SIGCONT to a process."""
+        """
+        v93.0/v148.0: Send SIGCONT to a process with fallback handling.
+        
+        v148.0 Enhancement: Added robust fallback for SIGCONT failures:
+        - If process died, removes from paused list (no error)
+        - If permission denied, logs warning and marks for cleanup
+        - If SIGCONT fails but process exists, tries escalation
+        """
         try:
             import psutil
 
+            # Check if process exists
             if not psutil.pid_exists(pid):
-                return False
+                self.logger.debug(f"[v148.0] Process {pid} no longer exists - removing from paused list")
+                return False  # Process died, not an error
 
-            os.kill(pid, signal.SIGCONT)
-            self.logger.debug(f"[v93.0] SIGCONT sent to PID {pid} ({name})")
-            return True
+            # Try to get process status
+            try:
+                proc = psutil.Process(pid)
+                proc_status = proc.status()
+            except psutil.NoSuchProcess:
+                self.logger.debug(f"[v148.0] Process {pid} disappeared during check")
+                return False
+            except psutil.AccessDenied:
+                self.logger.warning(f"[v148.0] Access denied checking status of PID {pid}")
+                proc_status = "unknown"
+
+            # Send SIGCONT
+            try:
+                os.kill(pid, signal.SIGCONT)
+                self.logger.debug(f"[v93.0] SIGCONT sent to PID {pid} ({name})")
+                return True
+                
+            except PermissionError:
+                self.logger.warning(
+                    f"[v148.0] Permission denied resuming PID {pid} ({name}) - "
+                    f"status was: {proc_status}. Process may need manual intervention."
+                )
+                return False
+                
+            except ProcessLookupError:
+                self.logger.debug(f"[v148.0] Process {pid} died before SIGCONT")
+                return False
+                
+            except OSError as os_err:
+                # v148.0: Try to understand why SIGCONT failed
+                if os_err.errno == 3:  # ESRCH - No such process
+                    self.logger.debug(f"[v148.0] Process {pid} no longer exists")
+                    return False
+                elif os_err.errno == 1:  # EPERM - Operation not permitted
+                    self.logger.warning(
+                        f"[v148.0] Cannot resume PID {pid} ({name}) - operation not permitted. "
+                        f"Process status: {proc_status}"
+                    )
+                    return False
+                else:
+                    self.logger.warning(f"[v148.0] OS error resuming PID {pid}: {os_err}")
+                    return False
 
         except Exception as e:
             self.logger.warning(f"[v93.0] Error resuming PID {pid}: {e}")

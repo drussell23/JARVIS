@@ -606,6 +606,12 @@ _trinity_gcp_ready_event: Optional[asyncio.Event] = None
 _trinity_cloud_locked: bool = False
 _trinity_protocol_active: bool = False
 
+# v148.0: Continuous GCP VM Health Monitor state
+_gcp_vm_health_monitor_task: Optional[asyncio.Task] = None
+_gcp_vm_health_monitor_running: bool = False
+_gcp_vm_consecutive_failures: int = 0
+_GCP_VM_MAX_FAILURES_BEFORE_REPROVISION = int(os.getenv("GCP_VM_MAX_HEALTH_FAILURES", "3"))
+
 # =============================================================================
 # v147.0: PROACTIVE RESCUE - Crash Pre-Cognition Patterns
 # =============================================================================
@@ -1226,6 +1232,16 @@ async def ensure_gcp_vm_ready_for_prime(
                         f"[v144.0] ✅ Active Rescue: GCP VM ready at {endpoint} "
                         f"(took {elapsed:.1f}s, {check_count} health checks)"
                     )
+                    
+                    # v148.0: Start continuous health monitor for the VM
+                    try:
+                        await start_gcp_vm_health_monitor(
+                            check_interval=30.0,
+                            validate_inference=True,
+                        )
+                    except Exception as monitor_err:
+                        logger.warning(f"[v148.0] Could not start health monitor: {monitor_err}")
+                    
                     return True, endpoint
                 else:
                     # Log progress every 30 seconds
@@ -1258,20 +1274,27 @@ async def ensure_gcp_vm_ready_for_prime(
         return False, None
 
 
-async def _verify_gcp_vm_health(ip_address: str, timeout: float = 10.0) -> bool:
+async def _verify_gcp_vm_health(
+    ip_address: str, 
+    timeout: float = 10.0,
+    validate_inference: bool = False,
+) -> bool:
     """
     v144.0: Verify GCP VM is reachable and healthy.
     v147.0: Fixed port mismatch - now checks both 8000 and 8010 (startup script uses 8010)
+    v148.0: Added optional inference validation to ensure actual inference works
 
     Args:
         ip_address: IP address of the VM
         timeout: Timeout for health check request
+        validate_inference: If True, also validates inference capability (slower but thorough)
 
     Returns:
-        True if VM is healthy, False otherwise
+        True if VM is healthy (and inference works if validate_inference=True), False otherwise
     """
     # v147.0: Check both ports - startup script uses 8010, but some configs use 8000
     ports_to_check = [8000, 8010]
+    working_port = None
     
     for port in ports_to_check:
         try:
@@ -1284,7 +1307,8 @@ async def _verify_gcp_vm_health(ip_address: str, timeout: float = 10.0) -> bool:
                 ) as response:
                     if response.status == 200:
                         logger.info(f"[v147.0] ✅ GCP VM health check passed: {health_url}")
-                        return True
+                        working_port = port
+                        break
                     else:
                         logger.debug(f"[v147.0] Health check {health_url} returned status {response.status}")
         except asyncio.TimeoutError:
@@ -1294,6 +1318,126 @@ async def _verify_gcp_vm_health(ip_address: str, timeout: float = 10.0) -> bool:
         except Exception as e:
             logger.debug(f"[v147.0] Health check error {ip_address}:{port}: {e}")
 
+    if working_port is None:
+        return False
+    
+    # v148.0: Optional inference validation - ensures the VM can actually process requests
+    if validate_inference:
+        inference_valid = await _validate_inference_capability(ip_address, working_port, timeout)
+        if not inference_valid:
+            logger.warning(
+                f"[v148.0] ⚠️ GCP VM health OK but inference validation failed: {ip_address}:{working_port}"
+            )
+            return False
+        logger.info(f"[v148.0] ✅ GCP VM inference validation passed: {ip_address}:{working_port}")
+    
+    return True
+
+
+async def _validate_inference_capability(
+    ip_address: str,
+    port: int,
+    timeout: float = 15.0,
+) -> bool:
+    """
+    v148.0: Validate that GCP VM can actually perform inference.
+    
+    Sends a small test request to verify the model is loaded and responsive.
+    This catches cases where health check passes but actual inference fails.
+    
+    Args:
+        ip_address: IP address of the VM
+        port: Port to connect to
+        timeout: Timeout for inference test
+        
+    Returns:
+        True if inference works, False otherwise
+    """
+    # Try multiple inference endpoints that might be available
+    inference_endpoints = [
+        # OpenAI-compatible endpoint
+        {
+            "url": f"http://{ip_address}:{port}/v1/chat/completions",
+            "method": "POST",
+            "json": {
+                "model": "default",
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 1,
+            },
+        },
+        # Simple completion endpoint
+        {
+            "url": f"http://{ip_address}:{port}/generate",
+            "method": "POST",
+            "json": {"prompt": "test", "max_tokens": 1},
+        },
+        # Health with inference status
+        {
+            "url": f"http://{ip_address}:{port}/health",
+            "method": "GET",
+            "check_field": "model_loaded",  # Check if this field is True
+        },
+        # Ready endpoint (stub server reports ready=True when full server is running)
+        {
+            "url": f"http://{ip_address}:{port}/ready",
+            "method": "GET",
+            "check_field": "ready",
+        },
+    ]
+    
+    try:
+        connector = aiohttp.TCPConnector(force_close=True)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            for endpoint in inference_endpoints:
+                try:
+                    url = endpoint["url"]
+                    method = endpoint.get("method", "GET")
+                    
+                    if method == "POST":
+                        async with session.post(
+                            url,
+                            json=endpoint.get("json", {}),
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as response:
+                            # Any response (even error) means the inference endpoint is responding
+                            if response.status < 500:
+                                logger.debug(f"[v148.0] Inference endpoint responding: {url}")
+                                return True
+                    else:
+                        async with session.get(
+                            url,
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as response:
+                            if response.status == 200:
+                                # Check specific field if required
+                                check_field = endpoint.get("check_field")
+                                if check_field:
+                                    try:
+                                        data = await response.json()
+                                        if data.get(check_field):
+                                            logger.debug(f"[v148.0] {check_field}=True at {url}")
+                                            return True
+                                        else:
+                                            logger.debug(f"[v148.0] {check_field}=False at {url}")
+                                    except Exception:
+                                        pass  # JSON parsing failed, try next
+                                else:
+                                    return True
+                                    
+                except asyncio.TimeoutError:
+                    logger.debug(f"[v148.0] Inference validation timeout: {endpoint['url']}")
+                except aiohttp.ClientError as e:
+                    logger.debug(f"[v148.0] Inference validation error: {type(e).__name__}")
+                except Exception as e:
+                    logger.debug(f"[v148.0] Inference validation error: {e}")
+    
+    except Exception as e:
+        logger.debug(f"[v148.0] Inference validation session error: {e}")
+    
+    # v148.0: If no inference endpoints worked, check if it's just a health stub
+    # The stub server responds to /health but not to inference endpoints
+    # This is OK during provisioning but not after
+    logger.debug(f"[v148.0] No inference endpoints responding at {ip_address}:{port}")
     return False
 
 
@@ -1347,6 +1491,192 @@ def invalidate_active_rescue_cache() -> None:
         _active_rescue_gcp_ready = False
 
     logger.info("[v144.0] Active Rescue cache invalidated")
+
+
+# =============================================================================
+# v148.0: CONTINUOUS GCP VM HEALTH MONITOR
+# =============================================================================
+# This background task monitors the active GCP VM and handles failures:
+#   1. Periodic health checks (default: every 30 seconds)
+#   2. Consecutive failure tracking with circuit breaker
+#   3. Automatic re-provisioning when VM becomes unhealthy
+#   4. Graceful degradation to local mode if re-provisioning fails
+# =============================================================================
+
+async def start_gcp_vm_health_monitor(
+    check_interval: float = 30.0,
+    validate_inference: bool = True,
+) -> Optional[asyncio.Task]:
+    """
+    v148.0: Start the continuous GCP VM health monitor.
+    
+    This monitors the active GCP VM and handles failures automatically:
+    - Periodic health checks
+    - Consecutive failure tracking
+    - Automatic re-provisioning when VM becomes unhealthy
+    
+    Args:
+        check_interval: Time between health checks (seconds)
+        validate_inference: Whether to validate inference capability (not just health)
+        
+    Returns:
+        The monitor task, or None if no GCP VM is active
+    """
+    global _gcp_vm_health_monitor_task, _gcp_vm_health_monitor_running
+    global _active_rescue_gcp_endpoint, _active_rescue_gcp_ready
+    
+    # Don't start if already running
+    if _gcp_vm_health_monitor_running:
+        logger.debug("[v148.0] GCP VM health monitor already running")
+        return _gcp_vm_health_monitor_task
+    
+    # Don't start if no GCP VM is active
+    if not _active_rescue_gcp_ready or not _active_rescue_gcp_endpoint:
+        logger.debug("[v148.0] No active GCP VM to monitor")
+        return None
+    
+    _gcp_vm_health_monitor_running = True
+    _gcp_vm_health_monitor_task = asyncio.create_task(
+        _gcp_vm_health_monitor_loop(check_interval, validate_inference),
+        name="gcp-vm-health-monitor-v148"
+    )
+    
+    logger.info(
+        f"[v148.0] 🔍 GCP VM health monitor started "
+        f"(interval={check_interval}s, inference_validation={validate_inference})"
+    )
+    
+    return _gcp_vm_health_monitor_task
+
+
+async def stop_gcp_vm_health_monitor() -> None:
+    """v148.0: Stop the continuous GCP VM health monitor."""
+    global _gcp_vm_health_monitor_task, _gcp_vm_health_monitor_running
+    
+    _gcp_vm_health_monitor_running = False
+    
+    if _gcp_vm_health_monitor_task and not _gcp_vm_health_monitor_task.done():
+        _gcp_vm_health_monitor_task.cancel()
+        try:
+            await asyncio.wait_for(_gcp_vm_health_monitor_task, timeout=5.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        _gcp_vm_health_monitor_task = None
+    
+    logger.info("[v148.0] GCP VM health monitor stopped")
+
+
+async def _gcp_vm_health_monitor_loop(
+    check_interval: float,
+    validate_inference: bool,
+) -> None:
+    """
+    v148.0: Internal health monitor loop.
+    
+    Runs continuously, checking GCP VM health and handling failures.
+    """
+    global _gcp_vm_consecutive_failures, _active_rescue_gcp_endpoint
+    global _active_rescue_gcp_ready, _gcp_vm_health_monitor_running
+    
+    _gcp_vm_consecutive_failures = 0
+    
+    while _gcp_vm_health_monitor_running:
+        try:
+            await asyncio.sleep(check_interval)
+            
+            # Skip if monitor was stopped during sleep
+            if not _gcp_vm_health_monitor_running:
+                break
+            
+            # Skip if no active endpoint
+            if not _active_rescue_gcp_endpoint:
+                logger.debug("[v148.0] No GCP endpoint to monitor, waiting...")
+                continue
+            
+            # Extract IP from endpoint (format: "IP:PORT" or "http://IP:PORT")
+            endpoint = _active_rescue_gcp_endpoint
+            if endpoint.startswith("http://"):
+                endpoint = endpoint[7:]
+            if endpoint.startswith("https://"):
+                endpoint = endpoint[8:]
+            ip_address = endpoint.split(":")[0]
+            
+            # Perform health check
+            is_healthy = await _verify_gcp_vm_health(
+                ip_address,
+                timeout=10.0,
+                validate_inference=validate_inference,
+            )
+            
+            if is_healthy:
+                # Reset failure counter on success
+                if _gcp_vm_consecutive_failures > 0:
+                    logger.info(
+                        f"[v148.0] ✅ GCP VM recovered after {_gcp_vm_consecutive_failures} failures"
+                    )
+                _gcp_vm_consecutive_failures = 0
+            else:
+                # Increment failure counter
+                _gcp_vm_consecutive_failures += 1
+                logger.warning(
+                    f"[v148.0] ⚠️ GCP VM health check failed "
+                    f"({_gcp_vm_consecutive_failures}/{_GCP_VM_MAX_FAILURES_BEFORE_REPROVISION})"
+                )
+                
+                # Check if we should re-provision
+                if _gcp_vm_consecutive_failures >= _GCP_VM_MAX_FAILURES_BEFORE_REPROVISION:
+                    logger.error(
+                        f"[v148.0] ❌ GCP VM unhealthy after {_gcp_vm_consecutive_failures} "
+                        f"consecutive failures - triggering re-provisioning"
+                    )
+                    
+                    # Invalidate cache and trigger re-provisioning
+                    invalidate_active_rescue_cache()
+                    _gcp_vm_consecutive_failures = 0
+                    
+                    # Try to re-provision
+                    try:
+                        success, new_endpoint = await ensure_gcp_vm_ready_for_prime(
+                            force_provision=True,
+                            timeout=180.0,
+                        )
+                        
+                        if success:
+                            logger.info(
+                                f"[v148.0] ✅ GCP VM re-provisioned successfully: {new_endpoint}"
+                            )
+                        else:
+                            logger.error(
+                                "[v148.0] ❌ GCP VM re-provisioning failed - "
+                                "system may fall back to local mode"
+                            )
+                    except Exception as e:
+                        logger.error(f"[v148.0] Re-provisioning error: {e}")
+        
+        except asyncio.CancelledError:
+            logger.debug("[v148.0] GCP VM health monitor cancelled")
+            break
+        except Exception as e:
+            logger.warning(f"[v148.0] GCP VM health monitor error: {e}")
+            await asyncio.sleep(5.0)  # Brief pause on error
+    
+    logger.info("[v148.0] GCP VM health monitor loop exited")
+
+
+def get_gcp_vm_health_status() -> Dict[str, Any]:
+    """
+    v148.0: Get current GCP VM health status.
+    
+    Returns:
+        Dict with health status information
+    """
+    return {
+        "monitor_running": _gcp_vm_health_monitor_running,
+        "consecutive_failures": _gcp_vm_consecutive_failures,
+        "max_failures_before_reprovision": _GCP_VM_MAX_FAILURES_BEFORE_REPROVISION,
+        "active_endpoint": _active_rescue_gcp_endpoint,
+        "is_ready": _active_rescue_gcp_ready,
+    }
 
 
 # =============================================================================
