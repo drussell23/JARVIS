@@ -1818,21 +1818,60 @@ class DynamicComponentManager:
         if not hasattr(self, '_last_pressure_log_time'):
             self._last_pressure_log_time = {}
             self._last_logged_pressure = None
+            self._startup_time = current_time  # v137.2: Track startup for grace period
         
-        # For low/medium pressure, only log every 60 seconds max
-        # For high/critical/emergency, always log (these are actionable)
+        # v137.2: Enhanced intelligent pressure logging
+        # - EMERGENCY/CRITICAL: Always log immediately (actionable)
+        # - HIGH: Log on change, every 30 seconds
+        # - MEDIUM: Log on change, every 120 seconds (not actionable, just informational)
+        # - LOW: Only log at DEBUG level (expected during normal operation)
         should_log = False
-        if pressure in (MemoryPressure.HIGH, MemoryPressure.CRITICAL, MemoryPressure.EMERGENCY):
-            # Always log high/critical/emergency
+        log_level = "info"
+        
+        # Grace period: don't spam during first 60 seconds of startup
+        in_startup_grace = (current_time - self._startup_time) < 60
+        
+        if pressure in (MemoryPressure.CRITICAL, MemoryPressure.EMERGENCY):
+            # Always log critical/emergency - these need immediate attention
             should_log = True
-        elif pressure != self._last_logged_pressure:
-            # Log state changes, but rate limit to once per 60 seconds
+            log_level = "warning"
+        elif pressure == MemoryPressure.HIGH:
+            # Log high pressure on state change or every 30 seconds
             last_log_time = self._last_pressure_log_time.get(pressure.value, 0)
-            if current_time - last_log_time > 60:
+            if pressure != self._last_logged_pressure or (current_time - last_log_time > 30):
                 should_log = True
+                log_level = "info"
+        elif pressure == MemoryPressure.MEDIUM:
+            # Log medium pressure only on state change, with 120s rate limit
+            last_log_time = self._last_pressure_log_time.get(pressure.value, 0)
+            if pressure != self._last_logged_pressure and (current_time - last_log_time > 120):
+                should_log = not in_startup_grace  # Skip during startup
+                log_level = "debug"  # Downgrade to debug - not actionable
+        elif pressure == MemoryPressure.LOW:
+            # Low pressure is expected - only log at debug on state transition
+            if pressure != self._last_logged_pressure:
+                should_log = not in_startup_grace
+                log_level = "debug"
         
         if should_log:
-            logger.info(f"⚠️ Memory pressure: {pressure.value}")
+            # v137.2: Add context about available memory
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                available_gb = mem.available / (1024 ** 3)
+                used_percent = mem.percent
+                context = f" (available: {available_gb:.1f}GB, used: {used_percent:.0f}%)"
+            except Exception:
+                context = ""
+            
+            msg = f"Memory pressure: {pressure.value}{context}"
+            if log_level == "warning":
+                logger.warning(f"⚠️ {msg}")
+            elif log_level == "debug":
+                logger.debug(f"📊 {msg}")
+            else:
+                logger.info(f"📊 {msg}")
+            
             self._last_pressure_log_time[pressure.value] = current_time
             self._last_logged_pressure = pressure
 

@@ -2265,12 +2265,32 @@ class GCPVMManager:
                                 # Unknown state - warning
                                 logger.warning(f"⚠️  VM {vm_name} in unexpected state: {vm.state.value}")
 
-                        # v132.2: Only log efficiency warnings for RUNNING VMs (not during shutdown)
+                        # v137.2: Intelligent efficiency warnings with grace period and rate limiting
+                        # - Skip during VM startup grace period (first 5 minutes)
+                        # - Rate limit warnings to once every 5 minutes per VM
+                        # - Only warn for RUNNING VMs (not during shutdown)
                         if vm.state == VMState.RUNNING and vm.cost_efficiency_score < 50:
-                            logger.warning(
-                                f"⚠️  VM {vm_name} low efficiency: {vm.cost_efficiency_score:.1f}% "
-                                f"(idle: {vm.idle_time_minutes:.1f}m)"
+                            vm_startup_minutes = vm.uptime_hours * 60
+                            startup_grace_minutes = 5.0  # Don't warn during first 5 minutes
+                            
+                            # Initialize rate limiting tracker if needed
+                            if not hasattr(self, '_efficiency_warning_times'):
+                                self._efficiency_warning_times: Dict[str, float] = {}
+                            
+                            last_warning = self._efficiency_warning_times.get(vm_name, 0)
+                            warning_interval = 300  # 5 minutes between warnings
+                            
+                            should_warn = (
+                                vm_startup_minutes > startup_grace_minutes and  # Past grace period
+                                time.time() - last_warning > warning_interval  # Rate limited
                             )
+                            
+                            if should_warn:
+                                logger.warning(
+                                    f"⚠️  VM {vm_name} low efficiency: {vm.cost_efficiency_score:.1f}% "
+                                    f"(idle: {vm.idle_time_minutes:.1f}m, uptime: {vm.uptime_hours:.1f}h)"
+                                )
+                                self._efficiency_warning_times[vm_name] = time.time()
 
                     except Exception as metrics_error:
                         logger.debug(f"Could not collect metrics for {vm_name}: {metrics_error}")
