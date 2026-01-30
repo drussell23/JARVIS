@@ -244,13 +244,25 @@ class GlobalProcessRegistry:
         return None
 
     @classmethod
-    def load_from_disk(cls) -> None:
+    def load_from_disk(cls, current_session_only: bool = True) -> None:
         """
-        v117.4: Load registry from disk with corruption recovery.
+        v140.0: Load registry from disk with INTELLIGENT STALE PROCESS DETECTION.
 
-        Validates PIDs still exist before adding to memory.
-        Handles JSON corruption gracefully.
+        This is the key fix for the "protected PID" issue where stale processes
+        from PREVIOUS sessions were being incorrectly protected.
+
+        Args:
+            current_session_only: If True, only load PIDs from the CURRENT session.
+                                  If False, load all still-running PIDs (legacy behavior).
+
+        The v140.0 enhancement:
+        - Each registered PID has a `session_id` (the parent supervisor PID at spawn time)
+        - When loading, we compare the stored session_id against the CURRENT supervisor PID
+        - PIDs from different sessions are considered STALE and are NOT protected
+        - This prevents the "protected PID" deadlock when a stale process holds a port
         """
+        current_supervisor_pid = os.getpid()
+
         try:
             if cls._registry_file.exists():
                 try:
@@ -268,9 +280,11 @@ class GlobalProcessRegistry:
                     cls._registry_file.unlink(missing_ok=True)
                     return
 
-                # Validate PIDs still exist and sanitize data
+                # v140.0: Validate PIDs with SESSION AWARENESS
                 loaded_count = 0
                 skipped_dead = 0
+                skipped_stale_session = 0
+
                 with cls._lock:
                     for pid_str, info in data.items():
                         try:
@@ -278,6 +292,29 @@ class GlobalProcessRegistry:
                         except (ValueError, TypeError):
                             continue  # Skip invalid PID entries
 
+                        # v140.0: Check if this PID is from the CURRENT session
+                        stored_session_id = info.get("session_id")
+                        if current_session_only and stored_session_id != current_supervisor_pid:
+                            # This PID is from a DIFFERENT session - it's STALE
+                            # Don't load it into the registry (so it won't be protected)
+                            try:
+                                os.kill(pid, 0)  # Check if still running
+                                # Process exists but from old session - LOG but don't protect
+                                component = info.get("component", "unknown")
+                                port = info.get("port", "unknown")
+                                logger.info(
+                                    f"[ProcessRegistry] v140.0: 🔍 STALE PID {pid} detected "
+                                    f"({component} on port {port}) from session {stored_session_id}. "
+                                    f"Current session: {current_supervisor_pid}. "
+                                    f"NOT loading as protected - can be cleaned up."
+                                )
+                                skipped_stale_session += 1
+                            except OSError:
+                                # Process doesn't exist anyway
+                                skipped_dead += 1
+                            continue
+
+                        # PID is from current session (or we're not filtering by session)
                         try:
                             os.kill(pid, 0)  # Check if process exists
                             cls._pids[pid] = info
@@ -285,17 +322,154 @@ class GlobalProcessRegistry:
                         except OSError:
                             skipped_dead += 1  # Process no longer exists
 
-                if skipped_dead > 0:
+                # v140.0: Enhanced logging
+                if skipped_stale_session > 0:
+                    logger.info(
+                        f"[ProcessRegistry] v140.0: 🧹 Session cleanup - "
+                        f"Loaded {loaded_count} current PIDs, "
+                        f"skipped {skipped_stale_session} stale (from previous sessions), "
+                        f"skipped {skipped_dead} dead"
+                    )
+                elif skipped_dead > 0:
                     logger.info(
                         f"[ProcessRegistry] v117.4: Loaded {loaded_count} PIDs, "
                         f"skipped {skipped_dead} dead processes"
                     )
-                    # Persist cleaned version
-                    cls._persist()
                 else:
                     logger.debug(f"[ProcessRegistry] Loaded {loaded_count} PIDs from disk")
+
+                # Persist cleaned version
+                if skipped_dead > 0 or skipped_stale_session > 0:
+                    cls._persist()
+
         except Exception as e:
             logger.warning(f"[ProcessRegistry] v117.4: Load failed, starting fresh: {e}")
+
+    @classmethod
+    def get_stale_pids(cls) -> Dict[int, Dict[str, Any]]:
+        """
+        v140.0: Get PIDs from PREVIOUS sessions that are still running.
+
+        These are "stale" processes that can be safely cleaned up because
+        they belong to a supervisor session that is no longer active.
+
+        Returns:
+            Dict of stale PIDs with their metadata
+        """
+        current_supervisor_pid = os.getpid()
+        stale_pids: Dict[int, Dict[str, Any]] = {}
+
+        try:
+            if not cls._registry_file.exists():
+                return {}
+
+            with open(cls._registry_file) as f:
+                data = json.load(f)
+
+            for pid_str, info in data.items():
+                try:
+                    pid = int(pid_str)
+                except (ValueError, TypeError):
+                    continue
+
+                stored_session_id = info.get("session_id")
+
+                # Only consider PIDs from DIFFERENT sessions
+                if stored_session_id == current_supervisor_pid:
+                    continue
+
+                # Check if process still exists
+                try:
+                    os.kill(pid, 0)
+                    # Process exists and is from old session = STALE
+                    stale_pids[pid] = info
+                except OSError:
+                    pass  # Process doesn't exist
+
+        except Exception as e:
+            logger.debug(f"[ProcessRegistry] Error getting stale PIDs: {e}")
+
+        return stale_pids
+
+    @classmethod
+    def cleanup_stale_session_processes(cls, force: bool = False) -> List[int]:
+        """
+        v140.0: Clean up processes from PREVIOUS supervisor sessions.
+
+        This is the key method for resolving "protected PID" deadlocks.
+        It identifies and terminates processes that were spawned by a
+        previous supervisor session that is no longer running.
+
+        Args:
+            force: If True, use SIGKILL. If False, use SIGTERM first.
+
+        Returns:
+            List of PIDs that were successfully terminated
+        """
+        stale_pids = cls.get_stale_pids()
+        cleaned_pids: List[int] = []
+
+        if not stale_pids:
+            logger.debug("[ProcessRegistry] v140.0: No stale session processes to clean up")
+            return []
+
+        logger.info(
+            f"[ProcessRegistry] v140.0: 🧹 Cleaning up {len(stale_pids)} stale processes "
+            f"from previous sessions..."
+        )
+
+        for pid, info in stale_pids.items():
+            component = info.get("component", "unknown")
+            port = info.get("port", "unknown")
+            session_id = info.get("session_id", "unknown")
+
+            try:
+                # Send SIGTERM first (graceful)
+                logger.info(
+                    f"[ProcessRegistry] v140.0: 🔪 Terminating stale PID {pid} "
+                    f"({component} on port {port}, session {session_id})"
+                )
+                os.kill(pid, signal.SIGTERM)
+
+                # Wait briefly for graceful shutdown
+                for _ in range(10):  # 1 second total
+                    time.sleep(0.1)
+                    try:
+                        os.kill(pid, 0)  # Check if still exists
+                    except OSError:
+                        # Process terminated
+                        cleaned_pids.append(pid)
+                        logger.info(f"[ProcessRegistry] v140.0: ✅ PID {pid} terminated gracefully")
+                        break
+                else:
+                    # Still running after SIGTERM - force kill if requested
+                    if force:
+                        logger.warning(f"[ProcessRegistry] v140.0: ⚠️ PID {pid} didn't respond to SIGTERM, sending SIGKILL")
+                        os.kill(pid, signal.SIGKILL)
+                        time.sleep(0.2)
+                        try:
+                            os.kill(pid, 0)
+                        except OSError:
+                            cleaned_pids.append(pid)
+                            logger.info(f"[ProcessRegistry] v140.0: ✅ PID {pid} force-killed")
+                    else:
+                        logger.warning(f"[ProcessRegistry] v140.0: ⚠️ PID {pid} still running after SIGTERM (use force=True to SIGKILL)")
+
+            except OSError as e:
+                if e.errno == 3:  # No such process
+                    cleaned_pids.append(pid)
+                    logger.debug(f"[ProcessRegistry] v140.0: PID {pid} already dead")
+                elif e.errno == 1:  # Operation not permitted
+                    logger.warning(f"[ProcessRegistry] v140.0: ⚠️ No permission to kill PID {pid}")
+                else:
+                    logger.warning(f"[ProcessRegistry] v140.0: ⚠️ Error killing PID {pid}: {e}")
+
+        if cleaned_pids:
+            logger.info(
+                f"[ProcessRegistry] v140.0: ✅ Cleaned up {len(cleaned_pids)} stale processes: {cleaned_pids}"
+            )
+
+        return cleaned_pids
 
     @classmethod
     def _persist(cls) -> None:

@@ -8792,18 +8792,22 @@ class ProcessOrchestrator:
 
     def _build_protected_pid_set(self) -> Set[int]:
         """
-        v136.0 GAP 3: Build set of PIDs that must NEVER be killed.
+        v140.0: Build set of PIDs that must NEVER be killed.
+
+        CRITICAL FIX: Only protect PIDs from the CURRENT SESSION.
+        PIDs from previous sessions are STALE and can be safely killed.
 
         Normalizes all PIDs to integers to prevent type mismatch issues.
-        Includes: self, parent, spawned children, GlobalProcessRegistry.
+        Includes: self, parent, spawned children, CURRENT SESSION GlobalProcessRegistry.
         """
         protected: Set[int] = set()
+        current_session_pid = os.getpid()
 
         # Always protect self and parent
-        protected.add(os.getpid())
+        protected.add(current_session_pid)
         protected.add(os.getppid())
 
-        # Add all spawned child PIDs from our process tracking
+        # Add all spawned child PIDs from our process tracking (this session only)
         for managed in self.processes.values():
             if managed.pid:
                 try:
@@ -8811,22 +8815,95 @@ class ProcessOrchestrator:
                 except (ValueError, TypeError):
                     pass
 
-        # Add from GlobalProcessRegistry with type normalization
+        # v140.0: Add from GlobalProcessRegistry with SESSION AWARENESS
+        # Only protect PIDs that were spawned by THIS session
         try:
             from backend.core.supervisor_singleton import GlobalProcessRegistry
-            for pid_key in GlobalProcessRegistry.get_all().keys():
+
+            for pid_key, info in GlobalProcessRegistry.get_all().items():
                 # GAP 3: Normalize to int (registry might store as str)
                 try:
                     if isinstance(pid_key, int):
-                        protected.add(pid_key)
+                        pid = pid_key
                     elif isinstance(pid_key, str) and pid_key.isdigit():
-                        protected.add(int(pid_key))
+                        pid = int(pid_key)
+                    else:
+                        continue
+
+                    # v140.0: CRITICAL - Only protect PIDs from CURRENT session
+                    stored_session_id = info.get("session_id") if isinstance(info, dict) else None
+                    if stored_session_id == current_session_pid:
+                        # This PID is from our session - protect it
+                        protected.add(pid)
+                    else:
+                        # This PID is from a DIFFERENT session - DO NOT protect
+                        # It can be safely cleaned up
+                        component = info.get("component", "unknown") if isinstance(info, dict) else "unknown"
+                        logger.debug(
+                            f"[v140.0] NOT protecting PID {pid} ({component}) - "
+                            f"from session {stored_session_id}, current session is {current_session_pid}"
+                        )
+
                 except (ValueError, TypeError):
                     logger.debug(f"[v136.0] Skipping invalid PID from registry: {pid_key}")
+
         except (ImportError, AttributeError) as e:
             logger.debug(f"[v136.0] GlobalProcessRegistry not available: {e}")
 
         return protected
+
+    async def _cleanup_stale_session_processes(self) -> int:
+        """
+        v140.0: Pre-flight cleanup of processes from PREVIOUS supervisor sessions.
+
+        This resolves the "protected PID" deadlock where stale processes from
+        crashed or killed supervisor sessions hold ports that the new supervisor
+        needs.
+
+        Returns:
+            Number of stale processes cleaned up
+        """
+        logger.info("[v140.0] 🔍 Checking for stale processes from previous sessions...")
+
+        try:
+            from backend.core.supervisor_singleton import GlobalProcessRegistry
+
+            # Get stale PIDs (processes from previous sessions that are still running)
+            stale_pids = GlobalProcessRegistry.get_stale_pids()
+
+            if not stale_pids:
+                logger.info("[v140.0] ✅ No stale processes found - clean slate!")
+                return 0
+
+            logger.warning(
+                f"[v140.0] ⚠️ Found {len(stale_pids)} stale processes from previous sessions:"
+            )
+            for pid, info in stale_pids.items():
+                component = info.get("component", "unknown")
+                port = info.get("port", "unknown")
+                session_id = info.get("session_id", "unknown")
+                logger.warning(
+                    f"    → PID {pid}: {component} on port {port} (session {session_id})"
+                )
+
+            # Clean them up
+            cleaned = GlobalProcessRegistry.cleanup_stale_session_processes(force=True)
+
+            if cleaned:
+                logger.info(
+                    f"[v140.0] ✅ Cleaned up {len(cleaned)} stale processes: {cleaned}"
+                )
+                # Wait for ports to be released
+                await asyncio.sleep(1.0)
+
+            return len(cleaned)
+
+        except ImportError as e:
+            logger.debug(f"[v140.0] GlobalProcessRegistry not available: {e}")
+            return 0
+        except Exception as e:
+            logger.warning(f"[v140.0] Stale process cleanup error: {e}")
+            return 0
 
     async def _get_listening_pids_on_port(self, port: int) -> Tuple[List[int], Optional[str]]:
         """
@@ -9246,16 +9323,23 @@ class ProcessOrchestrator:
 
     async def _comprehensive_pre_flight_cleanup(self) -> Dict[str, Dict[str, Any]]:
         """
-        v136.0 GAP 10, 13: Enhanced pre-flight with deduplication and accurate tracking.
+        v140.0: Enhanced pre-flight with STALE SESSION CLEANUP and port deduplication.
 
-        Improvements:
-        - Deduplicates ports (clean each unique port once)
+        This is the CRITICAL fix for "protected PID" deadlocks.
+
+        v140.0 Improvements:
+        - FIRST: Clean up stale processes from PREVIOUS supervisor sessions
+        - THEN: Deduplicate ports (clean each unique port once)
         - Tracks which PIDs were actually killed per port
         - Provides detailed summary for debugging
 
         Returns:
             Dict with structure:
             {
+                "stale_session_cleanup": {
+                    "cleaned_pids": [69780, ...],
+                    "count": 1
+                },
                 "port_8000": {
                     "services": ["jarvis-prime"],
                     "killed_pids": [12345],
@@ -9265,7 +9349,32 @@ class ProcessOrchestrator:
                 ...
             }
         """
-        logger.info("[v136.0] 🧹 Comprehensive pre-flight port cleanup...")
+        logger.info("[v140.0] 🧹 Comprehensive pre-flight cleanup with stale session detection...")
+
+        results: Dict[str, Dict[str, Any]] = {}
+
+        # =====================================================================
+        # v140.0: STEP 0 - STALE SESSION CLEANUP (THE KEY FIX)
+        # =====================================================================
+        # This MUST happen BEFORE port cleanup to prevent "protected PID" errors.
+        # Processes from previous supervisor sessions are NOT protected and can
+        # be safely terminated.
+        # =====================================================================
+        stale_cleaned = await self._cleanup_stale_session_processes()
+        results["stale_session_cleanup"] = {
+            "count": stale_cleaned,
+            "description": "Processes from previous supervisor sessions"
+        }
+
+        if stale_cleaned > 0:
+            # Wait for ports to be released after killing stale processes
+            logger.info(f"[v140.0] Waiting for port release after killing {stale_cleaned} stale processes...")
+            await asyncio.sleep(1.5)
+
+        # =====================================================================
+        # v136.0: STEP 1 - PORT CLEANUP
+        # =====================================================================
+        logger.info("[v136.0] 🧹 Now cleaning up ports...")
 
         all_ports = await self._get_all_service_ports()
 
