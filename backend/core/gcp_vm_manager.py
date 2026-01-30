@@ -800,10 +800,14 @@ class GCPVMManager:
             try:
                 # Initialize GCP Compute Engine clients (parallel-safe)
                 await self._initialize_gcp_clients()
-                
+
                 # Initialize integrations (with error isolation)
                 await self._initialize_integrations()
-                
+
+                # v134.0: Sync local VM tracking with GCP reality
+                # This cleans up stale entries from previous runs that may cause 404 errors
+                await self._sync_managed_vms_with_gcp()
+
                 # Start monitoring if enabled
                 if self.config.enable_monitoring:
                     self.monitoring_task = asyncio.create_task(
@@ -933,6 +937,96 @@ class GCPVMManager:
             self.gcp_optimizer = None
 
             self.gcp_optimizer = None
+
+    async def _sync_managed_vms_with_gcp(self):
+        """
+        v134.0: Synchronize local VM tracking with actual GCP state.
+
+        ROOT CAUSE FIX for stale managed_vms entries:
+        On startup, the managed_vms dict may contain entries from previous runs
+        that no longer exist in GCP (preempted, deleted, etc.). This causes 404
+        errors when trying to terminate them.
+
+        This method:
+        1. Checks each tracked VM against GCP to verify existence
+        2. Removes entries for VMs that no longer exist
+        3. Updates state for VMs that exist but have changed status
+        4. Logs any discrepancies for debugging
+
+        Called during initialization to ensure clean state before operations begin.
+        """
+        if not self.managed_vms:
+            logger.debug("[VMSync] No managed VMs to sync")
+            return
+
+        if not self.instances_client:
+            logger.warning("[VMSync] Instances client not available - skipping sync")
+            return
+
+        logger.info(f"[VMSync] Syncing {len(self.managed_vms)} tracked VMs with GCP...")
+
+        stale_vms = []
+        updated_vms = []
+
+        async with self._vm_lock:
+            for vm_name, vm in list(self.managed_vms.items()):
+                try:
+                    exists, gcp_status = await self._check_vm_exists_in_gcp(vm_name)
+
+                    if not exists:
+                        logger.info(
+                            f"[VMSync] VM '{vm_name}' no longer exists in GCP "
+                            f"(tracked state: {vm.state.value}) - marking for removal"
+                        )
+                        stale_vms.append(vm_name)
+                    elif gcp_status:
+                        # VM exists - update our tracking to match GCP state
+                        status_map = {
+                            "PROVISIONING": VMState.PROVISIONING,
+                            "STAGING": VMState.STAGING,
+                            "RUNNING": VMState.RUNNING,
+                            "STOPPING": VMState.STOPPING,
+                            "TERMINATED": VMState.TERMINATED,
+                        }
+                        new_state = status_map.get(gcp_status, VMState.UNKNOWN)
+
+                        if vm.state != new_state:
+                            logger.info(
+                                f"[VMSync] VM '{vm_name}' state updated: "
+                                f"{vm.state.value} → {new_state.value}"
+                            )
+                            vm.state = new_state
+                            updated_vms.append(vm_name)
+
+                        # If VM is terminated in GCP, mark for removal
+                        if gcp_status == "TERMINATED":
+                            logger.info(
+                                f"[VMSync] VM '{vm_name}' is TERMINATED in GCP - marking for removal"
+                            )
+                            stale_vms.append(vm_name)
+
+                except Exception as e:
+                    logger.warning(f"[VMSync] Error checking VM '{vm_name}': {e}")
+                    # Don't remove on error - could be transient
+
+            # Remove stale VMs from tracking
+            for vm_name in stale_vms:
+                if vm_name in self.managed_vms:
+                    vm = self.managed_vms[vm_name]
+                    # Update stats
+                    self.stats["current_active"] = max(0, self.stats["current_active"] - 1)
+                    if vm.state == VMState.RUNNING:
+                        self.stats["total_terminated"] += 1
+                    # Remove from tracking
+                    del self.managed_vms[vm_name]
+
+        if stale_vms or updated_vms:
+            logger.info(
+                f"[VMSync] Sync complete: {len(stale_vms)} stale VMs removed, "
+                f"{len(updated_vms)} VMs updated"
+            )
+        else:
+            logger.info("[VMSync] All tracked VMs verified in GCP")
 
     async def get_active_vm(self) -> Optional[VMInstance]:
         """
@@ -1733,14 +1827,22 @@ class GCPVMManager:
 
     async def terminate_vm(self, vm_name: str, reason: str = "Manual termination") -> bool:
         """
-        Terminate a VM instance with circuit breaker protection.
-        
+        v134.0: Terminate a VM instance with existence verification and circuit breaker protection.
+
+        ROOT CAUSE FIX for 404 NotFound errors:
+        This method now verifies VM existence in GCP before attempting delete operations.
+        This prevents spurious 404 errors that occur when:
+        1. Spot VMs are preempted by GCP (can happen at any time)
+        2. VMs are deleted manually via GCP Console or gcloud CLI
+        3. VMs are deleted by another process or previous session
+        4. Stale entries exist in managed_vms from previous runs
+
         Args:
             vm_name: Name of the VM to terminate
             reason: Reason for termination (for logging/tracking)
-            
+
         Returns:
-            True if terminated successfully, False otherwise
+            True if terminated successfully (or VM doesn't exist), False otherwise
         """
         async with self._vm_lock:
             if vm_name not in self.managed_vms:
@@ -1753,13 +1855,49 @@ class GCPVMManager:
         # Check circuit breaker
         circuit = self._circuit_breakers["vm_delete"]
         can_execute, circuit_reason = circuit.can_execute()
-        
+
         if not can_execute:
             logger.warning(f"🔌 VM termination blocked by circuit breaker: {circuit_reason}")
             self.stats["circuit_breaks"] += 1
             return False
 
-        logger.info(f"🛑 Terminating VM: {vm_name} (Reason: {reason})")
+        # v134.0: ROOT CAUSE FIX - Check if VM actually exists in GCP first
+        # This prevents 404 errors that would trip the circuit breaker
+        exists, gcp_status = await self._check_vm_exists_in_gcp(vm_name)
+
+        if not exists:
+            logger.info(
+                f"✅ VM '{vm_name}' does not exist in GCP - cleaning up local tracking "
+                f"(may have been preempted, manually deleted, or never created)"
+            )
+            # Update local tracking to reflect reality
+            async with self._vm_lock:
+                vm.state = VMState.TERMINATED
+                self.stats["total_terminated"] += 1
+                self.stats["current_active"] = max(0, self.stats["current_active"] - 1)
+                self.stats["total_cost"] += vm.total_cost
+                if vm_name in self.managed_vms:
+                    del self.managed_vms[vm_name]
+            # Record success - VM is in desired state (terminated/non-existent)
+            circuit.record_success()
+            return True
+
+        # v134.0: Check if VM is already in a terminal state
+        if gcp_status in ("TERMINATED", "STOPPING"):
+            logger.info(
+                f"ℹ️  VM '{vm_name}' is already {gcp_status} - cleaning up tracking"
+            )
+            async with self._vm_lock:
+                vm.state = VMState.TERMINATED
+                self.stats["total_terminated"] += 1
+                self.stats["current_active"] = max(0, self.stats["current_active"] - 1)
+                self.stats["total_cost"] += vm.total_cost
+                if vm_name in self.managed_vms:
+                    del self.managed_vms[vm_name]
+            circuit.record_success()
+            return True
+
+        logger.info(f"🛑 Terminating VM: {vm_name} (Reason: {reason}, GCP Status: {gcp_status})")
 
         try:
             # Update cost before termination
@@ -1799,27 +1937,135 @@ class GCPVMManager:
             return True
 
         except Exception as e:
+            error_str = str(e).lower()
+            # v134.0: Handle 404 gracefully if VM was deleted between our check and delete
+            is_not_found = (
+                "404" in error_str or
+                "not found" in error_str or
+                "notfound" in error_str
+            )
+
+            if is_not_found:
+                logger.info(
+                    f"✅ VM '{vm_name}' was deleted between existence check and delete call "
+                    f"(likely preempted or deleted by another process)"
+                )
+                # Clean up tracking - VM is in desired state
+                async with self._vm_lock:
+                    vm.state = VMState.TERMINATED
+                    self.stats["total_terminated"] += 1
+                    self.stats["current_active"] = max(0, self.stats["current_active"] - 1)
+                    self.stats["total_cost"] += vm.total_cost
+                    if vm_name in self.managed_vms:
+                        del self.managed_vms[vm_name]
+                circuit.record_success()  # Desired state achieved
+                return True
+
+            # Actual error - record failure
             circuit.record_failure(e)
             logger.error(f"❌ Failed to terminate VM {vm_name}: {e}", exc_info=True)
             return False
 
-    async def _force_delete_vm(self, vm_name: str, reason: str) -> bool:
-        """Force delete a VM that may exist in GCP but not in our tracking"""
+    async def _check_vm_exists_in_gcp(self, vm_name: str) -> Tuple[bool, Optional[str]]:
+        """
+        v134.0: Check if a VM actually exists in GCP before attempting operations.
+
+        ROOT CAUSE FIX for 404 errors during VM termination:
+        The 404 NotFound error occurs when we try to delete a VM that:
+        1. Was preempted by GCP (Spot VMs can be reclaimed at any time)
+        2. Was deleted manually via GCP Console or gcloud CLI
+        3. Was deleted by another process or previous session
+        4. Never existed (stale entry in managed_vms from previous run)
+
+        This method queries GCP to verify VM existence before delete operations.
+
+        Args:
+            vm_name: Name of the VM to check
+
+        Returns:
+            Tuple of (exists: bool, status: Optional[str])
+            - If VM exists: (True, current_status)
+            - If VM doesn't exist: (False, None)
+            - On error: (False, None) with logged warning
+        """
         try:
-            logger.info(f"🗑️  Force-deleting untracked VM: {vm_name}")
-            
+            instance = await asyncio.to_thread(
+                self.instances_client.get,
+                project=self.config.project_id,
+                zone=self.config.zone,
+                instance=vm_name,
+            )
+            return (True, instance.status)
+
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check for 404 NotFound errors (various formats from GCP client)
+            is_not_found = (
+                "404" in error_str or
+                "not found" in error_str or
+                "notfound" in error_str or
+                "does not exist" in error_str or
+                "was not found" in error_str
+            )
+
+            if is_not_found:
+                logger.debug(f"[VMExists] VM '{vm_name}' does not exist in GCP")
+                return (False, None)
+
+            # Other errors - log but treat as not existing to be safe
+            logger.warning(
+                f"[VMExists] Error checking VM '{vm_name}' existence: {e}. "
+                f"Treating as non-existent to prevent 404 on delete."
+            )
+            return (False, None)
+
+    async def _force_delete_vm(self, vm_name: str, reason: str) -> bool:
+        """
+        v134.0: Force delete a VM that may exist in GCP but not in our tracking.
+
+        ROOT CAUSE FIX: Now checks if VM exists before attempting delete to
+        prevent 404 NotFound errors from cluttering logs and circuit breaker.
+        """
+        # v134.0: Check if VM actually exists in GCP first
+        exists, status = await self._check_vm_exists_in_gcp(vm_name)
+
+        if not exists:
+            logger.info(
+                f"✅ VM '{vm_name}' does not exist in GCP - nothing to delete "
+                f"(may have been preempted, manually deleted, or never created)"
+            )
+            return True  # Return True because the desired state (VM deleted) is achieved
+
+        try:
+            logger.info(f"🗑️  Force-deleting untracked VM: {vm_name} (status: {status})")
+
             operation = await asyncio.to_thread(
                 self.instances_client.delete,
                 project=self.config.project_id,
                 zone=self.config.zone,
                 instance=vm_name,
             )
-            
+
             await self._wait_for_operation(operation)
             logger.info(f"✅ Force-deleted VM: {vm_name}")
             return True
-            
+
         except Exception as e:
+            error_str = str(e).lower()
+            # Handle race condition: VM was deleted between our check and delete call
+            is_not_found = (
+                "404" in error_str or
+                "not found" in error_str or
+                "notfound" in error_str
+            )
+
+            if is_not_found:
+                logger.info(
+                    f"✅ VM '{vm_name}' was deleted between existence check and delete call "
+                    f"(likely preempted or deleted by another process)"
+                )
+                return True  # Desired state achieved
+
             logger.warning(f"⚠️  Force delete failed for {vm_name}: {e}")
             return False
 

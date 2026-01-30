@@ -165,7 +165,7 @@ class DiscoveredService:
 
 class IntelligentServiceDiscovery:
     """
-    v84.0: Intelligent service discovery for J-Prime.
+    v84.0 + v134.0: Intelligent service discovery for J-Prime with auto-recovery.
 
     Features:
     - Multiple discovery methods with fallback
@@ -173,16 +173,18 @@ class IntelligentServiceDiscovery:
     - Latency-aware routing
     - Automatic port detection
     - API format detection (OpenAI vs custom)
+    - v134.0: Automatic service startup trigger when offline
+    - v134.0: Cross-repo coordination for Trinity components
     """
 
     # Known ports to probe (ordered by preference)
-    PROBE_PORTS: List[int] = field(default_factory=lambda: [
+    PROBE_PORTS: List[int] = [
         int(os.getenv("JARVIS_PRIME_PORT", "8000")),  # Default/configured
         8000,  # Standard J-Prime port
         8001,  # Alternate
         8002,  # Legacy
         11434, # Ollama compatibility
-    ])
+    ]
 
     # Health check endpoints (ordered by preference)
     HEALTH_ENDPOINTS: List[str] = [
@@ -206,9 +208,96 @@ class IntelligentServiceDiscovery:
             str(Path.home() / ".jarvis" / "trinity")
         ))
 
+        # v134.0: Auto-recovery settings
+        self._auto_recovery_enabled = os.getenv(
+            "JARVIS_PRIME_AUTO_RECOVERY", "true"
+        ).lower() in ("true", "1", "yes")
+        self._last_recovery_attempt: float = 0.0
+        self._recovery_cooldown: float = float(os.getenv(
+            "JARVIS_PRIME_RECOVERY_COOLDOWN", "60.0"  # Don't retry recovery within 60s
+        ))
+        self._consecutive_failures: int = 0
+        self._max_consecutive_failures: int = int(os.getenv(
+            "JARVIS_PRIME_MAX_FAILURES_BEFORE_RECOVERY", "3"
+        ))
+        self._startup_callback: Optional[Callable[[], Awaitable[bool]]] = None
+
+    def register_startup_callback(
+        self,
+        callback: Callable[[], "asyncio.Future[bool]"]
+    ) -> None:
+        """
+        v134.0: Register a callback to start the J-Prime service.
+
+        This callback is invoked when discovery finds no healthy service
+        and auto-recovery conditions are met.
+
+        Args:
+            callback: Async function that attempts to start J-Prime.
+                      Should return True if startup succeeded, False otherwise.
+        """
+        self._startup_callback = callback
+        logger.info("[Discovery] v134.0 Auto-recovery callback registered")
+
+    async def _attempt_auto_recovery(self) -> bool:
+        """
+        v134.0: Attempt to recover the J-Prime service.
+
+        Returns:
+            True if recovery was attempted and service is now available
+        """
+        now = time.time()
+
+        # Check cooldown
+        if now - self._last_recovery_attempt < self._recovery_cooldown:
+            remaining = self._recovery_cooldown - (now - self._last_recovery_attempt)
+            logger.debug(
+                f"[Discovery] v134.0 Auto-recovery in cooldown ({remaining:.0f}s remaining)"
+            )
+            return False
+
+        # Check if recovery is enabled and callback is set
+        if not self._auto_recovery_enabled:
+            logger.debug("[Discovery] v134.0 Auto-recovery disabled")
+            return False
+
+        if not self._startup_callback:
+            logger.debug("[Discovery] v134.0 No startup callback registered")
+            return False
+
+        # Check consecutive failure threshold
+        if self._consecutive_failures < self._max_consecutive_failures:
+            logger.debug(
+                f"[Discovery] v134.0 Not enough failures for recovery "
+                f"({self._consecutive_failures}/{self._max_consecutive_failures})"
+            )
+            return False
+
+        # Attempt recovery
+        self._last_recovery_attempt = now
+        logger.info(
+            f"[Discovery] v134.0 Attempting auto-recovery after "
+            f"{self._consecutive_failures} consecutive failures"
+        )
+
+        try:
+            success = await self._startup_callback()
+            if success:
+                logger.info("[Discovery] v134.0 Auto-recovery successful")
+                self._consecutive_failures = 0
+                # Wait briefly for service to fully initialize
+                await asyncio.sleep(2.0)
+                return True
+            else:
+                logger.warning("[Discovery] v134.0 Auto-recovery callback returned False")
+                return False
+        except Exception as e:
+            logger.error(f"[Discovery] v134.0 Auto-recovery failed: {e}")
+            return False
+
     async def discover(self, force: bool = False) -> Optional[DiscoveredService]:
         """
-        Discover J-Prime service using all available methods.
+        v134.0: Discover J-Prime service with auto-recovery support.
 
         Returns:
             Best available service or None
@@ -219,6 +308,7 @@ class IntelligentServiceDiscovery:
             # Skip if recently discovered (unless forced)
             if not force and (now - self._last_discovery_time) < self._discovery_interval:
                 if self._primary_service and self._primary_service.healthy:
+                    self._consecutive_failures = 0  # Reset on success
                     return self._primary_service
 
             self._last_discovery_time = now
@@ -252,6 +342,9 @@ class IntelligentServiceDiscovery:
                 for service in discovered:
                     self._discovered_services[service.url] = service
 
+                # v134.0: Reset failure counter on successful discovery
+                self._consecutive_failures = 0
+
                 logger.info(
                     f"[Discovery] Primary service: {self._primary_service.url} "
                     f"(latency={self._primary_service.latency_ms:.1f}ms, "
@@ -259,7 +352,26 @@ class IntelligentServiceDiscovery:
                 )
                 return self._primary_service
 
-            logger.warning("[Discovery] No healthy J-Prime service found")
+            # v134.0: No healthy service found - increment failure counter
+            self._consecutive_failures += 1
+            logger.warning(
+                f"[Discovery] No healthy J-Prime service found "
+                f"(failures: {self._consecutive_failures})"
+            )
+
+            # v134.0: Attempt auto-recovery if conditions are met
+            if await self._attempt_auto_recovery():
+                # Re-try discovery after recovery
+                probed = await self._discover_by_probing()
+                healthy = [s for s in probed if s.healthy]
+                if healthy:
+                    healthy.sort(key=lambda s: s.latency_ms)
+                    self._primary_service = healthy[0]
+                    logger.info(
+                        f"[Discovery] v134.0 Service recovered: {self._primary_service.url}"
+                    )
+                    return self._primary_service
+
             return None
 
     async def _discover_from_environment(self) -> Optional[DiscoveredService]:
@@ -447,6 +559,38 @@ class IntelligentServiceDiscovery:
 
 # Global discovery instance
 _service_discovery = IntelligentServiceDiscovery()
+
+
+def register_jprime_startup_callback(
+    callback: Callable[[], "asyncio.Future[bool]"]
+) -> None:
+    """
+    v134.0: Register a callback to start J-Prime when service discovery fails.
+
+    This enables automatic recovery when the J-Prime service goes offline.
+    The callback should attempt to start the J-Prime server and return True
+    if successful.
+
+    Args:
+        callback: Async function that starts J-Prime and returns success status
+
+    Example:
+        async def start_jprime():
+            # Start J-Prime subprocess
+            return True
+
+        register_jprime_startup_callback(start_jprime)
+    """
+    _service_discovery.register_startup_callback(callback)
+
+
+def get_service_discovery() -> IntelligentServiceDiscovery:
+    """
+    v134.0: Get the global service discovery instance.
+
+    Useful for registering callbacks or checking discovery status.
+    """
+    return _service_discovery
 
 
 # =============================================================================

@@ -12623,6 +12623,26 @@ class SupervisorBootstrapper:
 
             self._jarvis_prime_client.register_mode_change_callback(on_mode_change)
 
+            # v134.0: Register auto-recovery callback with service discovery
+            # This allows the client to automatically restart J-Prime if it goes offline
+            try:
+                from backend.clients.jarvis_prime_client import register_jprime_startup_callback
+
+                async def auto_start_jprime() -> bool:
+                    """v134.0: Auto-recovery callback to restart J-Prime."""
+                    self.logger.info("[v134.0] Auto-recovery: Attempting to restart J-Prime...")
+                    try:
+                        await self._init_jarvis_prime_local_if_needed()
+                        return True
+                    except Exception as e:
+                        self.logger.warning(f"[v134.0] Auto-recovery failed: {e}")
+                        return False
+
+                register_jprime_startup_callback(auto_start_jprime)
+                self.logger.info("[v134.0] J-Prime auto-recovery callback registered")
+            except Exception as cb_err:
+                self.logger.debug(f"[v134.0] Auto-recovery callback registration failed: {cb_err}")
+
             # Propagate settings to environment
             os.environ["JARVIS_PRIME_ENABLED"] = "true"
             os.environ["JARVIS_PRIME_HOST"] = self.config.jarvis_prime_host

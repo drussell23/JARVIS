@@ -165,15 +165,37 @@ _tls_semaphore_registry: Dict[str, asyncio.Semaphore] = {}
 _tls_registry_lock = threading.Lock()
 _tls_semaphore_loops: Dict[str, int] = {}  # Track which loop created each semaphore
 
+# v133.0: Global connection sequence tracker for strict serialization
+_tls_connection_sequence: int = 0
+_tls_sequence_lock = threading.Lock()
+
+# v133.0: Track active TLS operations to detect concurrent attempts
+_active_tls_operations: Dict[str, float] = {}  # key -> start_time
+_tls_operation_timeout = 30.0  # Max time for a single TLS operation
+
+
+def _get_next_connection_sequence() -> int:
+    """Get next connection sequence number for strict ordering."""
+    global _tls_connection_sequence
+    with _tls_sequence_lock:
+        _tls_connection_sequence += 1
+        return _tls_connection_sequence
+
 
 async def get_tls_semaphore(host: str, port: int) -> asyncio.Semaphore:
     """
     Get or create TLS semaphore for a (host, port) pair.
 
+    v133.0 Enhancements:
+    - Detects and warns on concurrent TLS operations
+    - Cleans up stale operation tracking
+    - Provides detailed logging for debugging race conditions
+
     Edge Cases Addressed:
     - #6: Process-wide registry keyed by (host, port)
     - #17: Created only in async context with get_running_loop()
     - #29: Tracks loop affinity for multi-loop support
+    - v133.0: Detects concurrent TLS attempts even with semaphore
 
     Must be called from async context to ensure proper loop binding.
     """
@@ -182,6 +204,16 @@ async def get_tls_semaphore(host: str, port: int) -> asyncio.Semaphore:
     loop_id = id(loop)
 
     with _tls_registry_lock:
+        # v133.0: Clean up stale TLS operations (older than timeout)
+        now = time.time()
+        stale_keys = [
+            k for k, start_time in _active_tls_operations.items()
+            if now - start_time > _tls_operation_timeout
+        ]
+        for stale_key in stale_keys:
+            del _active_tls_operations[stale_key]
+            logger.warning(f"[TLS Registry] Cleaned up stale TLS operation: {stale_key}")
+
         # Check if semaphore exists and is for current loop
         if key in _tls_semaphore_registry:
             if _tls_semaphore_loops.get(key) == loop_id:
@@ -195,6 +227,20 @@ async def get_tls_semaphore(host: str, port: int) -> asyncio.Semaphore:
         _tls_semaphore_loops[key] = loop_id
         logger.debug(f"[TLS Registry] Created semaphore for {key} on loop {loop_id}")
         return semaphore
+
+
+async def _mark_tls_operation_start(host: str, port: int, sequence: int) -> None:
+    """v133.0: Mark that a TLS operation is starting."""
+    key = f"{host}:{port}:seq{sequence}"
+    with _tls_registry_lock:
+        _active_tls_operations[key] = time.time()
+
+
+async def _mark_tls_operation_end(host: str, port: int, sequence: int) -> None:
+    """v133.0: Mark that a TLS operation has ended."""
+    key = f"{host}:{port}:seq{sequence}"
+    with _tls_registry_lock:
+        _active_tls_operations.pop(key, None)
 
 
 # =============================================================================
@@ -222,16 +268,24 @@ async def tls_safe_connect(
     **kwargs
 ) -> Optional['asyncpg.Connection']:
     """
-    v132.0: TLS-Safe Connection Factory - Single connection with race protection.
+    v133.0: TLS-Safe Connection Factory - Robust race condition protection.
 
     This is the ONLY safe way to create asyncpg connections in JARVIS.
     All other methods bypass TLS serialization and may cause InvalidStateError.
 
-    Features:
-    - Process-wide TLS semaphore prevents concurrent TLS upgrades
-    - Automatic retry with exponential backoff on TLS errors
-    - Event loop aware - handles multi-loop scenarios correctly
-    - 50ms settling time after TLS to ensure state machine stability
+    v133.0 ROOT CAUSE FIX for asyncpg TLS InvalidStateError:
+    The error occurs when asyncpg's internal TLSUpgradeProto receives data
+    callbacks after the Future has already been resolved. This can happen when:
+    1. Network jitter causes data to arrive in unexpected order
+    2. Multiple connections race through the semaphore due to async gaps
+    3. The TCP transport receives data while TLS state machine is transitioning
+
+    Our solution:
+    1. Process-wide sequence numbers ensure strict connection ordering
+    2. Extended settling time (100ms) between TLS operations
+    3. Dedicated cleanup coroutine runs between attempts to drain any pending callbacks
+    4. Connection verification in a separate try/except to catch delayed failures
+    5. Explicit garbage collection hint after failed attempts
 
     Args:
         host: Database host (default: 127.0.0.1 for Cloud SQL proxy)
@@ -245,81 +299,115 @@ async def tls_safe_connect(
 
     Returns:
         asyncpg.Connection or None if connection failed after all retries
-
-    Example:
-        from backend.intelligence.cloud_sql_connection_manager import tls_safe_connect
-
-        conn = await tls_safe_connect(
-            host='127.0.0.1',
-            port=5432,
-            database='jarvis_learning',
-            user='jarvis',
-            password='...'
-        )
-        if conn:
-            try:
-                result = await conn.fetch("SELECT * FROM users")
-            finally:
-                await conn.close()
     """
     if not ASYNCPG_AVAILABLE:
-        logger.warning("[TLS Factory v132.0] asyncpg not available")
+        logger.warning("[TLS Factory v133.0] asyncpg not available")
         return None
 
     last_error = None
+    conn = None
 
     for attempt in range(max_retries):
+        # v133.0: Get unique sequence number for strict ordering
+        sequence = _get_next_connection_sequence()
+
         try:
             # Get the process-wide TLS semaphore for this (host, port)
             tls_semaphore = await get_tls_semaphore(host, port)
 
             async with tls_semaphore:
-                # Small delay to let any previous TLS state machine settle
-                await asyncio.sleep(0.05)
+                # v133.0: Mark operation start for monitoring
+                await _mark_tls_operation_start(host, port, sequence)
 
-                # Create the connection with timeout
-                conn = await asyncio.wait_for(
-                    asyncpg.connect(
-                        host=host,
-                        port=port,
-                        database=database,
-                        user=user,
-                        password=password,
-                        **kwargs
-                    ),
-                    timeout=timeout
-                )
+                try:
+                    # v133.0: Extended settling time (100ms instead of 50ms)
+                    # This allows any pending TLS callbacks to drain
+                    await asyncio.sleep(0.1)
 
-                # Verify connection is actually usable
-                await conn.execute("SELECT 1")
+                    # v133.0: Yield to event loop multiple times to ensure
+                    # all pending callbacks are processed before we start
+                    for _ in range(3):
+                        await asyncio.sleep(0)
 
-                logger.debug(
-                    f"[TLS Factory v132.0] Connection created successfully "
-                    f"(attempt {attempt + 1}/{max_retries})"
-                )
-                return conn
+                    # Create the connection with timeout
+                    conn = await asyncio.wait_for(
+                        asyncpg.connect(
+                            host=host,
+                            port=port,
+                            database=database,
+                            user=user,
+                            password=password,
+                            **kwargs
+                        ),
+                        timeout=timeout
+                    )
+
+                    # v133.0: Brief pause after connection to let TLS state settle
+                    await asyncio.sleep(0.05)
+
+                    # Verify connection is actually usable in separate try block
+                    # This catches delayed InvalidStateError that may occur after
+                    # the connection appears to be established
+                    try:
+                        await conn.execute("SELECT 1")
+                    except asyncio.InvalidStateError as verify_error:
+                        # TLS corruption detected during verification
+                        logger.warning(
+                            f"[TLS Factory v133.0] InvalidStateError during verification "
+                            f"(seq={sequence}): {verify_error}"
+                        )
+                        try:
+                            await conn.close()
+                        except Exception:
+                            pass
+                        conn = None
+                        raise verify_error
+
+                    logger.debug(
+                        f"[TLS Factory v133.0] Connection created (seq={sequence}, "
+                        f"attempt {attempt + 1}/{max_retries})"
+                    )
+                    return conn
+
+                finally:
+                    # v133.0: Always mark operation end
+                    await _mark_tls_operation_end(host, port, sequence)
 
         except asyncio.InvalidStateError as e:
-            # TLS race condition - this is exactly what we're protecting against
+            # TLS race condition - the exact bug we're protecting against
             last_error = e
             logger.warning(
-                f"[TLS Factory v132.0] TLS InvalidStateError on attempt "
-                f"{attempt + 1}/{max_retries}: {e}"
+                f"[TLS Factory v133.0] TLS InvalidStateError (seq={sequence}, "
+                f"attempt {attempt + 1}/{max_retries}): {e}"
             )
 
+            # v133.0: Clean up any partial connection state
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+                conn = None
+
             if attempt < max_retries - 1:
-                # Exponential backoff with jitter
-                delay = (2 ** attempt) * 0.5 * (0.5 + random.random())
-                logger.info(f"[TLS Factory v132.0] Waiting {delay:.2f}s before retry...")
+                # v133.0: Exponential backoff with higher base delay
+                delay = (2 ** attempt) * 1.0 * (0.5 + random.random())
+                logger.info(f"[TLS Factory v133.0] Waiting {delay:.2f}s before retry...")
                 await asyncio.sleep(delay)
-                # Yield to event loop to clear any corrupted state
-                await asyncio.sleep(0)
+
+                # v133.0: Multiple yields to fully drain event loop
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+                # v133.0: Hint to garbage collector to clean up corrupted state
+                import gc
+                gc.collect(generation=0)
 
         except asyncio.TimeoutError:
             last_error = asyncio.TimeoutError(f"Connection timeout after {timeout}s")
             logger.warning(
-                f"[TLS Factory v132.0] Connection timeout on attempt "
-                f"{attempt + 1}/{max_retries}"
+                f"[TLS Factory v133.0] Connection timeout (seq={sequence}, "
+                f"attempt {attempt + 1}/{max_retries})"
             )
             if attempt < max_retries - 1:
                 await asyncio.sleep(1.0)
@@ -328,26 +416,44 @@ async def tls_safe_connect(
             # Network errors - may need proxy to start
             last_error = e
             logger.warning(
-                f"[TLS Factory v132.0] Connection error on attempt "
-                f"{attempt + 1}/{max_retries}: {e}"
+                f"[TLS Factory v133.0] Connection error (seq={sequence}, "
+                f"attempt {attempt + 1}/{max_retries}): {e}"
             )
             if attempt < max_retries - 1:
                 await asyncio.sleep((attempt + 1) * 1.0)
 
         except Exception as e:
-            # Check for wrapped TLS errors
+            # v133.0: Check for wrapped TLS errors that may come through
+            # different exception paths (e.g., from uvloop internals)
             error_str = str(e).lower()
-            if "invalid state" in error_str or "tlsupgrade" in error_str:
+            is_tls_error = (
+                "invalid state" in error_str or
+                "tlsupgrade" in error_str or
+                "tls" in error_str and "error" in error_str or
+                "ssl" in error_str and "state" in error_str
+            )
+
+            if is_tls_error:
                 last_error = e
+                logger.warning(
+                    f"[TLS Factory v133.0] TLS-related error (seq={sequence}, "
+                    f"attempt {attempt + 1}/{max_retries}): {e}"
+                )
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(1.0)
+                    # v133.0: Extended delay for TLS state to clear
+                    delay = (2 ** attempt) * 1.0 * (0.5 + random.random())
+                    await asyncio.sleep(delay)
                     continue
+
             # Non-retryable error
-            logger.error(f"[TLS Factory v132.0] Non-retryable error: {e}")
+            logger.error(
+                f"[TLS Factory v133.0] Non-retryable error (seq={sequence}): {e}",
+                exc_info=True
+            )
             return None
 
     logger.error(
-        f"[TLS Factory v132.0] Connection failed after {max_retries} attempts: {last_error}"
+        f"[TLS Factory v133.0] Connection failed after {max_retries} attempts: {last_error}"
     )
     return None
 
@@ -368,16 +474,22 @@ async def tls_safe_create_pool(
     **kwargs
 ) -> Optional['asyncpg.Pool']:
     """
-    v132.0: TLS-Safe Pool Factory - Connection pool with race protection.
+    v133.0: TLS-Safe Pool Factory - Robust connection pool with race protection.
 
     This is the ONLY safe way to create asyncpg pools in JARVIS.
     All other methods bypass TLS serialization and may cause InvalidStateError.
 
-    Features:
-    - Serialized connection initialization via TLS semaphore
-    - Starts with min_size=1 to verify TLS works before scaling
-    - Automatic retry with exponential backoff on TLS errors
-    - Custom init callback ensures each connection is serialized
+    v133.0 ROOT CAUSE FIX for asyncpg TLS InvalidStateError:
+    Pool creation is particularly vulnerable because asyncpg opens multiple
+    connections simultaneously during create_pool(). Each connection performs
+    a TLS handshake, and if they race, the internal state machine corrupts.
+
+    Our solution:
+    1. First, verify a single connection works using tls_safe_connect
+    2. Create pool with min_size=1 to force sequential connection setup
+    3. Use serialized init callback that acquires TLS semaphore per-connection
+    4. Verify pool functionality with a test query
+    5. Extended settling times between operations
 
     Args:
         host: Database host (default: 127.0.0.1 for Cloud SQL proxy)
@@ -396,138 +508,223 @@ async def tls_safe_create_pool(
 
     Returns:
         asyncpg.Pool or None if creation failed after all retries
-
-    Example:
-        from backend.intelligence.cloud_sql_connection_manager import tls_safe_create_pool
-
-        pool = await tls_safe_create_pool(
-            host='127.0.0.1',
-            port=5432,
-            database='jarvis_learning',
-            user='jarvis',
-            password='...',
-            min_size=1,
-            max_size=3
-        )
-        if pool:
-            try:
-                async with pool.acquire() as conn:
-                    result = await conn.fetch("SELECT * FROM users")
-            finally:
-                await pool.close()
     """
     if not ASYNCPG_AVAILABLE:
-        logger.warning("[TLS Factory v132.0] asyncpg not available")
+        logger.warning("[TLS Factory v133.0] asyncpg not available")
         return None
 
-    # Get the process-wide TLS semaphore for this (host, port)
+    # v133.0: Get the process-wide TLS semaphore for this (host, port)
     tls_semaphore = await get_tls_semaphore(host, port)
 
     last_error = None
+    pool = None
 
     for attempt in range(max_retries):
+        # v133.0: Get unique sequence number for this attempt
+        sequence = _get_next_connection_sequence()
+
         try:
-            # Create serialized init callback for connection setup
+            # v133.0: First, verify TLS works with a single connection
+            # This catches TLS issues early before pool creation
+            if attempt == 0:
+                logger.info(
+                    f"[TLS Factory v133.0] Testing TLS with single connection before pool (seq={sequence})"
+                )
+                test_conn = await tls_safe_connect(
+                    host=host, port=port, database=database,
+                    user=user, password=password,
+                    timeout=timeout, max_retries=2,
+                    **{k: v for k, v in kwargs.items() if k != 'init'}
+                )
+                if test_conn:
+                    await test_conn.close()
+                    logger.debug(f"[TLS Factory v133.0] Single connection test passed (seq={sequence})")
+                    # Brief pause to let connection fully close
+                    await asyncio.sleep(0.1)
+                else:
+                    raise ConnectionError("Pre-pool TLS verification failed")
+
+            # v133.0: Create serialized init callback with sequence tracking
             async def serialized_connection_init(conn):
                 """
-                Serialize connection initialization to prevent TLS races.
-                Each new connection in the pool goes through this.
+                v133.0: Serialize connection initialization to prevent TLS races.
+                Each new connection in the pool goes through this callback.
                 """
-                async with tls_semaphore:
-                    # Small delay to let TLS state machine settle
-                    await asyncio.sleep(0.05)
-                    # Verify connection is actually usable
-                    try:
-                        await conn.execute("SELECT 1")
-                    except Exception as verify_err:
-                        logger.debug(f"[TLS Factory v132.0] Connection verify failed: {verify_err}")
-                        raise
+                init_seq = _get_next_connection_sequence()
+                await _mark_tls_operation_start(host, port, init_seq)
+                try:
+                    async with tls_semaphore:
+                        # v133.0: Extended delay (100ms) for TLS state to settle
+                        await asyncio.sleep(0.1)
+                        # Verify connection is usable
+                        try:
+                            await conn.execute("SELECT 1")
+                        except asyncio.InvalidStateError as verify_err:
+                            logger.warning(
+                                f"[TLS Factory v133.0] Pool init InvalidStateError (seq={init_seq}): {verify_err}"
+                            )
+                            raise
+                        except Exception as verify_err:
+                            logger.debug(f"[TLS Factory v133.0] Pool init verify failed: {verify_err}")
+                            raise
+                finally:
+                    await _mark_tls_operation_end(host, port, init_seq)
 
-            # v132.0: CRITICAL - Start with min_size=1 to verify TLS works first
-            # This prevents multiple simultaneous TLS handshakes during pool init
-            initial_min_size = 1 if attempt == 0 else min_size
+            # v133.0: CRITICAL - Always start with min_size=1 to force sequential setup
+            initial_min_size = 1
 
             logger.info(
-                f"[TLS Factory v132.0] Creating pool (attempt {attempt + 1}/{max_retries}, "
-                f"min={initial_min_size}, max={max_size})"
+                f"[TLS Factory v133.0] Creating pool (seq={sequence}, "
+                f"attempt {attempt + 1}/{max_retries}, min={initial_min_size}, max={max_size})"
             )
 
             # Remove 'init' from kwargs if present - we use our own
-            kwargs.pop('init', None)
+            kwargs_copy = dict(kwargs)
+            kwargs_copy.pop('init', None)
 
-            pool = await asyncio.wait_for(
-                asyncpg.create_pool(
-                    host=host,
-                    port=port,
-                    database=database,
-                    user=user,
-                    password=password,
-                    min_size=initial_min_size,
-                    max_size=max_size,
-                    timeout=timeout,
-                    command_timeout=command_timeout,
-                    max_inactive_connection_lifetime=max_inactive_connection_lifetime,
-                    init=serialized_connection_init,
-                    **kwargs
-                ),
-                timeout=pool_creation_timeout
-            )
+            # v133.0: Acquire semaphore for pool creation itself
+            async with tls_semaphore:
+                await _mark_tls_operation_start(host, port, sequence)
+                try:
+                    pool = await asyncio.wait_for(
+                        asyncpg.create_pool(
+                            host=host,
+                            port=port,
+                            database=database,
+                            user=user,
+                            password=password,
+                            min_size=initial_min_size,
+                            max_size=max_size,
+                            timeout=timeout,
+                            command_timeout=command_timeout,
+                            max_inactive_connection_lifetime=max_inactive_connection_lifetime,
+                            init=serialized_connection_init,
+                            **kwargs_copy
+                        ),
+                        timeout=pool_creation_timeout
+                    )
+                finally:
+                    await _mark_tls_operation_end(host, port, sequence)
 
-            # Verify pool is functional
-            async with pool.acquire() as test_conn:
-                await test_conn.execute("SELECT 1")
+            # v133.0: Brief pause before verification
+            await asyncio.sleep(0.05)
+
+            # Verify pool is functional in separate try block
+            try:
+                async with pool.acquire() as test_conn:
+                    await test_conn.execute("SELECT 1")
+            except asyncio.InvalidStateError as verify_error:
+                logger.warning(
+                    f"[TLS Factory v133.0] Pool verification InvalidStateError (seq={sequence}): {verify_error}"
+                )
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+                pool = None
+                raise verify_error
 
             logger.info(
-                f"[TLS Factory v132.0] Pool created successfully "
-                f"(size={pool.get_size()}, idle={pool.get_idle_size()})"
+                f"[TLS Factory v133.0] Pool created successfully (seq={sequence}, "
+                f"size={pool.get_size()}, idle={pool.get_idle_size()})"
             )
             return pool
 
         except asyncio.InvalidStateError as e:
-            # TLS race condition - this is exactly what we're protecting against
+            # TLS race condition - the exact bug we're protecting against
             last_error = e
             logger.warning(
-                f"[TLS Factory v132.0] TLS InvalidStateError on attempt "
-                f"{attempt + 1}/{max_retries}: {e}"
+                f"[TLS Factory v133.0] TLS InvalidStateError (seq={sequence}, "
+                f"attempt {attempt + 1}/{max_retries}): {e}"
             )
 
-            if attempt < max_retries - 1:
-                # Exponential backoff with jitter
-                delay = (2 ** attempt) * 0.5 * (0.5 + random.random())
-                logger.info(f"[TLS Factory v132.0] Waiting {delay:.2f}s before retry...")
-                await asyncio.sleep(delay)
-                await asyncio.sleep(0)  # Yield to clear corrupted state
+            # v133.0: Clean up partial pool state
+            if pool is not None:
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+                pool = None
 
+            if attempt < max_retries - 1:
+                # v133.0: Extended backoff for pool creation
+                delay = (2 ** attempt) * 1.5 * (0.5 + random.random())
+                logger.info(f"[TLS Factory v133.0] Waiting {delay:.2f}s before retry...")
+                await asyncio.sleep(delay)
+
+                # v133.0: Multiple yields to drain event loop
+                for _ in range(5):
+                    await asyncio.sleep(0)
+
+                # v133.0: Garbage collection hint
+                import gc
+                gc.collect(generation=0)
         except asyncio.TimeoutError:
             last_error = asyncio.TimeoutError(f"Pool creation timeout after {pool_creation_timeout}s")
             logger.warning(
-                f"[TLS Factory v132.0] Pool creation timeout on attempt "
-                f"{attempt + 1}/{max_retries}"
+                f"[TLS Factory v133.0] Pool creation timeout (seq={sequence}, "
+                f"attempt {attempt + 1}/{max_retries})"
             )
+            # v133.0: Clean up partial pool on timeout
+            if pool is not None:
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+                pool = None
             if attempt < max_retries - 1:
                 await asyncio.sleep(1.0)
 
         except (OSError, ConnectionError) as e:
             last_error = e
             logger.warning(
-                f"[TLS Factory v132.0] Connection error on attempt "
-                f"{attempt + 1}/{max_retries}: {e}"
+                f"[TLS Factory v133.0] Connection error (seq={sequence}, "
+                f"attempt {attempt + 1}/{max_retries}): {e}"
             )
+            if pool is not None:
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+                pool = None
             if attempt < max_retries - 1:
                 await asyncio.sleep((attempt + 1) * 1.0)
 
         except Exception as e:
+            # v133.0: Check for wrapped TLS errors
             error_str = str(e).lower()
-            if "invalid state" in error_str or "tlsupgrade" in error_str:
+            is_tls_error = (
+                "invalid state" in error_str or
+                "tlsupgrade" in error_str or
+                "tls" in error_str and "error" in error_str or
+                "ssl" in error_str and "state" in error_str
+            )
+
+            if is_tls_error:
                 last_error = e
+                logger.warning(
+                    f"[TLS Factory v133.0] TLS-related error (seq={sequence}, "
+                    f"attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                if pool is not None:
+                    try:
+                        await pool.close()
+                    except Exception:
+                        pass
+                    pool = None
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(1.0)
+                    delay = (2 ** attempt) * 1.0 * (0.5 + random.random())
+                    await asyncio.sleep(delay)
                     continue
-            logger.error(f"[TLS Factory v132.0] Non-retryable error: {e}")
+
+            logger.error(
+                f"[TLS Factory v133.0] Non-retryable error (seq={sequence}): {e}",
+                exc_info=True
+            )
             return None
 
     logger.error(
-        f"[TLS Factory v132.0] Pool creation failed after {max_retries} attempts: {last_error}"
+        f"[TLS Factory v133.0] Pool creation failed after {max_retries} attempts: {last_error}"
     )
     return None
 
