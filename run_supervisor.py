@@ -12624,22 +12624,68 @@ class SupervisorBootstrapper:
             self._jarvis_prime_client.register_mode_change_callback(on_mode_change)
 
             # v134.0: Register auto-recovery callback with service discovery
+            # v136.0: Enhanced with global spawn coordinator to prevent double-spawn
             # This allows the client to automatically restart J-Prime if it goes offline
             try:
                 from backend.clients.jarvis_prime_client import register_jprime_startup_callback
+                from backend.supervisor.cross_repo_startup_orchestrator import (
+                    should_attempt_spawn,
+                    is_spawn_in_progress,
+                    is_service_ready,
+                )
 
                 async def auto_start_jprime() -> bool:
-                    """v134.0: Auto-recovery callback to restart J-Prime."""
-                    self.logger.info("[v134.0] Auto-recovery: Attempting to restart J-Prime...")
+                    """
+                    v134.0: Auto-recovery callback to restart J-Prime.
+                    v136.0: Enhanced with global spawn coordinator check.
+
+                    This callback is invoked by JARVISPrimeClient's service discovery
+                    when it detects J-Prime is offline. We MUST check the global
+                    spawn coordinator to prevent racing with the orchestrator.
+                    """
+                    # v136.0: Check global spawn coordinator first
+                    if is_spawn_in_progress("jarvis-prime"):
+                        component = None
+                        try:
+                            from backend.supervisor.cross_repo_startup_orchestrator import (
+                                get_spawn_coordinator,
+                            )
+                            component = get_spawn_coordinator().get_spawning_component("jarvis-prime")
+                        except Exception:
+                            pass
+                        self.logger.info(
+                            f"[v136.0] Auto-recovery skipped: jarvis-prime spawn already "
+                            f"in progress by {component or 'unknown'}"
+                        )
+                        return False
+
+                    if is_service_ready("jarvis-prime"):
+                        self.logger.info(
+                            "[v136.0] Auto-recovery skipped: jarvis-prime already ready"
+                        )
+                        return True
+
+                    ok, reason = should_attempt_spawn(
+                        "jarvis-prime",
+                        "auto_start_jprime_callback",
+                        ignore_cooldown=False,
+                    )
+                    if not ok:
+                        self.logger.info(
+                            f"[v136.0] Auto-recovery blocked by coordinator: {reason}"
+                        )
+                        return False
+
+                    self.logger.info("[v136.0] Auto-recovery: Attempting to restart J-Prime...")
                     try:
                         await self._init_jarvis_prime_local_if_needed()
                         return True
                     except Exception as e:
-                        self.logger.warning(f"[v134.0] Auto-recovery failed: {e}")
+                        self.logger.warning(f"[v136.0] Auto-recovery failed: {e}")
                         return False
 
                 register_jprime_startup_callback(auto_start_jprime)
-                self.logger.info("[v134.0] J-Prime auto-recovery callback registered")
+                self.logger.info("[v136.0] J-Prime auto-recovery callback registered with coordinator check")
             except Exception as cb_err:
                 self.logger.debug(f"[v134.0] Auto-recovery callback registration failed: {cb_err}")
 
@@ -12688,12 +12734,14 @@ class SupervisorBootstrapper:
         Start JARVIS-Prime local subprocess if not already running.
 
         v117.0: CRITICAL FIX - Prevent duplicate spawning race condition.
+        v136.0: Enhanced with GlobalSpawnCoordinator for cross-component sync.
 
         The cross_repo_startup_orchestrator may have ALREADY started jarvis-prime
         (via initialize_cross_repo_orchestration at line ~7347). We must:
-        1. Check if the orchestrator already manages jarvis-prime
-        2. Wait for it to become healthy (with longer timeout during startup)
-        3. Only spawn if orchestrator didn't start it AND it's not running
+        1. v136.0: Check global spawn coordinator FIRST
+        2. Check if the orchestrator already manages jarvis-prime
+        3. Wait for it to become healthy (with longer timeout during startup)
+        4. Only spawn if orchestrator didn't start it AND it's not running
 
         Root cause of "address already in use" error:
         - Orchestrator starts jarvis-prime on port 8000
@@ -12703,6 +12751,62 @@ class SupervisorBootstrapper:
         """
         port = self.config.jarvis_prime_port
         host = self.config.jarvis_prime_host
+
+        # =========================================================================
+        # v136.0: GLOBAL SPAWN COORDINATOR CHECK - FIRST PRIORITY
+        # =========================================================================
+        # This check is CRITICAL for preventing double-spawn across all components:
+        # - ProcessOrchestrator._spawn_service()
+        # - This function (_init_jarvis_prime_local_if_needed)
+        # - Auto-recovery callbacks
+        # - Health monitor restarts
+        # =========================================================================
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import (
+                is_spawn_in_progress,
+                is_service_ready,
+                should_attempt_spawn,
+                get_spawn_coordinator,
+            )
+
+            # Check if spawn is in progress by another component
+            if is_spawn_in_progress("jarvis-prime"):
+                component = get_spawn_coordinator().get_spawning_component("jarvis-prime")
+                self.logger.info(
+                    f"[v136.0] ⏳ jarvis-prime spawn already in progress by {component} - waiting..."
+                )
+                # Wait for spawn to complete (max 120s for model loading)
+                for i in range(120):
+                    await asyncio.sleep(1.0)
+                    if is_service_ready("jarvis-prime"):
+                        self.logger.info("[v136.0] ✅ jarvis-prime became ready while waiting")
+                        return
+                    if not is_spawn_in_progress("jarvis-prime"):
+                        self.logger.debug(f"[v136.0] Spawn finished (iteration {i})")
+                        break
+                # Check final state
+                if is_service_ready("jarvis-prime"):
+                    return
+
+            # Check if already ready
+            if is_service_ready("jarvis-prime"):
+                self.logger.info("[v136.0] ✅ jarvis-prime already ready via coordinator")
+                return
+
+            # Check if we should attempt spawn (cooldown, etc.)
+            ok, reason = should_attempt_spawn(
+                "jarvis-prime",
+                "_init_jarvis_prime_local_if_needed",
+                ignore_cooldown=False,
+            )
+            if not ok:
+                self.logger.info(f"[v136.0] Spawn blocked by coordinator: {reason}")
+                return
+
+        except ImportError:
+            self.logger.debug("[v136.0] Spawn coordinator not available, using legacy checks")
+        except Exception as coord_err:
+            self.logger.debug(f"[v136.0] Coordinator check failed: {coord_err}")
 
         # v117.0: STEP 1 - Check if cross_repo_orchestrator already started jarvis-prime
         orchestrator_started = False
@@ -21187,6 +21291,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
     async def _restart_jprime_on_crash(self, reason: str = "process_exited") -> None:
         """
         v95.16: Callback to restart J-Prime when crash detected.
+        v136.0: Enhanced with GlobalSpawnCoordinator for cross-component sync.
 
         Called by TrinityHealthMonitor when J-Prime heartbeat goes stale
         or process is detected as dead.
@@ -21197,30 +21302,100 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         """
         self.logger.warning(f"🔄 [Trinity] Restarting J-Prime (reason: {reason})")
 
-        # Cleanup old process
-        if self._jprime_orchestrator_process is not None:
-            try:
-                self._jprime_orchestrator_process.kill()
-                await self._jprime_orchestrator_process.wait()
-            except Exception:
-                pass
-            self._jprime_orchestrator_process = None
+        # =========================================================================
+        # v136.0: GLOBAL SPAWN COORDINATOR CHECK
+        # =========================================================================
+        # Before restarting, check if another component is already handling it.
+        # This prevents the race condition where health monitor and orchestrator
+        # both try to restart the same crashed service.
+        # =========================================================================
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import (
+                is_spawn_in_progress,
+                is_service_ready,
+                should_attempt_spawn,
+                mark_service_stopped,
+                mark_service_spawning,
+                mark_service_ready,
+                mark_service_failed,
+            )
 
-        # Wait a moment before restart
-        await asyncio.sleep(2.0)
+            # Mark service as stopped first
+            mark_service_stopped("jarvis-prime")
 
-        # Relaunch
-        await self._launch_jprime_orchestrator()
-
-        if self._jprime_orchestrator_process is not None:
-            self.logger.info(f"✅ [Trinity] J-Prime restarted (PID: {self._jprime_orchestrator_process.pid})")
-
-            # Voice announcement if enabled
-            if hasattr(self, 'narrator') and self.config.voice_enabled:
-                await self.narrator.speak(
-                    "J-Prime recovered from crash. Mind component back online.",
-                    wait=False,
+            # Check if another spawn is in progress
+            if is_spawn_in_progress("jarvis-prime"):
+                self.logger.info(
+                    "[v136.0] Restart skipped: spawn already in progress by another component"
                 )
+                return
+
+            # Check cooldown and other conditions
+            ok, block_reason = should_attempt_spawn(
+                "jarvis-prime",
+                "_restart_jprime_on_crash",
+                ignore_cooldown=False,
+            )
+            if not ok:
+                self.logger.info(f"[v136.0] Restart blocked by coordinator: {block_reason}")
+                return
+
+            # Mark that we're spawning
+            if not mark_service_spawning("jarvis-prime", "_restart_jprime_on_crash"):
+                self.logger.warning("[v136.0] Failed to mark spawning - another spawn may be starting")
+                return
+
+            coordinator_available = True
+        except ImportError:
+            self.logger.debug("[v136.0] Spawn coordinator not available")
+            coordinator_available = False
+        except Exception as coord_err:
+            self.logger.debug(f"[v136.0] Coordinator check failed: {coord_err}")
+            coordinator_available = False
+
+        try:
+            # Cleanup old process
+            if self._jprime_orchestrator_process is not None:
+                try:
+                    self._jprime_orchestrator_process.kill()
+                    await self._jprime_orchestrator_process.wait()
+                except Exception:
+                    pass
+                self._jprime_orchestrator_process = None
+
+            # Wait a moment before restart
+            await asyncio.sleep(2.0)
+
+            # Relaunch
+            await self._launch_jprime_orchestrator()
+
+            if self._jprime_orchestrator_process is not None:
+                self.logger.info(f"✅ [Trinity] J-Prime restarted (PID: {self._jprime_orchestrator_process.pid})")
+
+                # v136.0: Mark as ready in coordinator
+                if coordinator_available:
+                    mark_service_ready(
+                        "jarvis-prime",
+                        pid=self._jprime_orchestrator_process.pid,
+                        port=self.config.jarvis_prime_port,
+                    )
+
+                # Voice announcement if enabled
+                if hasattr(self, 'narrator') and self.config.voice_enabled:
+                    await self.narrator.speak(
+                        "J-Prime recovered from crash. Mind component back online.",
+                        wait=False,
+                    )
+            else:
+                # v136.0: Mark as failed if launch didn't produce a process
+                if coordinator_available:
+                    mark_service_failed("jarvis-prime", "launch returned no process")
+
+        except Exception as e:
+            self.logger.error(f"[v136.0] Restart failed: {e}")
+            if coordinator_available:
+                mark_service_failed("jarvis-prime", str(e))
+            raise
 
     async def _restart_reactor_core_on_crash(self, reason: str = "process_exited") -> None:
         """
