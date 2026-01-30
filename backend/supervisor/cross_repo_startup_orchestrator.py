@@ -52,9 +52,27 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 5.13.0 (v146.0)
+Version: 5.14.0 (v147.0)
 
 Changelog:
+- v147.0 (v5.14): UNBREAKABLE ARCHITECTURE - Proactive Rescue & Crash Pre-Cognition
+  - PART 1 PROACTIVE RESCUE: Real-time log analysis detects memory stress BEFORE crash
+    - Pattern matching for: MEMORY EMERGENCY, OOM Warning, load shedding, survival mode
+    - On detection: Triggers GCP provisioning IMMEDIATELY (don't wait for -9)
+    - Controlled restart is better than kernel kill
+  - PART 2 ATOMIC CLOUD LOCK: Corruption-proof state persistence
+    - Temp file + atomic rename strategy (survives power failure during write)
+    - Auto-creation of ~/.jarvis/trinity/ directory
+    - JSON schema validation on load
+  - PART 3 ELASTIC SCALING: Hardware upgrade detection
+    - On startup: If RAM > 32GB but cloud lock exists, AUTO-RELEASE lock
+    - "User upgraded hardware" → return to local mode automatically
+    - No manual intervention needed after RAM upgrade
+  - PART 4 CONSECUTIVE OOM CIRCUIT BREAKER: Prevents infinite crash loops
+    - Tracks consecutive OOMs even in cloud mode
+    - After 3 consecutive OOMs: Mark DEGRADED, stop restarting
+    - Prevents infinite billable GCP loops
+  - ROOT CAUSE FIX: System now PREDICTS crashes instead of just recovering from them
 - v146.0 (v5.13): TRINITY PROTOCOL - Elastic Hybrid Cloud Architecture
   - PART 1 CLOUD-FIRST STRATEGY: Proactive GCP pre-warming on SLIM hardware
     - Background asyncio task starts GCP provisioning IMMEDIATELY during startup
@@ -588,47 +606,274 @@ _trinity_gcp_ready_event: Optional[asyncio.Event] = None
 _trinity_cloud_locked: bool = False
 _trinity_protocol_active: bool = False
 
+# =============================================================================
+# v147.0: PROACTIVE RESCUE - Crash Pre-Cognition Patterns
+# =============================================================================
+# These patterns indicate IMMINENT memory pressure. When detected, we trigger
+# GCP provisioning BEFORE the kernel kills the process with -9.
+#
+# Pattern sources:
+#   - jarvis-prime memory emergency logs
+#   - Python memory allocation failures
+#   - System-level OOM warnings
+#   - JARVIS survival mode indicators
+# =============================================================================
+
+PROACTIVE_RESCUE_PATTERNS = frozenset({
+    # jarvis-prime memory pressure indicators
+    "MEMORY EMERGENCY",
+    "memory emergency",
+    "OOM Warning",
+    "oom warning",
+    "OOM_WARNING",
+    "load shedding",
+    "LOAD SHEDDING",
+    "survival mode",
+    "SURVIVAL MODE",
+    "memory pressure critical",
+    "MEMORY_PRESSURE_CRITICAL",
+    # Python memory allocation failures
+    "MemoryError",
+    "Cannot allocate memory",
+    "out of memory",
+    "OUT OF MEMORY",
+    # ML framework memory issues
+    "CUDA out of memory",
+    "torch.cuda.OutOfMemoryError",
+    "MPS backend out of memory",
+    # System-level indicators
+    "killed by signal 9",
+    "memory cgroup out of memory",
+    "oom-killer",
+    "OOM killer",
+})
+
+# v147.0: Patterns that indicate SEVERE memory stress (immediate action)
+PROACTIVE_RESCUE_SEVERE_PATTERNS = frozenset({
+    "MEMORY EMERGENCY",
+    "memory emergency",
+    "MemoryError",
+    "Cannot allocate memory",
+    "CUDA out of memory",
+    "MPS backend out of memory",
+    "oom-killer",
+})
+
+# v147.0: Consecutive OOM tracking for circuit breaker
+_consecutive_oom_counts: Dict[str, int] = {}
+_MAX_CONSECUTIVE_OOMS = 3  # After this many, stop restarting
+
+
+def _check_proactive_rescue_pattern(line: str) -> Tuple[bool, bool, Optional[str]]:
+    """
+    v147.0: Check if a log line indicates imminent memory pressure.
+
+    Returns:
+        Tuple of (should_trigger: bool, is_severe: bool, matched_pattern: Optional[str])
+    """
+    for pattern in PROACTIVE_RESCUE_SEVERE_PATTERNS:
+        if pattern in line:
+            return True, True, pattern
+
+    for pattern in PROACTIVE_RESCUE_PATTERNS:
+        if pattern in line:
+            return True, False, pattern
+
+    return False, False, None
+
 
 def _load_cloud_lock() -> Dict[str, Any]:
     """
     v146.0: Load persistent cloud lock state from disk.
+    v147.0: Added JSON schema validation and corruption recovery.
 
     Returns dict with:
       - locked: bool - Whether cloud-only mode is enforced
       - reason: str - Why the lock was set (e.g., "OOM_CRASH")
       - timestamp: float - When the lock was set
       - oom_count: int - Number of OOM events that led to lock
+      - consecutive_ooms: int - v147.0: Consecutive OOMs in cloud mode
     """
+    default_state = {
+        "locked": False,
+        "reason": None,
+        "timestamp": None,
+        "oom_count": 0,
+        "consecutive_ooms": 0,  # v147.0
+        "hardware_ram_gb": None,  # v147.0: RAM when lock was set
+    }
+
     try:
         if _CLOUD_LOCK_FILE.exists():
-            return json.loads(_CLOUD_LOCK_FILE.read_text())
+            content = _CLOUD_LOCK_FILE.read_text().strip()
+            if not content:
+                logger.debug("[v147.0] Cloud lock file is empty, using defaults")
+                return default_state
+
+            data = json.loads(content)
+
+            # v147.0: Validate JSON schema
+            if not isinstance(data, dict):
+                logger.warning("[v147.0] Cloud lock file has invalid format, resetting")
+                return default_state
+
+            # Merge with defaults to handle missing keys
+            result = default_state.copy()
+            result.update(data)
+            return result
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"[v147.0] Cloud lock file corrupted (JSON error: {e}), resetting")
+        # Delete corrupted file
+        try:
+            _CLOUD_LOCK_FILE.unlink()
+        except Exception:
+            pass
     except Exception as e:
-        logger.debug(f"[v146.0] Could not read cloud lock: {e}")
-    return {"locked": False, "reason": None, "timestamp": None, "oom_count": 0}
+        logger.debug(f"[v147.0] Could not read cloud lock: {e}")
+
+    return default_state
 
 
-def _save_cloud_lock(locked: bool, reason: str, oom_count: int = 0) -> bool:
+def _save_cloud_lock(
+    locked: bool,
+    reason: str,
+    oom_count: int = 0,
+    consecutive_ooms: int = 0,
+    hardware_ram_gb: Optional[float] = None,
+) -> bool:
     """
     v146.0: Persist cloud lock state to disk.
+    v147.0: ATOMIC WRITES - Uses temp file + rename to prevent corruption.
+
+    The atomic write strategy ensures that if power fails during the write,
+    we either have the old complete file or the new complete file, never
+    a corrupted partial file.
 
     This survives supervisor restarts, ensuring that after an OOM crash,
     the system stays in cloud mode until manually cleared.
     """
     try:
+        # v147.0: Ensure directory exists
         _CLOUD_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        # v147.0: Get current RAM if not provided
+        if hardware_ram_gb is None:
+            try:
+                import psutil
+                hardware_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+            except Exception:
+                hardware_ram_gb = None
+
         lock_state = {
             "locked": locked,
             "reason": reason,
             "timestamp": time.time(),
             "oom_count": oom_count,
-            "version": "v146.0",
+            "consecutive_ooms": consecutive_ooms,  # v147.0
+            "hardware_ram_gb": hardware_ram_gb,  # v147.0
+            "version": "v147.0",
         }
-        _CLOUD_LOCK_FILE.write_text(json.dumps(lock_state, indent=2))
-        logger.info(f"[v146.0] ☁️ Cloud lock {'SET' if locked else 'CLEARED'}: {reason}")
+
+        # v147.0: ATOMIC WRITE with temp file + rename
+        # This prevents corruption if power fails during write
+        temp_file = _CLOUD_LOCK_FILE.with_suffix('.json.tmp')
+
+        # Write to temp file first
+        temp_file.write_text(json.dumps(lock_state, indent=2))
+
+        # Atomic rename (on POSIX systems, rename is atomic)
+        temp_file.rename(_CLOUD_LOCK_FILE)
+
+        logger.info(f"[v147.0] ☁️ Cloud lock {'SET' if locked else 'CLEARED'}: {reason}")
         return True
+
     except Exception as e:
-        logger.warning(f"[v146.0] Could not save cloud lock: {e}")
+        logger.warning(f"[v147.0] Could not save cloud lock: {e}")
+        # Clean up temp file if it exists
+        try:
+            temp_file = _CLOUD_LOCK_FILE.with_suffix('.json.tmp')
+            if temp_file.exists():
+                temp_file.unlink()
+        except Exception:
+            pass
         return False
+
+
+def check_and_release_cloud_lock_on_hardware_upgrade() -> bool:
+    """
+    v147.0: ELASTIC SCALING - Auto-release cloud lock if hardware was upgraded.
+
+    Called during startup to detect if user has upgraded RAM since the lock
+    was set. If RAM is now >= 32GB but a cloud lock exists, we assume the
+    user upgraded and auto-release the lock.
+
+    Returns:
+        True if lock was released due to hardware upgrade, False otherwise.
+    """
+    lock_state = _load_cloud_lock()
+
+    if not lock_state.get("locked", False):
+        return False  # No lock to release
+
+    try:
+        import psutil
+        current_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return False
+
+    # v147.0: Hardware upgrade detection
+    # If RAM >= 32GB, user no longer has SLIM hardware
+    FULL_MODE_RAM_THRESHOLD = 32.0
+
+    if current_ram_gb >= FULL_MODE_RAM_THRESHOLD:
+        lock_ram = lock_state.get("hardware_ram_gb")
+
+        logger.info(
+            f"[v147.0] ♻️ HARDWARE UPGRADE DETECTED!\n"
+            f"    RAM when locked: {lock_ram:.1f}GB (SLIM)\n"
+            f"    Current RAM: {current_ram_gb:.1f}GB (FULL)\n"
+            f"    Action: AUTO-RELEASING cloud lock - returning to local mode"
+        )
+
+        _save_cloud_lock(
+            locked=False,
+            reason=f"HARDWARE_UPGRADE_DETECTED (was {lock_ram:.1f}GB, now {current_ram_gb:.1f}GB)",
+            oom_count=0,
+            consecutive_ooms=0,
+            hardware_ram_gb=current_ram_gb,
+        )
+
+        return True
+
+    return False
+
+
+def increment_consecutive_oom_count(service_name: str) -> int:
+    """
+    v147.0: Track consecutive OOM crashes for circuit breaker.
+
+    Returns the new consecutive OOM count.
+    """
+    global _consecutive_oom_counts
+    count = _consecutive_oom_counts.get(service_name, 0) + 1
+    _consecutive_oom_counts[service_name] = count
+    return count
+
+
+def reset_consecutive_oom_count(service_name: str) -> None:
+    """v147.0: Reset consecutive OOM count after successful operation."""
+    global _consecutive_oom_counts
+    _consecutive_oom_counts[service_name] = 0
+
+
+def should_circuit_break_oom(service_name: str) -> bool:
+    """
+    v147.0: Check if we should stop restarting due to consecutive OOMs.
+
+    Returns True if consecutive OOMs exceed threshold.
+    """
+    return _consecutive_oom_counts.get(service_name, 0) >= _MAX_CONSECUTIVE_OOMS
 
 
 def clear_cloud_lock() -> bool:
@@ -652,9 +897,10 @@ def is_cloud_locked() -> Tuple[bool, Optional[str]]:
     return lock_state.get("locked", False), lock_state.get("reason")
 
 
-def set_cloud_lock_after_oom(oom_count: int = 1) -> bool:
+def set_cloud_lock_after_oom(oom_count: int = 1, consecutive_ooms: int = 0) -> bool:
     """
     v146.0: Set cloud lock after OOM crash.
+    v147.0: Now tracks consecutive OOMs for circuit breaker.
 
     This is called by the OOM Death Handler to ensure the system
     stays in cloud mode across restarts.
@@ -663,8 +909,9 @@ def set_cloud_lock_after_oom(oom_count: int = 1) -> bool:
     _trinity_cloud_locked = True
     return _save_cloud_lock(
         locked=True,
-        reason=f"OOM_CRASH_PROTECTION",
+        reason="OOM_CRASH_PROTECTION",
         oom_count=oom_count,
+        consecutive_ooms=consecutive_ooms,
     )
 
 
@@ -5440,17 +5687,55 @@ class ProcessOrchestrator:
                 )
 
                 # =====================================================================
-                # v146.0: SET PERSISTENT CLOUD LOCK
+                # v147.0: CONSECUTIVE OOM CIRCUIT BREAKER
                 # =====================================================================
-                # This ensures the system stays in cloud mode even if the supervisor
-                # restarts. Without this, a supervisor restart would "forget" the OOM
-                # and try local again, creating an infinite OOM loop across restarts.
+                # Track consecutive OOMs even in cloud mode. If we keep crashing
+                # even with GCP offload, something is fundamentally broken and we
+                # should stop to prevent infinite billable loops.
+                # =====================================================================
+                consecutive_count = increment_consecutive_oom_count(service_name)
+
+                if should_circuit_break_oom(service_name):
+                    logger.error(
+                        f"[v147.0] 🛑 CIRCUIT BREAKER TRIPPED: {service_name} has crashed "
+                        f"{consecutive_count} consecutive times (threshold: {_MAX_CONSECUTIVE_OOMS}).\n"
+                        f"    Even cloud mode cannot save this service.\n"
+                        f"    Marking as DEGRADED and stopping all restart attempts.\n"
+                        f"    Manual investigation required!"
+                    )
+
+                    managed.status = ServiceStatus.FAILED
+                    managed._oom_detected = True
+                    self._crash_circuit_breakers[service_name] = True
+
+                    await _emit_event(
+                        "OOM_CIRCUIT_BREAKER_TRIPPED",
+                        service_name=service_name,
+                        priority="CRITICAL",
+                        details={
+                            "consecutive_ooms": consecutive_count,
+                            "threshold": _MAX_CONSECUTIVE_OOMS,
+                            "action": "STOPPED_ALL_RESTARTS",
+                            "requires_manual_intervention": True,
+                        }
+                    )
+
+                    return  # STOP - do not attempt restart
+
+                # =====================================================================
+                # v146.0: SET PERSISTENT CLOUD LOCK
+                # v147.0: Now includes consecutive OOM tracking
                 # =====================================================================
                 oom_count = managed.restart_count + 1
-                set_cloud_lock_after_oom(oom_count=oom_count)
+                _save_cloud_lock(
+                    locked=True,
+                    reason="OOM_CRASH_PROTECTION",
+                    oom_count=oom_count,
+                    consecutive_ooms=consecutive_count,
+                )
                 logger.warning(
-                    f"[v146.0] 🔒 CLOUD LOCK SET: System will enforce cloud-only mode "
-                    f"until manually cleared (OOM count: {oom_count})"
+                    f"[v147.0] 🔒 CLOUD LOCK SET: System will enforce cloud-only mode "
+                    f"until manually cleared (OOM #{oom_count}, consecutive: {consecutive_count})"
                 )
 
                 # Invalidate any stale GCP cache
@@ -5468,6 +5753,11 @@ class ProcessOrchestrator:
                         f"[v144.0] ✅ Active Rescue: GCP VM ready at {gcp_endpoint} - "
                         f"jarvis-prime will restart as Hollow Client"
                     )
+
+                    # v147.0: Update managed process state consistently
+                    managed.gcp_offload_active = True
+                    managed.gcp_vm_ip = gcp_endpoint.replace("http://", "").split(":")[0]
+
                     # Set up environment for Hollow Client restart
                     os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
                     os.environ["GCP_PRIME_ENDPOINT"] = gcp_endpoint
@@ -5479,7 +5769,8 @@ class ProcessOrchestrator:
                         priority="HIGH",
                         details={
                             "gcp_endpoint": gcp_endpoint,
-                            "oom_count": managed.restart_count + 1,
+                            "oom_count": oom_count,
+                            "consecutive_ooms": consecutive_count,
                             "mode": "hollow_client_forced",
                         }
                     )
@@ -12448,12 +12739,16 @@ echo "=== JARVIS Prime started ==="
         v93.0: Stream process output with intelligent log level detection.
         v93.16: Added warning suppression for known benign library warnings.
         v108.2: Added crash forensics buffer to capture output for post-mortem analysis.
+        v147.0: PROACTIVE RESCUE - Real-time pattern matching for crash pre-cognition.
 
         Python's logging module outputs to stderr by default, which previously
         caused all child process logs to appear as WARNING in our output.
 
         Now we parse the actual content to detect the real log level and
         route appropriately.
+
+        v147.0: Also scans for memory stress patterns and triggers GCP provisioning
+        BEFORE the process crashes. This is "Crash Pre-Cognition."
 
         Example output:
             [JARVIS_PRIME] Loading model...
@@ -12462,6 +12757,10 @@ echo "=== JARVIS Prime started ==="
         """
         prefix = f"[{managed.definition.name.upper().replace('-', '_')}]"
         is_stderr = stream_type == "stderr"
+        service_name = managed.definition.name
+
+        # v147.0: Track if proactive rescue has been triggered for this session
+        proactive_rescue_triggered = False
 
         try:
             while True:
@@ -12473,6 +12772,48 @@ echo "=== JARVIS Prime started ==="
                 if decoded:
                     # v108.2: Always add to crash forensics buffer (even if suppressed from logs)
                     managed.add_output_line(f"{stream_type}: {decoded}", is_stderr=is_stderr)
+
+                    # =========================================================
+                    # v147.0: PROACTIVE RESCUE - Crash Pre-Cognition
+                    # =========================================================
+                    # Scan EVERY line for memory stress patterns. If detected,
+                    # trigger GCP provisioning BEFORE the kernel kills us.
+                    # =========================================================
+                    if not proactive_rescue_triggered:
+                        should_trigger, is_severe, matched_pattern = _check_proactive_rescue_pattern(decoded)
+
+                        if should_trigger:
+                            proactive_rescue_triggered = True
+                            is_jarvis_prime = service_name.lower() in ["jarvis-prime", "jarvis_prime", "j-prime"]
+
+                            logger.warning(
+                                f"[v147.0] 🔮 PROACTIVE RESCUE TRIGGERED!\n"
+                                f"    Service: {service_name}\n"
+                                f"    Pattern: '{matched_pattern}'\n"
+                                f"    Severity: {'SEVERE' if is_severe else 'WARNING'}\n"
+                                f"    Action: Preemptive GCP provisioning initiated"
+                            )
+
+                            # Fire off GCP provisioning in background (don't block log streaming)
+                            if is_jarvis_prime:
+                                asyncio.create_task(
+                                    self._proactive_rescue_handler(
+                                        managed,
+                                        matched_pattern or "UNKNOWN_PATTERN",
+                                        is_severe,
+                                    )
+                                )
+
+                            await _emit_event(
+                                "PROACTIVE_RESCUE_TRIGGERED",
+                                service_name=service_name,
+                                priority="CRITICAL" if is_severe else "HIGH",
+                                details={
+                                    "matched_pattern": matched_pattern,
+                                    "is_severe": is_severe,
+                                    "line": decoded[:200],  # Truncate for log
+                                }
+                            )
 
                     # v93.16: Suppress known benign warnings
                     if self._should_suppress_line(decoded):
@@ -12496,6 +12837,125 @@ echo "=== JARVIS Prime started ==="
             pass
         except Exception as e:
             logger.error(f"Output streaming error for {managed.definition.name}: {e}")
+
+    async def _proactive_rescue_handler(
+        self,
+        managed: ManagedProcess,
+        matched_pattern: str,
+        is_severe: bool,
+    ) -> None:
+        """
+        v147.0: Handle proactive rescue when memory stress is detected.
+
+        This is called asynchronously when log patterns indicate imminent OOM.
+        We provision GCP BEFORE the crash happens, then optionally trigger
+        a controlled restart.
+        """
+        service_name = managed.definition.name
+
+        logger.info(
+            f"[v147.0] 🚀 Proactive Rescue Handler: Provisioning GCP for {service_name}..."
+        )
+
+        try:
+            # Step 1: Provision GCP VM (async, with timeout)
+            gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
+                timeout_seconds=90.0,  # Shorter timeout for proactive rescue
+                force_provision=False,
+            )
+
+            if gcp_ready and gcp_endpoint:
+                logger.info(
+                    f"[v147.0] ✅ Proactive Rescue: GCP VM ready at {gcp_endpoint}"
+                )
+
+                # Step 2: Update managed process state for next spawn
+                managed.gcp_offload_active = True
+                managed.gcp_vm_ip = gcp_endpoint.replace("http://", "").split(":")[0]
+
+                # Step 3: Update environment for next spawn
+                os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
+                os.environ["GCP_PRIME_ENDPOINT"] = gcp_endpoint
+                os.environ["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
+
+                # Step 4: Set cloud lock (persist across restarts)
+                _save_cloud_lock(
+                    locked=True,
+                    reason=f"PROACTIVE_RESCUE:{matched_pattern}",
+                    oom_count=0,
+                    consecutive_ooms=0,
+                )
+
+                # Step 5: If SEVERE, trigger controlled restart
+                if is_severe:
+                    logger.warning(
+                        f"[v147.0] ⚡ SEVERE memory stress - triggering controlled restart of {service_name}"
+                    )
+
+                    # Graceful shutdown is better than waiting for -9
+                    await self._graceful_restart_service(service_name)
+
+                await _emit_event(
+                    "PROACTIVE_RESCUE_SUCCESS",
+                    service_name=service_name,
+                    priority="HIGH",
+                    details={
+                        "gcp_endpoint": gcp_endpoint,
+                        "controlled_restart": is_severe,
+                    }
+                )
+
+            else:
+                logger.warning(
+                    f"[v147.0] ⚠️ Proactive Rescue: GCP provisioning failed. "
+                    f"Service {service_name} may crash."
+                )
+
+                await _emit_event(
+                    "PROACTIVE_RESCUE_GCP_FAILED",
+                    service_name=service_name,
+                    priority="CRITICAL",
+                    details={"reason": "GCP VM provisioning failed or timed out"}
+                )
+
+        except Exception as e:
+            logger.error(f"[v147.0] Proactive Rescue Handler error: {e}")
+
+    async def _graceful_restart_service(self, service_name: str) -> bool:
+        """
+        v147.0: Trigger a graceful restart of a service.
+
+        This is better than waiting for the kernel to kill with -9,
+        because we can ensure GCP is ready first.
+        """
+        if service_name not in self.processes:
+            return False
+
+        managed = self.processes[service_name]
+
+        logger.info(f"[v147.0] 🔄 Initiating graceful restart of {service_name}...")
+
+        try:
+            # Send SIGTERM for graceful shutdown
+            if managed.process and managed.process.returncode is None:
+                managed.process.terminate()
+
+                # Wait up to 10 seconds for graceful shutdown
+                try:
+                    await asyncio.wait_for(managed.process.wait(), timeout=10.0)
+                    logger.info(f"[v147.0] ✅ {service_name} terminated gracefully")
+                except asyncio.TimeoutError:
+                    # Force kill if graceful shutdown takes too long
+                    logger.warning(f"[v147.0] ⚠️ {service_name} didn't terminate gracefully, forcing...")
+                    managed.process.kill()
+                    await managed.process.wait()
+
+            # The normal crash handler will restart the service with GCP config
+            return True
+
+        except Exception as e:
+            logger.error(f"[v147.0] Graceful restart failed for {service_name}: {e}")
+            return False
 
     async def _start_output_streaming(self, managed: ManagedProcess) -> None:
         """Start streaming stdout and stderr for a process."""
@@ -17614,6 +18074,24 @@ echo "=== JARVIS Prime started ==="
             log_hardware_assessment(hw_assessment)
         except Exception as e:
             logger.warning(f"[v143.0] Hardware assessment failed: {e}, proceeding with defaults")
+
+        # =========================================================================
+        # v147.0: ELASTIC SCALING - Hardware Upgrade Detection
+        # =========================================================================
+        # Check if user upgraded RAM since the cloud lock was set.
+        # If RAM >= 32GB but cloud lock exists, auto-release it.
+        # This allows users to return to local mode after a RAM upgrade
+        # without manual intervention.
+        # =========================================================================
+        try:
+            hardware_upgraded = check_and_release_cloud_lock_on_hardware_upgrade()
+            if hardware_upgraded:
+                logger.info(
+                    "[v147.0] ✅ Cloud lock auto-released due to hardware upgrade. "
+                    "System will use local inference."
+                )
+        except Exception as e:
+            logger.debug(f"[v147.0] Hardware upgrade check failed: {e}")
 
         # =========================================================================
         # v146.0: TRINITY PROTOCOL - CLOUD-FIRST STRATEGY
