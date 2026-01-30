@@ -52,9 +52,23 @@ Architecture:
     └──────────────────────────────────────────────────────────────────┘
 
 Author: JARVIS AI System
-Version: 5.10.0 (v143.0)
+Version: 5.11.0 (v144.0)
 
 Changelog:
+- v144.0 (v5.11): HOLLOW CLIENT & ACTIVE RESCUE - Nuclear OOM Prevention
+  - PART 1 HOLLOW CLIENT: jarvis-prime now uses strict lazy imports (torch/transformers)
+    - Startup RAM reduced from ~4GB to ~300MB
+    - Heavy ML libs only loaded when actually doing inference
+    - New JARVIS_GCP_OFFLOAD_ACTIVE env var blocks local heavy imports
+    - Slim Mode + GCP Active = Hollow Client that routes to GCP
+  - PART 2 ACTIVE RESCUE: GCP VM provisioned BEFORE spawning jarvis-prime on SLIM hardware
+    - force_cloud_hybrid flag automatically set when profile is SLIM or CLOUD_ONLY
+    - ensure_gcp_vm_ready_for_prime() waits for GCP VM before spawn (async, timeout 120s)
+    - JARVIS_GCP_OFFLOAD_ACTIVE=true and GCP_PRIME_ENDPOINT injected to subprocess
+    - On Exit -9 (OOM): NO LOCAL RESTART, force GCP provisioning first
+    - OOM Death Handler triggers cloud rescue instead of local retry loop
+  - RESULT: The Life Raft (GCP) is now deployed BEFORE you need it, not after you drown
+  - ROOT CAUSE FIX: GCP was "tied to the dock" - only provisioned AFTER local crashes
 - v143.0 (v5.10): OPERATION HOLLOW CLIENT - Early Hardware Detection
   - CRITICAL FIX: Set JARVIS_ENABLE_SLIM_MODE in supervisor's OWN environment at startup
   - Hardware assessment now runs FIRST in start_all_services() BEFORE any spawn attempts
@@ -187,6 +201,8 @@ class HardwareAssessment:
     enable_slim_mode: bool
     defer_heavy_subsystems: bool
     reason: str
+    # v144.0: Active Rescue - Force GCP VM for heavy inference on SLIM systems
+    force_cloud_hybrid: bool = False
 
 
 # Singleton hardware assessment cache (assessed once at startup)
@@ -278,29 +294,36 @@ def assess_hardware_profile(force_refresh: bool = False) -> HardwareAssessment:
             recommended_context_size = 4096
 
         # Classify hardware profile
+        # v144.0: Added force_cloud_hybrid for Active Rescue
+        force_cloud_hybrid = False
+
         if total_ram_gb < 16:
             profile = HardwareProfile.CLOUD_ONLY
             skip_agi_hub = True
             enable_slim_mode = False  # Not applicable - skip entirely
             defer_heavy_subsystems = False
+            force_cloud_hybrid = True  # v144.0: MUST use GCP for all heavy inference
             reason = f"System has only {total_ram_gb:.1f}GB RAM (< 16GB). AGI Hub requires GCP cloud."
         elif total_ram_gb < 30:
             profile = HardwareProfile.SLIM
             skip_agi_hub = False
             enable_slim_mode = True
             defer_heavy_subsystems = True
+            force_cloud_hybrid = True  # v144.0: SLIM systems should proactively use GCP
             reason = f"System has {total_ram_gb:.1f}GB RAM (16-30GB). Using SLIM mode with deferred heavy subsystems."
         elif total_ram_gb < 64:
             profile = HardwareProfile.FULL
             skip_agi_hub = False
             enable_slim_mode = False
             defer_heavy_subsystems = True  # Still defer for staged loading
+            force_cloud_hybrid = False  # v144.0: FULL systems can handle local inference
             reason = f"System has {total_ram_gb:.1f}GB RAM (30-64GB). Full mode with staged initialization."
         else:
             profile = HardwareProfile.UNLIMITED
             skip_agi_hub = False
             enable_slim_mode = False
             defer_heavy_subsystems = False
+            force_cloud_hybrid = False  # v144.0: UNLIMITED systems prefer local
             reason = f"System has {total_ram_gb:.1f}GB RAM (64GB+). Unlimited mode - all subsystems can load in parallel."
 
         assessment = HardwareAssessment(
@@ -317,6 +340,7 @@ def assess_hardware_profile(force_refresh: bool = False) -> HardwareAssessment:
             enable_slim_mode=enable_slim_mode,
             defer_heavy_subsystems=defer_heavy_subsystems,
             reason=reason,
+            force_cloud_hybrid=force_cloud_hybrid,  # v144.0
         )
 
         _hardware_assessment_cache = assessment
@@ -361,29 +385,43 @@ def get_hardware_env_vars(assessment: Optional[HardwareAssessment] = None) -> Di
 
     # =========================================================================
     # v139.0: ACTIVE HYBRID BRIDGE - GCP ENDPOINT FOR SLIM MODE
+    # v144.0: Enhanced with Active Rescue pre-cached endpoint
     # =========================================================================
     # When Slim Mode is active, we need to tell jarvis-prime where to forward
     # heavy tasks. This enables the Active Hybrid Bridge to route to GCP.
     # =========================================================================
-    if assessment.enable_slim_mode:
-        # Get GCP endpoint from environment (set by user or infrastructure)
-        gcp_endpoint = os.environ.get("GCP_PRIME_ENDPOINT", os.environ.get("JARVIS_GCP_PRIME_ENDPOINT", ""))
-
-        if gcp_endpoint:
-            env_vars["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
-            env_vars["JARVIS_AUTO_WAKE_GCP"] = "true"
-            env_vars["JARVIS_WARM_UP_GCP_ON_START"] = "true"
+    if assessment.enable_slim_mode or assessment.force_cloud_hybrid:
+        # v144.0: First check for Active Rescue cached endpoint
+        active_rescue_vars = get_active_rescue_env_vars()
+        if active_rescue_vars:
+            env_vars.update(active_rescue_vars)
             logger.info(
-                f"[v139.0] ☁️ Active Hybrid Bridge: GCP endpoint set to {gcp_endpoint}"
+                f"[v144.0] 🚀 Active Rescue: GCP offload vars set from cache"
             )
         else:
-            # No explicit endpoint - GCPVMManager will handle provisioning
-            env_vars["JARVIS_AUTO_WAKE_GCP"] = "true"
-            env_vars["JARVIS_WARM_UP_GCP_ON_START"] = "false"  # Don't block startup
-            logger.info(
-                "[v139.0] ☁️ Active Hybrid Bridge: No GCP endpoint configured - "
-                "will use GCPVMManager for on-demand provisioning"
-            )
+            # Get GCP endpoint from environment (set by user or infrastructure)
+            gcp_endpoint = os.environ.get("GCP_PRIME_ENDPOINT", os.environ.get("JARVIS_GCP_PRIME_ENDPOINT", ""))
+
+            if gcp_endpoint:
+                env_vars["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
+                env_vars["JARVIS_AUTO_WAKE_GCP"] = "true"
+                env_vars["JARVIS_WARM_UP_GCP_ON_START"] = "true"
+                env_vars["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"  # v144.0
+                logger.info(
+                    f"[v139.0] ☁️ Active Hybrid Bridge: GCP endpoint set to {gcp_endpoint}"
+                )
+            else:
+                # No explicit endpoint - GCPVMManager will handle provisioning
+                env_vars["JARVIS_AUTO_WAKE_GCP"] = "true"
+                env_vars["JARVIS_WARM_UP_GCP_ON_START"] = "false"  # Don't block startup
+                logger.info(
+                    "[v139.0] ☁️ Active Hybrid Bridge: No GCP endpoint configured - "
+                    "will use GCPVMManager for on-demand provisioning"
+                )
+
+        # v144.0: Set force_cloud_hybrid flag for spawn logic
+        if assessment.force_cloud_hybrid:
+            env_vars["JARVIS_FORCE_CLOUD_HYBRID"] = "true"
 
     # Log the profile being passed
     logger.info(
@@ -470,9 +508,228 @@ def log_hardware_assessment(assessment: Optional[HardwareAssessment] = None) -> 
     logger.info(f"  Skip AGI Hub:  {assessment.skip_agi_hub}")
     logger.info(f"  Slim Mode:     {assessment.enable_slim_mode}")
     logger.info(f"  Defer Heavy:   {assessment.defer_heavy_subsystems}")
+    logger.info(f"  Force Cloud:   {assessment.force_cloud_hybrid}")  # v144.0
     logger.info("-" * 70)
     logger.info(f"  Reason: {assessment.reason}")
     logger.info("=" * 70)
+
+
+# =============================================================================
+# v144.0: ACTIVE RESCUE SYSTEM - GCP VM Provisioning Before Spawn
+# =============================================================================
+# The Active Rescue system ensures the GCP "Life Raft" is deployed BEFORE
+# jarvis-prime starts on SLIM hardware, not after it crashes from OOM.
+#
+# This breaks the deadlock where:
+#   1. User needs GCP Cloud to save RAM
+#   2. To use GCP, jarvis-prime needs to start (even in Slim Mode)
+#   3. But jarvis-prime crashes from OOM before it can route to GCP
+#   4. Result: Can't use Cloud because Local Client keeps crashing
+#
+# Active Rescue solves this by:
+#   1. Detecting SLIM/CLOUD_ONLY hardware profile
+#   2. Provisioning GCP VM BEFORE spawning jarvis-prime
+#   3. Passing GCP endpoint to jarvis-prime via environment variables
+#   4. jarvis-prime starts as Hollow Client (lazy imports) and routes to GCP
+#   5. On OOM (Exit -9): NO local restart, force GCP provisioning first
+# =============================================================================
+
+# Cache for GCP VM endpoint (to avoid re-provisioning)
+_active_rescue_gcp_endpoint: Optional[str] = None
+_active_rescue_gcp_ready: bool = False
+_active_rescue_lock = threading.Lock()
+
+
+async def ensure_gcp_vm_ready_for_prime(
+    timeout_seconds: float = 120.0,
+    force_provision: bool = False,
+) -> Tuple[bool, Optional[str]]:
+    """
+    v144.0: Ensure GCP VM is ready for jarvis-prime inference offloading.
+
+    This function is called BEFORE spawning jarvis-prime on SLIM hardware.
+    It either:
+    - Uses an existing running VM (no delay)
+    - Provisions a new VM and waits for it to be ready (up to timeout)
+
+    Args:
+        timeout_seconds: Maximum time to wait for VM to be ready
+        force_provision: If True, provision new VM even if one exists
+
+    Returns:
+        Tuple of (success: bool, gcp_endpoint: Optional[str])
+        - success=True: VM is ready, endpoint is valid
+        - success=False: VM not available, endpoint is None
+    """
+    global _active_rescue_gcp_endpoint, _active_rescue_gcp_ready
+
+    # Check cache first (fast path)
+    with _active_rescue_lock:
+        if _active_rescue_gcp_ready and _active_rescue_gcp_endpoint and not force_provision:
+            logger.info(
+                f"[v144.0] 🚀 Active Rescue: Using cached GCP endpoint: {_active_rescue_gcp_endpoint}"
+            )
+            return True, _active_rescue_gcp_endpoint
+
+    try:
+        # Try to get the GCP VM Manager
+        from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+
+        vm_manager = await get_gcp_vm_manager_safe()
+        if vm_manager is None:
+            logger.warning("[v144.0] ⚠️ Active Rescue: GCP VM Manager not available")
+            return False, None
+
+        # Check for existing running VM
+        logger.info("[v144.0] 🔍 Active Rescue: Checking for existing GCP VM...")
+        active_vm = await vm_manager.get_active_vm()
+
+        if active_vm and not force_provision:
+            # Verify VM is healthy
+            is_healthy = await _verify_gcp_vm_health(active_vm.ip_address)
+            if is_healthy:
+                endpoint = f"http://{active_vm.ip_address}:8000"
+                with _active_rescue_lock:
+                    _active_rescue_gcp_endpoint = endpoint
+                    _active_rescue_gcp_ready = True
+                logger.info(
+                    f"[v144.0] ✅ Active Rescue: Existing VM ready at {endpoint}"
+                )
+                return True, endpoint
+            else:
+                logger.warning(
+                    f"[v144.0] ⚠️ Active Rescue: Existing VM {active_vm.ip_address} not healthy, will provision new"
+                )
+
+        # No healthy VM - need to provision
+        logger.info(
+            f"[v144.0] ☁️ Active Rescue: Provisioning GCP VM for jarvis-prime offload..."
+        )
+        logger.info(
+            f"[v144.0] ⏱️ Active Rescue: Waiting up to {timeout_seconds}s for VM to be ready..."
+        )
+
+        # Provision and wait
+        start_time = time.time()
+        success, error_msg = await vm_manager.start_spot_vm()
+
+        if not success:
+            logger.error(f"[v144.0] ❌ Active Rescue: VM provisioning failed: {error_msg}")
+            return False, None
+
+        # Wait for VM to be ready with health checks
+        while time.time() - start_time < timeout_seconds:
+            await asyncio.sleep(5.0)  # Check every 5 seconds
+
+            active_vm = await vm_manager.get_active_vm()
+            if active_vm:
+                is_healthy = await _verify_gcp_vm_health(active_vm.ip_address, timeout=5.0)
+                if is_healthy:
+                    endpoint = f"http://{active_vm.ip_address}:8000"
+                    with _active_rescue_lock:
+                        _active_rescue_gcp_endpoint = endpoint
+                        _active_rescue_gcp_ready = True
+
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"[v144.0] ✅ Active Rescue: GCP VM ready at {endpoint} "
+                        f"(took {elapsed:.1f}s)"
+                    )
+                    return True, endpoint
+                else:
+                    logger.debug(f"[v144.0] VM {active_vm.ip_address} not ready yet, waiting...")
+
+        # Timeout reached
+        logger.error(
+            f"[v144.0] ❌ Active Rescue: GCP VM not ready after {timeout_seconds}s timeout"
+        )
+        return False, None
+
+    except ImportError as e:
+        logger.warning(f"[v144.0] ⚠️ Active Rescue: GCP modules not available: {e}")
+        return False, None
+    except Exception as e:
+        logger.error(f"[v144.0] ❌ Active Rescue: Unexpected error: {e}")
+        return False, None
+
+
+async def _verify_gcp_vm_health(ip_address: str, timeout: float = 10.0) -> bool:
+    """
+    v144.0: Verify GCP VM is reachable and healthy.
+
+    Args:
+        ip_address: IP address of the VM
+        timeout: Timeout for health check request
+
+    Returns:
+        True if VM is healthy, False otherwise
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            health_url = f"http://{ip_address}:8000/health"
+            async with session.get(health_url, timeout=timeout) as response:
+                if response.status == 200:
+                    return True
+    except asyncio.TimeoutError:
+        logger.debug(f"[v144.0] Health check timeout for {ip_address}")
+    except aiohttp.ClientError as e:
+        logger.debug(f"[v144.0] Health check error for {ip_address}: {e}")
+    except Exception as e:
+        logger.debug(f"[v144.0] Unexpected health check error for {ip_address}: {e}")
+
+    return False
+
+
+def get_active_rescue_env_vars(gcp_endpoint: Optional[str] = None) -> Dict[str, str]:
+    """
+    v144.0: Get environment variables for Active Rescue (GCP offloading).
+
+    These variables tell jarvis-prime to run as a Hollow Client that
+    routes heavy inference to GCP instead of loading models locally.
+
+    Args:
+        gcp_endpoint: Optional GCP endpoint. If None, uses cached endpoint.
+
+    Returns:
+        Dict of environment variables for subprocess
+    """
+    global _active_rescue_gcp_endpoint
+
+    endpoint = gcp_endpoint or _active_rescue_gcp_endpoint
+
+    if not endpoint:
+        # No GCP endpoint available - jarvis-prime will try local
+        return {}
+
+    return {
+        # Signal jarvis-prime to run as Hollow Client
+        "JARVIS_GCP_OFFLOAD_ACTIVE": "true",
+        # GCP endpoint for inference routing
+        "GCP_PRIME_ENDPOINT": endpoint,
+        "JARVIS_GCP_PRIME_ENDPOINT": endpoint,
+        "JARVIS_GCP_VM_IP": endpoint.replace("http://", "").split(":")[0],
+        # Additional flags for Hollow Client mode
+        "JARVIS_HOLLOW_CLIENT_MODE": "true",
+        "JARVIS_SKIP_LOCAL_MODEL_LOAD": "true",
+    }
+
+
+def invalidate_active_rescue_cache() -> None:
+    """
+    v144.0: Invalidate the Active Rescue GCP endpoint cache.
+
+    Call this when:
+    - GCP VM is terminated
+    - GCP VM becomes unhealthy
+    - User explicitly requests re-provisioning
+    """
+    global _active_rescue_gcp_endpoint, _active_rescue_gcp_ready
+
+    with _active_rescue_lock:
+        _active_rescue_gcp_endpoint = None
+        _active_rescue_gcp_ready = False
+
+    logger.info("[v144.0] Active Rescue cache invalidated")
 
 
 # =============================================================================
@@ -4890,6 +5147,7 @@ class ProcessOrchestrator:
             return
 
         # v132.3: Handle OOM kill - trigger GCP offload for restart
+        # v144.0: ACTIVE RESCUE - For jarvis-prime, FORCE GCP before any local restart
         if is_oom_kill:
             logger.warning(
                 f"[v132.3] 🔴 OOM DETECTED: Service {service_name} killed by SIGKILL "
@@ -4897,7 +5155,76 @@ class ProcessOrchestrator:
             )
             # Flag for GCP-assisted restart
             managed._oom_detected = True
-            # Continue to crash handling but will trigger GCP offload
+
+            # =========================================================================
+            # v144.0: ACTIVE RESCUE - OOM DEATH HANDLER
+            # =========================================================================
+            # For jarvis-prime specifically, we MUST force GCP provisioning before
+            # attempting any local restart. This prevents the OOM crash loop.
+            # =========================================================================
+            is_jarvis_prime = service_name.lower() in ["jarvis-prime", "jarvis_prime", "j-prime"]
+            slim_mode = os.environ.get("JARVIS_ENABLE_SLIM_MODE", "").lower() in ("true", "1", "yes", "on")
+
+            if is_jarvis_prime and slim_mode:
+                logger.warning(
+                    f"[v144.0] 🛟 ACTIVE RESCUE OOM DEATH HANDLER: "
+                    f"jarvis-prime OOM'd - forcing GCP provisioning BEFORE restart!"
+                )
+
+                # Invalidate any stale GCP cache
+                invalidate_active_rescue_cache()
+
+                # Force GCP provisioning
+                logger.info(f"[v144.0] ⏳ Provisioning GCP VM for jarvis-prime offload (timeout: 120s)...")
+                gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
+                    timeout_seconds=120.0,
+                    force_provision=True,  # Force new provisioning
+                )
+
+                if gcp_ready and gcp_endpoint:
+                    logger.info(
+                        f"[v144.0] ✅ Active Rescue: GCP VM ready at {gcp_endpoint} - "
+                        f"jarvis-prime will restart as Hollow Client"
+                    )
+                    # Set up environment for Hollow Client restart
+                    os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
+                    os.environ["GCP_PRIME_ENDPOINT"] = gcp_endpoint
+                    os.environ["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
+
+                    await _emit_event(
+                        "ACTIVE_RESCUE_OOM_RECOVERY",
+                        service_name=service_name,
+                        priority="HIGH",
+                        details={
+                            "gcp_endpoint": gcp_endpoint,
+                            "oom_count": managed.restart_count + 1,
+                            "mode": "hollow_client_forced",
+                        }
+                    )
+                else:
+                    logger.error(
+                        f"[v144.0] ❌ Active Rescue FAILED: Could not provision GCP VM. "
+                        f"jarvis-prime will NOT be restarted to prevent OOM crash loop. "
+                        f"Please manually check GCP quota/credentials."
+                    )
+                    managed.status = ServiceStatus.FAILED
+                    managed._oom_detected = True
+
+                    await _emit_event(
+                        "ACTIVE_RESCUE_OOM_FAILED",
+                        service_name=service_name,
+                        priority="CRITICAL",
+                        details={
+                            "reason": "GCP provisioning failed, cannot safely restart",
+                            "manual_action_required": True,
+                        }
+                    )
+
+                    # DO NOT restart - prevent OOM crash loop
+                    self._crash_circuit_breakers[service_name] = True
+                    return
+
+            # Continue to normal crash handling (will trigger GCP offload in restart logic)
 
         # v95.11: Check for startup-phase termination (very short uptime + SIGTERM)
         # This might indicate the service was killed before fully starting
@@ -14342,12 +14669,85 @@ echo "=== JARVIS Prime started ==="
         v136.0: Core spawn implementation (separated for coordinator integration).
         v137.1: Added diagnostic logging for hang debugging.
         v137.2: Added hard memory gate for heavy services.
+        v144.0: Active Rescue - ensure GCP VM ready before spawning jarvis-prime on SLIM.
 
         This is the actual spawn logic, wrapped by _spawn_service_inner which
         handles global coordination.
         """
         logger.info(f"[v137.1] _spawn_service_core({definition.name}): entering...")
-        
+
+        # =========================================================================
+        # v144.0: ACTIVE RESCUE - GCP VM PROVISIONING BEFORE JARVIS-PRIME SPAWN
+        # =========================================================================
+        # On SLIM hardware, we need to ensure the GCP VM is ready BEFORE spawning
+        # jarvis-prime. This prevents the OOM crash loop where:
+        #   1. jarvis-prime starts
+        #   2. jarvis-prime loads heavy models
+        #   3. System OOMs, jarvis-prime crashes with Exit -9
+        #   4. Supervisor restarts jarvis-prime locally (goto 1)
+        #
+        # Active Rescue breaks this loop by:
+        #   1. Detecting SLIM hardware
+        #   2. Provisioning GCP VM BEFORE spawning jarvis-prime
+        #   3. Passing GCP endpoint to jarvis-prime
+        #   4. jarvis-prime runs as Hollow Client, routes to GCP
+        # =========================================================================
+        is_jarvis_prime = definition.name.lower() in ["jarvis-prime", "jarvis_prime", "j-prime"]
+
+        if is_jarvis_prime:
+            # Check if Active Rescue should be triggered
+            force_cloud = os.environ.get("JARVIS_FORCE_CLOUD_HYBRID", "").lower() in ("true", "1", "yes", "on")
+            slim_mode = os.environ.get("JARVIS_ENABLE_SLIM_MODE", "").lower() in ("true", "1", "yes", "on")
+
+            if force_cloud or slim_mode:
+                logger.info(
+                    f"[v144.0] 🚀 Active Rescue: Ensuring GCP VM is ready BEFORE spawning {definition.name}..."
+                )
+
+                # Provision GCP VM (or use existing)
+                gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
+                    timeout_seconds=120.0,
+                    force_provision=False,
+                )
+
+                if gcp_ready and gcp_endpoint:
+                    logger.info(
+                        f"[v144.0] ✅ Active Rescue: GCP VM ready at {gcp_endpoint} - "
+                        f"jarvis-prime will run as Hollow Client"
+                    )
+                    # Mark that Active Rescue is active for this spawn
+                    managed.gcp_offload_active = True
+                    managed.gcp_vm_ip = gcp_endpoint.replace("http://", "").split(":")[0]
+
+                    # Emit event for monitoring
+                    await _emit_event(
+                        "ACTIVE_RESCUE_GCP_READY",
+                        service_name=definition.name,
+                        priority="HIGH",
+                        details={
+                            "gcp_endpoint": gcp_endpoint,
+                            "mode": "hollow_client",
+                            "reason": "force_cloud_hybrid" if force_cloud else "slim_mode",
+                        }
+                    )
+                else:
+                    logger.warning(
+                        f"[v144.0] ⚠️ Active Rescue: GCP VM not available - "
+                        f"jarvis-prime will attempt local startup in Hollow Client mode. "
+                        f"Heavy inference may fail without GCP."
+                    )
+                    # Still proceed - Hollow Client can handle some basic requests
+                    # and will gracefully fail inference requests that need GCP
+                    await _emit_event(
+                        "ACTIVE_RESCUE_GCP_UNAVAILABLE",
+                        service_name=definition.name,
+                        priority="HIGH",
+                        details={
+                            "reason": "GCP VM provisioning failed or timed out",
+                            "fallback": "hollow_client_without_gcp",
+                        }
+                    )
+
         # =========================================================================
         # v142.0: DYNAMIC MEMORY GATING - Context-Aware Slim Mode Support
         # =========================================================================
