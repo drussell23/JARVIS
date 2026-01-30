@@ -4612,6 +4612,41 @@ async def lock_with_context(request: Request):
 logger.info("✅ Context-intelligent /lock-with-context endpoint registered (module-level)")
 
 # ═══════════════════════════════════════════════════════════════
+# v149.0: WEBSOCKET PASS-THROUGH MIDDLEWARE
+# ═══════════════════════════════════════════════════════════════
+# This middleware runs FIRST (added last due to Starlette's LIFO order)
+# to ensure WebSocket connections bypass any CORS interference.
+# CORSMiddleware can sometimes incorrectly reject WebSocket upgrade requests.
+# ═══════════════════════════════════════════════════════════════
+
+class WebSocketPassThroughMiddleware:
+    """
+    v149.0: Pass-through middleware for WebSocket connections.
+    
+    This pure ASGI middleware ensures WebSocket connections are passed
+    directly to the application without interference from other middleware
+    (especially CORS which can incorrectly reject WebSocket upgrades).
+    
+    Must be added AFTER CORSMiddleware (so it runs BEFORE in the chain).
+    """
+    
+    def __init__(self, app):
+        self.app = app
+        logger.info("[v149.0] WebSocket Pass-Through middleware initialized")
+    
+    async def __call__(self, scope, receive, send):
+        """ASGI interface - pass through WebSocket connections unchanged."""
+        if scope['type'] == 'websocket':
+            # WebSocket connection - pass through directly
+            path = scope.get('path', '/')
+            logger.debug(f"[v149.0] WebSocket pass-through: {path}")
+            await self.app(scope, receive, send)
+            return
+        
+        # HTTP requests - continue through middleware chain
+        await self.app(scope, receive, send)
+
+# ═══════════════════════════════════════════════════════════════
 # ROBUST DYNAMIC CORS CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 logger.info("🔒 Configuring CORS security...")
@@ -4774,6 +4809,15 @@ except Exception as e:
         allow_headers=["*"],
     )
     logger.warning("⚠️  Using minimal fallback CORS configuration")
+
+# v149.0: Add WebSocket pass-through middleware AFTER CORS (runs BEFORE in chain)
+# This ensures WebSocket connections bypass CORS interference entirely
+try:
+    from starlette.middleware import Middleware
+    app.add_middleware(WebSocketPassThroughMiddleware)
+    logger.info("✅ [v149.0] WebSocket Pass-Through middleware added (fixes 403 on /ws)")
+except Exception as e:
+    logger.warning(f"⚠️ Could not add WebSocket pass-through middleware: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════

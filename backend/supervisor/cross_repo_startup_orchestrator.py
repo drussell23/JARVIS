@@ -627,6 +627,109 @@ _GCP_REPROVISION_JITTER = float(os.getenv("GCP_REPROVISION_JITTER", "0.3"))
 _gcp_reprovision_attempt: int = 0
 _gcp_reprovision_last_failure: float = 0.0
 
+# v149.1: Max re-provision attempts before triggering Claude API fallback
+_GCP_MAX_REPROVISION_ATTEMPTS = int(os.getenv("GCP_MAX_REPROVISION_ATTEMPTS", "3"))
+
+# =============================================================================
+# v149.1: CLAUDE API FALLBACK SIGNAL - Cross-repo coordination
+# =============================================================================
+# When GCP becomes persistently unavailable, this signal file tells jarvis-prime
+# to switch from Hollow Client mode (waiting for GCP) to Claude API mode.
+# This ensures inference continues even when GCP is completely down.
+# =============================================================================
+
+_CLAUDE_FALLBACK_SIGNAL_FILE = Path.home() / ".jarvis" / "trinity" / "claude_api_fallback.json"
+
+
+def write_claude_api_fallback_signal(reason: str, gcp_attempts: int = 0) -> bool:
+    """
+    v149.1: Write signal file to tell jarvis-prime to use Claude API fallback.
+    
+    This is the cross-repo coordination mechanism:
+    - JARVIS Core writes this file when GCP becomes unavailable
+    - JARVIS Prime reads this file and switches to Claude API mode
+    - This prevents jarvis-prime from being stuck in Hollow Client limbo
+    
+    Args:
+        reason: Human-readable reason for fallback
+        gcp_attempts: Number of GCP re-provision attempts that failed
+        
+    Returns:
+        True if signal was written successfully
+    """
+    import json
+    from datetime import datetime
+    
+    try:
+        _CLAUDE_FALLBACK_SIGNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
+        signal_data = {
+            "active": True,
+            "reason": reason,
+            "triggered_at": datetime.utcnow().isoformat() + "Z",
+            "gcp_attempts": gcp_attempts,
+            "fallback_mode": "claude_api",
+            "version": "v149.1",
+            "instructions": {
+                "jarvis_prime": "Switch to Claude API mode - do not wait for GCP",
+                "inference_mode": "api_only",
+                "local_models": "disabled",
+                "gcp_routing": "disabled",
+            },
+        }
+        
+        with open(_CLAUDE_FALLBACK_SIGNAL_FILE, "w") as f:
+            json.dump(signal_data, f, indent=2)
+        
+        logger.warning(
+            f"[v149.1] 📢 CLAUDE API FALLBACK SIGNAL WRITTEN: {reason} "
+            f"(after {gcp_attempts} GCP attempts)"
+        )
+        logger.info(f"[v149.1]    Signal file: {_CLAUDE_FALLBACK_SIGNAL_FILE}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[v149.1] Failed to write Claude fallback signal: {e}")
+        return False
+
+
+def clear_claude_api_fallback_signal() -> bool:
+    """
+    v149.1: Clear the Claude API fallback signal (when GCP becomes available again).
+    
+    Returns:
+        True if signal was cleared or didn't exist
+    """
+    try:
+        if _CLAUDE_FALLBACK_SIGNAL_FILE.exists():
+            _CLAUDE_FALLBACK_SIGNAL_FILE.unlink()
+            logger.info("[v149.1] ✅ Claude API fallback signal cleared (GCP restored)")
+        return True
+    except Exception as e:
+        logger.warning(f"[v149.1] Failed to clear Claude fallback signal: {e}")
+        return False
+
+
+def is_claude_api_fallback_active() -> bool:
+    """
+    v149.1: Check if Claude API fallback is currently active.
+    
+    Returns:
+        True if the fallback signal file exists and is active
+    """
+    import json
+    
+    try:
+        if not _CLAUDE_FALLBACK_SIGNAL_FILE.exists():
+            return False
+        
+        with open(_CLAUDE_FALLBACK_SIGNAL_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("active", False)
+            
+    except Exception:
+        return False
+
 
 @dataclass
 class GCPCircuitBreaker:
@@ -1375,10 +1478,23 @@ async def ensure_gcp_vm_ready_for_prime(
             f"VM IP was: {vm_ip}. The startup script may have failed or be taking too long. "
             f"Check GCP Console → Compute Engine → VM instances → Serial port output for details."
         )
+        
+        # v149.1: Trigger Claude API fallback on startup timeout
+        # This ensures jarvis-prime doesn't get stuck waiting for GCP
+        write_claude_api_fallback_signal(
+            reason=f"GCP VM startup timeout ({timeout_seconds}s) - VM IP: {vm_ip}",
+            gcp_attempts=1,
+        )
+        
         return False, None
 
     except ImportError as e:
         logger.warning(f"[v144.0] ⚠️ Active Rescue: GCP modules not available: {e}")
+        # v149.1: Fallback on import error (GCP SDK missing)
+        write_claude_api_fallback_signal(
+            reason=f"GCP modules unavailable: {e}",
+            gcp_attempts=0,
+        )
         return False, None
     except Exception as e:
         logger.error(f"[v144.0] ❌ Active Rescue: Unexpected error: {e}")
@@ -1735,6 +1851,12 @@ async def _gcp_vm_health_monitor_loop(
                 _gcp_vm_consecutive_failures = 0
                 # v149.0: Record success on circuit breaker (for half-open → closed)
                 _gcp_circuit_breaker.record_success()
+                
+                # v149.1: Clear Claude fallback signal when GCP recovers
+                if is_claude_api_fallback_active():
+                    clear_claude_api_fallback_signal()
+                    # v149.1: Reset re-provision attempt counter on GCP recovery
+                    _gcp_reprovision_attempt = 0
             else:
                 # Increment failure counter
                 _gcp_vm_consecutive_failures += 1
@@ -1791,6 +1913,8 @@ async def _gcp_vm_health_monitor_loop(
                             # v149.0: Reset backoff attempt counter on success
                             _gcp_reprovision_attempt = 0
                             _gcp_circuit_breaker.record_success()
+                            # v149.1: Clear fallback signal on GCP success
+                            clear_claude_api_fallback_signal()
                         else:
                             logger.error(
                                 "[v148.0] ❌ GCP VM re-provisioning failed - "
@@ -1799,11 +1923,25 @@ async def _gcp_vm_health_monitor_loop(
                             # v149.0: Increment backoff attempt and record failure
                             _gcp_reprovision_attempt += 1
                             _gcp_circuit_breaker.record_failure()
+                            
+                            # v149.1: Trigger Claude API fallback after max attempts
+                            if _gcp_reprovision_attempt >= _GCP_MAX_REPROVISION_ATTEMPTS:
+                                write_claude_api_fallback_signal(
+                                    reason=f"GCP VM re-provisioning failed {_gcp_reprovision_attempt} times",
+                                    gcp_attempts=_gcp_reprovision_attempt,
+                                )
                     except Exception as e:
                         logger.error(f"[v148.0] Re-provisioning error: {e}")
                         # v149.0: Increment backoff and record failure on exception
                         _gcp_reprovision_attempt += 1
                         _gcp_circuit_breaker.record_failure()
+                        
+                        # v149.1: Trigger Claude API fallback after max attempts
+                        if _gcp_reprovision_attempt >= _GCP_MAX_REPROVISION_ATTEMPTS:
+                            write_claude_api_fallback_signal(
+                                reason=f"GCP VM re-provisioning exception after {_gcp_reprovision_attempt} attempts: {e}",
+                                gcp_attempts=_gcp_reprovision_attempt,
+                            )
         
         except asyncio.CancelledError:
             logger.debug("[v148.0] GCP VM health monitor cancelled")
@@ -16976,14 +17114,34 @@ echo "=== JARVIS Prime started ==="
                     f"lightweight mode (profile: {_hw_profile})"
                 )
             
+            # ═══════════════════════════════════════════════════════════════════════
+            # v149.1: CHECK CLAUDE API FALLBACK SIGNAL FIRST
+            # ═══════════════════════════════════════════════════════════════════════
+            # If the fallback signal is active (GCP failed persistently), force API mode
+            # regardless of other settings. This ensures jarvis-prime never gets stuck.
+            # ═══════════════════════════════════════════════════════════════════════
+            _claude_fallback_active = is_claude_api_fallback_active()
+            if _claude_fallback_active and definition.name.lower() in jarvis_prime_names:
+                logger.warning(
+                    f"[v149.1] 📢 CLAUDE FALLBACK ACTIVE: {definition.name} forced to API-only mode"
+                )
+                env["JARVIS_API_ONLY_MODE"] = "true"
+                env["JARVIS_CLAUDE_FALLBACK_ONLY"] = "true"
+                env["JARVIS_MODEL_LOADING_MODE"] = "disabled"
+                env["JARVIS_HOLLOW_CLIENT_MODE"] = "false"  # Not waiting for GCP
+                env["JARVIS_SKIP_LOCAL_MODEL_LOAD"] = "true"
+                env["JARVIS_GCP_OFFLOAD_ACTIVE"] = "false"  # GCP is unavailable
+                # Don't check GCP - go straight to Claude API
+            
             # v147.0: Pass GCP offload information to spawned service
             # This tells the service to use GCP VM for model inference instead of local loading
             # CRITICAL FIX: jarvis-prime uses JARVIS_GCP_PRIME_ENDPOINT and GCP_PRIME_ENDPOINT
             # to determine where to route requests, NOT JARVIS_GCP_MODEL_SERVER
             # v149.0: Read GCP state from environment variables
+            # v149.1: Skip GCP routing if Claude fallback is active
             _gcp_active = env.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() == "true"
             _gcp_vm_ip = env.get("JARVIS_GCP_VM_IP", "")
-            if _gcp_active and _gcp_vm_ip:
+            if _gcp_active and _gcp_vm_ip and not _claude_fallback_active:
                 # Build the full endpoint URL (use port 8000 which is jarvis-prime's port)
                 gcp_endpoint = f"http://{_gcp_vm_ip}:8000"
                 
@@ -17001,8 +17159,9 @@ echo "=== JARVIS Prime started ==="
                 logger.info(
                     f"[v147.0] 🚀 {definition.name} will route inference to GCP: {gcp_endpoint}"
                 )
-            elif _hw_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"}:
+            elif _hw_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"} and not _claude_fallback_active:
                 # v149.0: SLIM hardware but no GCP - use API fallback mode
+                # v149.1: Skip if Claude fallback already set above
                 if definition.name.lower() in jarvis_prime_names:
                     logger.warning(
                         f"[v148.0] ⚠️ SLIM HARDWARE + NO GCP: {definition.name} will operate in "
