@@ -1193,37 +1193,60 @@ async def ensure_gcp_vm_ready_for_prime(
 
         # Provision and wait
         start_time = time.time()
-        success, error_msg = await vm_manager.start_spot_vm()
+        success, result_or_error = await vm_manager.start_spot_vm()
 
         if not success:
-            logger.error(f"[v144.0] ❌ Active Rescue: VM provisioning failed: {error_msg}")
+            logger.error(f"[v144.0] ❌ Active Rescue: VM provisioning failed: {result_or_error}")
             return False, None
 
-        # Wait for VM to be ready with health checks
+        # v147.0: start_spot_vm now returns IP on success
+        vm_ip = result_or_error  # This is the IP address when success=True
+        logger.info(f"[v147.0] 🔧 VM provisioned with IP: {vm_ip}, waiting for service to start...")
+
+        # Wait for VM service to be ready with health checks
+        check_count = 0
         while time.time() - start_time < timeout_seconds:
+            check_count += 1
             await asyncio.sleep(5.0)  # Check every 5 seconds
 
-            active_vm = await vm_manager.get_active_vm()
-            if active_vm:
-                is_healthy = await _verify_gcp_vm_health(active_vm.ip_address, timeout=5.0)
+            elapsed = time.time() - start_time
+            
+            # v147.0: Try direct health check on the IP we got from start_spot_vm
+            # Don't rely on get_active_vm() which requires is_healthy flag
+            if vm_ip:
+                is_healthy = await _verify_gcp_vm_health(vm_ip, timeout=8.0)
                 if is_healthy:
-                    endpoint = f"http://{active_vm.ip_address}:8000"
+                    # Try port 8000 first (jarvis-prime), fallback to 8010 (startup script default)
+                    endpoint = f"http://{vm_ip}:8000"
                     with _active_rescue_lock:
                         _active_rescue_gcp_endpoint = endpoint
                         _active_rescue_gcp_ready = True
 
-                    elapsed = time.time() - start_time
                     logger.info(
                         f"[v144.0] ✅ Active Rescue: GCP VM ready at {endpoint} "
-                        f"(took {elapsed:.1f}s)"
+                        f"(took {elapsed:.1f}s, {check_count} health checks)"
                     )
                     return True, endpoint
                 else:
-                    logger.debug(f"[v144.0] VM {active_vm.ip_address} not ready yet, waiting...")
+                    # Log progress every 30 seconds
+                    if check_count % 6 == 0:
+                        logger.info(
+                            f"[v147.0] ⏳ GCP VM {vm_ip} not ready yet "
+                            f"({elapsed:.0f}s elapsed, {check_count} checks). "
+                            f"Startup script may still be running..."
+                        )
+            else:
+                # Fallback: try to get VM from manager
+                active_vm = await vm_manager.get_active_vm()
+                if active_vm and active_vm.ip_address:
+                    vm_ip = active_vm.ip_address
+                    logger.info(f"[v147.0] 🔍 Found VM IP from manager: {vm_ip}")
 
         # Timeout reached
         logger.error(
-            f"[v144.0] ❌ Active Rescue: GCP VM not ready after {timeout_seconds}s timeout"
+            f"[v144.0] ❌ Active Rescue: GCP VM not ready after {timeout_seconds}s timeout. "
+            f"VM IP was: {vm_ip}. The startup script may have failed or be taking too long. "
+            f"Check GCP Console → Compute Engine → VM instances → Serial port output for details."
         )
         return False, None
 
@@ -1238,6 +1261,7 @@ async def ensure_gcp_vm_ready_for_prime(
 async def _verify_gcp_vm_health(ip_address: str, timeout: float = 10.0) -> bool:
     """
     v144.0: Verify GCP VM is reachable and healthy.
+    v147.0: Fixed port mismatch - now checks both 8000 and 8010 (startup script uses 8010)
 
     Args:
         ip_address: IP address of the VM
@@ -1246,18 +1270,29 @@ async def _verify_gcp_vm_health(ip_address: str, timeout: float = 10.0) -> bool:
     Returns:
         True if VM is healthy, False otherwise
     """
-    try:
-        async with aiohttp.ClientSession() as session:
-            health_url = f"http://{ip_address}:8000/health"
-            async with session.get(health_url, timeout=timeout) as response:
-                if response.status == 200:
-                    return True
-    except asyncio.TimeoutError:
-        logger.debug(f"[v144.0] Health check timeout for {ip_address}")
-    except aiohttp.ClientError as e:
-        logger.debug(f"[v144.0] Health check error for {ip_address}: {e}")
-    except Exception as e:
-        logger.debug(f"[v144.0] Unexpected health check error for {ip_address}: {e}")
+    # v147.0: Check both ports - startup script uses 8010, but some configs use 8000
+    ports_to_check = [8000, 8010]
+    
+    for port in ports_to_check:
+        try:
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                health_url = f"http://{ip_address}:{port}/health"
+                async with session.get(
+                    health_url, 
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as response:
+                    if response.status == 200:
+                        logger.info(f"[v147.0] ✅ GCP VM health check passed: {health_url}")
+                        return True
+                    else:
+                        logger.debug(f"[v147.0] Health check {health_url} returned status {response.status}")
+        except asyncio.TimeoutError:
+            logger.debug(f"[v147.0] Health check timeout: {ip_address}:{port}")
+        except aiohttp.ClientError as e:
+            logger.debug(f"[v147.0] Health check connection error {ip_address}:{port}: {type(e).__name__}")
+        except Exception as e:
+            logger.debug(f"[v147.0] Health check error {ip_address}:{port}: {e}")
 
     return False
 

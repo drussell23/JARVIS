@@ -1767,11 +1767,20 @@ class GCPVMManager:
         )
 
         # Metadata
+        # v147.0: Added port and repo URL for startup script configuration
+        jarvis_port = os.environ.get("JARVIS_PRIME_PORT", "8000")
+        jarvis_repo_url = os.environ.get("JARVIS_REPO_URL", "")  # Optional: private repo URL
+        
         metadata_items = [
             compute_v1.Items(key="jarvis-components", value=",".join(components)),
             compute_v1.Items(key="jarvis-trigger", value=trigger_reason),
             compute_v1.Items(key="jarvis-created-at", value=datetime.now().isoformat()),
+            compute_v1.Items(key="jarvis-port", value=jarvis_port),  # v147.0: Port for health checks
         ]
+        
+        # v147.0: Add repo URL if configured (for private repos)
+        if jarvis_repo_url:
+            metadata_items.append(compute_v1.Items(key="jarvis-repo-url", value=jarvis_repo_url))
 
         # Add startup script with self-destruct capability
         # The script will auto-shutdown if it doesn't receive a heartbeat or completes its task

@@ -56,16 +56,27 @@ python3 -m pip install --upgrade pip setuptools wheel
 # Clone JARVIS repository
 echo "📥 Cloning JARVIS repository..."
 cd /home
+
+# v147.0: Get git repo URL from instance metadata (injected during VM creation)
+JARVIS_REPO_URL=$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-repo-url || echo "")
+
 if [ ! -d "JARVIS-AI-Agent" ]; then
-    # Note: In production, you'd want to use a service account with read access
-    # or use a pre-baked image with the code already installed
-    git clone https://github.com/YOUR_USERNAME/JARVIS-AI-Agent.git || {
-        echo "⚠️  Git clone failed, using fallback method..."
-        # Fallback: Download release tarball or use pre-installed code
-        # For now, we'll create a minimal structure
-        mkdir -p JARVIS-AI-Agent/backend
-        echo "⚠️  Repository not available - using minimal setup"
-    }
+    if [ -n "$JARVIS_REPO_URL" ]; then
+        echo "📥 Cloning from: $JARVIS_REPO_URL"
+        git clone "$JARVIS_REPO_URL" JARVIS-AI-Agent || {
+            echo "⚠️  Git clone failed, trying public repo..."
+            git clone https://github.com/derekrussell/JARVIS-AI-Agent.git JARVIS-AI-Agent || {
+                echo "⚠️  Fallback clone also failed, creating minimal structure..."
+                mkdir -p JARVIS-AI-Agent/backend
+            }
+        }
+    else
+        echo "⚠️  No repo URL in metadata, trying public repo..."
+        git clone https://github.com/derekrussell/JARVIS-AI-Agent.git JARVIS-AI-Agent || {
+            echo "⚠️  Clone failed, creating minimal structure..."
+            mkdir -p JARVIS-AI-Agent/backend
+        }
+    fi
 fi
 
 cd JARVIS-AI-Agent/backend
@@ -87,14 +98,18 @@ python3 -m pip install \
 
 # Set up environment variables
 echo "⚙️  Configuring environment..."
+
+# v147.0: Get port from metadata or default to 8000 (matches jarvis-prime)
+BACKEND_PORT=$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-port || echo "8000")
+
 cat > /home/JARVIS-AI-Agent/backend/.env.gcp << EOF
 # GCP VM Environment Configuration
 GCP_PROJECT_ID=jarvis-473803
 GCP_REGION=us-central1
 GCP_ZONE=us-central1-a
 
-# Backend Configuration
-BACKEND_PORT=8010
+# Backend Configuration (v147.0: Changed from 8010 to 8000 to match jarvis-prime)
+BACKEND_PORT=${BACKEND_PORT}
 BACKEND_HOST=0.0.0.0
 
 # Component Configuration
@@ -165,11 +180,11 @@ screen -dmS self_destruct bash -c '
     done
 '
 
-# Start backend in screen session for easy access
-screen -dmS jarvis bash -c "python3 main.py --port 8010 > $LOG_FILE 2>&1"
+# Start backend in screen session for easy access (v147.0: Use dynamic port)
+screen -dmS jarvis bash -c "python3 main.py --port ${BACKEND_PORT} > $LOG_FILE 2>&1"
 
 # Wait for backend to start
-echo "⏳ Waiting for backend to start..."
+echo "⏳ Waiting for backend to start on port ${BACKEND_PORT}..."
 sleep 10
 
 # Health check
@@ -178,7 +193,7 @@ RETRY_COUNT=0
 BACKEND_READY=false
 
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if curl -s http://localhost:8010/health > /dev/null; then
+    if curl -s http://localhost:${BACKEND_PORT}/health > /dev/null; then
         BACKEND_READY=true
         break
     fi
@@ -189,8 +204,8 @@ done
 
 if [ "$BACKEND_READY" = true ]; then
     echo "✅ JARVIS backend is ready!"
-    echo "   URL: http://$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip):8010"
-    echo "   Health: http://localhost:8010/health"
+    echo "   URL: http://$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip):${BACKEND_PORT}"
+    echo "   Health: http://localhost:${BACKEND_PORT}/health"
     echo "   Logs: $LOG_FILE"
     echo "   Screen session: screen -r jarvis"
 else
