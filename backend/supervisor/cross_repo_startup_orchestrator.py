@@ -15635,7 +15635,14 @@ echo "=== JARVIS Prime started ==="
                     )
                     # Mark that Active Rescue is active for this spawn
                     managed.gcp_offload_active = True
-                    managed.gcp_vm_ip = gcp_endpoint.replace("http://", "").split(":")[0]
+                    # v147.0: Store just the IP (without http:// or port) for gcp_vm_ip field
+                    # The full endpoint is reconstructed later using port 8000
+                    managed.gcp_vm_ip = gcp_endpoint.replace("http://", "").replace("https://", "").split(":")[0]
+                    
+                    # v147.0: Also set environment variables in supervisor process for consistency
+                    os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
+                    os.environ["GCP_PRIME_ENDPOINT"] = gcp_endpoint
+                    os.environ["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
 
                     # Emit event for monitoring
                     await _emit_event(
@@ -16313,25 +16320,45 @@ echo "=== JARVIS Prime started ==="
                         "Proceeding with default settings."
                     )
 
-            # v132.4: Pass GCP offload information to spawned service
+            # v147.0: Pass GCP offload information to spawned service
             # This tells the service to use GCP VM for model inference instead of local loading
+            # CRITICAL FIX: jarvis-prime uses JARVIS_GCP_PRIME_ENDPOINT and GCP_PRIME_ENDPOINT
+            # to determine where to route requests, NOT JARVIS_GCP_MODEL_SERVER
             if managed.gcp_offload_active and managed.gcp_vm_ip:
+                # Build the full endpoint URL (use port 8000 which is jarvis-prime's port)
+                gcp_endpoint = f"http://{managed.gcp_vm_ip}:8000"
+                
+                # v147.0: Set ALL env vars that jarvis-prime checks for GCP routing
                 env["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
-                env["JARVIS_GCP_MODEL_SERVER"] = f"http://{managed.gcp_vm_ip}:8080"
+                env["GCP_PRIME_ENDPOINT"] = gcp_endpoint  # Used by hybrid_tiered_router.py
+                env["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint  # Alternate name
+                env["JARVIS_GCP_MODEL_SERVER"] = gcp_endpoint  # Legacy compatibility
                 env["JARVIS_GCP_VM_IP"] = managed.gcp_vm_ip
                 # Tell service to use lightweight/proxy mode
                 env["JARVIS_MODEL_LOADING_MODE"] = "gcp_proxy"
+                env["JARVIS_HOLLOW_CLIENT_MODE"] = "true"  # v147.0: Explicit hollow client
+                env["JARVIS_SKIP_LOCAL_MODEL_LOAD"] = "true"  # v147.0: Block local models
+                
                 logger.info(
-                    f"[v132.4] 🚀 {definition.name} will use GCP VM for model inference: {managed.gcp_vm_ip}"
+                    f"[v147.0] 🚀 {definition.name} will route inference to GCP: {gcp_endpoint}"
                 )
             elif managed._gcp_offload_endpoint:
                 # OOM recovery mode - use endpoint from crash recovery
+                gcp_endpoint = managed._gcp_offload_endpoint
+                if not gcp_endpoint.startswith("http"):
+                    gcp_endpoint = f"http://{gcp_endpoint}:8000"
+                    
                 env["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
-                env["JARVIS_GCP_MODEL_SERVER"] = f"http://{managed._gcp_offload_endpoint}:8080"
-                env["JARVIS_GCP_VM_IP"] = managed._gcp_offload_endpoint
+                env["GCP_PRIME_ENDPOINT"] = gcp_endpoint
+                env["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
+                env["JARVIS_GCP_MODEL_SERVER"] = gcp_endpoint
+                env["JARVIS_GCP_VM_IP"] = managed._gcp_offload_endpoint.replace("http://", "").split(":")[0]
                 env["JARVIS_MODEL_LOADING_MODE"] = "gcp_proxy"
+                env["JARVIS_HOLLOW_CLIENT_MODE"] = "true"
+                env["JARVIS_SKIP_LOCAL_MODEL_LOAD"] = "true"
+                
                 logger.info(
-                    f"[v132.4] 🔄 {definition.name} (OOM recovery) using GCP VM: {managed._gcp_offload_endpoint}"
+                    f"[v147.0] 🔄 {definition.name} (OOM recovery) routing to GCP: {gcp_endpoint}"
                 )
             elif managed.degradation_tier:
                 # Graceful degradation mode
