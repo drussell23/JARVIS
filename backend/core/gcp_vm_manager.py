@@ -322,9 +322,16 @@ class VMManagerConfig:
     No hardcoding - fully configurable at runtime.
     """
 
-    # GCP Enabled Flag - set to false to disable GCP features entirely
+    # v147.0: GCP Enabled Flag - checks multiple env vars for compatibility
+    # Accepts: GCP_ENABLED, GCP_VM_ENABLED, JARVIS_SPOT_VM_ENABLED (any "true" enables)
+    # This fixes the inconsistency where .env.gcp sets JARVIS_SPOT_VM_ENABLED
+    # but the manager only checked GCP_ENABLED
     enabled: bool = field(
-        default_factory=lambda: os.getenv("GCP_ENABLED", "false").lower() == "true"
+        default_factory=lambda: any([
+            os.getenv("GCP_ENABLED", "false").lower() == "true",
+            os.getenv("GCP_VM_ENABLED", "false").lower() == "true",
+            os.getenv("JARVIS_SPOT_VM_ENABLED", "false").lower() == "true",
+        ])
     )
 
     # GCP Configuration (all from environment)
@@ -1045,22 +1052,42 @@ class GCPVMManager:
         """
         Start a Spot VM for immediate use.
         
-        Wrapper around create_vm that returns success status and IP.
+        v147.0: Enhanced with detailed error messages for diagnostics.
         
         Returns:
-            (success, ip_address)
+            (success, result_or_error)
+            - On success: (True, ip_address)
+            - On failure: (False, error_message)
         """
+        # v147.0: Check enabled with detailed error
         if not self.config.enabled:
-            return False, None
+            enabled_vars = {
+                "GCP_ENABLED": os.getenv("GCP_ENABLED", "not set"),
+                "GCP_VM_ENABLED": os.getenv("GCP_VM_ENABLED", "not set"),
+                "JARVIS_SPOT_VM_ENABLED": os.getenv("JARVIS_SPOT_VM_ENABLED", "not set"),
+            }
+            logger.warning(
+                f"[v147.0] GCP VM Manager disabled. Env vars: {enabled_vars}. "
+                f"Set any of these to 'true' to enable."
+            )
+            return False, "GCP_DISABLED: Set GCP_ENABLED, GCP_VM_ENABLED, or JARVIS_SPOT_VM_ENABLED=true"
+        
+        # v147.0: Validate configuration before attempting
+        is_valid, validation_error = self.config.is_valid_for_vm_operations()
+        if not is_valid:
+            logger.warning(f"[v147.0] GCP config validation failed: {validation_error}")
+            return False, f"CONFIG_INVALID: {validation_error}"
             
         try:
             # Check if we already have one
             existing = await self.get_active_vm()
             if existing:
+                logger.info(f"[v147.0] Using existing active VM: {existing.ip_address}")
                 return True, existing.ip_address
                 
             # v132.2: Fixed create_vm call - uses correct parameters
             # create_vm expects (components: List[str], trigger_reason: str)
+            logger.info("[v147.0] No existing VM, creating new Spot VM...")
             vm = await self.create_vm(
                 components=["ml_processing", "heavy_computation", "auto_offload"],
                 trigger_reason="auto_offload",
@@ -1068,12 +1095,18 @@ class GCPVMManager:
             
             # Wait for IP (create_vm usually returns loaded VM but IP might take a moment)
             if vm and vm.state == VMState.RUNNING:
+                logger.info(f"[v147.0] Spot VM created successfully: {vm.ip_address}")
                 return True, vm.ip_address
+            
+            # VM creation returned but not running
+            if vm:
+                return False, f"VM_NOT_RUNNING: VM created but state is {vm.state.name}"
+            else:
+                return False, "VM_CREATE_FAILED: create_vm returned None"
                 
-            return False, None
         except Exception as e:
             logger.error(f"Failed to start Spot VM: {e}")
-            return False, None
+            return False, f"EXCEPTION: {str(e)}"
 
         # Initialize regions client for quota checking
         # Use modern asyncio patterns with fallback

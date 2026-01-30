@@ -1061,6 +1061,7 @@ async def ensure_gcp_vm_ready_for_prime(
 ) -> Tuple[bool, Optional[str]]:
     """
     v144.0: Ensure GCP VM is ready for jarvis-prime inference offloading.
+    v147.0: Enhanced with .env.gcp auto-loading and detailed diagnostics.
 
     This function is called BEFORE spawning jarvis-prime on SLIM hardware.
     It either:
@@ -1086,13 +1087,79 @@ async def ensure_gcp_vm_ready_for_prime(
             )
             return True, _active_rescue_gcp_endpoint
 
+    # =========================================================================
+    # v147.0: Pre-flight check - ensure .env.gcp is loaded
+    # =========================================================================
+    # Check if critical GCP env vars are set; if not, try loading .env.gcp
+    gcp_enabled_vars = [
+        os.environ.get("GCP_ENABLED"),
+        os.environ.get("GCP_VM_ENABLED"),
+        os.environ.get("JARVIS_SPOT_VM_ENABLED"),
+    ]
+    gcp_project = os.environ.get("GCP_PROJECT_ID")
+    
+    if not any(v and v.lower() == "true" for v in gcp_enabled_vars):
+        logger.warning(
+            "[v147.0] ⚠️ GCP not enabled in environment. Attempting to load .env.gcp..."
+        )
+        # Try to load .env.gcp
+        try:
+            from pathlib import Path
+            env_gcp_paths = [
+                Path.cwd() / ".env.gcp",
+                Path(__file__).parent.parent.parent / ".env.gcp",
+                Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent" / ".env.gcp",
+            ]
+            
+            for env_path in env_gcp_paths:
+                if env_path.exists():
+                    logger.info(f"[v147.0] Found .env.gcp at {env_path}, loading...")
+                    try:
+                        from dotenv import load_dotenv
+                        load_dotenv(env_path, override=True)
+                        logger.info(f"[v147.0] ✅ Loaded {env_path}")
+                        # Re-check after loading
+                        if os.environ.get("JARVIS_SPOT_VM_ENABLED", "").lower() == "true":
+                            logger.info("[v147.0] ✅ JARVIS_SPOT_VM_ENABLED now set to true")
+                        break
+                    except ImportError:
+                        # dotenv not available, manual parse
+                        with open(env_path, 'r') as f:
+                            for line in f:
+                                line = line.strip()
+                                if line and not line.startswith('#') and '=' in line:
+                                    key, _, value = line.partition('=')
+                                    os.environ[key.strip()] = value.strip()
+                        logger.info(f"[v147.0] ✅ Manually loaded {env_path}")
+                        break
+            else:
+                logger.warning(
+                    "[v147.0] ⚠️ .env.gcp not found. GCP features may not work. "
+                    "Create .env.gcp with GCP_ENABLED=true, GCP_PROJECT_ID, etc."
+                )
+        except Exception as e:
+            logger.debug(f"[v147.0] Failed to auto-load .env.gcp: {e}")
+    
+    # v147.0: Log current GCP configuration status
+    gcp_config_status = {
+        "GCP_ENABLED": os.environ.get("GCP_ENABLED", "not set"),
+        "GCP_VM_ENABLED": os.environ.get("GCP_VM_ENABLED", "not set"),
+        "JARVIS_SPOT_VM_ENABLED": os.environ.get("JARVIS_SPOT_VM_ENABLED", "not set"),
+        "GCP_PROJECT_ID": os.environ.get("GCP_PROJECT_ID", "not set")[:20] + "..." if os.environ.get("GCP_PROJECT_ID") else "not set",
+    }
+    logger.info(f"[v147.0] GCP config status: {gcp_config_status}")
+
     try:
         # Try to get the GCP VM Manager
         from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
 
         vm_manager = await get_gcp_vm_manager_safe()
         if vm_manager is None:
-            logger.warning("[v144.0] ⚠️ Active Rescue: GCP VM Manager not available")
+            logger.warning(
+                "[v147.0] ⚠️ Active Rescue: GCP VM Manager not available. "
+                "Check: 1) GCP_ENABLED/JARVIS_SPOT_VM_ENABLED=true in env, "
+                "2) GCP_PROJECT_ID is set, 3) GOOGLE_APPLICATION_CREDENTIALS exists"
+            )
             return False, None
 
         # Check for existing running VM
