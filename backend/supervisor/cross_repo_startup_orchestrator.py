@@ -3877,54 +3877,90 @@ class ProcessOrchestrator:
         self,
         service_name: str,
         requested_port: int,
+        max_retries: int = 3,
     ) -> Tuple[int, Optional[str]]:
         """
-        v95.9: Resolve port conflicts automatically.
+        v132.4: Enhanced port conflict resolution with intelligent handling.
 
-        Features:
-        - Detect port conflicts
-        - Find alternative port
-        - Identify conflicting process
-        - Clean up stale processes
+        CRITICAL IMPROVEMENTS:
+        1. Uses bind check (not connect) to catch TIME_WAIT ports
+        2. Retry logic for transient failures
+        3. Detects if same service is already healthy (reuse it)
+        4. Waits for TIME_WAIT to clear before retrying
+        5. Intelligent alternative port selection
 
         Args:
             service_name: Service requesting the port
             requested_port: Originally requested port
+            max_retries: Number of retry attempts for transient failures
 
         Returns:
             Tuple of (resolved_port, conflict_info)
         """
-        # Check if requested port is available
-        is_available = await self._check_port_available(requested_port)
+        for attempt in range(max_retries):
+            # v132.4: Use bind check for accurate detection
+            is_available = await self._check_port_available(requested_port, use_bind_check=True)
 
-        if is_available:
-            self._port_allocation_map[service_name] = requested_port
-            return requested_port, None
-
-        # Port conflict detected
-        conflict_info = await self._identify_port_conflict(requested_port)
-
-        logger.warning(
-            f"[v95.9] ⚠️ PORT CONFLICT: {service_name} requested port {requested_port}\n"
-            f"  Conflict: {conflict_info}"
-        )
-
-        # Try to clean up if it's a stale JARVIS process
-        if conflict_info and "jarvis" in conflict_info.lower():
-            cleanup_success = await self._cleanup_stale_process(requested_port)
-            if cleanup_success:
-                logger.info(f"[v95.9] ✅ Cleaned up stale process on port {requested_port}")
-                await asyncio.sleep(1.0)  # Give OS time to release port
+            if is_available:
                 self._port_allocation_map[service_name] = requested_port
-                return requested_port, f"Cleaned up stale process: {conflict_info}"
+                if attempt > 0:
+                    logger.info(f"[v132.4] Port {requested_port} became available after {attempt} retries")
+                return requested_port, None
 
-        # Find alternative port
+            # Port conflict detected - analyze it
+            conflict_info = await self._identify_port_conflict(requested_port)
+
+            # v132.4: Check if the same service is already running and healthy
+            if service_name in self.processes:
+                managed = self.processes[service_name]
+                if managed.status == ServiceStatus.HEALTHY and managed.port == requested_port:
+                    logger.info(
+                        f"[v132.4] Service {service_name} already healthy on port {requested_port} - reusing"
+                    )
+                    return requested_port, "already_running"
+
+            # v132.4: Check if conflict is from TIME_WAIT (no active listener)
+            is_time_wait = await self._is_port_in_time_wait(requested_port)
+
+            if is_time_wait and attempt < max_retries - 1:
+                wait_time = 2.0 * (attempt + 1)  # Progressive wait: 2s, 4s, 6s
+                logger.info(
+                    f"[v132.4] Port {requested_port} in TIME_WAIT state - "
+                    f"waiting {wait_time}s for release (attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(wait_time)
+                continue
+
+            logger.warning(
+                f"[v132.4] ⚠️ PORT CONFLICT: {service_name} requested port {requested_port}\n"
+                f"  Conflict: {conflict_info}\n"
+                f"  TIME_WAIT: {is_time_wait}"
+            )
+
+            # Try to clean up if it's a stale JARVIS process
+            if conflict_info and any(x in conflict_info.lower() for x in ['jarvis', 'prime', 'reactor', 'uvicorn']):
+                cleanup_success = await self._cleanup_stale_process(requested_port)
+                if cleanup_success:
+                    logger.info(f"[v132.4] ✅ Cleaned up stale process on port {requested_port}")
+                    # v132.4: Wait for port to be fully released
+                    await asyncio.sleep(2.0)
+                    # Verify port is now available
+                    if await self._check_port_available(requested_port, use_bind_check=True):
+                        self._port_allocation_map[service_name] = requested_port
+                        return requested_port, f"Cleaned up stale process: {conflict_info}"
+
+            # v132.4: If first attempt fails, wait before trying alternative
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.0)
+                continue
+
+        # All retries exhausted - find alternative port
         alternative_port = await self._find_available_port(service_name)
 
         if alternative_port:
             logger.info(
-                f"[v95.9] 🔄 {service_name}: Using alternative port {alternative_port} "
-                f"(original {requested_port} in use)"
+                f"[v132.4] 🔄 {service_name}: Using alternative port {alternative_port} "
+                f"(original {requested_port} in use by: {conflict_info})"
             )
             self._port_allocation_map[service_name] = alternative_port
 
@@ -3942,31 +3978,89 @@ class ProcessOrchestrator:
 
         # No alternative found
         logger.error(
-            f"[v95.9] ❌ CRITICAL: Cannot find available port for {service_name}\n"
+            f"[v132.4] ❌ CRITICAL: Cannot find available port for {service_name}\n"
             f"  Requested: {requested_port}\n"
             f"  Scanned range: {self._dynamic_port_range}\n"
             f"  💡 Free up ports or adjust JARVIS_PORT_RANGE_START/END"
         )
         return -1, f"No ports available in range {self._dynamic_port_range}"
 
-    async def _check_port_available(self, port: int) -> bool:
+    async def _is_port_in_time_wait(self, port: int) -> bool:
         """
-        v95.9: Check if a port is available (with caching).
+        v132.4: Check if port is in TIME_WAIT state (no active listener but OS hasn't released it).
+
+        TIME_WAIT happens after a TCP connection closes - the OS holds the port for ~60s
+        to handle delayed packets. This is different from an active listener.
+
+        Returns:
+            True if port is in TIME_WAIT (can potentially be reused with SO_REUSEADDR)
+        """
+        try:
+            import psutil
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr and hasattr(conn.laddr, 'port') and conn.laddr.port == port:
+                    if conn.status == 'TIME_WAIT':
+                        return True
+                    if conn.status == 'LISTEN':
+                        return False  # Active listener, not TIME_WAIT
+            return False
+        except ImportError:
+            return False
+        except Exception:
+            return False
+
+    async def _check_port_available(self, port: int, use_bind_check: bool = True) -> bool:
+        """
+        v132.4: Enhanced port availability check with bind verification.
+
+        CRITICAL FIX: The old connect_ex check only tests if something is LISTENING,
+        but Errno 48 (EADDRINUSE) happens during BIND when the port is in TIME_WAIT
+        state from a recently closed connection. This new check actually tries to
+        bind to the port, which catches ALL cases.
 
         Args:
             port: Port number to check
+            use_bind_check: If True, use actual bind check (more accurate but slower)
 
         Returns:
-            True if port is available
+            True if port is available for binding
         """
-        # Check cache
-        if port in self._port_scan_cache:
-            in_use, check_time = self._port_scan_cache[port]
-            if time.time() - check_time < self._port_scan_cache_ttl:
-                return not in_use
-
-        # Perform actual check
         import socket
+
+        # v132.4: Skip cache for bind checks - they need to be accurate
+        if not use_bind_check:
+            # Check cache for quick connect checks
+            if port in self._port_scan_cache:
+                in_use, check_time = self._port_scan_cache[port]
+                if time.time() - check_time < self._port_scan_cache_ttl:
+                    return not in_use
+
+        # v132.4: Primary method - try to actually BIND (catches TIME_WAIT)
+        if use_bind_check:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(('0.0.0.0', port))
+                sock.close()
+                # Port is truly available
+                self._port_scan_cache[port] = (False, time.time())
+                return True
+            except OSError as e:
+                sock.close()
+                # Errno 48 (EADDRINUSE) or 98 (Linux) = port in use
+                if e.errno in (48, 98):
+                    logger.debug(f"[v132.4] Port {port} bind check failed: {e}")
+                    self._port_scan_cache[port] = (True, time.time())
+                    return False
+                # Other errors - assume unavailable
+                logger.warning(f"[v132.4] Port {port} bind check error: {e}")
+                return False
+            except Exception as e:
+                sock.close()
+                logger.warning(f"[v132.4] Port {port} bind check exception: {e}")
+                return False
+
+        # Fallback: connect check (less accurate but faster)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(1.0)
         try:
@@ -4093,7 +4187,14 @@ class ProcessOrchestrator:
 
     async def _find_available_port(self, service_name: str) -> Optional[int]:
         """
-        v95.9: Find an available port in the configured range.
+        v132.4: Enhanced port finding with intelligent selection strategy.
+
+        IMPROVEMENTS:
+        1. Uses bind check for accuracy
+        2. Prefers ports not recently in conflict
+        3. Avoids ports that might be in TIME_WAIT
+        4. Parallel checking for speed
+        5. Service-specific port preferences
 
         Args:
             service_name: Service requesting the port
@@ -4103,12 +4204,141 @@ class ProcessOrchestrator:
         """
         start, end = self._dynamic_port_range
 
-        # Check ports in range
-        for port in range(start, end + 1):
-            if await self._check_port_available(port):
+        # v132.4: Service-specific preferred ports (for easier debugging)
+        service_port_hints = {
+            "jarvis-prime": [8001, 8002, 8003],
+            "reactor-core": [8010, 8011, 8012],
+            "jarvis-backend": [8020, 8021, 8022],
+        }
+
+        # Try service-specific hints first
+        service_lower = service_name.lower().replace("_", "-")
+        if service_lower in service_port_hints:
+            for hint_port in service_port_hints[service_lower]:
+                if hint_port not in self._port_allocation_map.values():
+                    if await self._check_port_available(hint_port, use_bind_check=True):
+                        logger.info(f"[v132.4] Using preferred port {hint_port} for {service_name}")
+                        return hint_port
+
+        # v132.4: Collect recently conflicted ports to avoid
+        recently_conflicted = set()
+        cutoff = time.time() - 300  # 5 minutes
+        for port, conflicts in self._port_conflict_history.items():
+            if any(c["timestamp"] > cutoff for c in conflicts):
+                recently_conflicted.add(port)
+
+        # v132.4: Check ports in parallel batches for speed
+        batch_size = 10
+        ports_to_check = [
+            p for p in range(start, end + 1)
+            if p not in recently_conflicted and p not in self._port_allocation_map.values()
+        ]
+
+        for i in range(0, len(ports_to_check), batch_size):
+            batch = ports_to_check[i:i + batch_size]
+            # Check batch in parallel
+            checks = await asyncio.gather(*[
+                self._check_port_available(port, use_bind_check=True)
+                for port in batch
+            ], return_exceptions=True)
+
+            for port, available in zip(batch, checks):
+                if available is True:
+                    logger.debug(f"[v132.4] Found available port {port} for {service_name}")
+                    return port
+
+        # Fallback: check recently conflicted ports (TIME_WAIT might have expired)
+        for port in recently_conflicted:
+            if await self._check_port_available(port, use_bind_check=True):
+                logger.info(f"[v132.4] Previously conflicted port {port} now available")
                 return port
 
         return None
+
+    # =========================================================================
+    # v132.4: GCP VM Health Verification
+    # =========================================================================
+
+    async def _verify_gcp_vm_health(
+        self,
+        gcp_vm_ip: str,
+        timeout: float = 10.0,
+        port: int = 8080,
+    ) -> bool:
+        """
+        v132.4: Verify that a GCP VM is actually reachable and healthy.
+
+        This prevents the "GCP VM ready but not reachable" scenario where
+        the VM is technically running but not yet serving requests.
+
+        Args:
+            gcp_vm_ip: IP address of the GCP VM
+            timeout: Maximum time to wait for health check
+            port: Port to check (default: 8080 for model server)
+
+        Returns:
+            True if VM is reachable and healthy
+        """
+        import aiohttp
+
+        health_endpoints = [
+            f"http://{gcp_vm_ip}:{port}/health",
+            f"http://{gcp_vm_ip}:{port}/",
+            f"http://{gcp_vm_ip}:{port}/api/health",
+        ]
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as session:
+                for endpoint in health_endpoints:
+                    try:
+                        async with session.get(endpoint) as response:
+                            if response.status < 500:  # Accept 2xx, 3xx, 4xx (service is running)
+                                logger.info(f"[v132.4] GCP VM health check passed: {endpoint}")
+                                return True
+                    except aiohttp.ClientError:
+                        continue  # Try next endpoint
+                    except Exception:
+                        continue
+
+            # All endpoints failed - try raw TCP connect
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            try:
+                result = sock.connect_ex((gcp_vm_ip, port))
+                sock.close()
+                if result == 0:
+                    logger.info(f"[v132.4] GCP VM TCP health check passed: {gcp_vm_ip}:{port}")
+                    return True
+            except Exception:
+                pass
+            finally:
+                sock.close()
+
+            logger.warning(f"[v132.4] GCP VM health check failed for {gcp_vm_ip}")
+            return False
+
+        except ImportError:
+            # aiohttp not available - use basic socket check
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            try:
+                result = sock.connect_ex((gcp_vm_ip, port))
+                sock.close()
+                return result == 0
+            except Exception:
+                return False
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"[v132.4] GCP VM health check error: {e}")
+            return False
 
     # =========================================================================
     # v95.9: Issue 24 - Import Error No Fallback
@@ -11988,25 +12218,40 @@ echo "=== JARVIS Prime started ==="
                     )
 
                     if memory_result.decision == _MemoryDecision.CLOUD_REQUIRED:
-                        if memory_result.gcp_vm_ready:
-                            logger.info(
-                                f"[OOM Prevention] ☁️ Using GCP VM for {definition.name}: "
-                                f"{memory_result.gcp_vm_ip}"
-                            )
-                            # Store GCP endpoint for later routing
-                            managed.gcp_offload_active = True
-                            managed.gcp_vm_ip = memory_result.gcp_vm_ip
-                            await _emit_event(
-                                "SERVICE_OFFLOADED_TO_CLOUD",
-                                service_name=definition.name,
-                                priority="HIGH",
-                                details={
-                                    "gcp_vm_ip": memory_result.gcp_vm_ip,
-                                    "reason": memory_result.reason,
-                                }
-                            )
-                            # For now, still spawn locally but record the offload status
-                            # Future: skip local spawn entirely when GCP is handling it
+                        if memory_result.gcp_vm_ready and memory_result.gcp_vm_ip:
+                            # v132.4: Verify GCP VM is actually reachable before relying on it
+                            gcp_verified = await self._verify_gcp_vm_health(memory_result.gcp_vm_ip)
+
+                            if gcp_verified:
+                                logger.info(
+                                    f"[OOM Prevention] ☁️ GCP VM verified for {definition.name}: "
+                                    f"{memory_result.gcp_vm_ip}"
+                                )
+                                # Store GCP endpoint for later routing
+                                managed.gcp_offload_active = True
+                                managed.gcp_vm_ip = memory_result.gcp_vm_ip
+                                await _emit_event(
+                                    "SERVICE_OFFLOADED_TO_CLOUD",
+                                    service_name=definition.name,
+                                    priority="HIGH",
+                                    details={
+                                        "gcp_vm_ip": memory_result.gcp_vm_ip,
+                                        "reason": memory_result.reason,
+                                        "verified": True,
+                                    }
+                                )
+                                # Local service will run in proxy mode, forwarding to GCP
+                                logger.info(
+                                    f"[v132.4] {definition.name} will use lightweight proxy mode "
+                                    f"with model inference on GCP ({memory_result.gcp_vm_ip})"
+                                )
+                            else:
+                                logger.warning(
+                                    f"[v132.4] GCP VM {memory_result.gcp_vm_ip} not reachable - "
+                                    f"will proceed locally with risk for {definition.name}"
+                                )
+                                # Still try local, but with degradation flags
+                                managed.degradation_tier = _DegradationTier.TIER_3_SEQUENTIAL_LOAD if _DegradationTier else None
                         else:
                             logger.warning(
                                 f"[OOM Prevention] ⚠️ GCP VM not available but memory is low - "
@@ -12162,6 +12407,38 @@ echo "=== JARVIS Prime started ==="
             env.setdefault("TRANSFORMERS_VERBOSITY", "error")  # Suppress transformers warnings
             env.setdefault("TOKENIZERS_PARALLELISM", "false")  # Suppress tokenizers warning
             env.setdefault("COREMLTOOLS_LOG_LEVEL", "ERROR")  # Suppress coremltools warnings
+
+            # v132.4: Pass GCP offload information to spawned service
+            # This tells the service to use GCP VM for model inference instead of local loading
+            if managed.gcp_offload_active and managed.gcp_vm_ip:
+                env["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
+                env["JARVIS_GCP_MODEL_SERVER"] = f"http://{managed.gcp_vm_ip}:8080"
+                env["JARVIS_GCP_VM_IP"] = managed.gcp_vm_ip
+                # Tell service to use lightweight/proxy mode
+                env["JARVIS_MODEL_LOADING_MODE"] = "gcp_proxy"
+                logger.info(
+                    f"[v132.4] 🚀 {definition.name} will use GCP VM for model inference: {managed.gcp_vm_ip}"
+                )
+            elif managed._gcp_offload_endpoint:
+                # OOM recovery mode - use endpoint from crash recovery
+                env["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
+                env["JARVIS_GCP_MODEL_SERVER"] = f"http://{managed._gcp_offload_endpoint}:8080"
+                env["JARVIS_GCP_VM_IP"] = managed._gcp_offload_endpoint
+                env["JARVIS_MODEL_LOADING_MODE"] = "gcp_proxy"
+                logger.info(
+                    f"[v132.4] 🔄 {definition.name} (OOM recovery) using GCP VM: {managed._gcp_offload_endpoint}"
+                )
+            elif managed.degradation_tier:
+                # Graceful degradation mode
+                tier_value = managed.degradation_tier.value if hasattr(managed.degradation_tier, 'value') else str(managed.degradation_tier)
+                env["JARVIS_DEGRADATION_TIER"] = tier_value
+                # Set model loading based on degradation tier
+                if "minimal" in tier_value.lower():
+                    env["JARVIS_MODEL_LOADING_MODE"] = "minimal"
+                    env["JARVIS_LOAD_SMALL_MODELS_ONLY"] = "true"
+                elif "aggressive" in tier_value.lower():
+                    env["JARVIS_MODEL_LOADING_MODE"] = "sequential"
+                    env["JARVIS_SEQUENTIAL_MODEL_LOADING"] = "true"
 
             # v4.0: Build command using the detected Python executable
             cmd: List[str] = []
