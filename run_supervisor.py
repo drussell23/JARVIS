@@ -3308,10 +3308,17 @@ class ParallelProcessCleaner:
         - File descriptors are exhausted or recycled
         - Race conditions with file operations
         - System file descriptor limits are stressed
+
+        v132.4: Added SystemExit protection for thread pool workers.
+        During interpreter shutdown, workers can receive SystemExit which breaks
+        the thread pool. We catch and suppress it, returning empty result.
         """
         try:
             import psutil
         except ImportError:
+            return {}
+        except SystemExit:
+            # v132.4: Interpreter shutting down - return gracefully
             return {}
 
         discovered = {}
@@ -3362,6 +3369,9 @@ class ParallelProcessCleaner:
                     )
             except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
                 self._safe_unlink(pid_file)
+            except SystemExit:
+                # v132.4: Interpreter shutting down - return what we have
+                return discovered
             except Exception as e:
                 # Log unexpected errors but don't crash
                 self.logger.debug(f"[ProcessCleaner] Error reading PID file {pid_file}: {e}")
@@ -3378,40 +3388,56 @@ class ParallelProcessCleaner:
             return False
     
     def _discover_from_process_list(self) -> Dict[int, ProcessInfo]:
-        """Scan process list for JARVIS processes (runs in thread)."""
+        """
+        Scan process list for JARVIS processes (runs in thread).
+
+        v132.4: Added SystemExit protection for thread pool workers.
+        """
         try:
             import psutil
         except ImportError:
             return {}
-        
+        except SystemExit:
+            return {}
+
         discovered = {}
-        
-        for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info']):
-            try:
-                pid = proc.info['pid']
-                if pid in (self._my_pid, self._my_parent):
-                    continue
-                
-                cmdline = " ".join(proc.info.get('cmdline') or []).lower()
-                if any(p in cmdline for p in self.config.jarvis_patterns):
-                    mem_info = proc.info.get('memory_info')
-                    discovered[pid] = ProcessInfo(
-                        pid=pid,
-                        cmdline=cmdline[:100],
-                        age_seconds=time.time() - proc.info['create_time'],
-                        memory_mb=mem_info.rss / (1024 * 1024) if mem_info else 0,
-                        source="scan"
-                    )
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
+
+        try:
+            for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info']):
+                try:
+                    pid = proc.info['pid']
+                    if pid in (self._my_pid, self._my_parent):
+                        continue
+
+                    cmdline = " ".join(proc.info.get('cmdline') or []).lower()
+                    if any(p in cmdline for p in self.config.jarvis_patterns):
+                        mem_info = proc.info.get('memory_info')
+                        discovered[pid] = ProcessInfo(
+                            pid=pid,
+                            cmdline=cmdline[:100],
+                            age_seconds=time.time() - proc.info['create_time'],
+                            memory_mb=mem_info.rss / (1024 * 1024) if mem_info else 0,
+                            source="scan"
+                        )
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except SystemExit:
+            # v132.4: Interpreter shutting down - return what we have
+            pass
+
         return discovered
 
     def _discover_from_ports(self) -> Dict[int, ProcessInfo]:
-        """Discover processes holding critical ports."""
+        """
+        Discover processes holding critical ports.
+
+        v132.4: Added SystemExit protection for thread pool workers.
+        """
         try:
             import psutil
         except ImportError:
+            return {}
+        except SystemExit:
             return {}
 
         discovered = {}
@@ -3424,7 +3450,7 @@ class ParallelProcessCleaner:
                         pid = conn.pid
                         if not pid or pid in (self._my_pid, self._my_parent):
                             continue
-                            
+
                         # Don't rediscover if we already found it, but verify it exists
                         if pid in discovered:
                             continue
@@ -3432,7 +3458,7 @@ class ParallelProcessCleaner:
                         proc = psutil.Process(pid)
                         cmdline = " ".join(proc.cmdline()).lower()
                         mem_info = proc.memory_info()
-                        
+
                         discovered[pid] = ProcessInfo(
                             pid=pid,
                             cmdline=cmdline[:100],
@@ -3445,7 +3471,10 @@ class ParallelProcessCleaner:
         except (psutil.AccessDenied, PermissionError):
             # macOS might require root for net_connections on other users' procs
             pass
-            
+        except SystemExit:
+            # v132.4: Interpreter shutting down - return what we have
+            pass
+
         return discovered
     
     async def _parallel_terminate(self, processes: Dict[int, ProcessInfo]) -> int:
@@ -3955,10 +3984,16 @@ class ComprehensiveZombieCleanup:
         return discovered
 
     def _discover_from_trinity_ports(self) -> Dict[int, ZombieProcessInfo]:
-        """Discover processes holding Trinity ports."""
+        """
+        Discover processes holding Trinity ports.
+
+        v132.4: Added SystemExit protection for thread pool workers.
+        """
         try:
             import psutil
         except ImportError:
+            return {}
+        except SystemExit:
             return {}
 
         discovered = {}
@@ -3999,57 +4034,72 @@ class ComprehensiveZombieCleanup:
                         pass
         except (psutil.AccessDenied, PermissionError):
             pass
+        except SystemExit:
+            # v132.4: Interpreter shutting down - return what we have
+            pass
 
         return discovered
 
     def _discover_from_patterns(self) -> Dict[int, ZombieProcessInfo]:
-        """Discover processes matching repo patterns."""
+        """
+        Discover processes matching repo patterns.
+
+        v132.4: Added SystemExit protection for thread pool workers.
+        """
         try:
             import psutil
         except ImportError:
             return {}
+        except SystemExit:
+            return {}
 
         discovered = {}
 
-        for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info', 'status']):
-            try:
-                pid = proc.info['pid']
-                if pid in (self._my_pid, self._my_parent):
-                    continue
+        try:
+            for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info', 'status']):
+                try:
+                    pid = proc.info['pid']
+                    if pid in (self._my_pid, self._my_parent):
+                        continue
 
-                cmdline = " ".join(proc.info.get('cmdline') or [])
-                if not cmdline:
-                    continue
+                    cmdline = " ".join(proc.info.get('cmdline') or [])
+                    if not cmdline:
+                        continue
 
-                cmdline_lower = cmdline.lower()
+                    cmdline_lower = cmdline.lower()
 
-                # Check against repo patterns
-                for repo, patterns in self.REPO_PATTERNS.items():
-                    import re
-                    for pattern in patterns:
-                        if re.search(pattern, cmdline_lower):
-                            mem_info = proc.info.get('memory_info')
-                            discovered[pid] = ZombieProcessInfo(
-                                pid=pid,
-                                cmdline=cmdline[:200],
-                                age_seconds=time.time() - proc.info['create_time'],
-                                memory_mb=mem_info.rss / (1024 * 1024) if mem_info else 0,
-                                status=proc.info.get('status', 'unknown'),
-                                repo_origin=repo,
-                                detection_source="pattern_scan",
-                            )
+                    # Check against repo patterns
+                    for repo, patterns in self.REPO_PATTERNS.items():
+                        import re
+                        for pattern in patterns:
+                            if re.search(pattern, cmdline_lower):
+                                mem_info = proc.info.get('memory_info')
+                                discovered[pid] = ZombieProcessInfo(
+                                    pid=pid,
+                                    cmdline=cmdline[:200],
+                                    age_seconds=time.time() - proc.info['create_time'],
+                                    memory_mb=mem_info.rss / (1024 * 1024) if mem_info else 0,
+                                    status=proc.info.get('status', 'unknown'),
+                                    repo_origin=repo,
+                                    detection_source="pattern_scan",
+                                )
+                                break
+                        if pid in discovered:
                             break
-                    if pid in discovered:
-                        break
 
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except SystemExit:
+            # v132.4: Interpreter shutting down - return what we have
+            pass
 
         return discovered
 
     def _discover_zombies_by_heuristics(self) -> Dict[int, ZombieProcessInfo]:
         """
         Discover zombie-like processes using heuristics.
+
+        v132.4: Added SystemExit protection for thread pool workers.
 
         A process is zombie-like if:
         - Orphaned (PPID=1) AND sleeping AND has stale connections
@@ -4058,77 +4108,83 @@ class ComprehensiveZombieCleanup:
         """
         try:
             import psutil
+        except SystemExit:
+            return {}
         except ImportError:
             return {}
 
         discovered = {}
 
-        for proc in psutil.process_iter(['pid', 'ppid', 'cmdline', 'create_time', 'status', 'connections']):
-            try:
-                pid = proc.info['pid']
-                if pid in (self._my_pid, self._my_parent):
-                    continue
-
-                cmdline = " ".join(proc.info.get('cmdline') or [])
-                cmdline_lower = cmdline.lower()
-
-                # Only check JARVIS-related processes
-                is_jarvis_related = any(
-                    pattern in cmdline_lower
-                    for patterns in self.REPO_PATTERNS.values()
-                    for pattern in patterns
-                )
-
-                if not is_jarvis_related:
-                    continue
-
-                # Get process details
-                ppid = proc.info.get('ppid', 0)
-                status = proc.info.get('status', '')
-                is_orphaned = ppid == 1
-                is_sleeping = status in ('sleeping', 'idle')
-                is_zombie_state = status in ('zombie', 'dead')
-
-                # Count stale connections
-                stale_count = 0
+        try:
+            for proc in psutil.process_iter(['pid', 'ppid', 'cmdline', 'create_time', 'status', 'connections']):
                 try:
-                    connections = proc.connections(kind='inet')
-                    for conn in connections:
-                        if conn.status in ('CLOSE_WAIT', 'TIME_WAIT', 'FIN_WAIT1', 'FIN_WAIT2'):
-                            stale_count += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+                    pid = proc.info['pid']
+                    if pid in (self._my_pid, self._my_parent):
+                        continue
 
-                # Get CPU percent
-                try:
-                    cpu_percent = proc.cpu_percent(interval=0.05)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    cpu_percent = 0.0
+                    cmdline = " ".join(proc.info.get('cmdline') or [])
+                    cmdline_lower = cmdline.lower()
 
-                # Apply zombie heuristics
-                is_zombie_like = (
-                    is_zombie_state or
-                    (is_orphaned and is_sleeping and stale_count > 0) or
-                    (stale_count > 5 and cpu_percent < 0.1)
-                )
-
-                if is_zombie_like:
-                    mem_info = proc.memory_info()
-                    discovered[pid] = ZombieProcessInfo(
-                        pid=pid,
-                        cmdline=cmdline[:200],
-                        age_seconds=time.time() - proc.info['create_time'],
-                        memory_mb=mem_info.rss / (1024 * 1024),
-                        cpu_percent=cpu_percent,
-                        status=status,
-                        is_orphaned=is_orphaned,
-                        is_zombie_like=True,
-                        stale_connection_count=stale_count,
-                        detection_source="zombie_heuristic",
+                    # Only check JARVIS-related processes
+                    is_jarvis_related = any(
+                        pattern in cmdline_lower
+                        for patterns in self.REPO_PATTERNS.values()
+                        for pattern in patterns
                     )
 
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+                    if not is_jarvis_related:
+                        continue
+
+                    # Get process details
+                    ppid = proc.info.get('ppid', 0)
+                    status = proc.info.get('status', '')
+                    is_orphaned = ppid == 1
+                    is_sleeping = status in ('sleeping', 'idle')
+                    is_zombie_state = status in ('zombie', 'dead')
+
+                    # Count stale connections
+                    stale_count = 0
+                    try:
+                        connections = proc.connections(kind='inet')
+                        for conn in connections:
+                            if conn.status in ('CLOSE_WAIT', 'TIME_WAIT', 'FIN_WAIT1', 'FIN_WAIT2'):
+                                stale_count += 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+                    # Get CPU percent
+                    try:
+                        cpu_percent = proc.cpu_percent(interval=0.05)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        cpu_percent = 0.0
+
+                    # Apply zombie heuristics
+                    is_zombie_like = (
+                        is_zombie_state or
+                        (is_orphaned and is_sleeping and stale_count > 0) or
+                        (stale_count > 5 and cpu_percent < 0.1)
+                    )
+
+                    if is_zombie_like:
+                        mem_info = proc.memory_info()
+                        discovered[pid] = ZombieProcessInfo(
+                            pid=pid,
+                            cmdline=cmdline[:200],
+                            age_seconds=time.time() - proc.info['create_time'],
+                            memory_mb=mem_info.rss / (1024 * 1024),
+                            cpu_percent=cpu_percent,
+                            status=status,
+                            is_orphaned=is_orphaned,
+                            is_zombie_like=True,
+                            stale_connection_count=stale_count,
+                            detection_source="zombie_heuristic",
+                        )
+
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except SystemExit:
+            # v132.4: Interpreter shutting down - return what we have
+            pass
 
         return discovered
 
