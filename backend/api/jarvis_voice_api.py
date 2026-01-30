@@ -388,11 +388,17 @@ except ImportError:
             sys.path.remove(parent_dir)
             JARVIS_IMPORTS_AVAILABLE = True
         except ImportError as e:
-            logger.warning(f"All import attempts failed for JARVIS voice components: {e}")
+            # v137.2: Downgrade to debug - this is an optional dependency
+            # speech_recognition not being installed is expected on many systems
+            logger.debug(f"[Optional] JARVIS voice components not available: {e}")
             JARVIS_IMPORTS_AVAILABLE = False
 
 if not JARVIS_IMPORTS_AVAILABLE:
-    logger.warning("JARVIS voice components could not be imported")
+    # v137.2: Log at INFO level once, clarifying this is optional
+    logger.info(
+        "📢 [Optional] JARVIS voice components not loaded - "
+        "install 'speech_recognition' package for voice features"
+    )
 
     # Create stub classes to prevent NameError
     class EnhancedJARVISVoiceAssistant:
