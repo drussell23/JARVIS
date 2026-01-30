@@ -125,6 +125,265 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# v138.0: HARDWARE-AWARE COORDINATION SYSTEM
+# =============================================================================
+# This section provides hardware detection and profile classification to enable
+# intelligent startup decisions across the JARVIS ecosystem. It coordinates with
+# jarvis-prime's Memory-Aware Staged Initialization (v138.0) to prevent OOM crashes.
+#
+# Hardware Profiles:
+# - CLOUD_ONLY: < 16GB RAM - Too small for any local ML, use GCP exclusively
+# - SLIM:       16-30GB RAM - Can run slim/deferred subsystems only
+# - FULL:       30-64GB RAM - Can run full AGI Hub with staged loading
+# - UNLIMITED:  64GB+ RAM - Can run everything in parallel
+#
+# USAGE:
+#   from backend.supervisor.cross_repo_startup_orchestrator import (
+#       HardwareProfile,
+#       assess_hardware_profile,
+#       get_hardware_env_vars,
+#   )
+# =============================================================================
+
+from enum import auto as enum_auto
+
+
+class HardwareProfile(Enum):
+    """Hardware profile classification for adaptive startup."""
+    CLOUD_ONLY = enum_auto()      # < 16GB RAM - use GCP exclusively
+    SLIM = enum_auto()            # 16-30GB RAM - slim mode / deferred heavy
+    FULL = enum_auto()            # 30-64GB RAM - full with staged loading
+    UNLIMITED = enum_auto()       # 64GB+ RAM - can run everything
+
+
+@dataclass
+class HardwareAssessment:
+    """Complete hardware assessment for startup decisions."""
+    profile: HardwareProfile
+    total_ram_gb: float
+    available_ram_gb: float
+    cpu_count: int
+    is_apple_silicon: bool
+    has_gpu: bool
+    gpu_name: str
+    recommended_gpu_layers: int
+    recommended_context_size: int
+    skip_agi_hub: bool
+    enable_slim_mode: bool
+    defer_heavy_subsystems: bool
+    reason: str
+
+
+# Singleton hardware assessment cache (assessed once at startup)
+_hardware_assessment_cache: Optional[HardwareAssessment] = None
+_hardware_assessment_lock = threading.Lock()
+
+
+def assess_hardware_profile(force_refresh: bool = False) -> HardwareAssessment:
+    """
+    v138.0: Assess local hardware to determine optimal startup profile.
+
+    This function MUST be called BEFORE spawning jarvis-prime to determine
+    whether to use CLOUD_ONLY, SLIM, FULL, or UNLIMITED mode.
+
+    The assessment is cached to avoid repeated system calls.
+
+    Args:
+        force_refresh: If True, re-assess hardware even if cached
+
+    Returns:
+        HardwareAssessment with profile and recommendations
+    """
+    global _hardware_assessment_cache
+
+    with _hardware_assessment_lock:
+        if _hardware_assessment_cache is not None and not force_refresh:
+            return _hardware_assessment_cache
+
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            total_ram_gb = mem.total / (1024 ** 3)
+            available_ram_gb = mem.available / (1024 ** 3)
+            cpu_count = psutil.cpu_count(logical=True) or 4
+        except ImportError:
+            # Fallback if psutil not available
+            total_ram_gb = 16.0  # Conservative assumption
+            available_ram_gb = 8.0
+            cpu_count = 4
+        except Exception as e:
+            logger.warning(f"[v138.0] Hardware assessment failed: {e}, using conservative defaults")
+            total_ram_gb = 16.0
+            available_ram_gb = 8.0
+            cpu_count = 4
+
+        # Detect Apple Silicon
+        import platform
+        is_apple_silicon = (
+            platform.system() == "Darwin" and
+            platform.machine() in ("arm64", "aarch64")
+        )
+
+        # GPU detection
+        has_gpu = False
+        gpu_name = "None"
+        recommended_gpu_layers = 0
+
+        if is_apple_silicon:
+            # Apple Silicon has unified memory - GPU layers depend on RAM
+            has_gpu = True
+            gpu_name = f"Apple Silicon ({platform.machine()})"
+            # Rough heuristic: 1 layer per 0.5GB available
+            recommended_gpu_layers = min(int(available_ram_gb * 2), 99)
+        else:
+            # Try to detect NVIDIA GPU
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    has_gpu = True
+                    gpu_name = result.stdout.strip().split("\n")[0]
+                    recommended_gpu_layers = 35  # Conservative default for NVIDIA
+            except Exception:
+                pass  # No NVIDIA GPU
+
+        # Determine context size based on available RAM
+        if available_ram_gb >= 32:
+            recommended_context_size = 32768
+        elif available_ram_gb >= 16:
+            recommended_context_size = 16384
+        elif available_ram_gb >= 8:
+            recommended_context_size = 8192
+        else:
+            recommended_context_size = 4096
+
+        # Classify hardware profile
+        if total_ram_gb < 16:
+            profile = HardwareProfile.CLOUD_ONLY
+            skip_agi_hub = True
+            enable_slim_mode = False  # Not applicable - skip entirely
+            defer_heavy_subsystems = False
+            reason = f"System has only {total_ram_gb:.1f}GB RAM (< 16GB). AGI Hub requires GCP cloud."
+        elif total_ram_gb < 30:
+            profile = HardwareProfile.SLIM
+            skip_agi_hub = False
+            enable_slim_mode = True
+            defer_heavy_subsystems = True
+            reason = f"System has {total_ram_gb:.1f}GB RAM (16-30GB). Using SLIM mode with deferred heavy subsystems."
+        elif total_ram_gb < 64:
+            profile = HardwareProfile.FULL
+            skip_agi_hub = False
+            enable_slim_mode = False
+            defer_heavy_subsystems = True  # Still defer for staged loading
+            reason = f"System has {total_ram_gb:.1f}GB RAM (30-64GB). Full mode with staged initialization."
+        else:
+            profile = HardwareProfile.UNLIMITED
+            skip_agi_hub = False
+            enable_slim_mode = False
+            defer_heavy_subsystems = False
+            reason = f"System has {total_ram_gb:.1f}GB RAM (64GB+). Unlimited mode - all subsystems can load in parallel."
+
+        assessment = HardwareAssessment(
+            profile=profile,
+            total_ram_gb=total_ram_gb,
+            available_ram_gb=available_ram_gb,
+            cpu_count=cpu_count,
+            is_apple_silicon=is_apple_silicon,
+            has_gpu=has_gpu,
+            gpu_name=gpu_name,
+            recommended_gpu_layers=recommended_gpu_layers,
+            recommended_context_size=recommended_context_size,
+            skip_agi_hub=skip_agi_hub,
+            enable_slim_mode=enable_slim_mode,
+            defer_heavy_subsystems=defer_heavy_subsystems,
+            reason=reason,
+        )
+
+        _hardware_assessment_cache = assessment
+        return assessment
+
+
+def get_hardware_env_vars(assessment: Optional[HardwareAssessment] = None) -> Dict[str, str]:
+    """
+    v138.0: Get environment variables to pass to jarvis-prime based on hardware.
+
+    These variables are read by jarvis-prime's run_server.py to configure
+    the AGIHubConfig for Memory-Aware Staged Initialization.
+
+    Args:
+        assessment: Optional pre-computed assessment. If None, will assess hardware.
+
+    Returns:
+        Dict of environment variables to merge into service environment
+    """
+    if assessment is None:
+        assessment = assess_hardware_profile()
+
+    env_vars: Dict[str, str] = {
+        # v138.0: Hardware profile communication
+        "JARVIS_HARDWARE_PROFILE": assessment.profile.name,
+        "JARVIS_TOTAL_RAM_GB": str(round(assessment.total_ram_gb, 1)),
+        "JARVIS_AVAILABLE_RAM_GB": str(round(assessment.available_ram_gb, 1)),
+        "JARVIS_CPU_COUNT": str(assessment.cpu_count),
+        "JARVIS_IS_APPLE_SILICON": str(assessment.is_apple_silicon).lower(),
+
+        # v138.0: AGI Hub configuration hints
+        "JARVIS_SKIP_AGI_HUB": str(assessment.skip_agi_hub).lower(),
+        "JARVIS_ENABLE_SLIM_MODE": str(assessment.enable_slim_mode).lower(),
+        "JARVIS_DEFER_HEAVY_SUBSYSTEMS": str(assessment.defer_heavy_subsystems).lower(),
+
+        # v138.0: GPU configuration
+        "JARVIS_HAS_GPU": str(assessment.has_gpu).lower(),
+        "JARVIS_GPU_NAME": assessment.gpu_name,
+        "JARVIS_GPU_LAYERS": str(assessment.recommended_gpu_layers),
+        "JARVIS_CONTEXT_SIZE": str(assessment.recommended_context_size),
+    }
+
+    # Log the profile being passed
+    logger.info(
+        f"[v138.0] 🖥️ Hardware Profile: {assessment.profile.name} - "
+        f"{assessment.total_ram_gb:.1f}GB total, {assessment.available_ram_gb:.1f}GB available"
+    )
+
+    return env_vars
+
+
+def log_hardware_assessment(assessment: Optional[HardwareAssessment] = None) -> None:
+    """
+    v138.0: Log detailed hardware assessment to console.
+
+    Args:
+        assessment: Optional pre-computed assessment. If None, will assess hardware.
+    """
+    if assessment is None:
+        assessment = assess_hardware_profile()
+
+    logger.info("=" * 70)
+    logger.info("v138.0 HARDWARE-AWARE STARTUP ASSESSMENT")
+    logger.info("=" * 70)
+    logger.info(f"  Profile:       {assessment.profile.name}")
+    logger.info(f"  Total RAM:     {assessment.total_ram_gb:.1f} GB")
+    logger.info(f"  Available RAM: {assessment.available_ram_gb:.1f} GB")
+    logger.info(f"  CPU Cores:     {assessment.cpu_count}")
+    logger.info(f"  Apple Silicon: {assessment.is_apple_silicon}")
+    logger.info(f"  GPU:           {assessment.gpu_name}")
+    logger.info(f"  GPU Layers:    {assessment.recommended_gpu_layers}")
+    logger.info(f"  Context Size:  {assessment.recommended_context_size}")
+    logger.info("-" * 70)
+    logger.info(f"  Skip AGI Hub:  {assessment.skip_agi_hub}")
+    logger.info(f"  Slim Mode:     {assessment.enable_slim_mode}")
+    logger.info(f"  Defer Heavy:   {assessment.defer_heavy_subsystems}")
+    logger.info("-" * 70)
+    logger.info(f"  Reason: {assessment.reason}")
+    logger.info("=" * 70)
+
+
+# =============================================================================
 # v136.0: GLOBAL SPAWN COORDINATION SYSTEM
 # =============================================================================
 # This is the SINGLE SOURCE OF TRUTH for service spawn coordination across:
@@ -3153,6 +3412,7 @@ class ServiceDefinitionRegistry:
             "default_repo_path": None,  # Discovered dynamically
             "discovery_service_name": "jarvis-prime",  # For discovery lookup
             "script_args_factory": lambda port: ["--port", str(port), "--host", "0.0.0.0"],
+            # v138.0: Environment factory now includes hardware profile for Memory-Aware Staged Init
             "environment_factory": lambda path: {
                 "PYTHONPATH": str(path),
                 "PYTHONWARNINGS": "ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning",
@@ -3160,6 +3420,9 @@ class ServiceDefinitionRegistry:
                 "TRANSFORMERS_VERBOSITY": "error",
                 "TOKENIZERS_PARALLELISM": "false",
                 "COREMLTOOLS_LOG_LEVEL": "ERROR",
+                # v138.0: Hardware profile is injected dynamically in _spawn_service_core
+                # These are placeholder values - actual values are set at spawn time
+                # based on assess_hardware_profile() to prevent OOM crashes
             },
             # v95.0: Dependency and priority configuration
             "depends_on": [],  # jarvis-prime can start independently
@@ -14296,6 +14559,52 @@ echo "=== JARVIS Prime started ==="
             env.setdefault("TRANSFORMERS_VERBOSITY", "error")  # Suppress transformers warnings
             env.setdefault("TOKENIZERS_PARALLELISM", "false")  # Suppress tokenizers warning
             env.setdefault("COREMLTOOLS_LOG_LEVEL", "ERROR")  # Suppress coremltools warnings
+
+            # =========================================================================
+            # v138.0: HARDWARE-AWARE STARTUP INTEGRATION
+            # =========================================================================
+            # For jarvis-prime (the AGI Hub host), inject hardware profile environment
+            # variables to enable Memory-Aware Staged Initialization. This prevents
+            # OOM kills by telling jarvis-prime:
+            # - Whether to skip AGI Hub entirely (CLOUD_ONLY mode)
+            # - Whether to use SLIM mode (deferred heavy subsystems)
+            # - Optimal GPU layers and context size for the hardware
+            # =========================================================================
+            jarvis_prime_names = ["jarvis-prime", "jarvis_prime", "j-prime"]
+            if definition.name.lower() in jarvis_prime_names:
+                logger.info(f"[v138.0] 🖥️ Assessing hardware for {definition.name}...")
+                try:
+                    # Assess hardware profile (cached after first call)
+                    hw_assessment = assess_hardware_profile()
+                    log_hardware_assessment(hw_assessment)
+
+                    # Get environment variables to pass to jarvis-prime
+                    hw_env_vars = get_hardware_env_vars(hw_assessment)
+                    env.update(hw_env_vars)
+
+                    logger.info(
+                        f"[v138.0] ✅ Hardware profile {hw_assessment.profile.name} will be passed to {definition.name}"
+                    )
+
+                    # Emit event for observability
+                    await _emit_event(
+                        "HARDWARE_ASSESSMENT_COMPLETE",
+                        service_name=definition.name,
+                        priority="MEDIUM",
+                        details={
+                            "profile": hw_assessment.profile.name,
+                            "total_ram_gb": hw_assessment.total_ram_gb,
+                            "available_ram_gb": hw_assessment.available_ram_gb,
+                            "skip_agi_hub": hw_assessment.skip_agi_hub,
+                            "slim_mode": hw_assessment.enable_slim_mode,
+                            "defer_heavy": hw_assessment.defer_heavy_subsystems,
+                        }
+                    )
+                except Exception as hw_err:
+                    logger.warning(
+                        f"[v138.0] ⚠️ Hardware assessment failed for {definition.name}: {hw_err}. "
+                        "Proceeding with default settings."
+                    )
 
             # v132.4: Pass GCP offload information to spawned service
             # This tells the service to use GCP VM for model inference instead of local loading
