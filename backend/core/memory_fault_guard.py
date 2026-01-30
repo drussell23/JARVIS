@@ -479,8 +479,34 @@ class MemoryFaultGuard:
             # Write shutdown signal
             shutdown_file = self.config.signal_file_path.parent / "shutdown_requested.txt"
             shutdown_file.write_text(f"Memory fault shutdown at {datetime.now().isoformat()}")
+            
+            # v149.0: Write Trinity Protocol cloud lock for SIGBUS->cloud handover
+            self._write_cloud_lock()
         except Exception:
             pass
+    
+    def _write_cloud_lock(self) -> None:
+        """v149.0: Write cloud lock for SIGBUS->cloud handover."""
+        try:
+            import json
+            cloud_lock_file = Path.home() / ".jarvis" / "trinity" / "cloud_lock.json"
+            cloud_lock_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            mem = psutil.virtual_memory()
+            lock_data = {
+                "locked": True,
+                "reason": "SIGBUS_MEMORY_FAULT",
+                "timestamp": time.time(),
+                "hardware_ram_gb": mem.total / (1024 ** 3),
+                "version": "v149.0",
+            }
+            
+            temp_file = cloud_lock_file.with_suffix('.json.tmp')
+            temp_file.write_text(json.dumps(lock_data, indent=2))
+            temp_file.rename(cloud_lock_file)
+            logger.critical("   ☁️ Cloud lock set - next restart forces cloud mode")
+        except Exception as e:
+            logger.debug(f"   Could not write cloud lock: {e}")
     
     def _get_traceback(self, frame: Any) -> Optional[str]:
         """Get traceback string from frame."""
