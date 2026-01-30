@@ -134,8 +134,10 @@ class TrinityConfig:
     RECOVERY_INTERVAL: Final[float] = float(os.getenv("JARVIS_RECOVERY_INTERVAL", "120.0"))
 
     # Process management
+    # v148.0: START_JARVIS_PRIME defaults to true (it's required for inference)
+    # v148.0: START_REACTOR_CORE defaults to false (optional training component)
     START_PRIME: Final[bool] = os.getenv("START_JARVIS_PRIME", "true").lower() == "true"
-    START_REACTOR: Final[bool] = os.getenv("START_REACTOR_CORE", "true").lower() == "true"
+    START_REACTOR: Final[bool] = os.getenv("START_REACTOR_CORE", "false").lower() == "true"
 
 
 # =============================================================================

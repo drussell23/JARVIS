@@ -1793,7 +1793,8 @@ class BootstrapConfig:
     # =========================================================================
     # Reactor-Core Integration (Auto-deployment of trained models)
     # =========================================================================
-    reactor_core_enabled: bool = field(default_factory=lambda: os.getenv("REACTOR_CORE_ENABLED", "true").lower() == "true")
+    # v148.0: Reactor Core disabled by default (optional training component)
+    reactor_core_enabled: bool = field(default_factory=lambda: os.getenv("REACTOR_CORE_ENABLED", "false").lower() == "true")
     reactor_core_watch_dir: Optional[str] = field(default_factory=lambda: os.getenv("REACTOR_CORE_OUTPUT"))
     reactor_core_auto_deploy: bool = field(default_factory=lambda: os.getenv("REACTOR_CORE_AUTO_DEPLOY", "true").lower() == "true")
 
@@ -1871,7 +1872,8 @@ class BootstrapConfig:
     # =========================================================================
     # v9.0: Reactor-Core Integration (Training Pipeline)
     # =========================================================================
-    reactor_core_integration_enabled: bool = field(default_factory=lambda: os.getenv("REACTOR_CORE_ENABLED", "true").lower() == "true")
+    # v148.0: Reactor Core integration disabled by default
+    reactor_core_integration_enabled: bool = field(default_factory=lambda: os.getenv("REACTOR_CORE_ENABLED", "false").lower() == "true")
     reactor_core_repo_path: str = field(default_factory=lambda: os.getenv("REACTOR_CORE_PATH", str(Path.home() / "Documents" / "repos" / "reactor-core")))
 
     # =========================================================================
@@ -5667,7 +5669,8 @@ class SupervisorBootstrapper:
 
         # v101.0: UnifiedTrinityConnector (Claude Code-like behaviors)
         self._unified_trinity_connector = None
-        self._reactor_core_enabled = os.getenv("JARVIS_REACTOR_CORE_ENABLED", "true").lower() == "true"
+        # v148.0: Reactor Core disabled by default (optional training component)
+        self._reactor_core_enabled = os.getenv("JARVIS_REACTOR_CORE_ENABLED", "false").lower() == "true"
         self._reactor_core_port = int(os.getenv("REACTOR_CORE_PORT", "8090"))
 
         # v72.0: Trinity Component Auto-Launch (One-Command Startup)
@@ -16669,7 +16672,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             "reactor_core": {
                 "files": ["reactor_core.json"],
                 "health_url": None,  # Uses file-based heartbeat
-                "required": os.getenv("REACTOR_CORE_ENABLED", "true").lower() == "true",
+                "required": os.getenv("REACTOR_CORE_ENABLED", "false").lower() == "true",  # v148.0: Optional
             },
             "coding_council": {
                 "files": ["coding_council.json"],

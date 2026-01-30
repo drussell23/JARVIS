@@ -1638,7 +1638,7 @@ async def _gcp_vm_health_monitor_loop(
                     try:
                         success, new_endpoint = await ensure_gcp_vm_ready_for_prime(
                             force_provision=True,
-                            timeout=180.0,
+                            timeout_seconds=180.0,  # v148.0: Fixed parameter name
                         )
                         
                         if success:
@@ -16650,6 +16650,29 @@ echo "=== JARVIS Prime started ==="
                         "Proceeding with default settings."
                     )
 
+            # ═══════════════════════════════════════════════════════════════════════
+            # v148.0: CRITICAL SAFETY NET - Prevent Local Model Loading on SLIM Hardware
+            # ═══════════════════════════════════════════════════════════════════════
+            # On 16GB Mac (SLIM hardware), we MUST prevent jarvis-prime from loading
+            # models locally. This is a SAFETY NET that works even if GCP fails.
+            #
+            # LOGIC:
+            # - SLIM/CLOUD_ONLY hardware → ALWAYS set JARVIS_SLIM_HARDWARE_MODE=true
+            # - This tells jarvis-prime to NEVER load heavy models locally
+            # - Instead, use Claude API as fallback if GCP unavailable
+            # ═══════════════════════════════════════════════════════════════════════
+            if managed.hardware_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"}:
+                # SAFETY NET: Always set these on SLIM hardware regardless of GCP
+                env["JARVIS_SLIM_HARDWARE_MODE"] = "true"
+                env["JARVIS_MAX_LOCAL_MODEL_RAM_MB"] = "500"  # Only tiny models allowed
+                env["JARVIS_FORCE_API_FALLBACK"] = "true"  # Use Claude if local fails
+                env["JARVIS_PREVENT_OOM"] = "true"  # Enable OOM prevention
+                env["JARVIS_SKIP_HEAVY_MODELS"] = "true"  # Skip torch, transformers
+                logger.info(
+                    f"[v148.0] 🛡️ SLIM HARDWARE SAFETY: {definition.name} restricted to "
+                    f"lightweight mode (profile: {managed.hardware_profile})"
+                )
+            
             # v147.0: Pass GCP offload information to spawned service
             # This tells the service to use GCP VM for model inference instead of local loading
             # CRITICAL FIX: jarvis-prime uses JARVIS_GCP_PRIME_ENDPOINT and GCP_PRIME_ENDPOINT
@@ -16701,6 +16724,18 @@ echo "=== JARVIS Prime started ==="
                 elif "aggressive" in tier_value.lower():
                     env["JARVIS_MODEL_LOADING_MODE"] = "sequential"
                     env["JARVIS_SEQUENTIAL_MODEL_LOADING"] = "true"
+            else:
+                # v148.0: No GCP and no degradation tier set - check hardware profile
+                # On SLIM hardware, ALWAYS block heavy models even without explicit tier
+                if managed.hardware_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"}:
+                    if definition.name == "jarvis-prime":
+                        logger.warning(
+                            f"[v148.0] ⚠️ SLIM HARDWARE + NO GCP: {definition.name} will operate in "
+                            f"API-fallback mode (no local inference). This is expected if GCP failed."
+                        )
+                        env["JARVIS_API_ONLY_MODE"] = "true"
+                        env["JARVIS_CLAUDE_FALLBACK_ONLY"] = "true"
+                        env["JARVIS_MODEL_LOADING_MODE"] = "disabled"
 
             # v4.0: Build command using the detected Python executable
             cmd: List[str] = []
