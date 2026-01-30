@@ -944,6 +944,101 @@ class GCPVMManager:
             self.gcp_optimizer = None
 
             self.gcp_optimizer = None
+        
+        # v147.0: Ensure firewall rule exists for health checks
+        await self._ensure_firewall_rule()
+
+    async def _ensure_firewall_rule(self):
+        """
+        v147.0: Ensure GCP firewall rule exists for health checks on port 8000.
+        
+        This is the ROOT FIX for "GCP VM not ready after Xs timeout" errors.
+        Without this firewall rule, the VM's port 8000 is blocked and health
+        checks fail even though the service is running inside the VM.
+        
+        Creates a firewall rule allowing TCP port 8000 from anywhere (0.0.0.0/0)
+        to VMs tagged with 'jarvis-node'.
+        """
+        try:
+            # Import the firewalls client
+            firewalls_client = await asyncio.to_thread(compute_v1.FirewallsClient)
+            
+            firewall_name = "jarvis-allow-health-checks"
+            
+            # Check if firewall rule already exists
+            try:
+                existing_rule = await asyncio.to_thread(
+                    firewalls_client.get,
+                    project=self.config.project_id,
+                    firewall=firewall_name,
+                )
+                logger.info(f"[v147.0] ✅ Firewall rule '{firewall_name}' already exists")
+                return
+            except Exception as e:
+                if "404" not in str(e) and "not found" not in str(e).lower():
+                    logger.warning(f"[v147.0] Firewall check error (non-critical): {e}")
+                    return
+                # 404 = rule doesn't exist, we'll create it
+            
+            # Create the firewall rule
+            logger.info(f"[v147.0] 🔥 Creating firewall rule '{firewall_name}' for health checks...")
+            
+            firewall_rule = compute_v1.Firewall(
+                name=firewall_name,
+                description="Allow health checks on port 8000 for JARVIS GCP VMs (v147.0)",
+                network=f"global/networks/{self.config.network}",
+                priority=1000,
+                direction="INGRESS",
+                target_tags=["jarvis-node"],  # Matches tags set on VM creation
+                source_ranges=["0.0.0.0/0"],  # Allow from anywhere (for health checks)
+                allowed=[
+                    compute_v1.Allowed(
+                        I_p_protocol="tcp",
+                        ports=["8000", "8010", "8080", "8090"],  # All JARVIS ports
+                    ),
+                ],
+            )
+            
+            # Insert the firewall rule
+            operation = await asyncio.to_thread(
+                firewalls_client.insert,
+                project=self.config.project_id,
+                firewall_resource=firewall_rule,
+            )
+            
+            # Wait for operation to complete (with timeout)
+            try:
+                global_ops_client = await asyncio.to_thread(compute_v1.GlobalOperationsClient)
+                
+                # Poll for completion (max 30 seconds)
+                for _ in range(30):
+                    op_result = await asyncio.to_thread(
+                        global_ops_client.get,
+                        project=self.config.project_id,
+                        operation=operation.name,
+                    )
+                    if op_result.status == compute_v1.Operation.Status.DONE:
+                        break
+                    await asyncio.sleep(1)
+                
+                logger.info(f"[v147.0] ✅ Firewall rule '{firewall_name}' created successfully!")
+                logger.info(f"[v147.0]    Allows TCP ports 8000,8010,8080,8090 to VMs with 'jarvis-node' tag")
+                
+            except Exception as wait_err:
+                # Operation started but we couldn't confirm completion
+                logger.info(f"[v147.0] ⏳ Firewall rule creation started (confirmation pending): {wait_err}")
+                
+        except Exception as e:
+            # Non-critical - log warning but don't fail initialization
+            # User may need to create the rule manually
+            logger.warning(
+                f"[v147.0] ⚠️ Could not create firewall rule (non-critical): {e}\n"
+                f"    If health checks fail, create rule manually:\n"
+                f"    gcloud compute firewall-rules create jarvis-allow-health-checks \\\n"
+                f"        --allow tcp:8000,tcp:8010,tcp:8080,tcp:8090 \\\n"
+                f"        --target-tags jarvis-node \\\n"
+                f"        --description 'JARVIS health checks'"
+            )
 
     async def _sync_managed_vms_with_gcp(self):
         """
