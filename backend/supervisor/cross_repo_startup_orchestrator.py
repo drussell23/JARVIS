@@ -16661,7 +16661,9 @@ echo "=== JARVIS Prime started ==="
             # - This tells jarvis-prime to NEVER load heavy models locally
             # - Instead, use Claude API as fallback if GCP unavailable
             # ═══════════════════════════════════════════════════════════════════════
-            if managed.hardware_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"}:
+            # v149.0: Read hardware profile from env vars (set by hw_env_vars above)
+            _hw_profile = env.get("JARVIS_HARDWARE_PROFILE", "UNKNOWN")
+            if _hw_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"}:
                 # SAFETY NET: Always set these on SLIM hardware regardless of GCP
                 env["JARVIS_SLIM_HARDWARE_MODE"] = "true"
                 env["JARVIS_MAX_LOCAL_MODEL_RAM_MB"] = "500"  # Only tiny models allowed
@@ -16670,23 +16672,26 @@ echo "=== JARVIS Prime started ==="
                 env["JARVIS_SKIP_HEAVY_MODELS"] = "true"  # Skip torch, transformers
                 logger.info(
                     f"[v148.0] 🛡️ SLIM HARDWARE SAFETY: {definition.name} restricted to "
-                    f"lightweight mode (profile: {managed.hardware_profile})"
+                    f"lightweight mode (profile: {_hw_profile})"
                 )
             
             # v147.0: Pass GCP offload information to spawned service
             # This tells the service to use GCP VM for model inference instead of local loading
             # CRITICAL FIX: jarvis-prime uses JARVIS_GCP_PRIME_ENDPOINT and GCP_PRIME_ENDPOINT
             # to determine where to route requests, NOT JARVIS_GCP_MODEL_SERVER
-            if managed.gcp_offload_active and managed.gcp_vm_ip:
+            # v149.0: Read GCP state from environment variables
+            _gcp_active = env.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() == "true"
+            _gcp_vm_ip = env.get("JARVIS_GCP_VM_IP", "")
+            if _gcp_active and _gcp_vm_ip:
                 # Build the full endpoint URL (use port 8000 which is jarvis-prime's port)
-                gcp_endpoint = f"http://{managed.gcp_vm_ip}:8000"
+                gcp_endpoint = f"http://{_gcp_vm_ip}:8000"
                 
                 # v147.0: Set ALL env vars that jarvis-prime checks for GCP routing
                 env["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
                 env["GCP_PRIME_ENDPOINT"] = gcp_endpoint  # Used by hybrid_tiered_router.py
                 env["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint  # Alternate name
                 env["JARVIS_GCP_MODEL_SERVER"] = gcp_endpoint  # Legacy compatibility
-                env["JARVIS_GCP_VM_IP"] = managed.gcp_vm_ip
+                env["JARVIS_GCP_VM_IP"] = _gcp_vm_ip
                 # Tell service to use lightweight/proxy mode
                 env["JARVIS_MODEL_LOADING_MODE"] = "gcp_proxy"
                 env["JARVIS_HOLLOW_CLIENT_MODE"] = "true"  # v147.0: Explicit hollow client
@@ -16695,47 +16700,16 @@ echo "=== JARVIS Prime started ==="
                 logger.info(
                     f"[v147.0] 🚀 {definition.name} will route inference to GCP: {gcp_endpoint}"
                 )
-            elif managed._gcp_offload_endpoint:
-                # OOM recovery mode - use endpoint from crash recovery
-                gcp_endpoint = managed._gcp_offload_endpoint
-                if not gcp_endpoint.startswith("http"):
-                    gcp_endpoint = f"http://{gcp_endpoint}:8000"
-                    
-                env["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
-                env["GCP_PRIME_ENDPOINT"] = gcp_endpoint
-                env["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
-                env["JARVIS_GCP_MODEL_SERVER"] = gcp_endpoint
-                env["JARVIS_GCP_VM_IP"] = managed._gcp_offload_endpoint.replace("http://", "").split(":")[0]
-                env["JARVIS_MODEL_LOADING_MODE"] = "gcp_proxy"
-                env["JARVIS_HOLLOW_CLIENT_MODE"] = "true"
-                env["JARVIS_SKIP_LOCAL_MODEL_LOAD"] = "true"
-                
-                logger.info(
-                    f"[v147.0] 🔄 {definition.name} (OOM recovery) routing to GCP: {gcp_endpoint}"
-                )
-            elif managed.degradation_tier:
-                # Graceful degradation mode
-                tier_value = managed.degradation_tier.value if hasattr(managed.degradation_tier, 'value') else str(managed.degradation_tier)
-                env["JARVIS_DEGRADATION_TIER"] = tier_value
-                # Set model loading based on degradation tier
-                if "minimal" in tier_value.lower():
-                    env["JARVIS_MODEL_LOADING_MODE"] = "minimal"
-                    env["JARVIS_LOAD_SMALL_MODELS_ONLY"] = "true"
-                elif "aggressive" in tier_value.lower():
-                    env["JARVIS_MODEL_LOADING_MODE"] = "sequential"
-                    env["JARVIS_SEQUENTIAL_MODEL_LOADING"] = "true"
-            else:
-                # v148.0: No GCP and no degradation tier set - check hardware profile
-                # On SLIM hardware, ALWAYS block heavy models even without explicit tier
-                if managed.hardware_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"}:
-                    if definition.name == "jarvis-prime":
-                        logger.warning(
-                            f"[v148.0] ⚠️ SLIM HARDWARE + NO GCP: {definition.name} will operate in "
-                            f"API-fallback mode (no local inference). This is expected if GCP failed."
-                        )
-                        env["JARVIS_API_ONLY_MODE"] = "true"
-                        env["JARVIS_CLAUDE_FALLBACK_ONLY"] = "true"
-                        env["JARVIS_MODEL_LOADING_MODE"] = "disabled"
+            elif _hw_profile in {"SLIM", "CLOUD_ONLY", "ULTRA_SLIM"}:
+                # v149.0: SLIM hardware but no GCP - use API fallback mode
+                if definition.name.lower() in jarvis_prime_names:
+                    logger.warning(
+                        f"[v148.0] ⚠️ SLIM HARDWARE + NO GCP: {definition.name} will operate in "
+                        f"API-fallback mode (no local inference). This is expected if GCP failed."
+                    )
+                    env["JARVIS_API_ONLY_MODE"] = "true"
+                    env["JARVIS_CLAUDE_FALLBACK_ONLY"] = "true"
+                    env["JARVIS_MODEL_LOADING_MODE"] = "disabled"
 
             # v4.0: Build command using the detected Python executable
             cmd: List[str] = []
