@@ -613,6 +613,105 @@ _gcp_vm_consecutive_failures: int = 0
 _GCP_VM_MAX_FAILURES_BEFORE_REPROVISION = int(os.getenv("GCP_VM_MAX_HEALTH_FAILURES", "3"))
 
 # =============================================================================
+# v149.0: ENTERPRISE-GRADE GCP RESILIENCE
+# =============================================================================
+# Adds exponential backoff for re-provisioning and circuit breaker for GCP API.
+# These patterns prevent quota exhaustion and continuous failed API calls during
+# GCP regional outages or authentication issues.
+# =============================================================================
+
+# v149.0: Exponential backoff configuration for GCP re-provisioning
+_GCP_REPROVISION_BASE_DELAY = float(os.getenv("GCP_REPROVISION_BASE_DELAY", "30.0"))
+_GCP_REPROVISION_MAX_DELAY = float(os.getenv("GCP_REPROVISION_MAX_DELAY", "600.0"))
+_GCP_REPROVISION_JITTER = float(os.getenv("GCP_REPROVISION_JITTER", "0.3"))
+_gcp_reprovision_attempt: int = 0
+_gcp_reprovision_last_failure: float = 0.0
+
+
+@dataclass
+class GCPCircuitBreaker:
+    """
+    v149.0: Circuit breaker for GCP API calls.
+    
+    Implements the standard circuit breaker pattern:
+    - CLOSED: Normal operation, requests flow through
+    - OPEN: Failures exceeded threshold, requests blocked
+    - HALF_OPEN: Recovery testing, limited requests allowed
+    
+    This prevents continuous failed API calls during GCP outages,
+    protecting quota and avoiding log spam.
+    """
+    state: str = "closed"  # "closed", "open", "half_open"
+    failure_count: int = 0
+    success_count: int = 0
+    last_failure_time: float = 0.0
+    failure_threshold: int = 3
+    recovery_timeout: float = 120.0  # Wait before half-open
+    half_open_success_threshold: int = 2  # Successes to close
+
+    def record_success(self) -> None:
+        """Record a successful GCP API call."""
+        if self.state == "half_open":
+            self.success_count += 1
+            if self.success_count >= self.half_open_success_threshold:
+                self.state = "closed"
+                self.failure_count = 0
+                logger.info("[v149.0] 🟢 GCP circuit breaker CLOSED (recovered)")
+        else:
+            self.failure_count = 0
+
+    def record_failure(self) -> None:
+        """Record a failed GCP API call."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        self.success_count = 0
+
+        if self.failure_count >= self.failure_threshold and self.state != "open":
+            self.state = "open"
+            logger.warning(
+                f"[v149.0] 🔴 GCP circuit breaker OPEN after {self.failure_count} failures"
+            )
+
+    def should_allow_request(self) -> Tuple[bool, str]:
+        """
+        Check if a GCP API request should be allowed.
+        
+        Returns:
+            Tuple of (allowed: bool, reason: str)
+        """
+        if self.state == "closed":
+            return (True, "circuit closed")
+        if self.state == "half_open":
+            return (True, "circuit half-open (testing)")
+        # Open state: check if recovery timeout elapsed
+        elapsed = time.time() - self.last_failure_time
+        if elapsed > self.recovery_timeout:
+            self.state = "half_open"
+            self.success_count = 0
+            logger.info(
+                f"[v149.0] 🟡 GCP circuit breaker HALF-OPEN after {elapsed:.0f}s"
+            )
+            return (True, "circuit half-open (recovery)")
+        return (
+            False,
+            f"circuit OPEN ({self.recovery_timeout - elapsed:.0f}s until recovery)"
+        )
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get circuit breaker status for monitoring."""
+        return {
+            "state": self.state,
+            "failure_count": self.failure_count,
+            "success_count": self.success_count,
+            "time_since_last_failure": time.time() - self.last_failure_time if self.last_failure_time else None,
+            "recovery_timeout": self.recovery_timeout,
+        }
+
+
+# v149.0: Global GCP circuit breaker instance
+_gcp_circuit_breaker = GCPCircuitBreaker()
+
+# =============================================================================
 # v147.0: PROACTIVE RESCUE - Crash Pre-Cognition Patterns
 # =============================================================================
 # These patterns indicate IMMINENT memory pressure. When detected, we trigger
@@ -1183,6 +1282,18 @@ async def ensure_gcp_vm_ready_for_prime(
                 logger.info(
                     f"[v144.0] ✅ Active Rescue: Existing VM ready at {endpoint}"
                 )
+                
+                # v149.0: Start health monitor EAGERLY when reusing existing VM
+                # This closes the race window between VM discovery and Prime spawn
+                try:
+                    await start_gcp_vm_health_monitor(
+                        check_interval=30.0,
+                        validate_inference=True,
+                    )
+                    logger.info("[v149.0] 🔍 Health monitor started for existing VM")
+                except Exception as monitor_err:
+                    logger.warning(f"[v149.0] Could not start health monitor: {monitor_err}")
+                
                 return True, endpoint
             else:
                 logger.warning(
@@ -1572,11 +1683,18 @@ async def _gcp_vm_health_monitor_loop(
 ) -> None:
     """
     v148.0: Internal health monitor loop.
+    v149.0: Added exponential backoff and circuit breaker integration.
     
-    Runs continuously, checking GCP VM health and handling failures.
+    Runs continuously, checking GCP VM health and handling failures with:
+    - Exponential backoff for re-provisioning (prevents quota exhaustion)
+    - Circuit breaker for GCP API (prevents continuous failed calls)
+    - Random jitter to prevent thundering herd
     """
     global _gcp_vm_consecutive_failures, _active_rescue_gcp_endpoint
     global _active_rescue_gcp_ready, _gcp_vm_health_monitor_running
+    global _gcp_reprovision_attempt
+    
+    import random
     
     _gcp_vm_consecutive_failures = 0
     
@@ -1615,6 +1733,8 @@ async def _gcp_vm_health_monitor_loop(
                         f"[v148.0] ✅ GCP VM recovered after {_gcp_vm_consecutive_failures} failures"
                     )
                 _gcp_vm_consecutive_failures = 0
+                # v149.0: Record success on circuit breaker (for half-open → closed)
+                _gcp_circuit_breaker.record_success()
             else:
                 # Increment failure counter
                 _gcp_vm_consecutive_failures += 1
@@ -1630,28 +1750,60 @@ async def _gcp_vm_health_monitor_loop(
                         f"consecutive failures - triggering re-provisioning"
                     )
                     
-                    # Invalidate cache and trigger re-provisioning
+                    # Invalidate cache
                     invalidate_active_rescue_cache()
                     _gcp_vm_consecutive_failures = 0
+                    
+                    # v149.0: Check circuit breaker before re-provisioning
+                    allowed, reason = _gcp_circuit_breaker.should_allow_request()
+                    if not allowed:
+                        logger.warning(
+                            f"[v149.0] ⏳ GCP re-provisioning blocked: {reason}"
+                        )
+                        continue
+                    
+                    # v149.0: Apply exponential backoff with jitter
+                    backoff = min(
+                        _GCP_REPROVISION_BASE_DELAY * (2 ** _gcp_reprovision_attempt),
+                        _GCP_REPROVISION_MAX_DELAY
+                    )
+                    jitter = backoff * random.uniform(-_GCP_REPROVISION_JITTER, _GCP_REPROVISION_JITTER)
+                    delay = max(0, backoff + jitter)
+                    
+                    if _gcp_reprovision_attempt > 0:
+                        logger.warning(
+                            f"[v149.0] ⏱️ Re-provisioning backoff: {delay:.1f}s "
+                            f"(attempt #{_gcp_reprovision_attempt + 1})"
+                        )
+                        await asyncio.sleep(delay)
                     
                     # Try to re-provision
                     try:
                         success, new_endpoint = await ensure_gcp_vm_ready_for_prime(
                             force_provision=True,
-                            timeout_seconds=180.0,  # v148.0: Fixed parameter name
+                            timeout_seconds=180.0,
                         )
                         
                         if success:
                             logger.info(
                                 f"[v148.0] ✅ GCP VM re-provisioned successfully: {new_endpoint}"
                             )
+                            # v149.0: Reset backoff attempt counter on success
+                            _gcp_reprovision_attempt = 0
+                            _gcp_circuit_breaker.record_success()
                         else:
                             logger.error(
                                 "[v148.0] ❌ GCP VM re-provisioning failed - "
                                 "system may fall back to local mode"
                             )
+                            # v149.0: Increment backoff attempt and record failure
+                            _gcp_reprovision_attempt += 1
+                            _gcp_circuit_breaker.record_failure()
                     except Exception as e:
                         logger.error(f"[v148.0] Re-provisioning error: {e}")
+                        # v149.0: Increment backoff and record failure on exception
+                        _gcp_reprovision_attempt += 1
+                        _gcp_circuit_breaker.record_failure()
         
         except asyncio.CancelledError:
             logger.debug("[v148.0] GCP VM health monitor cancelled")
@@ -1666,6 +1818,7 @@ async def _gcp_vm_health_monitor_loop(
 def get_gcp_vm_health_status() -> Dict[str, Any]:
     """
     v148.0: Get current GCP VM health status.
+    v149.0: Added circuit breaker and backoff status.
     
     Returns:
         Dict with health status information
@@ -1676,7 +1829,155 @@ def get_gcp_vm_health_status() -> Dict[str, Any]:
         "max_failures_before_reprovision": _GCP_VM_MAX_FAILURES_BEFORE_REPROVISION,
         "active_endpoint": _active_rescue_gcp_endpoint,
         "is_ready": _active_rescue_gcp_ready,
+        # v149.0: Enterprise resilience status
+        "circuit_breaker": _gcp_circuit_breaker.get_status(),
+        "reprovision_attempt": _gcp_reprovision_attempt,
+        "backoff_config": {
+            "base_delay": _GCP_REPROVISION_BASE_DELAY,
+            "max_delay": _GCP_REPROVISION_MAX_DELAY,
+            "jitter": _GCP_REPROVISION_JITTER,
+        },
     }
+
+
+# =============================================================================
+# v149.0: AGGREGATE TIMEOUT FOR CROSS-REPO HEALTH CHECKS
+# =============================================================================
+# Provides a utility for parallel health checks with aggregate timeout.
+# This prevents 90s combined waits when multiple services are slow.
+# =============================================================================
+
+async def verify_cross_repo_health_with_aggregate_timeout(
+    services: Optional[Dict[str, str]] = None,
+    individual_timeout: float = 10.0,
+    aggregate_timeout: float = 30.0,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    v149.0: Verify multiple cross-repo services with aggregate timeout.
+    
+    Runs health checks in PARALLEL and returns results as soon as:
+    - All checks complete, OR
+    - Aggregate timeout is reached (returns partial results)
+    
+    This prevents the scenario where 3 slow services each take 30s = 90s total.
+    
+    Args:
+        services: Dict mapping service names to health URLs.
+                  Defaults to standard Trinity services.
+        individual_timeout: Timeout per individual health check
+        aggregate_timeout: Total time to wait for all checks
+        
+    Returns:
+        Dict mapping service name to health status:
+        {
+            "service-name": {
+                "healthy": bool,
+                "response_time_ms": float | None,
+                "error": str | None,
+                "timed_out": bool
+            }
+        }
+    """
+    if services is None:
+        services = {
+            "jarvis-body": "http://localhost:8010/health",
+            "jarvis-prime": "http://localhost:8000/health",
+            "reactor-core": "http://localhost:8090/health",
+        }
+    
+    async def check_service(name: str, url: str) -> Tuple[str, Dict[str, Any]]:
+        """Check single service health."""
+        start = time.time()
+        try:
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=individual_timeout),
+                ) as response:
+                    elapsed = (time.time() - start) * 1000
+                    return (name, {
+                        "healthy": response.status == 200,
+                        "response_time_ms": round(elapsed, 1),
+                        "status_code": response.status,
+                        "error": None,
+                        "timed_out": False,
+                    })
+        except asyncio.TimeoutError:
+            return (name, {
+                "healthy": False,
+                "response_time_ms": None,
+                "error": "timeout",
+                "timed_out": True,
+            })
+        except aiohttp.ClientConnectorError as e:
+            return (name, {
+                "healthy": False,
+                "response_time_ms": None,
+                "error": f"connection refused: {type(e).__name__}",
+                "timed_out": False,
+            })
+        except Exception as e:
+            return (name, {
+                "healthy": False,
+                "response_time_ms": None,
+                "error": str(e),
+                "timed_out": False,
+            })
+    
+    # Create tasks for all services
+    tasks = [
+        asyncio.create_task(check_service(name, url), name=f"health-{name}")
+        for name, url in services.items()
+    ]
+    
+    results: Dict[str, Dict[str, Any]] = {}
+    
+    try:
+        # Wait for all tasks OR aggregate timeout
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=aggregate_timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        
+        # Collect completed results
+        for task in done:
+            try:
+                name, status = task.result()
+                results[name] = status
+            except Exception as e:
+                # Task raised exception
+                results[task.get_name().replace("health-", "")] = {
+                    "healthy": False,
+                    "response_time_ms": None,
+                    "error": str(e),
+                    "timed_out": False,
+                }
+        
+        # Mark pending as timed out
+        for task in pending:
+            task.cancel()
+            service_name = task.get_name().replace("health-", "")
+            results[service_name] = {
+                "healthy": False,
+                "response_time_ms": None,
+                "error": f"aggregate timeout ({aggregate_timeout}s)",
+                "timed_out": True,
+            }
+            logger.warning(
+                f"[v149.0] ⏱️ Health check for {service_name} cancelled "
+                f"(aggregate timeout)"
+            )
+    
+    except Exception as e:
+        logger.error(f"[v149.0] Aggregate health check error: {e}")
+        # Return what we have
+    
+    return results
+
+
+
 
 
 # =============================================================================
