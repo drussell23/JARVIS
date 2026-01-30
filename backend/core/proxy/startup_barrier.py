@@ -252,6 +252,61 @@ class BarrierConfig:
     # Latency thresholds
     LATENCY_WARNING_MS: Final[float] = float(os.getenv("CLOUDSQL_LATENCY_WARNING_MS", "100.0"))
     LATENCY_ERROR_MS: Final[float] = float(os.getenv("CLOUDSQL_LATENCY_ERROR_MS", "500.0"))
+    
+    # v149.0: Intelligent fast-fail for unconfigured CloudSQL
+    # Only retry 3 times when CloudSQL isn't configured (not 60!)
+    MAX_UNCONFIGURED_ATTEMPTS: Final[int] = int(os.getenv("CLOUDSQL_UNCONFIGURED_MAX_ATTEMPTS", "3"))
+    
+    @classmethod
+    def is_cloudsql_configured(cls) -> bool:
+        """
+        v149.0: Check if CloudSQL is properly configured.
+        
+        Returns True if the required environment variables are set,
+        indicating CloudSQL is expected to be available.
+        Returns False if configuration is missing (fast-fail mode).
+        """
+        # Check for required GCP configuration
+        gcp_project = os.getenv("GCP_PROJECT", "")
+        cloudsql_instance = os.getenv("CLOUDSQL_INSTANCE_NAME", "")
+        
+        # v149.0: Must have either:
+        # 1. GCP_PROJECT + CLOUDSQL_INSTANCE_NAME for Cloud SQL Auth Proxy
+        # 2. Or CLOUDSQL_CONNECTION_STRING for direct connection
+        connection_string = os.getenv("CLOUDSQL_CONNECTION_STRING", "")
+        
+        if connection_string:
+            return True
+        
+        if gcp_project and cloudsql_instance:
+            return True
+        
+        return False
+    
+    @classmethod
+    def get_configuration_status(cls) -> dict:
+        """
+        v149.0: Get detailed CloudSQL configuration status.
+        
+        Returns a dict with configuration state and missing variables.
+        """
+        gcp_project = os.getenv("GCP_PROJECT", "")
+        cloudsql_instance = os.getenv("CLOUDSQL_INSTANCE_NAME", "")
+        connection_string = os.getenv("CLOUDSQL_CONNECTION_STRING", "")
+        
+        missing = []
+        if not gcp_project:
+            missing.append("GCP_PROJECT")
+        if not cloudsql_instance:
+            missing.append("CLOUDSQL_INSTANCE_NAME")
+        
+        return {
+            "configured": cls.is_cloudsql_configured(),
+            "connection_string_set": bool(connection_string),
+            "gcp_project_set": bool(gcp_project),
+            "cloudsql_instance_set": bool(cloudsql_instance),
+            "missing_variables": missing,
+        }
 
     @classmethod
     def refresh_credentials(cls) -> None:
@@ -1111,11 +1166,39 @@ class AsyncStartupBarrier:
         Ensure CloudSQL proxy is verified ready.
 
         This is the main barrier that blocks CloudSQL-dependent components.
+        
+        v149.0: Intelligent fast-fail when CloudSQL is not configured.
+        Instead of retrying 60 times when GCP_PROJECT/CLOUDSQL_INSTANCE_NAME
+        are missing, we fail after MAX_UNCONFIGURED_ATTEMPTS (default: 3).
         """
         if self._cloudsql_verified:
             return True
 
-        timeout = timeout or BarrierConfig.ENSURE_READY_TIMEOUT
+        # v149.0: Check if CloudSQL is configured before retrying
+        is_configured = BarrierConfig.is_cloudsql_configured()
+        config_status = BarrierConfig.get_configuration_status()
+        
+        if not is_configured:
+            logger.warning(
+                f"[StartupBarrier] [v149.0] CloudSQL NOT CONFIGURED - fast-fail mode enabled"
+            )
+            logger.warning(
+                f"[StartupBarrier] Missing: {', '.join(config_status['missing_variables'])}"
+            )
+            logger.info(
+                "[StartupBarrier] To enable CloudSQL, set: GCP_PROJECT and CLOUDSQL_INSTANCE_NAME"
+            )
+            # Use reduced retry count for unconfigured state
+            max_attempts = BarrierConfig.MAX_UNCONFIGURED_ATTEMPTS
+            timeout = min(
+                timeout or BarrierConfig.ENSURE_READY_TIMEOUT,
+                10.0  # v149.0: Max 10s when not configured
+            )
+        else:
+            max_attempts = None  # No limit when configured - use timeout
+            timeout = timeout or BarrierConfig.ENSURE_READY_TIMEOUT
+            logger.info(f"[StartupBarrier] CloudSQL is configured, verifying connection...")
+
         deadline = time.monotonic() + timeout
         attempt = 0
         delay = BarrierConfig.RETRY_BASE_DELAY
@@ -1124,6 +1207,14 @@ class AsyncStartupBarrier:
 
         while time.monotonic() < deadline:
             attempt += 1
+            
+            # v149.0: Fast-fail for unconfigured CloudSQL
+            if max_attempts and attempt > max_attempts:
+                logger.warning(
+                    f"[StartupBarrier] [v149.0] Fast-fail: CloudSQL not configured, "
+                    f"stopping after {max_attempts} attempts (not {int(timeout)})"
+                )
+                break
 
             # First, ensure lifecycle controller has started proxy
             if self._lifecycle:
@@ -1158,18 +1249,33 @@ class AsyncStartupBarrier:
                 break
 
             wait_time = min(delay, remaining)
-            logger.warning(
-                f"[StartupBarrier] CloudSQL verification failed (attempt {attempt}), "
-                f"retrying in {wait_time:.1f}s"
-            )
+            
+            # v149.0: More informative logging based on configuration state
+            if is_configured:
+                logger.warning(
+                    f"[StartupBarrier] CloudSQL verification failed (attempt {attempt}), "
+                    f"retrying in {wait_time:.1f}s"
+                )
+            else:
+                logger.debug(
+                    f"[StartupBarrier] [v149.0] Unconfigured CloudSQL attempt {attempt}/{max_attempts}"
+                )
+            
             await asyncio.sleep(wait_time)
 
             delay = min(delay * 2, BarrierConfig.RETRY_MAX_DELAY)
 
-        # Timeout exceeded
-        logger.error(
-            f"[StartupBarrier] ❌ CloudSQL verification failed after {attempt} attempts"
-        )
+        # Timeout/max attempts exceeded
+        if is_configured:
+            logger.error(
+                f"[StartupBarrier] ❌ CloudSQL verification failed after {attempt} attempts"
+            )
+        else:
+            logger.warning(
+                f"[StartupBarrier] [v149.0] CloudSQL unavailable (not configured). "
+                f"Set GCP_PROJECT and CLOUDSQL_INSTANCE_NAME to enable."
+            )
+        
         self.mark_dependency_unavailable(DependencyType.CLOUDSQL)
         return False
 
