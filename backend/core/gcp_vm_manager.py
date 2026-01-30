@@ -1877,15 +1877,27 @@ class GCPVMManager:
         if jarvis_repo_url:
             metadata_items.append(compute_v1.Items(key="jarvis-repo-url", value=jarvis_repo_url))
 
-        # Add startup script with self-destruct capability
-        # The script will auto-shutdown if it doesn't receive a heartbeat or completes its task
+        # Add startup script
+        # v149.2: CRITICAL FIX - Do NOT inject auto-shutdown!
+        # The startup script (gcp_vm_startup.sh) is designed for LONG-RUNNING services:
+        # - Phase 1: Starts health endpoint quickly
+        # - Phase 2: Runs in BACKGROUND (nohup ... &)
+        # - Main script exits, but Phase 2 keeps running
+        #
+        # If we inject "shutdown -h now", it runs IMMEDIATELY after Phase 1,
+        # killing the VM before Phase 2 (the real inference server) starts.
+        # This was the ROOT CAUSE of "GCP VM unreachable" after 90s timeout.
+        #
+        # The VM's lifecycle is controlled by:
+        # 1. max_run_duration in Spot VM config (hard GCP limit)
+        # 2. Explicit terminate_vm() calls from JARVIS
+        # 3. GCP preemption (for Spot VMs)
         if self.config.startup_script_path and os.path.exists(self.config.startup_script_path):
             with open(self.config.startup_script_path, "r") as f:
                 startup_script = f.read()
             
-            # Inject self-destruct logic if not present
-            if "shutdown -h now" not in startup_script:
-                startup_script += "\n\n# Auto-shutdown on script completion\necho '✅ Task complete, shutting down...'\nsudo shutdown -h now"
+            # v149.2: REMOVED auto-shutdown injection - this killed VMs prematurely
+            # The VM will be managed by max_run_duration and explicit termination calls
                 
             metadata_items.append(compute_v1.Items(key="startup-script", value=startup_script))
 
