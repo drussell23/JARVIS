@@ -50,6 +50,42 @@ from backend.core.async_safety import LazyAsyncLock
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# v151.0: SHUTDOWN DIAGNOSTICS - Deep Forensic Logging
+# =============================================================================
+# Import diagnostic tools for tracing exactly what triggers shutdown
+try:
+    from backend.core.shutdown_diagnostics import (
+        log_shutdown_trigger,
+        log_state_change,
+        log_signal_received,
+        capture_system_state,
+    )
+    _DIAGNOSTICS_AVAILABLE = True
+except ImportError:
+    _DIAGNOSTICS_AVAILABLE = False
+    logger.debug("[v151.0] Shutdown diagnostics not available - using stubs")
+
+
+def _log_shutdown_trigger_safe(source: str, message: str, extra_data: dict = None) -> None:  # noqa: E501
+    """Safe wrapper for shutdown trigger logging."""
+    if _DIAGNOSTICS_AVAILABLE:
+        log_shutdown_trigger(source, message, extra_data)
+    else:
+        logger.warning(f"[DIAG] Shutdown trigger: [{source}] {message}")
+
+
+def _log_state_change_safe(component: str, old_state: str, new_state: str, reason: str = "") -> None:
+    """Safe wrapper for state change logging."""
+    if _DIAGNOSTICS_AVAILABLE:
+        log_state_change(component, old_state, new_state, reason)
+
+
+def _log_signal_received_safe(signum: int, handler_name: str) -> None:
+    """Safe wrapper for signal logging."""
+    if _DIAGNOSTICS_AVAILABLE:
+        log_signal_received(signum, handler_name)
+
 
 # =============================================================================
 # Configuration
@@ -644,6 +680,37 @@ class CoordinatedShutdownManager:
         Returns:
             ShutdownResult with details
         """
+        # ═══════════════════════════════════════════════════════════════════════════
+        # v151.0: DIAGNOSTIC LOGGING - Capture EXACTLY what triggered shutdown
+        # ═══════════════════════════════════════════════════════════════════════════
+        import traceback
+        import threading
+
+        caller_stack = "".join(traceback.format_stack())
+        caller_thread = threading.current_thread()
+
+        _log_shutdown_trigger_safe(
+            "CoordinatedShutdownManager.initiate_shutdown",
+            f"Shutdown initiated - reason={reason.value}, force={force}",
+            {
+                "reason_value": reason.value,
+                "force": force,
+                "timeout": timeout,
+                "thread_name": caller_thread.name,
+                "thread_id": caller_thread.ident,
+                "stack_trace": caller_stack,
+            }
+        )
+
+        logger.warning(
+            f"[v151.0] 🔬 SHUTDOWN TRIGGER DETECTED:\n"
+            f"    Reason: {reason.value}\n"
+            f"    Force: {force}\n"
+            f"    Thread: {caller_thread.name}\n"
+            f"    Stack trace:\n{caller_stack}"
+        )
+        # ═══════════════════════════════════════════════════════════════════════════
+
         async with self._shutdown_lock:
             if self._shutdown_in_progress and not force:
                 logger.warning("[ShutdownManager] Shutdown already in progress")
@@ -659,6 +726,13 @@ class CoordinatedShutdownManager:
 
             self._shutdown_in_progress = True
             self._shutdown_reason = reason
+
+            _log_state_change_safe(
+                "CoordinatedShutdownManager",
+                "idle",
+                "shutting_down",
+                f"reason={reason.value}"
+            )
 
             # v95.13: Trigger global shutdown signal IMMEDIATELY
             # This ensures ALL components (OrphanDetector, recovery coordinator, etc.)
