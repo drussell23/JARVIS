@@ -118,6 +118,9 @@ backend/swift_bridge/*.pyc
 .jarvis/
 *.json.cache
 
+# Git worktrees (development workspaces)
+.worktrees/
+
 # Rust build artifacts
 backend/vision/jarvis-rust-core/target/
 backend/rust_performance/target/
