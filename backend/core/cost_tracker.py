@@ -54,6 +54,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 
 from backend.core.async_safety import TimeoutConfig, get_shutdown_event
 
+# Log severity bridge for criticality-aware logging
+try:
+    from backend.core.log_severity_bridge import log_component_failure, is_component_required
+except ImportError:
+    def log_component_failure(component, message, error=None, **ctx):
+        logging.getLogger(__name__).error(f"{component}: {message}")
+    def is_component_required(component):
+        return True
+
 logger = logging.getLogger(__name__)
 
 # Redis channel names for Pub/Sub
@@ -536,7 +545,11 @@ class CostTracker:
             logger.info(f"   Channels: {REDIS_CHANNEL_COST_UPDATES}, {REDIS_CHANNEL_VM_EVENTS}")
             
         except Exception as e:
-            logger.error(f"Failed to start Pub/Sub listener: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to start Pub/Sub listener",
+                error=e,
+            )
 
     async def _pubsub_listener_loop(self):
         """
@@ -570,7 +583,11 @@ class CostTracker:
         except asyncio.CancelledError:
             logger.debug("Pub/Sub listener cancelled")
         except Exception as e:
-            logger.error(f"Pub/Sub listener error: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Pub/Sub listener error",
+                error=e,
+            )
 
     async def _publish_event(self, channel: str, data: Dict[str, Any]):
         """
@@ -599,7 +616,12 @@ class CostTracker:
             logger.debug(f"📡 Published to {channel}: {data.get('event_type', 'unknown')}")
             
         except Exception as e:
-            logger.error(f"Failed to publish to Redis: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to publish to Redis",
+                error=e,
+                channel=channel,
+            )
             # Fallback to local callbacks
             await self._notify_event(channel, data)
 
@@ -825,7 +847,12 @@ class CostTracker:
                     logger.info("✅ Advanced cost tracking database initialized")
 
         except Exception as e:
-            logger.error(f"Failed to initialize cost tracking database: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to initialize cost tracking database",
+                error=e,
+                db_path=str(self.config.db_path),
+            )
             raise
 
     async def _migrate_database(self, db):
@@ -913,7 +940,12 @@ class CostTracker:
             await self._notify_event("vm_created", {"instance_id": instance_id, "session": session})
 
         except Exception as e:
-            logger.error(f"Failed to record VM creation: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to record VM creation",
+                error=e,
+                instance_id=instance_id,
+            )
 
     async def record_vm_deleted(
         self, instance_id: str, was_orphaned: bool = False, actual_cost: Optional[float] = None
@@ -1019,7 +1051,12 @@ class CostTracker:
             await self._notify_event("vm_deleted", {"instance_id": instance_id, "session": session})
 
         except Exception as e:
-            logger.error(f"Failed to record VM deletion: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to record VM deletion",
+                error=e,
+                instance_id=instance_id,
+            )
 
     # ============================================================================
     # ALIAS METHODS FOR COMPATIBILITY (used by gcp_vm_manager.py)
@@ -1148,7 +1185,12 @@ class CostTracker:
                                 metadata=json.loads(row[6]) if row[6] else {},
                             )
         except Exception as e:
-            logger.error(f"Failed to load session from DB: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to load session from DB",
+                error=e,
+                instance_id=instance_id,
+            )
 
         return None
 
@@ -1338,7 +1380,11 @@ class CostTracker:
             except Exception as e:
                 if not self._cleanup_running:
                     break
-                logger.error(f"Auto-cleanup loop error: {e}")
+                log_component_failure(
+                    "cost-tracker",
+                    "Auto-cleanup loop error",
+                    error=e,
+                )
 
         # v93.6: Clean exit logging
         logger.info("Auto-cleanup loop stopped")
@@ -1387,7 +1433,11 @@ class CostTracker:
                     await db.commit()
 
         except Exception as e:
-            logger.error(f"Failed to record routing decision: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to record routing decision",
+                error=e,
+            )
 
     async def get_cost_summary(self, period: str = "all") -> Dict[str, Any]:
         """Get cost summary with enhanced metrics"""
@@ -1463,7 +1513,12 @@ class CostTracker:
             return {}
 
         except Exception as e:
-            logger.error(f"Failed to get cost summary: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to get cost summary",
+                error=e,
+                period=period,
+            )
             return {}
 
     async def get_daily_cost(self) -> float:
@@ -1543,7 +1598,11 @@ class CostTracker:
             }
 
         except Exception as e:
-            logger.error(f"Failed to get routing metrics: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to get routing metrics",
+                error=e,
+            )
             return {}
 
     async def _check_cost_alerts(self):
@@ -1635,7 +1694,11 @@ class CostTracker:
             )
 
         except Exception as e:
-            logger.error(f"Failed to log alert: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to log alert",
+                error=e,
+            )
 
     async def _send_desktop_notification(self, message: str):
         """Send desktop notification (macOS/Linux)"""
@@ -1761,7 +1824,11 @@ class CostTracker:
                         }
 
         except Exception as e:
-            logger.error(f"Failed to get orphaned VMs report: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Failed to get orphaned VMs report",
+                error=e,
+            )
             return {
                 "total_orphaned_vms": 0,
                 "total_orphaned_cost": 0,
@@ -1867,7 +1934,11 @@ class CostTracker:
             return True, "Budget OK", details
             
         except Exception as e:
-            logger.error(f"Budget check failed: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Budget check failed",
+                error=e,
+            )
             # On error, allow VM creation (don't block due to tracking issues)
             return True, f"Budget check error (allowing): {e}", details
 
@@ -1984,7 +2055,11 @@ class CostTracker:
             }
             
         except Exception as e:
-            logger.error(f"Cost forecasting failed: {e}")
+            log_component_failure(
+                "cost-tracker",
+                "Cost forecasting failed",
+                error=e,
+            )
             return {
                 "predicted_cost": 0.0,
                 "confidence": 0.0,

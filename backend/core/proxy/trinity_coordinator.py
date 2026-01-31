@@ -75,6 +75,15 @@ try:
 except ImportError:
     aiohttp = None  # type: ignore
 
+# Log severity bridge for criticality-aware logging
+try:
+    from backend.core.log_severity_bridge import log_component_failure, is_component_required
+except ImportError:
+    def log_component_failure(component, message, error=None, **ctx):
+        logging.getLogger(__name__).error(f"{component}: {message}")
+    def is_component_required(component):
+        return True
+
 logger = logging.getLogger(__name__)
 
 
@@ -752,7 +761,12 @@ class ProcessSupervisor:
             return True
 
         except Exception as e:
-            logger.error(f"[ProcessSupervisor] Failed to start {config.display_name}: {e}")
+            log_component_failure(
+                "trinity",
+                f"Failed to start {config.display_name}",
+                error=e,
+                component_name=config.display_name,
+            )
             return False
 
     async def stop_component(
@@ -783,7 +797,11 @@ class ProcessSupervisor:
             return True
 
         except Exception as e:
-            logger.error(f"[ProcessSupervisor] Stop error: {e}")
+            log_component_failure(
+                "trinity",
+                f"Failed to stop process: {component.value}",
+                error=e,
+            )
             return False
 
     async def stop_all(self, graceful: bool = True) -> None:
@@ -1011,7 +1029,11 @@ class UnifiedTrinityCoordinator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[TrinityCoordinator] Health check error: {e}")
+                log_component_failure(
+                    "trinity",
+                    "Health check loop error",
+                    error=e,
+                )
                 await asyncio.sleep(5.0)
 
     # -------------------------------------------------------------------------
