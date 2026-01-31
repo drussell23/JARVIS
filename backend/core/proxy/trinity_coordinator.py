@@ -783,17 +783,44 @@ class ProcessSupervisor:
             return True
 
         try:
+            # v149.0: Check if process already exited before attempting terminate
+            if process.returncode is not None:
+                # Process already exited - just clean up
+                logger.debug(f"[ProcessSupervisor] {component.value} already exited (code: {process.returncode})")
+                self._processes.pop(component, None)
+                self._pids.pop(component, None)
+                return True
+
             if graceful:
-                process.terminate()
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    # v149.0: Process exited between check and terminate - this is OK
+                    logger.debug(f"[ProcessSupervisor] {component.value} exited during graceful stop")
+                    self._processes.pop(component, None)
+                    self._pids.pop(component, None)
+                    return True
+
                 try:
                     await asyncio.wait_for(process.wait(), timeout=timeout)
                 except asyncio.TimeoutError:
                     logger.warning(f"[ProcessSupervisor] Graceful stop timeout, forcing")
-                    process.kill()
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass  # Already dead
             else:
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass  # Already dead
 
-            await process.wait()
+            # Wait for process cleanup (may already be done)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass  # Process cleanup may hang, proceed anyway
+
             self._processes.pop(component, None)
             self._pids.pop(component, None)
             return True
@@ -804,6 +831,9 @@ class ProcessSupervisor:
                 f"Failed to stop process: {component.value}",
                 error=e,
             )
+            # v149.0: Still clean up tracking even on error
+            self._processes.pop(component, None)
+            self._pids.pop(component, None)
             return False
 
     async def stop_all(self, graceful: bool = True) -> None:

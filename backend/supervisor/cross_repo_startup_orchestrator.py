@@ -185,6 +185,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Literal, Optional, Set, Tuple, Union
@@ -965,6 +966,15 @@ PROACTIVE_RESCUE_PATTERNS = frozenset({
     "memory cgroup out of memory",
     "oom-killer",
     "OOM killer",
+})
+
+# v149.0: Patterns that indicate need for cloud fallback (not memory-related)
+# These are intentional routing decisions, not emergencies
+CLOUD_FALLBACK_PATTERNS = frozenset({
+    "CloudOffloadRequired",
+    "Hollow Client mode",
+    "Local ML blocked",
+    "Route to GCP",
 })
 
 # v147.0: Patterns that indicate SEVERE memory stress (immediate action)
@@ -13897,6 +13907,46 @@ echo "=== JARVIS Prime started ==="
                                 }
                             )
 
+                    # =========================================================
+                    # v149.0: CLOUD FALLBACK - Handle CloudOffloadRequired
+                    # =========================================================
+                    # When jarvis-prime is in Hollow Client mode, local ML is
+                    # intentionally blocked. This triggers cloud fallback.
+                    # =========================================================
+                    cloud_fallback_triggered = getattr(self, '_cloud_fallback_triggered', False)
+                    if not cloud_fallback_triggered:
+                        for pattern in CLOUD_FALLBACK_PATTERNS:
+                            if pattern in decoded:
+                                self._cloud_fallback_triggered = True
+                                is_jarvis_prime = service_name.lower() in ["jarvis-prime", "jarvis_prime", "j-prime"]
+
+                                logger.info(
+                                    f"[v149.0] ☁️ CLOUD FALLBACK DETECTED\n"
+                                    f"    Service: {service_name}\n"
+                                    f"    Pattern: '{pattern}'\n"
+                                    f"    Action: Initiating cloud routing"
+                                )
+
+                                if is_jarvis_prime:
+                                    asyncio.create_task(
+                                        self._cloud_fallback_handler(
+                                            managed,
+                                            pattern,
+                                        )
+                                    )
+
+                                await _emit_event(
+                                    "CLOUD_FALLBACK_TRIGGERED",
+                                    service_name=service_name,
+                                    priority="HIGH",
+                                    details={
+                                        "matched_pattern": pattern,
+                                        "hollow_client_mode": True,
+                                        "line": decoded[:200],
+                                    }
+                                )
+                                break
+
                     # v93.16: Suppress known benign warnings
                     if self._should_suppress_line(decoded):
                         logger.debug(f"{prefix} [SUPPRESSED] {decoded}")
@@ -14038,6 +14088,135 @@ echo "=== JARVIS Prime started ==="
         except Exception as e:
             logger.error(f"[v147.0] Graceful restart failed for {service_name}: {e}")
             return False
+
+    async def _cloud_fallback_handler(
+        self,
+        managed: ManagedProcess,
+        matched_pattern: str,
+    ) -> None:
+        """
+        v149.0: Handle CloudOffloadRequired by triggering fallback to GCP or Claude API.
+
+        When jarvis-prime is in Hollow Client mode, local ML is intentionally blocked.
+        This handler provisions the cloud alternative and signals the system to use it.
+        """
+        service_name = managed.definition.name
+
+        logger.info(
+            f"[v149.0] ☁️ Cloud Fallback Handler: Routing {service_name} to cloud..."
+        )
+
+        try:
+            # Step 1: Try enterprise hooks for routing decision
+            try:
+                from backend.core.enterprise_hooks import (
+                    get_routing_decision,
+                    record_provider_failure,
+                    TRINITY_FALLBACK_CHAIN,
+                )
+
+                # Record that local ML failed
+                record_provider_failure("llm_inference", "local_llama", Exception(matched_pattern))
+
+                # Get fallback routing decision
+                decision = await get_routing_decision("llm_inference", preferred_provider=None)
+                if decision:
+                    logger.info(
+                        f"[v149.0] ☁️ Enterprise routing: Using {decision.provider} "
+                        f"(fallbacks: {decision.fallback_chain})"
+                    )
+            except ImportError:
+                logger.debug("[v149.0] Enterprise hooks not available, using legacy fallback")
+
+            # Step 2: Provision GCP VM as primary fallback
+            gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
+                timeout_seconds=120.0,
+                force_provision=False,
+            )
+
+            if gcp_ready and gcp_endpoint:
+                logger.info(
+                    f"[v149.0] ✅ Cloud Fallback: GCP VM ready at {gcp_endpoint}"
+                )
+
+                # Update managed process state
+                managed.gcp_offload_active = True
+                managed.gcp_vm_ip = gcp_endpoint.replace("http://", "").split(":")[0]
+
+                # Set environment for GCP routing
+                os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
+                os.environ["GCP_PRIME_ENDPOINT"] = gcp_endpoint
+                os.environ["JARVIS_GCP_PRIME_ENDPOINT"] = gcp_endpoint
+
+                # Set cloud lock
+                _save_cloud_lock(
+                    locked=True,
+                    reason=f"CLOUD_FALLBACK:{matched_pattern}",
+                    oom_count=0,
+                    consecutive_ooms=0,
+                )
+
+                await _emit_event(
+                    "CLOUD_FALLBACK_SUCCESS",
+                    service_name=service_name,
+                    priority="HIGH",
+                    details={
+                        "gcp_endpoint": gcp_endpoint,
+                        "hollow_client_mode": True,
+                        "pattern": matched_pattern,
+                    }
+                )
+
+            else:
+                # Step 3: If GCP fails, try Claude API fallback
+                logger.warning(
+                    f"[v149.0] ⚠️ GCP unavailable, trying Claude API fallback..."
+                )
+
+                # Signal Claude API as the active provider
+                os.environ["JARVIS_LLM_FALLBACK"] = "claude_api"
+                os.environ["JARVIS_HOLLOW_CLIENT_FALLBACK"] = "claude_api"
+
+                # Write fallback signal file
+                fallback_file = Path.home() / ".jarvis" / "trinity" / "claude_api_fallback.json"
+                fallback_file.parent.mkdir(parents=True, exist_ok=True)
+
+                import json
+                fallback_data = {
+                    "triggered_at": datetime.now().isoformat(),
+                    "reason": f"cloud_fallback:{matched_pattern}",
+                    "gcp_unavailable": True,
+                    "active_provider": "claude_api",
+                }
+                fallback_file.write_text(json.dumps(fallback_data, indent=2))
+
+                logger.info(
+                    f"[v149.0] ☁️ Claude API fallback signal written: {fallback_file}"
+                )
+
+                await _emit_event(
+                    "CLOUD_FALLBACK_CLAUDE_API",
+                    service_name=service_name,
+                    priority="HIGH",
+                    details={
+                        "gcp_unavailable": True,
+                        "active_provider": "claude_api",
+                        "pattern": matched_pattern,
+                    }
+                )
+
+        except Exception as e:
+            logger.error(f"[v149.0] Cloud Fallback Handler error: {e}")
+
+            await _emit_event(
+                "CLOUD_FALLBACK_FAILED",
+                service_name=service_name,
+                priority="CRITICAL",
+                details={
+                    "error": str(e),
+                    "pattern": matched_pattern,
+                }
+            )
 
     async def _start_output_streaming(self, managed: ManagedProcess) -> None:
         """Start streaming stdout and stderr for a process."""
