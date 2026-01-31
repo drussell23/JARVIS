@@ -1179,15 +1179,25 @@ class AsyncStartupBarrier:
         config_status = BarrierConfig.get_configuration_status()
         
         if not is_configured:
-            logger.warning(
-                f"[StartupBarrier] [v149.0] CloudSQL NOT CONFIGURED - fast-fail mode enabled"
-            )
-            logger.warning(
-                f"[StartupBarrier] Missing: {', '.join(config_status['missing_variables'])}"
-            )
-            logger.info(
-                "[StartupBarrier] To enable CloudSQL, set: GCP_PROJECT and CLOUDSQL_INSTANCE_NAME"
-            )
+            # v149.1: Context-aware logging - only warn if CloudSQL is expected
+            # In local development, unconfigured CloudSQL is normal, not a warning
+            is_required = os.getenv("CLOUDSQL_REQUIRED", "").lower() in ("true", "1", "yes")
+            is_production = os.getenv("JARVIS_ENV", "").lower() == "production"
+            
+            if is_required or is_production:
+                # Production: CloudSQL is expected but missing - this is a problem
+                logger.warning(
+                    f"[StartupBarrier] [v149.1] CloudSQL NOT CONFIGURED in production mode"
+                )
+                logger.warning(
+                    f"[StartupBarrier] Missing: {', '.join(config_status['missing_variables'])}"
+                )
+            else:
+                # Development: Unconfigured is normal - log at DEBUG, not WARNING
+                logger.debug(
+                    f"[StartupBarrier] [v149.1] CloudSQL not configured - using local database"
+                )
+            
             # Use reduced retry count for unconfigured state
             max_attempts = BarrierConfig.MAX_UNCONFIGURED_ATTEMPTS
             timeout = min(

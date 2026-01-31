@@ -3008,15 +3008,29 @@ def setup_logging(config: BootstrapConfig) -> logging.Logger:
         structured_logger = get_structured_logger("supervisor.bootstrap")
 
         # Reduce noise from libraries (still using basic logging for third-party libs)
+        # v149.1: Expanded list to reduce startup noise
         noisy_loggers = [
+            # Network/HTTP clients
             "urllib3", "asyncio", "aiohttp", "httpx",
-            "httpcore", "charset_normalizer", "google", "grpc",
+            "httpcore", "charset_normalizer", "requests",
+            # Google/GCP
+            "google", "grpc", "google.auth", "google.cloud",
+            # ML libraries
+            "numba", "numba.core", "numba.cuda",
+            "torch", "transformers", "huggingface_hub",
+            "PIL", "PIL.Image",
             # v93.12: Suppress SpeechBrain verbose debug logging
             "speechbrain",
             "speechbrain.utils.checkpoints",
             "speechbrain.utils.quirks",
             "speechbrain.utils.torch_audio_backend",
             "speechbrain.lobes.models.huggingface_transformers.huggingface",
+            # Internal verbose loggers
+            "backend.core.supervisor_singleton",
+            "backend.core.cross_repo_orchestrator",
+            "core.proxy.startup_barrier",
+            "watchfiles",
+            "filelock",
         ]
         for logger_name in noisy_loggers:
             logging.getLogger(logger_name).setLevel(logging.WARNING)
