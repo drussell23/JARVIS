@@ -1498,6 +1498,20 @@ class StartupLock:
                 pass
         self._acquired = False
 
+    def get_current_holder(self) -> Optional[Dict[str, Any]]:
+        """Get info about the current lock holder, or None if not locked."""
+        if not self.lock_path.exists():
+            return None
+        try:
+            content = self.lock_path.read_text().strip()
+            data = json.loads(content)
+            holder_pid = data.get("pid")
+            if holder_pid and self._is_process_alive(holder_pid):
+                return data
+            return None  # Stale lock
+        except (json.JSONDecodeError, KeyError, OSError):
+            return None
+
     def __enter__(self) -> "StartupLock":
         if not self.acquire():
             raise RuntimeError(f"Could not acquire lock: {self.lock_name}")
@@ -5114,211 +5128,205 @@ class IntelligenceRegistry:
 # ║                                                                               ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 
-# Placeholder for remaining zones
-# ZONE 5: Process Orchestration (signals, cleanup, hot reload, Trinity)
-# ZONE 6: The Kernel (JarvisSystemKernel class)
-# ZONE 7: Entry Point (CLI, main)
+# =============================================================================
+# ZONE 0-4 SELF-TEST FUNCTION
+# =============================================================================
+# Tests for Zones 0-4 (run with: python unified_supervisor.py --test zones)
 
-if __name__ == "__main__":
-    import asyncio
+async def _test_zones_0_through_4():
+    """Test Zones 0-4 components (Foundation through Intelligence)."""
+    # Test Zone 0, 1, 2, and 3
+    TerminalUI.print_banner(f"{KERNEL_NAME} v{KERNEL_VERSION}", "Zones 0-3 Implemented")
 
-    async def test_zones():
-        """Test Zones 0-3."""
-        # Test Zone 0, 1, 2, and 3
-        TerminalUI.print_banner(f"{KERNEL_NAME} v{KERNEL_VERSION}", "Zones 0-3 Implemented")
+    # Initialize logger
+    logger = UnifiedLogger()
 
-        # Initialize logger
-        logger = UnifiedLogger()
+    # Show config
+    config = SystemKernelConfig.from_environment()
+    logger.info("Configuration loaded")
 
-        # Show config
-        config = SystemKernelConfig.from_environment()
-        logger.info("Configuration loaded")
+    with logger.section_start(LogSection.CONFIG, "Configuration Summary"):
+        for line in config.summary().split("\n"):
+            logger.info(line)
 
-        with logger.section_start(LogSection.CONFIG, "Configuration Summary"):
-            for line in config.summary().split("\n"):
-                logger.info(line)
+    # Test warnings
+    warnings_list = config.validate()
+    if warnings_list:
+        with logger.section_start(LogSection.BOOT, "Configuration Warnings"):
+            for w in warnings_list:
+                logger.warning(w)
 
-        # Test warnings
-        warnings_list = config.validate()
-        if warnings_list:
-            with logger.section_start(LogSection.BOOT, "Configuration Warnings"):
-                for w in warnings_list:
-                    logger.warning(w)
+    # Test circuit breaker
+    logger.info("Testing circuit breaker...")
+    cb = CircuitBreaker("test", failure_threshold=3)
+    logger.success(f"Circuit breaker state: {cb.state.value}")
 
-        # Test circuit breaker
-        logger.info("Testing circuit breaker...")
-        cb = CircuitBreaker("test", failure_threshold=3)
-        logger.success(f"Circuit breaker state: {cb.state.value}")
+    # Test lock
+    logger.info("Testing startup lock...")
+    lock = StartupLock("kernel")  # Use standard kernel lock name
+    is_locked, holder_pid = lock.is_locked()
+    logger.success(f"Lock status: locked={is_locked}, holder_pid={holder_pid}")
 
-        # Test lock
-        logger.info("Testing startup lock...")
-        lock = StartupLock("test")
-        is_locked, holder = lock.is_locked()
-        logger.success(f"Lock status: locked={is_locked}, holder={holder}")
+    # ========== Zone 3 Tests ==========
+    with logger.section_start(LogSection.RESOURCES, "Zone 3: Resource Managers"):
 
-        # ========== Zone 3 Tests ==========
-        with logger.section_start(LogSection.RESOURCES, "Zone 3: Resource Managers"):
+        # Test ResourceManagerRegistry
+        logger.info("Creating resource manager registry...")
+        registry = ResourceManagerRegistry(config)
 
-            # Test ResourceManagerRegistry
-            logger.info("Creating resource manager registry...")
-            registry = ResourceManagerRegistry(config)
+        # Create managers
+        docker_mgr = DockerDaemonManager(config)
+        gcp_mgr = GCPInstanceManager(config)
+        cost_mgr = ScaleToZeroCostOptimizer(config)
+        port_mgr = DynamicPortManager(config)
+        voice_cache_mgr = SemanticVoiceCacheManager(config)
+        storage_mgr = TieredStorageManager(config)
 
-            # Create managers
-            docker_mgr = DockerDaemonManager(config)
-            gcp_mgr = GCPInstanceManager(config)
-            cost_mgr = ScaleToZeroCostOptimizer(config)
-            port_mgr = DynamicPortManager(config)
-            voice_cache_mgr = SemanticVoiceCacheManager(config)
-            storage_mgr = TieredStorageManager(config)
+        # Register all
+        registry.register(docker_mgr)
+        registry.register(gcp_mgr)
+        registry.register(cost_mgr)
+        registry.register(port_mgr)
+        registry.register(voice_cache_mgr)
+        registry.register(storage_mgr)
 
-            # Register all
-            registry.register(docker_mgr)
-            registry.register(gcp_mgr)
-            registry.register(cost_mgr)
-            registry.register(port_mgr)
-            registry.register(voice_cache_mgr)
-            registry.register(storage_mgr)
+        logger.success(f"Registered {registry.manager_count} resource managers")
 
-            logger.success(f"Registered {registry.manager_count} resource managers")
+        # Initialize all in parallel
+        logger.info("Initializing all managers in parallel...")
+        with logger.timed("resource_initialization"):
+            results = await registry.initialize_all(parallel=True)
 
-            # Initialize all in parallel
-            logger.info("Initializing all managers in parallel...")
-            with logger.timed("resource_initialization"):
-                results = await registry.initialize_all(parallel=True)
-
-            for name, success in results.items():
-                if success:
-                    logger.success(f"  {name}: initialized")
-                else:
-                    logger.warning(f"  {name}: failed")
-
-            # Health check all
-            logger.info("Running health checks...")
-            health_results = await registry.health_check_all()
-
-            for name, (healthy, message) in health_results.items():
-                if healthy:
-                    logger.debug(f"  {name}: {message}")
-                else:
-                    logger.warning(f"  {name}: {message}")
-
-            # Test DynamicPortManager specifically
-            logger.info(f"Selected port: {port_mgr.selected_port}")
-
-            # Test ScaleToZeroCostOptimizer
-            cost_mgr.record_activity("test")
-            stats = cost_mgr.get_statistics()
-            logger.info(f"Scale-to-Zero: {stats['activity_count']} activities, idle {stats['idle_minutes']:.1f}min")
-
-            # Test TieredStorageManager
-            await storage_mgr.put("test_key", {"data": "test_value"})
-            result = await storage_mgr.get("test_key")
-            if result:
-                logger.success("Tiered storage put/get: working")
+        for name, success in results.items():
+            if success:
+                logger.success(f"  {name}: initialized")
             else:
-                logger.warning("Tiered storage put/get: failed")
+                logger.warning(f"  {name}: failed")
 
-            storage_stats = storage_mgr.get_statistics()
-            logger.info(f"Hot tier: {storage_stats['hot_items']} items, {storage_stats['hot_size_mb']:.2f}MB")
+        # Health check all
+        logger.info("Running health checks...")
+        health_results = await registry.health_check_all()
 
-            # Get all status
-            logger.info("Getting all manager status...")
-            all_status = registry.get_all_status()
-            ready_count = sum(1 for s in all_status.values() if s.get("ready"))
-            logger.success(f"Managers ready: {ready_count}/{registry.manager_count}")
+        for name, (healthy, message) in health_results.items():
+            if healthy:
+                logger.debug(f"  {name}: {message}")
+            else:
+                logger.warning(f"  {name}: {message}")
 
-            # Cleanup
-            logger.info("Cleaning up managers...")
-            await registry.cleanup_all()
-            logger.success("All managers cleaned up")
+        # Test DynamicPortManager specifically
+        logger.info(f"Selected port: {port_mgr.selected_port}")
 
-        # ========== Zone 4 Tests ==========
-        with logger.section_start(LogSection.INTELLIGENCE, "Zone 4: Intelligence Layer"):
+        # Test ScaleToZeroCostOptimizer
+        cost_mgr.record_activity("test")
+        stats = cost_mgr.get_statistics()
+        logger.info(f"Scale-to-Zero: {stats['activity_count']} activities, idle {stats['idle_minutes']:.1f}min")
 
-            # Test AdaptiveThresholdManager
-            logger.info("Testing AdaptiveThresholdManager...")
-            threshold_mgr = AdaptiveThresholdManager()
-            ram_state = threshold_mgr.get_ram_state(0.70)
-            logger.success(f"RAM state at 70%: {ram_state.value}")
+        # Test TieredStorageManager
+        await storage_mgr.put("test_key", {"data": "test_value"})
+        result = await storage_mgr.get("test_key")
+        if result:
+            logger.success("Tiered storage put/get: working")
+        else:
+            logger.warning("Tiered storage put/get: failed")
 
-            # Test thresholds
-            thresholds = threshold_mgr.get_all_thresholds()
-            logger.info(f"Learned thresholds: {len(thresholds['thresholds'])} values")
+        storage_stats = storage_mgr.get_statistics()
+        logger.info(f"Hot tier: {storage_stats['hot_items']} items, {storage_stats['hot_size_mb']:.2f}MB")
 
-            # Test HybridLearningModel
-            logger.info("Testing HybridLearningModel...")
-            learning_model = HybridLearningModel()
+        # Get all status
+        logger.info("Getting all manager status...")
+        all_status = registry.get_all_status()
+        ready_count = sum(1 for s in all_status.values() if s.get("ready"))
+        logger.success(f"Managers ready: {ready_count}/{registry.manager_count}")
 
-            # Record some observations
-            await learning_model.record_ram_observation(
-                timestamp=time.time(),
-                usage=0.65,
-                components_active={"ml_models": True}
-            )
+        # Cleanup
+        logger.info("Cleaning up managers...")
+        await registry.cleanup_all()
+        logger.success("All managers cleaned up")
 
-            # Get spike prediction
-            prediction = await learning_model.predict_ram_spike(
-                current_usage=0.75,
-                trend=0.01
-            )
-            logger.success(f"Spike prediction: likely={prediction['spike_likely']}, confidence={prediction['confidence']:.2f}")
+    # ========== Zone 4 Tests ==========
+    with logger.section_start(LogSection.INTELLIGENCE, "Zone 4: Intelligence Layer"):
 
-            # Get optimal monitoring interval
-            interval = await learning_model.get_optimal_monitoring_interval(0.75)
-            logger.info(f"Optimal monitoring interval at 75% RAM: {interval}s")
+        # Test AdaptiveThresholdManager
+        logger.info("Testing AdaptiveThresholdManager...")
+        threshold_mgr = AdaptiveThresholdManager()
+        ram_state = threshold_mgr.get_ram_state(0.70)
+        logger.success(f"RAM state at 70%: {ram_state.value}")
 
-            # Test GoalInferenceEngine
-            logger.info("Testing GoalInferenceEngine...")
-            goal_engine = GoalInferenceEngine(config)
-            await goal_engine.initialize()
+        # Test thresholds
+        thresholds = threshold_mgr.get_all_thresholds()
+        logger.info(f"Learned thresholds: {len(thresholds['thresholds'])} values")
 
-            # Test intent classification
-            intent_result = await goal_engine.safe_infer({"text": "fix the bug in the login function"})
-            logger.success(f"Intent: {intent_result['intent']} (confidence: {intent_result['confidence']:.2f})")
+        # Test HybridLearningModel
+        logger.info("Testing HybridLearningModel...")
+        learning_model = HybridLearningModel()
 
-            # Test HybridWorkloadRouter
-            logger.info("Testing HybridWorkloadRouter...")
-            router = HybridWorkloadRouter(config)
-            await router.initialize()
+        # Record some observations
+        await learning_model.record_ram_observation(
+            timestamp=time.time(),
+            usage=0.65,
+            components_active={"ml_models": True}
+        )
 
-            routing = await router.safe_infer({
-                "component": "ml_models",
-                "ram_usage": 0.80
-            })
-            logger.success(f"Routing decision: {routing['location']} (latency: {routing['latency_estimate_ms']}ms)")
+        # Get spike prediction
+        prediction = await learning_model.predict_ram_spike(
+            current_usage=0.75,
+            trend=0.01
+        )
+        logger.success(f"Spike prediction: likely={prediction['spike_likely']}, confidence={prediction['confidence']:.2f}")
 
-            # Test HybridIntelligenceCoordinator
-            logger.info("Testing HybridIntelligenceCoordinator...")
-            coordinator = HybridIntelligenceCoordinator(config)
-            await coordinator.initialize()
+        # Get optimal monitoring interval
+        interval = await learning_model.get_optimal_monitoring_interval(0.75)
+        logger.info(f"Optimal monitoring interval at 75% RAM: {interval}s")
 
-            coord_result = await coordinator.safe_infer({
-                "ram_usage": 0.75,
-                "component": "vision",
-                "trend": 0.005
-            })
-            logger.success(f"Coordinator: RAM state={coord_result['ram_state']}, spike_likely={coord_result['spike_prediction']['spike_likely']}")
+        # Test GoalInferenceEngine
+        logger.info("Testing GoalInferenceEngine...")
+        goal_engine = GoalInferenceEngine(config)
+        await goal_engine.initialize()
 
-            # Get comprehensive status
-            status = await coordinator.get_comprehensive_status()
-            logger.info(f"Intelligence components: {len(status)} keys")
+        # Test intent classification
+        intent_result = await goal_engine.safe_infer({"text": "fix the bug in the login function"})
+        logger.success(f"Intent: {intent_result['intent']} (confidence: {intent_result['confidence']:.2f})")
 
-            # Test IntelligenceRegistry
-            logger.info("Testing IntelligenceRegistry...")
-            intel_registry = IntelligenceRegistry(config)
-            intel_registry.register(router)
-            intel_registry.register(goal_engine)
-            intel_registry.register(coordinator)
+        # Test HybridWorkloadRouter
+        logger.info("Testing HybridWorkloadRouter...")
+        router = HybridWorkloadRouter(config)
+        await router.initialize()
 
-            init_results = await intel_registry.initialize_all()
-            initialized_count = sum(1 for v in init_results.values() if v)
-            logger.success(f"Intelligence registry: {initialized_count}/{len(init_results)} initialized")
+        routing = await router.safe_infer({
+            "component": "ml_models",
+            "ram_usage": 0.80
+        })
+        logger.success(f"Routing decision: {routing['location']} (latency: {routing['latency_estimate_ms']}ms)")
 
-        logger.print_startup_summary()
-        TerminalUI.print_success("Zones 0-4 validation complete!")
+        # Test HybridIntelligenceCoordinator
+        logger.info("Testing HybridIntelligenceCoordinator...")
+        coordinator = HybridIntelligenceCoordinator(config)
+        await coordinator.initialize()
 
-    # Run async tests
-    asyncio.run(test_zones())
+        coord_result = await coordinator.safe_infer({
+            "ram_usage": 0.75,
+            "component": "vision",
+            "trend": 0.005
+        })
+        logger.success(f"Coordinator: RAM state={coord_result['ram_state']}, spike_likely={coord_result['spike_prediction']['spike_likely']}")
+
+        # Get comprehensive status
+        status = await coordinator.get_comprehensive_status()
+        logger.info(f"Intelligence components: {len(status)} keys")
+
+        # Test IntelligenceRegistry
+        logger.info("Testing IntelligenceRegistry...")
+        intel_registry = IntelligenceRegistry(config)
+        intel_registry.register(router)
+        intel_registry.register(goal_engine)
+        intel_registry.register(coordinator)
+
+        init_results = await intel_registry.initialize_all()
+        initialized_count = sum(1 for v in init_results.values() if v)
+        logger.success(f"Intelligence registry: {initialized_count}/{len(init_results)} initialized")
+
+    logger.print_startup_summary()
+    TerminalUI.print_success("Zones 0-4 validation complete!")
 
 
 # =============================================================================
@@ -7230,76 +7238,73 @@ class TrinityIntegrator:
 
 
 # =============================================================================
-# ZONE 5 TEST BLOCK
+# ZONE 5 SELF-TEST FUNCTION
 # =============================================================================
+# Tests for Zone 5 (run with: python unified_supervisor.py --test zone5)
 
-if __name__ == "__main__":
-    async def test_zone5():
-        """Test Zone 5 components."""
-        # Create config and logger
-        config = SystemKernelConfig()
-        logger = UnifiedLogger()  # Singleton - no args
+async def _test_zone5():
+    """Test Zone 5 components (Process Orchestration)."""
+    # Create config and logger
+    config = SystemKernelConfig()
+    logger = UnifiedLogger()  # Singleton - no args
 
-        # ========== Test UnifiedSignalHandler ==========
-        with logger.section_start(LogSection.PROCESS, "Zone 5.1: UnifiedSignalHandler"):
-            handler = get_unified_signal_handler()
-            logger.success(f"Signal handler created (installed={handler._installed})")
-            logger.info(f"Shutdown requested: {handler.shutdown_requested}")
-            logger.info(f"Shutdown count: {handler.shutdown_count}")
-
-        # ========== Test ComprehensiveZombieCleanup ==========
-        with logger.section_start(LogSection.PROCESS, "Zone 5.3: ComprehensiveZombieCleanup"):
-            zombie_cleanup = ComprehensiveZombieCleanup(config, logger)
-            # Note: Actually running cleanup would kill processes - just test init
-            logger.success(f"Zombie cleanup initialized")
-            logger.info(f"Service ports: {zombie_cleanup._service_ports}")
-            stats = zombie_cleanup.get_stats()
-            logger.info(f"Initial stats: {stats}")
-
-        # ========== Test ProcessStateManager ==========
-        with logger.section_start(LogSection.PROCESS, "Zone 5.4: ProcessStateManager"):
-            process_mgr = ProcessStateManager(config, logger)
-            stats = process_mgr.get_statistics()
-            logger.success(f"Process manager initialized")
-            logger.info(f"Stats: {stats['total_processes']} processes tracked")
-
-        # ========== Test HotReloadWatcher ==========
-        with logger.section_start(LogSection.DEV, "Zone 5.5: HotReloadWatcher"):
-            hot_reload = HotReloadWatcher(config, logger)
-            logger.success(f"Hot reload watcher initialized")
-            logger.info(f"Enabled: {hot_reload.enabled}")
-            logger.info(f"Grace period: {hot_reload.grace_period}s")
-            logger.info(f"Check interval: {hot_reload.check_interval}s")
-
-        # ========== Test ProgressiveReadinessManager ==========
-        with logger.section_start(LogSection.PROCESS, "Zone 5.6: ProgressiveReadinessManager"):
-            readiness = ProgressiveReadinessManager(config, logger)
-            readiness.mark_tier(ReadinessTier.PROCESS_STARTED)
-            readiness.mark_component_ready("backend", True)
-            status = readiness.get_status()
-            logger.success(f"Readiness manager initialized")
-            logger.info(f"Current tier: {status['tier']}")
-            logger.info(f"Components ready: {status['components_ready']}")
-
-        # ========== Test TrinityIntegrator ==========
-        with logger.section_start(LogSection.TRINITY, "Zone 5.7: TrinityIntegrator"):
-            trinity = TrinityIntegrator(config, logger)
-            await trinity.initialize()
-            status = trinity.get_status()
-            logger.success(f"Trinity integrator initialized")
-            logger.info(f"Enabled: {status['enabled']}")
-            logger.info(f"J-Prime configured: {status['components']['jarvis-prime']['configured']}")
-            logger.info(f"Reactor-Core configured: {status['components']['reactor-core']['configured']}")
-
-        logger.print_startup_summary()
-        TerminalUI.print_success("Zone 5 validation complete!")
-
-    # Only run if this is the main module
-    # (test is already inside __main__ block from Zone 4)
     print("\n" + "="*70)
-    print("Running Zone 5 tests...")
+    print("ZONE 5 TESTS: PROCESS ORCHESTRATION")
     print("="*70 + "\n")
-    asyncio.run(test_zone5())
+
+    # ========== Test UnifiedSignalHandler ==========
+    with logger.section_start(LogSection.PROCESS, "Zone 5.1: UnifiedSignalHandler"):
+        handler = get_unified_signal_handler()
+        logger.success(f"Signal handler created (installed={handler._installed})")
+        logger.info(f"Shutdown requested: {handler.shutdown_requested}")
+        logger.info(f"Shutdown count: {handler.shutdown_count}")
+
+    # ========== Test ComprehensiveZombieCleanup ==========
+    with logger.section_start(LogSection.PROCESS, "Zone 5.3: ComprehensiveZombieCleanup"):
+        zombie_cleanup = ComprehensiveZombieCleanup(config, logger)
+        # Note: Actually running cleanup would kill processes - just test init
+        logger.success("Zombie cleanup initialized")
+        logger.info(f"Service ports: {zombie_cleanup._service_ports}")
+        stats = zombie_cleanup.get_stats()
+        logger.info(f"Initial stats: {stats}")
+
+    # ========== Test ProcessStateManager ==========
+    with logger.section_start(LogSection.PROCESS, "Zone 5.4: ProcessStateManager"):
+        process_mgr = ProcessStateManager(config, logger)
+        stats = process_mgr.get_statistics()
+        logger.success("Process manager initialized")
+        logger.info(f"Stats: {stats['total_processes']} processes tracked")
+
+    # ========== Test HotReloadWatcher ==========
+    with logger.section_start(LogSection.DEV, "Zone 5.5: HotReloadWatcher"):
+        hot_reload = HotReloadWatcher(config, logger)
+        logger.success("Hot reload watcher initialized")
+        logger.info(f"Enabled: {hot_reload.enabled}")
+        logger.info(f"Grace period: {hot_reload.grace_period}s")
+        logger.info(f"Check interval: {hot_reload.check_interval}s")
+
+    # ========== Test ProgressiveReadinessManager ==========
+    with logger.section_start(LogSection.PROCESS, "Zone 5.6: ProgressiveReadinessManager"):
+        readiness = ProgressiveReadinessManager(config, logger)
+        readiness.mark_tier(ReadinessTier.PROCESS_STARTED)
+        readiness.mark_component_ready("backend", True)
+        status = readiness.get_status()
+        logger.success("Readiness manager initialized")
+        logger.info(f"Current tier: {status['tier']}")
+        logger.info(f"Components ready: {status['components_ready']}")
+
+    # ========== Test TrinityIntegrator ==========
+    with logger.section_start(LogSection.TRINITY, "Zone 5.7: TrinityIntegrator"):
+        trinity = TrinityIntegrator(config, logger)
+        await trinity.initialize()
+        status = trinity.get_status()
+        logger.success("Trinity integrator initialized")
+        logger.info(f"Enabled: {status['enabled']}")
+        logger.info(f"J-Prime configured: {status['components']['jarvis-prime']['configured']}")
+        logger.info(f"Reactor-Core configured: {status['components']['reactor-core']['configured']}")
+
+    logger.print_startup_summary()
+    TerminalUI.print_success("Zone 5 validation complete!")
 
 
 # =============================================================================
@@ -7344,75 +7349,7 @@ class KernelState(Enum):
     FAILED = "failed"
 
 
-class StartupLock:
-    """
-    Singleton enforcement for the kernel.
-
-    Ensures only one instance of the kernel can run at a time.
-    Uses file-based locking with PID tracking.
-    """
-
-    def __init__(self, lock_dir: Optional[Path] = None) -> None:
-        self._lock_dir = lock_dir or (Path.home() / ".jarvis" / "locks")
-        self._lock_dir.mkdir(parents=True, exist_ok=True)
-        self._lock_file = self._lock_dir / "kernel.lock"
-        self._pid_file = self._lock_dir / "kernel.pid"
-        self._acquired = False
-
-    def acquire(self, force: bool = False) -> bool:
-        """
-        Attempt to acquire the startup lock.
-
-        Args:
-            force: If True, forcibly take the lock even if another process holds it
-
-        Returns:
-            True if lock was acquired, False otherwise
-        """
-        # Check if another process holds the lock
-        if self._pid_file.exists() and not force:
-            try:
-                pid = int(self._pid_file.read_text().strip())
-                if self._is_process_running(pid):
-                    return False  # Another kernel is running
-            except (ValueError, IOError):
-                pass  # Stale pid file
-
-        # Acquire the lock
-        try:
-            self._lock_file.write_text(str(time.time()))
-            self._pid_file.write_text(str(os.getpid()))
-            self._acquired = True
-            return True
-        except IOError:
-            return False
-
-    def release(self) -> None:
-        """Release the startup lock."""
-        if self._acquired:
-            try:
-                self._lock_file.unlink(missing_ok=True)
-                self._pid_file.unlink(missing_ok=True)
-            except IOError:
-                pass
-            self._acquired = False
-
-    def _is_process_running(self, pid: int) -> bool:
-        """Check if a process with given PID is running."""
-        try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, OSError):
-            return False
-
-    def get_current_holder(self) -> Optional[int]:
-        """Get the PID of the current lock holder."""
-        if self._pid_file.exists():
-            try:
-                return int(self._pid_file.read_text().strip())
-            except (ValueError, IOError):
-                pass
-        return None
+# NOTE: StartupLock is defined in Zone 2 (Core Utilities)
 
 
 # =============================================================================
@@ -7791,7 +7728,8 @@ class JarvisSystemKernel:
                 return False
 
             # Update config with selected port
-            self.config.backend_port = port_manager.selected_port
+            if port_manager.selected_port is not None:
+                self.config.backend_port = port_manager.selected_port
             self.logger.success(f"[Kernel] Backend port: {self.config.backend_port}")
 
             ready_count = sum(1 for v in results.values() if v)
@@ -8251,53 +8189,695 @@ class JarvisSystemKernel:
 
 
 # =============================================================================
-# ZONE 6 TEST BLOCK
+# ZONE 6 SELF-TEST FUNCTION
+# =============================================================================
+# Tests for Zone 6 (run with: python unified_supervisor.py --test zone6)
+
+async def _test_zone6():
+    """Test Zone 6 components (The Kernel)."""
+    logger = UnifiedLogger()
+
+    print("\n" + "="*70)
+    print("ZONE 6 TESTS: THE KERNEL")
+    print("="*70 + "\n")
+
+    # Test StartupLock
+    with logger.section_start(LogSection.BOOT, "Zone 6.1: StartupLock"):
+        lock = StartupLock()
+        # Don't actually acquire during test
+        logger.success("StartupLock created")
+        holder = lock.get_current_holder()
+        logger.info(f"Current holder: {holder}")
+
+    # Test IPCServer
+    with logger.section_start(LogSection.BOOT, "Zone 6.2: IPCServer"):
+        config = SystemKernelConfig()
+        ipc = IPCServer(config, logger)
+        logger.success("IPCServer created")
+        logger.info(f"Socket path: {ipc._socket_path}")
+
+    # Test JarvisSystemKernel (partial - don't actually start)
+    with logger.section_start(LogSection.BOOT, "Zone 6.3: JarvisSystemKernel"):
+        # Reset singleton for testing
+        JarvisSystemKernel._instance = None
+
+        kernel = JarvisSystemKernel()
+        logger.success("JarvisSystemKernel created")
+        logger.info(f"State: {kernel.state.value}")
+        logger.info(f"Kernel ID: {kernel.config.kernel_id}")
+        logger.info(f"Mode: {kernel.config.mode}")
+
+        # Don't run startup, just verify structure
+        logger.info(f"Has startup lock: {kernel._startup_lock is not None}")
+        logger.info(f"Has IPC server: {kernel._ipc_server is not None}")
+        logger.info(f"Has signal handler: {kernel._signal_handler is not None}")
+
+    logger.print_startup_summary()
+    TerminalUI.print_success("Zone 6 validation complete!")
+
+
+# =============================================================================
+# =============================================================================
+#
+#  ███████╗ ██████╗ ███╗   ██╗███████╗    ███████╗
+#  ╚══███╔╝██╔═══██╗████╗  ██║██╔════╝    ╚════██║
+#    ███╔╝ ██║   ██║██╔██╗ ██║█████╗          ██╔╝
+#   ███╔╝  ██║   ██║██║╚██╗██║██╔══╝         ██╔╝
+#  ███████╗╚██████╔╝██║ ╚████║███████╗       ██║
+#  ╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝       ╚═╝
+#
+#  ZONE 7: ENTRY POINT
+#  Lines ~8300-9000
+#
+#  This zone contains:
+#  - Unified CLI argument parser (all flags merged from both old files)
+#  - main() function
+#  - if __name__ == "__main__" entry point
+#
+# =============================================================================
+# =============================================================================
+
+
+# =============================================================================
+# ZONE 7.1: UNIFIED CLI ARGUMENT PARSER
+# =============================================================================
+
+import argparse
+
+
+def create_argument_parser() -> argparse.ArgumentParser:
+    """
+    Create the unified CLI argument parser.
+
+    Merges all flags from run_supervisor.py and start_system.py into
+    a single comprehensive CLI interface.
+    """
+    parser = argparse.ArgumentParser(
+        prog="unified_supervisor",
+        description=f"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  JARVIS UNIFIED SYSTEM KERNEL v{KERNEL_VERSION}                                          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  The monolithic kernel that runs the entire JARVIS AI Agent system.          ║
+║                                                                              ║
+║  This is the SINGLE COMMAND needed to run JARVIS - it handles everything:    ║
+║  • Process management and cleanup                                            ║
+║  • Docker daemon management                                                  ║
+║  • GCP resource orchestration                                                ║
+║  • ML intelligence layer                                                     ║
+║  • Trinity cross-repo integration                                            ║
+║  • Hot reload for development                                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python unified_supervisor.py                  # Start JARVIS (default)
+  python unified_supervisor.py --status         # Check if running
+  python unified_supervisor.py --shutdown       # Stop JARVIS
+  python unified_supervisor.py --restart        # Restart JARVIS
+  python unified_supervisor.py --cleanup        # Clean up zombie processes
+  python unified_supervisor.py --debug          # Start with debug logging
+
+Environment Variables:
+  JARVIS_MODE                 Operating mode (supervisor|standalone|minimal)
+  JARVIS_BACKEND_PORT         Backend server port (auto-detected if not set)
+  JARVIS_DEV_MODE             Enable dev mode / hot reload (true|false)
+  JARVIS_DEBUG                Enable debug logging (true|false)
+  TRINITY_ENABLED             Enable Trinity cross-repo integration (true|false)
+        """,
+    )
+
+    # =========================================================================
+    # CONTROL COMMANDS
+    # =========================================================================
+    control = parser.add_argument_group("Control Commands")
+    control.add_argument(
+        "--status",
+        action="store_true",
+        help="Check if kernel is running and show status",
+    )
+    control.add_argument(
+        "--shutdown",
+        action="store_true",
+        help="Gracefully shutdown the running kernel",
+    )
+    control.add_argument(
+        "--restart",
+        action="store_true",
+        help="Restart the kernel (shutdown + start)",
+    )
+    control.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Run comprehensive zombie cleanup and exit",
+    )
+
+    # =========================================================================
+    # OPERATING MODE
+    # =========================================================================
+    mode = parser.add_argument_group("Operating Mode")
+    mode.add_argument(
+        "--mode",
+        choices=["supervisor", "standalone", "minimal"],
+        help="Operating mode (default: supervisor)",
+    )
+    mode.add_argument(
+        "--in-process",
+        action="store_true",
+        dest="in_process",
+        help="Run backend in-process (faster startup)",
+    )
+    mode.add_argument(
+        "--subprocess",
+        action="store_true",
+        help="Run backend as subprocess (more isolated)",
+    )
+
+    # =========================================================================
+    # NETWORK
+    # =========================================================================
+    network = parser.add_argument_group("Network")
+    network.add_argument(
+        "--port", "-p",
+        type=int,
+        metavar="PORT",
+        help="Backend server port (default: auto-detected)",
+    )
+    network.add_argument(
+        "--host",
+        metavar="HOST",
+        help="Backend server host (default: 0.0.0.0)",
+    )
+    network.add_argument(
+        "--websocket-port",
+        type=int,
+        metavar="PORT",
+        help="WebSocket server port (default: auto-detected)",
+    )
+
+    # =========================================================================
+    # DOCKER
+    # =========================================================================
+    docker = parser.add_argument_group("Docker")
+    docker.add_argument(
+        "--skip-docker",
+        action="store_true",
+        help="Skip Docker daemon management",
+    )
+    docker.add_argument(
+        "--no-docker-auto-start",
+        action="store_true",
+        help="Don't auto-start Docker daemon",
+    )
+
+    # =========================================================================
+    # GCP
+    # =========================================================================
+    gcp = parser.add_argument_group("GCP / Cloud")
+    gcp.add_argument(
+        "--skip-gcp",
+        action="store_true",
+        help="Skip GCP resource management",
+    )
+    gcp.add_argument(
+        "--prefer-cloud-run",
+        action="store_true",
+        help="Prefer Cloud Run over Spot VMs",
+    )
+    gcp.add_argument(
+        "--enable-spot-vm",
+        action="store_true",
+        help="Enable Spot VM provisioning",
+    )
+
+    # =========================================================================
+    # COST OPTIMIZATION
+    # =========================================================================
+    cost = parser.add_argument_group("Cost Optimization")
+    cost.add_argument(
+        "--no-scale-to-zero",
+        action="store_true",
+        help="Disable scale-to-zero cost optimization",
+    )
+    cost.add_argument(
+        "--idle-timeout",
+        type=int,
+        metavar="SECONDS",
+        help="Idle timeout before scale-to-zero (default: 300)",
+    )
+    cost.add_argument(
+        "--daily-budget",
+        type=float,
+        metavar="USD",
+        help="Daily cost budget in USD (default: 10.0)",
+    )
+
+    # =========================================================================
+    # INTELLIGENCE / ML
+    # =========================================================================
+    ml = parser.add_argument_group("Intelligence / ML")
+    ml.add_argument(
+        "--goal-preset",
+        choices=["auto", "aggressive", "balanced", "conservative"],
+        help="Goal inference preset (default: auto)",
+    )
+    ml.add_argument(
+        "--skip-intelligence",
+        action="store_true",
+        help="Skip ML intelligence layer initialization",
+    )
+    ml.add_argument(
+        "--enable-automation",
+        action="store_true",
+        help="Enable automated goal inference",
+    )
+
+    # =========================================================================
+    # VOICE / AUDIO
+    # =========================================================================
+    voice = parser.add_argument_group("Voice / Audio")
+    voice.add_argument(
+        "--skip-voice",
+        action="store_true",
+        help="Skip voice components",
+    )
+    voice.add_argument(
+        "--no-narrator",
+        action="store_true",
+        help="Disable startup narrator",
+    )
+    voice.add_argument(
+        "--skip-ecapa",
+        action="store_true",
+        help="Skip ECAPA voice embeddings",
+    )
+
+    # =========================================================================
+    # TRINITY
+    # =========================================================================
+    trinity = parser.add_argument_group("Trinity / Cross-Repo")
+    trinity.add_argument(
+        "--skip-trinity",
+        action="store_true",
+        help="Skip Trinity cross-repo integration",
+    )
+    trinity.add_argument(
+        "--prime-path",
+        metavar="PATH",
+        help="Path to jarvis-prime repository",
+    )
+    trinity.add_argument(
+        "--reactor-path",
+        metavar="PATH",
+        help="Path to reactor-core repository",
+    )
+
+    # =========================================================================
+    # DEVELOPMENT
+    # =========================================================================
+    dev = parser.add_argument_group("Development")
+    dev.add_argument(
+        "--no-hot-reload",
+        action="store_true",
+        help="Disable hot reload",
+    )
+    dev.add_argument(
+        "--reload-interval",
+        type=float,
+        metavar="SECONDS",
+        help="Hot reload check interval (default: 10)",
+    )
+    dev.add_argument(
+        "--debug", "-d",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    dev.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
+    dev.add_argument(
+        "--test",
+        choices=["all", "zones", "zone5", "zone6"],
+        metavar="SUITE",
+        help="Run self-tests: all, zones (0-4), zone5, zone6",
+    )
+
+    # =========================================================================
+    # ADVANCED
+    # =========================================================================
+    advanced = parser.add_argument_group("Advanced")
+    advanced.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force takeover from existing kernel",
+    )
+    advanced.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Take over from existing kernel (alias for --force)",
+    )
+    advanced.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate startup without actually running",
+    )
+    advanced.add_argument(
+        "--config-file",
+        metavar="PATH",
+        help="Load configuration from YAML/JSON file",
+    )
+    advanced.add_argument(
+        "--version",
+        action="version",
+        version=f"JARVIS Unified System Kernel v{KERNEL_VERSION}",
+    )
+
+    return parser
+
+
+# =============================================================================
+# ZONE 7.2: CLI COMMAND HANDLERS
+# =============================================================================
+
+async def handle_status() -> int:
+    """Handle --status command."""
+    logger = UnifiedLogger()
+    logger.info("Checking kernel status...")
+
+    # Try to connect to IPC socket
+    socket_path = Path.home() / ".jarvis" / "locks" / "kernel.sock"
+    if not socket_path.exists():
+        print("\n" + "="*60)
+        print("❌ JARVIS Kernel is NOT running")
+        print("="*60)
+        print("   No IPC socket found at", socket_path)
+        print("\n   To start: python unified_supervisor.py")
+        print("="*60 + "\n")
+        return 1
+
+    try:
+        # Connect and send health command
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+        request = json.dumps({"command": "status"}) + "\n"
+        writer.write(request.encode())
+        await writer.drain()
+
+        response_data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        response = json.loads(response_data.decode())
+
+        writer.close()
+        await writer.wait_closed()
+
+        if response.get("success"):
+            result = response.get("result", {})
+            print("\n" + "="*60)
+            print("✅ JARVIS Kernel is RUNNING")
+            print("="*60)
+            print(f"   State:    {result.get('state', 'unknown')}")
+            print(f"   PID:      {result.get('pid', 'unknown')}")
+            print(f"   Uptime:   {result.get('uptime_seconds', 0):.1f}s")
+            print(f"   Mode:     {result.get('config', {}).get('mode', 'unknown')}")
+            print(f"   Port:     {result.get('config', {}).get('backend_port', 'unknown')}")
+
+            readiness = result.get("readiness", {})
+            if readiness:
+                print(f"   Tier:     {readiness.get('tier', 'unknown')}")
+
+            print("="*60 + "\n")
+            return 0
+        else:
+            print("\n❌ Status check failed:", response.get("error"))
+            return 1
+
+    except asyncio.TimeoutError:
+        print("\n❌ Timeout connecting to kernel")
+        return 1
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        return 1
+
+
+async def handle_shutdown() -> int:
+    """Handle --shutdown command."""
+    logger = UnifiedLogger()
+    logger.info("Sending shutdown command...")
+
+    socket_path = Path.home() / ".jarvis" / "locks" / "kernel.sock"
+    if not socket_path.exists():
+        print("\n❌ Kernel is not running (no IPC socket)")
+        return 1
+
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+        request = json.dumps({"command": "shutdown"}) + "\n"
+        writer.write(request.encode())
+        await writer.drain()
+
+        response_data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        response = json.loads(response_data.decode())
+
+        writer.close()
+        await writer.wait_closed()
+
+        if response.get("success"):
+            print("\n" + "="*60)
+            print("✅ Shutdown acknowledged")
+            print("="*60)
+            print("   The kernel is shutting down gracefully.")
+            print("   Use --status to verify shutdown is complete.")
+            print("="*60 + "\n")
+            return 0
+        else:
+            print("\n❌ Shutdown failed:", response.get("error"))
+            return 1
+
+    except Exception as e:
+        print(f"\n❌ Error sending shutdown: {e}")
+        return 1
+
+
+async def handle_cleanup() -> int:
+    """Handle --cleanup command."""
+    print("\n" + "="*60)
+    print("🧹 JARVIS Comprehensive Zombie Cleanup")
+    print("="*60 + "\n")
+
+    config = SystemKernelConfig()
+    logger = UnifiedLogger()
+
+    cleanup = ComprehensiveZombieCleanup(config, logger)
+    result = await cleanup.run_comprehensive_cleanup()
+
+    print("\n" + "="*60)
+    print("Cleanup Results:")
+    print("="*60)
+    print(f"   Zombies found:  {result['zombies_found']}")
+    print(f"   Zombies killed: {result['zombies_killed']}")
+    print(f"   Ports freed:    {len(result['ports_freed'])}")
+    print(f"   Duration:       {result['duration_ms']}ms")
+    print("="*60 + "\n")
+
+    return 0 if result["success"] else 1
+
+
+# =============================================================================
+# ZONE 7.3: CONFIGURATION FROM CLI ARGS
+# =============================================================================
+
+def apply_cli_to_config(args: argparse.Namespace, config: SystemKernelConfig) -> None:
+    """Apply CLI arguments to configuration."""
+
+    # Operating mode
+    if args.mode:
+        config.mode = args.mode
+    if args.in_process:
+        config.in_process_backend = True
+    if args.subprocess:
+        config.in_process_backend = False
+
+    # Network
+    if args.port:
+        config.backend_port = args.port
+    if args.host:
+        config.backend_host = args.host
+    if hasattr(args, 'websocket_port') and args.websocket_port:
+        config.websocket_port = args.websocket_port
+
+    # Docker
+    if args.skip_docker:
+        config.docker_enabled = False
+    if args.no_docker_auto_start:
+        config.docker_auto_start = False
+
+    # GCP
+    if args.skip_gcp:
+        config.gcp_enabled = False
+    if args.prefer_cloud_run:
+        config.prefer_cloud_run = True
+    if args.enable_spot_vm:
+        config.spot_vm_enabled = True
+
+    # Cost
+    if args.no_scale_to_zero:
+        config.scale_to_zero_enabled = False
+    if args.idle_timeout:
+        config.idle_timeout_seconds = args.idle_timeout
+    if args.daily_budget:
+        config.cost_budget_daily_usd = args.daily_budget
+
+    # Intelligence
+    if args.goal_preset:
+        config.goal_preset = args.goal_preset
+    if args.skip_intelligence:
+        config.hybrid_intelligence_enabled = False
+
+    # Voice
+    if args.skip_voice:
+        config.voice_enabled = False
+    if args.skip_ecapa:
+        config.ecapa_enabled = False
+
+    # Trinity
+    if args.skip_trinity:
+        config.trinity_enabled = False
+    if args.prime_path:
+        config.prime_repo_path = Path(args.prime_path)
+    if args.reactor_path:
+        config.reactor_repo_path = Path(args.reactor_path)
+
+    # Development
+    if args.no_hot_reload:
+        config.hot_reload_enabled = False
+    if args.reload_interval:
+        config.reload_check_interval = args.reload_interval
+    if args.debug:
+        config.debug = True
+    if args.verbose:
+        config.verbose = True
+
+
+# =============================================================================
+# ZONE 7.4: MAIN FUNCTION
+# =============================================================================
+
+async def handle_test(test_suite: str) -> int:
+    """Handle --test command to run self-tests."""
+    print("\n" + "="*70)
+    print(f"RUNNING SELF-TESTS: {test_suite.upper()}")
+    print("="*70 + "\n")
+
+    try:
+        if test_suite == "zones" or test_suite == "all":
+            await _test_zones_0_through_4()
+
+        if test_suite == "zone5" or test_suite == "all":
+            await _test_zone5()
+
+        if test_suite == "zone6" or test_suite == "all":
+            await _test_zone6()
+
+        print("\n" + "="*70)
+        print("✅ ALL TESTS PASSED")
+        print("="*70 + "\n")
+        return 0
+
+    except Exception as e:
+        print(f"\n❌ TEST FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+async def async_main(args: argparse.Namespace) -> int:
+    """
+    Async main entry point.
+
+    Handles CLI commands and kernel startup.
+    """
+    # Handle control commands first
+    if args.status:
+        return await handle_status()
+
+    if args.shutdown:
+        return await handle_shutdown()
+
+    if args.cleanup:
+        return await handle_cleanup()
+
+    # Handle test command
+    if hasattr(args, 'test') and args.test:
+        return await handle_test(args.test)
+
+    if args.restart:
+        # Shutdown first, then continue to startup
+        await handle_shutdown()
+        await asyncio.sleep(2.0)  # Wait for shutdown
+
+    # Dry run - just print what would happen
+    if args.dry_run:
+        print("\n" + "="*60)
+        print("DRY RUN - Would start with:")
+        print("="*60)
+        config = SystemKernelConfig()
+        apply_cli_to_config(args, config)
+        print(f"   Mode:              {config.mode}")
+        print(f"   In-process:        {config.in_process_backend}")
+        print(f"   Dev mode:          {config.dev_mode}")
+        print(f"   Hot reload:        {config.hot_reload_enabled}")
+        print(f"   Docker enabled:    {config.docker_enabled}")
+        print(f"   GCP enabled:       {config.gcp_enabled}")
+        print(f"   Trinity enabled:   {config.trinity_enabled}")
+        print(f"   Intelligence:      {config.hybrid_intelligence_enabled}")
+        print(f"   Force takeover:    {args.force or args.takeover}")
+        print("="*60 + "\n")
+        return 0
+
+    # Start the kernel
+    config = SystemKernelConfig()
+    apply_cli_to_config(args, config)
+
+    force = args.force or args.takeover
+
+    # Reset singleton for fresh start
+    JarvisSystemKernel._instance = None
+
+    kernel = JarvisSystemKernel(config=config, force=force)
+
+    # Run startup
+    exit_code = await kernel.startup()
+    if exit_code != 0:
+        return exit_code
+
+    # Run main loop
+    return await kernel.run()
+
+
+def main() -> int:
+    """
+    Main entry point for JARVIS Unified System Kernel.
+
+    Parses CLI arguments and runs the appropriate command.
+    """
+    # Parse arguments
+    parser = create_argument_parser()
+    args = parser.parse_args()
+
+    # Run async main
+    try:
+        return asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        print("\n[Kernel] Interrupted by user")
+        return 130  # 128 + SIGINT(2)
+
+
+# =============================================================================
+# ZONE 7.5: ENTRY POINT
 # =============================================================================
 
 if __name__ == "__main__":
-    async def test_zone6():
-        """Test Zone 6 components."""
-        logger = UnifiedLogger()
-
-        print("="*70)
-        print("ZONE 6 TESTS: THE KERNEL")
-        print("="*70)
-
-        # Test StartupLock
-        with logger.section_start(LogSection.BOOT, "Zone 6.1: StartupLock"):
-            lock = StartupLock()
-            # Don't actually acquire during test
-            logger.success("StartupLock created")
-            holder = lock.get_current_holder()
-            logger.info(f"Current holder: {holder}")
-
-        # Test IPCServer
-        with logger.section_start(LogSection.BOOT, "Zone 6.2: IPCServer"):
-            config = SystemKernelConfig()
-            ipc = IPCServer(config, logger)
-            logger.success("IPCServer created")
-            logger.info(f"Socket path: {ipc._socket_path}")
-
-        # Test JarvisSystemKernel (partial - don't actually start)
-        with logger.section_start(LogSection.BOOT, "Zone 6.3: JarvisSystemKernel"):
-            # Reset singleton for testing
-            JarvisSystemKernel._instance = None
-
-            kernel = JarvisSystemKernel()
-            logger.success("JarvisSystemKernel created")
-            logger.info(f"State: {kernel.state.value}")
-            logger.info(f"Kernel ID: {kernel.config.kernel_id}")
-            logger.info(f"Mode: {kernel.config.mode}")
-
-            # Don't run startup, just verify structure
-            logger.info(f"Has startup lock: {kernel._startup_lock is not None}")
-            logger.info(f"Has IPC server: {kernel._ipc_server is not None}")
-            logger.info(f"Has signal handler: {kernel._signal_handler is not None}")
-
-        logger.print_startup_summary()
-        TerminalUI.print_success("Zone 6 validation complete!")
-
-    print("\n" + "="*70)
-    print("Running Zone 6 tests...")
-    print("="*70 + "\n")
-    asyncio.run(test_zone6())
+    sys.exit(main())
