@@ -277,3 +277,75 @@ class TestComponentState:
         state.mark_disabled("Disabled via env var")
         assert state.status == ComponentStatus.DISABLED
         assert state.failure_reason == "Disabled via env var"
+
+
+class TestComponentRegistry:
+    """Tests for ComponentRegistry - singleton registry for all components."""
+
+    def test_singleton_pattern(self):
+        from backend.core.component_registry import get_component_registry
+        reg1 = get_component_registry()
+        reg2 = get_component_registry()
+        assert reg1 is reg2
+
+    def test_register_component(self):
+        from backend.core.component_registry import (
+            get_component_registry, ComponentDefinition,
+            Criticality, ProcessType, ComponentStatus
+        )
+        registry = get_component_registry()
+        registry._reset_for_testing()
+
+        defn = ComponentDefinition(
+            name="test-comp",
+            criticality=Criticality.OPTIONAL,
+            process_type=ProcessType.IN_PROCESS,
+        )
+        registry.register(defn)
+
+        assert registry.has("test-comp")
+        state = registry.get_state("test-comp")
+        assert state.status == ComponentStatus.PENDING
+
+    def test_get_by_capability(self):
+        from backend.core.component_registry import (
+            get_component_registry, ComponentDefinition,
+            Criticality, ProcessType, ComponentStatus
+        )
+        registry = get_component_registry()
+        registry._reset_for_testing()
+
+        defn = ComponentDefinition(
+            name="inference-provider",
+            criticality=Criticality.DEGRADED_OK,
+            process_type=ProcessType.SUBPROCESS,
+            provides_capabilities=["inference", "llm"],
+        )
+        registry.register(defn)
+
+        # Mark it healthy so has_capability returns True
+        registry.mark_status("inference-provider", ComponentStatus.HEALTHY)
+
+        assert registry.has_capability("inference")
+        assert registry.get_provider("inference") == "inference-provider"
+        assert not registry.has_capability("vision")
+
+    def test_all_definitions(self):
+        from backend.core.component_registry import (
+            get_component_registry, ComponentDefinition,
+            Criticality, ProcessType
+        )
+        registry = get_component_registry()
+        registry._reset_for_testing()
+
+        registry.register(ComponentDefinition(
+            name="comp1", criticality=Criticality.REQUIRED,
+            process_type=ProcessType.IN_PROCESS
+        ))
+        registry.register(ComponentDefinition(
+            name="comp2", criticality=Criticality.OPTIONAL,
+            process_type=ProcessType.IN_PROCESS
+        ))
+
+        all_defs = registry.all_definitions()
+        assert len(all_defs) == 2
