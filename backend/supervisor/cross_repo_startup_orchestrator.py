@@ -13527,9 +13527,24 @@ echo "=== JARVIS Prime started ==="
     # Output Streaming (v93.0: Intelligent log level detection)
     # =========================================================================
 
+    # v148.1: Expected conditions that should be WARNING not ERROR
+    # These are known conditions that indicate degraded but acceptable operation
+    _EXPECTED_CONDITION_PATTERNS = [
+        'CLOUDOFFLOADREQUIRED',      # Cloud offload not available (Hollow Client)
+        'HOLLOW CLIENT MODE',         # Running in Hollow Client mode
+        'DEGRADED_OK',                # Explicitly marked as degraded-ok
+        'OPTIONAL COMPONENT',         # Optional component not available
+        'SERVICE UNAVAILABLE',        # Expected service unavailability
+        'FALLBACK ACTIVATED',         # Fallback mode is working as designed
+        'RUNNING WITHOUT',            # Running without optional component
+        'NOT AVAILABLE, CONTINUING',  # Graceful degradation
+        'SKIPPING OPTIONAL',          # Skipping optional feature
+    ]
+
     def _detect_log_level(self, line: str) -> str:
         """
         v93.0: Intelligently detect log level from output line content.
+        v148.1: Added expected condition detection (DEGRADED_OK components)
 
         Python logging outputs to stderr by default, so we can't rely on
         stream type alone. Instead, we parse the line content to detect
@@ -13542,8 +13557,14 @@ echo "=== JARVIS Prime started ==="
         - "| ERROR |", "ERROR:", "[ERROR]"
         - "| CRITICAL |", "CRITICAL:", "[CRITICAL]"
         - Traceback, Exception indicators -> ERROR
+        - Expected conditions (CloudOffloadRequired, etc.) -> WARNING
         """
         line_upper = line.upper()
+
+        # v148.1: Check for expected conditions FIRST
+        # These are DEGRADED_OK components that should be WARNING, not ERROR
+        if any(p in line_upper for p in self._EXPECTED_CONDITION_PATTERNS):
+            return 'warning'
 
         # Check for explicit log level indicators
         if any(p in line_upper for p in ['| ERROR |', 'ERROR:', '[ERROR]', '| CRITICAL |', 'CRITICAL:']):

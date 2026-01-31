@@ -5337,8 +5337,9 @@ async def health_ready():
     # ═══════════════════════════════════════════════════════════════════════════
     speaker_service_ready = False
     try:
-        from voice.speaker_verification_service import get_speaker_service
-        speaker_svc = get_speaker_service()
+        # v148.1: Use synchronous getter to avoid coroutine warning
+        from voice.speaker_verification_service import get_speaker_service_sync
+        speaker_svc = get_speaker_service_sync()
         if speaker_svc and speaker_svc._initialized:
             details["speaker_service_ready"] = True
             speaker_service_ready = True

@@ -7942,5 +7942,29 @@ async def reset_speaker_verification_service():
     _speaker_verification_service = None
 
 
-# Alias for backward compatibility
+# Alias for backward compatibility (async)
 get_speaker_service = get_speaker_verification_service
+
+
+def get_speaker_service_sync() -> Optional[SpeakerVerificationService]:
+    """
+    v148.1: Synchronous getter for speaker verification service.
+
+    Returns the cached service instance WITHOUT initializing it.
+    Use this for health checks and status queries where you just need
+    to check if the service exists and is ready.
+
+    For full service access with initialization, use the async version:
+        service = await get_speaker_verification_service()
+
+    Returns:
+        SpeakerVerificationService instance if available, None otherwise.
+    """
+    global _speaker_verification_service, _global_speaker_service
+
+    # Return pre-loaded service if available
+    if _global_speaker_service is not None:
+        return _global_speaker_service
+
+    # Return singleton if already created
+    return _speaker_verification_service
