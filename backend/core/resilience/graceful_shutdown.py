@@ -64,6 +64,23 @@ logger = logging.getLogger("GracefulShutdown")
 
 
 # =============================================================================
+# v151.0: SHUTDOWN DIAGNOSTICS - Deep Forensic Logging
+# =============================================================================
+try:
+    from backend.core.shutdown_diagnostics import (
+        log_shutdown_trigger,
+        log_state_change,
+        capture_system_state,
+    )
+    _SHUTDOWN_DIAGNOSTICS_AVAILABLE = True
+except ImportError:
+    _SHUTDOWN_DIAGNOSTICS_AVAILABLE = False
+    log_shutdown_trigger = lambda *args, **kwargs: None  # noqa: E731
+    log_state_change = lambda *args, **kwargs: None  # noqa: E731
+    capture_system_state = lambda: {}  # noqa: E731
+
+
+# =============================================================================
 # v128.0: Suppress Resource Tracker Semaphore Warnings
 # =============================================================================
 # On macOS with multiprocessing 'spawn' mode, the resource_tracker process
@@ -1707,6 +1724,33 @@ class GlobalShutdownSignal:
             reason: Why shutdown was initiated (user_request, signal, error, etc.)
             initiator: Identifier of the component that initiated shutdown
         """
+        # ═══════════════════════════════════════════════════════════════════════════
+        # v151.0: DIAGNOSTIC LOGGING - Capture full context of shutdown trigger
+        # ═══════════════════════════════════════════════════════════════════════════
+        import traceback
+
+        stack_trace = "".join(traceback.format_stack())
+
+        if _SHUTDOWN_DIAGNOSTICS_AVAILABLE:
+            log_shutdown_trigger(
+                "GlobalShutdownSignal.initiate",
+                f"Global shutdown signal - reason={reason}, initiator={initiator}",
+                {
+                    "reason": reason,
+                    "initiator": initiator,
+                    "stack_trace": stack_trace,
+                    "system_state": capture_system_state(),
+                }
+            )
+
+        logger.warning(
+            f"[v151.0] 🔬 GLOBAL SHUTDOWN TRIGGER:\n"
+            f"    Reason: {reason}\n"
+            f"    Initiator: {initiator}\n"
+            f"    Stack trace:\n{stack_trace}"
+        )
+        # ═══════════════════════════════════════════════════════════════════════════
+
         with self._state_lock:
             if self._initiated:
                 logger.debug("[v95.13] Shutdown already initiated, ignoring")
@@ -1716,6 +1760,14 @@ class GlobalShutdownSignal:
             self._initiated_at = time.time()
             self._reason = reason
             self._initiator = initiator or f"pid-{os.getpid()}"
+
+            if _SHUTDOWN_DIAGNOSTICS_AVAILABLE:
+                log_state_change(
+                    "GlobalShutdownSignal",
+                    "idle",
+                    "initiated",
+                    f"reason={reason}"
+                )
 
             logger.info(
                 f"[v95.13] 🛑 Global shutdown initiated: "

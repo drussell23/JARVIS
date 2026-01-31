@@ -59,6 +59,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jarvis.shutdown_hook")
 
+# =============================================================================
+# v151.0: SHUTDOWN DIAGNOSTICS - Deep Forensic Logging
+# =============================================================================
+try:
+    from backend.core.shutdown_diagnostics import (
+        log_shutdown_trigger,
+        log_signal_received,
+    )
+    _DIAG_AVAILABLE = True
+except ImportError:
+    _DIAG_AVAILABLE = False
+    log_shutdown_trigger = lambda *args, **kwargs: None  # noqa: E731
+    log_signal_received = lambda *args, **kwargs: None  # noqa: E731
+
 # ============================================================================
 # STATE TRACKING
 # ============================================================================
@@ -963,6 +977,7 @@ def _signal_handler(signum: int, frame: Any) -> None:
     BEFORE any async operations that might timeout or fail.
 
     v109.4: Marks shutdown phase for proper cleanup coordination.
+    v151.0: Enhanced with deep forensic logging for shutdown analysis.
 
     Triggers cleanup and then calls the original handler.
     """
@@ -970,6 +985,35 @@ def _signal_handler(signum: int, frame: Any) -> None:
     _shutdown_phase = 1  # v109.4: Mark signal phase
 
     signal_name = signal.Signals(signum).name
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # v151.0: DIAGNOSTIC LOGGING - Log signal receipt with full context
+    # ═══════════════════════════════════════════════════════════════════════════
+    import traceback
+
+    stack_trace = "".join(traceback.format_stack())
+
+    if _DIAG_AVAILABLE:
+        log_signal_received(signum, "shutdown_hook._signal_handler")
+        log_shutdown_trigger(
+            "shutdown_hook._signal_handler",
+            f"Signal {signal_name} received - initiating cleanup",
+            {
+                "signal_number": signum,
+                "signal_name": signal_name,
+                "original_sigterm_type": str(type(_original_sigterm)),
+                "original_sigint_type": str(type(_original_sigint)),
+                "stack_trace": stack_trace,
+            }
+        )
+
+    logger.warning(
+        f"[v151.0] 🔬 SIGNAL RECEIVED:\n"
+        f"    Signal: {signal_name} ({signum})\n"
+        f"    Stack trace:\n{stack_trace}"
+    )
+    # ═══════════════════════════════════════════════════════════════════════════
+
     logger.info(f"🛑 Received {signal_name} - triggering cleanup...")
 
     # v95.17: CRITICAL - Clean up multiprocessing resources FIRST, synchronously

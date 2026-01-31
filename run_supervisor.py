@@ -821,6 +821,42 @@ except ImportError:
     def is_supervisor_running():
         return False, None
 
+# =============================================================================
+# v151.0: SHUTDOWN DIAGNOSTICS - Deep Forensic Logging for Shutdown Analysis
+# =============================================================================
+# This module provides enterprise-grade diagnostic logging to trace exactly
+# what triggers shutdown events in the JARVIS system. If the system shuts down
+# unexpectedly, check ~/.jarvis/trinity/shutdown_forensics.json for full trace.
+# =============================================================================
+try:
+    from backend.core.shutdown_diagnostics import (
+        log_shutdown_trigger,
+        log_startup_checkpoint,
+        log_state_change,
+        log_signal_received,
+        capture_system_state,
+        get_diagnostic_summary,
+        instrument_signal_handlers,
+    )
+    _SHUTDOWN_DIAGNOSTICS_AVAILABLE = True
+except ImportError:
+    _SHUTDOWN_DIAGNOSTICS_AVAILABLE = False
+    # Stub functions when diagnostics module not available
+    def log_shutdown_trigger(source: str, message: str, extra_data: Optional[Dict[str, Any]] = None) -> None:  # noqa: E731
+        pass
+    def log_startup_checkpoint(name: str, message: str = "") -> float:  # noqa: E731
+        return 0.0
+    def log_state_change(component: str, old_state: str, new_state: str, reason: str = "") -> None:  # noqa: E731
+        pass
+    def log_signal_received(signum: int, handler_name: str) -> None:  # noqa: E731
+        pass
+    def capture_system_state() -> Dict[str, Any]:  # noqa: E731
+        return {}
+    def get_diagnostic_summary() -> Dict[str, Any]:  # noqa: E731
+        return {}
+    def instrument_signal_handlers() -> None:  # noqa: E731
+        pass
+
 # v12.0: Intelligent Docker Daemon Manager with Self-Healing
 try:
     from backend.infrastructure.docker_daemon_manager import (
@@ -6281,24 +6317,36 @@ class SupervisorBootstrapper:
         for instant JARVIS startup.
 
         v80.0: Wrapped with global timeout to prevent infinite hangs.
+        v151.0: Added diagnostic checkpoints for shutdown forensics.
 
         Returns:
             Exit code (0 for success, non-zero for failure)
         """
+        # v151.0: DIAGNOSTIC CHECKPOINT - Entry to SupervisorBootstrapper.run()
+        log_startup_checkpoint("bootstrapper_run_entry", "Entered SupervisorBootstrapper.run() method")
+        log_state_change("SupervisorBootstrapper", "init", "running", "Starting bootstrap sequence")
+
         # Check for fast startup mode
         fast_startup = os.environ.get("JARVIS_FAST_STARTUP", "").lower() in ("1", "true", "yes")
+        log_startup_checkpoint("fast_startup_check", f"Fast startup mode: {fast_startup}")
 
         if fast_startup:
+            log_startup_checkpoint("fast_startup_begin", "Starting fast startup path")
             return await self._run_fast_startup()
 
         # v80.0: Wrap entire startup in global timeout
         # v5.3: Properly handle CancelledError (not subclass of Exception in Python 3.8+)
+        log_startup_checkpoint("normal_startup_begin", f"Starting normal startup with {self.config.global_startup_timeout}s timeout")
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._run_with_deep_health(),
                 timeout=self.config.global_startup_timeout,
             )
+            log_startup_checkpoint("startup_complete", f"Startup completed with exit code: {result}")
+            return result
         except asyncio.TimeoutError:
+            # v151.0: Log shutdown trigger
+            log_shutdown_trigger("SupervisorBootstrapper.run", f"GLOBAL STARTUP TIMEOUT after {self.config.global_startup_timeout}s - forcing emergency shutdown")
             self.logger.error(
                 f"🚨 GLOBAL STARTUP TIMEOUT after {self.config.global_startup_timeout}s - "
                 "forcing emergency shutdown"
@@ -6307,6 +6355,8 @@ class SupervisorBootstrapper:
             return 1
         except asyncio.CancelledError:
             # v5.3: CancelledError is BaseException, not Exception - handle explicitly
+            # v151.0: Log shutdown trigger
+            log_shutdown_trigger("SupervisorBootstrapper.run", "Startup cancelled (SIGINT/SIGTERM received via CancelledError)")
             self.logger.warning("🛑 Startup cancelled (SIGINT/SIGTERM received)")
             try:
                 await self._emergency_shutdown()
@@ -6314,6 +6364,9 @@ class SupervisorBootstrapper:
                 pass  # Already shutting down
             return 130  # Standard exit code for SIGINT
         except Exception as e:
+            # v151.0: Log shutdown trigger with full exception context
+            import traceback
+            log_shutdown_trigger("SupervisorBootstrapper.run", f"Startup failed with exception: {e}", {"exception_type": type(e).__name__, "traceback": traceback.format_exc()})
             self.logger.error(f"🚨 Startup failed with exception: {e}")
             await self._emergency_shutdown()
             return 1
@@ -6747,7 +6800,14 @@ class SupervisorBootstrapper:
         return False, None, {"error": "Protection disabled, no fallback", "component": component}
 
     async def _emergency_shutdown(self) -> None:
-        """v80.0/v148.0: Emergency shutdown when startup times out."""
+        """v80.0/v148.0/v151.0: Emergency shutdown when startup times out."""
+        # v151.0: DIAGNOSTIC - Log emergency shutdown trigger
+        import traceback
+        log_shutdown_trigger(
+            "SupervisorBootstrapper._emergency_shutdown",
+            "Emergency shutdown initiated",
+            {"stack_trace": "".join(traceback.format_stack())}
+        )
         self.logger.warning("🚨 Emergency shutdown initiated")
         
         # v148.0: Write exit code marker for crash detection on next startup
@@ -7740,10 +7800,14 @@ class SupervisorBootstrapper:
     async def _run_with_deep_health(self) -> int:
         """
         v80.0: Run startup with deep health verification.
+        v151.0: Added diagnostic checkpoints for shutdown forensics.
 
         This wraps the main startup sequence and verifies components
         are actually functional, not just responding to HTTP.
         """
+        # v151.0: DIAGNOSTIC CHECKPOINT - Entry to deep health startup
+        log_startup_checkpoint("deep_health_entry", "Entered _run_with_deep_health() method")
+
         try:
             # v108.3: Reset global shutdown flag at the very beginning
             # This clears any stale shutdown state from previous runs or
@@ -7753,13 +7817,16 @@ class SupervisorBootstrapper:
                 from backend.core.resilience.graceful_shutdown import reset_global_shutdown
                 reset_global_shutdown()
                 self.logger.debug("[v108.3] Global shutdown flag reset at startup")
+                log_startup_checkpoint("shutdown_flag_reset", "Global shutdown flag reset successfully")
             except ImportError:
                 pass  # Module not available
             except Exception as e:
                 self.logger.debug(f"[v108.3] Could not reset global shutdown: {e}")
 
             # Setup signal handlers
+            log_startup_checkpoint("pre_signal_setup", "About to setup signal handlers")
             self._setup_signal_handlers()
+            log_startup_checkpoint("post_signal_setup", "Signal handlers setup complete")
 
             # ═══════════════════════════════════════════════════════════════════
             # v113.0: START LOADING SERVER FIRST (shows progress on port 3001)
@@ -7768,10 +7835,13 @@ class SupervisorBootstrapper:
             # The loading server must be running BEFORE ANYTHING ELSE so users
             # can see startup progress in their browser.
             # ═══════════════════════════════════════════════════════════════════
+            log_startup_checkpoint("pre_loading_server", "About to start loading server v113")
             await self._start_loading_server_v113()
+            log_startup_checkpoint("post_loading_server", "Loading server started successfully")
 
             # Print banner
             TerminalUI.print_banner()
+            log_startup_checkpoint("banner_printed", "Terminal banner printed")
 
             # v9.0: Log Hyper-Runtime Engine status
             runtime_icons = {3: "⚡", 2: "🚀", 1: "🐍"}
@@ -7793,7 +7863,9 @@ class SupervisorBootstrapper:
             # This catches network partitions, filesystem issues, disk space
             # problems, and clock skew early in startup.
             # ═══════════════════════════════════════════════════════════════════
+            log_startup_checkpoint("pre_preflight", "About to run v87 preflight checks")
             preflight_passed = await self._run_v87_preflight_checks()
+            log_startup_checkpoint("post_preflight", f"Preflight checks completed: passed={preflight_passed}")
             if not preflight_passed:
                 self.logger.error("[v87.0] ❌ Pre-flight checks failed - aborting startup")
                 TerminalUI.print_error("[v87.0] Pre-flight checks failed")
@@ -25850,9 +25922,17 @@ async def main() -> int:
     Signal escalation: 1st=graceful, 2nd=faster, 3rd=immediate exit.
 
     v121.0: Signal handler only installed for supervisor mode, not CLI commands.
+
+    v151.0: Added comprehensive diagnostic checkpoints for shutdown forensics.
     """
+    # =========================================================================
+    # v151.0: DIAGNOSTIC CHECKPOINT - Entry to main()
+    # =========================================================================
+    log_startup_checkpoint("main_entry", "Entered main() function")
+
     # v121.0: Parse args FIRST to determine if we're in CLI command mode
     args = parse_args()
+    log_startup_checkpoint("args_parsed", f"Parsed CLI arguments: status={getattr(args, 'status', False)}, restart={getattr(args, 'restart', False)}, shutdown={getattr(args, 'shutdown', False)}")
 
     # v121.0: Check if this is a CLI command that should NOT install signal handlers
     # These commands make IPC calls and exit - they don't need signal handling
@@ -25870,10 +25950,14 @@ async def main() -> int:
     # during restart verification. The restart command was getting killed
     # by SIGTERM because it had the signal handler installed.
     # =========================================================================
+    log_startup_checkpoint("signal_handler_pre", f"About to install signal handlers, is_cli_command={is_cli_command}")
     if not is_cli_command:
         signal_handler = get_unified_signal_handler()
         loop = asyncio.get_running_loop()
         signal_handler.install(loop)
+        log_startup_checkpoint("signal_handler_installed", "Unified signal handler installed for supervisor mode")
+        # v151.0: Log current signal handler state
+        instrument_signal_handlers()
     else:
         # v121.0: CLI mode - IMMEDIATELY protect from signals
         # The supervisor restart process sends signals that can kill the client
@@ -26687,7 +26771,15 @@ async def main() -> int:
     if args.no_voice:
         os.environ["JARVIS_VOICE_ENABLED"] = "false"
 
+    # =========================================================================
+    # v151.0: DIAGNOSTIC CHECKPOINT - Pre-bootstrapper creation
+    # =========================================================================
+    log_startup_checkpoint("pre_bootstrapper", "About to create SupervisorBootstrapper instance")
+
     bootstrapper = SupervisorBootstrapper()
+
+    # v151.0: DIAGNOSTIC CHECKPOINT - Post-bootstrapper creation
+    log_startup_checkpoint("post_bootstrapper", "SupervisorBootstrapper instance created successfully")
 
     if args.task:
         # Single task mode: Initialize, run task, shutdown
@@ -26726,6 +26818,9 @@ async def main() -> int:
         # Run the bootstrapper with shutdown signal monitoring.
         # If a shutdown signal is received, we gracefully stop the supervisor.
         # =====================================================================
+        # v151.0: DIAGNOSTIC CHECKPOINT - About to launch supervisor
+        log_startup_checkpoint("pre_supervisor_launch", "About to create supervisor and shutdown monitoring tasks")
+
         supervisor_task = asyncio.create_task(
             bootstrapper.run(),
             name="supervisor_main"
@@ -26734,6 +26829,9 @@ async def main() -> int:
             signal_handler.wait_for_shutdown(),
             name="shutdown_monitor"
         )
+
+        # v151.0: DIAGNOSTIC CHECKPOINT - Tasks created
+        log_startup_checkpoint("tasks_created", "Supervisor and shutdown monitor tasks created, entering event loop wait")
 
         try:
             # Wait for either supervisor completion or shutdown signal
@@ -26744,6 +26842,8 @@ async def main() -> int:
 
             if shutdown_task in done:
                 # Shutdown signal received - stop supervisor gracefully
+                # v151.0: Log shutdown trigger
+                log_shutdown_trigger("main.shutdown_task", f"Shutdown task completed - reason: {getattr(signal_handler, 'shutdown_reason', 'unknown')}")
                 print("[v111.0] Shutdown signal received, stopping supervisor...")
 
                 # v123.4: Start a deadline timer - force exit after 30 seconds

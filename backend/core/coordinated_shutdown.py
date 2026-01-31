@@ -67,7 +67,7 @@ except ImportError:
     logger.debug("[v151.0] Shutdown diagnostics not available - using stubs")
 
 
-def _log_shutdown_trigger_safe(source: str, message: str, extra_data: dict = None) -> None:  # noqa: E501
+def _log_shutdown_trigger_safe(source: str, message: str, extra_data: Optional[Dict[str, Any]] = None) -> None:
     """Safe wrapper for shutdown trigger logging."""
     if _DIAGNOSTICS_AVAILABLE:
         log_shutdown_trigger(source, message, extra_data)
