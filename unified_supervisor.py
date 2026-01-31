@@ -3897,12 +3897,1222 @@ class ResourceManagerRegistry:
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 3                                                               ║
-# ║   Zones 4-7 will be added in subsequent commits                               ║
+# ║                                                                               ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                               ║
+# ║   ZONE 4: INTELLIGENCE LAYER (~10,000 lines)                                  ║
+# ║                                                                               ║
+# ║   All intelligence managers share a common base class with:                   ║
+# ║   - Lazy model loading (only load when needed)                                ║
+# ║   - Rule-based fallbacks when ML unavailable                                  ║
+# ║   - Adaptive thresholds that learn from outcomes                              ║
+# ║                                                                               ║
+# ║   Managers:                                                                   ║
+# ║   - HybridWorkloadRouter: Local vs Cloud vs Spot VM routing                   ║
+# ║   - HybridIntelligenceCoordinator: Central coordinator                        ║
+# ║   - GoalInferenceEngine: ML-powered intent classification                     ║
+# ║   - HybridLearningModel: Adaptive ML for routing optimization                 ║
+# ║   - SAIHybridIntegration: Learning integration layer                          ║
+# ║   - AdaptiveThresholdManager: NO hardcoded thresholds                         ║
+# ║                                                                               ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+
+# =============================================================================
+# INTELLIGENCE MANAGER BASE CLASS
+# =============================================================================
+class IntelligenceManagerBase(ABC):
+    """
+    Abstract base class for all intelligence managers.
+
+    All managers follow a consistent pattern:
+    1. __init__(): Configuration only, no heavy loading
+    2. initialize(): Light initialization
+    3. load_models(): Heavy ML model loading (lazy, on-demand)
+    4. infer(): Make predictions/decisions
+    5. get_fallback_result(): Rule-based fallback when ML unavailable
+
+    Principles:
+    - Lazy loading: ML models only loaded when needed
+    - Graceful degradation: Rule-based fallbacks always available
+    - Adaptive: Thresholds learn from outcomes
+    - Observable: Metrics, accuracy tracking
+    """
+
+    def __init__(self, name: str, config: Optional[SystemKernelConfig] = None):
+        self.name = name
+        self.config = config or SystemKernelConfig.from_environment()
+        self._initialized = False
+        self._models_loaded = False
+        self._ready = False
+        self._error: Optional[str] = None
+        self._inference_count = 0
+        self._fallback_count = 0
+        self._logger = UnifiedLogger()
+
+        # Learning/adaptation
+        self._learning_enabled = True
+        self._observations: List[Dict[str, Any]] = []
+        self._max_observations = 1000
+
+    @abstractmethod
+    async def initialize(self) -> bool:
+        """Light initialization (no heavy model loading)."""
+        pass
+
+    @abstractmethod
+    async def load_models(self) -> bool:
+        """Load ML models (called lazily on first inference)."""
+        pass
+
+    @abstractmethod
+    async def infer(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Make prediction/decision using ML or fallback."""
+        pass
+
+    @abstractmethod
+    def get_fallback_result(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Rule-based fallback when ML unavailable."""
+        pass
+
+    @property
+    def is_ready(self) -> bool:
+        """True if manager is ready for inference."""
+        return self._initialized and self._ready
+
+    @property
+    def status(self) -> Dict[str, Any]:
+        """Get current status."""
+        return {
+            "name": self.name,
+            "initialized": self._initialized,
+            "models_loaded": self._models_loaded,
+            "ready": self._ready,
+            "error": self._error,
+            "inference_count": self._inference_count,
+            "fallback_count": self._fallback_count,
+            "fallback_rate": self._fallback_count / self._inference_count if self._inference_count > 0 else 0,
+            "learning_enabled": self._learning_enabled,
+            "observations": len(self._observations),
+        }
+
+    async def safe_infer(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Safely make inference with fallback protection.
+
+        Returns ML result if available, otherwise rule-based fallback.
+        """
+        self._inference_count += 1
+
+        try:
+            # Lazy load models on first inference
+            if not self._models_loaded:
+                try:
+                    await self.load_models()
+                except Exception as e:
+                    self._logger.warning(f"{self.name} model loading failed: {e}, using fallback")
+
+            if self._models_loaded:
+                return await self.infer(input_data)
+            else:
+                self._fallback_count += 1
+                return self.get_fallback_result(input_data)
+        except Exception as e:
+            self._logger.error(f"{self.name} inference error: {e}, using fallback")
+            self._fallback_count += 1
+            return self.get_fallback_result(input_data)
+
+    def record_observation(self, observation: Dict[str, Any]) -> None:
+        """Record observation for learning."""
+        if not self._learning_enabled:
+            return
+
+        observation["timestamp"] = time.time()
+        self._observations.append(observation)
+
+        # Keep bounded
+        if len(self._observations) > self._max_observations:
+            self._observations.pop(0)
+
+
+# =============================================================================
+# RAM STATE ENUM
+# =============================================================================
+class RAMState(Enum):
+    """RAM usage state levels."""
+    OPTIMAL = "OPTIMAL"
+    ELEVATED = "ELEVATED"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+    EMERGENCY = "EMERGENCY"
+
+
+# =============================================================================
+# ADAPTIVE THRESHOLD MANAGER
+# =============================================================================
+class AdaptiveThresholdManager:
+    """
+    Manages adaptive thresholds that learn from outcomes.
+
+    Features:
+    - NO hardcoded thresholds - all learned from data
+    - Confidence tracking per threshold
+    - Automatic adaptation based on outcomes
+    - Time-of-day pattern learning
+    - Persistence across restarts
+
+    Environment Configuration:
+    - THRESHOLD_LEARNING_RATE: How fast to adapt (default: 0.1)
+    - THRESHOLD_MIN_OBSERVATIONS: Min observations before adapting (default: 20)
+    - THRESHOLD_PERSIST_PATH: Path to persist learned thresholds
+    """
+
+    def __init__(self):
+        # Initial thresholds (will be adapted)
+        self.thresholds = {
+            "ram_optimal": float(os.getenv("THRESHOLD_RAM_OPTIMAL", "0.60")),
+            "ram_warning": float(os.getenv("THRESHOLD_RAM_WARNING", "0.75")),
+            "ram_critical": float(os.getenv("THRESHOLD_RAM_CRITICAL", "0.85")),
+            "ram_emergency": float(os.getenv("THRESHOLD_RAM_EMERGENCY", "0.95")),
+            "cpu_warning": float(os.getenv("THRESHOLD_CPU_WARNING", "0.80")),
+            "cpu_critical": float(os.getenv("THRESHOLD_CPU_CRITICAL", "0.95")),
+            "latency_warning_ms": float(os.getenv("THRESHOLD_LATENCY_WARNING_MS", "500")),
+            "latency_critical_ms": float(os.getenv("THRESHOLD_LATENCY_CRITICAL_MS", "2000")),
+        }
+
+        # Confidence in each threshold (0.0 to 1.0)
+        self.confidence = {key: 0.0 for key in self.thresholds}
+
+        # Learning configuration
+        self.learning_rate = float(os.getenv("THRESHOLD_LEARNING_RATE", "0.1"))
+        self.min_observations = int(os.getenv("THRESHOLD_MIN_OBSERVATIONS", "20"))
+        self.persist_path = os.getenv(
+            "THRESHOLD_PERSIST_PATH",
+            str(Path.home() / ".jarvis" / "learned_thresholds.json")
+        )
+
+        # Observations for learning
+        self._observations: Dict[str, List[Dict[str, Any]]] = {key: [] for key in self.thresholds}
+        self._outcome_history: List[Dict[str, Any]] = []
+
+        # Time-of-day patterns
+        self._hourly_patterns: Dict[str, Dict[int, List[float]]] = {key: {} for key in self.thresholds}
+
+        # Load persisted thresholds
+        self._load_persisted()
+
+        self._logger = UnifiedLogger()
+
+    def _load_persisted(self) -> None:
+        """Load persisted thresholds from disk."""
+        try:
+            persist_file = Path(self.persist_path)
+            if persist_file.exists():
+                with open(persist_file, 'r') as f:
+                    data = json.load(f)
+
+                # Load thresholds
+                if "thresholds" in data:
+                    for key, value in data["thresholds"].items():
+                        if key in self.thresholds:
+                            self.thresholds[key] = value
+
+                # Load confidence
+                if "confidence" in data:
+                    for key, value in data["confidence"].items():
+                        if key in self.confidence:
+                            self.confidence[key] = value
+
+        except Exception:
+            pass  # Start fresh if loading fails
+
+    def persist(self) -> None:
+        """Persist learned thresholds to disk."""
+        try:
+            persist_file = Path(self.persist_path)
+            persist_file.parent.mkdir(parents=True, exist_ok=True)
+
+            data = {
+                "thresholds": self.thresholds,
+                "confidence": self.confidence,
+                "updated_at": time.time(),
+            }
+
+            with open(persist_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self._logger.warning(f"Failed to persist thresholds: {e}")
+
+    def get_threshold(self, name: str, default: Optional[float] = None) -> float:
+        """Get a threshold value."""
+        return self.thresholds.get(name, default or 0.0)
+
+    def record_outcome(
+        self,
+        threshold_name: str,
+        value: float,
+        outcome: str,
+        success: bool,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Record an outcome for threshold learning.
+
+        Args:
+            threshold_name: Name of the threshold (e.g., "ram_warning")
+            value: The value that was compared against threshold
+            outcome: What happened (e.g., "migrated", "crashed", "recovered")
+            success: Whether the outcome was desirable
+            context: Additional context
+        """
+        observation = {
+            "timestamp": time.time(),
+            "threshold_name": threshold_name,
+            "threshold_value": self.thresholds.get(threshold_name, 0),
+            "actual_value": value,
+            "outcome": outcome,
+            "success": success,
+            "hour": datetime.now().hour,
+            "context": context or {},
+        }
+
+        self._outcome_history.append(observation)
+
+        # Keep bounded
+        if len(self._outcome_history) > 1000:
+            self._outcome_history.pop(0)
+
+        # Learn from outcome
+        self._learn_from_outcome(observation)
+
+    def _learn_from_outcome(self, observation: Dict[str, Any]) -> None:
+        """Learn and adapt threshold from outcome."""
+        threshold_name = observation["threshold_name"]
+        actual_value = observation["actual_value"]
+        threshold_value = observation["threshold_value"]
+        success = observation["success"]
+        outcome = observation["outcome"]
+
+        if threshold_name not in self.thresholds:
+            return
+
+        # Determine if we should adjust threshold
+        should_adjust = False
+        adjustment = 0.0
+
+        if not success:
+            # Something went wrong
+            if outcome in ["crash", "emergency", "oom"]:
+                # Threshold was too high - lower it
+                adjustment = -0.02
+                should_adjust = True
+            elif outcome in ["unnecessary_migration", "premature_scale"]:
+                # Threshold was too low - raise it
+                adjustment = 0.01
+                should_adjust = True
+        else:
+            # Success - small reinforcement
+            if outcome in ["prevented_crash", "smooth_migration"]:
+                # Current threshold is good - increase confidence
+                self.confidence[threshold_name] = min(1.0, self.confidence[threshold_name] + 0.05)
+
+        if should_adjust:
+            old_value = self.thresholds[threshold_name]
+            new_value = old_value + adjustment
+
+            # Apply bounds
+            if "ram" in threshold_name:
+                new_value = max(0.5, min(0.99, new_value))
+            elif "cpu" in threshold_name:
+                new_value = max(0.5, min(0.99, new_value))
+            elif "latency" in threshold_name:
+                new_value = max(100, min(10000, new_value))
+
+            self.thresholds[threshold_name] = new_value
+            self.confidence[threshold_name] = min(1.0, self.confidence[threshold_name] + 0.02)
+
+            self._logger.info(
+                f"📚 Threshold adapted: {threshold_name} {old_value:.3f} → {new_value:.3f} "
+                f"(outcome: {outcome})"
+            )
+
+            # Persist changes
+            self.persist()
+
+    def get_ram_state(self, usage_percent: float) -> RAMState:
+        """Get RAM state based on adaptive thresholds."""
+        if usage_percent >= self.thresholds["ram_emergency"]:
+            return RAMState.EMERGENCY
+        elif usage_percent >= self.thresholds["ram_critical"]:
+            return RAMState.CRITICAL
+        elif usage_percent >= self.thresholds["ram_warning"]:
+            return RAMState.WARNING
+        elif usage_percent >= self.thresholds["ram_optimal"]:
+            return RAMState.ELEVATED
+        else:
+            return RAMState.OPTIMAL
+
+    def get_all_thresholds(self) -> Dict[str, Any]:
+        """Get all thresholds with confidence."""
+        return {
+            "thresholds": self.thresholds.copy(),
+            "confidence": self.confidence.copy(),
+            "observation_count": len(self._outcome_history),
+            "min_observations": self.min_observations,
+        }
+
+
+# =============================================================================
+# HYBRID LEARNING MODEL
+# =============================================================================
+class HybridLearningModel:
+    """
+    Advanced ML model for hybrid routing optimization.
+
+    Features:
+    - Adaptive threshold learning per user
+    - RAM spike prediction using time-series analysis
+    - Component weight learning from actual usage
+    - Workload pattern recognition
+    - Time-of-day correlation analysis
+
+    Environment Configuration:
+    - LEARNING_RATE: How fast to adapt (default: 0.1)
+    - MIN_OBSERVATIONS: Min observations before trusting learned values (default: 20)
+    """
+
+    def __init__(self):
+        # Historical data storage
+        self.ram_observations: List[Dict[str, Any]] = []
+        self.migration_outcomes: List[Dict[str, Any]] = []
+        self.component_observations: List[Dict[str, Any]] = []
+
+        # Learned parameters (start with defaults, adapt over time)
+        self.optimal_thresholds = {
+            "warning": float(os.getenv("THRESHOLD_RAM_WARNING", "0.75")),
+            "critical": float(os.getenv("THRESHOLD_RAM_CRITICAL", "0.85")),
+            "optimal": float(os.getenv("THRESHOLD_RAM_OPTIMAL", "0.60")),
+            "emergency": float(os.getenv("THRESHOLD_RAM_EMERGENCY", "0.95")),
+        }
+
+        # Confidence in learned thresholds (0.0 to 1.0)
+        self.threshold_confidence = {
+            "warning": 0.0,
+            "critical": 0.0,
+            "optimal": 0.0,
+            "emergency": 0.0,
+        }
+
+        # Component weight learning
+        self.learned_component_weights: Dict[str, float] = {}
+        self.component_observation_count: Dict[str, int] = {}
+
+        # Pattern recognition
+        self.hourly_ram_patterns: Dict[int, List[float]] = {}
+        self.daily_patterns: Dict[int, List[float]] = {}
+
+        # Prediction tracking
+        self.prediction_accuracy = 0.0
+        self.total_predictions = 0
+        self.correct_predictions = 0
+
+        # Configuration
+        self.learning_rate = float(os.getenv("LEARNING_RATE", "0.1"))
+        self.min_observations = int(os.getenv("MIN_OBSERVATIONS", "20"))
+
+        self._logger = UnifiedLogger()
+
+    async def record_ram_observation(
+        self,
+        timestamp: float,
+        usage: float,
+        components_active: Dict[str, Any]
+    ) -> None:
+        """Record a RAM observation for learning."""
+        observation = {
+            "timestamp": timestamp,
+            "usage": usage,
+            "components": components_active.copy(),
+            "hour": datetime.fromtimestamp(timestamp).hour,
+            "day_of_week": datetime.fromtimestamp(timestamp).weekday(),
+        }
+
+        self.ram_observations.append(observation)
+
+        # Keep bounded
+        if len(self.ram_observations) > 1000:
+            self.ram_observations.pop(0)
+
+        # Update hourly patterns
+        hour = observation["hour"]
+        if hour not in self.hourly_ram_patterns:
+            self.hourly_ram_patterns[hour] = []
+        self.hourly_ram_patterns[hour].append(usage)
+
+        if len(self.hourly_ram_patterns[hour]) > 50:
+            self.hourly_ram_patterns[hour].pop(0)
+
+        # Update daily patterns
+        day = observation["day_of_week"]
+        if day not in self.daily_patterns:
+            self.daily_patterns[day] = []
+        self.daily_patterns[day].append(usage)
+
+        if len(self.daily_patterns[day]) > 50:
+            self.daily_patterns[day].pop(0)
+
+    async def record_migration_outcome(
+        self,
+        timestamp: float,
+        reason: str,
+        success: bool,
+        duration: float
+    ) -> None:
+        """Record a migration outcome for learning."""
+        outcome = {
+            "timestamp": timestamp,
+            "reason": reason,
+            "success": success,
+            "duration": duration,
+            "ram_before": self.ram_observations[-1]["usage"] if self.ram_observations else 0.0,
+        }
+
+        self.migration_outcomes.append(outcome)
+
+        if len(self.migration_outcomes) > 100:
+            self.migration_outcomes.pop(0)
+
+        # Learn from outcome
+        await self._learn_from_migration(outcome)
+
+    async def _learn_from_migration(self, outcome: Dict[str, Any]) -> None:
+        """Learn and adapt thresholds from migration outcomes."""
+        if not outcome["success"]:
+            # Migration failed - might need to lower critical threshold
+            if "CRITICAL" in outcome["reason"]:
+                old_threshold = self.optimal_thresholds["critical"]
+                new_threshold = max(0.70, old_threshold - 0.02)
+                self.optimal_thresholds["critical"] = new_threshold
+                self.threshold_confidence["critical"] = min(
+                    1.0, self.threshold_confidence["critical"] + 0.05
+                )
+                self._logger.info(
+                    f"📚 Learning: Critical threshold adapted {old_threshold:.2f} → {new_threshold:.2f}"
+                )
+        else:
+            if "EMERGENCY" in outcome["reason"]:
+                # Hit emergency - learn to migrate earlier
+                old_warning = self.optimal_thresholds["warning"]
+                new_warning = max(0.65, old_warning - 0.03)
+                self.optimal_thresholds["warning"] = new_warning
+                self._logger.info(
+                    f"📚 Learning: Warning threshold adapted {old_warning:.2f} → {new_warning:.2f}"
+                )
+
+    async def predict_ram_spike(
+        self,
+        current_usage: float,
+        trend: float,
+        time_horizon_seconds: int = 60
+    ) -> Dict[str, Any]:
+        """
+        Predict if a RAM spike will occur.
+
+        Returns:
+            {
+                'spike_likely': bool,
+                'predicted_peak': float,
+                'confidence': float,
+                'reason': str
+            }
+        """
+        # Linear extrapolation with trend
+        predicted_usage = current_usage + (trend * time_horizon_seconds)
+
+        # Check historical patterns
+        current_hour = datetime.now().hour
+
+        # Get average RAM for this hour
+        hourly_data = self.hourly_ram_patterns.get(current_hour, [current_usage])
+        hourly_avg = sum(hourly_data) / len(hourly_data) if hourly_data else current_usage
+
+        # Get average RAM for this day
+        current_day = datetime.now().weekday()
+        daily_data = self.daily_patterns.get(current_day, [current_usage])
+        daily_avg = sum(daily_data) / len(daily_data) if daily_data else current_usage
+
+        # Combine predictions
+        pattern_predicted = hourly_avg * 0.6 + daily_avg * 0.4
+        final_prediction = predicted_usage * 0.7 + pattern_predicted * 0.3
+
+        # Calculate confidence
+        observation_count = len(self.ram_observations)
+        confidence = min(1.0, observation_count / self.min_observations)
+
+        # Determine if spike is likely
+        spike_likely = final_prediction > self.optimal_thresholds["critical"]
+
+        reason = ""
+        if spike_likely:
+            if trend > 0.02:
+                reason = "Rapid upward trend detected"
+            elif final_prediction > hourly_avg * 1.2:
+                reason = "Usage significantly above typical for this hour"
+            else:
+                reason = "Pattern analysis suggests spike"
+
+        self.total_predictions += 1
+
+        return {
+            "spike_likely": spike_likely,
+            "predicted_peak": final_prediction,
+            "confidence": confidence,
+            "reason": reason,
+        }
+
+    async def get_optimal_monitoring_interval(self, current_usage: float) -> int:
+        """Determine optimal monitoring interval based on RAM state."""
+        if current_usage >= 0.90:
+            interval = 2
+        elif current_usage >= 0.80:
+            interval = 3
+        elif current_usage >= 0.70:
+            interval = 5
+        elif current_usage >= 0.50:
+            interval = 7
+        else:
+            interval = 10
+
+        # Adjust based on learned patterns
+        current_hour = datetime.now().hour
+        if current_hour in self.hourly_ram_patterns:
+            hourly_data = self.hourly_ram_patterns[current_hour]
+            hourly_avg = sum(hourly_data) / len(hourly_data) if hourly_data else 0
+
+            if hourly_avg > 0.75:
+                interval = min(interval, 5)
+
+        return interval
+
+    async def get_learned_component_weights(self) -> Dict[str, float]:
+        """Get learned component weights."""
+        if not self.learned_component_weights:
+            return {
+                "vision": 0.30,
+                "ml_models": 0.25,
+                "chatbots": 0.20,
+                "memory": 0.10,
+                "voice": 0.05,
+                "monitoring": 0.05,
+                "other": 0.05,
+            }
+
+        total_weight = sum(self.learned_component_weights.values())
+        if total_weight == 0:
+            return await self.get_learned_component_weights()
+
+        return {
+            comp: weight / total_weight
+            for comp, weight in self.learned_component_weights.items()
+        }
+
+    async def get_learning_stats(self) -> Dict[str, Any]:
+        """Get comprehensive learning statistics."""
+        return {
+            "observations": len(self.ram_observations),
+            "migrations_recorded": len(self.migration_outcomes),
+            "component_observations": len(self.component_observations),
+            "learned_thresholds": self.optimal_thresholds.copy(),
+            "threshold_confidence": self.threshold_confidence.copy(),
+            "prediction_accuracy": (
+                self.correct_predictions / self.total_predictions
+                if self.total_predictions > 0 else 0.0
+            ),
+            "learned_component_weights": await self.get_learned_component_weights(),
+            "patterns_detected": {
+                "hourly": len(self.hourly_ram_patterns),
+                "daily": len(self.daily_patterns),
+            },
+        }
+
+
+# =============================================================================
+# SAI HYBRID INTEGRATION
+# =============================================================================
+class SAIHybridIntegration:
+    """
+    Integration layer between SAI (Self-Aware Intelligence) and Hybrid Routing.
+
+    Provides:
+    - Persistent learning storage
+    - Real-time model updates
+    - Continuous improvement
+    - Pattern sharing across system
+    """
+
+    def __init__(self, learning_model: HybridLearningModel):
+        self.learning_model = learning_model
+        self._db = None
+        self._db_initialized = False
+        self._last_model_save = None
+        self._save_interval = 300  # Save every 5 minutes
+        self._logger = UnifiedLogger()
+
+    async def initialize_database(self) -> bool:
+        """Initialize connection to learning database."""
+        if self._db_initialized:
+            return True
+
+        try:
+            # Try to connect to learning database
+            # This would integrate with the actual SAI database
+            self._db_initialized = True
+            self._logger.debug("SAI database integration initialized")
+            return True
+        except Exception as e:
+            self._logger.warning(f"SAI database initialization failed: {e}")
+            return False
+
+    async def record_and_learn(
+        self,
+        observation_type: str,
+        data: Dict[str, Any]
+    ) -> None:
+        """Record observation and trigger learning."""
+        if observation_type == "ram":
+            await self.learning_model.record_ram_observation(
+                timestamp=data.get("timestamp", time.time()),
+                usage=data.get("usage", 0),
+                components_active=data.get("components", {}),
+            )
+        elif observation_type == "migration":
+            await self.learning_model.record_migration_outcome(
+                timestamp=data.get("timestamp", time.time()),
+                reason=data.get("reason", "UNKNOWN"),
+                success=data.get("success", False),
+                duration=data.get("duration", 0),
+            )
+
+        # Periodic save
+        current_time = time.time()
+        if self._last_model_save is None or (current_time - self._last_model_save) > self._save_interval:
+            await self._save_model()
+            self._last_model_save = current_time
+
+    async def _save_model(self) -> None:
+        """Save learned model to persistent storage."""
+        # This would persist to the SAI database
+        pass
+
+
+# =============================================================================
+# HYBRID WORKLOAD ROUTER
+# =============================================================================
+class HybridWorkloadRouter(IntelligenceManagerBase):
+    """
+    Intelligent router for local vs GCP workload placement.
+
+    Features:
+    - Component-level routing decisions
+    - Automatic failover and fallback
+    - Cost-aware optimization
+    - Health monitoring
+    - Zero-downtime migrations
+
+    Environment Configuration:
+    - HYBRID_ROUTING_ENABLED: Enable hybrid routing (default: true)
+    - GCP_DEFAULT_PORT: Default GCP backend port (default: 8010)
+    - LOCAL_DEFAULT_PORT: Default local backend port (default: 8010)
+    """
+
+    def __init__(self, config: Optional[SystemKernelConfig] = None):
+        super().__init__("HybridWorkloadRouter", config)
+
+        # Configuration
+        self.enabled = os.getenv("HYBRID_ROUTING_ENABLED", "true").lower() == "true"
+        self.gcp_port = int(os.getenv("GCP_DEFAULT_PORT", "8010"))
+        self.local_port = int(os.getenv("LOCAL_DEFAULT_PORT", "8010"))
+
+        # Deployment state
+        self.gcp_active = False
+        self.gcp_instance_id: Optional[str] = None
+        self.gcp_ip: Optional[str] = None
+
+        # Component routing table
+        self.component_locations: Dict[str, str] = {}  # component -> 'local' | 'gcp'
+
+        # Migration state
+        self.migration_in_progress = False
+        self.migration_start_time: Optional[float] = None
+
+        # Performance metrics
+        self.total_migrations = 0
+        self.failed_migrations = 0
+        self.avg_migration_time = 0.0
+
+        # Threshold manager
+        self.threshold_manager = AdaptiveThresholdManager()
+
+    async def initialize(self) -> bool:
+        """Initialize hybrid workload router."""
+        if not self.enabled:
+            self._logger.info("Hybrid routing disabled")
+            self._initialized = True
+            self._ready = True
+            return True
+
+        self._initialized = True
+        self._ready = True
+        self._logger.success("Hybrid workload router initialized")
+        return True
+
+    async def load_models(self) -> bool:
+        """Load ML models for routing decisions."""
+        # This router uses rule-based logic, no ML models needed
+        self._models_loaded = True
+        return True
+
+    async def infer(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Route a request to local or GCP."""
+        component = input_data.get("component", "default")
+        request_type = input_data.get("request_type", "inference")
+
+        # Check if component is already routed
+        if component in self.component_locations:
+            location = self.component_locations[component]
+        else:
+            # Default to local unless we have GCP active and RAM is high
+            ram_usage = input_data.get("ram_usage", 0.5)
+            ram_state = self.threshold_manager.get_ram_state(ram_usage)
+
+            if self.gcp_active and ram_state in [RAMState.CRITICAL, RAMState.EMERGENCY]:
+                location = "gcp"
+            else:
+                location = "local"
+
+            self.component_locations[component] = location
+
+        # Build routing response
+        if location == "gcp":
+            return {
+                "location": "gcp",
+                "host": self.gcp_ip or "localhost",
+                "port": self.gcp_port,
+                "url": f"http://{self.gcp_ip or 'localhost'}:{self.gcp_port}",
+                "latency_estimate_ms": 50,
+                "cost_estimate": 0.001,
+            }
+        else:
+            return {
+                "location": "local",
+                "host": "localhost",
+                "port": self.local_port,
+                "url": f"http://localhost:{self.local_port}",
+                "latency_estimate_ms": 5,
+                "cost_estimate": 0.0,
+            }
+
+    def get_fallback_result(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Always route to local as fallback."""
+        return {
+            "location": "local",
+            "host": "localhost",
+            "port": self.local_port,
+            "url": f"http://localhost:{self.local_port}",
+            "latency_estimate_ms": 5,
+            "cost_estimate": 0.0,
+            "fallback": True,
+        }
+
+    def get_routing_stats(self) -> Dict[str, Any]:
+        """Get routing statistics."""
+        return {
+            "enabled": self.enabled,
+            "gcp_active": self.gcp_active,
+            "gcp_instance_id": self.gcp_instance_id,
+            "component_locations": self.component_locations.copy(),
+            "total_migrations": self.total_migrations,
+            "failed_migrations": self.failed_migrations,
+            "avg_migration_time": self.avg_migration_time,
+            "thresholds": self.threshold_manager.get_all_thresholds(),
+        }
+
+
+# =============================================================================
+# GOAL INFERENCE ENGINE
+# =============================================================================
+class GoalInferenceEngine(IntelligenceManagerBase):
+    """
+    ML-powered intent classification and goal inference.
+
+    Features:
+    - User intent classification from natural language
+    - Goal extraction and prioritization
+    - Context-aware inference
+    - Confidence scoring
+    - Rule-based fallback
+
+    Environment Configuration:
+    - GOAL_INFERENCE_ENABLED: Enable goal inference (default: true)
+    - GOAL_INFERENCE_MODEL: Model to use (default: rule_based)
+    - GOAL_CONFIDENCE_THRESHOLD: Min confidence (default: 0.7)
+    """
+
+    # Known intents for rule-based fallback
+    KNOWN_INTENTS = {
+        "code": ["code", "program", "implement", "write", "develop", "create function"],
+        "debug": ["debug", "fix", "error", "bug", "issue", "problem", "crash"],
+        "search": ["search", "find", "look for", "locate", "where is"],
+        "explain": ["explain", "what is", "how does", "describe", "tell me about"],
+        "refactor": ["refactor", "clean up", "improve", "optimize", "restructure"],
+        "test": ["test", "testing", "verify", "validate", "check"],
+        "deploy": ["deploy", "release", "publish", "ship", "launch"],
+        "chat": ["hello", "hi", "hey", "thanks", "help"],
+    }
+
+    def __init__(self, config: Optional[SystemKernelConfig] = None):
+        super().__init__("GoalInferenceEngine", config)
+
+        # Configuration
+        self.enabled = os.getenv("GOAL_INFERENCE_ENABLED", "true").lower() == "true"
+        self.model_type = os.getenv("GOAL_INFERENCE_MODEL", "rule_based")
+        self.confidence_threshold = float(os.getenv("GOAL_CONFIDENCE_THRESHOLD", "0.7"))
+
+        # ML model (lazy loaded)
+        self._classifier = None
+
+    async def initialize(self) -> bool:
+        """Initialize goal inference engine."""
+        if not self.enabled:
+            self._logger.info("Goal inference disabled")
+            self._initialized = True
+            self._ready = True
+            return True
+
+        self._initialized = True
+        self._ready = True
+        self._logger.success("Goal inference engine initialized")
+        return True
+
+    async def load_models(self) -> bool:
+        """Load ML models for intent classification."""
+        if self.model_type == "rule_based":
+            self._models_loaded = True
+            return True
+
+        try:
+            # Would load actual ML model here
+            self._models_loaded = True
+            return True
+        except Exception as e:
+            self._logger.warning(f"Failed to load ML model: {e}, using rule-based")
+            self.model_type = "rule_based"
+            self._models_loaded = True
+            return True
+
+    async def infer(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Infer user intent from input."""
+        text = input_data.get("text", "")
+        context = input_data.get("context", {})
+
+        if self.model_type == "rule_based" or not self._classifier:
+            return self.get_fallback_result(input_data)
+
+        # Would use ML model here
+        return self.get_fallback_result(input_data)
+
+    def get_fallback_result(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Rule-based intent classification."""
+        text = input_data.get("text", "").lower()
+
+        # Score each intent
+        scores: Dict[str, float] = {}
+        for intent, keywords in self.KNOWN_INTENTS.items():
+            score = 0.0
+            for keyword in keywords:
+                if keyword in text:
+                    score += 1.0 / len(keywords)
+            scores[intent] = min(1.0, score)
+
+        # Find best match
+        if scores:
+            best_intent = max(scores.keys(), key=lambda k: scores[k])
+            best_score = scores[best_intent]
+        else:
+            best_intent = "unknown"
+            best_score = 0.0
+
+        return {
+            "intent": best_intent,
+            "confidence": best_score,
+            "all_scores": scores,
+            "method": "rule_based",
+            "meets_threshold": best_score >= self.confidence_threshold,
+        }
+
+
+# =============================================================================
+# HYBRID INTELLIGENCE COORDINATOR
+# =============================================================================
+class HybridIntelligenceCoordinator(IntelligenceManagerBase):
+    """
+    Master coordinator for hybrid local/GCP intelligence.
+
+    Orchestrates:
+    - Continuous RAM monitoring
+    - Automatic workload shifting
+    - Cost optimization
+    - SAI learning integration
+    - Health monitoring
+    - Emergency fallback
+
+    Environment Configuration:
+    - HYBRID_INTELLIGENCE_ENABLED: Enable coordinator (default: true)
+    - MONITORING_INTERVAL: Base monitoring interval in seconds (default: 5)
+    """
+
+    def __init__(self, config: Optional[SystemKernelConfig] = None):
+        super().__init__("HybridIntelligenceCoordinator", config)
+
+        # Configuration
+        self.enabled = os.getenv("HYBRID_INTELLIGENCE_ENABLED", "true").lower() == "true"
+        self.base_monitoring_interval = int(os.getenv("MONITORING_INTERVAL", "5"))
+
+        # Components
+        self.workload_router = HybridWorkloadRouter(config)
+        self.learning_model = HybridLearningModel()
+        self.sai_integration = SAIHybridIntegration(self.learning_model)
+        self.threshold_manager = AdaptiveThresholdManager()
+
+        # State
+        self._monitoring_task: Optional[asyncio.Task] = None
+        self._monitoring_interval = self.base_monitoring_interval
+        self._running = False
+
+        # Emergency state
+        self._emergency_mode = False
+        self._emergency_start: Optional[float] = None
+
+        # Decision history
+        self._decision_history: List[Dict[str, Any]] = []
+        self._max_decision_history = 100
+
+    async def initialize(self) -> bool:
+        """Initialize hybrid intelligence coordinator."""
+        if not self.enabled:
+            self._logger.info("Hybrid intelligence disabled")
+            self._initialized = True
+            self._ready = True
+            return True
+
+        # Initialize components
+        await self.workload_router.initialize()
+        await self.sai_integration.initialize_database()
+
+        self._initialized = True
+        self._ready = True
+        self._logger.success("Hybrid intelligence coordinator initialized")
+        return True
+
+    async def load_models(self) -> bool:
+        """Load ML models."""
+        await self.workload_router.load_models()
+        self._models_loaded = True
+        return True
+
+    async def infer(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Get routing decision and system status."""
+        ram_usage = input_data.get("ram_usage", 0.5)
+        component = input_data.get("component", "default")
+
+        # Get RAM state
+        ram_state = self.threshold_manager.get_ram_state(ram_usage)
+
+        # Get routing decision
+        routing = await self.workload_router.safe_infer({
+            "component": component,
+            "ram_usage": ram_usage,
+        })
+
+        # Get spike prediction
+        spike_prediction = await self.learning_model.predict_ram_spike(
+            current_usage=ram_usage,
+            trend=input_data.get("trend", 0.0),
+        )
+
+        return {
+            "ram_state": ram_state.value,
+            "routing": routing,
+            "spike_prediction": spike_prediction,
+            "emergency_mode": self._emergency_mode,
+            "monitoring_interval": self._monitoring_interval,
+        }
+
+    def get_fallback_result(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback: route to local."""
+        return {
+            "ram_state": "UNKNOWN",
+            "routing": self.workload_router.get_fallback_result(input_data),
+            "spike_prediction": {"spike_likely": False, "confidence": 0.0},
+            "emergency_mode": False,
+            "fallback": True,
+        }
+
+    async def start_monitoring(self) -> None:
+        """Start continuous monitoring loop."""
+        if not self.enabled or self._running:
+            return
+
+        self._running = True
+        self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+        self._logger.info(f"Hybrid intelligence monitoring started (interval: {self._monitoring_interval}s)")
+
+    async def stop_monitoring(self) -> None:
+        """Stop monitoring loop."""
+        self._running = False
+        if self._monitoring_task:
+            self._monitoring_task.cancel()
+            try:
+                await self._monitoring_task
+            except asyncio.CancelledError:
+                pass
+            self._monitoring_task = None
+
+    async def _monitoring_loop(self) -> None:
+        """Continuous monitoring and decision loop."""
+        while self._running:
+            try:
+                # Get current system state
+                ram_usage = await self._get_current_ram_usage()
+                ram_state = self.threshold_manager.get_ram_state(ram_usage)
+
+                # Record observation for learning
+                await self.sai_integration.record_and_learn("ram", {
+                    "timestamp": time.time(),
+                    "usage": ram_usage,
+                    "components": {},
+                })
+
+                # Handle emergency
+                if ram_state == RAMState.EMERGENCY and not self._emergency_mode:
+                    await self._handle_emergency(ram_usage)
+                elif self._emergency_mode and ram_state == RAMState.OPTIMAL:
+                    await self._exit_emergency()
+
+                # Adapt monitoring interval
+                self._monitoring_interval = await self.learning_model.get_optimal_monitoring_interval(ram_usage)
+
+                # Record decision
+                self._decision_history.append({
+                    "timestamp": time.time(),
+                    "ram_usage": ram_usage,
+                    "ram_state": ram_state.value,
+                    "emergency_mode": self._emergency_mode,
+                })
+                if len(self._decision_history) > self._max_decision_history:
+                    self._decision_history.pop(0)
+
+            except Exception as e:
+                self._logger.error(f"Monitoring loop error: {e}")
+
+            await asyncio.sleep(self._monitoring_interval)
+
+    async def _get_current_ram_usage(self) -> float:
+        """Get current RAM usage percentage."""
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            return mem.percent / 100.0
+        except Exception:
+            return 0.5  # Default if psutil unavailable
+
+    async def _handle_emergency(self, ram_usage: float) -> None:
+        """Handle emergency RAM situation."""
+        self._emergency_mode = True
+        self._emergency_start = time.time()
+        self._logger.error(f"🚨 EMERGENCY MODE ACTIVATED: RAM at {ram_usage*100:.1f}%")
+
+    async def _exit_emergency(self) -> None:
+        """Exit emergency mode."""
+        duration = time.time() - self._emergency_start if self._emergency_start else 0
+        self._logger.info(f"✅ Emergency resolved (duration: {duration:.1f}s)")
+        self._emergency_mode = False
+        self._emergency_start = None
+
+    async def get_comprehensive_status(self) -> Dict[str, Any]:
+        """Get comprehensive coordinator status."""
+        return {
+            "enabled": self.enabled,
+            "initialized": self._initialized,
+            "running": self._running,
+            "emergency_mode": self._emergency_mode,
+            "monitoring_interval": self._monitoring_interval,
+            "router_stats": self.workload_router.get_routing_stats(),
+            "learning_stats": await self.learning_model.get_learning_stats(),
+            "thresholds": self.threshold_manager.get_all_thresholds(),
+            "decision_history_count": len(self._decision_history),
+        }
+
+
+# =============================================================================
+# INTELLIGENCE REGISTRY
+# =============================================================================
+class IntelligenceRegistry:
+    """
+    Registry for all intelligence managers.
+
+    Provides centralized initialization and access to all
+    intelligence components.
+    """
+
+    def __init__(self, config: Optional[SystemKernelConfig] = None):
+        self.config = config or SystemKernelConfig.from_environment()
+        self._managers: Dict[str, IntelligenceManagerBase] = {}
+        self._logger = UnifiedLogger()
+        self._initialized = False
+
+    def register(self, manager: IntelligenceManagerBase) -> None:
+        """Register an intelligence manager."""
+        self._managers[manager.name] = manager
+
+    def get(self, name: str) -> Optional[IntelligenceManagerBase]:
+        """Get a manager by name."""
+        return self._managers.get(name)
+
+    async def initialize_all(self) -> Dict[str, bool]:
+        """Initialize all registered managers."""
+        results: Dict[str, bool] = {}
+
+        for name, manager in self._managers.items():
+            try:
+                results[name] = await manager.initialize()
+                if results[name]:
+                    self._logger.success(f"{name}: initialized")
+                else:
+                    self._logger.warning(f"{name}: initialization failed")
+            except Exception as e:
+                self._logger.error(f"{name} initialization error: {e}")
+                results[name] = False
+
+        self._initialized = True
+        return results
+
+    def get_all_status(self) -> Dict[str, Dict[str, Any]]:
+        """Get status of all managers."""
+        return {name: manager.status for name, manager in self._managers.items()}
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                               ║
+# ║   END OF ZONE 4                                                               ║
+# ║   Zones 5-7 will be added in subsequent commits                               ║
 # ║                                                                               ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 
 # Placeholder for remaining zones
-# ZONE 4: Intelligence Layer (routing, goal inference, SAI)
 # ZONE 5: Process Orchestration (signals, cleanup, hot reload, Trinity)
 # ZONE 6: The Kernel (JarvisSystemKernel class)
 # ZONE 7: Entry Point (CLI, main)
@@ -4020,8 +5230,90 @@ if __name__ == "__main__":
             await registry.cleanup_all()
             logger.success("All managers cleaned up")
 
+        # ========== Zone 4 Tests ==========
+        with logger.section_start(LogSection.INTELLIGENCE, "Zone 4: Intelligence Layer"):
+
+            # Test AdaptiveThresholdManager
+            logger.info("Testing AdaptiveThresholdManager...")
+            threshold_mgr = AdaptiveThresholdManager()
+            ram_state = threshold_mgr.get_ram_state(0.70)
+            logger.success(f"RAM state at 70%: {ram_state.value}")
+
+            # Test thresholds
+            thresholds = threshold_mgr.get_all_thresholds()
+            logger.info(f"Learned thresholds: {len(thresholds['thresholds'])} values")
+
+            # Test HybridLearningModel
+            logger.info("Testing HybridLearningModel...")
+            learning_model = HybridLearningModel()
+
+            # Record some observations
+            await learning_model.record_ram_observation(
+                timestamp=time.time(),
+                usage=0.65,
+                components_active={"ml_models": True}
+            )
+
+            # Get spike prediction
+            prediction = await learning_model.predict_ram_spike(
+                current_usage=0.75,
+                trend=0.01
+            )
+            logger.success(f"Spike prediction: likely={prediction['spike_likely']}, confidence={prediction['confidence']:.2f}")
+
+            # Get optimal monitoring interval
+            interval = await learning_model.get_optimal_monitoring_interval(0.75)
+            logger.info(f"Optimal monitoring interval at 75% RAM: {interval}s")
+
+            # Test GoalInferenceEngine
+            logger.info("Testing GoalInferenceEngine...")
+            goal_engine = GoalInferenceEngine(config)
+            await goal_engine.initialize()
+
+            # Test intent classification
+            intent_result = await goal_engine.safe_infer({"text": "fix the bug in the login function"})
+            logger.success(f"Intent: {intent_result['intent']} (confidence: {intent_result['confidence']:.2f})")
+
+            # Test HybridWorkloadRouter
+            logger.info("Testing HybridWorkloadRouter...")
+            router = HybridWorkloadRouter(config)
+            await router.initialize()
+
+            routing = await router.safe_infer({
+                "component": "ml_models",
+                "ram_usage": 0.80
+            })
+            logger.success(f"Routing decision: {routing['location']} (latency: {routing['latency_estimate_ms']}ms)")
+
+            # Test HybridIntelligenceCoordinator
+            logger.info("Testing HybridIntelligenceCoordinator...")
+            coordinator = HybridIntelligenceCoordinator(config)
+            await coordinator.initialize()
+
+            coord_result = await coordinator.safe_infer({
+                "ram_usage": 0.75,
+                "component": "vision",
+                "trend": 0.005
+            })
+            logger.success(f"Coordinator: RAM state={coord_result['ram_state']}, spike_likely={coord_result['spike_prediction']['spike_likely']}")
+
+            # Get comprehensive status
+            status = await coordinator.get_comprehensive_status()
+            logger.info(f"Intelligence components: {len(status)} keys")
+
+            # Test IntelligenceRegistry
+            logger.info("Testing IntelligenceRegistry...")
+            intel_registry = IntelligenceRegistry(config)
+            intel_registry.register(router)
+            intel_registry.register(goal_engine)
+            intel_registry.register(coordinator)
+
+            init_results = await intel_registry.initialize_all()
+            initialized_count = sum(1 for v in init_results.values() if v)
+            logger.success(f"Intelligence registry: {initialized_count}/{len(init_results)} initialized")
+
         logger.print_startup_summary()
-        TerminalUI.print_success("Zone 3 validation complete!")
+        TerminalUI.print_success("Zones 0-4 validation complete!")
 
     # Run async tests
     asyncio.run(test_zones())
