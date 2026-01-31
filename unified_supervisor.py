@@ -7300,3 +7300,1004 @@ if __name__ == "__main__":
     print("Running Zone 5 tests...")
     print("="*70 + "\n")
     asyncio.run(test_zone5())
+
+
+# =============================================================================
+# =============================================================================
+#
+#  ███████╗ ██████╗ ███╗   ██╗███████╗     ██████╗
+#  ╚══███╔╝██╔═══██╗████╗  ██║██╔════╝    ██╔════╝
+#    ███╔╝ ██║   ██║██╔██╗ ██║█████╗      ███████╗
+#   ███╔╝  ██║   ██║██║╚██╗██║██╔══╝      ██╔═══██╗
+#  ███████╗╚██████╔╝██║ ╚████║███████╗    ╚██████╔╝
+#  ╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝     ╚═════╝
+#
+#  ZONE 6: THE KERNEL
+#  Lines ~7300-9000
+#
+#  This zone contains:
+#  - JarvisSystemKernel: The brain that ties everything together
+#  - IPC Server: Unix socket for control commands
+#  - Startup phases: Preflight → Resources → Backend → Intelligence → Trinity
+#  - Main run loop: Health monitoring, cost optimization, IPC handling
+#  - Cleanup: Master shutdown orchestration
+#
+# =============================================================================
+# =============================================================================
+
+
+# =============================================================================
+# ZONE 6.1: KERNEL STATE AND STARTUP LOCK
+# =============================================================================
+
+class KernelState(Enum):
+    """States of the system kernel."""
+    INITIALIZING = "initializing"
+    PREFLIGHT = "preflight"
+    STARTING_RESOURCES = "starting_resources"
+    STARTING_BACKEND = "starting_backend"
+    STARTING_INTELLIGENCE = "starting_intelligence"
+    STARTING_TRINITY = "starting_trinity"
+    RUNNING = "running"
+    SHUTTING_DOWN = "shutting_down"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+class StartupLock:
+    """
+    Singleton enforcement for the kernel.
+
+    Ensures only one instance of the kernel can run at a time.
+    Uses file-based locking with PID tracking.
+    """
+
+    def __init__(self, lock_dir: Optional[Path] = None) -> None:
+        self._lock_dir = lock_dir or (Path.home() / ".jarvis" / "locks")
+        self._lock_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_file = self._lock_dir / "kernel.lock"
+        self._pid_file = self._lock_dir / "kernel.pid"
+        self._acquired = False
+
+    def acquire(self, force: bool = False) -> bool:
+        """
+        Attempt to acquire the startup lock.
+
+        Args:
+            force: If True, forcibly take the lock even if another process holds it
+
+        Returns:
+            True if lock was acquired, False otherwise
+        """
+        # Check if another process holds the lock
+        if self._pid_file.exists() and not force:
+            try:
+                pid = int(self._pid_file.read_text().strip())
+                if self._is_process_running(pid):
+                    return False  # Another kernel is running
+            except (ValueError, IOError):
+                pass  # Stale pid file
+
+        # Acquire the lock
+        try:
+            self._lock_file.write_text(str(time.time()))
+            self._pid_file.write_text(str(os.getpid()))
+            self._acquired = True
+            return True
+        except IOError:
+            return False
+
+    def release(self) -> None:
+        """Release the startup lock."""
+        if self._acquired:
+            try:
+                self._lock_file.unlink(missing_ok=True)
+                self._pid_file.unlink(missing_ok=True)
+            except IOError:
+                pass
+            self._acquired = False
+
+    def _is_process_running(self, pid: int) -> bool:
+        """Check if a process with given PID is running."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+
+    def get_current_holder(self) -> Optional[int]:
+        """Get the PID of the current lock holder."""
+        if self._pid_file.exists():
+            try:
+                return int(self._pid_file.read_text().strip())
+            except (ValueError, IOError):
+                pass
+        return None
+
+
+# =============================================================================
+# ZONE 6.2: IPC SERVER
+# =============================================================================
+
+class IPCCommand(Enum):
+    """Commands that can be sent to the kernel via IPC."""
+    HEALTH = "health"
+    STATUS = "status"
+    SHUTDOWN = "shutdown"
+    RESTART = "restart"
+    RELOAD = "reload"
+
+
+@dataclass
+class IPCRequest:
+    """IPC request from a client."""
+    command: IPCCommand
+    args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class IPCResponse:
+    """IPC response to a client."""
+    success: bool
+    result: Any = None
+    error: Optional[str] = None
+
+
+class IPCServer:
+    """
+    Unix socket server for inter-process communication.
+
+    Allows external tools (CLI, monitoring) to communicate with the running kernel.
+    Commands: health, status, shutdown, restart, reload
+    """
+
+    def __init__(
+        self,
+        config: SystemKernelConfig,
+        logger: UnifiedLogger,
+        socket_path: Optional[Path] = None,
+    ) -> None:
+        self.config = config
+        self.logger = logger
+        self._socket_path = socket_path or (Path.home() / ".jarvis" / "locks" / "kernel.sock")
+        self._socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self._server: Optional[asyncio.AbstractServer] = None
+        self._handlers: Dict[IPCCommand, Callable[..., Coroutine[Any, Any, Any]]] = {}
+        self._shutdown_event = asyncio.Event()
+
+    def register_handler(
+        self,
+        command: IPCCommand,
+        handler: Callable[..., Coroutine[Any, Any, Any]],
+    ) -> None:
+        """Register a handler for an IPC command."""
+        self._handlers[command] = handler
+
+    async def start(self) -> bool:
+        """Start the IPC server."""
+        # Remove stale socket file
+        if self._socket_path.exists():
+            try:
+                self._socket_path.unlink()
+            except IOError:
+                self.logger.warning("[IPC] Could not remove stale socket file")
+                return False
+
+        try:
+            self._server = await asyncio.start_unix_server(
+                self._handle_client,
+                path=str(self._socket_path),
+            )
+            self.logger.info(f"[IPC] Server listening on {self._socket_path}")
+            return True
+        except Exception as e:
+            self.logger.error(f"[IPC] Failed to start server: {e}")
+            return False
+
+    async def stop(self) -> None:
+        """Stop the IPC server."""
+        self._shutdown_event.set()
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+        if self._socket_path.exists():
+            try:
+                self._socket_path.unlink()
+            except IOError:
+                pass
+        self.logger.info("[IPC] Server stopped")
+
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle a client connection."""
+        try:
+            # Read request
+            data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            if not data:
+                return
+
+            # Parse request
+            try:
+                request_data = json.loads(data.decode())
+                command_str = request_data.get("command", "")
+                command = IPCCommand(command_str)
+                args = request_data.get("args", {})
+            except (json.JSONDecodeError, ValueError) as e:
+                response = IPCResponse(success=False, error=f"Invalid request: {e}")
+                await self._send_response(writer, response)
+                return
+
+            # Execute handler
+            if command in self._handlers:
+                try:
+                    result = await self._handlers[command](**args)
+                    response = IPCResponse(success=True, result=result)
+                except Exception as e:
+                    response = IPCResponse(success=False, error=str(e))
+            else:
+                response = IPCResponse(success=False, error=f"Unknown command: {command.value}")
+
+            await self._send_response(writer, response)
+
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            self.logger.debug(f"[IPC] Client handler error: {e}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _send_response(self, writer: asyncio.StreamWriter, response: IPCResponse) -> None:
+        """Send response to client."""
+        try:
+            response_data = {
+                "success": response.success,
+                "result": response.result,
+                "error": response.error,
+            }
+            writer.write(json.dumps(response_data).encode() + b"\n")
+            await writer.drain()
+        except Exception:
+            pass
+
+
+# =============================================================================
+# ZONE 6.3: JARVIS SYSTEM KERNEL
+# =============================================================================
+
+class JarvisSystemKernel:
+    """
+    The brain that ties the entire JARVIS system together.
+
+    This is the central coordinator that:
+    - Initializes all managers in the correct order
+    - Runs the full boot sequence through phases
+    - Manages the main event loop
+    - Orchestrates graceful shutdown
+
+    Singleton: Only one kernel can run at a time.
+
+    Startup Phases:
+    1. Preflight: Cleanup zombies, acquire lock, setup IPC
+    2. Resources: Docker, GCP, storage (parallel)
+    3. Backend: Start uvicorn server (in-process or subprocess)
+    4. Intelligence: Initialize ML layer
+    5. Trinity: Start cross-repo components
+
+    Background Tasks:
+    - Health monitoring
+    - Cost optimization
+    - IPC command handling
+    """
+
+    _instance: Optional["JarvisSystemKernel"] = None
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> "JarvisSystemKernel":
+        """Singleton pattern."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(
+        self,
+        config: Optional[SystemKernelConfig] = None,
+        force: bool = False,
+    ) -> None:
+        """
+        Initialize the kernel.
+
+        Args:
+            config: Kernel configuration. If None, uses defaults.
+            force: If True, forcibly take over from existing kernel.
+        """
+        # Avoid re-initialization in singleton
+        if hasattr(self, "_initialized") and self._initialized:
+            return
+
+        self.config = config or SystemKernelConfig()
+        self.logger = UnifiedLogger()
+        self._force = force
+        self._state = KernelState.INITIALIZING
+        self._started_at: Optional[float] = None
+        self._initialized = True
+
+        # Core components
+        self._startup_lock = StartupLock()
+        self._ipc_server = IPCServer(self.config, self.logger)
+        self._signal_handler = get_unified_signal_handler()
+
+        # Managers (initialized during startup)
+        self._resource_registry: Optional[ResourceManagerRegistry] = None
+        self._intelligence_registry: Optional[IntelligenceRegistry] = None
+        self._process_manager: Optional[ProcessStateManager] = None
+        self._readiness_manager: Optional[ProgressiveReadinessManager] = None
+        self._zombie_cleanup: Optional[ComprehensiveZombieCleanup] = None
+        self._hot_reload: Optional[HotReloadWatcher] = None
+        self._trinity: Optional[TrinityIntegrator] = None
+
+        # Backend process
+        self._backend_process: Optional[asyncio.subprocess.Process] = None
+        self._backend_server: Optional[Any] = None  # uvicorn.Server if in-process
+
+        # Background tasks
+        self._background_tasks: List[asyncio.Task] = []
+        self._shutdown_event = asyncio.Event()
+
+    @property
+    def state(self) -> KernelState:
+        """Current kernel state."""
+        return self._state
+
+    @property
+    def uptime_seconds(self) -> float:
+        """Kernel uptime in seconds."""
+        if self._started_at is None:
+            return 0.0
+        return time.time() - self._started_at
+
+    async def startup(self) -> int:
+        """
+        Run the full boot sequence.
+
+        Returns:
+            Exit code (0 for success, non-zero for failure)
+        """
+        self.logger.info("="*70)
+        self.logger.info("JARVIS SYSTEM KERNEL - Starting")
+        self.logger.info("="*70)
+
+        self._started_at = time.time()
+
+        try:
+            # Phase 1: Preflight
+            if not await self._phase_preflight():
+                return 1
+
+            # Phase 2: Resources
+            if not await self._phase_resources():
+                return 1
+
+            # Phase 3: Backend
+            if not await self._phase_backend():
+                return 1
+
+            # Phase 4: Intelligence
+            if not await self._phase_intelligence():
+                # Non-fatal - continue without intelligence
+                self.logger.warning("[Kernel] Intelligence layer failed - continuing without ML")
+
+            # Phase 5: Trinity
+            if self.config.trinity_enabled:
+                await self._phase_trinity()
+
+            # Mark as running
+            self._state = KernelState.RUNNING
+            if self._readiness_manager:
+                self._readiness_manager.mark_tier(ReadinessTier.FULLY_READY)
+
+            self.logger.success(f"[Kernel] ✅ Startup complete in {time.time() - self._started_at:.2f}s")
+            return 0
+
+        except Exception as e:
+            self.logger.error(f"[Kernel] Startup failed: {e}")
+            self.logger.error(traceback.format_exc())
+            self._state = KernelState.FAILED
+            return 1
+
+    async def _phase_preflight(self) -> bool:
+        """
+        Phase 1: Preflight checks and cleanup.
+
+        - Acquire startup lock
+        - Clean up zombie processes
+        - Initialize IPC server
+        - Install signal handlers
+        """
+        self._state = KernelState.PREFLIGHT
+
+        with self.logger.section_start(LogSection.BOOT, "Phase 1: Preflight"):
+            # Acquire startup lock
+            if not self._startup_lock.acquire(force=self._force):
+                holder_pid = self._startup_lock.get_current_holder()
+                self.logger.error(f"[Kernel] Another kernel is running (PID: {holder_pid})")
+                self.logger.error("[Kernel] Use --force to take over")
+                return False
+            self.logger.success("[Kernel] Startup lock acquired")
+
+            # Initialize managers
+            self._readiness_manager = ProgressiveReadinessManager(self.config, self.logger)
+            self._readiness_manager.mark_tier(ReadinessTier.STARTING)
+            await self._readiness_manager.start_heartbeat_loop()
+
+            self._process_manager = ProcessStateManager(self.config, self.logger)
+
+            # Zombie cleanup
+            self._zombie_cleanup = ComprehensiveZombieCleanup(self.config, self.logger)
+            cleanup_result = await self._zombie_cleanup.run_comprehensive_cleanup()
+            if cleanup_result["zombies_killed"] > 0:
+                self.logger.info(f"[Kernel] Cleaned {cleanup_result['zombies_killed']} zombie processes")
+
+            # Install signal handlers
+            loop = asyncio.get_event_loop()
+            self._signal_handler.install(loop)
+            self._signal_handler.register_callback(self._signal_shutdown)
+
+            # Start IPC server
+            await self._ipc_server.start()
+            self._register_ipc_handlers()
+
+            self._readiness_manager.mark_tier(ReadinessTier.PROCESS_STARTED)
+            return True
+
+    async def _phase_resources(self) -> bool:
+        """
+        Phase 2: Initialize resource managers.
+
+        Initializes in parallel:
+        - Docker daemon
+        - GCP services
+        - Dynamic port allocation
+        - Storage tiers
+        """
+        self._state = KernelState.STARTING_RESOURCES
+
+        with self.logger.section_start(LogSection.RESOURCES, "Phase 2: Resources"):
+            self._resource_registry = ResourceManagerRegistry(self.config)
+
+            # Create managers
+            port_manager = DynamicPortManager(self.config)
+            docker_manager = DockerDaemonManager(self.config)
+            gcp_manager = GCPInstanceManager(self.config)
+            storage_manager = TieredStorageManager(self.config)
+
+            # Register managers (order matters - ports first)
+            self._resource_registry.register(port_manager)
+            self._resource_registry.register(docker_manager)
+            self._resource_registry.register(gcp_manager)
+            self._resource_registry.register(storage_manager)
+
+            # Initialize all in parallel
+            results = await self._resource_registry.initialize_all()
+
+            # Check results (ports are critical)
+            if not results.get("DynamicPortManager", False):
+                self.logger.error("[Kernel] Failed to allocate ports")
+                return False
+
+            # Update config with selected port
+            self.config.backend_port = port_manager.selected_port
+            self.logger.success(f"[Kernel] Backend port: {self.config.backend_port}")
+
+            ready_count = sum(1 for v in results.values() if v)
+            self.logger.success(f"[Kernel] Resources: {ready_count}/{len(results)} initialized")
+            return True
+
+    async def _phase_backend(self) -> bool:
+        """
+        Phase 3: Start the backend server.
+
+        Can run:
+        - In-process: Using uvicorn.Server (shared memory, faster)
+        - Subprocess: Using asyncio.subprocess (isolated, more robust)
+        """
+        self._state = KernelState.STARTING_BACKEND
+
+        with self.logger.section_start(LogSection.BACKEND, "Phase 3: Backend"):
+            if self.config.in_process_backend:
+                success = await self._start_backend_in_process()
+            else:
+                success = await self._start_backend_subprocess()
+
+            if success and self._readiness_manager:
+                self._readiness_manager.mark_tier(ReadinessTier.HTTP_HEALTHY)
+                self._readiness_manager.mark_component_ready("backend", True)
+
+            return success
+
+    async def _start_backend_in_process(self) -> bool:
+        """Start backend as in-process uvicorn server."""
+        self.logger.info("[Kernel] Starting backend in-process...")
+
+        try:
+            # Import uvicorn
+            import uvicorn
+
+            # Import the FastAPI app
+            try:
+                from backend.main import app
+            except ImportError as e:
+                self.logger.error(f"[Kernel] Could not import backend app: {e}")
+                return False
+
+            # Create uvicorn config
+            uvicorn_config = uvicorn.Config(
+                app=app,
+                host=self.config.backend_host,
+                port=self.config.backend_port,
+                log_level="warning",
+                loop="asyncio",
+            )
+
+            # Create server
+            self._backend_server = uvicorn.Server(uvicorn_config)
+
+            # Run server in background task
+            task = asyncio.create_task(self._backend_server.serve())
+            self._background_tasks.append(task)
+
+            # Wait for server to be ready
+            for _ in range(30):  # 30 second timeout
+                if self._backend_server.started:
+                    self.logger.success(f"[Kernel] Backend running at http://{self.config.backend_host}:{self.config.backend_port}")
+                    return True
+                await asyncio.sleep(1.0)
+
+            self.logger.error("[Kernel] Backend failed to start in time")
+            return False
+
+        except ImportError:
+            self.logger.error("[Kernel] uvicorn not available for in-process mode")
+            return False
+        except Exception as e:
+            self.logger.error(f"[Kernel] In-process backend failed: {e}")
+            return False
+
+    async def _start_backend_subprocess(self) -> bool:
+        """Start backend as subprocess."""
+        self.logger.info("[Kernel] Starting backend subprocess...")
+
+        # Find backend script
+        backend_script = Path(__file__).parent / "backend" / "main.py"
+        if not backend_script.exists():
+            # Try alternative locations
+            for alt_path in [
+                Path(__file__).parent.parent / "backend" / "main.py",
+                Path.cwd() / "backend" / "main.py",
+            ]:
+                if alt_path.exists():
+                    backend_script = alt_path
+                    break
+
+        if not backend_script.exists():
+            self.logger.error(f"[Kernel] Backend script not found at {backend_script}")
+            return False
+
+        try:
+            # Start process
+            env = os.environ.copy()
+            env["JARVIS_BACKEND_PORT"] = str(self.config.backend_port)
+            env["JARVIS_KERNEL_PID"] = str(os.getpid())
+
+            self._backend_process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m", "uvicorn",
+                "backend.main:app",
+                "--host", self.config.backend_host,
+                "--port", str(self.config.backend_port),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Register with process manager
+            if self._process_manager:
+                await self._process_manager.register_process(
+                    "backend",
+                    self._backend_process,
+                    {"port": self.config.backend_port}
+                )
+
+            # Wait for backend to be ready (health check)
+            if await self._wait_for_backend_health(timeout=60.0):
+                self.logger.success(f"[Kernel] Backend running at http://{self.config.backend_host}:{self.config.backend_port}")
+                return True
+            else:
+                self.logger.error("[Kernel] Backend failed health check")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"[Kernel] Subprocess backend failed: {e}")
+            return False
+
+    async def _wait_for_backend_health(self, timeout: float = 60.0) -> bool:
+        """Wait for backend to respond to health checks."""
+        if not AIOHTTP_AVAILABLE:
+            # Simple socket check
+            start_time = time.time()
+            while (time.time() - start_time) < timeout:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1.0)
+                    result = sock.connect_ex(('localhost', self.config.backend_port))
+                    sock.close()
+                    if result == 0:
+                        return True
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+            return False
+
+        # HTTP health check
+        health_url = f"http://localhost:{self.config.backend_port}/health"
+        start_time = time.time()
+
+        while (time.time() - start_time) < timeout:
+            try:
+                async with aiohttp.ClientSession() as session:  # type: ignore[union-attr]
+                    async with session.get(health_url, timeout=5.0) as response:
+                        if response.status == 200:
+                            return True
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        return False
+
+    async def _phase_intelligence(self) -> bool:
+        """
+        Phase 4: Initialize intelligence layer.
+
+        Initializes:
+        - Adaptive threshold manager
+        - Hybrid workload router
+        - Goal inference engine
+        - Hybrid intelligence coordinator
+        """
+        self._state = KernelState.STARTING_INTELLIGENCE
+
+        with self.logger.section_start(LogSection.INTELLIGENCE, "Phase 4: Intelligence"):
+            try:
+                self._intelligence_registry = IntelligenceRegistry(self.config)
+
+                # Create managers
+                router = HybridWorkloadRouter(self.config)
+                goal_engine = GoalInferenceEngine(self.config)
+                coordinator = HybridIntelligenceCoordinator(self.config)
+
+                # Register managers
+                self._intelligence_registry.register(router)
+                self._intelligence_registry.register(goal_engine)
+                self._intelligence_registry.register(coordinator)
+
+                # Initialize all
+                results = await self._intelligence_registry.initialize_all()
+
+                ready_count = sum(1 for v in results.values() if v)
+                self.logger.success(f"[Kernel] Intelligence: {ready_count}/{len(results)} initialized")
+
+                if self._readiness_manager:
+                    self._readiness_manager.mark_component_ready("intelligence", ready_count > 0)
+
+                return ready_count > 0
+
+            except Exception as e:
+                self.logger.warning(f"[Kernel] Intelligence initialization failed: {e}")
+                return False
+
+    async def _phase_trinity(self) -> bool:
+        """
+        Phase 5: Initialize Trinity cross-repo integration.
+
+        Starts:
+        - J-Prime (local LLM inference)
+        - Reactor-Core (training pipeline)
+        """
+        self._state = KernelState.STARTING_TRINITY
+
+        with self.logger.section_start(LogSection.TRINITY, "Phase 5: Trinity"):
+            try:
+                self._trinity = TrinityIntegrator(self.config, self.logger)
+                await self._trinity.initialize()
+
+                # Start components
+                results = await self._trinity.start_components()
+
+                started_count = sum(1 for v in results.values() if v)
+                self.logger.success(f"[Kernel] Trinity: {started_count}/{len(results)} components started")
+
+                if self._readiness_manager:
+                    self._readiness_manager.mark_component_ready("trinity", started_count > 0)
+
+                return True  # Trinity is optional
+
+            except Exception as e:
+                self.logger.warning(f"[Kernel] Trinity initialization failed: {e}")
+                return True  # Non-fatal
+
+    async def run(self) -> int:
+        """
+        Run the main event loop.
+
+        Starts background tasks and waits for shutdown signal.
+
+        Returns:
+            Exit code
+        """
+        self.logger.info("[Kernel] Entering main loop...")
+
+        # Start hot reload if in dev mode
+        if self.config.dev_mode and self.config.hot_reload_enabled:
+            self._hot_reload = HotReloadWatcher(self.config, self.logger)
+            self._hot_reload.set_restart_callback(self._handle_hot_reload)
+            await self._hot_reload.start()
+
+        # Start background tasks
+        self._background_tasks.extend([
+            asyncio.create_task(self._health_monitor_loop(), name="health-monitor"),
+        ])
+
+        # If readiness manager has heartbeat, it's already running
+        # Add cost optimizer if scale-to-zero is enabled
+        if self.config.scale_to_zero_enabled:
+            self._background_tasks.append(
+                asyncio.create_task(self._cost_optimizer_loop(), name="cost-optimizer")
+            )
+
+        try:
+            # Wait for shutdown signal
+            await self._signal_handler.wait_for_shutdown()
+            self.logger.info("[Kernel] Shutdown signal received")
+            return await self.cleanup()
+
+        except asyncio.CancelledError:
+            self.logger.info("[Kernel] Main loop cancelled")
+            return await self.cleanup()
+
+    async def cleanup(self) -> int:
+        """
+        Master shutdown orchestration.
+
+        Stops all components in reverse order:
+        1. Background tasks
+        2. Trinity components
+        3. Intelligence layer
+        4. Backend
+        5. Resources
+        6. IPC server
+        7. Release lock
+
+        Returns:
+            Exit code
+        """
+        self._state = KernelState.SHUTTING_DOWN
+        self.logger.info("[Kernel] Initiating shutdown...")
+
+        with self.logger.section_start(LogSection.SHUTDOWN, "Shutdown"):
+            # Stop hot reload
+            if self._hot_reload:
+                await self._hot_reload.stop()
+
+            # Stop readiness heartbeat
+            if self._readiness_manager:
+                await self._readiness_manager.stop_heartbeat_loop()
+
+            # Cancel background tasks
+            for task in self._background_tasks:
+                task.cancel()
+
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+
+            # Stop Trinity
+            if self._trinity:
+                await self._trinity.stop()
+                self.logger.info("[Kernel] Trinity stopped")
+
+            # Stop backend
+            if self._backend_server:
+                self._backend_server.should_exit = True
+                self.logger.info("[Kernel] Backend server stopping")
+            elif self._backend_process:
+                self._backend_process.terminate()
+                try:
+                    await asyncio.wait_for(self._backend_process.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    self._backend_process.kill()
+                self.logger.info("[Kernel] Backend process stopped")
+
+            # Stop process manager
+            if self._process_manager:
+                await self._process_manager.stop_all()
+
+            # Cleanup resources
+            if self._resource_registry:
+                await self._resource_registry.cleanup_all()
+                self.logger.info("[Kernel] Resources cleaned up")
+
+            # Stop IPC server
+            await self._ipc_server.stop()
+
+            # Release lock
+            self._startup_lock.release()
+
+            self._state = KernelState.STOPPED
+            self.logger.success("[Kernel] Shutdown complete")
+
+            # Return appropriate exit code
+            if self._signal_handler.shutdown_reason == "SIGINT":
+                return 130  # 128 + SIGINT(2)
+            elif self._signal_handler.shutdown_reason == "SIGTERM":
+                return 143  # 128 + SIGTERM(15)
+            return 0
+
+    async def _signal_shutdown(self) -> None:
+        """Handle shutdown signal callback."""
+        self._shutdown_event.set()
+
+    def _register_ipc_handlers(self) -> None:
+        """Register IPC command handlers."""
+        self._ipc_server.register_handler(IPCCommand.HEALTH, self._ipc_health)
+        self._ipc_server.register_handler(IPCCommand.STATUS, self._ipc_status)
+        self._ipc_server.register_handler(IPCCommand.SHUTDOWN, self._ipc_shutdown)
+
+    async def _ipc_health(self) -> Dict[str, Any]:
+        """Handle health IPC command."""
+        return {
+            "healthy": self._state == KernelState.RUNNING,
+            "state": self._state.value,
+            "uptime_seconds": self.uptime_seconds,
+            "pid": os.getpid(),
+            "kernel_id": self.config.kernel_id,
+            "readiness": self._readiness_manager.get_status() if self._readiness_manager else {},
+        }
+
+    async def _ipc_status(self) -> Dict[str, Any]:
+        """Handle status IPC command."""
+        status: Dict[str, Any] = {
+            "state": self._state.value,
+            "uptime_seconds": self.uptime_seconds,
+            "pid": os.getpid(),
+            "config": {
+                "kernel_id": self.config.kernel_id,
+                "mode": self.config.mode,
+                "backend_port": self.config.backend_port,
+                "dev_mode": self.config.dev_mode,
+            },
+        }
+
+        if self._readiness_manager:
+            status["readiness"] = self._readiness_manager.get_status()
+
+        if self._resource_registry:
+            status["resources"] = self._resource_registry.get_all_status()
+
+        if self._trinity:
+            status["trinity"] = self._trinity.get_status()
+
+        if self._process_manager:
+            status["processes"] = self._process_manager.get_statistics()
+
+        return status
+
+    async def _ipc_shutdown(self) -> Dict[str, Any]:
+        """Handle shutdown IPC command."""
+        self._shutdown_event.set()
+        self._signal_handler._shutdown_requested = True
+        self._signal_handler._shutdown_event.set() if self._signal_handler._shutdown_event else None
+        return {"acknowledged": True, "message": "Shutdown initiated"}
+
+    async def _health_monitor_loop(self) -> None:
+        """Background health monitoring loop."""
+        interval = self.config.health_check_interval
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval)
+
+                # Check backend health
+                if self._backend_process:
+                    if self._backend_process.returncode is not None:
+                        self.logger.error("[Kernel] Backend process died!")
+                        if self._readiness_manager:
+                            self._readiness_manager.mark_component_ready("backend", False)
+                            self._readiness_manager.add_error("Backend process died")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Health monitor error: {e}")
+
+    async def _cost_optimizer_loop(self) -> None:
+        """Background cost optimization loop."""
+        interval = 60.0  # Check every minute
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval)
+
+                # Check for scale-to-zero conditions
+                # This would integrate with ScaleToZeroCostOptimizer
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Cost optimizer error: {e}")
+
+    async def _handle_hot_reload(self, changed_files: List[str]) -> None:
+        """Handle hot reload trigger."""
+        self.logger.info(f"[Kernel] Hot reload triggered by {len(changed_files)} file change(s)")
+
+        # For now, just log. Full implementation would restart backend.
+        for f in changed_files[:5]:
+            self.logger.info(f"  - {f}")
+        if len(changed_files) > 5:
+            self.logger.info(f"  ... and {len(changed_files) - 5} more")
+
+
+# =============================================================================
+# ZONE 6 TEST BLOCK
+# =============================================================================
+
+if __name__ == "__main__":
+    async def test_zone6():
+        """Test Zone 6 components."""
+        logger = UnifiedLogger()
+
+        print("="*70)
+        print("ZONE 6 TESTS: THE KERNEL")
+        print("="*70)
+
+        # Test StartupLock
+        with logger.section_start(LogSection.BOOT, "Zone 6.1: StartupLock"):
+            lock = StartupLock()
+            # Don't actually acquire during test
+            logger.success("StartupLock created")
+            holder = lock.get_current_holder()
+            logger.info(f"Current holder: {holder}")
+
+        # Test IPCServer
+        with logger.section_start(LogSection.BOOT, "Zone 6.2: IPCServer"):
+            config = SystemKernelConfig()
+            ipc = IPCServer(config, logger)
+            logger.success("IPCServer created")
+            logger.info(f"Socket path: {ipc._socket_path}")
+
+        # Test JarvisSystemKernel (partial - don't actually start)
+        with logger.section_start(LogSection.BOOT, "Zone 6.3: JarvisSystemKernel"):
+            # Reset singleton for testing
+            JarvisSystemKernel._instance = None
+
+            kernel = JarvisSystemKernel()
+            logger.success("JarvisSystemKernel created")
+            logger.info(f"State: {kernel.state.value}")
+            logger.info(f"Kernel ID: {kernel.config.kernel_id}")
+            logger.info(f"Mode: {kernel.config.mode}")
+
+            # Don't run startup, just verify structure
+            logger.info(f"Has startup lock: {kernel._startup_lock is not None}")
+            logger.info(f"Has IPC server: {kernel._ipc_server is not None}")
+            logger.info(f"Has signal handler: {kernel._signal_handler is not None}")
+
+        logger.print_startup_summary()
+        TerminalUI.print_success("Zone 6 validation complete!")
+
+    print("\n" + "="*70)
+    print("Running Zone 6 tests...")
+    print("="*70 + "\n")
+    asyncio.run(test_zone6())
