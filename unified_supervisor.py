@@ -13972,6 +13972,146 @@ class JarvisSystemKernel:
             return 0.0
         return time.time() - self._started_at
 
+    # =========================================================================
+    # SAFE PHASE INITIALIZATION (v107.0)
+    # =========================================================================
+    async def _safe_phase_init(
+        self,
+        phase_name: str,
+        init_coro: Coroutine[Any, Any, bool],
+        timeout_seconds: float = 30.0,
+        critical: bool = False,
+    ) -> bool:
+        """
+        v107.0: Safe phase initialization with timeout and error handling.
+
+        CRITICAL FIX: This prevents any single initialization phase from blocking
+        the entire startup flow indefinitely. Each phase gets a timeout and proper
+        error handling so the startup can continue even if non-critical phases fail.
+
+        Args:
+            phase_name: Human-readable name for logging (e.g., "PHASE 13: Neural Mesh Bridge")
+            init_coro: The async coroutine to execute (must return bool)
+            timeout_seconds: Maximum time to wait (default: 30s)
+            critical: If True, failure will be logged as error; otherwise warning
+
+        Returns:
+            True if initialization succeeded, False otherwise
+
+        Features:
+        - Timeout protection prevents indefinite blocking
+        - Error isolation ensures one phase can't crash startup
+        - Clear logging for debugging startup issues
+        - Graceful degradation - startup continues on non-critical failures
+        - Async-safe with proper cancellation handling
+        """
+        try:
+            self.logger.info(f"[v107.0] Starting {phase_name} (timeout: {timeout_seconds}s)...")
+            result = await asyncio.wait_for(init_coro, timeout=timeout_seconds)
+            if result:
+                self.logger.info(f"[v107.0] ✅ {phase_name} completed")
+            else:
+                msg = f"[v107.0] ⚠️ {phase_name} returned False"
+                if critical:
+                    self.logger.error(msg)
+                else:
+                    self.logger.warning(msg)
+            return result
+        except asyncio.TimeoutError:
+            msg = f"[v107.0] ⏱️ {phase_name} timed out after {timeout_seconds}s - skipping"
+            if critical:
+                self.logger.error(msg)
+            else:
+                self.logger.warning(msg)
+            return False
+        except asyncio.CancelledError:
+            self.logger.warning(f"[v107.0] ❌ {phase_name} cancelled")
+            raise  # Re-raise cancellation
+        except Exception as e:
+            msg = f"[v107.0] ❌ {phase_name} failed: {e}"
+            if critical:
+                self.logger.error(msg)
+            else:
+                self.logger.warning(msg)
+            self.logger.debug(traceback.format_exc())
+            return False
+
+    async def _run_with_global_timeout(
+        self,
+        coro: Coroutine[Any, Any, int],
+        timeout_seconds: float = 300.0,
+    ) -> int:
+        """
+        v80.0: Wrap startup in global timeout to prevent infinite hangs.
+
+        Args:
+            coro: The coroutine to execute
+            timeout_seconds: Maximum total startup time
+
+        Returns:
+            Exit code from the coroutine or 1 on timeout/error
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            self.logger.error(
+                f"🚨 GLOBAL STARTUP TIMEOUT after {timeout_seconds}s - "
+                "forcing emergency shutdown"
+            )
+            await self._emergency_shutdown()
+            return 1
+        except asyncio.CancelledError:
+            self.logger.warning("🛑 Startup cancelled (SIGINT/SIGTERM received)")
+            try:
+                await self._emergency_shutdown()
+            except asyncio.CancelledError:
+                pass  # Already shutting down
+            return 130  # Standard exit code for SIGINT
+        except Exception as e:
+            self.logger.error(f"🚨 Startup failed: {e}")
+            self.logger.error(traceback.format_exc())
+            try:
+                await self._emergency_shutdown()
+            except Exception:
+                pass
+            return 1
+
+    async def _emergency_shutdown(self) -> None:
+        """
+        Emergency shutdown - kill everything fast.
+
+        Called when:
+        - Global timeout exceeded
+        - Unhandled exception during startup
+        - Critical failure detected
+
+        Does NOT wait for graceful shutdown.
+        """
+        self.logger.warning("[Kernel] ⚠️ Emergency shutdown initiated")
+        self._state = KernelState.SHUTTING_DOWN
+
+        # Kill backend immediately
+        if self._backend_process:
+            self._backend_process.kill()
+        if self._backend_server:
+            self._backend_server.should_exit = True
+
+        # Kill frontend/loading server
+        if self._frontend_process:
+            self._frontend_process.kill()
+        if self._loading_server_process:
+            self._loading_server_process.kill()
+
+        # Cancel all background tasks
+        for task in self._background_tasks:
+            task.cancel()
+
+        # Release lock
+        self._startup_lock.release()
+
+        self._state = KernelState.STOPPED
+        self.logger.warning("[Kernel] ⚠️ Emergency shutdown complete")
+
     async def startup(self) -> int:
         """
         Run the full boot sequence.
