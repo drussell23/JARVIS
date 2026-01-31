@@ -2746,6 +2746,356 @@ class GCPInstanceManager(ResourceManagerBase):
 
 
 # =============================================================================
+# COST TRACKER
+# =============================================================================
+class CostTracker(ResourceManagerBase):
+    """
+    Enterprise-grade cost tracking for cloud resources.
+
+    Features:
+    - Real-time cost estimation for GCP VMs
+    - Session-based cost tracking with persistence
+    - Budget enforcement with alerts
+    - Daily/weekly/monthly cost summaries
+    - Spot vs regular VM savings calculation
+    - Cloud SQL and Cloud Run cost tracking
+
+    Environment Configuration:
+    - COST_TRACKING_ENABLED: Enable cost tracking (default: true)
+    - COST_SPOT_VM_HOURLY: Spot VM hourly rate (default: 0.029)
+    - COST_REGULAR_VM_HOURLY: Regular VM hourly rate (default: 0.097)
+    - COST_CLOUD_SQL_HOURLY: Cloud SQL hourly rate (default: 0.017)
+    - COST_BUDGET_DAILY_USD: Daily budget limit (default: 5.0)
+    - COST_BUDGET_MONTHLY_USD: Monthly budget limit (default: 100.0)
+    - COST_ALERT_THRESHOLD: Alert at % of budget (default: 0.8)
+    - COST_STATE_FILE: Path to persist cost state
+    """
+
+    def __init__(self, config: Optional[SystemKernelConfig] = None):
+        super().__init__("CostTracker", config)
+
+        # Configuration from environment
+        self.enabled = os.getenv("COST_TRACKING_ENABLED", "true").lower() == "true"
+        self.spot_vm_hourly = float(os.getenv("COST_SPOT_VM_HOURLY", "0.029"))
+        self.regular_vm_hourly = float(os.getenv("COST_REGULAR_VM_HOURLY", "0.097"))
+        self.cloud_sql_hourly = float(os.getenv("COST_CLOUD_SQL_HOURLY", "0.017"))
+        self.daily_budget = float(os.getenv("COST_BUDGET_DAILY_USD", "5.0"))
+        self.monthly_budget = float(os.getenv("COST_BUDGET_MONTHLY_USD", "100.0"))
+        self.alert_threshold = float(os.getenv("COST_ALERT_THRESHOLD", "0.8"))
+
+        # State file
+        self.state_file = Path(os.getenv(
+            "COST_STATE_FILE",
+            str(Path.home() / ".jarvis" / "cost_tracker.json")
+        ))
+
+        # Active sessions: instance_id -> session_info
+        self.active_sessions: Dict[str, Dict[str, Any]] = {}
+
+        # Cost accumulation
+        self._daily_cost = 0.0
+        self._monthly_cost = 0.0
+        self._total_cost = 0.0
+        self._savings_vs_regular = 0.0
+
+        # Tracking
+        self._cost_events: List[Dict[str, Any]] = []
+        self._alert_callbacks: List[Callable[[Dict[str, Any]], Awaitable[None]]] = []
+
+    async def initialize(self) -> bool:
+        """Initialize cost tracker and load persisted state."""
+        if not self.enabled:
+            self._logger.info("Cost tracking disabled")
+            self._initialized = True
+            return True
+
+        # Load persisted state
+        await self._load_state()
+
+        self._initialized = True
+        self._logger.success("Cost tracker initialized")
+        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Check cost tracker health and budget status."""
+        if not self.enabled:
+            return True, "Cost tracking disabled"
+
+        daily_pct = (self._daily_cost / self.daily_budget) * 100 if self.daily_budget > 0 else 0
+
+        if daily_pct >= 100:
+            return False, f"Daily budget exceeded: ${self._daily_cost:.2f}/${self.daily_budget:.2f}"
+        elif daily_pct >= self.alert_threshold * 100:
+            return True, f"Budget warning: ${self._daily_cost:.2f}/{self.daily_budget:.2f} ({daily_pct:.0f}%)"
+        else:
+            return True, f"Cost: ${self._daily_cost:.2f} today, ${self._monthly_cost:.2f} this month"
+
+    async def cleanup(self) -> None:
+        """Persist state and clean up."""
+        await self._save_state()
+        self._initialized = False
+
+    async def record_vm_created(
+        self,
+        instance_id: str,
+        vm_type: str = "spot",
+        components: Optional[List[str]] = None,
+        region: str = "us-central1",
+        trigger_reason: str = "HIGH_RAM"
+    ) -> None:
+        """
+        Record VM creation for cost tracking.
+
+        Args:
+            instance_id: GCP instance ID
+            vm_type: "spot" or "regular"
+            components: List of components deployed
+            region: GCP region
+            trigger_reason: Why VM was created
+        """
+        if not self.enabled:
+            return
+
+        session = {
+            "instance_id": instance_id,
+            "vm_type": vm_type,
+            "components": components or [],
+            "region": region,
+            "trigger_reason": trigger_reason,
+            "created_at": time.time(),
+            "hourly_rate": self.spot_vm_hourly if vm_type == "spot" else self.regular_vm_hourly,
+            "accumulated_cost": 0.0,
+        }
+
+        self.active_sessions[instance_id] = session
+        self._logger.info(f"💰 Cost tracking started for {instance_id} ({vm_type})")
+
+        # Record event
+        self._cost_events.append({
+            "type": "vm_created",
+            "timestamp": time.time(),
+            "instance_id": instance_id,
+            "vm_type": vm_type,
+        })
+
+    async def record_vm_deleted(self, instance_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Record VM deletion and calculate session cost.
+
+        Args:
+            instance_id: GCP instance ID
+
+        Returns:
+            Session cost summary
+        """
+        if not self.enabled or instance_id not in self.active_sessions:
+            return None
+
+        session = self.active_sessions.pop(instance_id)
+        duration_hours = (time.time() - session["created_at"]) / 3600
+        session_cost = duration_hours * session["hourly_rate"]
+
+        # Calculate savings
+        regular_cost = duration_hours * self.regular_vm_hourly
+        savings = regular_cost - session_cost if session["vm_type"] == "spot" else 0
+
+        # Update accumulators
+        self._daily_cost += session_cost
+        self._monthly_cost += session_cost
+        self._total_cost += session_cost
+        self._savings_vs_regular += savings
+
+        result = {
+            "instance_id": instance_id,
+            "duration_hours": duration_hours,
+            "session_cost": session_cost,
+            "hourly_rate": session["hourly_rate"],
+            "savings_vs_regular": savings,
+            "vm_type": session["vm_type"],
+        }
+
+        self._logger.info(
+            f"💰 Session ended: {instance_id} - "
+            f"${session_cost:.4f} ({duration_hours:.2f}h), saved ${savings:.4f}"
+        )
+
+        # Record event
+        self._cost_events.append({
+            "type": "vm_deleted",
+            "timestamp": time.time(),
+            "instance_id": instance_id,
+            **result,
+        })
+
+        # Check budget alerts
+        await self._check_budget_alerts()
+
+        # Persist state
+        await self._save_state()
+
+        return result
+
+    async def get_cost_summary(self, period: str = "day") -> Dict[str, Any]:
+        """
+        Get cost summary for a period.
+
+        Args:
+            period: "day", "week", "month", or "all"
+
+        Returns:
+            Cost summary
+        """
+        # Update active session costs
+        for instance_id, session in self.active_sessions.items():
+            duration_hours = (time.time() - session["created_at"]) / 3600
+            session["accumulated_cost"] = duration_hours * session["hourly_rate"]
+
+        active_cost = sum(s["accumulated_cost"] for s in self.active_sessions.values())
+
+        if period == "day":
+            total = self._daily_cost + active_cost
+            budget = self.daily_budget
+        elif period == "month":
+            total = self._monthly_cost + active_cost
+            budget = self.monthly_budget
+        else:
+            total = self._total_cost + active_cost
+            budget = self.monthly_budget
+
+        return {
+            "period": period,
+            "total_cost": total,
+            "budget": budget,
+            "budget_remaining": max(0, budget - total),
+            "budget_used_percent": (total / budget * 100) if budget > 0 else 0,
+            "active_sessions": len(self.active_sessions),
+            "active_cost": active_cost,
+            "total_savings": self._savings_vs_regular,
+        }
+
+    async def check_budget_available(self, estimated_cost: float) -> Tuple[bool, str]:
+        """
+        Check if budget is available for an operation.
+
+        Args:
+            estimated_cost: Estimated cost of operation
+
+        Returns:
+            (allowed, reason)
+        """
+        if not self.enabled:
+            return True, "Cost tracking disabled"
+
+        remaining = self.daily_budget - self._daily_cost
+        if estimated_cost > remaining:
+            return False, f"Insufficient budget: ${remaining:.2f} remaining, ${estimated_cost:.2f} needed"
+
+        return True, f"Budget available: ${remaining:.2f} remaining"
+
+    async def _check_budget_alerts(self) -> None:
+        """Check and trigger budget alerts."""
+        daily_pct = self._daily_cost / self.daily_budget if self.daily_budget > 0 else 0
+        monthly_pct = self._monthly_cost / self.monthly_budget if self.monthly_budget > 0 else 0
+
+        if daily_pct >= self.alert_threshold:
+            alert = {
+                "type": "daily_budget_warning",
+                "current": self._daily_cost,
+                "budget": self.daily_budget,
+                "percent": daily_pct * 100,
+            }
+            self._logger.warning(f"⚠️ Daily budget alert: ${self._daily_cost:.2f}/${self.daily_budget:.2f}")
+            for callback in self._alert_callbacks:
+                try:
+                    await callback(alert)
+                except Exception as e:
+                    self._logger.error(f"Alert callback failed: {e}")
+
+        if monthly_pct >= self.alert_threshold:
+            alert = {
+                "type": "monthly_budget_warning",
+                "current": self._monthly_cost,
+                "budget": self.monthly_budget,
+                "percent": monthly_pct * 100,
+            }
+            self._logger.warning(f"⚠️ Monthly budget alert: ${self._monthly_cost:.2f}/${self.monthly_budget:.2f}")
+            for callback in self._alert_callbacks:
+                try:
+                    await callback(alert)
+                except Exception as e:
+                    self._logger.error(f"Alert callback failed: {e}")
+
+    def register_alert_callback(self, callback: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
+        """Register a callback for budget alerts."""
+        self._alert_callbacks.append(callback)
+
+    async def _load_state(self) -> None:
+        """Load persisted cost state."""
+        try:
+            if self.state_file.exists():
+                data = json.loads(self.state_file.read_text())
+
+                # Reset daily cost if new day
+                last_date = data.get("last_date", "")
+                today = time.strftime("%Y-%m-%d")
+                if last_date != today:
+                    self._daily_cost = 0.0
+                else:
+                    self._daily_cost = data.get("daily_cost", 0.0)
+
+                # Reset monthly cost if new month
+                last_month = data.get("last_month", "")
+                this_month = time.strftime("%Y-%m")
+                if last_month != this_month:
+                    self._monthly_cost = 0.0
+                else:
+                    self._monthly_cost = data.get("monthly_cost", 0.0)
+
+                self._total_cost = data.get("total_cost", 0.0)
+                self._savings_vs_regular = data.get("savings", 0.0)
+
+                self._logger.debug(f"Loaded cost state: daily=${self._daily_cost:.2f}, monthly=${self._monthly_cost:.2f}")
+
+        except Exception as e:
+            self._logger.warning(f"Failed to load cost state: {e}")
+
+    async def _save_state(self) -> None:
+        """Persist cost state."""
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+            data = {
+                "last_date": time.strftime("%Y-%m-%d"),
+                "last_month": time.strftime("%Y-%m"),
+                "daily_cost": self._daily_cost,
+                "monthly_cost": self._monthly_cost,
+                "total_cost": self._total_cost,
+                "savings": self._savings_vs_regular,
+                "updated_at": time.time(),
+            }
+
+            self.state_file.write_text(json.dumps(data, indent=2))
+
+        except Exception as e:
+            self._logger.warning(f"Failed to save cost state: {e}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get cost tracker statistics."""
+        return {
+            "enabled": self.enabled,
+            "daily_cost": self._daily_cost,
+            "monthly_cost": self._monthly_cost,
+            "total_cost": self._total_cost,
+            "savings_vs_regular": self._savings_vs_regular,
+            "active_sessions": len(self.active_sessions),
+            "daily_budget": self.daily_budget,
+            "monthly_budget": self.monthly_budget,
+            "spot_rate": self.spot_vm_hourly,
+            "regular_rate": self.regular_vm_hourly,
+        }
+
+
+# =============================================================================
 # SCALE TO ZERO COST OPTIMIZER
 # =============================================================================
 class ScaleToZeroCostOptimizer(ResourceManagerBase):
@@ -5295,6 +5645,489 @@ class HybridWorkloadRouter(IntelligenceManagerBase):
             "cost_estimate": 0.0,
             "fallback": True,
         }
+
+    # =========================================================================
+    # GCP DEPLOYMENT METHODS
+    # =========================================================================
+
+    async def trigger_gcp_deployment(
+        self,
+        components: List[str],
+        reason: str = "HIGH_RAM"
+    ) -> Dict[str, Any]:
+        """
+        Trigger GCP deployment for specified components.
+
+        Args:
+            components: List of components to deploy (e.g., ["vision", "ml_models"])
+            reason: Reason for deployment (for cost tracking)
+
+        Returns:
+            Deployment result with instance_id, ip, and status
+        """
+        if self.migration_in_progress:
+            return {"success": False, "reason": "Migration already in progress"}
+
+        self.migration_in_progress = True
+        self.migration_start_time = time.time()
+
+        try:
+            self._logger.info(f"🚀 Initiating GCP deployment for: {', '.join(components)}")
+
+            # Step 1: Validate GCP configuration
+            gcp_config = await self._get_gcp_config()
+            if not gcp_config["valid"]:
+                raise Exception(f"GCP configuration invalid: {gcp_config['reason']}")
+
+            # Step 2: Deploy instance
+            deployment = await self._deploy_gcp_instance(components, gcp_config)
+
+            # Track instance for cleanup
+            self.gcp_instance_id = deployment["instance_id"]
+            self.gcp_instance_zone = deployment.get("zone", gcp_config.get("zone", "us-central1-a"))
+            self.gcp_active = True
+
+            self._logger.info(f"📝 Tracking GCP instance: {self.gcp_instance_id}")
+
+            # Step 3: Wait for instance to be ready
+            ready = await self._wait_for_gcp_ready(deployment["instance_id"], timeout=120)
+
+            # Get IP if not already set
+            if not self.gcp_ip:
+                self.gcp_ip = deployment.get("ip") or await self._get_instance_ip(deployment["instance_id"])
+
+            # Update component locations
+            for comp in components:
+                self.component_locations[comp] = "gcp"
+
+            # Update metrics
+            migration_time = time.time() - self.migration_start_time
+            self.total_migrations += 1
+            self.avg_migration_time = (
+                self.avg_migration_time * (self.total_migrations - 1) + migration_time
+            ) / self.total_migrations
+
+            if ready:
+                self._logger.success(f"GCP deployment successful in {migration_time:.1f}s")
+            else:
+                self._logger.warning(f"GCP instance created but health check timeout ({migration_time:.1f}s)")
+
+            return {
+                "success": True,
+                "instance_id": self.gcp_instance_id,
+                "ip": self.gcp_ip,
+                "zone": self.gcp_instance_zone,
+                "components": components,
+                "migration_time": migration_time,
+                "health_check_passed": ready,
+            }
+
+        except Exception as e:
+            self._logger.error(f"GCP deployment failed: {e}")
+            self.failed_migrations += 1
+            return {"success": False, "reason": str(e)}
+        finally:
+            self.migration_in_progress = False
+
+    async def _get_gcp_config(self) -> Dict[str, Any]:
+        """Get and validate GCP configuration."""
+        project_id = os.getenv("GCP_PROJECT_ID", "")
+        region = os.getenv("GCP_REGION", "us-central1")
+        zone = os.getenv("GCP_ZONE", f"{region}-a")
+        machine_type = os.getenv("GCP_MACHINE_TYPE", "e2-medium")
+        service_account = os.getenv("GCP_SERVICE_ACCOUNT", "")
+
+        # Validate required settings
+        if not project_id:
+            return {"valid": False, "reason": "GCP_PROJECT_ID not set"}
+
+        # Check for credentials
+        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        has_credentials = bool(credentials_path and Path(credentials_path).exists())
+
+        # Check for gcloud CLI
+        has_gcloud = shutil.which("gcloud") is not None
+
+        if not has_credentials and not has_gcloud:
+            return {"valid": False, "reason": "No GCP credentials found (neither file nor gcloud)"}
+
+        return {
+            "valid": True,
+            "project_id": project_id,
+            "region": region,
+            "zone": zone,
+            "machine_type": machine_type,
+            "service_account": service_account,
+            "has_credentials_file": has_credentials,
+            "has_gcloud": has_gcloud,
+            "repo_url": os.getenv("JARVIS_REPO_URL", "https://github.com/drussell23/JARVIS-AI-Agent.git"),
+            "branch": os.getenv("JARVIS_BRANCH", "main"),
+        }
+
+    async def _deploy_gcp_instance(
+        self,
+        components: List[str],
+        gcp_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Deploy a GCP Compute instance.
+
+        Args:
+            components: Components to deploy
+            gcp_config: GCP configuration
+
+        Returns:
+            Deployment info with instance_id and zone
+        """
+        instance_name = f"jarvis-{uuid.uuid4().hex[:8]}"
+
+        # Generate startup script
+        startup_script = self._generate_startup_script(gcp_config, components)
+
+        try:
+            # Try using google-cloud-compute library
+            from google.cloud import compute_v1
+
+            # Create instance config
+            instance = compute_v1.Instance()
+            instance.name = instance_name
+            instance.machine_type = f"zones/{gcp_config['zone']}/machineTypes/{gcp_config['machine_type']}"
+
+            # Spot instance scheduling (cost optimization)
+            scheduling = compute_v1.Scheduling()
+            scheduling.preemptible = True
+            scheduling.automatic_restart = False
+            scheduling.on_host_maintenance = "TERMINATE"
+            instance.scheduling = scheduling
+
+            # Boot disk
+            disk = compute_v1.AttachedDisk()
+            disk.boot = True
+            disk.auto_delete = True
+            init_params = compute_v1.AttachedDiskInitializeParams()
+            init_params.source_image = "projects/debian-cloud/global/images/family/debian-11"
+            init_params.disk_size_gb = 30
+            disk.initialize_params = init_params
+            instance.disks = [disk]
+
+            # Network interface
+            network_interface = compute_v1.NetworkInterface()
+            network_interface.network = "global/networks/default"
+            access_config = compute_v1.AccessConfig()
+            access_config.name = "External NAT"
+            access_config.type_ = "ONE_TO_ONE_NAT"
+            network_interface.access_configs = [access_config]
+            instance.network_interfaces = [network_interface]
+
+            # Metadata (startup script)
+            metadata = compute_v1.Metadata()
+            metadata.items = [
+                compute_v1.Items(key="startup-script", value=startup_script)
+            ]
+            instance.metadata = metadata
+
+            # Create instance
+            client = compute_v1.InstancesClient()
+            loop = asyncio.get_event_loop()
+            operation = await loop.run_in_executor(
+                None,
+                lambda: client.insert(
+                    project=gcp_config["project_id"],
+                    zone=gcp_config["zone"],
+                    instance_resource=instance
+                )
+            )
+
+            self._logger.info(f"GCP instance creation initiated: {instance_name}")
+
+            return {
+                "instance_id": instance_name,
+                "zone": gcp_config["zone"],
+                "operation": operation.name if hasattr(operation, "name") else None,
+            }
+
+        except ImportError:
+            # Fallback to gcloud CLI
+            return await self._deploy_via_gcloud(instance_name, gcp_config, startup_script)
+
+    async def _deploy_via_gcloud(
+        self,
+        instance_name: str,
+        gcp_config: Dict[str, Any],
+        startup_script: str
+    ) -> Dict[str, Any]:
+        """Deploy instance using gcloud CLI."""
+        # Write startup script to temp file
+        script_file = Path(f"/tmp/jarvis_startup_{uuid.uuid4().hex[:8]}.sh")
+        script_file.write_text(startup_script)
+
+        cmd = [
+            "gcloud", "compute", "instances", "create", instance_name,
+            f"--project={gcp_config['project_id']}",
+            f"--zone={gcp_config['zone']}",
+            f"--machine-type={gcp_config['machine_type']}",
+            "--preemptible",
+            "--image-family=debian-11",
+            "--image-project=debian-cloud",
+            "--boot-disk-size=30GB",
+            f"--metadata-from-file=startup-script={script_file}",
+            "--format=json",
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+
+            if process.returncode == 0:
+                result = json.loads(stdout.decode())
+                return {
+                    "instance_id": instance_name,
+                    "zone": gcp_config["zone"],
+                    "ip": result[0].get("networkInterfaces", [{}])[0].get("accessConfigs", [{}])[0].get("natIP"),
+                }
+            else:
+                raise Exception(f"gcloud failed: {stderr.decode()}")
+        finally:
+            script_file.unlink(missing_ok=True)
+
+    def _generate_startup_script(
+        self,
+        gcp_config: Dict[str, Any],
+        components: List[str]
+    ) -> str:
+        """Generate VM startup script."""
+        repo_url = gcp_config.get("repo_url", "https://github.com/drussell23/JARVIS-AI-Agent.git")
+        branch = gcp_config.get("branch", "main")
+
+        return f'''#!/bin/bash
+set -e
+
+# Log startup
+echo "=== JARVIS GCP Instance Starting ===" | tee /var/log/jarvis-startup.log
+
+# Install dependencies
+apt-get update -qq
+apt-get install -y -qq python3 python3-pip python3-venv git curl
+
+# Clone repository
+cd /opt
+git clone --depth 1 --branch {branch} {repo_url} jarvis
+cd jarvis
+
+# Create venv and install
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# Start components
+cd backend
+export JARVIS_MODE=gcp
+export JARVIS_COMPONENTS="{','.join(components)}"
+export BACKEND_PORT=8010
+
+# Start backend
+python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8010 &
+
+# Signal ready
+echo "JARVIS_READY" > /tmp/jarvis_ready
+curl -X POST http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/jarvis/ready \\
+    -H "Metadata-Flavor: Google" \\
+    -d "true" 2>/dev/null || true
+
+echo "=== JARVIS GCP Instance Ready ===" | tee -a /var/log/jarvis-startup.log
+'''
+
+    async def _wait_for_gcp_ready(self, instance_id: str, timeout: int = 300) -> bool:
+        """
+        Wait for GCP instance to be ready.
+
+        Args:
+            instance_id: Instance name
+            timeout: Max wait time in seconds
+
+        Returns:
+            True if instance is ready
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            # Try to get IP if we don't have it
+            if not self.gcp_ip:
+                ip = await self._get_instance_ip(instance_id)
+                if ip:
+                    self.gcp_ip = ip
+
+            # Health check if we have IP
+            if self.gcp_ip:
+                try:
+                    if AIOHTTP_AVAILABLE and aiohttp is not None:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(
+                                f"http://{self.gcp_ip}:{self.gcp_port}/health",
+                                timeout=aiohttp.ClientTimeout(total=5)
+                            ) as response:
+                                if response.status == 200:
+                                    self._logger.success(f"GCP instance ready: {self.gcp_ip}")
+                                    return True
+                except Exception:
+                    pass
+
+            await asyncio.sleep(5)
+
+        return False
+
+    async def _get_instance_ip(self, instance_id: str) -> Optional[str]:
+        """Get external IP of a GCP instance."""
+        zone = self.gcp_instance_zone or os.getenv("GCP_ZONE", "us-central1-a")
+        project = os.getenv("GCP_PROJECT_ID", "")
+
+        try:
+            # Try google-cloud library
+            from google.cloud import compute_v1
+            client = compute_v1.InstancesClient()
+
+            loop = asyncio.get_event_loop()
+            instance = await loop.run_in_executor(
+                None,
+                lambda: client.get(project=project, zone=zone, instance=instance_id)
+            )
+
+            for interface in instance.network_interfaces:
+                for config in interface.access_configs:
+                    if config.nat_i_p:
+                        return config.nat_i_p
+        except ImportError:
+            # Fallback to gcloud
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "gcloud", "compute", "instances", "describe", instance_id,
+                    f"--project={project}",
+                    f"--zone={zone}",
+                    "--format=json",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await process.communicate()
+                if process.returncode == 0:
+                    data = json.loads(stdout.decode())
+                    return data.get("networkInterfaces", [{}])[0].get("accessConfigs", [{}])[0].get("natIP")
+            except Exception:
+                pass
+        except Exception as e:
+            self._logger.debug(f"Failed to get instance IP: {e}")
+
+        return None
+
+    async def cleanup_gcp_instance(self, instance_id: Optional[str] = None) -> bool:
+        """
+        Clean up (delete) a GCP instance.
+
+        Args:
+            instance_id: Instance to delete (defaults to current)
+
+        Returns:
+            True if deletion succeeded
+        """
+        target_id = instance_id or self.gcp_instance_id
+        if not target_id:
+            return True  # Nothing to clean up
+
+        zone = self.gcp_instance_zone or os.getenv("GCP_ZONE", "us-central1-a")
+        project = os.getenv("GCP_PROJECT_ID", "")
+
+        self._logger.info(f"🧹 Cleaning up GCP instance: {target_id}")
+
+        try:
+            # Try google-cloud library
+            from google.cloud import compute_v1
+            client = compute_v1.InstancesClient()
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: client.delete(project=project, zone=zone, instance=target_id)
+            )
+
+            self._logger.success(f"GCP instance deleted: {target_id}")
+
+        except ImportError:
+            # Fallback to gcloud
+            process = await asyncio.create_subprocess_exec(
+                "gcloud", "compute", "instances", "delete", target_id,
+                f"--project={project}",
+                f"--zone={zone}",
+                "--quiet",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await process.communicate()
+
+            if process.returncode == 0:
+                self._logger.success(f"GCP instance deleted via gcloud: {target_id}")
+            else:
+                self._logger.warning(f"gcloud delete returned code {process.returncode}")
+
+        except Exception as e:
+            self._logger.error(f"Failed to delete GCP instance: {e}")
+            return False
+
+        # Clear state
+        if target_id == self.gcp_instance_id:
+            self.gcp_active = False
+            self.gcp_instance_id = None
+            self.gcp_ip = None
+            self.gcp_instance_zone = None
+
+        return True
+
+    async def shift_to_local(self, components: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Shift components from GCP back to local.
+
+        Args:
+            components: Specific components to shift (None = all GCP components)
+
+        Returns:
+            Shift result
+        """
+        target_components = components or [
+            comp for comp, loc in self.component_locations.items()
+            if loc == "gcp"
+        ]
+
+        if not target_components:
+            return {"success": True, "shifted": 0, "reason": "No GCP components to shift"}
+
+        try:
+            # Update routing table
+            for comp in target_components:
+                self.component_locations[comp] = "local"
+
+            self._logger.info(f"Shifted {len(target_components)} components to local")
+
+            # Clean up GCP instance if no components left
+            remaining_gcp = [
+                comp for comp, loc in self.component_locations.items()
+                if loc == "gcp"
+            ]
+
+            if not remaining_gcp and self.gcp_instance_id:
+                await self.cleanup_gcp_instance()
+
+            return {
+                "success": True,
+                "shifted": len(target_components),
+                "components": target_components,
+            }
+
+        except Exception as e:
+            self._logger.error(f"Failed to shift to local: {e}")
+            return {"success": False, "reason": str(e)}
 
     def get_routing_stats(self) -> Dict[str, Any]:
         """Get routing statistics."""
