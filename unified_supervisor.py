@@ -1074,13 +1074,728 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
-# ║   END OF ZONE 0 & ZONE 1                                                      ║
-# ║   Zones 2-7 will be added in subsequent commits                               ║
+# ║   ███████╗ ██████╗ ███╗   ██╗███████╗    ██████╗                             ║
+# ║   ╚══███╔╝██╔═══██╗████╗  ██║██╔════╝    ╚════██╗                            ║
+# ║     ███╔╝ ██║   ██║██╔██╗ ██║█████╗      █████╔╝                             ║
+# ║    ███╔╝  ██║   ██║██║╚██╗██║██╔══╝     ██╔═══╝                              ║
+# ║   ███████╗╚██████╔╝██║ ╚████║███████╗   ███████╗                             ║
+# ║   ╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝   ╚══════╝                              ║
+# ║                                                                               ║
+# ║   CORE UTILITIES - Logging, locks, retry logic, terminal UI                   ║
 # ║                                                                               ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 
-# Placeholder for remaining zones - will be implemented incrementally
-# ZONE 2: Core Utilities (UnifiedLogger, locks, retry, terminal UI)
+# =============================================================================
+# LOG LEVEL & SECTION ENUMS
+# =============================================================================
+class LogLevel(Enum):
+    """Log severity levels with ANSI color codes."""
+    DEBUG = ("DEBUG", "\033[36m")      # Cyan
+    INFO = ("INFO", "\033[32m")        # Green
+    WARNING = ("WARNING", "\033[33m")  # Yellow
+    ERROR = ("ERROR", "\033[31m")      # Red
+    CRITICAL = ("CRITICAL", "\033[35m") # Magenta
+    SUCCESS = ("SUCCESS", "\033[92m")  # Bright Green
+    PHASE = ("PHASE", "\033[94m")      # Bright Blue
+
+
+class LogSection(Enum):
+    """Logical sections for organized log output."""
+    BOOT = "BOOT"
+    CONFIG = "CONFIG"
+    DOCKER = "DOCKER"
+    GCP = "GCP"
+    BACKEND = "BACKEND"
+    TRINITY = "TRINITY"
+    INTELLIGENCE = "INTELLIGENCE"
+    VOICE = "VOICE"
+    HEALTH = "HEALTH"
+    SHUTDOWN = "SHUTDOWN"
+
+
+# =============================================================================
+# SECTION CONTEXT MANAGER
+# =============================================================================
+class SectionContext:
+    """Context manager for logging sections with timing."""
+
+    def __init__(self, logger: "UnifiedLogger", section: LogSection, title: str):
+        self.logger = logger
+        self.section = section
+        self.title = title
+        self.start_time: float = 0
+
+    def __enter__(self) -> "SectionContext":
+        self.start_time = time.perf_counter()
+        self.logger._render_section_header(self.section, self.title)
+        self.logger._section_stack.append(self.section)
+        self.logger._indent_level += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.logger._indent_level = max(0, self.logger._indent_level - 1)
+        if self.logger._section_stack:
+            self.logger._section_stack.pop()
+        duration_ms = (time.perf_counter() - self.start_time) * 1000
+        self.logger._render_section_footer(self.section, duration_ms)
+        return None
+
+
+# =============================================================================
+# PARALLEL TRACKER
+# =============================================================================
+class ParallelTracker:
+    """Track multiple parallel async operations."""
+
+    def __init__(self, logger: "UnifiedLogger", task_names: List[str]):
+        self.logger = logger
+        self.task_names = task_names
+        self._start_times: Dict[str, float] = {}
+        self._results: Dict[str, Tuple[bool, float]] = {}
+
+    async def __aenter__(self) -> "ParallelTracker":
+        self.logger.info(f"Starting {len(self.task_names)} parallel tasks: {', '.join(self.task_names)}")
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Log summary
+        successful = sum(1 for success, _ in self._results.values() if success)
+        total_time = max((t for _, t in self._results.values()), default=0)
+        self.logger.info(f"Parallel tasks: {successful}/{len(self.task_names)} succeeded in {total_time:.0f}ms")
+
+    async def track(self, name: str, coro: Awaitable[T]) -> T:
+        """Track a single task within the parallel operation."""
+        self._start_times[name] = time.perf_counter()
+        try:
+            result = await coro
+            duration = (time.perf_counter() - self._start_times[name]) * 1000
+            self._results[name] = (True, duration)
+            self.logger.debug(f"  [{name}] completed in {duration:.0f}ms")
+            return result
+        except Exception as e:
+            duration = (time.perf_counter() - self._start_times[name]) * 1000
+            self._results[name] = (False, duration)
+            self.logger.warning(f"  [{name}] failed in {duration:.0f}ms: {e}")
+            raise
+
+
+# =============================================================================
+# UNIFIED LOGGER
+# =============================================================================
+class UnifiedLogger:
+    """
+    Enterprise-grade logging with visual organization AND performance metrics.
+
+    Merges:
+    - OrganizedLogger: Section boxes, visual hierarchy
+    - PerformanceLogger: Millisecond timing, phase tracking
+
+    Features:
+    - Visual section boxes with ASCII headers
+    - Millisecond-precision timing
+    - Nested context tracking
+    - Parallel operation logging
+    - JSON output mode option
+    - Color-coded severity
+    - Thread-safe + asyncio-safe
+    """
+
+    _instance: Optional["UnifiedLogger"] = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __new__(cls) -> "UnifiedLogger":
+        """Singleton pattern."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    instance = super().__new__(cls)
+                    instance._initialize()
+                    cls._instance = instance
+        return cls._instance
+
+    def _initialize(self) -> None:
+        """Initialize logger state."""
+        self._start_time = time.perf_counter()
+        self._phase_times: Dict[str, float] = {}
+        self._active_phases: Dict[str, float] = {}
+        self._section_stack: List[LogSection] = []
+        self._indent_level: int = 0
+        self._metrics: Dict[str, List[float]] = defaultdict(list)
+        self._json_mode = _get_env_bool("JARVIS_LOG_JSON", False)
+        self._verbose = _get_env_bool("JARVIS_VERBOSE", False)
+        self._colors_enabled = sys.stdout.isatty()
+        self._log_lock = threading.Lock()
+
+    def _elapsed_ms(self) -> float:
+        """Get elapsed time since logger start in milliseconds."""
+        return (time.perf_counter() - self._start_time) * 1000
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # VISUAL SECTIONS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def section_start(self, section: LogSection, title: str) -> SectionContext:
+        """Start a visual section with box header."""
+        return SectionContext(self, section, title)
+
+    def _render_section_header(self, section: LogSection, title: str) -> None:
+        """Render ASCII box header."""
+        width = 70
+        elapsed = self._elapsed_ms()
+        reset = "\033[0m" if self._colors_enabled else ""
+        blue = "\033[94m" if self._colors_enabled else ""
+
+        with self._log_lock:
+            print(f"\n{blue}{'═' * width}{reset}")
+            print(f"{blue}║{reset} {section.value:12} │ {title:<43} │ +{elapsed:>6.0f}ms {blue}║{reset}")
+            print(f"{blue}{'═' * width}{reset}")
+
+    def _render_section_footer(self, section: LogSection, duration_ms: float) -> None:
+        """Render ASCII box footer with timing."""
+        width = 70
+        reset = "\033[0m" if self._colors_enabled else ""
+        blue = "\033[94m" if self._colors_enabled else ""
+
+        with self._log_lock:
+            print(f"{blue}{'─' * width}{reset}")
+            print(f"  └── {section.value} completed in {duration_ms:.1f}ms\n")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PERFORMANCE TRACKING
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def phase_start(self, phase_name: str) -> None:
+        """Mark the start of a timed phase."""
+        self._active_phases[phase_name] = time.perf_counter()
+
+    def phase_end(self, phase_name: str) -> float:
+        """Mark the end of a phase, return duration in ms."""
+        if phase_name not in self._active_phases:
+            return 0.0
+        duration = (time.perf_counter() - self._active_phases.pop(phase_name)) * 1000
+        self._phase_times[phase_name] = duration
+        self._metrics[phase_name].append(duration)
+        return duration
+
+    @contextmanager
+    def timed(self, operation: str) -> Generator[None, None, None]:
+        """Context manager for timing operations."""
+        self.phase_start(operation)
+        try:
+            yield
+        finally:
+            duration = self.phase_end(operation)
+            self.debug(f"{operation} completed in {duration:.1f}ms")
+
+    async def timed_async(self, operation: str, coro: Awaitable[T]) -> T:
+        """Async wrapper for timing coroutines."""
+        self.phase_start(operation)
+        try:
+            return await coro
+        finally:
+            duration = self.phase_end(operation)
+            self.debug(f"{operation} completed in {duration:.1f}ms")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PARALLEL TRACKING
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def parallel_start(self, task_names: List[str]) -> ParallelTracker:
+        """Track multiple parallel operations."""
+        return ParallelTracker(self, task_names)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # STANDARD LOGGING METHODS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _log(self, level: LogLevel, message: str, **kwargs) -> None:
+        """Core logging method."""
+        elapsed = self._elapsed_ms()
+        indent = "  " * self._indent_level
+
+        if self._json_mode:
+            self._log_json(level, message, elapsed, **kwargs)
+        else:
+            reset = "\033[0m" if self._colors_enabled else ""
+            color = level.value[1] if self._colors_enabled else ""
+            level_str = f"[{level.value[0]:8}]"
+            time_str = f"+{elapsed:>7.0f}ms"
+
+            with self._log_lock:
+                print(f"{color}{level_str}{reset} {time_str} │ {indent}{message}")
+
+    def _log_json(self, level: LogLevel, message: str, elapsed: float, **kwargs) -> None:
+        """Log in JSON format."""
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "level": level.value[0],
+            "elapsed_ms": round(elapsed, 1),
+            "message": message,
+            **kwargs,
+        }
+        with self._log_lock:
+            print(json.dumps(log_entry))
+
+    def debug(self, message: str, **kwargs) -> None:
+        """Debug level logging (only in verbose mode)."""
+        if self._verbose:
+            self._log(LogLevel.DEBUG, message, **kwargs)
+
+    def info(self, message: str, **kwargs) -> None:
+        """Info level logging."""
+        self._log(LogLevel.INFO, message, **kwargs)
+
+    def success(self, message: str, **kwargs) -> None:
+        """Success level logging."""
+        self._log(LogLevel.SUCCESS, f"✓ {message}", **kwargs)
+
+    def warning(self, message: str, **kwargs) -> None:
+        """Warning level logging."""
+        self._log(LogLevel.WARNING, f"⚠ {message}", **kwargs)
+
+    def error(self, message: str, **kwargs) -> None:
+        """Error level logging."""
+        self._log(LogLevel.ERROR, f"✗ {message}", **kwargs)
+
+    def critical(self, message: str, **kwargs) -> None:
+        """Critical level logging."""
+        self._log(LogLevel.CRITICAL, f"🔥 {message}", **kwargs)
+
+    def phase(self, message: str, **kwargs) -> None:
+        """Phase announcement logging."""
+        self._log(LogLevel.PHASE, f"▸ {message}", **kwargs)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # METRICS & SUMMARY
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def get_metrics_summary(self) -> Dict[str, Any]:
+        """Get performance metrics summary."""
+        return {
+            "total_elapsed_ms": self._elapsed_ms(),
+            "phase_times": dict(self._phase_times),
+            "phase_averages": {
+                k: sum(v) / len(v) for k, v in self._metrics.items() if v
+            },
+        }
+
+    def print_startup_summary(self) -> None:
+        """Print final startup timing summary."""
+        total = self._elapsed_ms()
+        reset = "\033[0m" if self._colors_enabled else ""
+        green = "\033[92m" if self._colors_enabled else ""
+
+        print(f"\n{green}{'═' * 70}{reset}")
+        print(f"{green}║ STARTUP COMPLETE │ Total: {total:.0f}ms ({total/1000:.2f}s){reset}")
+        print(f"{green}{'═' * 70}{reset}")
+
+        # Top 5 slowest phases
+        sorted_phases = sorted(self._phase_times.items(), key=lambda x: x[1], reverse=True)[:5]
+        if sorted_phases:
+            print("║ Slowest phases:")
+            for phase, duration in sorted_phases:
+                pct = (duration / total * 100) if total > 0 else 0
+                bar_len = int(pct / 100 * 30)
+                bar = "█" * bar_len + "░" * (30 - bar_len)
+                print(f"║   {phase:30} │ {bar} │ {duration:>6.0f}ms ({pct:>4.1f}%)")
+
+        print(f"{green}{'═' * 70}{reset}\n")
+
+
+# =============================================================================
+# STARTUP LOCK (Singleton Enforcement)
+# =============================================================================
+class StartupLock:
+    """
+    Enforce single-instance kernel using file locks.
+
+    Features:
+    - PID-based lock verification
+    - Stale lock detection and cleanup
+    - Lock file contains process metadata
+    """
+
+    def __init__(self, lock_name: str = "kernel"):
+        self.lock_name = lock_name
+        self.lock_path = LOCKS_DIR / f"{lock_name}.lock"
+        self.pid = os.getpid()
+        self._acquired = False
+
+    def is_locked(self) -> Tuple[bool, Optional[int]]:
+        """Check if lock is held. Returns (is_locked, holder_pid)."""
+        if not self.lock_path.exists():
+            return False, None
+
+        try:
+            content = self.lock_path.read_text().strip()
+            data = json.loads(content)
+            holder_pid = data.get("pid")
+
+            if holder_pid and self._is_process_alive(holder_pid):
+                return True, holder_pid
+            else:
+                # Stale lock
+                return False, None
+
+        except (json.JSONDecodeError, KeyError, OSError):
+            return False, None
+
+    def _is_process_alive(self, pid: int) -> bool:
+        """Check if a process is alive."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    def acquire(self, force: bool = False) -> bool:
+        """
+        Acquire the lock.
+
+        Args:
+            force: If True, forcibly take lock from another process
+
+        Returns:
+            True if lock acquired, False otherwise
+        """
+        is_locked, holder_pid = self.is_locked()
+
+        if is_locked and not force:
+            return False
+
+        # Clean up stale lock or force acquire
+        if self.lock_path.exists():
+            self.lock_path.unlink()
+
+        # Write new lock
+        lock_data = {
+            "pid": self.pid,
+            "acquired_at": datetime.now().isoformat(),
+            "kernel_version": KERNEL_VERSION,
+            "hostname": platform.node(),
+        }
+
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path.write_text(json.dumps(lock_data, indent=2))
+        self._acquired = True
+
+        return True
+
+    def release(self) -> None:
+        """Release the lock."""
+        if self._acquired and self.lock_path.exists():
+            try:
+                content = self.lock_path.read_text()
+                data = json.loads(content)
+                if data.get("pid") == self.pid:
+                    self.lock_path.unlink()
+            except (json.JSONDecodeError, OSError):
+                pass
+        self._acquired = False
+
+    def __enter__(self) -> "StartupLock":
+        if not self.acquire():
+            raise RuntimeError(f"Could not acquire lock: {self.lock_name}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.release()
+
+
+# =============================================================================
+# CIRCUIT BREAKER STATE
+# =============================================================================
+class CircuitBreakerState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing recovery
+
+
+# =============================================================================
+# CIRCUIT BREAKER
+# =============================================================================
+class CircuitBreaker:
+    """
+    Circuit breaker pattern for fault tolerance.
+
+    Prevents cascade failures by stopping requests to failing services.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+    ):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+
+        self._state = CircuitBreakerState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time: Optional[float] = None
+        self._half_open_calls = 0
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> CircuitBreakerState:
+        """Get current state (may transition from OPEN to HALF_OPEN)."""
+        with self._lock:
+            if self._state == CircuitBreakerState.OPEN:
+                if self._last_failure_time and \
+                   time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = CircuitBreakerState.HALF_OPEN
+                    self._half_open_calls = 0
+            return self._state
+
+    def can_execute(self) -> bool:
+        """Check if execution is allowed."""
+        state = self.state
+        if state == CircuitBreakerState.CLOSED:
+            return True
+        if state == CircuitBreakerState.HALF_OPEN:
+            with self._lock:
+                if self._half_open_calls < self.half_open_max_calls:
+                    self._half_open_calls += 1
+                    return True
+        return False
+
+    def record_success(self) -> None:
+        """Record successful execution."""
+        with self._lock:
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self.half_open_max_calls:
+                    self._state = CircuitBreakerState.CLOSED
+                    self._failure_count = 0
+                    self._success_count = 0
+            elif self._state == CircuitBreakerState.CLOSED:
+                self._failure_count = max(0, self._failure_count - 1)
+
+    def record_failure(self) -> None:
+        """Record failed execution."""
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.OPEN
+            elif self._failure_count >= self.failure_threshold:
+                self._state = CircuitBreakerState.OPEN
+
+    async def execute(self, coro: Awaitable[T]) -> T:
+        """Execute with circuit breaker protection."""
+        if not self.can_execute():
+            raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+
+        try:
+            result = await coro
+            self.record_success()
+            return result
+        except Exception:
+            self.record_failure()
+            raise
+
+
+# =============================================================================
+# RETRY WITH BACKOFF
+# =============================================================================
+class RetryWithBackoff:
+    """
+    Retry logic with exponential backoff.
+
+    Features:
+    - Configurable max retries and delays
+    - Exponential backoff with jitter
+    - Exception filtering
+    """
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
+        exponential_base: float = 2.0,
+        jitter: float = 0.1,
+        retry_exceptions: Optional[Tuple[Type[Exception], ...]] = None,
+    ):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.exponential_base = exponential_base
+        self.jitter = jitter
+        self.retry_exceptions = retry_exceptions or (Exception,)
+
+    def _calculate_delay(self, attempt: int) -> float:
+        """Calculate delay for given attempt with jitter."""
+        delay = min(
+            self.base_delay * (self.exponential_base ** attempt),
+            self.max_delay
+        )
+        # Add jitter
+        jitter_range = delay * self.jitter
+        delay += (time.time() % 1) * jitter_range * 2 - jitter_range
+        return max(0, delay)
+
+    async def execute(
+        self,
+        coro_factory: Callable[[], Awaitable[T]],
+        operation_name: str = "operation",
+    ) -> T:
+        """Execute with retry logic."""
+        last_exception: Optional[Exception] = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await coro_factory()
+            except self.retry_exceptions as e:
+                last_exception = e
+
+                if attempt < self.max_retries:
+                    delay = self._calculate_delay(attempt)
+                    logging.debug(
+                        f"Retry {attempt + 1}/{self.max_retries} for {operation_name} "
+                        f"after {delay:.1f}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+
+        raise last_exception or RuntimeError(f"Retries exhausted for {operation_name}")
+
+
+# =============================================================================
+# TERMINAL UI HELPERS
+# =============================================================================
+class TerminalUI:
+    """Terminal UI utilities for visual feedback."""
+
+    # ANSI color codes
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
+    @classmethod
+    def _supports_color(cls) -> bool:
+        """Check if terminal supports colors."""
+        return sys.stdout.isatty()
+
+    @classmethod
+    def _color(cls, text: str, color: str) -> str:
+        """Apply color to text if supported."""
+        if cls._supports_color():
+            return f"{color}{text}{cls.RESET}"
+        return text
+
+    @classmethod
+    def print_banner(cls, title: str, subtitle: str = "") -> None:
+        """Print a banner with title."""
+        width = 70
+
+        print()
+        print(cls._color("╔" + "═" * (width - 2) + "╗", cls.CYAN))
+        print(cls._color("║", cls.CYAN) + f" {title:^{width - 4}} " + cls._color("║", cls.CYAN))
+        if subtitle:
+            print(cls._color("║", cls.CYAN) + f" {subtitle:^{width - 4}} " + cls._color("║", cls.CYAN))
+        print(cls._color("╚" + "═" * (width - 2) + "╝", cls.CYAN))
+        print()
+
+    @classmethod
+    def print_success(cls, message: str) -> None:
+        """Print success message."""
+        print(cls._color(f"✓ {message}", cls.GREEN))
+
+    @classmethod
+    def print_error(cls, message: str) -> None:
+        """Print error message."""
+        print(cls._color(f"✗ {message}", cls.RED))
+
+    @classmethod
+    def print_warning(cls, message: str) -> None:
+        """Print warning message."""
+        print(cls._color(f"⚠ {message}", cls.YELLOW))
+
+    @classmethod
+    def print_info(cls, message: str) -> None:
+        """Print info message."""
+        print(cls._color(f"ℹ {message}", cls.BLUE))
+
+    @classmethod
+    def print_progress(cls, current: int, total: int, label: str = "") -> None:
+        """Print a progress bar."""
+        if total == 0:
+            pct = 100
+        else:
+            pct = int(current / total * 100)
+
+        bar_width = 30
+        filled = int(bar_width * current / total) if total > 0 else bar_width
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        line = f"\r  [{bar}] {pct:3d}% {label}"
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+        if current >= total:
+            print()  # New line when complete
+
+
+# =============================================================================
+# BENIGN WARNING FILTER
+# =============================================================================
+class BenignWarningFilter(logging.Filter):
+    """
+    Filter to suppress known benign warnings from ML frameworks.
+
+    These warnings are informational and not actual problems:
+    - "Wav2Vec2Model is frozen" = Expected for inference
+    - "Some weights not initialized" = Expected for fine-tuned models
+    """
+
+    _SUPPRESSED_PATTERNS = [
+        'wav2vec2model is frozen',
+        'model is frozen',
+        'weights were not initialized',
+        'you should probably train',
+        'some weights of the model checkpoint',
+        'initializing bert',
+        'initializing wav2vec',
+        'registered checkpoint',
+        'non-supported python version',
+        'gspread not available',
+        'redis not available',
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return False to suppress, True to allow."""
+        msg_lower = record.getMessage().lower()
+        for pattern in self._SUPPRESSED_PATTERNS:
+            if pattern in msg_lower:
+                return False
+        return True
+
+
+# Install benign warning filter on noisy loggers
+_benign_filter = BenignWarningFilter()
+for _logger_name in ["speechbrain", "transformers", "transformers.modeling_utils"]:
+    logging.getLogger(_logger_name).addFilter(_benign_filter)
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║                                                                               ║
+# ║   END OF ZONE 2                                                               ║
+# ║   Zones 3-7 will be added in subsequent commits                               ║
+# ║                                                                               ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# Placeholder for remaining zones
 # ZONE 3: Resource Managers (Docker, GCP, ports, storage)
 # ZONE 4: Intelligence Layer (routing, goal inference, SAI)
 # ZONE 5: Process Orchestration (signals, cleanup, hot reload, Trinity)
@@ -1088,20 +1803,37 @@ if str(PROJECT_ROOT) not in sys.path:
 # ZONE 7: Entry Point (CLI, main)
 
 if __name__ == "__main__":
-    print(f"\n{KERNEL_NAME} v{KERNEL_VERSION}")
-    print("=" * 60)
-    print("Zone 0 (Early Protection) and Zone 1 (Foundation) implemented.")
-    print("Zones 2-7 coming soon...")
-    print("=" * 60)
+    # Test Zone 0, 1, and 2
+    TerminalUI.print_banner(f"{KERNEL_NAME} v{KERNEL_VERSION}", "Zone 0, 1, 2 Implemented")
 
-    # Show config summary
+    # Initialize logger
+    logger = UnifiedLogger()
+
+    # Show config
     config = SystemKernelConfig.from_environment()
-    print("\nConfiguration:")
-    print(config.summary())
+    logger.info("Configuration loaded")
 
-    # Show warnings
+    with logger.section_start(LogSection.CONFIG, "Configuration Summary"):
+        for line in config.summary().split("\n"):
+            logger.info(line)
+
+    # Test warnings
     warnings_list = config.validate()
     if warnings_list:
-        print("\nWarnings:")
-        for w in warnings_list:
-            print(f"  - {w}")
+        with logger.section_start(LogSection.BOOT, "Configuration Warnings"):
+            for w in warnings_list:
+                logger.warning(w)
+
+    # Test circuit breaker
+    logger.info("Testing circuit breaker...")
+    cb = CircuitBreaker("test", failure_threshold=3)
+    logger.success(f"Circuit breaker state: {cb.state.value}")
+
+    # Test lock
+    logger.info("Testing startup lock...")
+    lock = StartupLock("test")
+    is_locked, holder = lock.is_locked()
+    logger.success(f"Lock status: locked={is_locked}, holder={holder}")
+
+    logger.print_startup_summary()
+    TerminalUI.print_success("Zone 2 validation complete!")
