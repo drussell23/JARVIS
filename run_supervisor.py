@@ -8515,10 +8515,13 @@ class SupervisorBootstrapper:
             # NOTE: Cross-Repo Orchestration (v10.1) moved earlier (see ~4961)
 
             # v9.0: Initialize Intelligence Systems (UAE/SAI/Neural Mesh/MAS)
+            # v149.0: Increased timeout for Intelligence Systems (complex subsystem)
+            # The default 60s is often insufficient for initializing UAE, SAI, MAS together
+            intelligence_timeout = float(os.getenv("INTELLIGENCE_SYSTEMS_TIMEOUT", str(major_init_timeout * 2)))
             await self._safe_phase_init(
                 "Intelligence Systems (UAE/SAI/MAS)",
                 self._initialize_intelligence_systems(),
-                timeout_seconds=major_init_timeout,
+                timeout_seconds=intelligence_timeout,  # v149.0: Default 120s for intelligence systems
             )
 
             # v12.0: Initialize Docker Manager (Self-Healing) BEFORE infrastructure

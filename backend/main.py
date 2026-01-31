@@ -4979,62 +4979,70 @@ try:
         get_profiler,
         ProfileSample,
     )
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.responses import Response
     import time as _perf_time
 
-    class PerformanceProfilingMiddleware(BaseHTTPMiddleware):
+    class PerformanceProfilingMiddleware:
         """
-        FastAPI middleware for request latency tracking and profiling.
+        Pure ASGI middleware for request latency tracking and profiling.
+
+        v149.0: CRITICAL FIX - Converted from BaseHTTPMiddleware to pure ASGI.
+        BaseHTTPMiddleware breaks WebSocket connections by wrapping them
+        in HTTP response handling, causing 403 Forbidden errors.
 
         Features:
         - Non-blocking request timing
         - Automatic slow request detection
         - Error rate tracking
         - Zero impact on existing DB/Cache systems
-        - CRITICAL: Skips WebSocket requests (BaseHTTPMiddleware breaks WebSocket)
+        - Pure ASGI: Properly passes through WebSocket connections
 
         Logs format: [PERF] GET /health took 12ms
         """
 
-        async def dispatch(self, request: Request, call_next) -> Response:
-            # CRITICAL FIX: Skip WebSocket requests!
-            # BaseHTTPMiddleware breaks WebSocket connections by wrapping them
-            # in HTTP response handling. We must pass through WebSocket requests
-            # without any processing.
-            is_websocket = (
-                request.headers.get("upgrade", "").lower() == "websocket" or
-                request.scope.get("type") == "websocket"
-            )
-            if is_websocket:
-                # Pass through without profiling - WebSocket needs direct handling
-                return await call_next(request)
+        def __init__(self, app):
+            self.app = app
+            logger.info("[v149.0] Performance Profiling Middleware initialized (pure ASGI)")
+
+        async def __call__(self, scope, receive, send):
+            # CRITICAL: WebSocket connections MUST be passed through directly
+            # This fixes the 403 Forbidden error that occurs when
+            # BaseHTTPMiddleware wraps WebSocket connections
+            if scope['type'] == 'websocket':
+                await self.app(scope, receive, send)
+                return
+
+            # Only profile HTTP requests
+            if scope['type'] != 'http':
+                await self.app(scope, receive, send)
+                return
 
             config = get_config()
             profiler = get_profiler()
 
             start_time = _perf_time.time()
-            path = request.url.path
-            method = request.method
+            path = scope.get('path', '/')
+            method = scope.get('method', 'GET')
 
             success = True
             error_msg = None
             status_code = 200
 
-            try:
-                response = await call_next(request)
-                status_code = response.status_code
-                success = status_code < 400
-                if not success:
-                    error_msg = f"HTTP {status_code}"
-                return response
+            # Capture response status
+            async def send_wrapper(message):
+                nonlocal status_code, success, error_msg
+                if message['type'] == 'http.response.start':
+                    status_code = message.get('status', 200)
+                    success = status_code < 400
+                    if not success:
+                        error_msg = f"HTTP {status_code}"
+                await send(message)
 
+            try:
+                await self.app(scope, receive, send_wrapper)
             except Exception as e:
                 success = False
                 error_msg = str(e)
                 raise
-
             finally:
                 end_time = _perf_time.time()
                 duration_ms = (end_time - start_time) * 1000
@@ -5079,6 +5087,19 @@ except ImportError as e:
     logger.debug(f"Performance Optimizer not available: {e}")
 except Exception as e:
     logger.warning(f"⚠️  Performance Optimizer initialization failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# v149.0: FINAL WEBSOCKET PASS-THROUGH - RUNS FIRST IN CHAIN
+# ═══════════════════════════════════════════════════════════════
+# This MUST be the LAST middleware added (Starlette LIFO order).
+# Ensures WebSocket connections bypass ALL other middleware.
+# ═══════════════════════════════════════════════════════════════
+try:
+    app.add_middleware(WebSocketPassThroughMiddleware)
+    logger.info("✅ [v149.0] Final WebSocket Pass-Through added (runs FIRST, fixes 403)")
+except Exception as e:
+    logger.warning(f"⚠️ Could not add final WebSocket pass-through: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════

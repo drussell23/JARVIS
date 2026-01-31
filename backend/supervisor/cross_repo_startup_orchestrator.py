@@ -217,6 +217,95 @@ except ImportError:
 
 
 # =============================================================================
+# v149.0: ENTERPRISE HOOKS INTEGRATION - Intelligent failure recovery
+# =============================================================================
+# Enterprise hooks provide intelligent error classification, recovery strategies,
+# and circuit breaker patterns for GCP/Trinity failures. This enables:
+#   - Adaptive retry with exponential backoff based on error type
+#   - Automatic fallback chain execution (GCP -> Claude API -> Local)
+#   - Memory pressure handling with proactive recovery
+#   - Health aggregation and status propagation
+# =============================================================================
+_ENTERPRISE_HOOKS_AVAILABLE = False
+_enterprise_hooks_init_done = False
+
+try:
+    from backend.core.enterprise_hooks import (
+        enterprise_init as _enterprise_init,
+        handle_gcp_failure as _handle_gcp_failure,
+        handle_memory_pressure as _handle_memory_pressure,
+        get_routing_decision as _get_routing_decision,
+        route_with_fallback as _route_with_fallback,
+        record_provider_success as _record_provider_success,
+        record_provider_failure as _record_provider_failure,
+        update_component_health as _update_component_health,
+        aggregate_health as _aggregate_health,
+        is_enterprise_available as _is_enterprise_available,
+        classify_gcp_error as _classify_gcp_error,
+        GCPErrorContext,
+        RecoveryStrategy,
+        TRINITY_FALLBACK_CHAIN,
+    )
+    from backend.core.health_contracts import HealthStatus
+    _ENTERPRISE_HOOKS_AVAILABLE = True
+    logger.info("[v149.0] Enterprise hooks module available")
+except ImportError as e:
+    logger.warning(f"[v149.0] Enterprise hooks not available: {e}")
+    # Define fallback stubs
+    class RecoveryStrategy:
+        RETRY = "retry"
+        FULL_RESTART = "full_restart"
+        FALLBACK_MODE = "fallback_mode"
+        DISABLE_AND_CONTINUE = "disable"
+        ESCALATE_TO_USER = "escalate"
+
+    class HealthStatus:
+        HEALTHY = "healthy"
+        DEGRADED = "degraded"
+        UNHEALTHY = "unhealthy"
+
+    GCPErrorContext = None
+    TRINITY_FALLBACK_CHAIN = {}
+
+    async def _enterprise_init(**kwargs):
+        return False
+
+    async def _handle_gcp_failure(error, context=None):
+        return RecoveryStrategy.RETRY
+
+    async def _handle_memory_pressure(memory_percent, **kwargs):
+        return RecoveryStrategy.RETRY
+
+    def _record_provider_success(capability, provider):
+        pass
+
+    def _record_provider_failure(capability, provider, error):
+        pass
+
+    def _update_component_health(component, status, message=""):
+        pass
+
+    def _classify_gcp_error(error, context=None):
+        return ("gcp_unknown", "transient")
+
+
+async def _ensure_enterprise_init():
+    """Lazily initialize enterprise hooks (called once)."""
+    global _enterprise_hooks_init_done
+    if _ENTERPRISE_HOOKS_AVAILABLE and not _enterprise_hooks_init_done:
+        try:
+            success = await _enterprise_init()
+            _enterprise_hooks_init_done = True
+            if success:
+                logger.info("[v149.0] Enterprise hooks initialized successfully")
+            else:
+                logger.warning("[v149.0] Enterprise hooks initialization failed")
+        except Exception as e:
+            logger.warning(f"[v149.0] Enterprise hooks init error: {e}")
+            _enterprise_hooks_init_done = True  # Don't retry
+
+
+# =============================================================================
 # v138.0: HARDWARE-AWARE COORDINATION SYSTEM
 # =============================================================================
 # This section provides hardware detection and profile classification to enable
@@ -1407,7 +1496,17 @@ async def ensure_gcp_vm_ready_for_prime(
                 logger.info(
                     f"[v144.0] ✅ Active Rescue: Existing VM ready at {endpoint}"
                 )
-                
+
+                # v149.0: Record success in enterprise hooks
+                if _ENTERPRISE_HOOKS_AVAILABLE:
+                    await _ensure_enterprise_init()
+                    _record_provider_success("llm_inference", "gcp_vm")
+                    _update_component_health(
+                        "gcp_vm",
+                        HealthStatus.HEALTHY,
+                        f"VM ready at {endpoint}"
+                    )
+
                 # v149.0: Start health monitor EAGERLY when reusing existing VM
                 # This closes the race window between VM discovery and Prime spawn
                 try:
@@ -1418,7 +1517,7 @@ async def ensure_gcp_vm_ready_for_prime(
                     logger.info("[v149.0] 🔍 Health monitor started for existing VM")
                 except Exception as monitor_err:
                     logger.warning(f"[v149.0] Could not start health monitor: {monitor_err}")
-                
+
                 return True, endpoint
             else:
                 logger.warning(
@@ -1468,7 +1567,16 @@ async def ensure_gcp_vm_ready_for_prime(
                         f"[v144.0] ✅ Active Rescue: GCP VM ready at {endpoint} "
                         f"(took {elapsed:.1f}s, {check_count} health checks)"
                     )
-                    
+
+                    # v149.0: Record success in enterprise hooks
+                    if _ENTERPRISE_HOOKS_AVAILABLE:
+                        _record_provider_success("llm_inference", "gcp_vm")
+                        _update_component_health(
+                            "gcp_vm",
+                            HealthStatus.HEALTHY,
+                            f"VM provisioned and ready at {endpoint} in {elapsed:.1f}s"
+                        )
+
                     # v148.0: Start continuous health monitor for the VM
                     try:
                         await start_gcp_vm_health_monitor(
@@ -1477,7 +1585,7 @@ async def ensure_gcp_vm_ready_for_prime(
                         )
                     except Exception as monitor_err:
                         logger.warning(f"[v148.0] Could not start health monitor: {monitor_err}")
-                    
+
                     return True, endpoint
                 else:
                     # Log progress every 30 seconds
@@ -1495,23 +1603,67 @@ async def ensure_gcp_vm_ready_for_prime(
                     logger.info(f"[v147.0] 🔍 Found VM IP from manager: {vm_ip}")
 
         # Timeout reached
-        logger.error(
-            f"[v144.0] ❌ Active Rescue: GCP VM not ready after {timeout_seconds}s timeout. "
-            f"VM IP was: {vm_ip}. The startup script may have failed or be taking too long. "
-            f"Check GCP Console → Compute Engine → VM instances → Serial port output for details."
+        timeout_error = TimeoutError(
+            f"GCP VM not ready after {timeout_seconds}s timeout. "
+            f"VM IP was: {vm_ip}. Startup script may have failed."
         )
-        
+        logger.error(
+            f"[v144.0] ❌ Active Rescue: {timeout_error}"
+        )
+
+        # v149.0: Use enterprise hooks for intelligent recovery decision
+        if _ENTERPRISE_HOOKS_AVAILABLE:
+            await _ensure_enterprise_init()
+            try:
+                # Classify error and get recovery strategy
+                category, error_class = _classify_gcp_error(timeout_error, {"vm_ip": vm_ip})
+                logger.info(f"[v149.0] GCP error classified: {category} ({error_class})")
+
+                # Record failure for circuit breaker
+                _record_provider_failure("llm_inference", "gcp_vm", timeout_error)
+
+                # Update component health
+                _update_component_health(
+                    "gcp_vm",
+                    HealthStatus.UNHEALTHY,
+                    f"Startup timeout after {timeout_seconds}s"
+                )
+
+                # Get recovery strategy
+                if GCPErrorContext:
+                    ctx = GCPErrorContext(
+                        error=timeout_error,
+                        error_message=str(timeout_error),
+                        vm_ip=vm_ip,
+                        timeout_seconds=timeout_seconds,
+                        gcp_attempts=1,
+                    )
+                    recovery_strategy = await _handle_gcp_failure(timeout_error, ctx)
+                    logger.info(f"[v149.0] Recovery strategy: {recovery_strategy}")
+            except Exception as hook_err:
+                logger.warning(f"[v149.0] Enterprise hooks error: {hook_err}")
+
         # v149.1: Trigger Claude API fallback on startup timeout
         # This ensures jarvis-prime doesn't get stuck waiting for GCP
         write_claude_api_fallback_signal(
             reason=f"GCP VM startup timeout ({timeout_seconds}s) - VM IP: {vm_ip}",
             gcp_attempts=1,
         )
-        
+
         return False, None
 
     except ImportError as e:
         logger.warning(f"[v144.0] ⚠️ Active Rescue: GCP modules not available: {e}")
+
+        # v149.0: Record import failure in enterprise hooks
+        if _ENTERPRISE_HOOKS_AVAILABLE:
+            _record_provider_failure("llm_inference", "gcp_vm", e)
+            _update_component_health(
+                "gcp_vm",
+                HealthStatus.UNHEALTHY,
+                f"GCP modules not available: {e}"
+            )
+
         # v149.1: Fallback on import error (GCP SDK missing)
         write_claude_api_fallback_signal(
             reason=f"GCP modules unavailable: {e}",
@@ -1520,6 +1672,22 @@ async def ensure_gcp_vm_ready_for_prime(
         return False, None
     except Exception as e:
         logger.error(f"[v144.0] ❌ Active Rescue: Unexpected error: {e}")
+
+        # v149.0: Handle unexpected errors with enterprise hooks
+        if _ENTERPRISE_HOOKS_AVAILABLE:
+            await _ensure_enterprise_init()
+            try:
+                category, error_class = _classify_gcp_error(e)
+                logger.info(f"[v149.0] Unexpected error classified: {category} ({error_class})")
+                _record_provider_failure("llm_inference", "gcp_vm", e)
+                _update_component_health(
+                    "gcp_vm",
+                    HealthStatus.UNHEALTHY,
+                    f"Unexpected error: {e}"
+                )
+            except Exception as hook_err:
+                logger.debug(f"[v149.0] Enterprise hooks error: {hook_err}")
+
         return False, None
 
 
