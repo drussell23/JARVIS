@@ -3676,11 +3676,20 @@ class ParallelProcessCleaner:
 
     async def cleanup_stale_lock_holders(self) -> int:
         """
-        v97.0: Clean up processes holding fcntl locks on ownership files.
+        v97.0/v152.0: Clean up processes holding fcntl locks on ownership files.
 
         This is a critical safeguard to prevent 30-second ownership timeouts.
         Uses lsof to detect which process holds the lock file, then kills
         it if it's an orphaned supervisor from a previous session.
+
+        v152.0 ENHANCEMENT: Now checks progressive readiness state before killing.
+        A supervisor actively loading models (showing progress) is NOT stale,
+        even if it's been running for 15+ minutes.
+
+        Staleness is determined by:
+        1. No heartbeat update in the last 60 seconds
+        2. No readiness state update in the last 120 seconds
+        3. Process is not responding to IPC ping
 
         Returns:
             Number of lock holders killed
@@ -3730,6 +3739,16 @@ class ParallelProcessCleaner:
 
                     # Only kill if it's a supervisor process
                     if "run_supervisor.py" in cmdline or "start_system.py" in cmdline:
+                        # v152.0: Check if process is actually stale (not just slow)
+                        is_truly_stale = await self._is_supervisor_truly_stale(holder_pid)
+
+                        if not is_truly_stale:
+                            self.logger.info(
+                                f"[v152.0] Lock holder PID {holder_pid} is still making progress "
+                                f"(model loading or startup) - NOT killing"
+                            )
+                            continue
+
                         self.logger.warning(
                             f"[v97.0] Found stale lock holder PID {holder_pid} "
                             f"({cmdline[:60]}...), killing..."
@@ -3774,6 +3793,119 @@ class ParallelProcessCleaner:
             self.logger.debug(f"[v97.0] Lock holder cleanup error: {e}")
 
         return killed_count
+
+    async def _is_supervisor_truly_stale(self, holder_pid: int) -> bool:
+        """
+        v152.0: Determine if a supervisor process is truly stale or just slow.
+
+        A supervisor is NOT stale if:
+        1. Readiness state file was updated in the last 120 seconds
+        2. Heartbeat file was updated in the last 60 seconds
+        3. Process is responsive to signals (can catch SIGUSR1)
+
+        This prevents killing supervisors that are actively loading 70B models
+        (which can take 15+ minutes).
+
+        Args:
+            holder_pid: PID of the supervisor holding the lock
+
+        Returns:
+            True if the supervisor is truly stale and should be killed
+        """
+        now = time.time()
+
+        # Check 1: Readiness state file freshness
+        # v152.0: If readiness state was updated recently, process is alive
+        readiness_state_file = Path.home() / ".jarvis" / "trinity" / "readiness_state.json"
+        try:
+            if readiness_state_file.exists():
+                state_data = json.loads(readiness_state_file.read_text())
+                updated_at = state_data.get("updated_at", 0)
+                state_age = now - updated_at
+
+                # If state was updated in last 120 seconds, not stale
+                if state_age < 120:
+                    self.logger.debug(
+                        f"[v152.0] PID {holder_pid} readiness state fresh "
+                        f"(age={state_age:.1f}s, tier={state_data.get('tier', 'unknown')})"
+                    )
+                    return False
+
+                # Log the state for debugging
+                self.logger.debug(
+                    f"[v152.0] PID {holder_pid} readiness state stale "
+                    f"(age={state_age:.1f}s, tier={state_data.get('tier', 'unknown')})"
+                )
+        except Exception as e:
+            self.logger.debug(f"[v152.0] Could not read readiness state: {e}")
+
+        # Check 2: Heartbeat file freshness
+        heartbeat_file = Path.home() / ".jarvis" / "trinity" / "heartbeats" / "supervisor.json"
+        try:
+            if heartbeat_file.exists():
+                heartbeat_data = json.loads(heartbeat_file.read_text())
+                heartbeat_time = heartbeat_data.get("timestamp", 0)
+                heartbeat_age = now - heartbeat_time
+
+                # If heartbeat in last 60 seconds, not stale
+                if heartbeat_age < 60:
+                    self.logger.debug(
+                        f"[v152.0] PID {holder_pid} heartbeat fresh (age={heartbeat_age:.1f}s)"
+                    )
+                    return False
+
+                self.logger.debug(
+                    f"[v152.0] PID {holder_pid} heartbeat stale (age={heartbeat_age:.1f}s)"
+                )
+        except Exception as e:
+            self.logger.debug(f"[v152.0] Could not read heartbeat: {e}")
+
+        # Check 3: Cross-repo orchestrator state (for model loading progress)
+        orchestrator_state_file = Path.home() / ".jarvis" / "cross_repo" / "orchestrator_state.json"
+        try:
+            if orchestrator_state_file.exists():
+                orch_data = json.loads(orchestrator_state_file.read_text())
+                orch_updated = orch_data.get("updated_at", 0)
+                orch_age = now - orch_updated
+
+                # If orchestrator state was updated recently, models may still be loading
+                if orch_age < 180:  # 3 minutes - model loading can be slow
+                    prime_state = orch_data.get("jarvis_prime", {})
+                    if prime_state.get("state") in ("starting", "loading_model", "warming_up"):
+                        self.logger.debug(
+                            f"[v152.0] PID {holder_pid} orchestrator shows active model loading "
+                            f"(state={prime_state.get('state')}, age={orch_age:.1f}s)"
+                        )
+                        return False
+        except Exception as e:
+            self.logger.debug(f"[v152.0] Could not read orchestrator state: {e}")
+
+        # Check 4: Try IPC ping (last resort)
+        try:
+            # Quick IPC ping attempt
+            ipc_socket = Path.home() / ".jarvis" / "ipc" / "supervisor.sock"
+            if ipc_socket.exists():
+                import socket
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(2.0)  # 2 second timeout
+                try:
+                    sock.connect(str(ipc_socket))
+                    sock.sendall(b'{"type": "ping"}\n')
+                    response = sock.recv(1024)
+                    if response:
+                        self.logger.debug(f"[v152.0] PID {holder_pid} responded to IPC ping")
+                        return False
+                finally:
+                    sock.close()
+        except Exception as e:
+            self.logger.debug(f"[v152.0] IPC ping failed: {e}")
+
+        # All checks failed - supervisor is truly stale
+        self.logger.info(
+            f"[v152.0] PID {holder_pid} determined to be truly stale "
+            f"(no recent heartbeat, no readiness update, no IPC response)"
+        )
+        return True
 
 
 # =============================================================================
