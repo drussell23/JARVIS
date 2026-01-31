@@ -21007,6 +21007,29 @@ Environment Variables:
     )
 
     # =========================================================================
+    # TASK EXECUTION
+    # =========================================================================
+    task = parser.add_argument_group("Task Execution")
+    task.add_argument(
+        "--task", "-t",
+        metavar="GOAL",
+        help="Execute a single agentic task and exit",
+    )
+    task.add_argument(
+        "--task-mode",
+        choices=["direct", "supervised", "autonomous"],
+        default="autonomous",
+        help="Execution mode for --task (default: autonomous)",
+    )
+    task.add_argument(
+        "--task-timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="Task timeout in seconds (default: 300)",
+    )
+
+    # =========================================================================
     # ADVANCED
     # =========================================================================
     advanced = parser.add_argument_group("Advanced")
@@ -21166,6 +21189,119 @@ async def handle_cleanup() -> int:
     return 0 if result["success"] else 1
 
 
+async def handle_single_task(
+    task_goal: str,
+    task_mode: str,
+    task_timeout: float,
+) -> int:
+    """
+    Handle --task command: Execute a single agentic task and exit.
+
+    This enables CLI-based task execution without requiring the full
+    kernel to be running. Useful for:
+    - Quick one-off tasks
+    - Script integration
+    - Testing agentic capabilities
+
+    Args:
+        task_goal: The natural language goal/task to execute
+        task_mode: Execution mode (direct|supervised|autonomous)
+        task_timeout: Maximum time for task completion in seconds
+
+    Returns:
+        Exit code: 0 for success, 1 for failure
+    """
+    print("\n" + "="*60)
+    print("🤖 JARVIS Single Task Execution")
+    print("="*60)
+    print(f"   Goal:    {task_goal}")
+    print(f"   Mode:    {task_mode}")
+    print(f"   Timeout: {task_timeout}s")
+    print("="*60 + "\n")
+
+    config = SystemKernelConfig()
+    logger = UnifiedLogger()
+
+    # Initialize minimal components for task execution
+    logger.info("Initializing agentic runner...")
+
+    try:
+        # Lazy import of agentic runner
+        from core.agentic_task_runner import RunnerMode, get_agentic_runner
+    except ImportError:
+        logger.error("Agentic task runner not available")
+        print("\n❌ Error: Agentic task runner module not found")
+        print("   Make sure backend/core/agentic_task_runner.py exists")
+        return 1
+
+    # Get or create the agentic runner
+    runner = get_agentic_runner()
+    if not runner:
+        logger.error("Failed to get agentic runner instance")
+        print("\n❌ Error: Could not initialize agentic runner")
+        return 1
+
+    # Wait for runner to be ready (with timeout)
+    if not runner.is_ready:
+        logger.info("Waiting for agentic runner to initialize...")
+        ready_timeout = 30  # 30 second initialization timeout
+        for i in range(ready_timeout):
+            await asyncio.sleep(1)
+            if runner.is_ready:
+                break
+            if i % 5 == 0:
+                logger.info(f"   Still initializing... ({i}/{ready_timeout}s)")
+
+        if not runner.is_ready:
+            logger.error("Agentic runner failed to initialize within timeout")
+            print("\n❌ Error: Agentic runner did not become ready")
+            return 1
+
+    logger.info("Agentic runner ready, executing task...")
+
+    try:
+        # Execute the task with timeout
+        result = await asyncio.wait_for(
+            runner.run(
+                goal=task_goal,
+                mode=RunnerMode(task_mode),
+                narrate=config.voice_enabled,
+            ),
+            timeout=task_timeout,
+        )
+
+        # Display results
+        print("\n" + "="*60)
+        print("📋 TASK RESULT")
+        print("="*60)
+        print(f"   Success:  {'✅ Yes' if result.success else '❌ No'}")
+        print(f"   Message:  {result.final_message}")
+        print(f"   Time:     {result.execution_time_ms:.0f}ms")
+        print(f"   Actions:  {result.actions_count}")
+
+        if result.learning_insights:
+            print("\n   Insights:")
+            for insight in result.learning_insights:
+                print(f"      • {insight}")
+
+        if result.error:
+            print(f"\n   Error:    {result.error}")
+
+        print("="*60 + "\n")
+
+        return 0 if result.success else 1
+
+    except asyncio.TimeoutError:
+        logger.error(f"Task timed out after {task_timeout}s")
+        print(f"\n❌ Error: Task timed out after {task_timeout}s")
+        print("   Consider increasing --task-timeout for complex tasks")
+        return 1
+    except Exception as e:
+        logger.error(f"Task execution failed: {e}")
+        print(f"\n❌ Error: Task execution failed: {e}")
+        return 1
+
+
 # =============================================================================
 # ZONE 7.3: CONFIGURATION FROM CLI ARGS
 # =============================================================================
@@ -21293,6 +21429,14 @@ async def async_main(args: argparse.Namespace) -> int:
     # Handle test command
     if hasattr(args, 'test') and args.test:
         return await handle_test(args.test)
+
+    # Handle single task execution
+    if hasattr(args, 'task') and args.task:
+        return await handle_single_task(
+            task_goal=args.task,
+            task_mode=getattr(args, 'task_mode', 'autonomous'),
+            task_timeout=getattr(args, 'task_timeout', 300.0),
+        )
 
     if args.restart:
         # Shutdown first, then continue to startup
