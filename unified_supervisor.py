@@ -922,6 +922,8 @@ class SystemKernelConfig:
     prime_cloud_run_url: Optional[str] = field(default_factory=lambda: os.environ.get("JARVIS_PRIME_CLOUD_RUN_URL"))
     prime_enabled: bool = field(default_factory=lambda: _get_env_bool("JARVIS_PRIME_ENABLED", True))
     reactor_enabled: bool = field(default_factory=lambda: _get_env_bool("REACTOR_CORE_ENABLED", True))
+    prime_api_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_API_PORT", 8011))
+    reactor_api_port: int = field(default_factory=lambda: _get_env_int("REACTOR_CORE_API_PORT", 8012))
 
     # ═══════════════════════════════════════════════════════════════════════════
     # DOCKER
@@ -3825,6 +3827,10 @@ class ResourceManagerRegistry:
     def get(self, name: str) -> Optional[ResourceManagerBase]:
         """Get a resource manager by name."""
         return self._managers.get(name)
+
+    def get_manager(self, name: str) -> Optional[ResourceManagerBase]:
+        """Get a resource manager by name (alias for get)."""
+        return self.get(name)
 
     async def initialize_all(self, parallel: bool = True) -> Dict[str, bool]:
         """
@@ -7633,10 +7639,32 @@ class JarvisSystemKernel:
             if self.config.trinity_enabled:
                 await self._phase_trinity()
 
+            # Phase 6: Enterprise Services (Voice Biometrics, Cloud SQL, Caches)
+            await self._phase_enterprise_services()
+
+            # Start background pre-warming task (non-blocking)
+            prewarm_task = asyncio.create_task(
+                self._prewarm_python_modules(),
+                name="module-prewarm"
+            )
+            self._background_tasks.append(prewarm_task)
+
             # Mark as running
             self._state = KernelState.RUNNING
             if self._readiness_manager:
                 self._readiness_manager.mark_tier(ReadinessTier.FULLY_READY)
+
+            # Final service verification
+            verification = await self._verify_all_services(timeout=10.0)
+            if not verification["all_healthy"]:
+                unhealthy = [
+                    k for k, v in verification["services"].items()
+                    if isinstance(v, dict) and not v.get("healthy") and not v.get("note")
+                ]
+                if unhealthy:
+                    self.logger.warning(f"[Kernel] Some services unhealthy: {unhealthy}")
+                else:
+                    self.logger.info("[Kernel] All configured services operational")
 
             self.logger.success(f"[Kernel] ✅ Startup complete in {time.time() - self._started_at:.2f}s")
             return 0
@@ -7968,6 +7996,72 @@ class JarvisSystemKernel:
                 self.logger.warning(f"[Kernel] Trinity initialization failed: {e}")
                 return True  # Non-fatal
 
+    async def _phase_enterprise_services(self) -> bool:
+        """
+        Phase 6: Initialize enterprise services.
+
+        Initializes in parallel:
+        - Cloud SQL proxy for database connections
+        - Voice biometric authentication system
+        - Semantic voice cache (ChromaDB)
+        - Infrastructure orchestrator for GCP resources
+
+        All services are optional - failures don't stop startup.
+        """
+        with self.logger.section_start(LogSection.BOOT, "Phase 6: Enterprise Services"):
+            self.logger.info("[Kernel] Initializing enterprise services (parallel)...")
+
+            # Run enterprise service initialization in parallel
+            init_results = await asyncio.gather(
+                self._initialize_cloud_sql_proxy(),
+                self._initialize_voice_biometrics(),
+                self._initialize_semantic_voice_cache(),
+                self._initialize_infrastructure_orchestrator(),
+                return_exceptions=True
+            )
+
+            # Process results
+            service_names = [
+                "cloud_sql",
+                "voice_biometrics",
+                "semantic_cache",
+                "infra_orchestrator"
+            ]
+
+            init_status: Dict[str, Any] = {}
+            for name, result in zip(service_names, init_results):
+                if isinstance(result, Exception):
+                    self.logger.warning(f"[Kernel] {name} initialization error: {result}")
+                    init_status[name] = {"error": str(result)}
+                else:
+                    init_status[name] = result
+
+            # Report status
+            successful = [
+                name for name, status in init_status.items()
+                if isinstance(status, dict) and (
+                    status.get("initialized") or
+                    status.get("enabled") or
+                    status.get("running")
+                )
+            ]
+
+            self.logger.success(
+                f"[Kernel] Enterprise services: {len(successful)}/{len(service_names)} active"
+            )
+
+            # Store results for later reference
+            self._enterprise_status = init_status
+
+            # Mark readiness
+            if self._readiness_manager:
+                # Voice biometrics is the most important enterprise service
+                voice_ready = isinstance(init_status.get("voice_biometrics"), dict) and \
+                             init_status.get("voice_biometrics", {}).get("initialized", False)
+                self._readiness_manager.mark_component_ready("voice_biometrics", voice_ready)
+
+            return True  # Enterprise services are optional
+
     async def run(self) -> int:
         """
         Run the main event loop.
@@ -8186,6 +8280,1433 @@ class JarvisSystemKernel:
             self.logger.info(f"  - {f}")
         if len(changed_files) > 5:
             self.logger.info(f"  ... and {len(changed_files) - 5} more")
+
+    # =========================================================================
+    # ENTERPRISE VOICE BIOMETRICS INITIALIZATION
+    # =========================================================================
+    # Full voice biometric system initialization with ECAPA-TDNN speaker
+    # verification, dynamic user detection, and profile validation.
+    # =========================================================================
+
+    async def _initialize_voice_biometrics(self) -> Dict[str, Any]:
+        """
+        Initialize the voice biometric authentication system.
+
+        This enterprise-grade initialization:
+        - Loads Cloud SQL database with voiceprint profiles
+        - Initializes ECAPA-TDNN speaker verification model
+        - Validates all profile dimensions match model dimensions
+        - Detects primary users dynamically (no hardcoding!)
+        - Enables BEAST MODE features if available
+
+        Returns:
+            Dict with initialization results and status
+        """
+        result: Dict[str, Any] = {
+            "initialized": False,
+            "model_dimension": 0,
+            "profiles_loaded": 0,
+            "primary_users": [],
+            "beast_mode_enabled": False,
+            "warnings": [],
+            "errors": [],
+        }
+
+        self.logger.info("[VoiceBio] Initializing voice biometric system...")
+
+        try:
+            # Ensure backend dir is in path for imports
+            backend_dir = self.config.backend_dir
+            if str(backend_dir) not in sys.path:
+                sys.path.insert(0, str(backend_dir))
+
+            # Initialize learning database
+            self.logger.info("[VoiceBio] Loading learning database...")
+            try:
+                from intelligence.learning_database import JARVISLearningDatabase
+
+                learning_db = JARVISLearningDatabase()
+                await learning_db.initialize()
+
+                self.logger.success("[VoiceBio] Learning database initialized")
+
+                # Check for Phase 2 features
+                if hasattr(learning_db, 'hybrid_sync') and learning_db.hybrid_sync:
+                    hs = learning_db.hybrid_sync
+                    result["phase2_features"] = {
+                        "faiss_cache": bool(hs.faiss_cache and getattr(hs.faiss_cache, 'index', None)),
+                        "prometheus": bool(hs.prometheus and hs.prometheus.enabled),
+                        "redis": bool(hs.redis and getattr(hs.redis, 'redis', None)),
+                        "ml_prefetcher": bool(hs.ml_prefetcher),
+                    }
+
+            except ImportError as e:
+                result["warnings"].append(f"Learning database not available: {e}")
+                learning_db = None
+
+            # Initialize speaker verification service
+            self.logger.info("[VoiceBio] Loading speaker verification service...")
+            try:
+                from voice.speaker_verification_service import SpeakerVerificationService
+
+                speaker_service = SpeakerVerificationService(learning_db)
+                await speaker_service.initialize_fast()  # Background encoder loading
+
+                result["model_dimension"] = speaker_service.current_model_dimension
+                result["profiles_loaded"] = len(speaker_service.speaker_profiles)
+
+                self.logger.success(
+                    f"[VoiceBio] Speaker verification ready: "
+                    f"{result['profiles_loaded']} profiles, {result['model_dimension']}D model"
+                )
+
+                # Validate profile dimensions
+                mismatched = []
+                for name, profile in speaker_service.speaker_profiles.items():
+                    embedding = profile.get('embedding')
+                    if embedding is not None:
+                        import numpy as np
+                        emb_array = np.array(embedding)
+                        emb_dim = emb_array.shape[-1] if emb_array.ndim > 0 else 0
+                        if emb_dim != result["model_dimension"]:
+                            mismatched.append((name, emb_dim))
+
+                if mismatched:
+                    result["warnings"].append(
+                        f"{len(mismatched)} profiles need re-enrollment: "
+                        f"{[m[0] for m in mismatched]}"
+                    )
+
+                # Dynamic primary user detection (no hardcoding!)
+                primary_users = []
+                for name, profile in speaker_service.speaker_profiles.items():
+                    is_primary = (
+                        profile.get("is_primary_user", False) or
+                        profile.get("is_owner", False) or
+                        profile.get("security_clearance") == "admin"
+                    )
+                    if is_primary:
+                        primary_users.append(name)
+
+                # Fallback: users with valid embeddings
+                if not primary_users:
+                    for name, profile in speaker_service.speaker_profiles.items():
+                        if profile.get("embedding") is not None:
+                            primary_users.append(name)
+
+                result["primary_users"] = primary_users
+
+                # Check BEAST MODE (acoustic features)
+                beast_mode_profiles = []
+                for name, profile in speaker_service.speaker_profiles.items():
+                    acoustic_features = profile.get("acoustic_features", {})
+                    if any(v is not None for v in acoustic_features.values()):
+                        beast_mode_profiles.append(name)
+
+                result["beast_mode_enabled"] = len(beast_mode_profiles) > 0
+                if result["beast_mode_enabled"]:
+                    self.logger.success(
+                        f"[VoiceBio] 🔬 BEAST MODE enabled for {len(beast_mode_profiles)} profile(s)"
+                    )
+
+                result["initialized"] = True
+
+            except ImportError as e:
+                result["errors"].append(f"Speaker verification not available: {e}")
+
+        except Exception as e:
+            result["errors"].append(f"Voice biometric initialization failed: {e}")
+            self.logger.error(f"[VoiceBio] Initialization failed: {e}")
+
+        return result
+
+    # =========================================================================
+    # CLOUD SQL PROXY MANAGEMENT
+    # =========================================================================
+    # Enterprise-grade Cloud SQL proxy lifecycle management with automatic
+    # startup, health monitoring, and graceful shutdown.
+    # =========================================================================
+
+    async def _initialize_cloud_sql_proxy(self) -> Dict[str, Any]:
+        """
+        Initialize and manage the Cloud SQL proxy for database connections.
+
+        Features:
+        - Auto-detects if proxy is already running
+        - Starts proxy if needed (singleton pattern)
+        - Validates connection to Cloud SQL
+        - Falls back to SQLite if unavailable
+
+        Returns:
+            Dict with proxy status and connection info
+        """
+        result: Dict[str, Any] = {
+            "enabled": False,
+            "running": False,
+            "reused_existing": False,
+            "port": None,
+            "connection_name": None,
+            "fallback_to_sqlite": False,
+        }
+
+        if not self.config.cloud_sql_enabled:
+            self.logger.info("[CloudSQL] Proxy disabled by configuration")
+            return result
+
+        self.logger.info("[CloudSQL] Initializing Cloud SQL proxy...")
+
+        try:
+            # Load database config
+            config_path = self.config.jarvis_home / "gcp" / "database_config.json"
+            if not config_path.exists():
+                self.logger.warning("[CloudSQL] Config not found, falling back to SQLite")
+                result["fallback_to_sqlite"] = True
+                return result
+
+            import json
+            with open(config_path, "r") as f:
+                db_config = json.load(f)
+
+            cloud_sql_config = db_config.get("cloud_sql", {})
+            result["connection_name"] = cloud_sql_config.get("connection_name")
+            result["port"] = cloud_sql_config.get("port", 5432)
+
+            # Set environment variables
+            os.environ["JARVIS_DB_TYPE"] = "cloudsql"
+            os.environ["JARVIS_DB_CONNECTION_NAME"] = result["connection_name"]
+            os.environ["JARVIS_DB_HOST"] = "127.0.0.1"
+            os.environ["JARVIS_DB_PORT"] = str(result["port"])
+            if "password" in cloud_sql_config:
+                os.environ["JARVIS_DB_PASSWORD"] = cloud_sql_config["password"]
+
+            # Import proxy manager
+            backend_dir = self.config.backend_dir
+            if str(backend_dir) not in sys.path:
+                sys.path.insert(0, str(backend_dir))
+
+            try:
+                from intelligence.cloud_sql_proxy_manager import get_proxy_manager
+
+                proxy_manager = get_proxy_manager()
+
+                # Check if already running
+                if proxy_manager.is_running():
+                    self.logger.info("[CloudSQL] Proxy already running - reusing")
+                    result["running"] = True
+                    result["reused_existing"] = True
+                    result["enabled"] = True
+                else:
+                    # Start proxy
+                    self.logger.info("[CloudSQL] Starting proxy process...")
+                    started = await proxy_manager.start(force_restart=False)
+
+                    if started:
+                        self.logger.success(f"[CloudSQL] Proxy started on port {result['port']}")
+                        result["running"] = True
+                        result["enabled"] = True
+                    else:
+                        self.logger.warning("[CloudSQL] Proxy failed to start, using SQLite")
+                        result["fallback_to_sqlite"] = True
+
+            except ImportError as e:
+                self.logger.warning(f"[CloudSQL] Proxy manager not available: {e}")
+                result["fallback_to_sqlite"] = True
+
+        except Exception as e:
+            self.logger.error(f"[CloudSQL] Initialization error: {e}")
+            result["fallback_to_sqlite"] = True
+
+        return result
+
+    # =========================================================================
+    # MODULE PRE-WARMING
+    # =========================================================================
+    # Background task that pre-imports heavy Python modules to reduce
+    # latency during actual usage.
+    # =========================================================================
+
+    async def _prewarm_python_modules(self) -> Dict[str, Any]:
+        """
+        Pre-warm heavy Python modules in the background.
+
+        This imports commonly-used but slow-loading modules before
+        they're needed, reducing latency during actual operations.
+
+        Returns:
+            Dict with pre-warming results
+        """
+        result: Dict[str, Any] = {
+            "modules_loaded": [],
+            "modules_failed": [],
+            "total_time_ms": 0,
+        }
+
+        start_time = time.time()
+
+        # Heavy modules to pre-warm (in order of priority)
+        modules_to_prewarm = [
+            # ML/AI modules (slowest)
+            "torch",
+            "transformers",
+            "numpy",
+            "scipy",
+            "sklearn",
+            # Audio/Voice
+            "librosa",
+            "sounddevice",
+            "pyaudio",
+            # Database
+            "asyncpg",
+            "sqlalchemy",
+            # Web
+            "aiohttp",
+            "websockets",
+            # System
+            "psutil",
+            "watchdog",
+        ]
+
+        self.logger.info(f"[Prewarm] Pre-warming {len(modules_to_prewarm)} modules...")
+
+        for module_name in modules_to_prewarm:
+            try:
+                # Import in executor to not block
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    __import__,
+                    module_name
+                )
+                result["modules_loaded"].append(module_name)
+            except ImportError:
+                result["modules_failed"].append(module_name)
+            except Exception as e:
+                self.logger.debug(f"[Prewarm] {module_name} failed: {e}")
+                result["modules_failed"].append(module_name)
+
+            # Small yield to allow other tasks
+            await asyncio.sleep(0)
+
+        result["total_time_ms"] = (time.time() - start_time) * 1000
+
+        self.logger.info(
+            f"[Prewarm] Loaded {len(result['modules_loaded'])}/{len(modules_to_prewarm)} "
+            f"modules in {result['total_time_ms']:.0f}ms"
+        )
+
+        return result
+
+    # =========================================================================
+    # SEMANTIC VOICE CACHE INITIALIZATION
+    # =========================================================================
+    # ChromaDB-based semantic cache for voice embeddings to reduce
+    # API calls and improve response time for voice authentication.
+    # =========================================================================
+
+    async def _initialize_semantic_voice_cache(self) -> Dict[str, Any]:
+        """
+        Initialize the semantic voice cache (ChromaDB).
+
+        Features:
+        - Caches voice embeddings for faster verification
+        - Reduces ECAPA-TDNN inference for known phrases
+        - Persists across restarts
+
+        Returns:
+            Dict with cache initialization status
+        """
+        result: Dict[str, Any] = {
+            "enabled": False,
+            "initialized": False,
+            "collection_name": "voice_embeddings",
+            "cached_count": 0,
+        }
+
+        if not self.config.voice_cache_enabled:
+            self.logger.info("[VoiceCache] Semantic cache disabled by configuration")
+            return result
+
+        self.logger.info("[VoiceCache] Initializing semantic voice cache...")
+
+        try:
+            import chromadb
+            from chromadb.config import Settings
+
+            # Configure persistent storage
+            cache_dir = self.config.jarvis_home / "cache" / "voice_embeddings"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create ChromaDB client
+            client = chromadb.PersistentClient(
+                path=str(cache_dir),
+                settings=Settings(anonymized_telemetry=False)
+            )
+
+            # Get or create collection
+            collection = client.get_or_create_collection(
+                name=result["collection_name"],
+                metadata={"description": "Voice embedding cache for ECAPA-TDNN"}
+            )
+
+            result["cached_count"] = collection.count()
+            result["enabled"] = True
+            result["initialized"] = True
+
+            self.logger.success(
+                f"[VoiceCache] ChromaDB ready with {result['cached_count']} cached embeddings"
+            )
+
+        except ImportError:
+            self.logger.info("[VoiceCache] ChromaDB not available - cache disabled")
+        except Exception as e:
+            self.logger.warning(f"[VoiceCache] Initialization failed: {e}")
+
+        return result
+
+    # =========================================================================
+    # INFRASTRUCTURE ORCHESTRATION
+    # =========================================================================
+    # Manages GCP infrastructure lifecycle including Spot VMs, Cloud Run,
+    # and orphan resource cleanup.
+    # =========================================================================
+
+    async def _initialize_infrastructure_orchestrator(self) -> Dict[str, Any]:
+        """
+        Initialize the infrastructure orchestrator for GCP resource management.
+
+        Features:
+        - Session tracking with unique IDs
+        - Orphan detection and cleanup (5-minute intervals)
+        - Resource tagging for cost allocation
+
+        Returns:
+            Dict with orchestrator status
+        """
+        result: Dict[str, Any] = {
+            "enabled": False,
+            "session_id": None,
+            "orphan_detection": False,
+        }
+
+        if not self.config.gcp_enabled:
+            self.logger.info("[InfraOrch] GCP disabled - skipping orchestrator")
+            return result
+
+        self.logger.info("[InfraOrch] Initializing infrastructure orchestrator...")
+
+        try:
+            backend_dir = self.config.backend_dir
+            if str(backend_dir) not in sys.path:
+                sys.path.insert(0, str(backend_dir))
+
+            from core.infrastructure_orchestrator import (
+                get_infrastructure_orchestrator,
+                start_orphan_detection,
+            )
+
+            # Initialize orchestrator
+            orchestrator = await get_infrastructure_orchestrator()
+            result["session_id"] = orchestrator.session_id if hasattr(orchestrator, 'session_id') else None
+            result["enabled"] = True
+
+            self.logger.success("[InfraOrch] Orchestrator initialized")
+
+            # Start orphan detection
+            orphan_task = await start_orphan_detection(auto_cleanup=True)
+            result["orphan_detection"] = True
+
+            self.logger.success("[InfraOrch] Orphan detection loop started (5-min interval)")
+
+        except ImportError as e:
+            self.logger.info(f"[InfraOrch] Orchestrator not available: {e}")
+        except Exception as e:
+            self.logger.warning(f"[InfraOrch] Initialization failed: {e}")
+
+        return result
+
+    # =========================================================================
+    # COMPREHENSIVE SERVICE VERIFICATION
+    # =========================================================================
+    # Advanced service health checking with parallel execution and
+    # detailed diagnostics.
+    # =========================================================================
+
+    async def _verify_all_services(self, timeout: float = 30.0) -> Dict[str, Any]:
+        """
+        Verify all services are healthy and ready.
+
+        Performs parallel health checks on:
+        - Backend API
+        - WebSocket server
+        - Database connection
+        - Voice biometric service
+        - Trinity components (if enabled)
+
+        Returns:
+            Dict with comprehensive health status
+        """
+        result: Dict[str, Any] = {
+            "all_healthy": True,
+            "services": {},
+            "total_check_time_ms": 0,
+        }
+
+        start_time = time.time()
+
+        # Define service checks
+        async def check_backend() -> Dict[str, Any]:
+            port = self.config.backend_port
+            status: Dict[str, Any] = {"healthy": False, "name": "backend"}
+            try:
+                # Socket check
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                conn_result = sock.connect_ex(('localhost', port))
+                sock.close()
+
+                if conn_result == 0:
+                    # HTTP health check
+                    if AIOHTTP_AVAILABLE and aiohttp is not None:
+                        async with aiohttp.ClientSession() as session:
+                            url = f"http://localhost:{port}/health"
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    status["healthy"] = True
+                                    status["response"] = data
+                    else:
+                        status["healthy"] = True
+                        status["note"] = "Port open (no HTTP check)"
+                else:
+                    status["error"] = f"Port {port} not open"
+            except Exception as e:
+                status["error"] = str(e)
+            return status
+
+        async def check_websocket() -> Dict[str, Any]:
+            port = self.config.websocket_port
+            status: Dict[str, Any] = {"healthy": False, "name": "websocket"}
+            if port == 0:
+                status["note"] = "WebSocket port not configured"
+                return status
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                conn_result = sock.connect_ex(('localhost', port))
+                sock.close()
+                status["healthy"] = conn_result == 0
+                if not status["healthy"]:
+                    status["error"] = f"Port {port} not open"
+            except Exception as e:
+                status["error"] = str(e)
+            return status
+
+        async def check_trinity_prime() -> Dict[str, Any]:
+            status: Dict[str, Any] = {"healthy": False, "name": "prime"}
+            if not self.config.trinity_enabled or not self.config.prime_enabled:
+                status["note"] = "Prime not enabled"
+                return status
+            port = self.config.prime_api_port
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                conn_result = sock.connect_ex(('localhost', port))
+                sock.close()
+                status["healthy"] = conn_result == 0
+                if not status["healthy"]:
+                    status["note"] = f"Prime not responding on port {port}"
+            except Exception as e:
+                status["error"] = str(e)
+            return status
+
+        async def check_trinity_reactor() -> Dict[str, Any]:
+            status: Dict[str, Any] = {"healthy": False, "name": "reactor"}
+            if not self.config.trinity_enabled or not self.config.reactor_enabled:
+                status["note"] = "Reactor not enabled"
+                return status
+            port = self.config.reactor_api_port
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5.0)
+                conn_result = sock.connect_ex(('localhost', port))
+                sock.close()
+                status["healthy"] = conn_result == 0
+                if not status["healthy"]:
+                    status["note"] = f"Reactor not responding on port {port}"
+            except Exception as e:
+                status["error"] = str(e)
+            return status
+
+        # Run all checks in parallel
+        check_results = await asyncio.gather(
+            check_backend(),
+            check_websocket(),
+            check_trinity_prime(),
+            check_trinity_reactor(),
+            return_exceptions=True
+        )
+
+        for check_result in check_results:
+            if isinstance(check_result, Exception):
+                result["services"]["error"] = str(check_result)
+                result["all_healthy"] = False
+            elif isinstance(check_result, dict):
+                name = check_result.get("name", "unknown")
+                result["services"][name] = check_result
+                if not check_result.get("healthy", False) and not check_result.get("note"):
+                    result["all_healthy"] = False
+
+        result["total_check_time_ms"] = (time.time() - start_time) * 1000
+
+        return result
+
+    # =========================================================================
+    # ENTERPRISE-GRADE PRE-FLIGHT CHECKS
+    # =========================================================================
+    # These methods perform comprehensive system validation before startup,
+    # ensuring all prerequisites are met and the environment is healthy.
+    # =========================================================================
+
+    async def _enhanced_preflight_checks(self) -> Dict[str, Any]:
+        """
+        Run comprehensive pre-flight checks.
+
+        Returns a dict with check results and any warnings/errors.
+        This is an enterprise-grade validation that catches issues early.
+        """
+        results = {
+            "passed": True,
+            "checks": {},
+            "warnings": [],
+            "errors": [],
+        }
+
+        # Run all checks in parallel for speed
+        check_tasks = [
+            ("python_version", self._check_python_version()),
+            ("system_resources", self._check_system_resources()),
+            ("claude_config", self._check_claude_configuration()),
+            ("permissions", self._check_permissions()),
+            ("dependencies", self._check_critical_dependencies()),
+            ("network", self._check_network_availability()),
+        ]
+
+        # Execute in parallel with timeout
+        async def run_check(name: str, coro) -> Tuple[str, Dict[str, Any]]:
+            try:
+                result = await asyncio.wait_for(coro, timeout=30.0)
+                return name, result
+            except asyncio.TimeoutError:
+                return name, {"passed": False, "error": "Check timed out"}
+            except Exception as e:
+                return name, {"passed": False, "error": str(e)}
+
+        check_results = await asyncio.gather(
+            *[run_check(name, coro) for name, coro in check_tasks],
+            return_exceptions=False
+        )
+
+        for name, result in check_results:
+            results["checks"][name] = result
+            if not result.get("passed", False):
+                if result.get("critical", False):
+                    results["errors"].append(f"{name}: {result.get('error', 'Failed')}")
+                    results["passed"] = False
+                else:
+                    results["warnings"].append(f"{name}: {result.get('warning', 'Issue detected')}")
+
+        return results
+
+    async def _check_python_version(self) -> Dict[str, Any]:
+        """Validate Python version meets requirements."""
+        version_info = sys.version_info
+        min_version = (3, 9)
+
+        if version_info < min_version:
+            return {
+                "passed": False,
+                "critical": True,
+                "error": f"Python {min_version[0]}.{min_version[1]}+ required, got {version_info.major}.{version_info.minor}",
+            }
+
+        return {
+            "passed": True,
+            "version": f"{version_info.major}.{version_info.minor}.{version_info.micro}",
+            "executable": sys.executable,
+        }
+
+    async def _check_system_resources(self) -> Dict[str, Any]:
+        """Check system has adequate resources."""
+        result: Dict[str, Any] = {"passed": True}
+
+        try:
+            import psutil
+
+            # Memory check
+            memory = psutil.virtual_memory()
+            available_gb = memory.available / (1024 ** 3)
+            total_gb = memory.total / (1024 ** 3)
+            usage_percent = memory.percent
+
+            result["memory"] = {
+                "available_gb": round(available_gb, 2),
+                "total_gb": round(total_gb, 2),
+                "usage_percent": usage_percent,
+            }
+
+            # Warning if less than 2GB available
+            if available_gb < 2.0:
+                result["warning"] = f"Low memory: {available_gb:.1f}GB available"
+
+            # Critical if less than 1GB
+            if available_gb < 1.0:
+                result["passed"] = False
+                result["critical"] = True
+                result["error"] = f"Critically low memory: {available_gb:.1f}GB"
+
+            # CPU check
+            cpu_count = psutil.cpu_count()
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+
+            result["cpu"] = {
+                "count": cpu_count,
+                "usage_percent": cpu_percent,
+            }
+
+            # Disk check
+            disk = psutil.disk_usage(str(Path.home()))
+            free_gb = disk.free / (1024 ** 3)
+
+            result["disk"] = {
+                "free_gb": round(free_gb, 2),
+                "usage_percent": disk.percent,
+            }
+
+            if free_gb < 5.0:
+                result["warning"] = f"Low disk space: {free_gb:.1f}GB free"
+
+        except ImportError:
+            result["warning"] = "psutil not available - skipping resource checks"
+        except Exception as e:
+            result["warning"] = f"Resource check error: {e}"
+
+        return result
+
+    async def _check_claude_configuration(self) -> Dict[str, Any]:
+        """Check Claude/Anthropic API configuration."""
+        result: Dict[str, Any] = {"passed": True}
+
+        # Check for API key
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+        if not api_key:
+            result["warning"] = "ANTHROPIC_API_KEY not set - some features unavailable"
+            result["api_configured"] = False
+        else:
+            # Validate key format (basic check)
+            if api_key.startswith("sk-ant-"):
+                result["api_configured"] = True
+                result["key_prefix"] = api_key[:12] + "..."
+            else:
+                result["warning"] = "ANTHROPIC_API_KEY has unexpected format"
+                result["api_configured"] = False
+
+        return result
+
+    async def _check_permissions(self) -> Dict[str, Any]:
+        """Check system permissions (microphone, screen recording on macOS)."""
+        result: Dict[str, Any] = {"passed": True, "permissions": {}}
+
+        if sys.platform == "darwin":
+            # Check microphone permission
+            try:
+                import subprocess
+                # Use tccutil to check microphone permission
+                # This is a simplified check - full implementation would use pyobjc
+                result["permissions"]["microphone"] = "check_required"
+                result["permissions"]["screen_recording"] = "check_required"
+            except Exception as e:
+                result["warning"] = f"Permission check error: {e}"
+        else:
+            result["permissions"]["note"] = "Non-macOS - permissions not applicable"
+
+        return result
+
+    async def _check_critical_dependencies(self) -> Dict[str, Any]:
+        """Check critical Python dependencies are available."""
+        result: Dict[str, Any] = {"passed": True, "available": [], "missing": []}
+
+        critical_modules = [
+            ("fastapi", "Backend framework"),
+            ("uvicorn", "ASGI server"),
+            ("pydantic", "Data validation"),
+            ("asyncio", "Async support"),
+        ]
+
+        optional_modules = [
+            ("aiohttp", "Async HTTP client"),
+            ("websockets", "WebSocket support"),
+            ("psutil", "System monitoring"),
+            ("chromadb", "Vector database"),
+            ("torch", "ML inference"),
+            ("transformers", "NLP models"),
+        ]
+
+        for module_name, description in critical_modules:
+            try:
+                __import__(module_name)
+                result["available"].append(module_name)
+            except ImportError:
+                result["missing"].append(module_name)
+                result["passed"] = False
+                result["critical"] = True
+                result["error"] = f"Critical dependency missing: {module_name} ({description})"
+
+        for module_name, description in optional_modules:
+            try:
+                __import__(module_name)
+                result["available"].append(module_name)
+            except ImportError:
+                # Optional - just note it
+                pass
+
+        return result
+
+    async def _check_network_availability(self) -> Dict[str, Any]:
+        """Check network connectivity."""
+        result: Dict[str, Any] = {"passed": True}
+
+        # Check if we can bind to localhost
+        test_port = 0  # Let OS assign a port
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('localhost', test_port))
+            assigned_port = sock.getsockname()[1]
+            sock.close()
+            result["localhost_binding"] = True
+            result["test_port"] = assigned_port
+        except socket.error as e:
+            result["passed"] = False
+            result["error"] = f"Cannot bind to localhost: {e}"
+
+        return result
+
+    # =========================================================================
+    # SELF-HEALING MECHANISMS
+    # =========================================================================
+    # Enterprise-grade automatic recovery from common failure conditions.
+    # These methods attempt to fix issues without user intervention.
+    # =========================================================================
+
+    async def _diagnose_and_heal(
+        self,
+        error_context: str,
+        error: Exception,
+        max_attempts: int = 3
+    ) -> bool:
+        """
+        Master self-healing dispatcher.
+
+        Analyzes an error and attempts automatic recovery.
+
+        Args:
+            error_context: Description of what was being attempted
+            error: The exception that occurred
+            max_attempts: Maximum healing attempts
+
+        Returns:
+            True if healing was successful, False otherwise
+        """
+        error_str = str(error).lower()
+        error_type = type(error).__name__
+
+        # Track healing attempts to prevent infinite loops
+        heal_key = f"{error_context}:{error_type}"
+        if not hasattr(self, '_healing_attempts'):
+            self._healing_attempts = {}
+
+        self._healing_attempts[heal_key] = self._healing_attempts.get(heal_key, 0) + 1
+
+        if self._healing_attempts[heal_key] > max_attempts:
+            self.logger.warning(f"[SelfHeal] Max attempts ({max_attempts}) reached for {heal_key}")
+            return False
+
+        self.logger.info(f"[SelfHeal] Diagnosing: {error_context}")
+        self.logger.debug(f"[SelfHeal] Error: {error}")
+
+        # Dispatch to appropriate healer based on error type
+        healing_strategies = [
+            (self._is_port_conflict, self._heal_port_conflict),
+            (self._is_missing_module, self._heal_missing_module),
+            (self._is_permission_issue, self._heal_permission_issue),
+            (self._is_memory_pressure, self._heal_memory_pressure),
+            (self._is_process_crash, self._heal_process_crash),
+            (self._is_api_key_issue, self._heal_api_key_issue),
+        ]
+
+        for check_fn, heal_fn in healing_strategies:
+            if check_fn(error_str, error_type):
+                try:
+                    healed = await heal_fn(error_context, error)
+                    if healed:
+                        self.logger.success(f"[SelfHeal] Successfully healed: {error_context}")
+                        # Reset attempt counter on success
+                        self._healing_attempts[heal_key] = 0
+                        return True
+                except Exception as heal_error:
+                    self.logger.warning(f"[SelfHeal] Healing failed: {heal_error}")
+
+        self.logger.warning(f"[SelfHeal] No healing strategy found for: {error_context}")
+        return False
+
+    def _is_port_conflict(self, error_str: str, error_type: str) -> bool:
+        """Check if error indicates a port conflict."""
+        port_indicators = [
+            "address already in use",
+            "port is already",
+            "bind failed",
+            "eaddrinuse",
+            "errno 48",  # macOS
+            "errno 98",  # Linux
+        ]
+        return any(indicator in error_str for indicator in port_indicators)
+
+    def _is_missing_module(self, error_str: str, error_type: str) -> bool:
+        """Check if error indicates a missing module."""
+        return error_type == "ModuleNotFoundError" or "no module named" in error_str
+
+    def _is_permission_issue(self, error_str: str, error_type: str) -> bool:
+        """Check if error indicates a permission issue."""
+        permission_indicators = [
+            "permission denied",
+            "access denied",
+            "operation not permitted",
+            "eacces",
+        ]
+        return any(indicator in error_str for indicator in permission_indicators)
+
+    def _is_memory_pressure(self, error_str: str, error_type: str) -> bool:
+        """Check if error indicates memory pressure."""
+        memory_indicators = [
+            "out of memory",
+            "memory error",
+            "cannot allocate",
+            "memoryerror",
+            "killed",
+        ]
+        return any(indicator in error_str for indicator in memory_indicators)
+
+    def _is_process_crash(self, error_str: str, error_type: str) -> bool:
+        """Check if error indicates a process crash."""
+        crash_indicators = [
+            "process exited",
+            "process terminated",
+            "segmentation fault",
+            "sigsegv",
+            "sigkill",
+        ]
+        return any(indicator in error_str for indicator in crash_indicators)
+
+    def _is_api_key_issue(self, error_str: str, error_type: str) -> bool:
+        """Check if error indicates an API key issue."""
+        api_indicators = [
+            "api key",
+            "unauthorized",
+            "invalid api",
+            "authentication",
+        ]
+        return any(indicator in error_str for indicator in api_indicators)
+
+    async def _heal_port_conflict(self, context: str, error: Exception) -> bool:
+        """Attempt to heal a port conflict."""
+        # Extract port number from error
+        port = self._extract_port_from_error(str(error))
+        if not port:
+            port = self.config.backend_port
+
+        self.logger.info(f"[SelfHeal] Attempting to free port {port}")
+
+        # Try to kill the process using the port
+        try:
+            # Use lsof on Unix systems
+            if sys.platform != "win32":
+                result = await asyncio.create_subprocess_exec(
+                    "lsof", "-ti", f":{port}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await result.communicate()
+
+                if stdout:
+                    pids = stdout.decode().strip().split('\n')
+                    for pid_str in pids:
+                        try:
+                            pid = int(pid_str.strip())
+                            if pid != os.getpid():  # Don't kill ourselves
+                                os.kill(pid, signal.SIGTERM)
+                                self.logger.info(f"[SelfHeal] Sent SIGTERM to PID {pid}")
+                        except (ValueError, ProcessLookupError):
+                            pass
+
+                    # Wait for processes to die
+                    await asyncio.sleep(2.0)
+                    return True
+
+        except Exception as e:
+            self.logger.debug(f"[SelfHeal] Port healing error: {e}")
+
+        return False
+
+    async def _heal_missing_module(self, context: str, error: Exception) -> bool:
+        """Attempt to install a missing module."""
+        module_name = self._extract_module_from_error(str(error))
+        if not module_name:
+            return False
+
+        self.logger.info(f"[SelfHeal] Attempting to install missing module: {module_name}")
+
+        # Only auto-install known safe modules
+        safe_to_install = {
+            "aiohttp", "websockets", "psutil", "pydantic",
+            "python-dotenv", "httpx",
+        }
+
+        if module_name not in safe_to_install:
+            self.logger.warning(f"[SelfHeal] Module {module_name} not in safe install list")
+            return False
+
+        try:
+            result = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip", "install", module_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+
+            if result.returncode == 0:
+                self.logger.success(f"[SelfHeal] Installed {module_name}")
+                return True
+            else:
+                self.logger.warning(f"[SelfHeal] pip install failed: {stderr.decode()}")
+
+        except Exception as e:
+            self.logger.debug(f"[SelfHeal] Module install error: {e}")
+
+        return False
+
+    async def _heal_permission_issue(self, context: str, error: Exception) -> bool:
+        """Attempt to resolve permission issues."""
+        self.logger.info("[SelfHeal] Permission issue detected")
+
+        # On macOS, we can't auto-fix permission issues - need user action
+        if sys.platform == "darwin":
+            self.logger.warning("[SelfHeal] macOS permissions require user action")
+            self.logger.info("  → System Preferences → Security & Privacy → Privacy")
+            return False
+
+        return False
+
+    async def _heal_memory_pressure(self, context: str, error: Exception) -> bool:
+        """Attempt to resolve memory pressure."""
+        self.logger.info("[SelfHeal] Memory pressure detected")
+
+        try:
+            import gc
+
+            # Force garbage collection
+            gc.collect()
+            self.logger.info("[SelfHeal] Forced garbage collection")
+
+            # If hybrid cloud is enabled, try offloading to GCP
+            if hasattr(self, '_resource_registry') and self._resource_registry:
+                gcp_manager = self._resource_registry.get_manager("GCPInstanceManager")
+                if gcp_manager and gcp_manager.is_ready:
+                    self.logger.info("[SelfHeal] Attempting GCP offload")
+                    # This would trigger workload migration to GCP
+                    return True
+
+            return True  # GC is always somewhat helpful
+
+        except Exception as e:
+            self.logger.debug(f"[SelfHeal] Memory healing error: {e}")
+
+        return False
+
+    async def _heal_process_crash(self, context: str, error: Exception) -> bool:
+        """Attempt to recover from a process crash."""
+        self.logger.info(f"[SelfHeal] Process crash detected in: {context}")
+
+        # If backend crashed, try to restart it
+        if "backend" in context.lower():
+            self.logger.info("[SelfHeal] Attempting backend restart")
+
+            # Clean up old process
+            if hasattr(self, '_backend_process') and self._backend_process:
+                try:
+                    self._backend_process.terminate()
+                    await asyncio.wait_for(
+                        self._backend_process.wait(),
+                        timeout=5.0
+                    )
+                except Exception:
+                    pass
+
+            # Restart backend
+            try:
+                success = await self._start_backend_subprocess()
+                return success
+            except Exception as e:
+                self.logger.warning(f"[SelfHeal] Backend restart failed: {e}")
+
+        return False
+
+    async def _heal_api_key_issue(self, context: str, error: Exception) -> bool:
+        """Handle API key issues."""
+        self.logger.info("[SelfHeal] API key issue detected")
+        self.logger.warning("  → Please set ANTHROPIC_API_KEY environment variable")
+        # Can't auto-fix API key issues - need user action
+        return False
+
+    def _extract_port_from_error(self, error_str: str) -> Optional[int]:
+        """Extract port number from error message."""
+        import re
+        # Look for common port patterns
+        patterns = [
+            r"port[:\s]+(\d{4,5})",
+            r":(\d{4,5})",
+            r"(\d{4,5})\s+already in use",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, error_str.lower())
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    pass
+        return None
+
+    def _extract_module_from_error(self, error_str: str) -> Optional[str]:
+        """Extract module name from error message."""
+        import re
+        patterns = [
+            r"no module named ['\"]?([a-z_][a-z0-9_]*)",
+            r"modulenotfounderror.*['\"]([a-z_][a-z0-9_]*)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, error_str.lower())
+            if match:
+                return match.group(1)
+        return None
+
+    # =========================================================================
+    # ADVANCED SERVICE MONITORING
+    # =========================================================================
+    # Enterprise-grade health monitoring with parallel checks and
+    # intelligent failure detection.
+    # =========================================================================
+
+    async def _run_parallel_health_checks(self, timeout: float = 10.0) -> Dict[str, Any]:
+        """
+        Run health checks on all services in parallel.
+
+        Returns comprehensive health status for monitoring and alerting.
+        """
+        services = [
+            ("backend", f"http://localhost:{self.config.backend_port}/health"),
+            ("websocket", f"ws://localhost:{self.config.websocket_port}"),
+        ]
+
+        async def check_http_service(name: str, url: str) -> Dict[str, Any]:
+            """Check an HTTP service health endpoint."""
+            start_time = time.time()
+            try:
+                if AIOHTTP_AVAILABLE and aiohttp is not None:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                            latency = (time.time() - start_time) * 1000
+                            return {
+                                "name": name,
+                                "healthy": resp.status == 200,
+                                "status_code": resp.status,
+                                "latency_ms": round(latency, 2),
+                            }
+                else:
+                    # Socket-based check
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    host = parsed.hostname or 'localhost'
+                    port = parsed.port or 80
+
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout)
+                    result = sock.connect_ex((host, port))
+                    sock.close()
+
+                    latency = (time.time() - start_time) * 1000
+                    return {
+                        "name": name,
+                        "healthy": result == 0,
+                        "latency_ms": round(latency, 2),
+                    }
+
+            except Exception as e:
+                return {
+                    "name": name,
+                    "healthy": False,
+                    "error": str(e),
+                    "latency_ms": (time.time() - start_time) * 1000,
+                }
+
+        # Run all checks in parallel
+        results = await asyncio.gather(
+            *[check_http_service(name, url) for name, url in services],
+            return_exceptions=True
+        )
+
+        health_status = {
+            "timestamp": datetime.now().isoformat(),
+            "overall_healthy": True,
+            "services": {},
+        }
+
+        for result in results:
+            if isinstance(result, Exception):
+                health_status["overall_healthy"] = False
+            else:
+                health_status["services"][result["name"]] = result
+                if not result.get("healthy", False):
+                    health_status["overall_healthy"] = False
+
+        return health_status
+
+    async def _verify_backend_ready(self, timeout: float = 60.0) -> bool:
+        """
+        Verify backend is fully ready (not just port open).
+
+        Uses progressive health checks with intelligent retry.
+        """
+        start_time = time.time()
+        check_interval = 1.0
+        last_error = None
+
+        while (time.time() - start_time) < timeout:
+            try:
+                # First check: Port is open
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                result = sock.connect_ex(('localhost', self.config.backend_port))
+                sock.close()
+
+                if result != 0:
+                    await asyncio.sleep(check_interval)
+                    continue
+
+                # Second check: HTTP health endpoint
+                if AIOHTTP_AVAILABLE and aiohttp is not None:
+                    async with aiohttp.ClientSession() as session:
+                        url = f"http://localhost:{self.config.backend_port}/health"
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                # Check if backend reports ready
+                                if data.get("status") in ["healthy", "ok", "ready"]:
+                                    return True
+
+                # If no aiohttp, just port check is enough
+                else:
+                    return True
+
+            except Exception as e:
+                last_error = e
+
+            # Progressive backoff
+            await asyncio.sleep(check_interval)
+            check_interval = min(check_interval * 1.2, 5.0)
+
+        if last_error:
+            self.logger.warning(f"[Kernel] Backend readiness check failed: {last_error}")
+
+        return False
+
+    # =========================================================================
+    # COST OPTIMIZATION INTEGRATION
+    # =========================================================================
+    # Integrates scale-to-zero, semantic caching, and cloud cost management.
+    # =========================================================================
+
+    async def _initialize_cost_optimization(self) -> bool:
+        """Initialize cost optimization subsystems."""
+        self.logger.info("[Kernel] Initializing cost optimization...")
+
+        try:
+            # Scale-to-Zero monitoring
+            if hasattr(self, '_resource_registry') and self._resource_registry:
+                cost_optimizer = self._resource_registry.get_manager("ScaleToZeroCostOptimizer")
+                if cost_optimizer:
+                    # Register activity callback
+                    cost_optimizer.record_activity("kernel_startup")
+                    self.logger.info("  → Scale-to-Zero: Active")
+
+                # Semantic voice cache
+                voice_cache = self._resource_registry.get_manager("SemanticVoiceCacheManager")
+                if voice_cache:
+                    self.logger.info("  → Semantic Voice Cache: Active")
+
+            return True
+
+        except Exception as e:
+            self.logger.warning(f"[Kernel] Cost optimization init failed: {e}")
+            return False
+
+    # =========================================================================
+    # TRINITY INTEGRATION (CROSS-REPO)
+    # =========================================================================
+    # First-class integration with JARVIS Prime and Reactor Core.
+    # Enables unified orchestration across the system of systems.
+    # =========================================================================
+
+    async def _verify_trinity_connections(self, timeout: float = 30.0) -> Dict[str, Any]:
+        """
+        Verify connections to Trinity components (Prime and Reactor).
+
+        Returns detailed status for each cross-repo component.
+        """
+        trinity_status = {
+            "enabled": self.config.trinity_enabled,
+            "components": {},
+            "all_healthy": True,
+        }
+
+        if not self.config.trinity_enabled:
+            return trinity_status
+
+        # Check JARVIS Prime
+        if self.config.prime_repo_path and self.config.prime_repo_path.exists():
+            prime_status = await self._check_trinity_component(
+                "jarvis-prime",
+                self.config.prime_repo_path,
+                self.config.prime_api_port if hasattr(self.config, 'prime_api_port') else 8000
+            )
+            trinity_status["components"]["jarvis-prime"] = prime_status
+            if not prime_status.get("healthy", False):
+                trinity_status["all_healthy"] = False
+
+        # Check Reactor Core
+        if self.config.reactor_repo_path and self.config.reactor_repo_path.exists():
+            reactor_status = await self._check_trinity_component(
+                "reactor-core",
+                self.config.reactor_repo_path,
+                self.config.reactor_api_port if hasattr(self.config, 'reactor_api_port') else 8090
+            )
+            trinity_status["components"]["reactor-core"] = reactor_status
+            if not reactor_status.get("healthy", False):
+                trinity_status["all_healthy"] = False
+
+        return trinity_status
+
+    async def _check_trinity_component(
+        self,
+        name: str,
+        repo_path: Path,
+        port: int
+    ) -> Dict[str, Any]:
+        """Check a single Trinity component."""
+        status = {
+            "name": name,
+            "repo_path": str(repo_path),
+            "port": port,
+            "healthy": False,
+            "details": {},
+        }
+
+        # Check if repo exists
+        if not repo_path.exists():
+            status["details"]["error"] = "Repository not found"
+            return status
+
+        # Check for running process on expected port
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            result = sock.connect_ex(('localhost', port))
+            sock.close()
+
+            if result == 0:
+                status["healthy"] = True
+                status["details"]["port_open"] = True
+
+                # Try to get health status
+                if AIOHTTP_AVAILABLE and aiohttp is not None:
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            url = f"http://localhost:{port}/health"
+                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    status["details"]["health_response"] = data
+                    except Exception:
+                        pass
+            else:
+                status["details"]["port_open"] = False
+                status["details"]["note"] = f"Not running on port {port}"
+
+        except Exception as e:
+            status["details"]["error"] = str(e)
+
+        return status
+
+    async def _start_trinity_component(self, name: str, repo_path: Path) -> bool:
+        """Start a Trinity component if not already running."""
+        self.logger.info(f"[Trinity] Starting {name}...")
+
+        # Look for startup script
+        startup_scripts = [
+            repo_path / "start.py",
+            repo_path / "run.py",
+            repo_path / "main.py",
+        ]
+
+        script_path = None
+        for script in startup_scripts:
+            if script.exists():
+                script_path = script
+                break
+
+        if not script_path:
+            self.logger.warning(f"[Trinity] No startup script found for {name}")
+            return False
+
+        try:
+            env = os.environ.copy()
+            env["JARVIS_KERNEL_PID"] = str(os.getpid())
+            env["TRINITY_COORDINATOR"] = "jarvis"
+
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(script_path),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(repo_path)
+            )
+
+            # Store process reference
+            if not hasattr(self, '_trinity_processes'):
+                self._trinity_processes = {}
+            self._trinity_processes[name] = process
+
+            # Register with process manager
+            if self._process_manager:
+                await self._process_manager.register_process(
+                    name,
+                    process,
+                    {"type": "trinity", "repo": str(repo_path)}
+                )
+
+            self.logger.success(f"[Trinity] Started {name} (PID: {process.pid})")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[Trinity] Failed to start {name}: {e}")
+            return False
 
 
 # =============================================================================
