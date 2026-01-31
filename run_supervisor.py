@@ -740,6 +740,15 @@ except ImportError:
     # Fallback if module not available
     safe_close = lambda fd, **kwargs: os.close(fd) if fd >= 0 else None  # noqa: E731
 
+# Log severity bridge for criticality-aware logging (Enterprise Hardening v1.0)
+try:
+    from backend.core.log_severity_bridge import log_component_failure, is_component_required
+except ImportError:
+    def log_component_failure(component, message, error=None, **ctx):
+        logging.getLogger(__name__).error(f"{component}: {message}")
+    def is_component_required(component):
+        return True
+
 # =============================================================================
 # v111.4: ENVIRONMENT LOADING - Load .env files including GCP hybrid cloud config
 # =============================================================================
@@ -5197,11 +5206,11 @@ class HotReloadWatcher:
                 self.logger.info("   ✅ Frontend rebuild completed successfully")
                 return True
             else:
-                self.logger.error(f"   ❌ Frontend rebuild failed: {stderr.decode()[:200]}")
+                log_component_failure("frontend", "Frontend rebuild failed", context={"stderr": stderr.decode()[:200]})
                 return False
 
         except asyncio.TimeoutError:
-            self.logger.error("   ❌ Frontend rebuild timed out (120s)")
+            log_component_failure("frontend", "Frontend rebuild timed out (120s)")
             # Clean up zombie process on timeout
             if process is not None:
                 try:
@@ -5211,7 +5220,7 @@ class HotReloadWatcher:
                     pass  # Best effort cleanup
             return False
         except Exception as e:
-            self.logger.error(f"   ❌ Frontend rebuild error: {e}")
+            log_component_failure("frontend", "Frontend rebuild error", error=e)
             # Clean up zombie process on error
             if process is not None:
                 try:
@@ -7696,7 +7705,7 @@ class SupervisorBootstrapper:
             return False
 
         except Exception as e:
-            self.logger.error(f"[v113.0] Failed to start frontend: {e}")
+            log_component_failure("frontend", "Failed to start frontend", error=e)
             return False
 
     async def _stop_loading_server_v113(self) -> None:
@@ -11121,7 +11130,7 @@ class SupervisorBootstrapper:
             await self._start_jprime_orchestrator()
             self.logger.info("[v91] Self-healing: J-Prime restart complete")
         except Exception as e:
-            self.logger.error(f"[v91] Self-healing: J-Prime restart failed: {e}")
+            log_component_failure("jarvis-prime", "Self-healing: J-Prime restart failed", error=e)
 
     async def _restart_reactor_core_process(self) -> None:
         """v91.0: Restart Reactor-Core process as part of self-healing."""
@@ -11132,7 +11141,7 @@ class SupervisorBootstrapper:
             await self._start_reactor_core_orchestrator()
             self.logger.info("[v91] Self-healing: Reactor-Core restart complete")
         except Exception as e:
-            self.logger.error(f"[v91] Self-healing: Reactor-Core restart failed: {e}")
+            log_component_failure("reactor-core", "Self-healing: Reactor-Core restart failed", error=e)
 
     # =========================================================================
     # v102.0: Process Tree Registration Helper
@@ -11401,7 +11410,7 @@ class SupervisorBootstrapper:
             self.logger.info("[v100.4] J-Prime orchestrator started")
 
         except Exception as e:
-            self.logger.error(f"[v100.4] Failed to start J-Prime: {e}")
+            log_component_failure("jarvis-prime", "Failed to start J-Prime orchestrator", error=e)
             raise
 
     async def _start_reactor_core_orchestrator(self) -> None:
@@ -11442,7 +11451,7 @@ class SupervisorBootstrapper:
             self.logger.info("[v100.4] Reactor-Core orchestrator started")
 
         except Exception as e:
-            self.logger.error(f"[v100.4] Failed to start Reactor-Core: {e}")
+            log_component_failure("reactor-core", "Failed to start Reactor-Core orchestrator", error=e)
             raise
 
     async def _run_resource_monitoring_loop(self) -> None:
@@ -13125,7 +13134,7 @@ class SupervisorBootstrapper:
             print(f"  {TerminalUI.YELLOW}⚠️ JARVIS-Prime: Client not available{TerminalUI.RESET}")
 
         except Exception as e:
-            self.logger.error(f"❌ Failed to initialize JARVIS-Prime: {e}")
+            log_component_failure("jarvis-prime", "Failed to initialize JARVIS-Prime", error=e)
             os.environ["JARVIS_PRIME_ENABLED"] = "false"
             print(f"  {TerminalUI.YELLOW}⚠️ JARVIS-Prime: Not available ({e}){TerminalUI.RESET}")
 
@@ -13313,10 +13322,12 @@ class SupervisorBootstrapper:
             sock.close()
             self.logger.info(f"[v117.0] Port {port} is available - proceeding with spawn")
         except OSError as bind_err:
-            self.logger.error(
-                f"[v117.0] ❌ Port {port} still unavailable after cleanup: {bind_err}"
+            log_component_failure(
+                "jarvis-prime",
+                f"Port {port} still unavailable after cleanup - cannot start jarvis-prime",
+                error=bind_err,
+                context={"port": port}
             )
-            self.logger.error("    Cannot start jarvis-prime - port conflict unresolved")
             return
 
         # Start local subprocess
@@ -15764,7 +15775,7 @@ class SupervisorBootstrapper:
                 os.environ["REACTOR_CORE_ENABLED"] = "false"
                 print(f"  {TerminalUI.YELLOW}⚠️ Reactor-Core: Not available{TerminalUI.RESET}")
             except Exception as e:
-                self.logger.error(f"❌ Reactor-Core initialization failed: {e}")
+                log_component_failure("reactor-core", "Reactor-Core initialization failed", error=e)
                 os.environ["REACTOR_CORE_ENABLED"] = "false"
                 print(f"  {TerminalUI.YELLOW}⚠️ Reactor-Core: Failed ({e}){TerminalUI.RESET}")
 
@@ -15808,7 +15819,7 @@ class SupervisorBootstrapper:
                 os.environ["TRINITY_INDEXER_ENABLED"] = "false"
                 print(f"  {TerminalUI.YELLOW}⚠️ Trinity Indexer: Not available{TerminalUI.RESET}")
             except Exception as e:
-                self.logger.error(f"❌ Trinity Indexer initialization failed: {e}")
+                log_component_failure("trinity-indexer", "Trinity Indexer initialization failed", error=e)
                 os.environ["TRINITY_INDEXER_ENABLED"] = "false"
                 print(f"  {TerminalUI.YELLOW}⚠️ Trinity Indexer: Failed ({e}){TerminalUI.RESET}")
         else:
@@ -16578,7 +16589,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                             with open(stderr_log, "r") as f:
                                 stderr_content = f.read().strip()
                                 if stderr_content:
-                                    self.logger.error(f"   Reactor-Core stderr:\n{stderr_content[-500:]}")  # Last 500 chars
+                                    log_component_failure("reactor-core", "Reactor-Core stderr output", context={"stderr": stderr_content[-500:]})
                         except Exception:
                             pass
 
@@ -17214,7 +17225,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 pass
 
         except Exception as e:
-            self.logger.error(f"[v87.0] Trinity voice coordination init failed: {e}", exc_info=True)
+            log_component_failure("trinity-voice", "Trinity voice coordination init failed", error=e)
             self._trinity_voice_coordinator = {"initialized": False, "error": str(e)}
 
     async def _start_trinity_heartbeat_system(self) -> None:
@@ -17545,7 +17556,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 self._trinity_knowledge_indexer = None
 
         except Exception as e:
-            self.logger.error(f"[v88.0] Trinity knowledge indexer init failed: {e}", exc_info=True)
+            log_component_failure("trinity-indexer", "Trinity knowledge indexer init failed", error=e)
             self._trinity_knowledge_indexer = None
 
         # =====================================================================
@@ -18124,7 +18135,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.warning(f"[v101.0] ⚠️ Trinity Bridge Adapter import failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ Trinity Bridge: Not available{TerminalUI.RESET}")
         except Exception as e:
-            self.logger.error(f"[v101.0] ❌ Trinity Bridge Adapter initialization failed: {e}")
+            log_component_failure("trinity-bridge", "Trinity Bridge Adapter initialization failed", error=e)
             print(f"  {TerminalUI.RED}✗ Trinity Bridge: Failed to initialize - {e}{TerminalUI.RESET}")
             import traceback
             self.logger.debug(f"[v101.0] Traceback: {traceback.format_exc()}")
@@ -18258,7 +18269,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.warning(f"[v104.0] ⚠️ Trinity IPC Hub import failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ Trinity IPC Hub: Not available (import error){TerminalUI.RESET}")
         except Exception as e:
-            self.logger.error(f"[v104.0] ❌ Trinity IPC Hub initialization failed: {e}")
+            log_component_failure("trinity-ipc", "Trinity IPC Hub initialization failed", error=e)
             print(f"  {TerminalUI.RED}✗ Trinity IPC Hub: Failed to initialize - {e}{TerminalUI.RESET}")
             import traceback
             self.logger.debug(f"[v104.0] Traceback: {traceback.format_exc()}")
@@ -18369,7 +18380,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.warning(f"[v105.0] ⚠️ Trinity State Manager import failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ Trinity State Manager: Not available (import error){TerminalUI.RESET}")
         except Exception as e:
-            self.logger.error(f"[v105.0] ❌ Trinity State Manager initialization failed: {e}")
+            log_component_failure("trinity-state", "Trinity State Manager initialization failed", error=e)
             print(f"  {TerminalUI.RED}✗ Trinity State Manager: Failed - {e}{TerminalUI.RESET}")
             import traceback
             self.logger.debug(f"[v105.0] Traceback: {traceback.format_exc()}")
@@ -18456,7 +18467,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.warning(f"[v106.0] ⚠️ Trinity Observability import failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ Trinity Observability: Not available (import error){TerminalUI.RESET}")
         except Exception as e:
-            self.logger.error(f"[v106.0] ❌ Trinity Observability initialization failed: {e}")
+            log_component_failure("trinity-observability", "Trinity Observability initialization failed", error=e)
             print(f"  {TerminalUI.RED}✗ Trinity Observability: Failed - {e}{TerminalUI.RESET}")
             import traceback
             self.logger.debug(f"[v106.0] Traceback: {traceback.format_exc()}")
@@ -19647,7 +19658,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             self.logger.warning(f"[v102.0] ⚠️ Reactor Bridge import failed: {e}")
             print(f"  {TerminalUI.YELLOW}⚠️ Reactor Bridge: Not available{TerminalUI.RESET}")
         except Exception as e:
-            self.logger.error(f"[v102.0] ❌ Reactor Bridge initialization failed: {e}")
+            log_component_failure("reactor-bridge", "Reactor Bridge initialization failed", error=e)
             print(f"  {TerminalUI.RED}✗ Reactor Bridge: Failed - {e}{TerminalUI.RESET}")
 
     async def _monitor_reactor_training_health(self) -> None:
@@ -21417,14 +21428,14 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                                     try:
                                         await callback()
                                     except Exception as e:
-                                        self.logger.error(f"[v95.0] J-Prime restart callback failed: {e}")
+                                        log_component_failure("jarvis-prime", "J-Prime restart callback failed", error=e)
                             else:
                                 # Direct restart if no health monitor
                                 self.logger.info("[v95.0] Attempting direct J-Prime restart")
                                 try:
                                     await self._restart_jprime_on_crash(f"exit_code_{returncode}")
                                 except Exception as e:
-                                    self.logger.error(f"[v95.0] J-Prime direct restart failed: {e}")
+                                    log_component_failure("jarvis-prime", "J-Prime direct restart failed", error=e)
                         else:
                             self.logger.warning(
                                 f"[v95.0] J-Prime restart skipped (cooldown: "
@@ -21457,14 +21468,14 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                                     try:
                                         await callback()
                                     except Exception as e:
-                                        self.logger.error(f"[v95.0] Reactor-Core restart callback failed: {e}")
+                                        log_component_failure("reactor-core", "Reactor-Core restart callback failed", error=e)
                             else:
                                 # Direct restart if no health monitor
                                 self.logger.info("[v95.0] Attempting direct Reactor-Core restart")
                                 try:
                                     await self._restart_reactor_core_on_crash(f"exit_code_{returncode}")
                                 except Exception as e:
-                                    self.logger.error(f"[v95.0] Reactor-Core direct restart failed: {e}")
+                                    log_component_failure("reactor-core", "Reactor-Core direct restart failed", error=e)
                         else:
                             self.logger.warning(
                                 f"[v95.0] Reactor-Core restart skipped (cooldown: "
@@ -25658,7 +25669,7 @@ class UnifiedTrinityConnector:
             return True
 
         except Exception as e:
-            self.logger.error(f"[Trinity] Initialization failed: {e}")
+            log_component_failure("trinity", "Trinity initialization failed", error=e)
             import traceback
             self.logger.debug(traceback.format_exc())
             return False

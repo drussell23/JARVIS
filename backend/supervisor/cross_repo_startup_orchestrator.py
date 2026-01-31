@@ -193,6 +193,28 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# v148.1: LOG SEVERITY BRIDGE - Criticality-aware logging for component failures
+# =============================================================================
+# This bridge reduces log noise by logging component failures at appropriate
+# severity levels based on component criticality:
+#   - REQUIRED components: ERROR level
+#   - DEGRADED_OK components: WARNING level
+#   - OPTIONAL components: INFO level
+# =============================================================================
+try:
+    from backend.core.log_severity_bridge import log_component_failure, is_component_required
+except ImportError:
+    # Fallback if bridge not available - log all as errors (current behavior)
+    def log_component_failure(component, message, error=None, **ctx):
+        if error:
+            logger.error(f"{component}: {message}", exc_info=True)
+        else:
+            logger.error(f"{component}: {message}")
+
+    def is_component_required(component):
+        return True  # Conservative default
+
 
 # =============================================================================
 # v138.0: HARDWARE-AWARE COORDINATION SYSTEM
@@ -16343,7 +16365,13 @@ echo "=== JARVIS Prime started ==="
             return success
 
         except Exception as e:
-            logger.error(f"[v137.1] _spawn_service_inner({definition.name}): exception: {e}")
+            # v148.1: Use log_component_failure for criticality-aware logging
+            log_component_failure(
+                definition.name,
+                f"[v137.1] _spawn_service_inner exception",
+                error=e,
+                phase="spawn_inner"
+            )
             coordinator.mark_failed(definition.name, str(e))
             raise
 
@@ -16642,11 +16670,16 @@ echo "=== JARVIS Prime started ==="
                         available_gb = mem.available / (1024 ** 3)
 
                         if memory_pressure > percent_threshold or available_gb < min_available_gb:
-                            logger.error(
-                                f"[v142.0] ❌ MEMORY GATE BLOCKED: Cannot start {definition.name} "
-                                f"in {mode_label} mode - memory still at {memory_pressure:.1f}% "
-                                f"({available_gb:.1f}GB free). Threshold: {percent_threshold}%, "
-                                f"min free: {min_available_gb}GB. This prevents OOM kill (SIGKILL -9)."
+                            # v148.1: Use log_component_failure for criticality-aware logging
+                            log_component_failure(
+                                definition.name,
+                                f"[v142.0] MEMORY GATE BLOCKED: Cannot start in {mode_label} mode - "
+                                f"memory at {memory_pressure:.1f}% ({available_gb:.1f}GB free). "
+                                f"Threshold: {percent_threshold}%, min free: {min_available_gb}GB. "
+                                f"This prevents OOM kill (SIGKILL -9).",
+                                phase="memory_gate",
+                                memory_percent=memory_pressure,
+                                available_gb=available_gb,
                             )
                             managed.status = ServiceStatus.DEGRADED
                             # v142.0: Return gracefully without raising SystemExit
@@ -16670,8 +16703,12 @@ echo "=== JARVIS Prime started ==="
             logger.info(f"[v137.1] _spawn_service_core({definition.name}): checking dependencies...")
             deps_ready = await self._wait_for_dependencies(definition)
             if not deps_ready:
-                logger.error(
-                    f"[v95.0] Cannot spawn {definition.name}: dependencies not ready"
+                # v148.1: Use log_component_failure for criticality-aware logging
+                log_component_failure(
+                    definition.name,
+                    "[v95.0] Cannot spawn: dependencies not ready",
+                    phase="dependency_check",
+                    depends_on=definition.depends_on,
                 )
                 managed.status = ServiceStatus.FAILED
                 await _emit_event(
@@ -16738,9 +16775,14 @@ echo "=== JARVIS Prime started ==="
         logger.info(f"[v137.1] _spawn_service_core({definition.name}): port hygiene complete: ready={port_ready}, error={port_error}")
 
         if not port_ready:
-            logger.error(
-                f"[v136.0] ❌ Cannot spawn {definition.name}: port {definition.default_port} "
-                f"not available after cleanup: {port_error}"
+            # v148.1: Use log_component_failure for criticality-aware logging
+            log_component_failure(
+                definition.name,
+                f"[v136.0] Cannot spawn: port {definition.default_port} "
+                f"not available after cleanup: {port_error}",
+                phase="port_hygiene",
+                port=definition.default_port,
+                error_detail=port_error,
             )
             managed.status = ServiceStatus.FAILED
             await _emit_event(
@@ -16994,7 +17036,12 @@ echo "=== JARVIS Prime started ==="
             return True
 
         if not is_valid:
-            logger.error(f"Cannot spawn {definition.name}: pre-spawn validation failed")
+            # v148.1: Use log_component_failure for criticality-aware logging
+            log_component_failure(
+                definition.name,
+                "Cannot spawn: pre-spawn validation failed",
+                phase="pre_spawn_validation",
+            )
             managed.status = ServiceStatus.FAILED
             # v95.0: Emit service failed event
             await _emit_event(
@@ -17013,7 +17060,12 @@ echo "=== JARVIS Prime started ==="
             logger.warning(f"Using system Python for {definition.name} as no venv detected")
 
         if script_path is None:
-            logger.error(f"Cannot spawn {definition.name}: no script found")
+            # v148.1: Use log_component_failure for criticality-aware logging
+            log_component_failure(
+                definition.name,
+                "Cannot spawn: no script found",
+                phase="script_discovery",
+            )
             managed.status = ServiceStatus.FAILED
             # v95.0: Emit service failed event
             await _emit_event(
@@ -17363,7 +17415,13 @@ echo "=== JARVIS Prime started ==="
                 return False  # Still return False to indicate not healthy
 
         except Exception as e:
-            logger.error(f"❌ Failed to spawn {definition.name}: {e}", exc_info=True)
+            # v148.1: Use log_component_failure for criticality-aware logging
+            log_component_failure(
+                definition.name,
+                "Failed to spawn service",
+                error=e,
+                phase="spawn_core",
+            )
             managed.status = ServiceStatus.FAILED
             # v95.0: Emit service crashed event
             await _emit_event(

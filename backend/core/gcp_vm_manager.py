@@ -98,6 +98,15 @@ except ImportError:
 
 from backend.core.async_safety import LazyAsyncLock
 
+# Log severity bridge for criticality-aware logging
+try:
+    from backend.core.log_severity_bridge import log_component_failure, is_component_required
+except ImportError:
+    def log_component_failure(component, message, error=None, **ctx):
+        logging.getLogger(__name__).error(f"{component}: {message}")
+    def is_component_required(component):
+        return True
+
 logger = logging.getLogger(__name__)
 
 # Type variable for generic retry decorator
@@ -832,7 +841,13 @@ class GCPVMManager:
 
             except Exception as e:
                 self._initialization_error = e
-                logger.error(f"Failed to initialize GCP VM Manager: {e}", exc_info=True)
+                log_component_failure(
+                    "gcp-vm",
+                    "Failed to initialize GCP VM Manager",
+                    error=e,
+                    project_id=self.config.project_id,
+                    zone=self.config.zone,
+                )
                 raise
 
     async def _initialize_gcp_clients(self):
@@ -887,7 +902,11 @@ class GCPVMManager:
             logger.info(f"✅ GCP API clients initialized (Project: {self.config.project_id})")
 
         except Exception as e:
-            logger.error(f"Failed to initialize GCP API clients: {e}")
+            log_component_failure(
+                "gcp-vm",
+                "Failed to initialize GCP API clients",
+                error=e,
+            )
             raise RuntimeError(f"GCP API client initialization failed: {e}") from e
 
     def _initialize_gcp_clients_sync(self):
@@ -908,7 +927,11 @@ class GCPVMManager:
                 f"(Project: {self.config.project_id})"
             )
         except Exception as e:
-            logger.error(f"Synchronous GCP client initialization failed: {e}")
+            log_component_failure(
+                "gcp-vm",
+                "Synchronous GCP client initialization failed",
+                error=e,
+            )
             raise
 
     async def _initialize_integrations(self):
@@ -1200,7 +1223,11 @@ class GCPVMManager:
                 return False, "VM_CREATE_FAILED: create_vm returned None"
                 
         except Exception as e:
-            logger.error(f"Failed to start Spot VM: {e}")
+            log_component_failure(
+                "gcp-vm",
+                "Failed to start Spot VM",
+                error=e,
+            )
             return False, f"EXCEPTION: {str(e)}"
 
         # Initialize regions client for quota checking
@@ -1314,7 +1341,11 @@ class GCPVMManager:
             
         except Exception as e:
             circuit.record_failure(e)
-            logger.error(f"❌ Quota check failed: {e}")
+            log_component_failure(
+                "gcp-vm",
+                "Quota check failed",
+                error=e,
+            )
             # Proceed optimistically if quota check fails
             return QuotaCheckResult(can_create=True, message=f"Quota check error: {e} - proceeding optimistically")
     
@@ -2112,7 +2143,12 @@ class GCPVMManager:
 
             # Actual error - record failure
             circuit.record_failure(e)
-            logger.error(f"❌ Failed to terminate VM {vm_name}: {e}", exc_info=True)
+            log_component_failure(
+                "gcp-vm",
+                f"Failed to terminate VM {vm_name}",
+                error=e,
+                vm_name=vm_name,
+            )
             return False
 
     async def _check_vm_exists_in_gcp(self, vm_name: str) -> Tuple[bool, Optional[str]]:
@@ -2453,7 +2489,11 @@ class GCPVMManager:
                 if not self.is_monitoring:
                     # Shutdown in progress, don't log error
                     break
-                logger.error(f"Error in monitoring loop: {e}", exc_info=True)
+                log_component_failure(
+                    "gcp-vm",
+                    "Error in monitoring loop",
+                    error=e,
+                )
 
         # v93.6: Clean exit logging
         logger.info("🔍 VM monitoring loop stopped")
@@ -2487,7 +2527,12 @@ class GCPVMManager:
             return vm.state == VMState.RUNNING
 
         except Exception as e:
-            logger.error(f"Health check failed for {vm_name}: {e}")
+            log_component_failure(
+                "gcp-vm",
+                f"Health check failed for {vm_name}",
+                error=e,
+                vm_name=vm_name,
+            )
             return False
 
     async def cleanup_all_vms(self, reason: str = "System shutdown"):
@@ -2775,7 +2820,11 @@ async def create_vm_if_needed(
             return None
             
     except Exception as e:
-        logger.error(f"Error in create_vm_if_needed: {e}")
+        log_component_failure(
+            "gcp-vm",
+            "Error in create_vm_if_needed",
+            error=e,
+        )
         return None
 
 

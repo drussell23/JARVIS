@@ -204,6 +204,10 @@ core.*
 !backend/context_intelligence/core/
 !backend/context_intelligence/core/**
 !backend/context_intelligence/core/**/*
+# Exception: Allow tests/unit/backend/core directory (unit tests for backend/core modules)
+!tests/unit/backend/core/
+!tests/unit/backend/core/**
+!tests/unit/backend/core/**/*
 # But still ignore build artifacts and cache in backend/core/
 backend/core/__pycache__/
 backend/core/**/__pycache__/
