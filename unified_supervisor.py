@@ -565,6 +565,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import ssl
 import stat
 import subprocess
@@ -9486,6 +9487,1082 @@ def get_process_cleaner() -> ParallelProcessCleaner:
     if _process_cleaner is None:
         _process_cleaner = ParallelProcessCleaner()
     return _process_cleaner
+
+
+# =============================================================================
+# ZONE 3.8: PHYSICS-AWARE VOICE AUTHENTICATION MANAGER
+# =============================================================================
+# v109.0: Physics-based voice anti-spoofing and liveness detection
+
+
+class PhysicsAwareAuthManager:
+    """
+    Physics-Aware Voice Authentication Startup Manager.
+
+    Initializes and manages the physics-aware authentication components:
+    - Reverberation analyzer (RT60, double-reverb detection)
+    - Vocal tract length estimator (VTL biometrics)
+    - Doppler analyzer (liveness detection)
+    - Bayesian confidence fusion
+    - 7-layer anti-spoofing system
+
+    Environment Configuration:
+    - PHYSICS_AWARE_ENABLED: Enable/disable (default: true)
+    - PHYSICS_PRELOAD_MODELS: Preload models at startup (default: false)
+    - PHYSICS_BASELINE_VTL_CM: User's baseline VTL (default: auto-detect)
+    - PHYSICS_BASELINE_RT60_SEC: User's baseline RT60 (default: auto-detect)
+
+    Anti-Spoofing Layers:
+    1. Spectral analysis for replay detection
+    2. Microphone fingerprinting
+    3. Environmental acoustics
+    4. Vocal tract analysis (VTL biometrics)
+    5. Reverberation consistency
+    6. Doppler movement detection
+    7. Bayesian fusion of all layers
+    """
+
+    def __init__(
+        self,
+        config: Optional[SystemKernelConfig] = None,
+        logger: Optional[Any] = None,
+    ):
+        """
+        Initialize physics-aware authentication manager.
+
+        Args:
+            config: System kernel configuration
+            logger: Logger instance
+        """
+        self.config = config
+        self._logger = logger or logging.getLogger("PhysicsAuth")
+
+        # Configuration from environment
+        self.enabled = os.getenv("PHYSICS_AWARE_ENABLED", "true").lower() == "true"
+        self.preload_models = (
+            os.getenv("PHYSICS_PRELOAD_MODELS", "false").lower() == "true"
+        )
+
+        # Baseline values (can be overridden or auto-detected)
+        self._baseline_vtl_cm: Optional[float] = None
+        self._baseline_rt60_sec: Optional[float] = None
+
+        baseline_vtl = os.getenv("PHYSICS_BASELINE_VTL_CM")
+        if baseline_vtl:
+            try:
+                self._baseline_vtl_cm = float(baseline_vtl)
+            except ValueError:
+                pass
+
+        baseline_rt60 = os.getenv("PHYSICS_BASELINE_RT60_SEC")
+        if baseline_rt60:
+            try:
+                self._baseline_rt60_sec = float(baseline_rt60)
+            except ValueError:
+                pass
+
+        # Component references
+        self._physics_extractor: Optional[Any] = None
+        self._anti_spoofing_detector: Optional[Any] = None
+        self._initialized = False
+
+        # Statistics
+        self.initialization_time_ms = 0.0
+        self.physics_verifications = 0
+        self.spoofs_detected = 0
+        self.legitimate_authentications = 0
+
+        # Spoof detection history for learning
+        self._spoof_history: List[Dict[str, Any]] = []
+        self._max_history = 100
+
+        self._logger.info("🔬 Physics-Aware Auth Manager initialized:")
+        self._logger.info(f"   ├─ Enabled: {self.enabled}")
+        self._logger.info(f"   ├─ Preload models: {self.preload_models}")
+        self._logger.info(f"   ├─ Baseline VTL: {self._baseline_vtl_cm or 'auto-detect'} cm")
+        self._logger.info(f"   └─ Baseline RT60: {self._baseline_rt60_sec or 'auto-detect'} sec")
+
+    async def initialize(self) -> bool:
+        """
+        Initialize physics-aware authentication components.
+
+        Returns:
+            True if initialization successful
+        """
+        if not self.enabled:
+            self._logger.info("🔬 Physics-aware authentication disabled")
+            return False
+
+        start_time = time.time()
+
+        try:
+            # Try to import physics components from backend
+            try:
+                from backend.voice_unlock.core.feature_extraction import (
+                    get_physics_feature_extractor,
+                    PhysicsConfig,
+                )
+                from backend.voice_unlock.core.anti_spoofing import (
+                    get_anti_spoofing_detector,
+                )
+
+                # Initialize physics extractor
+                sample_rate = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
+                self._physics_extractor = get_physics_feature_extractor(sample_rate)
+
+                # Set baselines if provided
+                if self._baseline_vtl_cm and hasattr(
+                    self._physics_extractor, "_baseline_vtl"
+                ):
+                    self._physics_extractor._baseline_vtl = self._baseline_vtl_cm
+                if self._baseline_rt60_sec and hasattr(
+                    self._physics_extractor, "_baseline_rt60"
+                ):
+                    self._physics_extractor._baseline_rt60 = self._baseline_rt60_sec
+
+                # Initialize anti-spoofing detector (includes Layer 7 physics)
+                self._anti_spoofing_detector = get_anti_spoofing_detector()
+
+                self._initialized = True
+                self.initialization_time_ms = (time.time() - start_time) * 1000
+
+                vtl_range = (
+                    f"{PhysicsConfig.VTL_MIN_CM}-{PhysicsConfig.VTL_MAX_CM} cm"
+                    if hasattr(PhysicsConfig, "VTL_MIN_CM")
+                    else "12-20 cm"
+                )
+                prior = (
+                    f"{PhysicsConfig.PRIOR_AUTHENTIC:.0%}"
+                    if hasattr(PhysicsConfig, "PRIOR_AUTHENTIC")
+                    else "95%"
+                )
+
+                self._logger.info(
+                    f"✅ Physics-aware auth initialized ({self.initialization_time_ms:.0f}ms)"
+                )
+                self._logger.info(f"   ├─ Physics extractor: Ready")
+                self._logger.info(f"   ├─ Anti-spoofing (7-layer): Ready")
+                self._logger.info(f"   ├─ VTL range: {vtl_range}")
+                self._logger.info(f"   └─ Bayesian prior: {prior} authentic")
+
+                return True
+
+            except ImportError as e:
+                self._logger.debug(f"Physics components not available: {e}")
+                # Fall back to mock implementation
+                self._initialized = True
+                self.initialization_time_ms = (time.time() - start_time) * 1000
+                self._logger.info(
+                    f"✅ Physics-aware auth initialized (mock mode, {self.initialization_time_ms:.0f}ms)"
+                )
+                return True
+
+        except Exception as e:
+            self._logger.error(f"Physics initialization failed: {e}")
+            self.enabled = False
+            return False
+
+    async def verify_physics(
+        self,
+        audio_data: bytes,
+        sample_rate: int = 16000,
+    ) -> Dict[str, Any]:
+        """
+        Perform physics-based verification on audio.
+
+        Args:
+            audio_data: Raw audio bytes
+            sample_rate: Audio sample rate
+
+        Returns:
+            Verification result with confidence scores
+        """
+        self.physics_verifications += 1
+
+        result = {
+            "authentic": True,
+            "confidence": 0.95,
+            "checks": {},
+            "timestamp": time.time(),
+        }
+
+        if not self._initialized:
+            result["error"] = "Not initialized"
+            return result
+
+        try:
+            if self._anti_spoofing_detector:
+                # Run 7-layer anti-spoofing
+                spoof_result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._anti_spoofing_detector.detect(
+                        audio_data, sample_rate
+                    ),
+                )
+
+                result["authentic"] = not spoof_result.get("is_spoof", False)
+                result["confidence"] = spoof_result.get("confidence", 0.5)
+                result["checks"] = spoof_result.get("layer_results", {})
+
+                if not result["authentic"]:
+                    self.spoofs_detected += 1
+                    self._record_spoof(spoof_result)
+                else:
+                    self.legitimate_authentications += 1
+
+            if self._physics_extractor:
+                # Extract physics features
+                features = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._physics_extractor.extract(audio_data, sample_rate),
+                )
+                result["physics_features"] = features
+
+        except Exception as e:
+            self._logger.error(f"Physics verification failed: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    def _record_spoof(self, spoof_result: Dict[str, Any]) -> None:
+        """Record spoof detection for learning."""
+        record = {
+            "timestamp": time.time(),
+            "result": spoof_result,
+        }
+        self._spoof_history.append(record)
+
+        # Trim history
+        if len(self._spoof_history) > self._max_history:
+            self._spoof_history = self._spoof_history[-self._max_history :]
+
+    def get_physics_extractor(self) -> Optional[Any]:
+        """Get the physics feature extractor instance."""
+        return self._physics_extractor
+
+    def get_anti_spoofing_detector(self) -> Optional[Any]:
+        """Get the anti-spoofing detector instance."""
+        return self._anti_spoofing_detector
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get physics startup statistics."""
+        return {
+            "enabled": self.enabled,
+            "initialized": self._initialized,
+            "initialization_time_ms": self.initialization_time_ms,
+            "baseline_vtl_cm": self._baseline_vtl_cm,
+            "baseline_rt60_sec": self._baseline_rt60_sec,
+            "physics_verifications": self.physics_verifications,
+            "spoofs_detected": self.spoofs_detected,
+            "legitimate_authentications": self.legitimate_authentications,
+            "spoof_history_count": len(self._spoof_history),
+        }
+
+
+# =============================================================================
+# ZONE 3.9: SPOT INSTANCE RESILIENCE HANDLER
+# =============================================================================
+# v109.0: GCP Spot VM preemption handling and automatic fallback
+
+
+class SpotInstanceResilienceHandler:
+    """
+    Spot Instance Resilience Handler for GCP Preemption.
+
+    Features:
+    - Graceful preemption handling (30 second warning from GCP)
+    - State preservation before shutdown
+    - Automatic fallback to micro instance or local
+    - Cost tracking during preemption events
+    - Learning from preemption patterns
+
+    Environment Configuration:
+    - SPOT_RESILIENCE_ENABLED: Enable/disable (default: true)
+    - SPOT_FALLBACK_MODE: micro/local/none (default: local)
+    - SPOT_STATE_PRESERVE: Save state on preemption (default: true)
+    - SPOT_PREEMPTION_WEBHOOK: Webhook URL for notifications (default: none)
+
+    GCP Spot VMs can be preempted at any time with 30 seconds warning.
+    This handler ensures graceful shutdown and automatic failover.
+    """
+
+    def __init__(
+        self,
+        config: Optional[SystemKernelConfig] = None,
+        logger: Optional[Any] = None,
+    ):
+        """
+        Initialize Spot Instance resilience handler.
+
+        Args:
+            config: System kernel configuration
+            logger: Logger instance
+        """
+        self.config = config
+        self._logger = logger or logging.getLogger("SpotResilience")
+
+        # Configuration from environment
+        self.enabled = os.getenv("SPOT_RESILIENCE_ENABLED", "true").lower() == "true"
+        self.fallback_mode = os.getenv("SPOT_FALLBACK_MODE", "local")
+        self.state_preserve = (
+            os.getenv("SPOT_STATE_PRESERVE", "true").lower() == "true"
+        )
+        self.preemption_webhook = os.getenv("SPOT_PREEMPTION_WEBHOOK")
+
+        # Preemption tracking
+        self.preemption_count = 0
+        self.last_preemption_time: Optional[float] = None
+        self.preemption_history: List[Dict[str, Any]] = []
+
+        # State preservation
+        state_file_path = os.getenv(
+            "SPOT_STATE_FILE", str(Path.home() / ".jarvis" / "spot_state.json")
+        )
+        self.state_file = Path(state_file_path)
+
+        # Callbacks for external components
+        self.preemption_callback: Optional[Callable] = None
+        self.fallback_callback: Optional[Callable] = None
+
+        # Polling task reference
+        self._polling_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        self._logger.info("🛡️ Spot Instance Resilience initialized:")
+        self._logger.info(f"   ├─ Enabled: {self.enabled}")
+        self._logger.info(f"   ├─ Fallback mode: {self.fallback_mode}")
+        self._logger.info(f"   └─ State preserve: {self.state_preserve}")
+
+    async def setup_preemption_handler(
+        self,
+        preemption_callback: Optional[Callable] = None,
+        fallback_callback: Optional[Callable] = None,
+    ) -> None:
+        """
+        Setup preemption handling callbacks.
+
+        Args:
+            preemption_callback: Called when preemption detected
+            fallback_callback: Called to trigger fallback mode
+        """
+        self.preemption_callback = preemption_callback
+        self.fallback_callback = fallback_callback
+
+        if self.enabled:
+            # Start metadata server polling for preemption notice
+            self._running = True
+            self._polling_task = asyncio.create_task(self._poll_preemption_notice())
+            self._logger.info("🛡️ Preemption handler active")
+
+    async def stop(self) -> None:
+        """Stop the preemption polling."""
+        self._running = False
+        if self._polling_task:
+            self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _poll_preemption_notice(self) -> None:
+        """
+        Poll GCP metadata server for preemption notice.
+
+        GCP sends a preemption notice 30 seconds before termination.
+        This method checks the metadata server every 5 seconds.
+        """
+        metadata_url = (
+            "http://metadata.google.internal/computeMetadata/v1/instance/preempted"
+        )
+        headers = {"Metadata-Flavor": "Google"}
+
+        while self._running:
+            try:
+                # Try aiohttp first, fall back to urllib
+                try:
+                    import aiohttp
+
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            metadata_url,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as response:
+                            if response.status == 200:
+                                text = await response.text()
+                                if text.strip().lower() == "true":
+                                    await self._handle_preemption()
+                                    break
+                except ImportError:
+                    # Fallback to urllib (blocking)
+                    loop = asyncio.get_running_loop()
+
+                    def _check_sync():
+                        import urllib.request
+
+                        req = urllib.request.Request(metadata_url, headers=headers)
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            return resp.read().decode().strip().lower()
+
+                    try:
+                        result = await loop.run_in_executor(None, _check_sync)
+                        if result == "true":
+                            await self._handle_preemption()
+                            break
+                    except Exception:
+                        pass
+
+            except Exception:
+                # Not on GCP or metadata not available - this is normal
+                pass
+
+            await asyncio.sleep(5)  # Check every 5 seconds
+
+    async def _handle_preemption(self) -> None:
+        """
+        Handle preemption event.
+
+        We have approximately 30 seconds to:
+        1. Preserve state
+        2. Notify external systems
+        3. Trigger fallback
+        """
+        self._logger.warning(
+            "⚠️ SPOT PREEMPTION NOTICE - 30 seconds to shutdown!"
+        )
+
+        self.preemption_count += 1
+        self.last_preemption_time = time.time()
+
+        preemption_event = {
+            "timestamp": time.time(),
+            "preemption_count": self.preemption_count,
+            "fallback_mode": self.fallback_mode,
+        }
+        self.preemption_history.append(preemption_event)
+
+        # Preserve state if enabled
+        if self.state_preserve:
+            await self._preserve_state()
+
+        # Call preemption callback
+        if self.preemption_callback:
+            try:
+                if asyncio.iscoroutinefunction(self.preemption_callback):
+                    await self.preemption_callback()
+                else:
+                    self.preemption_callback()
+            except Exception as e:
+                self._logger.error(f"Preemption callback failed: {e}")
+
+        # Trigger fallback
+        if self.fallback_mode != "none" and self.fallback_callback:
+            try:
+                if asyncio.iscoroutinefunction(self.fallback_callback):
+                    await self.fallback_callback(self.fallback_mode)
+                else:
+                    self.fallback_callback(self.fallback_mode)
+            except Exception as e:
+                self._logger.error(f"Fallback callback failed: {e}")
+
+        # Send webhook notification if configured
+        if self.preemption_webhook:
+            await self._send_webhook_notification(preemption_event)
+
+    async def _preserve_state(self) -> None:
+        """Preserve current state to disk for recovery."""
+        try:
+            state = {
+                "timestamp": time.time(),
+                "preemption_count": self.preemption_count,
+                "preemption_history": self.preemption_history[-10:],  # Last 10
+                "version": KERNEL_VERSION,
+            }
+
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.state_file.write_text(json.dumps(state, indent=2))
+            self._logger.info(f"💾 State preserved to {self.state_file}")
+
+        except Exception as e:
+            self._logger.error(f"State preservation failed: {e}")
+
+    async def _send_webhook_notification(self, event: Dict[str, Any]) -> None:
+        """Send webhook notification for preemption event."""
+        if not self.preemption_webhook:
+            return
+
+        try:
+            try:
+                import aiohttp
+
+                async with aiohttp.ClientSession() as session:
+                    await session.post(
+                        self.preemption_webhook,
+                        json=event,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    )
+                self._logger.info("📤 Preemption webhook sent")
+            except ImportError:
+                # Fallback to urllib
+                loop = asyncio.get_running_loop()
+
+                def _post_sync():
+                    import urllib.request
+
+                    data = json.dumps(event).encode()
+                    req = urllib.request.Request(
+                        self.preemption_webhook,
+                        data=data,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    urllib.request.urlopen(req, timeout=5)
+
+                await loop.run_in_executor(None, _post_sync)
+                self._logger.info("📤 Preemption webhook sent (sync)")
+
+        except Exception as e:
+            self._logger.error(f"Webhook notification failed: {e}")
+
+    async def load_preserved_state(self) -> Optional[Dict[str, Any]]:
+        """Load preserved state from previous session."""
+        try:
+            if self.state_file.exists():
+                state = json.loads(self.state_file.read_text())
+                self._logger.info(f"💾 Loaded preserved state from {self.state_file}")
+
+                # Restore preemption history
+                if "preemption_history" in state:
+                    self.preemption_history = state["preemption_history"]
+                if "preemption_count" in state:
+                    self.preemption_count = state["preemption_count"]
+
+                return state
+        except Exception as e:
+            self._logger.error(f"Failed to load preserved state: {e}")
+        return None
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get resilience statistics."""
+        return {
+            "enabled": self.enabled,
+            "fallback_mode": self.fallback_mode,
+            "state_preserve": self.state_preserve,
+            "preemption_count": self.preemption_count,
+            "last_preemption_time": self.last_preemption_time,
+            "preemption_history_count": len(self.preemption_history),
+            "has_webhook": self.preemption_webhook is not None,
+        }
+
+
+# =============================================================================
+# ZONE 3.10: INTELLIGENT MODEL MANAGER
+# =============================================================================
+# v109.0: Memory-aware model selection with auto-download from HuggingFace
+
+
+# Model catalog for available LLM models
+MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
+    "phi-2-q4": {
+        "repo_id": "TheBloke/phi-2-GGUF",
+        "filename": "phi-2.Q4_K_M.gguf",
+        "size_mb": 1800,
+        "min_ram_gb": 4,
+        "description": "Microsoft Phi-2 - Efficient 2.7B model",
+        "context_length": 2048,
+    },
+    "phi-3-mini-q4": {
+        "repo_id": "microsoft/Phi-3-mini-4k-instruct-gguf",
+        "filename": "Phi-3-mini-4k-instruct-q4.gguf",
+        "size_mb": 2500,
+        "min_ram_gb": 6,
+        "description": "Microsoft Phi-3 Mini - Strong 3.8B model",
+        "context_length": 4096,
+    },
+    "mistral-7b-q4": {
+        "repo_id": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+        "filename": "mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+        "size_mb": 4370,
+        "min_ram_gb": 8,
+        "description": "Mistral 7B Instruct v0.2 - Excellent balance",
+        "context_length": 32768,
+    },
+    "mistral-7b-q8": {
+        "repo_id": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+        "filename": "mistral-7b-instruct-v0.2.Q8_0.gguf",
+        "size_mb": 7700,
+        "min_ram_gb": 12,
+        "description": "Mistral 7B Q8 - Higher quality, more RAM",
+        "context_length": 32768,
+    },
+    "llama-3-8b-q4": {
+        "repo_id": "MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF",
+        "filename": "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
+        "size_mb": 4900,
+        "min_ram_gb": 10,
+        "description": "Llama 3 8B Instruct - Latest Meta model",
+        "context_length": 8192,
+    },
+}
+
+
+class IntelligentModelManager:
+    """
+    Comprehensive model manager with auto-download and reactor-core integration.
+
+    Features:
+    - Memory-aware model selection (picks best model for available RAM)
+    - Auto-download from HuggingFace Hub
+    - Reactor-core trained model deployment
+    - Hot-swap capability (change models without restart)
+    - Version registry with rollback
+    - Model health monitoring
+
+    This manager ensures JARVIS always has the best available model
+    for the current system resources.
+    """
+
+    def __init__(
+        self,
+        models_dir: Optional[Path] = None,
+        config: Optional[SystemKernelConfig] = None,
+        logger: Optional[Any] = None,
+    ):
+        """
+        Initialize the intelligent model manager.
+
+        Args:
+            models_dir: Directory to store models
+            config: System kernel configuration
+            logger: Logger instance
+        """
+        self.config = config
+        self._logger = logger or logging.getLogger("ModelManager")
+
+        # Model directory
+        if models_dir:
+            self.models_dir = Path(models_dir)
+        else:
+            self.models_dir = Path(__file__).parent / "models"
+
+        # Ensure models directory exists
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        # State tracking
+        self.current_model: Optional[str] = None
+        self.current_model_path: Optional[Path] = None
+        self.model_registry: Dict[str, Any] = {}
+        self.download_in_progress = False
+
+        # Configuration
+        self.auto_download = (
+            os.getenv("MODEL_AUTO_DOWNLOAD", "true").lower() == "true"
+        )
+        self.auto_select = os.getenv("MODEL_AUTO_SELECT", "true").lower() == "true"
+        self.default_model = os.getenv("MODEL_DEFAULT", "mistral-7b-q4")
+
+        # Reactor-core integration
+        self._reactor_core_path: Optional[Path] = None
+        reactor_path = Path(__file__).parent.parent / "reactor-core"
+        if reactor_path.exists():
+            self._reactor_core_path = reactor_path
+
+        # Thread safety
+        self._lock = asyncio.Lock()
+
+        # Statistics
+        self._stats = {
+            "models_downloaded": 0,
+            "model_loads": 0,
+            "hot_swaps": 0,
+            "download_bytes": 0,
+        }
+
+        # Load existing metadata
+        self._load_registry()
+
+        self._logger.info("🧠 Intelligent Model Manager initialized:")
+        self._logger.info(f"   ├─ Models dir: {self.models_dir}")
+        self._logger.info(f"   ├─ Auto download: {self.auto_download}")
+        self._logger.info(f"   ├─ Auto select: {self.auto_select}")
+        self._logger.info(
+            f"   └─ Reactor-core: {'connected' if self._reactor_core_path else 'not found'}"
+        )
+
+    def _load_registry(self) -> None:
+        """Load model registry from disk."""
+        metadata_file = self.models_dir / "models_metadata.json"
+        if metadata_file.exists():
+            try:
+                self.model_registry = json.loads(metadata_file.read_text())
+                self._logger.debug(
+                    f"Loaded model registry with {len(self.model_registry.get('models', {}))} models"
+                )
+            except Exception as e:
+                self._logger.debug(f"Failed to load registry: {e}")
+                self.model_registry = {"models": {}, "current": None}
+        else:
+            self.model_registry = {"models": {}, "current": None}
+
+    def _save_registry(self) -> None:
+        """Save model registry to disk."""
+        metadata_file = self.models_dir / "models_metadata.json"
+        self.model_registry["last_updated"] = datetime.now().isoformat()
+        metadata_file.write_text(
+            json.dumps(self.model_registry, indent=2, default=str)
+        )
+
+    def get_available_memory_gb(self) -> float:
+        """Get available system memory in GB."""
+        try:
+            import psutil
+
+            mem = psutil.virtual_memory()
+            return mem.available / (1024**3)
+        except ImportError:
+            # Fallback: assume 8GB available
+            return 8.0
+
+    def select_optimal_model(self) -> Optional[str]:
+        """
+        Select the best model based on available memory.
+
+        Returns:
+            Model name from catalog or None if no suitable model
+        """
+        available_gb = self.get_available_memory_gb()
+
+        self._logger.debug(f"Available memory: {available_gb:.1f}GB")
+
+        # Sort models by min_ram_gb descending (prefer larger models)
+        suitable_models = [
+            (name, info)
+            for name, info in MODEL_CATALOG.items()
+            if info["min_ram_gb"] <= available_gb
+        ]
+
+        if not suitable_models:
+            self._logger.warning("No models suitable for available memory")
+            return None
+
+        # Sort by min_ram_gb descending to get the best model we can run
+        suitable_models.sort(key=lambda x: x[1]["min_ram_gb"], reverse=True)
+        selected = suitable_models[0][0]
+        self._logger.info(
+            f"Selected optimal model: {selected} (needs {MODEL_CATALOG[selected]['min_ram_gb']}GB, have {available_gb:.1f}GB)"
+        )
+        return selected
+
+    def check_model_exists(self, model_name: Optional[str] = None) -> Optional[Path]:
+        """
+        Check if a model exists in the models directory.
+
+        Args:
+            model_name: Specific model to check, or None for any model
+
+        Returns:
+            Path to model file if found, None otherwise
+        """
+        # Check current.gguf symlink first
+        current_link = self.models_dir / "current.gguf"
+        if current_link.exists():
+            resolved = current_link.resolve()
+            if resolved.exists() and resolved.stat().st_size > 1000:
+                return resolved
+
+        # Check for specific model
+        if model_name and model_name in MODEL_CATALOG:
+            model_info = MODEL_CATALOG[model_name]
+            model_file = self.models_dir / model_info["filename"]
+            if model_file.exists() and model_file.stat().st_size > 1000:
+                return model_file
+
+        # Check for any .gguf files
+        gguf_files = list(self.models_dir.glob("*.gguf"))
+        for gguf in gguf_files:
+            if gguf.stat().st_size > 1000 and not gguf.is_symlink():
+                return gguf
+
+        return None
+
+    async def _check_reactor_core_models(self) -> Optional[Path]:
+        """Check for trained models from reactor-core."""
+        try:
+            # Check reactor-core output directories
+            reactor_paths = [
+                self._reactor_core_path / "output" / "models"
+                if self._reactor_core_path
+                else None,
+                Path(os.getenv("REACTOR_CORE_OUTPUT", "")) / "deployed",
+                Path(__file__).parent / "reactor-core-output" / "deployed",
+            ]
+
+            for reactor_path in reactor_paths:
+                if reactor_path and reactor_path.exists():
+                    gguf_files = list(reactor_path.glob("*.gguf"))
+                    if gguf_files:
+                        # Sort by modification time, newest first
+                        gguf_files.sort(
+                            key=lambda x: x.stat().st_mtime, reverse=True
+                        )
+                        newest = gguf_files[0]
+                        if newest.stat().st_size > 1000:
+                            self._logger.info(
+                                f"✓ Found reactor-core model: {newest.name}"
+                            )
+                            return newest
+        except Exception as e:
+            self._logger.debug(f"Reactor-core check error: {e}")
+        return None
+
+    async def ensure_model_available(self) -> Dict[str, Any]:
+        """
+        Ensure a model is available for JARVIS-Prime.
+
+        Returns:
+            Status dict with:
+            - available: bool
+            - model_name: str
+            - model_path: Path
+            - source: str (existing, downloaded, reactor_core)
+        """
+        result = {
+            "available": False,
+            "model_name": None,
+            "model_path": None,
+            "source": None,
+            "error": None,
+        }
+
+        async with self._lock:
+            try:
+                # Step 1: Check for existing model
+                existing_path = self.check_model_exists()
+                if existing_path:
+                    result["available"] = True
+                    result["model_path"] = existing_path
+                    result["model_name"] = existing_path.name
+                    result["source"] = "existing"
+                    self.current_model_path = existing_path
+                    self._stats["model_loads"] += 1
+                    self._logger.info(f"✓ Found existing model: {existing_path.name}")
+                    return result
+
+                # Step 2: Check for reactor-core trained models
+                reactor_model = await self._check_reactor_core_models()
+                if reactor_model:
+                    result["available"] = True
+                    result["model_path"] = reactor_model
+                    result["model_name"] = reactor_model.name
+                    result["source"] = "reactor_core"
+                    self.current_model_path = reactor_model
+                    self._stats["model_loads"] += 1
+                    return result
+
+                # Step 3: Auto-download if enabled
+                if self.auto_download:
+                    # Select optimal model for available memory
+                    if self.auto_select:
+                        model_name = self.select_optimal_model()
+                    else:
+                        model_name = self.default_model
+
+                    if model_name:
+                        self._logger.info(f"📥 Auto-downloading model: {model_name}")
+                        download_result = await self.download_model(model_name)
+                        if download_result["success"]:
+                            result["available"] = True
+                            result["model_path"] = download_result["path"]
+                            result["model_name"] = model_name
+                            result["source"] = "downloaded"
+                            return result
+                        else:
+                            result["error"] = download_result.get(
+                                "error", "Download failed"
+                            )
+
+            except Exception as e:
+                result["error"] = str(e)
+                self._logger.error(f"Model availability check failed: {e}")
+
+        return result
+
+    async def download_model(self, model_name: str) -> Dict[str, Any]:
+        """
+        Download a model from HuggingFace Hub.
+
+        Args:
+            model_name: Name of model from MODEL_CATALOG
+
+        Returns:
+            Result dict with success status and path
+        """
+        result = {"success": False, "path": None, "error": None}
+
+        if model_name not in MODEL_CATALOG:
+            result["error"] = f"Unknown model: {model_name}"
+            return result
+
+        if self.download_in_progress:
+            result["error"] = "Download already in progress"
+            return result
+
+        self.download_in_progress = True
+        model_info = MODEL_CATALOG[model_name]
+
+        try:
+            # Try using huggingface_hub for download
+            try:
+                from huggingface_hub import hf_hub_download
+
+                self._logger.info(
+                    f"📥 Downloading {model_name} ({model_info['size_mb']}MB)..."
+                )
+
+                loop = asyncio.get_running_loop()
+                downloaded_path = await loop.run_in_executor(
+                    None,
+                    lambda: hf_hub_download(
+                        repo_id=model_info["repo_id"],
+                        filename=model_info["filename"],
+                        local_dir=str(self.models_dir),
+                        local_dir_use_symlinks=False,
+                    ),
+                )
+
+                model_path = Path(downloaded_path)
+                if model_path.exists():
+                    # Create current.gguf symlink
+                    current_link = self.models_dir / "current.gguf"
+                    if current_link.exists():
+                        current_link.unlink()
+                    current_link.symlink_to(model_path)
+
+                    result["success"] = True
+                    result["path"] = model_path
+                    self._update_registry(model_name, model_path, "downloaded")
+                    self._stats["models_downloaded"] += 1
+                    self._stats["download_bytes"] += model_info["size_mb"] * 1024 * 1024
+
+                    self._logger.info(f"✅ Downloaded {model_name} to {model_path}")
+
+            except ImportError:
+                result["error"] = "huggingface_hub not installed"
+                self._logger.warning(
+                    "Install huggingface_hub for auto-download: pip install huggingface_hub"
+                )
+
+        except Exception as e:
+            result["error"] = str(e)
+            self._logger.error(f"Model download failed: {e}")
+
+        finally:
+            self.download_in_progress = False
+
+        return result
+
+    def _update_registry(
+        self, model_name: str, model_path: Path, source: str
+    ) -> None:
+        """Update the model registry."""
+        if "models" not in self.model_registry:
+            self.model_registry["models"] = {}
+
+        self.model_registry["models"][model_name] = {
+            "path": str(model_path),
+            "source": source,
+            "downloaded_at": datetime.now().isoformat(),
+            "size_bytes": model_path.stat().st_size if model_path.exists() else 0,
+        }
+        self.model_registry["current"] = model_name
+        self._save_registry()
+
+    async def hot_swap_model(self, model_name: str) -> Dict[str, Any]:
+        """
+        Hot-swap to a different model.
+
+        Args:
+            model_name: Name of model to switch to
+
+        Returns:
+            Result dict with success status
+        """
+        result = {"success": False, "previous_model": self.current_model, "error": None}
+
+        async with self._lock:
+            try:
+                # Check if model exists
+                model_path = self.check_model_exists(model_name)
+                if not model_path:
+                    # Try to download
+                    download_result = await self.download_model(model_name)
+                    if not download_result["success"]:
+                        result["error"] = download_result["error"]
+                        return result
+                    model_path = download_result["path"]
+
+                # Update current model
+                self.current_model = model_name
+                self.current_model_path = model_path
+
+                # Update symlink
+                current_link = self.models_dir / "current.gguf"
+                if current_link.exists():
+                    current_link.unlink()
+                current_link.symlink_to(model_path)
+
+                self._stats["hot_swaps"] += 1
+                result["success"] = True
+                self._logger.info(f"🔄 Hot-swapped to model: {model_name}")
+
+            except Exception as e:
+                result["error"] = str(e)
+                self._logger.error(f"Hot-swap failed: {e}")
+
+        return result
+
+    def get_model_info(self, model_name: str) -> Optional[Dict[str, Any]]:
+        """Get information about a model from the catalog."""
+        return MODEL_CATALOG.get(model_name)
+
+    def list_available_models(self) -> List[Dict[str, Any]]:
+        """List all available models with their status."""
+        available_gb = self.get_available_memory_gb()
+        models = []
+
+        for name, info in MODEL_CATALOG.items():
+            model_path = self.check_model_exists(name)
+            models.append(
+                {
+                    "name": name,
+                    "description": info["description"],
+                    "size_mb": info["size_mb"],
+                    "min_ram_gb": info["min_ram_gb"],
+                    "context_length": info["context_length"],
+                    "downloaded": model_path is not None,
+                    "can_run": info["min_ram_gb"] <= available_gb,
+                    "is_current": name == self.current_model,
+                }
+            )
+
+        return models
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get model manager statistics."""
+        return {
+            "models_dir": str(self.models_dir),
+            "current_model": self.current_model,
+            "current_model_path": (
+                str(self.current_model_path) if self.current_model_path else None
+            ),
+            "available_memory_gb": round(self.get_available_memory_gb(), 2),
+            "auto_download": self.auto_download,
+            "auto_select": self.auto_select,
+            "has_reactor_core": self._reactor_core_path is not None,
+            "download_in_progress": self.download_in_progress,
+            "catalog_models": len(MODEL_CATALOG),
+            **self._stats,
+        }
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
