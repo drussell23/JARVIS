@@ -41,6 +41,18 @@ from typing import (
     TypeVar,
 )
 
+# v149.2: Component contract system for proper logging severity
+try:
+    from backend.core.startup import (
+        ComponentType,
+        get_component_type,
+        get_failure_level,
+        get_registry,
+    )
+    _HAS_COMPONENT_CONTRACT = True
+except ImportError:
+    _HAS_COMPONENT_CONTRACT = False
+
 if TYPE_CHECKING:
     from .lifecycle_controller import ProxyLifecycleController
 
@@ -1174,35 +1186,36 @@ class AsyncStartupBarrier:
         if self._cloudsql_verified:
             return True
 
-        # v149.0: Check if CloudSQL is configured before retrying
+        # v149.2: Use component contract for proper logging severity
         is_configured = BarrierConfig.is_cloudsql_configured()
-        config_status = BarrierConfig.get_configuration_status()
         
-        if not is_configured:
-            # v149.1: Context-aware logging - only warn if CloudSQL is expected
-            # In local development, unconfigured CloudSQL is normal, not a warning
+        # Determine component type and log level
+        if _HAS_COMPONENT_CONTRACT:
+            component_type = get_component_type("cloudsql")
+            failure_level = get_failure_level(component_type)
+            registry = get_registry()
+            registry.register("cloudsql", component_type)
+            registry.mark_initializing("cloudsql")
+        else:
+            # Fallback if component contract not available
             is_required = os.getenv("CLOUDSQL_REQUIRED", "").lower() in ("true", "1", "yes")
             is_production = os.getenv("JARVIS_ENV", "").lower() == "production"
-            
-            if is_required or is_production:
-                # Production: CloudSQL is expected but missing - this is a problem
-                logger.warning(
-                    f"[StartupBarrier] [v149.1] CloudSQL NOT CONFIGURED in production mode"
-                )
-                logger.warning(
-                    f"[StartupBarrier] Missing: {', '.join(config_status['missing_variables'])}"
-                )
-            else:
-                # Development: Unconfigured is normal - log at DEBUG, not WARNING
-                logger.debug(
-                    f"[StartupBarrier] [v149.1] CloudSQL not configured - using local database"
-                )
+            failure_level = logging.WARNING if (is_required or is_production) else logging.DEBUG
+            registry = None
+        
+        if not is_configured:
+            # v149.2: Log at appropriate level based on component type
+            # OPTIONAL in dev = DEBUG, REQUIRED in prod = ERROR
+            logger.log(
+                failure_level,
+                f"[StartupBarrier] [v149.2] CloudSQL not configured - using local database"
+            )
             
             # Use reduced retry count for unconfigured state
             max_attempts = BarrierConfig.MAX_UNCONFIGURED_ATTEMPTS
             timeout = min(
                 timeout or BarrierConfig.ENSURE_READY_TIMEOUT,
-                10.0  # v149.0: Max 10s when not configured
+                5.0  # v149.2: Reduced to 5s when not configured
             )
         else:
             max_attempts = None  # No limit when configured - use timeout
@@ -1213,17 +1226,19 @@ class AsyncStartupBarrier:
         attempt = 0
         delay = BarrierConfig.RETRY_BASE_DELAY
 
-        logger.info(f"[StartupBarrier] Ensuring CloudSQL ready (timeout: {timeout}s)")
+        # Only log this at DEBUG to reduce noise
+        logger.debug(f"[StartupBarrier] CloudSQL verification (timeout: {timeout}s)")
 
         while time.monotonic() < deadline:
             attempt += 1
             
-            # v149.0: Fast-fail for unconfigured CloudSQL
+            # v149.2: Fast-fail for unconfigured CloudSQL - log at DEBUG
             if max_attempts and attempt > max_attempts:
-                logger.warning(
-                    f"[StartupBarrier] [v149.0] Fast-fail: CloudSQL not configured, "
-                    f"stopping after {max_attempts} attempts (not {int(timeout)})"
+                logger.debug(
+                    f"[StartupBarrier] CloudSQL not configured, skipping after {max_attempts} attempts"
                 )
+                if registry:
+                    registry.mark_skipped("cloudsql", "not configured")
                 break
 
             # First, ensure lifecycle controller has started proxy
