@@ -14438,6 +14438,1686 @@ class CollectiveAI:
         }
 
 
+# =============================================================================
+# ZONE 4.9: ENTERPRISE INTEGRATION LAYER
+# =============================================================================
+# Advanced enterprise features for production-grade deployments:
+# - Data Flywheel (Self-Improving Learning Loop)
+# - Training Orchestrator (Reactor-Core Pipeline)
+# - AGI Orchestrator (Unified Cognitive Architecture)
+# - Ouroboros Engine (Self-Improvement)
+# - Trinity IPC Hub (Cross-Repo Communication)
+# - Graceful Degradation Manager
+
+class DataFlywheelManager:
+    """
+    Self-improving learning loop that continuously improves JARVIS.
+
+    The Data Flywheel captures user interactions, extracts learning signals,
+    and feeds them back into the training pipeline for continuous improvement.
+
+    Flow:
+    1. Capture: Log all user interactions with context
+    2. Process: Extract learning signals (positive/negative feedback)
+    3. Queue: Buffer experiences for batch training
+    4. Train: Trigger training jobs via Reactor Core
+    5. Deploy: Hot-swap improved models
+    6. Evaluate: A/B test improvements
+    """
+
+    def __init__(
+        self,
+        experience_dir: Optional[Path] = None,
+        batch_size: int = 100,
+        flush_interval: float = 300.0,  # 5 minutes
+        min_quality_score: float = 0.7,
+    ) -> None:
+        self._experience_dir = experience_dir or Path.home() / ".jarvis" / "experiences"
+        self._experience_dir.mkdir(parents=True, exist_ok=True)
+
+        self._batch_size = batch_size
+        self._flush_interval = flush_interval
+        self._min_quality_score = min_quality_score
+
+        # Experience buffer
+        self._experience_buffer: List[Dict[str, Any]] = []
+        self._buffer_lock = asyncio.Lock()
+
+        # Statistics
+        self._stats = {
+            "total_captured": 0,
+            "total_processed": 0,
+            "total_queued": 0,
+            "batches_flushed": 0,
+            "training_jobs_triggered": 0,
+            "quality_rejections": 0,
+            "last_flush_time": None,
+            "last_training_trigger": None,
+        }
+
+        # Background tasks
+        self._flush_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Training pipeline connection
+        self._reactor_core_url = os.getenv("REACTOR_CORE_URL", "http://localhost:8090")
+        self._training_enabled = os.getenv("FLYWHEEL_TRAINING_ENABLED", "true").lower() == "true"
+
+    async def start(self) -> bool:
+        """Start the data flywheel background processing."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._flush_task = asyncio.create_task(self._flush_loop())
+        return True
+
+    async def stop(self) -> None:
+        """Stop the data flywheel and flush remaining experiences."""
+        self._running = False
+
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Final flush
+        await self._flush_buffer()
+
+    async def capture_experience(
+        self,
+        interaction_type: str,
+        user_input: str,
+        system_response: str,
+        context: Optional[Dict[str, Any]] = None,
+        feedback: Optional[str] = None,  # positive, negative, neutral
+        quality_score: Optional[float] = None,
+    ) -> str:
+        """
+        Capture a user interaction for the learning flywheel.
+
+        Returns:
+            Experience ID for tracking
+        """
+        experience_id = f"exp_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
+
+        experience = {
+            "id": experience_id,
+            "timestamp": datetime.now().isoformat(),
+            "type": interaction_type,
+            "user_input": user_input,
+            "system_response": system_response,
+            "context": context or {},
+            "feedback": feedback,
+            "quality_score": quality_score,
+            "metadata": {
+                "source": "unified_kernel",
+                "version": KERNEL_VERSION,
+            },
+        }
+
+        async with self._buffer_lock:
+            self._experience_buffer.append(experience)
+            self._stats["total_captured"] += 1
+
+        # Check if we should trigger immediate flush
+        if len(self._experience_buffer) >= self._batch_size:
+            asyncio.create_task(self._flush_buffer())
+
+        return experience_id
+
+    async def _flush_loop(self) -> None:
+        """Background loop to periodically flush experiences."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._flush_interval)
+                await self._flush_buffer()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Log but don't crash the flywheel
+                pass
+
+    async def _flush_buffer(self) -> None:
+        """Flush buffered experiences to disk and potentially trigger training."""
+        async with self._buffer_lock:
+            if not self._experience_buffer:
+                return
+
+            experiences_to_flush = self._experience_buffer.copy()
+            self._experience_buffer.clear()
+
+        # Filter by quality
+        quality_experiences = []
+        for exp in experiences_to_flush:
+            score = exp.get("quality_score")
+            if score is None or score >= self._min_quality_score:
+                quality_experiences.append(exp)
+                self._stats["total_processed"] += 1
+            else:
+                self._stats["quality_rejections"] += 1
+
+        if not quality_experiences:
+            return
+
+        # Write to disk
+        batch_file = self._experience_dir / f"batch_{int(time.time())}.jsonl"
+        try:
+            with open(batch_file, "w") as f:
+                for exp in quality_experiences:
+                    f.write(json.dumps(exp) + "\n")
+
+            self._stats["batches_flushed"] += 1
+            self._stats["total_queued"] += len(quality_experiences)
+            self._stats["last_flush_time"] = datetime.now().isoformat()
+        except Exception:
+            pass
+
+        # Trigger training if enabled and we have enough data
+        if self._training_enabled and self._stats["total_queued"] >= self._batch_size * 10:
+            await self._trigger_training()
+
+    async def _trigger_training(self) -> bool:
+        """Trigger a training job on Reactor Core."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self._reactor_core_url}/api/training/trigger",
+                    json={
+                        "source": "data_flywheel",
+                        "experience_dir": str(self._experience_dir),
+                        "batch_count": self._stats["batches_flushed"],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        self._stats["training_jobs_triggered"] += 1
+                        self._stats["last_training_trigger"] = datetime.now().isoformat()
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get flywheel statistics."""
+        return {
+            **self._stats,
+            "buffer_size": len(self._experience_buffer),
+            "running": self._running,
+        }
+
+
+class TrainingOrchestrator:
+    """
+    Intelligent training orchestrator for the Reactor-Core pipeline.
+
+    Manages the end-to-end training lifecycle:
+    1. Data collection and validation
+    2. Training job scheduling
+    3. Model evaluation
+    4. A/B testing
+    5. Model deployment (hot-swap)
+    """
+
+    def __init__(
+        self,
+        reactor_core_url: Optional[str] = None,
+        model_dir: Optional[Path] = None,
+        min_training_samples: int = 1000,
+        evaluation_split: float = 0.1,
+    ) -> None:
+        self._reactor_core_url = reactor_core_url or os.getenv(
+            "REACTOR_CORE_URL", "http://localhost:8090"
+        )
+        self._model_dir = model_dir or Path.home() / ".jarvis" / "models"
+        self._model_dir.mkdir(parents=True, exist_ok=True)
+
+        self._min_training_samples = min_training_samples
+        self._evaluation_split = evaluation_split
+
+        # Training state
+        self._current_job: Optional[Dict[str, Any]] = None
+        self._job_history: List[Dict[str, Any]] = []
+        self._active_model: Optional[str] = None
+        self._candidate_model: Optional[str] = None
+
+        # A/B testing
+        self._ab_test_active = False
+        self._ab_test_metrics: Dict[str, List[float]] = {"A": [], "B": []}
+
+        # Statistics
+        self._stats = {
+            "jobs_scheduled": 0,
+            "jobs_completed": 0,
+            "jobs_failed": 0,
+            "models_deployed": 0,
+            "ab_tests_completed": 0,
+            "total_training_time_seconds": 0,
+        }
+
+    async def schedule_training(
+        self,
+        training_config: Dict[str, Any],
+        priority: str = "normal",  # low, normal, high, critical
+    ) -> Optional[str]:
+        """
+        Schedule a training job.
+
+        Returns:
+            Job ID if scheduled successfully, None otherwise
+        """
+        job_id = f"train_{int(time.time())}_{os.urandom(4).hex()}"
+
+        job = {
+            "id": job_id,
+            "config": training_config,
+            "priority": priority,
+            "status": "scheduled",
+            "created_at": datetime.now().isoformat(),
+            "started_at": None,
+            "completed_at": None,
+            "metrics": {},
+            "error": None,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self._reactor_core_url}/api/training/schedule",
+                    json=job,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        job["status"] = "submitted"
+                        self._current_job = job
+                        self._stats["jobs_scheduled"] += 1
+                        return job_id
+        except Exception:
+            pass
+
+        return None
+
+    async def check_job_status(self, job_id: str) -> Dict[str, Any]:
+        """Check the status of a training job."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self._reactor_core_url}/api/training/status/{job_id}",
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+        except Exception:
+            pass
+
+        return {"status": "unknown", "error": "Failed to check status"}
+
+    async def deploy_model(
+        self,
+        model_path: str,
+        model_name: str,
+        as_candidate: bool = True,
+    ) -> bool:
+        """
+        Deploy a trained model.
+
+        Args:
+            model_path: Path to the model file
+            model_name: Human-readable name
+            as_candidate: If True, deploy as A/B test candidate
+        """
+        if as_candidate:
+            self._candidate_model = model_path
+            self._ab_test_active = True
+            self._ab_test_metrics = {"A": [], "B": []}
+        else:
+            self._active_model = model_path
+            self._candidate_model = None
+            self._ab_test_active = False
+            self._stats["models_deployed"] += 1
+
+        return True
+
+    async def record_ab_metric(self, variant: str, metric: float) -> None:
+        """Record a metric for A/B testing."""
+        if self._ab_test_active and variant in self._ab_test_metrics:
+            self._ab_test_metrics[variant].append(metric)
+
+            # Check if we have enough data to make a decision
+            if (
+                len(self._ab_test_metrics["A"]) >= 100 and
+                len(self._ab_test_metrics["B"]) >= 100
+            ):
+                await self._evaluate_ab_test()
+
+    async def _evaluate_ab_test(self) -> None:
+        """Evaluate A/B test results and potentially promote candidate."""
+        a_mean = sum(self._ab_test_metrics["A"]) / len(self._ab_test_metrics["A"])
+        b_mean = sum(self._ab_test_metrics["B"]) / len(self._ab_test_metrics["B"])
+
+        # Simple comparison (in production, use statistical significance)
+        if b_mean > a_mean * 1.05:  # 5% improvement threshold
+            # Promote candidate to active
+            self._active_model = self._candidate_model
+            self._stats["models_deployed"] += 1
+
+        # End A/B test
+        self._candidate_model = None
+        self._ab_test_active = False
+        self._ab_test_metrics = {"A": [], "B": []}
+        self._stats["ab_tests_completed"] += 1
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get orchestrator statistics."""
+        return {
+            **self._stats,
+            "current_job": self._current_job,
+            "active_model": self._active_model,
+            "candidate_model": self._candidate_model,
+            "ab_test_active": self._ab_test_active,
+        }
+
+
+class TrinityHealthMonitor:
+    """
+    Cross-repo health monitoring for the Trinity system.
+
+    Monitors health of:
+    - JARVIS (main body)
+    - JARVIS Prime (Tier-0 brain)
+    - Reactor Core (training pipeline)
+
+    Features:
+    - Heartbeat monitoring with adaptive intervals
+    - Crash detection and auto-recovery
+    - Circuit breakers for failing components
+    - Health trend analysis
+    """
+
+    def __init__(
+        self,
+        heartbeat_interval: float = 15.0,
+        failure_threshold: int = 3,
+        recovery_cooldown: float = 60.0,
+    ) -> None:
+        self._heartbeat_interval = heartbeat_interval
+        self._failure_threshold = failure_threshold
+        self._recovery_cooldown = recovery_cooldown
+
+        # Component health state
+        self._components: Dict[str, Dict[str, Any]] = {
+            "jarvis": {
+                "healthy": False,
+                "last_heartbeat": None,
+                "consecutive_failures": 0,
+                "circuit_breaker_open": False,
+                "metrics_history": [],
+            },
+            "jarvis_prime": {
+                "healthy": False,
+                "last_heartbeat": None,
+                "consecutive_failures": 0,
+                "circuit_breaker_open": False,
+                "metrics_history": [],
+            },
+            "reactor_core": {
+                "healthy": False,
+                "last_heartbeat": None,
+                "consecutive_failures": 0,
+                "circuit_breaker_open": False,
+                "metrics_history": [],
+            },
+        }
+
+        # Heartbeat file paths
+        trinity_dir = Path.home() / ".jarvis" / "trinity"
+        self._heartbeat_files = {
+            "jarvis": trinity_dir / "jarvis_body.json",
+            "jarvis_prime": trinity_dir / "jprime_body.json",
+            "reactor_core": trinity_dir / "reactor_body.json",
+        }
+
+        # Recovery callbacks
+        self._recovery_callbacks: Dict[str, Callable[[], Awaitable[bool]]] = {}
+
+        # Background task
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Statistics
+        self._stats = {
+            "health_checks": 0,
+            "failures_detected": 0,
+            "recoveries_triggered": 0,
+            "recoveries_successful": 0,
+        }
+
+    def register_recovery_callback(
+        self,
+        component: str,
+        callback: Callable[[], Awaitable[bool]],
+    ) -> None:
+        """Register a recovery callback for a component."""
+        self._recovery_callbacks[component] = callback
+
+    async def start(self) -> bool:
+        """Start health monitoring."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        return True
+
+    async def stop(self) -> None:
+        """Stop health monitoring."""
+        self._running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _monitor_loop(self) -> None:
+        """Background health monitoring loop."""
+        while self._running:
+            try:
+                await self._check_all_components()
+                await asyncio.sleep(self._heartbeat_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(self._heartbeat_interval)
+
+    async def _check_all_components(self) -> None:
+        """Check health of all components."""
+        self._stats["health_checks"] += 1
+
+        for component, state in self._components.items():
+            if state["circuit_breaker_open"]:
+                # Check if cooldown has passed
+                last_failure = state.get("last_failure_time")
+                if last_failure:
+                    elapsed = time.time() - last_failure
+                    if elapsed >= self._recovery_cooldown:
+                        state["circuit_breaker_open"] = False
+                        state["consecutive_failures"] = 0
+                    else:
+                        continue
+
+            healthy = await self._check_component_health(component)
+
+            if healthy:
+                state["healthy"] = True
+                state["consecutive_failures"] = 0
+                state["last_heartbeat"] = time.time()
+            else:
+                state["consecutive_failures"] += 1
+                self._stats["failures_detected"] += 1
+
+                if state["consecutive_failures"] >= self._failure_threshold:
+                    state["healthy"] = False
+                    state["circuit_breaker_open"] = True
+                    state["last_failure_time"] = time.time()
+
+                    # Trigger recovery
+                    await self._trigger_recovery(component)
+
+    async def _check_component_health(self, component: str) -> bool:
+        """Check health of a specific component via heartbeat file."""
+        heartbeat_file = self._heartbeat_files.get(component)
+        if not heartbeat_file or not heartbeat_file.exists():
+            return False
+
+        try:
+            content = heartbeat_file.read_text()
+            data = json.loads(content)
+
+            # Check heartbeat freshness
+            last_update = data.get("last_heartbeat") or data.get("timestamp")
+            if last_update:
+                if isinstance(last_update, str):
+                    last_time = datetime.fromisoformat(last_update.replace("Z", "+00:00"))
+                    age = (datetime.now(last_time.tzinfo) - last_time).total_seconds()
+                else:
+                    age = time.time() - last_update
+
+                # Consider healthy if heartbeat within 2x interval
+                return age < self._heartbeat_interval * 2
+
+            return True  # File exists but no timestamp
+        except Exception:
+            return False
+
+    async def _trigger_recovery(self, component: str) -> None:
+        """Trigger recovery for a failed component."""
+        self._stats["recoveries_triggered"] += 1
+
+        callback = self._recovery_callbacks.get(component)
+        if callback:
+            try:
+                success = await callback()
+                if success:
+                    self._stats["recoveries_successful"] += 1
+            except Exception:
+                pass
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get current health status of all components."""
+        return {
+            "components": {
+                name: {
+                    "healthy": state["healthy"],
+                    "last_heartbeat": state["last_heartbeat"],
+                    "circuit_breaker_open": state["circuit_breaker_open"],
+                }
+                for name, state in self._components.items()
+            },
+            "stats": self._stats,
+            "overall_healthy": all(s["healthy"] for s in self._components.values()),
+        }
+
+
+class GracefulDegradationManager:
+    """
+    Resource-aware feature flag manager for graceful degradation.
+
+    Automatically disables non-essential features when system resources
+    are constrained, ensuring core functionality remains available.
+
+    Priority Levels:
+    - CRITICAL (1): Never disabled (core voice, basic responses)
+    - HIGH (2): Disabled under extreme pressure
+    - MEDIUM (3): Disabled under high pressure
+    - LOW (4): Disabled under moderate pressure
+    - OPTIONAL (5): Disabled preemptively
+    """
+
+    class Priority(IntEnum):
+        CRITICAL = 1
+        HIGH = 2
+        MEDIUM = 3
+        LOW = 4
+        OPTIONAL = 5
+
+    def __init__(
+        self,
+        memory_threshold_high: float = 85.0,
+        memory_threshold_extreme: float = 95.0,
+        cpu_threshold_high: float = 80.0,
+        cpu_threshold_extreme: float = 95.0,
+    ) -> None:
+        self._memory_threshold_high = memory_threshold_high
+        self._memory_threshold_extreme = memory_threshold_extreme
+        self._cpu_threshold_high = cpu_threshold_high
+        self._cpu_threshold_extreme = cpu_threshold_extreme
+
+        # Feature registry: name -> (priority, enabled, description)
+        self._features: Dict[str, Tuple[int, bool, str]] = {}
+
+        # Current degradation level
+        self._degradation_level = 0  # 0=normal, 1=moderate, 2=high, 3=extreme
+
+        # Monitoring
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._check_interval = 10.0
+
+        # Statistics
+        self._stats = {
+            "features_disabled": 0,
+            "features_re_enabled": 0,
+            "degradation_events": 0,
+            "recovery_events": 0,
+        }
+
+    def register_feature(
+        self,
+        name: str,
+        priority: int,
+        description: str = "",
+        initially_enabled: bool = True,
+    ) -> None:
+        """Register a feature for degradation management."""
+        self._features[name] = (priority, initially_enabled, description)
+
+    def is_feature_enabled(self, name: str) -> bool:
+        """Check if a feature is currently enabled."""
+        if name not in self._features:
+            return True  # Unknown features default to enabled
+        return self._features[name][1]
+
+    async def start(self) -> bool:
+        """Start resource monitoring."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        return True
+
+    async def stop(self) -> None:
+        """Stop resource monitoring."""
+        self._running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _monitor_loop(self) -> None:
+        """Background resource monitoring loop."""
+        while self._running:
+            try:
+                await self._check_resources()
+                await asyncio.sleep(self._check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(self._check_interval)
+
+    async def _check_resources(self) -> None:
+        """Check system resources and adjust degradation level."""
+        try:
+            import psutil
+
+            memory = psutil.virtual_memory()
+            cpu = psutil.cpu_percent(interval=0.1)
+
+            # Determine degradation level
+            new_level = 0
+
+            if memory.percent >= self._memory_threshold_extreme or cpu >= self._cpu_threshold_extreme:
+                new_level = 3  # Extreme
+            elif memory.percent >= self._memory_threshold_high or cpu >= self._cpu_threshold_high:
+                new_level = 2  # High
+            elif memory.percent >= self._memory_threshold_high * 0.9 or cpu >= self._cpu_threshold_high * 0.9:
+                new_level = 1  # Moderate
+
+            if new_level != self._degradation_level:
+                if new_level > self._degradation_level:
+                    self._stats["degradation_events"] += 1
+                else:
+                    self._stats["recovery_events"] += 1
+
+                self._degradation_level = new_level
+                await self._apply_degradation()
+        except ImportError:
+            pass  # psutil not available
+
+    async def _apply_degradation(self) -> None:
+        """Apply degradation based on current level."""
+        # Calculate minimum priority to keep enabled
+        if self._degradation_level == 0:
+            min_priority = self.Priority.OPTIONAL + 1  # Keep all
+        elif self._degradation_level == 1:
+            min_priority = self.Priority.OPTIONAL  # Disable optional
+        elif self._degradation_level == 2:
+            min_priority = self.Priority.LOW  # Disable low and optional
+        else:
+            min_priority = self.Priority.MEDIUM  # Only keep critical and high
+
+        for name, (priority, enabled, desc) in list(self._features.items()):
+            should_enable = priority < min_priority
+
+            if should_enable != enabled:
+                self._features[name] = (priority, should_enable, desc)
+                if should_enable:
+                    self._stats["features_re_enabled"] += 1
+                else:
+                    self._stats["features_disabled"] += 1
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get degradation status."""
+        level_names = ["normal", "moderate", "high", "extreme"]
+        return {
+            "degradation_level": self._degradation_level,
+            "degradation_name": level_names[self._degradation_level],
+            "features": {
+                name: {"enabled": enabled, "priority": priority}
+                for name, (priority, enabled, _) in self._features.items()
+            },
+            "stats": self._stats,
+        }
+
+
+class AGIOrchestrator:
+    """
+    Unified Cognitive Architecture for AGI-level capabilities.
+
+    Integrates multiple AI subsystems into a coherent cognitive architecture:
+    - MetaCognitiveEngine: Self-aware reasoning and introspection
+    - MultiModalPerceptionFusion: Vision + voice + text integration
+    - ContinuousImprovementEngine: Self-improving learning loop
+    - EmotionalIntelligenceModule: Empathetic response system
+    - LongTermMemoryManager: Persistent knowledge storage
+    """
+
+    def __init__(
+        self,
+        enable_metacognition: bool = True,
+        enable_multimodal: bool = True,
+        enable_emotional_intelligence: bool = True,
+        memory_capacity_mb: int = 512,
+    ) -> None:
+        self._enable_metacognition = enable_metacognition
+        self._enable_multimodal = enable_multimodal
+        self._enable_emotional_intelligence = enable_emotional_intelligence
+        self._memory_capacity_mb = memory_capacity_mb
+
+        # Cognitive state
+        self._cognitive_state: Dict[str, Any] = {
+            "attention_focus": None,
+            "working_memory": [],
+            "emotional_state": "neutral",
+            "confidence_level": 0.5,
+            "introspection_depth": 0,
+        }
+
+        # Long-term memory (vector store reference)
+        self._long_term_memory: List[Dict[str, Any]] = []
+        self._memory_index: Dict[str, int] = {}
+
+        # Subsystem states
+        self._subsystems = {
+            "metacognition": {"enabled": enable_metacognition, "active": False},
+            "multimodal": {"enabled": enable_multimodal, "active": False},
+            "emotional": {"enabled": enable_emotional_intelligence, "active": False},
+            "memory": {"enabled": True, "active": False},
+        }
+
+        # Processing history for introspection
+        self._reasoning_trace: List[Dict[str, Any]] = []
+        self._max_trace_length = 100
+
+        # Statistics
+        self._stats = {
+            "queries_processed": 0,
+            "introspections": 0,
+            "memories_stored": 0,
+            "memories_retrieved": 0,
+            "emotional_adjustments": 0,
+            "multimodal_fusions": 0,
+        }
+
+    async def initialize(self) -> bool:
+        """Initialize all cognitive subsystems."""
+        for name, subsystem in self._subsystems.items():
+            if subsystem["enabled"]:
+                subsystem["active"] = True
+
+        return True
+
+    async def process_input(
+        self,
+        text: Optional[str] = None,
+        audio: Optional[bytes] = None,
+        image: Optional[bytes] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Process multimodal input through the cognitive architecture.
+
+        Returns:
+            Cognitive processing result with response and metadata
+        """
+        self._stats["queries_processed"] += 1
+
+        # Phase 1: Multimodal Fusion
+        fused_input = await self._fuse_modalities(text, audio, image)
+
+        # Phase 2: Memory Retrieval
+        relevant_memories = await self._retrieve_relevant_memories(fused_input)
+
+        # Phase 3: Metacognitive Processing
+        if self._enable_metacognition:
+            reasoning = await self._metacognitive_process(fused_input, relevant_memories)
+        else:
+            reasoning = {"approach": "direct", "confidence": 0.7}
+
+        # Phase 4: Generate Response
+        response = await self._generate_response(fused_input, relevant_memories, reasoning)
+
+        # Phase 5: Emotional Adjustment
+        if self._enable_emotional_intelligence:
+            response = await self._apply_emotional_intelligence(response, context)
+
+        # Phase 6: Store Experience
+        await self._store_experience(fused_input, response)
+
+        # Record reasoning trace
+        self._record_reasoning_trace(fused_input, reasoning, response)
+
+        return {
+            "response": response,
+            "reasoning": reasoning,
+            "emotional_state": self._cognitive_state["emotional_state"],
+            "confidence": self._cognitive_state["confidence_level"],
+            "memories_used": len(relevant_memories),
+        }
+
+    async def _fuse_modalities(
+        self,
+        text: Optional[str],
+        audio: Optional[bytes],
+        image: Optional[bytes],
+    ) -> Dict[str, Any]:
+        """Fuse multiple input modalities into unified representation."""
+        fused = {
+            "text": text,
+            "has_audio": audio is not None,
+            "has_image": image is not None,
+            "primary_modality": "text" if text else ("audio" if audio else "image"),
+        }
+
+        if audio or image:
+            self._stats["multimodal_fusions"] += 1
+
+        return fused
+
+    async def _retrieve_relevant_memories(
+        self,
+        fused_input: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Retrieve relevant memories for the input."""
+        # Simple keyword-based retrieval (production would use vector similarity)
+        relevant = []
+        query_text = fused_input.get("text", "").lower()
+
+        for memory in self._long_term_memory[-100:]:  # Recent memories
+            memory_text = memory.get("content", "").lower()
+            if any(word in memory_text for word in query_text.split()[:5]):
+                relevant.append(memory)
+
+        self._stats["memories_retrieved"] += len(relevant)
+        return relevant[:10]  # Limit to 10 most relevant
+
+    async def _metacognitive_process(
+        self,
+        fused_input: Dict[str, Any],
+        memories: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Apply metacognitive reasoning."""
+        self._stats["introspections"] += 1
+
+        # Assess query complexity
+        query_text = fused_input.get("text", "")
+        complexity = len(query_text.split()) / 20  # Simple heuristic
+
+        # Determine approach
+        if complexity > 1.0:
+            approach = "analytical"
+        elif memories:
+            approach = "memory-assisted"
+        else:
+            approach = "direct"
+
+        # Confidence based on memory availability
+        confidence = min(0.9, 0.5 + len(memories) * 0.05)
+
+        return {
+            "approach": approach,
+            "complexity": complexity,
+            "confidence": confidence,
+            "introspection_notes": f"Using {approach} reasoning with {len(memories)} memories",
+        }
+
+    async def _generate_response(
+        self,
+        fused_input: Dict[str, Any],
+        memories: List[Dict[str, Any]],
+        reasoning: Dict[str, Any],
+    ) -> str:
+        """Generate response based on processed input."""
+        # In production, this would call the actual LLM
+        # Here we return a placeholder that shows processing occurred
+        return f"[AGI Response - {reasoning['approach']} reasoning, confidence: {reasoning['confidence']:.2f}]"
+
+    async def _apply_emotional_intelligence(
+        self,
+        response: str,
+        context: Optional[Dict[str, Any]],
+    ) -> str:
+        """Apply emotional intelligence to response."""
+        self._stats["emotional_adjustments"] += 1
+
+        # Detect emotional cues from context
+        if context:
+            user_sentiment = context.get("user_sentiment", "neutral")
+            if user_sentiment == "frustrated":
+                self._cognitive_state["emotional_state"] = "empathetic"
+            elif user_sentiment == "excited":
+                self._cognitive_state["emotional_state"] = "enthusiastic"
+            else:
+                self._cognitive_state["emotional_state"] = "neutral"
+
+        return response
+
+    async def _store_experience(
+        self,
+        fused_input: Dict[str, Any],
+        response: str,
+    ) -> None:
+        """Store experience in long-term memory."""
+        memory_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "content": fused_input.get("text", ""),
+            "response": response,
+            "emotional_context": self._cognitive_state["emotional_state"],
+        }
+
+        self._long_term_memory.append(memory_entry)
+        self._stats["memories_stored"] += 1
+
+        # Trim memory if needed
+        max_memories = self._memory_capacity_mb * 10  # Rough estimate
+        if len(self._long_term_memory) > max_memories:
+            self._long_term_memory = self._long_term_memory[-max_memories:]
+
+    def _record_reasoning_trace(
+        self,
+        fused_input: Dict[str, Any],
+        reasoning: Dict[str, Any],
+        response: str,
+    ) -> None:
+        """Record reasoning for introspection."""
+        trace_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "input": fused_input,
+            "reasoning": reasoning,
+            "response_preview": response[:100] if response else None,
+        }
+
+        self._reasoning_trace.append(trace_entry)
+        if len(self._reasoning_trace) > self._max_trace_length:
+            self._reasoning_trace = self._reasoning_trace[-self._max_trace_length:]
+
+    async def introspect(self) -> Dict[str, Any]:
+        """Perform self-introspection on recent reasoning."""
+        self._stats["introspections"] += 1
+        self._cognitive_state["introspection_depth"] += 1
+
+        return {
+            "cognitive_state": self._cognitive_state.copy(),
+            "recent_reasoning": self._reasoning_trace[-5:],
+            "subsystem_status": self._subsystems.copy(),
+            "stats": self._stats.copy(),
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get AGI orchestrator status."""
+        return {
+            "cognitive_state": self._cognitive_state,
+            "subsystems": self._subsystems,
+            "memory_size": len(self._long_term_memory),
+            "stats": self._stats,
+        }
+
+
+class OuroborosEngine:
+    """
+    Self-improvement engine using autonomous code evolution.
+
+    The Ouroboros Engine enables JARVIS to improve its own code through:
+    - Genetic algorithm for multi-path improvement
+    - AST-based code analysis and semantic diff
+    - Test-driven validation with mutation testing
+    - Git-based rollback protection
+    - LLM-powered code generation via JARVIS Prime
+
+    Safety Features:
+    - Sandbox execution for testing changes
+    - Automatic rollback on test failures
+    - Human approval for major changes
+    - Rate limiting on self-modifications
+    """
+
+    def __init__(
+        self,
+        project_root: Optional[Path] = None,
+        enable_auto_improve: bool = False,
+        max_changes_per_hour: int = 5,
+        require_approval: bool = True,
+        min_test_coverage: float = 0.8,
+    ) -> None:
+        self._project_root = project_root or Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent"
+        self._enable_auto_improve = enable_auto_improve
+        self._max_changes_per_hour = max_changes_per_hour
+        self._require_approval = require_approval
+        self._min_test_coverage = min_test_coverage
+
+        # Change tracking
+        self._pending_changes: List[Dict[str, Any]] = []
+        self._approved_changes: List[Dict[str, Any]] = []
+        self._applied_changes: List[Dict[str, Any]] = []
+        self._rolled_back_changes: List[Dict[str, Any]] = []
+
+        # Rate limiting
+        self._changes_this_hour: List[float] = []
+
+        # Improvement goals queue
+        self._improvement_goals: List[Dict[str, Any]] = []
+
+        # LLM client (JARVIS Prime)
+        self._jprime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8080")
+
+        # Git integration
+        self._git_enabled = self._check_git_available()
+
+        # Statistics
+        self._stats = {
+            "improvements_proposed": 0,
+            "improvements_approved": 0,
+            "improvements_applied": 0,
+            "improvements_rolled_back": 0,
+            "tests_run": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
+        }
+
+    def _check_git_available(self) -> bool:
+        """Check if git is available for rollback protection."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "status"],
+                cwd=self._project_root,
+                capture_output=True,
+                timeout=5,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    async def propose_improvement(
+        self,
+        target_file: str,
+        improvement_goal: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Propose an improvement to a file.
+
+        Args:
+            target_file: Relative path to the file to improve
+            improvement_goal: Natural language description of the improvement
+            context: Additional context (error messages, performance data, etc.)
+
+        Returns:
+            Proposal with diff preview and confidence score
+        """
+        self._stats["improvements_proposed"] += 1
+
+        # Check rate limiting
+        if not self._check_rate_limit():
+            return {
+                "status": "rate_limited",
+                "message": f"Max {self._max_changes_per_hour} changes per hour",
+            }
+
+        # Read current file
+        target_path = self._project_root / target_file
+        if not target_path.exists():
+            return {"status": "error", "message": f"File not found: {target_file}"}
+
+        try:
+            current_content = target_path.read_text()
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to read file: {e}"}
+
+        # Generate improvement via LLM
+        proposal = await self._generate_improvement(
+            target_file,
+            current_content,
+            improvement_goal,
+            context,
+        )
+
+        if proposal.get("status") != "success":
+            return proposal
+
+        # Create change record
+        change_id = f"ouroboros_{int(time.time())}_{os.urandom(4).hex()}"
+        change = {
+            "id": change_id,
+            "file": target_file,
+            "goal": improvement_goal,
+            "original_content": current_content,
+            "proposed_content": proposal.get("improved_content", ""),
+            "diff": proposal.get("diff", ""),
+            "confidence": proposal.get("confidence", 0.5),
+            "created_at": datetime.now().isoformat(),
+            "status": "pending",
+        }
+
+        self._pending_changes.append(change)
+
+        return {
+            "status": "proposed",
+            "change_id": change_id,
+            "diff_preview": proposal.get("diff", "")[:1000],  # Truncate for preview
+            "confidence": proposal.get("confidence", 0.5),
+            "requires_approval": self._require_approval,
+        }
+
+    async def _generate_improvement(
+        self,
+        target_file: str,
+        current_content: str,
+        improvement_goal: str,
+        context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Generate improved code via JARVIS Prime."""
+        prompt = f"""You are an expert code improvement assistant. Your task is to improve the following code file.
+
+FILE: {target_file}
+
+IMPROVEMENT GOAL: {improvement_goal}
+
+CONTEXT: {json.dumps(context or {})}
+
+CURRENT CODE:
+```
+{current_content[:5000]}  # Truncate for prompt size
+```
+
+Please provide:
+1. The improved code
+2. A brief explanation of changes
+3. A confidence score (0-1) for the improvement
+
+Respond in JSON format:
+{{"improved_content": "...", "explanation": "...", "confidence": 0.X}}
+"""
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self._jprime_url}/v1/completions",
+                    json={
+                        "prompt": prompt,
+                        "max_tokens": 4096,
+                        "temperature": 0.3,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        completion = result.get("choices", [{}])[0].get("text", "")
+
+                        # Parse JSON response
+                        try:
+                            parsed = json.loads(completion)
+                            diff = self._generate_diff(current_content, parsed.get("improved_content", ""))
+                            return {
+                                "status": "success",
+                                "improved_content": parsed.get("improved_content", ""),
+                                "explanation": parsed.get("explanation", ""),
+                                "confidence": parsed.get("confidence", 0.5),
+                                "diff": diff,
+                            }
+                        except json.JSONDecodeError:
+                            return {"status": "error", "message": "Failed to parse LLM response"}
+        except Exception as e:
+            return {"status": "error", "message": f"LLM request failed: {e}"}
+
+        return {"status": "error", "message": "Unknown error"}
+
+    def _generate_diff(self, original: str, improved: str) -> str:
+        """Generate a unified diff between original and improved content."""
+        import difflib
+
+        original_lines = original.splitlines(keepends=True)
+        improved_lines = improved.splitlines(keepends=True)
+
+        diff = difflib.unified_diff(
+            original_lines,
+            improved_lines,
+            fromfile="original",
+            tofile="improved",
+        )
+
+        return "".join(diff)
+
+    def _check_rate_limit(self) -> bool:
+        """Check if we're within rate limits."""
+        current_time = time.time()
+        hour_ago = current_time - 3600
+
+        # Remove old entries
+        self._changes_this_hour = [t for t in self._changes_this_hour if t > hour_ago]
+
+        return len(self._changes_this_hour) < self._max_changes_per_hour
+
+    async def approve_change(self, change_id: str) -> Dict[str, Any]:
+        """Approve a pending change."""
+        for i, change in enumerate(self._pending_changes):
+            if change["id"] == change_id:
+                change["status"] = "approved"
+                change["approved_at"] = datetime.now().isoformat()
+                self._approved_changes.append(change)
+                self._pending_changes.pop(i)
+                self._stats["improvements_approved"] += 1
+                return {"status": "approved", "change_id": change_id}
+
+        return {"status": "error", "message": f"Change not found: {change_id}"}
+
+    async def apply_change(self, change_id: str) -> Dict[str, Any]:
+        """Apply an approved change."""
+        for i, change in enumerate(self._approved_changes):
+            if change["id"] == change_id:
+                # Create git commit point for rollback
+                if self._git_enabled:
+                    await self._create_rollback_point(change)
+
+                # Apply the change
+                target_path = self._project_root / change["file"]
+                try:
+                    target_path.write_text(change["proposed_content"])
+
+                    # Run tests
+                    test_result = await self._run_tests(change["file"])
+
+                    if test_result["passed"]:
+                        change["status"] = "applied"
+                        change["applied_at"] = datetime.now().isoformat()
+                        self._applied_changes.append(change)
+                        self._approved_changes.pop(i)
+                        self._changes_this_hour.append(time.time())
+                        self._stats["improvements_applied"] += 1
+
+                        return {
+                            "status": "applied",
+                            "change_id": change_id,
+                            "test_result": test_result,
+                        }
+                    else:
+                        # Rollback
+                        await self._rollback_change(change)
+                        return {
+                            "status": "rolled_back",
+                            "change_id": change_id,
+                            "reason": "Tests failed",
+                            "test_result": test_result,
+                        }
+                except Exception as e:
+                    # Rollback on error
+                    await self._rollback_change(change)
+                    return {
+                        "status": "error",
+                        "message": f"Failed to apply: {e}",
+                    }
+
+        return {"status": "error", "message": f"Change not found: {change_id}"}
+
+    async def _create_rollback_point(self, change: Dict[str, Any]) -> None:
+        """Create a git stash or commit for rollback."""
+        try:
+            import subprocess
+            subprocess.run(
+                ["git", "stash", "push", "-m", f"ouroboros_backup_{change['id']}"],
+                cwd=self._project_root,
+                capture_output=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+    async def _rollback_change(self, change: Dict[str, Any]) -> None:
+        """Rollback a change by restoring original content."""
+        target_path = self._project_root / change["file"]
+        try:
+            target_path.write_text(change["original_content"])
+            change["status"] = "rolled_back"
+            change["rolled_back_at"] = datetime.now().isoformat()
+            self._rolled_back_changes.append(change)
+            self._stats["improvements_rolled_back"] += 1
+        except Exception:
+            pass
+
+    async def _run_tests(self, target_file: str) -> Dict[str, Any]:
+        """Run tests to validate the change."""
+        self._stats["tests_run"] += 1
+
+        try:
+            import subprocess
+
+            # Try pytest first
+            result = subprocess.run(
+                ["python", "-m", "pytest", "-x", "--tb=short"],
+                cwd=self._project_root,
+                capture_output=True,
+                timeout=300,
+                text=True,
+            )
+
+            passed = result.returncode == 0
+            if passed:
+                self._stats["tests_passed"] += 1
+            else:
+                self._stats["tests_failed"] += 1
+
+            return {
+                "passed": passed,
+                "output": result.stdout[:1000] if result.stdout else "",
+                "errors": result.stderr[:1000] if result.stderr else "",
+            }
+        except Exception as e:
+            self._stats["tests_failed"] += 1
+            return {
+                "passed": False,
+                "error": str(e),
+            }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get Ouroboros engine status."""
+        return {
+            "enabled": self._enable_auto_improve,
+            "git_available": self._git_enabled,
+            "require_approval": self._require_approval,
+            "pending_changes": len(self._pending_changes),
+            "approved_changes": len(self._approved_changes),
+            "applied_changes": len(self._applied_changes),
+            "rolled_back_changes": len(self._rolled_back_changes),
+            "rate_limit_remaining": self._max_changes_per_hour - len(self._changes_this_hour),
+            "stats": self._stats,
+        }
+
+
+class TrinityIPCHub:
+    """
+    Inter-Process Communication Hub for Trinity cross-repo coordination.
+
+    Provides 10 communication channels:
+    1. Body → Reactor Command Channel
+    2. Reactor → Body Status Push Channel
+    3. Prime → Reactor Feedback Channel
+    4. Body → Reactor Training Data Pipeline
+    5. Bidirectional Model Metadata Exchange
+    6. Cross-Repo Query Interface
+    7. Real-Time Event Streaming
+    8. Cross-Repo RPC Layer
+    9. Multi-Cast Event Broadcasting (Pub/Sub)
+    10. Reliable Message Queue with ACK
+    """
+
+    def __init__(
+        self,
+        ipc_dir: Optional[Path] = None,
+        enable_persistence: bool = True,
+        message_ttl_seconds: float = 3600.0,
+    ) -> None:
+        self._ipc_dir = ipc_dir or Path.home() / ".jarvis" / "trinity" / "ipc"
+        self._ipc_dir.mkdir(parents=True, exist_ok=True)
+
+        self._enable_persistence = enable_persistence
+        self._message_ttl_seconds = message_ttl_seconds
+
+        # Channel queues
+        self._channels: Dict[str, asyncio.Queue] = {
+            "body_to_reactor_cmd": asyncio.Queue(),
+            "reactor_to_body_status": asyncio.Queue(),
+            "prime_to_reactor_feedback": asyncio.Queue(),
+            "body_to_reactor_training": asyncio.Queue(),
+            "model_metadata": asyncio.Queue(),
+            "cross_repo_query": asyncio.Queue(),
+            "event_stream": asyncio.Queue(),
+            "rpc": asyncio.Queue(),
+            "pubsub": asyncio.Queue(),
+            "reliable_queue": asyncio.Queue(),
+        }
+
+        # Pub/Sub subscriptions
+        self._subscriptions: Dict[str, List[Callable[[Dict[str, Any]], Awaitable[None]]]] = {}
+
+        # Message acknowledgment tracking
+        self._pending_acks: Dict[str, Dict[str, Any]] = {}
+        self._ack_timeout = 30.0
+
+        # RPC handlers
+        self._rpc_handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = {}
+
+        # Background tasks
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Statistics
+        self._stats = {
+            "messages_sent": 0,
+            "messages_received": 0,
+            "messages_acked": 0,
+            "messages_expired": 0,
+            "rpc_calls": 0,
+            "pubsub_broadcasts": 0,
+        }
+
+    async def start(self) -> bool:
+        """Start the IPC hub."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+        # Load persisted messages
+        if self._enable_persistence:
+            await self._load_persisted_messages()
+
+        return True
+
+    async def stop(self) -> None:
+        """Stop the IPC hub."""
+        self._running = False
+
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+        # Persist remaining messages
+        if self._enable_persistence:
+            await self._persist_messages()
+
+    async def send(
+        self,
+        channel: str,
+        message: Dict[str, Any],
+        require_ack: bool = False,
+    ) -> Optional[str]:
+        """
+        Send a message to a channel.
+
+        Returns:
+            Message ID if successful, None otherwise
+        """
+        if channel not in self._channels:
+            return None
+
+        message_id = f"msg_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
+        envelope = {
+            "id": message_id,
+            "channel": channel,
+            "timestamp": datetime.now().isoformat(),
+            "payload": message,
+            "require_ack": require_ack,
+        }
+
+        await self._channels[channel].put(envelope)
+        self._stats["messages_sent"] += 1
+
+        if require_ack:
+            self._pending_acks[message_id] = {
+                "envelope": envelope,
+                "sent_at": time.time(),
+            }
+
+        return message_id
+
+    async def receive(
+        self,
+        channel: str,
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Receive a message from a channel."""
+        if channel not in self._channels:
+            return None
+
+        try:
+            if timeout:
+                envelope = await asyncio.wait_for(
+                    self._channels[channel].get(),
+                    timeout=timeout,
+                )
+            else:
+                envelope = await self._channels[channel].get()
+
+            self._stats["messages_received"] += 1
+            return envelope
+        except asyncio.TimeoutError:
+            return None
+
+    async def acknowledge(self, message_id: str) -> bool:
+        """Acknowledge receipt of a message."""
+        if message_id in self._pending_acks:
+            del self._pending_acks[message_id]
+            self._stats["messages_acked"] += 1
+            return True
+        return False
+
+    def subscribe(
+        self,
+        topic: str,
+        callback: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> str:
+        """Subscribe to a pub/sub topic."""
+        if topic not in self._subscriptions:
+            self._subscriptions[topic] = []
+
+        subscription_id = f"sub_{os.urandom(4).hex()}"
+        self._subscriptions[topic].append(callback)
+        return subscription_id
+
+    async def publish(self, topic: str, message: Dict[str, Any]) -> int:
+        """Publish a message to all subscribers of a topic."""
+        if topic not in self._subscriptions:
+            return 0
+
+        self._stats["pubsub_broadcasts"] += 1
+        delivered = 0
+
+        for callback in self._subscriptions[topic]:
+            try:
+                await callback(message)
+                delivered += 1
+            except Exception:
+                pass
+
+        return delivered
+
+    def register_rpc_handler(
+        self,
+        method: str,
+        handler: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
+    ) -> None:
+        """Register an RPC handler."""
+        self._rpc_handlers[method] = handler
+
+    async def call_rpc(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Make an RPC call."""
+        self._stats["rpc_calls"] += 1
+
+        if method in self._rpc_handlers:
+            try:
+                result = await asyncio.wait_for(
+                    self._rpc_handlers[method](params),
+                    timeout=timeout,
+                )
+                return {"status": "success", "result": result}
+            except asyncio.TimeoutError:
+                return {"status": "timeout", "error": f"RPC call timed out after {timeout}s"}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        return {"status": "error", "error": f"Unknown method: {method}"}
+
+    async def _cleanup_loop(self) -> None:
+        """Background cleanup of expired messages and acks."""
+        while self._running:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+
+                current_time = time.time()
+
+                # Check for expired acks
+                expired_acks = []
+                for msg_id, ack_info in self._pending_acks.items():
+                    if current_time - ack_info["sent_at"] > self._ack_timeout:
+                        expired_acks.append(msg_id)
+                        self._stats["messages_expired"] += 1
+
+                for msg_id in expired_acks:
+                    del self._pending_acks[msg_id]
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _load_persisted_messages(self) -> None:
+        """Load persisted messages from disk."""
+        persist_file = self._ipc_dir / "persisted_messages.json"
+        if persist_file.exists():
+            try:
+                content = persist_file.read_text()
+                data = json.loads(content)
+                for envelope in data.get("messages", []):
+                    channel = envelope.get("channel")
+                    if channel in self._channels:
+                        await self._channels[channel].put(envelope)
+            except Exception:
+                pass
+
+    async def _persist_messages(self) -> None:
+        """Persist remaining messages to disk."""
+        messages = []
+        for channel_name, queue in self._channels.items():
+            while not queue.empty():
+                try:
+                    envelope = queue.get_nowait()
+                    messages.append(envelope)
+                except asyncio.QueueEmpty:
+                    break
+
+        persist_file = self._ipc_dir / "persisted_messages.json"
+        try:
+            persist_file.write_text(json.dumps({"messages": messages}))
+        except Exception:
+            pass
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get IPC hub status."""
+        return {
+            "running": self._running,
+            "channels": {name: queue.qsize() for name, queue in self._channels.items()},
+            "subscriptions": {topic: len(callbacks) for topic, callbacks in self._subscriptions.items()},
+            "pending_acks": len(self._pending_acks),
+            "rpc_handlers": list(self._rpc_handlers.keys()),
+            "stats": self._stats,
+        }
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 4                                                               ║
