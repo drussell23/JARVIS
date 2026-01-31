@@ -7153,6 +7153,1526 @@ def get_restart_manager() -> ProcessRestartManager:
     return _restart_manager
 
 
+# =============================================================================
+# TRINITY CIRCUIT BREAKER (v100.1) - Persistent State Circuit Breaker
+# =============================================================================
+
+class TrinityCircuitBreakerState(Enum):
+    """Circuit breaker states for Trinity component protection."""
+    CLOSED = "closed"      # Normal operation, requests pass through
+    OPEN = "open"          # Circuit tripped, requests blocked
+    HALF_OPEN = "half_open"  # Testing if service recovered
+
+
+class TrinityCircuitBreaker:
+    """
+    Circuit breaker for Trinity component launch with PERSISTENT STATE.
+    Prevents cascade failures by stopping launch attempts after repeated failures.
+
+    v100.1: Added state persistence across restarts to prevent infinite retry loops.
+    State is saved to ~/.jarvis/state/circuit_breakers/ and loaded on init.
+
+    Features:
+    - Persistent state across supervisor restarts
+    - Automatic OPEN → HALF_OPEN transition after timeout
+    - Configurable failure thresholds
+    - Full status reporting
+    """
+
+    def __init__(self, name: str, config: Optional[TrinityLaunchConfig] = None):
+        self.name = name
+        self.config = config or TrinityLaunchConfig()
+        self.half_open_calls = 0
+        self._logger = logging.getLogger(f"TrinityCircuitBreaker.{name}")
+
+        # v100.1: Persistent state file
+        self._state_dir = Path.home() / ".jarvis" / "state" / "circuit_breakers"
+        self._state_file = self._state_dir / f"{name}.json"
+
+        # Load persisted state or initialize fresh
+        loaded_state = self._load_state()
+        self.state = loaded_state.get("state", TrinityCircuitBreakerState.CLOSED)
+        if isinstance(self.state, str):
+            self.state = TrinityCircuitBreakerState(self.state)
+        self.failure_count = loaded_state.get("failure_count", 0)
+        self.success_count = loaded_state.get("success_count", 0)
+        self.last_failure_time = loaded_state.get("last_failure_time")
+        self.last_state_change = loaded_state.get("last_state_change", time.time())
+        self.total_failures = loaded_state.get("total_failures", 0)
+        self.total_successes = loaded_state.get("total_successes", 0)
+
+        # Check if OPEN state has timed out
+        if self.state == TrinityCircuitBreakerState.OPEN and self.last_failure_time:
+            elapsed = time.time() - self.last_failure_time
+            if elapsed > self.config.circuit_breaker_timeout_sec:
+                self._transition_to(TrinityCircuitBreakerState.HALF_OPEN)
+                self._logger.info(f"[{name}] OPEN → HALF_OPEN (timeout elapsed during restart)")
+
+    def _load_state(self) -> Dict[str, Any]:
+        """Load circuit breaker state from disk."""
+        if not self._state_file.exists():
+            return {}
+        try:
+            with open(self._state_file) as f:
+                return json.load(f)
+        except Exception as e:
+            self._logger.warning(f"Failed to load circuit breaker state: {e}")
+            return {}
+
+    def _save_state(self) -> None:
+        """Persist circuit breaker state to disk (v100.1)."""
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            state_data = {
+                "state": self.state.value if isinstance(self.state, TrinityCircuitBreakerState) else self.state,
+                "failure_count": self.failure_count,
+                "success_count": self.success_count,
+                "last_failure_time": self.last_failure_time,
+                "last_state_change": self.last_state_change,
+                "total_failures": self.total_failures,
+                "total_successes": self.total_successes,
+                "updated_at": time.time(),
+            }
+            with open(self._state_file, "w") as f:
+                json.dump(state_data, f, indent=2)
+        except Exception as e:
+            self._logger.warning(f"Failed to save circuit breaker state: {e}")
+
+    def can_execute(self) -> bool:
+        """Check if execution is allowed based on circuit state."""
+        if self.state == TrinityCircuitBreakerState.CLOSED:
+            return True
+
+        if self.state == TrinityCircuitBreakerState.OPEN:
+            # Check if timeout has elapsed
+            if self.last_failure_time and (time.time() - self.last_failure_time) > self.config.circuit_breaker_timeout_sec:
+                self._transition_to(TrinityCircuitBreakerState.HALF_OPEN)
+                return True
+            return False
+
+        if self.state == TrinityCircuitBreakerState.HALF_OPEN:
+            return self.half_open_calls < self.config.circuit_breaker_half_open_max_calls
+
+        return False
+
+    def record_success(self) -> None:
+        """Record a successful execution."""
+        self.success_count += 1
+        self.total_successes += 1
+        self.failure_count = max(0, self.failure_count - 1)
+
+        if self.state == TrinityCircuitBreakerState.HALF_OPEN:
+            self._transition_to(TrinityCircuitBreakerState.CLOSED)
+        else:
+            self._save_state()  # v100.1: Persist state
+
+    def record_failure(self) -> None:
+        """Record a failed execution."""
+        self.failure_count += 1
+        self.total_failures += 1
+        self.last_failure_time = time.time()
+
+        if self.state == TrinityCircuitBreakerState.HALF_OPEN:
+            self._transition_to(TrinityCircuitBreakerState.OPEN)
+        elif self.failure_count >= self.config.circuit_breaker_failure_threshold:
+            self._transition_to(TrinityCircuitBreakerState.OPEN)
+        else:
+            self._save_state()  # v100.1: Persist state
+
+    def _transition_to(self, new_state: TrinityCircuitBreakerState) -> None:
+        """Transition to a new state."""
+        old_state = self.state
+        self.state = new_state
+        self.last_state_change = time.time()
+
+        if new_state == TrinityCircuitBreakerState.HALF_OPEN:
+            self.half_open_calls = 0
+        elif new_state == TrinityCircuitBreakerState.CLOSED:
+            self.failure_count = 0  # Reset on recovery
+
+        self._save_state()  # v100.1: Persist on every state transition
+        self._logger.info(f"[{self.name}] {old_state.value} → {new_state.value}")
+
+    def reset(self) -> None:
+        """Reset circuit breaker to initial state."""
+        self.state = TrinityCircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = None
+        self.last_state_change = time.time()
+        self.half_open_calls = 0
+        self._save_state()
+        self._logger.info(f"[{self.name}] Circuit breaker reset")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get comprehensive circuit breaker status."""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "failure_count": self.failure_count,
+            "success_count": self.success_count,
+            "total_failures": self.total_failures,
+            "total_successes": self.total_successes,
+            "last_failure_time": self.last_failure_time,
+            "last_state_change": self.last_state_change,
+            "can_execute": self.can_execute(),
+        }
+
+
+# =============================================================================
+# ASYNC RETRY UTILITY (v95.0) - Standalone Retry Function
+# =============================================================================
+
+async def async_retry(
+    operation: Callable[[], Any],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    exponential_base: float = 2.0,
+    operation_name: str = "operation",
+    retryable_exceptions: Optional[Tuple[type, ...]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Any:
+    """
+    v95.0: Simple async retry utility for critical operations.
+
+    Unlike RetryWithBackoff (tied to TrinityLaunchConfig), this is a standalone
+    function that can be used anywhere for HTTP requests, subprocess ops, etc.
+
+    Features:
+    - Exponential backoff with configurable base
+    - Jitter to prevent thundering herd
+    - Configurable max delay cap
+    - Exception type filtering
+
+    Args:
+        operation: Async callable to execute (can be lambda returning coroutine)
+        max_retries: Maximum number of retry attempts (default: 3)
+        base_delay: Initial delay in seconds (default: 1.0)
+        max_delay: Maximum delay cap (default: 30.0)
+        exponential_base: Multiplier for exponential backoff (default: 2.0)
+        operation_name: Name for logging (default: "operation")
+        retryable_exceptions: Tuple of exception types to retry on (default: all)
+        logger: Optional logger instance
+
+    Returns:
+        The result of the operation
+
+    Raises:
+        The last exception if all retries fail
+
+    Example:
+        result = await async_retry(
+            lambda: session.get(url),
+            max_retries=3,
+            operation_name="health_check",
+            retryable_exceptions=(aiohttp.ClientError, asyncio.TimeoutError),
+        )
+    """
+    _logger = logger or logging.getLogger("AsyncRetry")
+    last_exception: Optional[Exception] = None
+    max_attempts = max_retries + 1
+
+    for attempt in range(max_attempts):
+        try:
+            # Handle both async functions and lambdas returning coroutines
+            if asyncio.iscoroutinefunction(operation):
+                result = await operation()
+            else:
+                result = operation()
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+            if attempt > 0:
+                _logger.info(f"[{operation_name}] Succeeded on attempt {attempt + 1}")
+
+            return result
+
+        except Exception as e:
+            last_exception = e
+
+            # Check if this exception type should be retried
+            if retryable_exceptions and not isinstance(e, retryable_exceptions):
+                _logger.debug(f"[{operation_name}] Non-retryable exception: {type(e).__name__}")
+                raise
+
+            _logger.warning(f"[{operation_name}] Attempt {attempt + 1}/{max_attempts} failed: {e}")
+
+            # Check if we have retries left
+            if attempt < max_attempts - 1:
+                # Calculate delay with exponential backoff and jitter
+                import random
+                delay = min(base_delay * (exponential_base ** attempt), max_delay)
+                jitter = delay * 0.1 * (2 * random.random() - 1)  # ±10% jitter
+                delay = max(0, delay + jitter)
+
+                _logger.debug(f"[{operation_name}] Retrying in {delay:.2f}s...")
+                await asyncio.sleep(delay)
+
+    # All retries exhausted
+    _logger.error(f"[{operation_name}] All {max_attempts} attempts failed")
+    if last_exception:
+        raise last_exception
+    raise RuntimeError(f"{operation_name} failed after {max_attempts} attempts")
+
+
+# =============================================================================
+# STARTUP PHASE ENUM - Phases of Supervisor Startup
+# =============================================================================
+
+class StartupPhase(Enum):
+    """Phases of supervisor startup for tracking progress."""
+    INIT = "init"                       # Initial phase, configuration loading
+    CLEANUP = "cleanup"                 # Zombie/stale process cleanup
+    VALIDATION = "validation"           # Environment validation
+    SUPERVISOR_INIT = "supervisor_init" # Core supervisor initialization
+    RESOURCES = "resources"             # Resource managers startup
+    INTELLIGENCE = "intelligence"       # ML/Intelligence layer startup
+    TRINITY = "trinity"                 # Trinity cross-repo startup
+    BACKEND = "backend"                 # Backend server startup
+    JARVIS_START = "jarvis_start"       # Full JARVIS system startup
+    COMPLETE = "complete"               # Startup completed successfully
+    FAILED = "failed"                   # Startup failed
+
+
+# =============================================================================
+# INTELLIGENT CHROME INCOGNITO MANAGER - Browser Automation
+# =============================================================================
+
+# Global browser state management
+_browser_opened_this_startup: bool = False
+_browser_lock: Optional[asyncio.Lock] = None
+
+
+def _get_browser_lock() -> asyncio.Lock:
+    """Get or create the global browser lock (lazy init for Python 3.9)."""
+    global _browser_lock
+    if _browser_lock is None:
+        _browser_lock = asyncio.Lock()
+    return _browser_lock
+
+
+class IntelligentChromeIncognitoManager:
+    """
+    Advanced Chrome Incognito Window Manager for JARVIS.
+
+    DESIGN PHILOSOPHY: INCOGNITO ONLY, SINGLE WINDOW, ZERO DUPLICATES
+
+    This manager ensures:
+    1. ONLY Chrome Incognito mode is used - NEVER regular Chrome windows
+    2. EXACTLY ONE incognito window/tab with JARVIS at any time
+    3. Intelligent deduplication - closes ALL duplicates automatically
+    4. Cache-free experience - bypasses all cached CSS, JS, assets
+    5. Robust async operations with retry logic and error recovery
+
+    Key Features:
+    - Parallel window scanning with asyncio.gather()
+    - Intelligent URL pattern matching (localhost:3000, 3001, 8010, etc.)
+    - Graceful degradation with detailed error reporting
+    - Window state persistence across restarts
+    - Automatic cleanup on system restart
+    """
+
+    # Default patterns as fallback (loaded dynamically from config)
+    DEFAULT_URL_PATTERNS = [
+        "localhost:3000", "localhost:3001", "localhost:8010",
+        "localhost:8001", "localhost:8888",
+        "127.0.0.1:3000", "127.0.0.1:3001", "127.0.0.1:8010",
+        "127.0.0.1:8001", "127.0.0.1:8888"
+    ]
+
+    def __init__(self):
+        self._incognito_window_id: Optional[int] = None
+        self._incognito_tab_id: Optional[int] = None
+        self._session_started: bool = False
+        self._lock = LazyAsyncLock()  # Lazy init for Python 3.9 compatibility
+        self._last_operation_time: Optional[datetime] = None
+        self._operation_count: int = 0
+        self._error_count: int = 0
+        self._retry_delays = [0.5, 1.0, 2.0, 5.0]  # Exponential backoff
+        self._logger = logging.getLogger("ChromeIncognito")
+
+        # Load URL patterns from config
+        self.JARVIS_URL_PATTERNS = self._load_url_patterns()
+
+        self._logger.info("🔒 IntelligentChromeIncognitoManager initialized (INCOGNITO-ONLY mode)")
+
+    def _load_url_patterns(self) -> List[str]:
+        """Load JARVIS URL patterns from configuration file."""
+        config_paths = [
+            Path.cwd() / 'backend' / 'config' / 'startup_progress_config.json',
+            Path.cwd() / 'backend' / 'config' / 'browser_config.json',
+        ]
+
+        for config_path in config_paths:
+            try:
+                if config_path.exists():
+                    with open(config_path, 'r') as f:
+                        data = json.load(f)
+                        patterns = data.get('jarvis_url_patterns',
+                                          data.get('browser_config', {}).get('url_patterns'))
+                        if patterns:
+                            self._logger.debug(f"Loaded {len(patterns)} URL patterns from {config_path.name}")
+                            return patterns
+            except Exception as e:
+                self._logger.debug(f"Could not load URL patterns from {config_path}: {e}")
+
+        # Use defaults
+        self._logger.debug(f"Using default URL patterns: {len(self.DEFAULT_URL_PATTERNS)} patterns")
+        return self.DEFAULT_URL_PATTERNS.copy()
+
+    async def ensure_single_incognito_window(self, url: str, force_new: bool = False) -> Dict[str, Any]:
+        """
+        Ensure exactly ONE Chrome Incognito window with JARVIS.
+
+        This is the main entry point. It will:
+        1. Close ALL regular Chrome windows with JARVIS tabs
+        2. Close ALL duplicate incognito windows with JARVIS tabs
+        3. Keep or create exactly ONE incognito window
+        4. Navigate that window to the specified URL
+
+        Args:
+            url: The URL to load (e.g., http://localhost:3001)
+            force_new: If True, close everything and create fresh incognito window
+
+        Returns:
+            dict with status info
+        """
+        global_lock = _get_browser_lock()
+        async with global_lock:
+            global _browser_opened_this_startup
+
+            result = {
+                'success': False,
+                'action': None,
+                'duplicates_closed': 0,
+                'regular_windows_closed': 0,
+                'error': None
+            }
+
+            try:
+                # Quick check for existing incognito windows first
+                if not force_new:
+                    quick_window = await self._quick_find_any_incognito_window()
+                    if quick_window is not None:
+                        self._logger.info(f"🔄 Found existing incognito window {quick_window} - reusing")
+                        success = await self._redirect_incognito_window(quick_window, url)
+                        if success:
+                            _browser_opened_this_startup = True
+                            await self._ensure_fullscreen()
+                            return {
+                                'success': True,
+                                'action': 'redirected',
+                                'duplicates_closed': 0,
+                                'regular_windows_closed': 0,
+                                'error': None
+                            }
+
+                # Check if browser already opened this startup
+                if _browser_opened_this_startup and not force_new:
+                    scan_result = await self._scan_all_chrome_windows()
+                    all_incognito = scan_result.get('all_incognito_windows', [])
+                    if all_incognito:
+                        success = await self._redirect_incognito_window(all_incognito[0], url)
+                        if success:
+                            await self._ensure_fullscreen()
+                        return {
+                            'success': success,
+                            'action': 'redirected',
+                            'duplicates_closed': 0,
+                            'regular_windows_closed': 0,
+                            'error': None
+                        }
+                    _browser_opened_this_startup = False
+
+                async with self._lock:
+                    self._operation_count += 1
+                    self._last_operation_time = datetime.now()
+
+                    # Scan and categorize all Chrome windows
+                    scan_result = await self._scan_all_chrome_windows()
+
+                    if not scan_result['chrome_running']:
+                        # Chrome not running - launch fresh
+                        _browser_opened_this_startup = True
+                        success = await self._launch_fresh_incognito(url)
+                        result['success'] = success
+                        result['action'] = 'created'
+                        return result
+
+                    # Close ALL regular Chrome windows with JARVIS tabs
+                    if scan_result['regular_jarvis_windows']:
+                        closed = await self._close_regular_jarvis_windows(
+                            scan_result['regular_jarvis_windows']
+                        )
+                        result['regular_windows_closed'] = closed
+
+                    # Handle incognito windows
+                    all_incognito = scan_result.get('all_incognito_windows', [])
+
+                    if force_new and all_incognito:
+                        closed = await self._close_incognito_windows(all_incognito)
+                        result['duplicates_closed'] = closed
+                        _browser_opened_this_startup = True
+                        success = await self._launch_fresh_incognito(url)
+                        result['success'] = success
+                        result['action'] = 'created'
+                    elif not all_incognito:
+                        _browser_opened_this_startup = True
+                        success = await self._launch_fresh_incognito(url)
+                        result['success'] = success
+                        result['action'] = 'created'
+                    elif len(all_incognito) == 1:
+                        _browser_opened_this_startup = True
+                        success = await self._redirect_incognito_window(all_incognito[0], url)
+                        if success:
+                            await self._ensure_fullscreen()
+                        result['success'] = success
+                        result['action'] = 'redirected'
+                    else:
+                        # Multiple incognito - keep first, close rest
+                        to_keep = all_incognito[0]
+                        to_close = all_incognito[1:]
+                        closed = await self._close_incognito_windows(to_close)
+                        result['duplicates_closed'] = closed
+                        _browser_opened_this_startup = True
+                        success = await self._redirect_incognito_window(to_keep, url)
+                        if success:
+                            await self._ensure_fullscreen()
+                        result['success'] = success
+                        result['action'] = 'reused'
+
+                    self._session_started = True
+                    return result
+
+            except Exception as e:
+                self._error_count += 1
+                result['error'] = str(e)
+                self._logger.error(f"❌ Chrome Incognito operation failed: {e}")
+                return result
+
+    async def _quick_find_any_incognito_window(self) -> Optional[int]:
+        """Quick check for any existing incognito window."""
+        if sys.platform != 'darwin':
+            return None
+
+        applescript = '''
+        tell application "System Events"
+            if not (exists process "Google Chrome") then
+                return "NO_CHROME"
+            end if
+        end tell
+
+        tell application "Google Chrome"
+            set windowCount to count of windows
+            repeat with i from 1 to windowCount
+                try
+                    set w to window i
+                    if mode of w is "incognito" then
+                        return "FOUND|" & i
+                    end if
+                end try
+            end repeat
+        end tell
+        return "NONE"
+        '''
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+            output = stdout.decode().strip() if stdout else ""
+
+            if output.startswith("FOUND|"):
+                try:
+                    return int(output.split("|")[1])
+                except (ValueError, IndexError):
+                    pass
+
+            return None
+        except Exception as e:
+            self._logger.warning(f"Quick incognito scan failed: {e}")
+            return None
+
+    async def _scan_all_chrome_windows(self) -> Dict[str, Any]:
+        """Scan all Chrome windows and categorize them."""
+        if sys.platform != 'darwin':
+            return {
+                'chrome_running': False,
+                'regular_jarvis_windows': [],
+                'incognito_jarvis_windows': [],
+                'all_incognito_windows': [],
+                'total_windows': 0
+            }
+
+        patterns_str = ', '.join(f'"{p}"' for p in self.JARVIS_URL_PATTERNS)
+
+        applescript = f'''
+        tell application "System Events"
+            if not (exists process "Google Chrome") then
+                return "NOT_RUNNING"
+            end if
+        end tell
+
+        tell application "Google Chrome"
+            set regularJarvis to {{}}
+            set incognitoJarvis to {{}}
+            set allIncognito to {{}}
+            set jarvisPatterns to {{{patterns_str}}}
+            set windowCount to count of windows
+
+            repeat with windowIndex from 1 to windowCount
+                set w to window windowIndex
+                try
+                    set windowMode to mode of w
+                    set isIncognito to (windowMode is "incognito")
+
+                    if isIncognito then
+                        set end of allIncognito to windowIndex
+                    end if
+
+                    set foundJarvis to false
+                    repeat with t in tabs of w
+                        if not foundJarvis then
+                            set tabURL to URL of t
+                            repeat with pattern in jarvisPatterns
+                                if tabURL contains pattern then
+                                    if isIncognito then
+                                        set end of incognitoJarvis to windowIndex
+                                    else
+                                        set end of regularJarvis to windowIndex
+                                    end if
+                                    set foundJarvis to true
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                    end repeat
+                end try
+            end repeat
+
+            return "RUNNING|" & (count of regularJarvis) & "|" & (count of incognitoJarvis) & "|" & windowCount & "|" & (regularJarvis as string) & "|" & (incognitoJarvis as string) & "|" & (count of allIncognito) & "|" & (allIncognito as string)
+        end tell
+        '''
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
+            output = stdout.decode().strip() if stdout else ""
+
+            if output == "NOT_RUNNING":
+                return {
+                    'chrome_running': False,
+                    'regular_jarvis_windows': [],
+                    'incognito_jarvis_windows': [],
+                    'all_incognito_windows': [],
+                    'total_windows': 0
+                }
+
+            if output.startswith("RUNNING|"):
+                parts = output.split("|")
+                if len(parts) >= 4:
+                    regular_count = int(parts[1])
+                    incognito_jarvis_count = int(parts[2])
+                    total = int(parts[3])
+                    regular_indices = self._parse_applescript_list(parts[4]) if len(parts) > 4 else []
+                    incognito_jarvis_indices = self._parse_applescript_list(parts[5]) if len(parts) > 5 else []
+                    all_incognito_count = int(parts[6]) if len(parts) > 6 else 0
+                    all_incognito_indices = self._parse_applescript_list(parts[7]) if len(parts) > 7 else []
+
+                    return {
+                        'chrome_running': True,
+                        'regular_jarvis_windows': regular_indices[:regular_count],
+                        'incognito_jarvis_windows': incognito_jarvis_indices[:incognito_jarvis_count],
+                        'all_incognito_windows': all_incognito_indices[:all_incognito_count],
+                        'total_windows': total
+                    }
+
+            return {
+                'chrome_running': True,
+                'regular_jarvis_windows': [],
+                'incognito_jarvis_windows': [],
+                'all_incognito_windows': [],
+                'total_windows': 0
+            }
+
+        except Exception as e:
+            self._logger.warning(f"Window scan failed: {e}")
+            return {
+                'chrome_running': False,
+                'regular_jarvis_windows': [],
+                'incognito_jarvis_windows': [],
+                'all_incognito_windows': [],
+                'total_windows': 0
+            }
+
+    def _parse_applescript_list(self, list_str: str) -> List[int]:
+        """Parse AppleScript list string into Python list."""
+        if not list_str:
+            return []
+        try:
+            return [int(x.strip()) for x in list_str.split(",") if x.strip().isdigit()]
+        except Exception:
+            return []
+
+    async def _launch_fresh_incognito(self, url: str) -> bool:
+        """Launch a fresh Chrome incognito window."""
+        if sys.platform != 'darwin':
+            self._logger.warning("Non-macOS platform - cannot launch Chrome via AppleScript")
+            return False
+
+        applescript = f'''
+        tell application "Google Chrome"
+            set newWindow to make new window with properties {{mode:"incognito"}}
+            set URL of active tab of newWindow to "{url}"
+            activate
+        end tell
+        '''
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+
+            if process.returncode == 0:
+                self._logger.info(f"🔒 Launched fresh incognito window: {url}")
+                return True
+            else:
+                self._logger.error(f"Failed to launch incognito: {stderr.decode()}")
+                return False
+        except Exception as e:
+            self._logger.error(f"Error launching incognito: {e}")
+            return False
+
+    async def _redirect_incognito_window(self, window_index: int, url: str) -> bool:
+        """Redirect an existing incognito window to a URL."""
+        if sys.platform != 'darwin':
+            return False
+
+        applescript = f'''
+        tell application "Google Chrome"
+            set URL of active tab of window {window_index} to "{url}"
+            set active tab index of window {window_index} to 1
+            activate
+        end tell
+        '''
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+
+            if process.returncode == 0:
+                self._logger.info(f"🔄 Redirected incognito window {window_index} to {url}")
+                return True
+            else:
+                self._logger.warning(f"Redirect failed: {stderr.decode()}")
+                return False
+        except Exception as e:
+            self._logger.warning(f"Error redirecting window: {e}")
+            return False
+
+    async def _close_regular_jarvis_windows(self, window_indices: List[int]) -> int:
+        """Close regular (non-incognito) Chrome windows with JARVIS tabs."""
+        closed = 0
+        for idx in sorted(window_indices, reverse=True):  # Close in reverse order
+            try:
+                applescript = f'tell application "Google Chrome" to close window {idx}'
+                process = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", applescript,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(process.communicate(), timeout=5)
+                if process.returncode == 0:
+                    closed += 1
+            except Exception:
+                pass
+        return closed
+
+    async def _close_incognito_windows(self, window_indices: List[int]) -> int:
+        """Close incognito Chrome windows."""
+        closed = 0
+        for idx in sorted(window_indices, reverse=True):
+            try:
+                applescript = f'tell application "Google Chrome" to close window {idx}'
+                process = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", applescript,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                await asyncio.wait_for(process.communicate(), timeout=5)
+                if process.returncode == 0:
+                    closed += 1
+            except Exception:
+                pass
+        return closed
+
+    async def _ensure_fullscreen(self) -> bool:
+        """Ensure Chrome window is fullscreen."""
+        if sys.platform != 'darwin':
+            return False
+
+        try:
+            applescript = '''
+            tell application "System Events"
+                tell process "Google Chrome"
+                    if (count of windows) > 0 then
+                        set frontmost to true
+                    end if
+                end tell
+            end tell
+            '''
+            process = await asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.wait_for(process.communicate(), timeout=5)
+            return True
+        except Exception:
+            return False
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get Chrome manager status."""
+        return {
+            'session_started': self._session_started,
+            'operation_count': self._operation_count,
+            'error_count': self._error_count,
+            'last_operation_time': self._last_operation_time.isoformat() if self._last_operation_time else None,
+            'patterns_loaded': len(self.JARVIS_URL_PATTERNS),
+        }
+
+
+# Global Chrome manager singleton
+_chrome_manager: Optional[IntelligentChromeIncognitoManager] = None
+
+
+def get_chrome_manager() -> IntelligentChromeIncognitoManager:
+    """Get the global Chrome incognito manager."""
+    global _chrome_manager
+    if _chrome_manager is None:
+        _chrome_manager = IntelligentChromeIncognitoManager()
+    return _chrome_manager
+
+
+# =============================================================================
+# UNIFIED TRINITY CONNECTOR - Cross-Repo Orchestration
+# =============================================================================
+
+class UnifiedTrinityConnector:
+    """
+    Master orchestrator that connects JARVIS, JARVIS Prime, and Reactor Core.
+
+    This is the single point of coordination for the entire Trinity system,
+    providing:
+    - Cross-repo self-improvement with diff preview and approval
+    - Atomic multi-repo transactions with 2PC (two-phase commit)
+    - Distributed health consensus
+    - Unified improvement request routing
+    - Session memory across all repos
+
+    Architecture:
+    - JARVIS Body: This repo (execution, voice, vision, UI)
+    - JARVIS Prime: Reasoning brain (jarvis-prime repo)
+    - Reactor Core: Training/learning pipeline (reactor-core repo)
+    """
+
+    def __init__(self):
+        self.logger = logging.getLogger("Trinity.Connector")
+        self._running = False
+        self._initialized = False
+
+        # Components (lazy-loaded)
+        self._enhanced_self_improvement = None
+        self._enhanced_cross_repo = None
+        self._session_id = f"trinity_{uuid.uuid4().hex[:12]}"
+
+        # Repository paths (from environment or defaults)
+        self._jarvis_path = Path(os.environ.get(
+            "JARVIS_PATH",
+            Path(__file__).parent
+        ))
+        self._prime_path = Path(os.environ.get(
+            "JARVIS_PRIME_PATH",
+            self._jarvis_path.parent / "jarvis-prime"
+        ))
+        self._reactor_path = Path(os.environ.get(
+            "REACTOR_CORE_PATH",
+            self._jarvis_path.parent / "reactor-core"
+        ))
+
+        # Health state
+        self._health = {
+            "jarvis": False,
+            "prime": False,
+            "reactor": False,
+        }
+
+        # Real-time communication
+        self._realtime_broadcaster = None
+
+    async def initialize(
+        self,
+        websocket_manager=None,
+        voice_system=None,
+        menu_bar=None,
+        event_bus=None,
+    ) -> bool:
+        """
+        Initialize the Trinity connector.
+
+        Sets up all enhanced components and establishes
+        connections to JARVIS Prime and Reactor Core.
+
+        Args:
+            websocket_manager: WebSocket manager for real-time UI updates
+            voice_system: Voice system for real-time narration
+            menu_bar: Menu bar for status indicators
+            event_bus: Event bus for system events
+        """
+        if self._initialized:
+            return True
+
+        self.logger.info("=" * 60)
+        self.logger.info("  UNIFIED TRINITY CONNECTOR v1.0")
+        self.logger.info("=" * 60)
+        self.logger.info(f"  Session: {self._session_id}")
+        self.logger.info(f"  JARVIS: {self._jarvis_path}")
+        self.logger.info(f"  Prime: {self._prime_path}")
+        self.logger.info(f"  Reactor: {self._reactor_path}")
+        self.logger.info("=" * 60)
+
+        try:
+            # Phase 1: Validate repositories
+            self.logger.info("[Trinity] Phase 1: Repository Validation...")
+            await self._validate_repositories()
+
+            # Phase 2: Initialize cross-repo communication (if available)
+            self.logger.info("[Trinity] Phase 2: Cross-Repo Communication...")
+            try:
+                from core.ouroboros.cross_repo import (
+                    get_enhanced_cross_repo_orchestrator,
+                    initialize_enhanced_cross_repo,
+                )
+                await initialize_enhanced_cross_repo()
+                self._enhanced_cross_repo = get_enhanced_cross_repo_orchestrator()
+                self.logger.info("[Trinity] ✓ Cross-repo orchestrator ready")
+            except ImportError:
+                self.logger.info("[Trinity] Cross-repo module not available - standalone mode")
+            except Exception as e:
+                self.logger.warning(f"[Trinity] Cross-repo init error: {e}")
+
+            # Phase 3: Initialize self-improvement (if available)
+            self.logger.info("[Trinity] Phase 3: Self-Improvement Engine...")
+            try:
+                from core.ouroboros.native_integration import (
+                    get_enhanced_self_improvement,
+                )
+                self._enhanced_self_improvement = get_enhanced_self_improvement()
+                await self._enhanced_self_improvement.initialize()
+                self.logger.info("[Trinity] ✓ Enhanced self-improvement ready")
+            except ImportError:
+                self.logger.info("[Trinity] Self-improvement module not available")
+            except Exception as e:
+                self.logger.warning(f"[Trinity] Self-improvement init error: {e}")
+
+            self._initialized = True
+            self._running = True
+
+            self.logger.info("=" * 60)
+            self.logger.info("  TRINITY CONNECTOR INITIALIZED SUCCESSFULLY")
+            self.logger.info("=" * 60)
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[Trinity] Initialization failed: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+            return False
+
+    async def _validate_repositories(self) -> None:
+        """Validate all repository connections."""
+        # JARVIS (always available - we're in it)
+        self._health["jarvis"] = True
+        self.logger.info(f"  - JARVIS: ✓ (local)")
+
+        # JARVIS Prime
+        if self._prime_path.exists():
+            prime_git = self._prime_path / ".git"
+            if prime_git.exists():
+                self._health["prime"] = True
+                self.logger.info(f"  - JARVIS Prime: ✓ ({self._prime_path})")
+            else:
+                self.logger.warning(f"  - JARVIS Prime: ⚠ not a git repo")
+        else:
+            self.logger.warning(f"  - JARVIS Prime: ⚠ not found ({self._prime_path})")
+
+        # Reactor Core
+        if self._reactor_path.exists():
+            reactor_git = self._reactor_path / ".git"
+            if reactor_git.exists():
+                self._health["reactor"] = True
+                self.logger.info(f"  - Reactor Core: ✓ ({self._reactor_path})")
+            else:
+                self.logger.warning(f"  - Reactor Core: ⚠ not a git repo")
+        else:
+            self.logger.warning(f"  - Reactor Core: ⚠ not found ({self._reactor_path})")
+
+    async def shutdown(self) -> None:
+        """Shutdown the Trinity connector."""
+        if not self._running:
+            return
+
+        self.logger.info("[Trinity] Shutting down...")
+
+        try:
+            if self._realtime_broadcaster:
+                try:
+                    from core.ouroboros.ui_integration import disconnect_realtime_broadcaster
+                    await disconnect_realtime_broadcaster()
+                except Exception as e:
+                    self.logger.warning(f"[Trinity] Realtime broadcaster disconnect error: {e}")
+                self._realtime_broadcaster = None
+
+            if self._enhanced_cross_repo:
+                try:
+                    from core.ouroboros.cross_repo import shutdown_enhanced_cross_repo
+                    await shutdown_enhanced_cross_repo()
+                except Exception as e:
+                    self.logger.warning(f"[Trinity] Cross-repo shutdown error: {e}")
+
+            if self._enhanced_self_improvement:
+                await self._enhanced_self_improvement.shutdown()
+
+        except Exception as e:
+            self.logger.warning(f"[Trinity] Shutdown error: {e}")
+
+        self._running = False
+        self._initialized = False
+        self.logger.info("[Trinity] Shutdown complete")
+
+    async def execute_improvement_with_preview(
+        self,
+        target: str,
+        goal: str,
+        require_approval: bool = True,
+    ):
+        """
+        Execute improvement with diff preview and approval workflow.
+
+        This is the main interface for Claude Code-like self-improvement.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._enhanced_self_improvement:
+            return await self._enhanced_self_improvement.execute_with_preview(
+                target=target,
+                goal=goal,
+                require_approval=require_approval,
+            )
+        else:
+            return {"error": "Self-improvement module not available"}
+
+    async def execute_multi_file_improvement(
+        self,
+        files_and_goals: List[Tuple[str, str]],
+        shared_context: str = None,
+    ):
+        """Execute atomic multi-file improvement."""
+        if not self._initialized:
+            await self.initialize()
+
+        if self._enhanced_self_improvement:
+            return await self._enhanced_self_improvement.execute_multi_file_improvement(
+                files_and_goals=files_and_goals,
+                shared_context=shared_context,
+            )
+        else:
+            return {"error": "Self-improvement module not available"}
+
+    async def request_cross_repo_improvement(
+        self,
+        file_path: str,
+        goal: str,
+    ) -> str:
+        """
+        Request improvement across repositories with proper ordering.
+
+        Uses Lamport clocks for causal ordering.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._enhanced_cross_repo:
+            return await self._enhanced_cross_repo.request_improvement_with_ordering(
+                file_path=file_path,
+                goal=goal,
+            )
+        else:
+            return "Cross-repo orchestrator not available"
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get comprehensive Trinity status."""
+        status = {
+            "session_id": self._session_id,
+            "running": self._running,
+            "initialized": self._initialized,
+            "repositories": self._health,
+        }
+
+        if self._enhanced_self_improvement:
+            try:
+                status["self_improvement"] = self._enhanced_self_improvement.get_status()
+            except Exception:
+                status["self_improvement"] = {"error": "Status unavailable"}
+
+        if self._enhanced_cross_repo:
+            try:
+                status["cross_repo"] = self._enhanced_cross_repo.get_status()
+            except Exception:
+                status["cross_repo"] = {"error": "Status unavailable"}
+
+        return status
+
+
+# Global Trinity connector
+_trinity_connector: Optional[UnifiedTrinityConnector] = None
+
+
+def get_trinity_connector() -> UnifiedTrinityConnector:
+    """Get the global Trinity connector."""
+    global _trinity_connector
+    if _trinity_connector is None:
+        _trinity_connector = UnifiedTrinityConnector()
+    return _trinity_connector
+
+
+async def initialize_trinity() -> bool:
+    """Initialize the Trinity connector."""
+    connector = get_trinity_connector()
+    return await connector.initialize()
+
+
+async def shutdown_trinity() -> None:
+    """Shutdown the Trinity connector."""
+    global _trinity_connector
+    if _trinity_connector:
+        await _trinity_connector.shutdown()
+        _trinity_connector = None
+
+
+# =============================================================================
+# ADVANCED STARTUP BOOTSTRAPPER - Dynamic Environment Discovery
+# =============================================================================
+
+class AdvancedStartupBootstrapper:
+    """
+    Advanced Startup Bootstrapper for JARVIS AI System.
+
+    Features:
+    - 🔍 Dynamic path discovery (zero hardcoding)
+    - ⚡ Async parallel initialization
+    - 🌍 Multi-environment detection (dev/prod/test/ci)
+    - 📁 Configuration layering (file → env → CLI)
+    - 🏥 Health checks and validation
+    - 🔄 Self-healing with automatic recovery
+    - 📊 Comprehensive telemetry and logging
+    - 🛡️ Graceful degradation on failures
+    - 🧹 Automatic cleanup on exit
+    """
+
+    # Environment detection patterns
+    ENV_PATTERNS = {
+        'production': ['prod', 'production', 'prd'],
+        'staging': ['staging', 'stg', 'stage'],
+        'development': ['dev', 'development', 'local'],
+        'test': ['test', 'testing', 'ci', 'qa'],
+    }
+
+    # Required directories for validation
+    REQUIRED_DIRS = ['backend', 'frontend']
+    OPTIONAL_DIRS = ['core', 'api', 'intelligence', 'vision', 'voice']
+
+    # Config file search paths (relative to project root)
+    CONFIG_PATHS = [
+        'backend/config/startup_progress_config.json',
+        'config/startup.json',
+        '.jarvis/config.json',
+        'jarvis.config.json',
+    ]
+
+    def __init__(self):
+        """Initialize the bootstrapper with dynamic discovery."""
+        self._start_time = time.time()
+        self._initialized = False
+        self._paths: Dict[str, Path] = {}
+        self._config: Dict[str, Any] = {}
+        self._environment: str = 'development'
+        self._health_status: Dict[str, Any] = {}
+        self._recovery_attempts: int = 0
+        self._max_recovery_attempts: int = 3
+        self._telemetry: Dict[str, Any] = {'events': [], 'timings': {}}
+        self._cleanup_handlers: List[Callable] = []
+        self._interrupt_count: int = 0
+        self._last_interrupt_time: float = 0
+        self._lock = LazyAsyncLock()  # Lazy init for Python 3.9 compatibility
+
+        # Discover paths immediately (sync, required for early setup)
+        self._discover_paths()
+
+    def _discover_paths(self) -> None:
+        """
+        Dynamically discover all required paths.
+        Zero hardcoding - works from any invocation location.
+        """
+        # Method 1: Script location (most reliable)
+        script_path = Path(__file__).resolve()
+        script_dir = script_path.parent
+
+        # Method 2: Current working directory
+        cwd = Path.cwd().resolve()
+
+        # Method 3: Environment variable override
+        env_root = os.environ.get('JARVIS_ROOT')
+
+        # Determine project root by checking for marker files/dirs
+        candidate_roots = [script_dir, cwd]
+        if env_root:
+            candidate_roots.insert(0, Path(env_root).resolve())
+
+        project_root = None
+        for candidate in candidate_roots:
+            if self._is_project_root(candidate):
+                project_root = candidate
+                break
+            # Check parent directories
+            for parent in candidate.parents:
+                if self._is_project_root(parent):
+                    project_root = parent
+                    break
+            if project_root:
+                break
+
+        if not project_root:
+            project_root = script_dir
+
+        # Store discovered paths
+        self._paths = {
+            'project_root': project_root,
+            'script': script_path,
+            'backend': project_root / 'backend',
+            'frontend': project_root / 'frontend',
+            'config': project_root / 'backend' / 'config',
+            'logs': project_root / 'backend' / 'logs',
+            'venv': project_root / 'backend' / 'venv',
+            'core': project_root / 'backend' / 'core',
+            'api': project_root / 'backend' / 'api',
+            'intelligence': project_root / 'backend' / 'intelligence',
+            'temp': Path(tempfile.gettempdir()),
+            'home': Path.home(),
+            'jarvis_home': Path.home() / '.jarvis',
+        }
+
+        # Discover Python executable
+        self._paths['python'] = self._discover_python()
+        self._paths['venv_python'] = self._discover_venv_python()
+
+    def _is_project_root(self, path: Path) -> bool:
+        """Check if path is the JARVIS project root."""
+        markers = [
+            path / 'backend' / 'main.py',
+            path / 'unified_supervisor.py',
+            path / 'frontend' / 'package.json',
+        ]
+        return any(m.exists() for m in markers)
+
+    def _discover_python(self) -> Path:
+        """Discover the best Python executable to use."""
+        candidates = [
+            self._paths.get('venv', Path()) / 'bin' / 'python3',
+            self._paths.get('venv', Path()) / 'bin' / 'python',
+            Path(sys.executable),
+            Path('/usr/bin/python3'),
+            Path('/usr/local/bin/python3'),
+        ]
+
+        for candidate in candidates:
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return candidate
+
+        return Path(sys.executable)
+
+    def _discover_venv_python(self) -> Optional[Path]:
+        """Discover virtual environment Python."""
+        venv_paths = [
+            self._paths['backend'] / 'venv' / 'bin' / 'python3',
+            self._paths['backend'] / 'venv' / 'bin' / 'python',
+            self._paths['project_root'] / 'venv' / 'bin' / 'python3',
+            self._paths['project_root'] / '.venv' / 'bin' / 'python3',
+        ]
+
+        for venv_python in venv_paths:
+            if venv_python.exists():
+                return venv_python
+
+        return None
+
+    def _detect_environment(self) -> str:
+        """
+        Detect the current runtime environment.
+        Priority: CLI arg → ENV var → git branch → default
+        """
+        # Check environment variable
+        env_var = os.environ.get('JARVIS_ENV', '').lower()
+        for env_name, patterns in self.ENV_PATTERNS.items():
+            if env_var in patterns:
+                return env_name
+
+        # Check git branch
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture_output=True, text=True, timeout=5,
+                cwd=self._paths['project_root']
+            )
+            if result.returncode == 0:
+                branch = result.stdout.strip().lower()
+                if 'prod' in branch or 'main' == branch or 'master' == branch:
+                    return 'production'
+                elif 'stag' in branch:
+                    return 'staging'
+                elif 'test' in branch or 'ci' in branch:
+                    return 'test'
+        except Exception:
+            pass
+
+        # Check for CI environment
+        ci_indicators = ['CI', 'GITHUB_ACTIONS', 'GITLAB_CI', 'JENKINS_URL', 'TRAVIS']
+        if any(os.environ.get(ci) for ci in ci_indicators):
+            return 'test'
+
+        return 'development'
+
+    async def _load_config_async(self) -> Dict[str, Any]:
+        """
+        Load configuration with layering: file → env → runtime.
+        Fully async for non-blocking I/O.
+        """
+        config = self._get_default_config()
+
+        # Layer 1: File-based config
+        for config_path_str in self.CONFIG_PATHS:
+            config_path = self._paths['project_root'] / config_path_str
+            if config_path.exists():
+                try:
+                    async with self._lock:
+                        content = await asyncio.to_thread(config_path.read_text)
+                        file_config = json.loads(content)
+                        config = self._merge_config(config, file_config)
+                        self._log_event('config_loaded', {'source': str(config_path)})
+                        break
+                except Exception as e:
+                    self._log_event('config_error', {'source': str(config_path), 'error': str(e)})
+
+        # Layer 2: Environment variables
+        env_overrides = self._get_env_overrides()
+        config = self._merge_config(config, env_overrides)
+
+        # Layer 3: Runtime detection
+        config['environment'] = self._environment
+        config['paths'] = {k: str(v) for k, v in self._paths.items()}
+
+        return config
+
+    def _get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration values."""
+        return {
+            'backend': {
+                'host': '0.0.0.0',
+                'port': 8010,
+                'fallback_ports': [8011, 8000, 8001, 8080, 8888],
+                'workers': 1,
+                'timeout': 300,
+            },
+            'frontend': {
+                'port': 3000,
+                'fallback_ports': [3001, 3002, 3003],
+            },
+            'startup': {
+                'parallel_init': True,
+                'health_check_timeout': 30,
+                'max_recovery_attempts': 3,
+                'graceful_shutdown_timeout': 10,
+            },
+            'features': {
+                'voice_unlock': True,
+                'vision': True,
+                'autonomous': True,
+                'cloud_sql': True,
+            },
+            'logging': {
+                'level': 'INFO',
+                'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                'file': 'jarvis_startup.log',
+            },
+        }
+
+    def _get_env_overrides(self) -> Dict[str, Any]:
+        """Extract configuration overrides from environment variables."""
+        overrides = {}
+
+        env_mappings = {
+            'JARVIS_BACKEND_PORT': ('backend', 'port', int),
+            'JARVIS_FRONTEND_PORT': ('frontend', 'port', int),
+            'JARVIS_HOST': ('backend', 'host', str),
+            'JARVIS_WORKERS': ('backend', 'workers', int),
+            'JARVIS_LOG_LEVEL': ('logging', 'level', str),
+            'JARVIS_PARALLEL_INIT': ('startup', 'parallel_init', lambda x: x.lower() == 'true'),
+            'JARVIS_VOICE_UNLOCK': ('features', 'voice_unlock', lambda x: x.lower() == 'true'),
+            'JARVIS_VISION': ('features', 'vision', lambda x: x.lower() == 'true'),
+            'JARVIS_AUTONOMOUS': ('features', 'autonomous', lambda x: x.lower() == 'true'),
+        }
+
+        for env_key, (section, key, converter) in env_mappings.items():
+            value = os.environ.get(env_key)
+            if value is not None:
+                if section not in overrides:
+                    overrides[section] = {}
+                try:
+                    overrides[section][key] = converter(value)
+                except (ValueError, TypeError):
+                    pass
+
+        return overrides
+
+    def _merge_config(self, base: Dict, overlay: Dict) -> Dict:
+        """Deep merge configuration dictionaries."""
+        result = base.copy()
+        for key, value in overlay.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._merge_config(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    def _log_event(self, event_type: str, data: Dict[str, Any] = None) -> None:
+        """Log telemetry event."""
+        event = {
+            'type': event_type,
+            'timestamp': time.time(),
+            'data': data or {},
+        }
+        self._telemetry['events'].append(event)
+
+    def setup_python_path(self) -> None:
+        """Configure Python path for imports."""
+        paths_to_add = [
+            self._paths['project_root'],
+            self._paths['backend'],
+        ]
+
+        for path in paths_to_add:
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+
+        # Set environment variable for subprocesses
+        existing_pythonpath = os.environ.get('PYTHONPATH', '')
+        new_paths = ':'.join(str(p) for p in paths_to_add)
+        os.environ['PYTHONPATH'] = f"{new_paths}:{existing_pythonpath}" if existing_pythonpath else new_paths
+
+    def setup_working_directory(self) -> None:
+        """Change to project root directory."""
+        project_root = self._paths['project_root']
+        if Path.cwd() != project_root:
+            os.chdir(project_root)
+
+    async def initialize(self) -> bool:
+        """
+        Full async initialization sequence.
+        Returns True if initialization succeeded.
+        """
+        try:
+            self._log_event('init_started')
+
+            # Phase 1: Environment setup (sync, must happen first)
+            self.setup_working_directory()
+            self.setup_python_path()
+            self._environment = self._detect_environment()
+
+            # Phase 2: Load configuration (async)
+            self._config = await self._load_config_async()
+
+            # Phase 3: Create required directories
+            await self._create_required_directories()
+
+            self._initialized = True
+            self._log_event('init_completed', {
+                'environment': self._environment,
+                'duration_ms': (time.time() - self._start_time) * 1000,
+            })
+
+            return True
+
+        except Exception as e:
+            self._log_event('init_failed', {'error': str(e)})
+            return False
+
+    async def _create_required_directories(self) -> None:
+        """Create required directories if they don't exist."""
+        dirs_to_create = [
+            self._paths['logs'],
+            self._paths['jarvis_home'],
+            self._paths['jarvis_home'] / 'state',
+            self._paths['jarvis_home'] / 'cache',
+        ]
+
+        for dir_path in dirs_to_create:
+            try:
+                dir_path.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass  # Ignore errors - not critical
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get bootstrapper status."""
+        return {
+            'initialized': self._initialized,
+            'environment': self._environment,
+            'paths': {k: str(v) for k, v in self._paths.items()},
+            'config': self._config,
+            'uptime_seconds': time.time() - self._start_time,
+            'telemetry_events': len(self._telemetry['events']),
+        }
+
+
+# Global bootstrapper singleton
+_bootstrapper: Optional[AdvancedStartupBootstrapper] = None
+
+
+def get_bootstrapper() -> AdvancedStartupBootstrapper:
+    """Get the global bootstrapper."""
+    global _bootstrapper
+    if _bootstrapper is None:
+        _bootstrapper = AdvancedStartupBootstrapper()
+    return _bootstrapper
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 3                                                               ║
