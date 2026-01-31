@@ -8560,6 +8560,332 @@ class JarvisSystemKernel:
             self.logger.info(f"  ... and {len(changed_files) - 5} more")
 
     # =========================================================================
+    # ADAPTIVE TIMEOUT MANAGEMENT
+    # =========================================================================
+    # Enterprise-grade adaptive timeouts that adjust based on system load
+    # to prevent false failures during legitimate slow operations.
+    # =========================================================================
+
+    async def _get_adaptive_timeout(self, base_timeout: float) -> float:
+        """
+        Calculate adaptive timeout based on system load.
+
+        Increases timeout when system is under heavy load to prevent
+        false timeouts during legitimate slow operations.
+
+        Args:
+            base_timeout: Base timeout in seconds
+
+        Returns:
+            Adjusted timeout (potentially higher if system is loaded)
+        """
+        try:
+            import psutil
+
+            # Quick CPU and memory check (non-blocking)
+            cpu_percent = psutil.cpu_percent(interval=0.05)
+            memory = psutil.virtual_memory()
+
+            # Calculate load multiplier
+            if cpu_percent > 90 or memory.percent > 95:
+                multiplier = 2.0  # Heavy load - double timeout
+            elif cpu_percent > 75 or memory.percent > 85:
+                multiplier = 1.5  # Moderate load - 50% more time
+            elif cpu_percent > 50 or memory.percent > 70:
+                multiplier = 1.25  # Light load - 25% more time
+            else:
+                multiplier = 1.0  # Normal
+
+            adjusted = base_timeout * multiplier
+            if multiplier > 1.0:
+                self.logger.debug(
+                    f"[AdaptiveTimeout] {base_timeout}s → {adjusted}s "
+                    f"(CPU: {cpu_percent}%, MEM: {memory.percent}%)"
+                )
+            return adjusted
+
+        except ImportError:
+            return base_timeout
+        except Exception:
+            return base_timeout
+
+    # =========================================================================
+    # ADVANCED STARTUP DIAGNOSTICS
+    # =========================================================================
+    # Comprehensive startup diagnostics for troubleshooting and optimization.
+    # =========================================================================
+
+    async def _run_startup_diagnostics(self) -> Dict[str, Any]:
+        """
+        Run comprehensive startup diagnostics.
+
+        Collects system information, component status, and performance metrics
+        for troubleshooting and optimization.
+
+        Returns:
+            Dict with diagnostic information
+        """
+        diagnostics: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "kernel_id": self.config.kernel_id,
+            "kernel_version": self.config.kernel_version,
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "platform": sys.platform,
+            "system": {},
+            "components": {},
+            "performance": {},
+            "warnings": [],
+        }
+
+        # System information
+        try:
+            import psutil
+
+            diagnostics["system"] = {
+                "cpu_count": psutil.cpu_count(),
+                "cpu_percent": psutil.cpu_percent(interval=0.1),
+                "memory_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+                "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
+                "memory_percent": psutil.virtual_memory().percent,
+                "disk_free_gb": round(psutil.disk_usage('/').free / (1024**3), 2),
+            }
+        except ImportError:
+            diagnostics["system"]["note"] = "psutil not available"
+
+        # Component status
+        diagnostics["components"] = {
+            "backend": {
+                "running": self._backend_process is not None and self._backend_process.returncode is None,
+                "port": self.config.backend_port,
+            },
+            "ipc_server": {
+                "running": self._ipc_server is not None,
+            },
+            "readiness_manager": {
+                "enabled": self._readiness_manager is not None,
+                "status": self._readiness_manager.get_status() if self._readiness_manager else None,
+            },
+            "trinity": {
+                "enabled": self.config.trinity_enabled,
+                "prime_enabled": self.config.prime_enabled,
+                "reactor_enabled": self.config.reactor_enabled,
+            },
+        }
+
+        # Performance metrics
+        if self._started_at:
+            diagnostics["performance"] = {
+                "uptime_seconds": self.uptime_seconds,
+                "startup_time_seconds": self._started_at - time.time() if hasattr(self, '_boot_start_time') else None,
+            }
+
+        return diagnostics
+
+    async def _validate_trinity_repos(self) -> Dict[str, Any]:
+        """
+        Validate Trinity repository availability and health.
+
+        Checks that JARVIS-Prime and Reactor-Core repositories are present
+        and properly configured for cross-repo coordination.
+
+        Returns:
+            Dict with validation results
+        """
+        result: Dict[str, Any] = {
+            "valid": True,
+            "prime": {"found": False, "path": None, "issues": []},
+            "reactor": {"found": False, "path": None, "issues": []},
+        }
+
+        # Check JARVIS-Prime
+        if self.config.prime_repo_path:
+            prime_path = self.config.prime_repo_path
+            result["prime"]["path"] = str(prime_path)
+
+            if prime_path.exists():
+                result["prime"]["found"] = True
+
+                # Check for key files
+                key_files = [
+                    prime_path / "main.py",
+                    prime_path / "start.py",
+                    prime_path / "pyproject.toml",
+                ]
+                has_startup = any(f.exists() for f in key_files)
+
+                if not has_startup:
+                    result["prime"]["issues"].append("No startup script found")
+            else:
+                result["prime"]["issues"].append(f"Path does not exist: {prime_path}")
+        else:
+            result["prime"]["issues"].append("Prime repo path not configured")
+
+        # Check Reactor-Core
+        if self.config.reactor_repo_path:
+            reactor_path = self.config.reactor_repo_path
+            result["reactor"]["path"] = str(reactor_path)
+
+            if reactor_path.exists():
+                result["reactor"]["found"] = True
+
+                # Check for key files
+                key_files = [
+                    reactor_path / "main.py",
+                    reactor_path / "start.py",
+                    reactor_path / "pyproject.toml",
+                ]
+                has_startup = any(f.exists() for f in key_files)
+
+                if not has_startup:
+                    result["reactor"]["issues"].append("No startup script found")
+            else:
+                result["reactor"]["issues"].append(f"Path does not exist: {reactor_path}")
+        else:
+            result["reactor"]["issues"].append("Reactor repo path not configured")
+
+        # Determine overall validity
+        result["valid"] = (
+            (not self.config.prime_enabled or result["prime"]["found"]) and
+            (not self.config.reactor_enabled or result["reactor"]["found"])
+        )
+
+        return result
+
+    # =========================================================================
+    # RESOURCE QUOTA MANAGEMENT
+    # =========================================================================
+    # Enterprise-grade resource quota management for preventing system
+    # resource exhaustion.
+    # =========================================================================
+
+    async def _check_resource_quotas(self) -> Dict[str, Any]:
+        """
+        Check current resource utilization against quotas.
+
+        Returns:
+            Dict with quota status and any violations
+        """
+        result: Dict[str, Any] = {
+            "within_limits": True,
+            "quotas": {},
+            "violations": [],
+        }
+
+        try:
+            import psutil
+
+            # Memory quota (default: 80% of available)
+            mem_quota_percent = float(os.environ.get("JARVIS_MEM_QUOTA_PERCENT", "80"))
+            mem_current = psutil.virtual_memory().percent
+            result["quotas"]["memory"] = {
+                "current_percent": mem_current,
+                "quota_percent": mem_quota_percent,
+                "ok": mem_current < mem_quota_percent,
+            }
+            if mem_current >= mem_quota_percent:
+                result["violations"].append(f"Memory usage {mem_current}% exceeds quota {mem_quota_percent}%")
+                result["within_limits"] = False
+
+            # CPU quota (informational)
+            cpu_quota_percent = float(os.environ.get("JARVIS_CPU_QUOTA_PERCENT", "90"))
+            cpu_current = psutil.cpu_percent(interval=0.1)
+            result["quotas"]["cpu"] = {
+                "current_percent": cpu_current,
+                "quota_percent": cpu_quota_percent,
+                "ok": cpu_current < cpu_quota_percent,
+            }
+
+            # Disk quota
+            disk_quota_gb = float(os.environ.get("JARVIS_DISK_QUOTA_GB", "1"))
+            disk_free_gb = psutil.disk_usage('/').free / (1024**3)
+            result["quotas"]["disk"] = {
+                "free_gb": round(disk_free_gb, 2),
+                "quota_gb": disk_quota_gb,
+                "ok": disk_free_gb > disk_quota_gb,
+            }
+            if disk_free_gb < disk_quota_gb:
+                result["violations"].append(f"Free disk {disk_free_gb:.1f}GB below quota {disk_quota_gb}GB")
+                result["within_limits"] = False
+
+            # File descriptor quota
+            try:
+                import resource
+                soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+                # Count current open files
+                current_fds = len(psutil.Process().open_files()) + len(psutil.Process().net_connections())
+                fd_quota_percent = 80  # Use at most 80% of soft limit
+                fd_quota = int(soft_limit * fd_quota_percent / 100)
+
+                result["quotas"]["file_descriptors"] = {
+                    "current": current_fds,
+                    "soft_limit": soft_limit,
+                    "hard_limit": hard_limit,
+                    "quota": fd_quota,
+                    "ok": current_fds < fd_quota,
+                }
+                if current_fds >= fd_quota:
+                    result["violations"].append(f"File descriptors {current_fds} near limit {fd_quota}")
+            except (ImportError, AttributeError):
+                pass
+
+        except ImportError:
+            result["quotas"]["note"] = "psutil not available"
+
+        return result
+
+    # =========================================================================
+    # GRACEFUL DEGRADATION
+    # =========================================================================
+    # Enterprise-grade graceful degradation for handling resource constraints.
+    # =========================================================================
+
+    async def _apply_graceful_degradation(self) -> Dict[str, Any]:
+        """
+        Apply graceful degradation based on resource constraints.
+
+        Disables non-essential features when resources are constrained
+        to maintain core functionality.
+
+        Returns:
+            Dict with degradation decisions
+        """
+        result: Dict[str, Any] = {
+            "degradation_applied": False,
+            "disabled_features": [],
+            "reason": None,
+        }
+
+        quota_status = await self._check_resource_quotas()
+
+        if not quota_status["within_limits"]:
+            result["degradation_applied"] = True
+            result["reason"] = "; ".join(quota_status["violations"])
+
+            # Determine what to disable based on available memory
+            mem_quota = quota_status.get("quotas", {}).get("memory", {})
+            if mem_quota.get("current_percent", 0) > 85:
+                # Critical memory pressure - disable ML features
+                if self.config.hybrid_intelligence_enabled:
+                    self.logger.warning("[Degradation] Disabling ML features due to memory pressure")
+                    result["disabled_features"].append("hybrid_intelligence")
+
+                if self.config.voice_cache_enabled:
+                    self.logger.warning("[Degradation] Disabling voice cache due to memory pressure")
+                    result["disabled_features"].append("voice_cache")
+
+            elif mem_quota.get("current_percent", 0) > 75:
+                # Moderate memory pressure - disable voice cache
+                if self.config.voice_cache_enabled:
+                    self.logger.warning("[Degradation] Disabling voice cache due to memory usage")
+                    result["disabled_features"].append("voice_cache")
+
+            self.logger.warning(
+                f"[Degradation] Applied degradation: {result['disabled_features']} - {result['reason']}"
+            )
+
+        return result
+
+    # =========================================================================
     # ENTERPRISE VOICE BIOMETRICS INITIALIZATION
     # =========================================================================
     # Full voice biometric system initialization with ECAPA-TDNN speaker
