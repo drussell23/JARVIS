@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: Secret Scanning
-- **Run Number**: #1928
-- **Branch**: `feature/unified-kernel`
-- **Commit**: `294eb7dc36472edd80394c5809e93bb9d17d274b`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #1689
+- **Branch**: `fix/ci/secret-scanning-run1928-20260201-010745`
+- **Commit**: `c6f46daa2c3218082add210d6f7e50ae73511350`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-02-01T01:06:30Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/21553947817)
+- **Timestamp**: 2026-02-01T01:08:06Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/21553969453)
 
 ## Failure Overview
 
@@ -17,43 +17,43 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Scan for Secrets with Gitleaks | permission_error | high | 10s |
+| 1 | Validate PR Title | timeout | high | 6s |
 
 ## Detailed Analysis
 
-### 1. Scan for Secrets with Gitleaks
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-02-01T01:06:33Z
-**Completed**: 2026-02-01T01:06:43Z
-**Duration**: 10 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/21553947817/job/62107088057)
+**Started**: 2026-02-01T01:08:09Z
+**Completed**: 2026-02-01T01:08:15Z
+**Duration**: 6 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/21553969453/job/62107142342)
 
 #### Failed Steps
 
-- **Step 3**: Run Gitleaks
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
 **Detected Error Patterns:**
 
-- Pattern: `FAIL|Failed|failed`
+- Pattern: `ERROR|Error|error`
+  - Occurrences: 2
+  - Sample matches:
+    - Line 29: `2026-02-01T01:08:12.1782898Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 41: `2026-02-01T01:08:12.8122672Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Secr`
+
+- Pattern: `timeout|timed out`
   - Occurrences: 1
   - Sample matches:
-    - Line 97: `2026-02-01T01:06:42.4265928Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 4
-  - Sample matches:
-    - Line 76: `2026-02-01T01:06:42.0676234Z ##[warning]🛑 Leaks detected, see job summary for details`
-    - Line 82: `2026-02-01T01:06:42.0772960Z   if-no-files-found: warn`
-    - Line 87: `2026-02-01T01:06:42.2813991Z ##[warning]No files were found with the provided path: gitleaks-report.`
+    - Line 33: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -73,5 +73,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-02-01T01:07:45.895182*
+📊 *Report generated on 2026-02-01T01:09:25.817635*
 🤖 *JARVIS CI/CD Auto-PR Manager*
