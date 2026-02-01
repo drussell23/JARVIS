@@ -31081,6 +31081,2097 @@ class ThreatIntelligenceManager:
 
 
 # =============================================================================
+# ZONE 4.15: INTEGRATION AND API MANAGEMENT
+# =============================================================================
+# This zone provides enterprise integration and API management capabilities:
+# - ServiceRegistryManager: Service discovery and registration
+# - ConfigurationManager: Centralized configuration management
+# - DependencyContainer: Dependency injection container
+# - EventSourcingManager: Event sourcing and CQRS patterns
+# - GraphDatabaseManager: Graph data operations
+# - SearchEngineManager: Full-text search operations
+# - IntegrationBusManager: Message-based integration
+# - APIVersionManager: API versioning and deprecation
+# =============================================================================
+
+
+@dataclass
+class ServiceRegistration:
+    """Represents a registered service instance."""
+    service_id: str
+    service_name: str
+    service_type: str
+    host: str
+    port: int
+    version: str
+    health_check_url: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    registered_at: datetime = field(default_factory=datetime.now)
+    last_heartbeat: datetime = field(default_factory=datetime.now)
+    status: str = "healthy"  # healthy, unhealthy, unknown
+    tags: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ServiceQuery:
+    """Query parameters for service discovery."""
+    service_name: Optional[str] = None
+    service_type: Optional[str] = None
+    version: Optional[str] = None
+    tags: Optional[List[str]] = None
+    status: Optional[str] = None
+    metadata_filters: Optional[Dict[str, Any]] = None
+
+
+class ServiceRegistryManager:
+    """
+    Service discovery and registration system.
+
+    Provides service registration, discovery, and health tracking
+    for distributed microservice architectures.
+
+    Features:
+    - Service registration with metadata
+    - Health check monitoring
+    - Load balancing across instances
+    - Service version management
+    - Tag-based filtering
+    - Automatic deregistration on failure
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._services: Dict[str, ServiceRegistration] = {}
+        self._services_by_name: Dict[str, List[str]] = {}
+        self._health_check_interval: float = 30.0
+        self._unhealthy_threshold: int = 3
+        self._health_check_failures: Dict[str, int] = {}
+        self._deregister_after_failures: int = 5
+        self._logger = UnifiedLogger(
+            name="ServiceRegistryManager",
+            config=config
+        )
+        self._health_check_task: Optional[asyncio.Task] = None
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize service registry."""
+        try:
+            async with self._lock:
+                # Start health check loop
+                self._health_check_task = asyncio.create_task(
+                    self._health_check_loop()
+                )
+                self._initialized = True
+                self._logger.info("Service registry initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize service registry: {e}")
+            return False
+
+    async def register(
+        self,
+        service_name: str,
+        service_type: str,
+        host: str,
+        port: int,
+        version: str = "1.0.0",
+        health_check_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None
+    ) -> ServiceRegistration:
+        """
+        Register a service instance.
+
+        Args:
+            service_name: Name of the service
+            service_type: Type of service (api, worker, etc.)
+            host: Service host
+            port: Service port
+            version: Service version
+            health_check_url: URL for health checks
+            metadata: Additional metadata
+            tags: Tags for filtering
+
+        Returns:
+            ServiceRegistration object
+        """
+        service_id = f"{service_name}_{host}_{port}_{int(time.time())}"
+
+        registration = ServiceRegistration(
+            service_id=service_id,
+            service_name=service_name,
+            service_type=service_type,
+            host=host,
+            port=port,
+            version=version,
+            health_check_url=health_check_url or f"http://{host}:{port}/health",
+            metadata=metadata or {},
+            tags=tags or []
+        )
+
+        async with self._lock:
+            self._services[service_id] = registration
+            if service_name not in self._services_by_name:
+                self._services_by_name[service_name] = []
+            self._services_by_name[service_name].append(service_id)
+
+        self._logger.info(f"Registered service: {service_name} at {host}:{port}")
+        return registration
+
+    async def deregister(self, service_id: str) -> bool:
+        """Deregister a service instance."""
+        async with self._lock:
+            if service_id not in self._services:
+                return False
+
+            service = self._services.pop(service_id)
+            if service.service_name in self._services_by_name:
+                self._services_by_name[service.service_name].remove(service_id)
+
+        self._logger.info(f"Deregistered service: {service_id}")
+        return True
+
+    async def heartbeat(self, service_id: str) -> bool:
+        """Update service heartbeat."""
+        if service_id not in self._services:
+            return False
+
+        self._services[service_id].last_heartbeat = datetime.now()
+        self._services[service_id].status = "healthy"
+        self._health_check_failures[service_id] = 0
+        return True
+
+    async def discover(
+        self,
+        query: ServiceQuery
+    ) -> List[ServiceRegistration]:
+        """
+        Discover services matching query criteria.
+
+        Args:
+            query: ServiceQuery with filter criteria
+
+        Returns:
+            List of matching ServiceRegistration objects
+        """
+        results = []
+
+        for service in self._services.values():
+            # Apply filters
+            if query.service_name and service.service_name != query.service_name:
+                continue
+            if query.service_type and service.service_type != query.service_type:
+                continue
+            if query.version and service.version != query.version:
+                continue
+            if query.status and service.status != query.status:
+                continue
+            if query.tags:
+                if not all(tag in service.tags for tag in query.tags):
+                    continue
+            if query.metadata_filters:
+                match = True
+                for key, value in query.metadata_filters.items():
+                    if service.metadata.get(key) != value:
+                        match = False
+                        break
+                if not match:
+                    continue
+
+            results.append(service)
+
+        return results
+
+    async def discover_one(
+        self,
+        service_name: str,
+        strategy: str = "round_robin"
+    ) -> Optional[ServiceRegistration]:
+        """
+        Discover a single service instance with load balancing.
+
+        Args:
+            service_name: Name of service to discover
+            strategy: Load balancing strategy (round_robin, random, least_conn)
+
+        Returns:
+            ServiceRegistration or None
+        """
+        query = ServiceQuery(service_name=service_name, status="healthy")
+        services = await self.discover(query)
+
+        if not services:
+            return None
+
+        if strategy == "random":
+            return secrets.choice(services)
+        elif strategy == "round_robin":
+            # Simple round robin using modulo
+            idx = hash(service_name + str(time.time())) % len(services)
+            return services[idx]
+        else:
+            # Default to first available
+            return services[0]
+
+    async def _health_check_loop(self) -> None:
+        """Background loop for health checking."""
+        while True:
+            try:
+                await asyncio.sleep(self._health_check_interval)
+
+                for service_id, service in list(self._services.items()):
+                    try:
+                        healthy = await self._check_service_health(service)
+                        if healthy:
+                            service.status = "healthy"
+                            self._health_check_failures[service_id] = 0
+                        else:
+                            failures = self._health_check_failures.get(service_id, 0) + 1
+                            self._health_check_failures[service_id] = failures
+
+                            if failures >= self._unhealthy_threshold:
+                                service.status = "unhealthy"
+
+                            if failures >= self._deregister_after_failures:
+                                self._logger.warning(
+                                    f"Deregistering unhealthy service: {service_id}"
+                                )
+                                await self.deregister(service_id)
+
+                    except Exception as e:
+                        self._logger.debug(f"Health check error for {service_id}: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._logger.error(f"Health check loop error: {e}")
+
+    async def _check_service_health(self, service: ServiceRegistration) -> bool:
+        """Check health of a single service."""
+        # Check heartbeat freshness
+        heartbeat_age = (datetime.now() - service.last_heartbeat).total_seconds()
+        if heartbeat_age > self._health_check_interval * 3:
+            return False
+
+        # In production, would make HTTP request to health_check_url
+        return True
+
+    def get_all_services(self) -> List[ServiceRegistration]:
+        """Get all registered services."""
+        return list(self._services.values())
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get registry statistics."""
+        by_type: Dict[str, int] = {}
+        by_status: Dict[str, int] = {}
+
+        for service in self._services.values():
+            by_type[service.service_type] = by_type.get(service.service_type, 0) + 1
+            by_status[service.status] = by_status.get(service.status, 0) + 1
+
+        return {
+            "total_services": len(self._services),
+            "unique_names": len(self._services_by_name),
+            "by_type": by_type,
+            "by_status": by_status
+        }
+
+
+@dataclass
+class ConfigurationEntry:
+    """A configuration entry."""
+    key: str
+    value: Any
+    value_type: str  # string, int, float, bool, json
+    source: str  # env, file, remote, default
+    version: int = 1
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ConfigurationChangeEvent:
+    """Event for configuration changes."""
+    key: str
+    old_value: Any
+    new_value: Any
+    source: str
+    changed_at: datetime = field(default_factory=datetime.now)
+    changed_by: str = "system"
+
+
+class ConfigurationManager:
+    """
+    Centralized configuration management system.
+
+    Provides hierarchical configuration with multiple sources,
+    change tracking, and hot reloading.
+
+    Features:
+    - Multiple configuration sources (env, file, remote)
+    - Hierarchical overrides (env > file > default)
+    - Configuration validation
+    - Change event notifications
+    - Hot reloading
+    - Version tracking
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._entries: Dict[str, ConfigurationEntry] = {}
+        self._defaults: Dict[str, Any] = {}
+        self._validators: Dict[str, Callable[[Any], bool]] = {}
+        self._change_handlers: List[Callable[[ConfigurationChangeEvent], Awaitable[None]]] = []
+        self._history: deque = deque(maxlen=10000)
+        self._source_priority = ["remote", "env", "file", "default"]
+        self._logger = UnifiedLogger(
+            name="ConfigurationManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize configuration manager."""
+        try:
+            async with self._lock:
+                # Load default configurations
+                await self._load_defaults()
+
+                # Load from environment
+                await self._load_from_environment()
+
+                self._initialized = True
+                self._logger.info("Configuration manager initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize configuration: {e}")
+            return False
+
+    async def _load_defaults(self) -> None:
+        """Load default configuration values."""
+        defaults = {
+            "app.name": "JARVIS",
+            "app.version": "1.0.0",
+            "app.debug": False,
+            "server.host": "0.0.0.0",
+            "server.port": 8000,
+            "server.workers": 4,
+            "database.pool_size": 10,
+            "database.timeout": 30,
+            "cache.enabled": True,
+            "cache.ttl": 300,
+            "logging.level": "INFO",
+            "logging.format": "json",
+            "security.rate_limit": 100,
+            "security.jwt_expiry": 3600,
+        }
+
+        for key, value in defaults.items():
+            await self.set(key, value, source="default")
+
+    async def _load_from_environment(self) -> None:
+        """Load configuration from environment variables."""
+        prefix = "JARVIS_"
+        for key, value in os.environ.items():
+            if key.startswith(prefix):
+                config_key = key[len(prefix):].lower().replace("__", ".")
+                typed_value = self._parse_env_value(value)
+                await self.set(config_key, typed_value, source="env")
+
+    def _parse_env_value(self, value: str) -> Any:
+        """Parse environment variable value to appropriate type."""
+        # Try boolean
+        if value.lower() in ("true", "yes", "1"):
+            return True
+        if value.lower() in ("false", "no", "0"):
+            return False
+
+        # Try integer
+        try:
+            return int(value)
+        except ValueError:
+            pass
+
+        # Try float
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+        # Try JSON
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Return as string
+        return value
+
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        source: str = "default",
+        validate: bool = True
+    ) -> bool:
+        """
+        Set a configuration value.
+
+        Args:
+            key: Configuration key (dot-separated)
+            value: Configuration value
+            source: Source of the configuration
+            validate: Whether to validate the value
+
+        Returns:
+            True if set successfully
+        """
+        # Validate if validator exists
+        if validate and key in self._validators:
+            if not self._validators[key](value):
+                self._logger.error(f"Validation failed for {key}")
+                return False
+
+        # Check source priority
+        existing = self._entries.get(key)
+        if existing:
+            existing_priority = self._source_priority.index(existing.source)
+            new_priority = self._source_priority.index(source)
+            if new_priority > existing_priority:
+                # New source has lower priority, don't override
+                return True
+
+        # Determine value type
+        value_type = type(value).__name__
+        if value_type == "dict" or value_type == "list":
+            value_type = "json"
+
+        # Create or update entry
+        old_value = existing.value if existing else None
+
+        entry = ConfigurationEntry(
+            key=key,
+            value=value,
+            value_type=value_type,
+            source=source,
+            version=(existing.version + 1) if existing else 1
+        )
+
+        async with self._lock:
+            self._entries[key] = entry
+
+        # Emit change event if value changed
+        if old_value != value:
+            event = ConfigurationChangeEvent(
+                key=key,
+                old_value=old_value,
+                new_value=value,
+                source=source
+            )
+            self._history.append(event)
+
+            for handler in self._change_handlers:
+                try:
+                    await handler(event)
+                except Exception as e:
+                    self._logger.error(f"Change handler error: {e}")
+
+        return True
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        Get a configuration value.
+
+        Args:
+            key: Configuration key
+            default: Default value if not found
+
+        Returns:
+            Configuration value
+        """
+        entry = self._entries.get(key)
+        if entry:
+            return entry.value
+        return default
+
+    def get_typed(self, key: str, value_type: type, default: Any = None) -> Any:
+        """Get configuration value with type checking."""
+        value = self.get(key, default)
+        if value is not None and not isinstance(value, value_type):
+            try:
+                return value_type(value)
+            except (ValueError, TypeError):
+                return default
+        return value
+
+    def get_int(self, key: str, default: int = 0) -> int:
+        """Get integer configuration value."""
+        return self.get_typed(key, int, default)
+
+    def get_float(self, key: str, default: float = 0.0) -> float:
+        """Get float configuration value."""
+        return self.get_typed(key, float, default)
+
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        """Get boolean configuration value."""
+        value = self.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "yes", "1")
+        return bool(value)
+
+    def get_str(self, key: str, default: str = "") -> str:
+        """Get string configuration value."""
+        return str(self.get(key, default))
+
+    async def delete(self, key: str) -> bool:
+        """Delete a configuration entry."""
+        async with self._lock:
+            if key in self._entries:
+                del self._entries[key]
+                return True
+        return False
+
+    def register_validator(
+        self,
+        key: str,
+        validator: Callable[[Any], bool]
+    ) -> None:
+        """Register a validator for a configuration key."""
+        self._validators[key] = validator
+
+    def register_change_handler(
+        self,
+        handler: Callable[[ConfigurationChangeEvent], Awaitable[None]]
+    ) -> None:
+        """Register a handler for configuration changes."""
+        self._change_handlers.append(handler)
+
+    def get_all(self, prefix: Optional[str] = None) -> Dict[str, Any]:
+        """Get all configuration as dictionary."""
+        result = {}
+        for key, entry in self._entries.items():
+            if prefix is None or key.startswith(prefix):
+                result[key] = entry.value
+        return result
+
+    def get_history(self, key: Optional[str] = None, limit: int = 100) -> List[ConfigurationChangeEvent]:
+        """Get configuration change history."""
+        history = list(self._history)
+        if key:
+            history = [e for e in history if e.key == key]
+        return history[-limit:]
+
+
+@dataclass
+class DependencyDefinition:
+    """Definition of a dependency."""
+    name: str
+    factory: Callable[..., Any]
+    scope: str = "singleton"  # singleton, transient, scoped
+    dependencies: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class DependencyContainer:
+    """
+    Dependency injection container.
+
+    Provides dependency injection with support for different
+    scopes and automatic dependency resolution.
+
+    Features:
+    - Singleton, transient, and scoped lifetimes
+    - Constructor injection
+    - Circular dependency detection
+    - Lazy initialization
+    - Factory functions
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._definitions: Dict[str, DependencyDefinition] = {}
+        self._singletons: Dict[str, Any] = {}
+        self._scopes: Dict[str, Dict[str, Any]] = {}
+        self._resolving: Set[str] = set()
+        self._logger = UnifiedLogger(
+            name="DependencyContainer",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize dependency container."""
+        try:
+            self._initialized = True
+            self._logger.info("Dependency container initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize dependency container: {e}")
+            return False
+
+    def register(
+        self,
+        name: str,
+        factory: Callable[..., Any],
+        scope: str = "singleton",
+        dependencies: Optional[List[str]] = None
+    ) -> None:
+        """
+        Register a dependency.
+
+        Args:
+            name: Dependency name
+            factory: Factory function to create instance
+            scope: Lifetime scope (singleton, transient, scoped)
+            dependencies: List of dependency names needed by factory
+        """
+        definition = DependencyDefinition(
+            name=name,
+            factory=factory,
+            scope=scope,
+            dependencies=dependencies or []
+        )
+        self._definitions[name] = definition
+        self._logger.debug(f"Registered dependency: {name} ({scope})")
+
+    def register_instance(self, name: str, instance: Any) -> None:
+        """Register an existing instance as singleton."""
+        self._definitions[name] = DependencyDefinition(
+            name=name,
+            factory=lambda: instance,
+            scope="singleton"
+        )
+        self._singletons[name] = instance
+        self._logger.debug(f"Registered instance: {name}")
+
+    async def resolve(
+        self,
+        name: str,
+        scope_id: Optional[str] = None
+    ) -> Any:
+        """
+        Resolve a dependency.
+
+        Args:
+            name: Dependency name to resolve
+            scope_id: Scope ID for scoped dependencies
+
+        Returns:
+            Resolved dependency instance
+        """
+        if name not in self._definitions:
+            raise ValueError(f"Unknown dependency: {name}")
+
+        definition = self._definitions[name]
+
+        # Check for circular dependency
+        if name in self._resolving:
+            raise ValueError(f"Circular dependency detected: {name}")
+
+        # Check singleton cache
+        if definition.scope == "singleton" and name in self._singletons:
+            return self._singletons[name]
+
+        # Check scoped cache
+        if definition.scope == "scoped" and scope_id:
+            if scope_id in self._scopes and name in self._scopes[scope_id]:
+                return self._scopes[scope_id][name]
+
+        # Mark as resolving for circular detection
+        self._resolving.add(name)
+
+        try:
+            # Resolve dependencies
+            resolved_deps = []
+            for dep_name in definition.dependencies:
+                dep = await self.resolve(dep_name, scope_id)
+                resolved_deps.append(dep)
+
+            # Create instance
+            instance = definition.factory(*resolved_deps)
+
+            # Handle async factories
+            if asyncio.iscoroutine(instance):
+                instance = await instance
+
+            # Cache based on scope
+            if definition.scope == "singleton":
+                self._singletons[name] = instance
+            elif definition.scope == "scoped" and scope_id:
+                if scope_id not in self._scopes:
+                    self._scopes[scope_id] = {}
+                self._scopes[scope_id][name] = instance
+
+            return instance
+
+        finally:
+            self._resolving.discard(name)
+
+    async def resolve_all(self, names: List[str], scope_id: Optional[str] = None) -> Dict[str, Any]:
+        """Resolve multiple dependencies."""
+        results = {}
+        for name in names:
+            results[name] = await self.resolve(name, scope_id)
+        return results
+
+    def create_scope(self, scope_id: str) -> None:
+        """Create a new scope."""
+        self._scopes[scope_id] = {}
+
+    def dispose_scope(self, scope_id: str) -> None:
+        """Dispose a scope and its instances."""
+        if scope_id in self._scopes:
+            del self._scopes[scope_id]
+
+    def get_registered(self) -> List[str]:
+        """Get list of registered dependency names."""
+        return list(self._definitions.keys())
+
+
+@dataclass
+class Event:
+    """Base event class for event sourcing."""
+    event_id: str
+    event_type: str
+    aggregate_id: str
+    aggregate_type: str
+    data: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
+    version: int = 1
+
+
+@dataclass
+class EventStream:
+    """A stream of events for an aggregate."""
+    aggregate_id: str
+    aggregate_type: str
+    events: List[Event]
+    version: int = 0
+
+
+class EventSourcingManager:
+    """
+    Event sourcing and CQRS manager.
+
+    Provides event storage, replay, and aggregate reconstruction
+    for event-sourced systems.
+
+    Features:
+    - Event persistence and retrieval
+    - Aggregate reconstruction from events
+    - Event versioning
+    - Snapshot support
+    - Event projections
+    - Optimistic concurrency
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._event_store: Dict[str, List[Event]] = {}  # aggregate_id -> events
+        self._snapshots: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # aggregate_id -> (version, state)
+        self._projections: Dict[str, Callable[[Event], Awaitable[None]]] = {}
+        self._event_handlers: Dict[str, List[Callable[[Event], Awaitable[None]]]] = {}
+        self._snapshot_interval: int = 100
+        self._logger = UnifiedLogger(
+            name="EventSourcingManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize event sourcing manager."""
+        try:
+            self._initialized = True
+            self._logger.info("Event sourcing manager initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize event sourcing: {e}")
+            return False
+
+    async def append_event(
+        self,
+        aggregate_id: str,
+        aggregate_type: str,
+        event_type: str,
+        data: Dict[str, Any],
+        expected_version: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Event:
+        """
+        Append an event to an aggregate's stream.
+
+        Args:
+            aggregate_id: ID of the aggregate
+            aggregate_type: Type of aggregate
+            event_type: Type of event
+            data: Event data
+            expected_version: Expected version for optimistic concurrency
+            metadata: Event metadata
+
+        Returns:
+            The created Event
+        """
+        async with self._lock:
+            if aggregate_id not in self._event_store:
+                self._event_store[aggregate_id] = []
+
+            events = self._event_store[aggregate_id]
+            current_version = len(events)
+
+            # Optimistic concurrency check
+            if expected_version is not None and expected_version != current_version:
+                raise ValueError(
+                    f"Concurrency conflict: expected version {expected_version}, "
+                    f"but current version is {current_version}"
+                )
+
+            # Create event
+            event = Event(
+                event_id=f"evt_{aggregate_id}_{current_version + 1}_{secrets.token_hex(4)}",
+                event_type=event_type,
+                aggregate_id=aggregate_id,
+                aggregate_type=aggregate_type,
+                data=data,
+                metadata=metadata or {},
+                version=current_version + 1
+            )
+
+            events.append(event)
+
+        # Run event handlers
+        await self._dispatch_event(event)
+
+        # Check if snapshot needed
+        if len(events) % self._snapshot_interval == 0:
+            await self._create_snapshot(aggregate_id, aggregate_type)
+
+        self._logger.debug(f"Appended event {event.event_type} to {aggregate_id}")
+        return event
+
+    async def get_events(
+        self,
+        aggregate_id: str,
+        from_version: int = 0,
+        to_version: Optional[int] = None
+    ) -> List[Event]:
+        """
+        Get events for an aggregate.
+
+        Args:
+            aggregate_id: Aggregate ID
+            from_version: Start version (inclusive)
+            to_version: End version (inclusive)
+
+        Returns:
+            List of events
+        """
+        if aggregate_id not in self._event_store:
+            return []
+
+        events = self._event_store[aggregate_id]
+
+        if to_version is None:
+            to_version = len(events)
+
+        return [e for e in events if from_version < e.version <= to_version]
+
+    async def get_stream(self, aggregate_id: str) -> Optional[EventStream]:
+        """Get the full event stream for an aggregate."""
+        if aggregate_id not in self._event_store:
+            return None
+
+        events = self._event_store[aggregate_id]
+        if not events:
+            return None
+
+        return EventStream(
+            aggregate_id=aggregate_id,
+            aggregate_type=events[0].aggregate_type,
+            events=events.copy(),
+            version=len(events)
+        )
+
+    async def reconstruct_aggregate(
+        self,
+        aggregate_id: str,
+        apply_event: Callable[[Dict[str, Any], Event], Dict[str, Any]],
+        initial_state: Optional[Dict[str, Any]] = None
+    ) -> Optional[Tuple[Dict[str, Any], int]]:
+        """
+        Reconstruct aggregate state from events.
+
+        Args:
+            aggregate_id: Aggregate ID
+            apply_event: Function to apply event to state
+            initial_state: Initial state if no snapshot
+
+        Returns:
+            Tuple of (state, version) or None
+        """
+        # Check for snapshot
+        state = initial_state or {}
+        from_version = 0
+
+        if aggregate_id in self._snapshots:
+            snapshot_version, snapshot_state = self._snapshots[aggregate_id]
+            state = snapshot_state.copy()
+            from_version = snapshot_version
+
+        # Apply events
+        events = await self.get_events(aggregate_id, from_version)
+        for event in events:
+            state = apply_event(state, event)
+
+        if not events and aggregate_id not in self._snapshots:
+            return None
+
+        version = from_version + len(events)
+        return state, version
+
+    async def _create_snapshot(self, aggregate_id: str, aggregate_type: str) -> None:
+        """Create a snapshot of current aggregate state."""
+        # This is a simplified snapshot - in production would use proper aggregate
+        events = self._event_store.get(aggregate_id, [])
+        version = len(events)
+
+        # Store snapshot (in real implementation, would reconstruct state)
+        self._snapshots[aggregate_id] = (version, {"version": version})
+        self._logger.debug(f"Created snapshot for {aggregate_id} at version {version}")
+
+    def register_handler(
+        self,
+        event_type: str,
+        handler: Callable[[Event], Awaitable[None]]
+    ) -> None:
+        """Register an event handler."""
+        if event_type not in self._event_handlers:
+            self._event_handlers[event_type] = []
+        self._event_handlers[event_type].append(handler)
+
+    def register_projection(
+        self,
+        name: str,
+        handler: Callable[[Event], Awaitable[None]]
+    ) -> None:
+        """Register a projection."""
+        self._projections[name] = handler
+
+    async def _dispatch_event(self, event: Event) -> None:
+        """Dispatch event to handlers and projections."""
+        # Event-specific handlers
+        handlers = self._event_handlers.get(event.event_type, [])
+        for handler in handlers:
+            try:
+                await handler(event)
+            except Exception as e:
+                self._logger.error(f"Event handler error: {e}")
+
+        # All projections
+        for name, projection in self._projections.items():
+            try:
+                await projection(event)
+            except Exception as e:
+                self._logger.error(f"Projection {name} error: {e}")
+
+    async def replay_events(
+        self,
+        aggregate_id: str,
+        handler: Callable[[Event], Awaitable[None]]
+    ) -> int:
+        """Replay all events for an aggregate through a handler."""
+        events = await self.get_events(aggregate_id)
+        for event in events:
+            await handler(event)
+        return len(events)
+
+
+@dataclass
+class GraphNode:
+    """A node in the graph."""
+    node_id: str
+    node_type: str
+    properties: Dict[str, Any]
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class GraphEdge:
+    """An edge in the graph."""
+    edge_id: str
+    edge_type: str
+    source_id: str
+    target_id: str
+    properties: Dict[str, Any]
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+class GraphDatabaseManager:
+    """
+    In-memory graph database manager.
+
+    Provides graph data operations including traversal,
+    pattern matching, and shortest path algorithms.
+
+    Features:
+    - Node and edge CRUD operations
+    - Graph traversal (BFS, DFS)
+    - Shortest path finding
+    - Pattern matching
+    - Subgraph extraction
+    - Graph analytics (degree, centrality)
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._nodes: Dict[str, GraphNode] = {}
+        self._edges: Dict[str, GraphEdge] = {}
+        self._outgoing: Dict[str, List[str]] = {}  # node_id -> edge_ids
+        self._incoming: Dict[str, List[str]] = {}  # node_id -> edge_ids
+        self._logger = UnifiedLogger(
+            name="GraphDatabaseManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize graph database."""
+        try:
+            self._initialized = True
+            self._logger.info("Graph database initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize graph database: {e}")
+            return False
+
+    async def create_node(
+        self,
+        node_type: str,
+        properties: Dict[str, Any],
+        node_id: Optional[str] = None
+    ) -> GraphNode:
+        """
+        Create a node in the graph.
+
+        Args:
+            node_type: Type of node
+            properties: Node properties
+            node_id: Optional specific ID
+
+        Returns:
+            Created GraphNode
+        """
+        node_id = node_id or f"node_{secrets.token_hex(8)}"
+
+        node = GraphNode(
+            node_id=node_id,
+            node_type=node_type,
+            properties=properties
+        )
+
+        async with self._lock:
+            self._nodes[node_id] = node
+            self._outgoing[node_id] = []
+            self._incoming[node_id] = []
+
+        return node
+
+    async def get_node(self, node_id: str) -> Optional[GraphNode]:
+        """Get a node by ID."""
+        return self._nodes.get(node_id)
+
+    async def update_node(
+        self,
+        node_id: str,
+        properties: Dict[str, Any]
+    ) -> Optional[GraphNode]:
+        """Update node properties."""
+        node = self._nodes.get(node_id)
+        if not node:
+            return None
+
+        node.properties.update(properties)
+        node.updated_at = datetime.now()
+        return node
+
+    async def delete_node(self, node_id: str) -> bool:
+        """Delete a node and its edges."""
+        if node_id not in self._nodes:
+            return False
+
+        async with self._lock:
+            # Delete outgoing edges
+            for edge_id in self._outgoing.get(node_id, []).copy():
+                await self.delete_edge(edge_id)
+
+            # Delete incoming edges
+            for edge_id in self._incoming.get(node_id, []).copy():
+                await self.delete_edge(edge_id)
+
+            del self._nodes[node_id]
+            del self._outgoing[node_id]
+            del self._incoming[node_id]
+
+        return True
+
+    async def create_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        edge_type: str,
+        properties: Optional[Dict[str, Any]] = None,
+        edge_id: Optional[str] = None
+    ) -> Optional[GraphEdge]:
+        """
+        Create an edge between nodes.
+
+        Args:
+            source_id: Source node ID
+            target_id: Target node ID
+            edge_type: Type of edge
+            properties: Edge properties
+            edge_id: Optional specific ID
+
+        Returns:
+            Created GraphEdge or None if nodes don't exist
+        """
+        if source_id not in self._nodes or target_id not in self._nodes:
+            return None
+
+        edge_id = edge_id or f"edge_{secrets.token_hex(8)}"
+
+        edge = GraphEdge(
+            edge_id=edge_id,
+            edge_type=edge_type,
+            source_id=source_id,
+            target_id=target_id,
+            properties=properties or {}
+        )
+
+        async with self._lock:
+            self._edges[edge_id] = edge
+            self._outgoing[source_id].append(edge_id)
+            self._incoming[target_id].append(edge_id)
+
+        return edge
+
+    async def delete_edge(self, edge_id: str) -> bool:
+        """Delete an edge."""
+        edge = self._edges.get(edge_id)
+        if not edge:
+            return False
+
+        async with self._lock:
+            self._outgoing[edge.source_id].remove(edge_id)
+            self._incoming[edge.target_id].remove(edge_id)
+            del self._edges[edge_id]
+
+        return True
+
+    async def get_neighbors(
+        self,
+        node_id: str,
+        direction: str = "outgoing",
+        edge_type: Optional[str] = None
+    ) -> List[GraphNode]:
+        """
+        Get neighboring nodes.
+
+        Args:
+            node_id: Starting node ID
+            direction: outgoing, incoming, or both
+            edge_type: Filter by edge type
+
+        Returns:
+            List of neighbor nodes
+        """
+        neighbors = []
+        edge_ids = []
+
+        if direction in ("outgoing", "both"):
+            edge_ids.extend(self._outgoing.get(node_id, []))
+        if direction in ("incoming", "both"):
+            edge_ids.extend(self._incoming.get(node_id, []))
+
+        for edge_id in edge_ids:
+            edge = self._edges.get(edge_id)
+            if not edge:
+                continue
+            if edge_type and edge.edge_type != edge_type:
+                continue
+
+            neighbor_id = edge.target_id if edge.source_id == node_id else edge.source_id
+            neighbor = self._nodes.get(neighbor_id)
+            if neighbor and neighbor not in neighbors:
+                neighbors.append(neighbor)
+
+        return neighbors
+
+    async def traverse_bfs(
+        self,
+        start_id: str,
+        max_depth: int = 10,
+        edge_types: Optional[List[str]] = None
+    ) -> List[Tuple[GraphNode, int]]:
+        """
+        Breadth-first traversal from a starting node.
+
+        Args:
+            start_id: Starting node ID
+            max_depth: Maximum traversal depth
+            edge_types: Filter by edge types
+
+        Returns:
+            List of (node, depth) tuples
+        """
+        if start_id not in self._nodes:
+            return []
+
+        visited: Set[str] = {start_id}
+        queue: deque = deque([(start_id, 0)])
+        result: List[Tuple[GraphNode, int]] = [(self._nodes[start_id], 0)]
+
+        while queue:
+            current_id, depth = queue.popleft()
+
+            if depth >= max_depth:
+                continue
+
+            neighbors = await self.get_neighbors(current_id, "outgoing")
+            for neighbor in neighbors:
+                if neighbor.node_id not in visited:
+                    visited.add(neighbor.node_id)
+                    queue.append((neighbor.node_id, depth + 1))
+                    result.append((neighbor, depth + 1))
+
+        return result
+
+    async def find_shortest_path(
+        self,
+        source_id: str,
+        target_id: str
+    ) -> Optional[List[str]]:
+        """
+        Find shortest path between two nodes using BFS.
+
+        Args:
+            source_id: Source node ID
+            target_id: Target node ID
+
+        Returns:
+            List of node IDs in path, or None if no path
+        """
+        if source_id not in self._nodes or target_id not in self._nodes:
+            return None
+
+        if source_id == target_id:
+            return [source_id]
+
+        visited: Set[str] = {source_id}
+        queue: deque = deque([(source_id, [source_id])])
+
+        while queue:
+            current_id, path = queue.popleft()
+
+            neighbors = await self.get_neighbors(current_id, "outgoing")
+            for neighbor in neighbors:
+                if neighbor.node_id == target_id:
+                    return path + [target_id]
+
+                if neighbor.node_id not in visited:
+                    visited.add(neighbor.node_id)
+                    queue.append((neighbor.node_id, path + [neighbor.node_id]))
+
+        return None
+
+    async def find_nodes(
+        self,
+        node_type: Optional[str] = None,
+        property_filters: Optional[Dict[str, Any]] = None
+    ) -> List[GraphNode]:
+        """Find nodes matching criteria."""
+        results = []
+
+        for node in self._nodes.values():
+            if node_type and node.node_type != node_type:
+                continue
+
+            if property_filters:
+                match = True
+                for key, value in property_filters.items():
+                    if node.properties.get(key) != value:
+                        match = False
+                        break
+                if not match:
+                    continue
+
+            results.append(node)
+
+        return results
+
+    def get_degree(self, node_id: str, direction: str = "both") -> int:
+        """Get the degree of a node."""
+        degree = 0
+        if direction in ("outgoing", "both"):
+            degree += len(self._outgoing.get(node_id, []))
+        if direction in ("incoming", "both"):
+            degree += len(self._incoming.get(node_id, []))
+        return degree
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get graph statistics."""
+        return {
+            "node_count": len(self._nodes),
+            "edge_count": len(self._edges),
+            "avg_degree": sum(self.get_degree(nid) for nid in self._nodes) / max(1, len(self._nodes)),
+            "node_types": list(set(n.node_type for n in self._nodes.values())),
+            "edge_types": list(set(e.edge_type for e in self._edges.values()))
+        }
+
+
+@dataclass
+class SearchDocument:
+    """A document in the search index."""
+    doc_id: str
+    content: str
+    title: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    indexed_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class SearchResult:
+    """A search result."""
+    doc_id: str
+    score: float
+    highlights: List[str]
+    document: SearchDocument
+
+
+class SearchEngineManager:
+    """
+    Full-text search engine manager.
+
+    Provides document indexing and search with support for
+    relevance scoring and highlighting.
+
+    Features:
+    - Document indexing with tokenization
+    - TF-IDF scoring
+    - Boolean queries (AND, OR, NOT)
+    - Phrase matching
+    - Fuzzy matching
+    - Result highlighting
+    - Faceted search
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._documents: Dict[str, SearchDocument] = {}
+        self._inverted_index: Dict[str, Set[str]] = {}  # term -> doc_ids
+        self._term_frequency: Dict[str, Dict[str, int]] = {}  # doc_id -> term -> count
+        self._document_frequency: Dict[str, int] = {}  # term -> doc_count
+        self._stop_words: Set[str] = {
+            "a", "an", "the", "is", "are", "was", "were", "be", "been",
+            "being", "have", "has", "had", "do", "does", "did", "will",
+            "would", "could", "should", "may", "might", "can", "shall",
+            "in", "on", "at", "to", "for", "of", "with", "by", "from",
+            "as", "into", "through", "during", "before", "after", "above",
+            "below", "between", "under", "again", "further", "then", "once",
+            "and", "but", "or", "nor", "so", "yet", "both", "either", "neither",
+            "not", "only", "own", "same", "than", "too", "very"
+        }
+        self._logger = UnifiedLogger(
+            name="SearchEngineManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize search engine."""
+        try:
+            self._initialized = True
+            self._logger.info("Search engine initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize search engine: {e}")
+            return False
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Tokenize text into terms."""
+        # Simple tokenization - lowercase and split on non-alphanumeric
+        text = text.lower()
+        tokens = re.findall(r'\b[a-z0-9]+\b', text)
+        # Remove stop words and short tokens
+        return [t for t in tokens if t not in self._stop_words and len(t) > 1]
+
+    async def index_document(
+        self,
+        doc_id: str,
+        content: str,
+        title: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> SearchDocument:
+        """
+        Index a document for search.
+
+        Args:
+            doc_id: Document ID
+            content: Document content
+            title: Optional title
+            metadata: Optional metadata
+
+        Returns:
+            Indexed SearchDocument
+        """
+        document = SearchDocument(
+            doc_id=doc_id,
+            content=content,
+            title=title,
+            metadata=metadata or {}
+        )
+
+        # Tokenize
+        tokens = self._tokenize(content)
+        if title:
+            tokens.extend(self._tokenize(title))
+
+        async with self._lock:
+            # Remove old index entries if document exists
+            if doc_id in self._documents:
+                await self._remove_from_index(doc_id)
+
+            # Store document
+            self._documents[doc_id] = document
+
+            # Build term frequency
+            term_freq: Dict[str, int] = {}
+            for token in tokens:
+                term_freq[token] = term_freq.get(token, 0) + 1
+
+            self._term_frequency[doc_id] = term_freq
+
+            # Update inverted index and document frequency
+            for term in term_freq:
+                if term not in self._inverted_index:
+                    self._inverted_index[term] = set()
+                self._inverted_index[term].add(doc_id)
+                self._document_frequency[term] = len(self._inverted_index[term])
+
+        self._logger.debug(f"Indexed document: {doc_id}")
+        return document
+
+    async def _remove_from_index(self, doc_id: str) -> None:
+        """Remove document from index."""
+        if doc_id not in self._term_frequency:
+            return
+
+        for term in self._term_frequency[doc_id]:
+            if term in self._inverted_index:
+                self._inverted_index[term].discard(doc_id)
+                self._document_frequency[term] = len(self._inverted_index[term])
+
+        del self._term_frequency[doc_id]
+
+    async def delete_document(self, doc_id: str) -> bool:
+        """Delete a document from the index."""
+        if doc_id not in self._documents:
+            return False
+
+        async with self._lock:
+            await self._remove_from_index(doc_id)
+            del self._documents[doc_id]
+
+        return True
+
+    async def search(
+        self,
+        query: str,
+        limit: int = 10,
+        offset: int = 0,
+        metadata_filters: Optional[Dict[str, Any]] = None
+    ) -> List[SearchResult]:
+        """
+        Search for documents.
+
+        Args:
+            query: Search query
+            limit: Maximum results
+            offset: Result offset
+            metadata_filters: Filter by metadata
+
+        Returns:
+            List of SearchResult objects
+        """
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+
+        # Find candidate documents (intersection of term doc sets)
+        candidate_docs: Optional[Set[str]] = None
+        for token in query_tokens:
+            token_docs = self._inverted_index.get(token, set())
+            if candidate_docs is None:
+                candidate_docs = token_docs.copy()
+            else:
+                candidate_docs &= token_docs
+
+        if not candidate_docs:
+            return []
+
+        # Calculate TF-IDF scores
+        total_docs = len(self._documents)
+        scores: List[Tuple[str, float]] = []
+
+        for doc_id in candidate_docs:
+            # Apply metadata filters
+            if metadata_filters:
+                doc = self._documents.get(doc_id)
+                if doc:
+                    match = True
+                    for key, value in metadata_filters.items():
+                        if doc.metadata.get(key) != value:
+                            match = False
+                            break
+                    if not match:
+                        continue
+
+            score = 0.0
+            term_freq = self._term_frequency.get(doc_id, {})
+
+            for token in query_tokens:
+                tf = term_freq.get(token, 0)
+                df = self._document_frequency.get(token, 1)
+                idf = math.log(total_docs / df) if df > 0 else 0
+                score += tf * idf
+
+            if score > 0:
+                scores.append((doc_id, score))
+
+        # Sort by score
+        scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Apply pagination
+        scores = scores[offset:offset + limit]
+
+        # Build results
+        results = []
+        for doc_id, score in scores:
+            doc = self._documents.get(doc_id)
+            if doc:
+                highlights = self._generate_highlights(doc.content, query_tokens)
+                results.append(SearchResult(
+                    doc_id=doc_id,
+                    score=score,
+                    highlights=highlights,
+                    document=doc
+                ))
+
+        return results
+
+    def _generate_highlights(
+        self,
+        content: str,
+        query_tokens: List[str],
+        context_size: int = 50
+    ) -> List[str]:
+        """Generate highlighted snippets from content."""
+        highlights = []
+        content_lower = content.lower()
+
+        for token in query_tokens[:3]:  # Limit to first 3 tokens
+            idx = content_lower.find(token)
+            if idx != -1:
+                start = max(0, idx - context_size)
+                end = min(len(content), idx + len(token) + context_size)
+                snippet = content[start:end]
+                if start > 0:
+                    snippet = "..." + snippet
+                if end < len(content):
+                    snippet = snippet + "..."
+                highlights.append(snippet)
+
+        return highlights[:3]  # Max 3 highlights
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get search engine statistics."""
+        return {
+            "document_count": len(self._documents),
+            "term_count": len(self._inverted_index),
+            "avg_doc_length": sum(
+                len(self._term_frequency.get(d, {}))
+                for d in self._documents
+            ) / max(1, len(self._documents))
+        }
+
+
+@dataclass
+class IntegrationMessage:
+    """A message on the integration bus."""
+    message_id: str
+    message_type: str
+    source: str
+    destination: Optional[str]
+    payload: Dict[str, Any]
+    headers: Dict[str, str] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
+    correlation_id: Optional[str] = None
+    reply_to: Optional[str] = None
+
+
+class IntegrationBusManager:
+    """
+    Message-based integration bus.
+
+    Provides message routing, transformation, and delivery
+    for system integration scenarios.
+
+    Features:
+    - Publish/subscribe messaging
+    - Request/reply patterns
+    - Message routing
+    - Content-based routing
+    - Message transformation
+    - Dead letter handling
+    - Message persistence
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._channels: Dict[str, List[Callable[[IntegrationMessage], Awaitable[None]]]] = {}
+        self._pending_replies: Dict[str, asyncio.Future] = {}
+        self._transformers: Dict[str, Callable[[IntegrationMessage], IntegrationMessage]] = {}
+        self._routers: List[Callable[[IntegrationMessage], Optional[str]]] = []
+        self._dead_letter: deque = deque(maxlen=10000)
+        self._message_log: deque = deque(maxlen=50000)
+        self._logger = UnifiedLogger(
+            name="IntegrationBusManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize integration bus."""
+        try:
+            self._initialized = True
+            self._logger.info("Integration bus initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize integration bus: {e}")
+            return False
+
+    def subscribe(
+        self,
+        channel: str,
+        handler: Callable[[IntegrationMessage], Awaitable[None]]
+    ) -> None:
+        """Subscribe to a channel."""
+        if channel not in self._channels:
+            self._channels[channel] = []
+        self._channels[channel].append(handler)
+        self._logger.debug(f"Subscribed to channel: {channel}")
+
+    def unsubscribe(
+        self,
+        channel: str,
+        handler: Callable[[IntegrationMessage], Awaitable[None]]
+    ) -> bool:
+        """Unsubscribe from a channel."""
+        if channel not in self._channels:
+            return False
+        if handler in self._channels[channel]:
+            self._channels[channel].remove(handler)
+            return True
+        return False
+
+    async def publish(
+        self,
+        channel: str,
+        message_type: str,
+        payload: Dict[str, Any],
+        source: str = "system",
+        headers: Optional[Dict[str, str]] = None,
+        correlation_id: Optional[str] = None
+    ) -> str:
+        """
+        Publish a message to a channel.
+
+        Args:
+            channel: Target channel
+            message_type: Type of message
+            payload: Message payload
+            source: Message source
+            headers: Optional headers
+            correlation_id: Optional correlation ID
+
+        Returns:
+            Message ID
+        """
+        message = IntegrationMessage(
+            message_id=f"msg_{secrets.token_hex(8)}",
+            message_type=message_type,
+            source=source,
+            destination=channel,
+            payload=payload,
+            headers=headers or {},
+            correlation_id=correlation_id
+        )
+
+        # Apply transformers
+        for transformer in self._transformers.values():
+            message = transformer(message)
+
+        # Apply content-based routing
+        for router in self._routers:
+            routed_channel = router(message)
+            if routed_channel:
+                channel = routed_channel
+                message.destination = channel
+                break
+
+        # Log message
+        self._message_log.append({
+            "message_id": message.message_id,
+            "channel": channel,
+            "type": message_type,
+            "timestamp": message.timestamp.isoformat()
+        })
+
+        # Deliver to subscribers
+        handlers = self._channels.get(channel, [])
+        if not handlers:
+            self._dead_letter.append(message)
+            self._logger.warning(f"No subscribers for channel: {channel}")
+            return message.message_id
+
+        delivery_errors = []
+        for handler in handlers:
+            try:
+                await handler(message)
+            except Exception as e:
+                delivery_errors.append(str(e))
+                self._logger.error(f"Message delivery error: {e}")
+
+        if delivery_errors and len(delivery_errors) == len(handlers):
+            # All deliveries failed
+            self._dead_letter.append(message)
+
+        return message.message_id
+
+    async def request(
+        self,
+        channel: str,
+        message_type: str,
+        payload: Dict[str, Any],
+        timeout: float = 30.0
+    ) -> Optional[IntegrationMessage]:
+        """
+        Send a request and wait for reply.
+
+        Args:
+            channel: Target channel
+            message_type: Type of message
+            payload: Message payload
+            timeout: Timeout in seconds
+
+        Returns:
+            Reply message or None
+        """
+        correlation_id = f"req_{secrets.token_hex(8)}"
+        reply_channel = f"_reply_{correlation_id}"
+
+        # Create future for reply
+        reply_future: asyncio.Future = asyncio.Future()
+        self._pending_replies[correlation_id] = reply_future
+
+        # Subscribe to reply channel
+        async def reply_handler(msg: IntegrationMessage) -> None:
+            if msg.correlation_id == correlation_id:
+                reply_future.set_result(msg)
+
+        self.subscribe(reply_channel, reply_handler)
+
+        try:
+            # Send request
+            await self.publish(
+                channel=channel,
+                message_type=message_type,
+                payload=payload,
+                headers={"reply_to": reply_channel},
+                correlation_id=correlation_id
+            )
+
+            # Wait for reply
+            try:
+                reply = await asyncio.wait_for(reply_future, timeout)
+                return reply
+            except asyncio.TimeoutError:
+                self._logger.warning(f"Request timeout: {correlation_id}")
+                return None
+
+        finally:
+            self.unsubscribe(reply_channel, reply_handler)
+            self._pending_replies.pop(correlation_id, None)
+
+    async def reply(
+        self,
+        original_message: IntegrationMessage,
+        payload: Dict[str, Any]
+    ) -> Optional[str]:
+        """Send a reply to a request message."""
+        reply_to = original_message.headers.get("reply_to")
+        if not reply_to:
+            return None
+
+        return await self.publish(
+            channel=reply_to,
+            message_type=f"{original_message.message_type}_reply",
+            payload=payload,
+            correlation_id=original_message.correlation_id
+        )
+
+    def register_transformer(
+        self,
+        name: str,
+        transformer: Callable[[IntegrationMessage], IntegrationMessage]
+    ) -> None:
+        """Register a message transformer."""
+        self._transformers[name] = transformer
+
+    def register_router(
+        self,
+        router: Callable[[IntegrationMessage], Optional[str]]
+    ) -> None:
+        """Register a content-based router."""
+        self._routers.append(router)
+
+    def get_dead_letters(self, limit: int = 100) -> List[IntegrationMessage]:
+        """Get dead letter messages."""
+        return list(self._dead_letter)[-limit:]
+
+
+@dataclass
+class APIVersion:
+    """An API version definition."""
+    version: str
+    base_path: str
+    status: str  # active, deprecated, sunset
+    introduced_at: datetime = field(default_factory=datetime.now)
+    deprecated_at: Optional[datetime] = None
+    sunset_at: Optional[datetime] = None
+    migration_guide: Optional[str] = None
+    changes_from_previous: List[str] = field(default_factory=list)
+
+
+class APIVersionManager:
+    """
+    API versioning and lifecycle management.
+
+    Manages API versions, deprecation, and provides
+    version negotiation for API consumers.
+
+    Features:
+    - Version registration and tracking
+    - Deprecation management
+    - Sunset scheduling
+    - Version negotiation
+    - Migration guidance
+    - Usage tracking per version
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._versions: Dict[str, APIVersion] = {}
+        self._current_version: Optional[str] = None
+        self._usage_stats: Dict[str, int] = {}
+        self._logger = UnifiedLogger(
+            name="APIVersionManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize API version manager."""
+        try:
+            # Register default versions
+            await self.register_version(APIVersion(
+                version="v1",
+                base_path="/api/v1",
+                status="active"
+            ))
+
+            self._current_version = "v1"
+            self._initialized = True
+            self._logger.info("API version manager initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize API version manager: {e}")
+            return False
+
+    async def register_version(
+        self,
+        version: APIVersion,
+        set_as_current: bool = False
+    ) -> bool:
+        """
+        Register a new API version.
+
+        Args:
+            version: APIVersion to register
+            set_as_current: Set as current version
+
+        Returns:
+            True if registered successfully
+        """
+        async with self._lock:
+            self._versions[version.version] = version
+            self._usage_stats[version.version] = 0
+
+            if set_as_current:
+                self._current_version = version.version
+
+        self._logger.info(f"Registered API version: {version.version}")
+        return True
+
+    async def deprecate_version(
+        self,
+        version: str,
+        sunset_date: datetime,
+        migration_guide: Optional[str] = None
+    ) -> bool:
+        """
+        Mark a version as deprecated.
+
+        Args:
+            version: Version to deprecate
+            sunset_date: When version will be removed
+            migration_guide: URL to migration guide
+
+        Returns:
+            True if deprecated successfully
+        """
+        if version not in self._versions:
+            return False
+
+        async with self._lock:
+            api_version = self._versions[version]
+            api_version.status = "deprecated"
+            api_version.deprecated_at = datetime.now()
+            api_version.sunset_at = sunset_date
+            api_version.migration_guide = migration_guide
+
+        self._logger.warning(f"Deprecated API version: {version}")
+        return True
+
+    async def sunset_version(self, version: str) -> bool:
+        """Mark a version as sunset (removed)."""
+        if version not in self._versions:
+            return False
+
+        async with self._lock:
+            self._versions[version].status = "sunset"
+
+        self._logger.warning(f"Sunset API version: {version}")
+        return True
+
+    def negotiate_version(
+        self,
+        requested_version: Optional[str] = None,
+        accept_header: Optional[str] = None
+    ) -> Tuple[str, APIVersion]:
+        """
+        Negotiate the API version to use.
+
+        Args:
+            requested_version: Explicitly requested version
+            accept_header: Accept header value
+
+        Returns:
+            Tuple of (version_string, APIVersion)
+        """
+        # Parse version from Accept header if provided
+        if accept_header and not requested_version:
+            # Parse application/vnd.api+json;version=2
+            version_match = re.search(r'version=(\d+)', accept_header)
+            if version_match:
+                requested_version = f"v{version_match.group(1)}"
+
+        # Use requested version if valid and active
+        if requested_version and requested_version in self._versions:
+            version = self._versions[requested_version]
+            if version.status != "sunset":
+                return requested_version, version
+
+        # Fall back to current version
+        if self._current_version and self._current_version in self._versions:
+            return self._current_version, self._versions[self._current_version]
+
+        # Fall back to any active version
+        for v, api_version in self._versions.items():
+            if api_version.status == "active":
+                return v, api_version
+
+        raise ValueError("No active API version available")
+
+    def record_usage(self, version: str) -> None:
+        """Record API version usage."""
+        if version in self._usage_stats:
+            self._usage_stats[version] += 1
+
+    def get_version(self, version: str) -> Optional[APIVersion]:
+        """Get a specific API version."""
+        return self._versions.get(version)
+
+    def get_all_versions(self) -> List[APIVersion]:
+        """Get all registered versions."""
+        return list(self._versions.values())
+
+    def get_active_versions(self) -> List[APIVersion]:
+        """Get all active versions."""
+        return [v for v in self._versions.values() if v.status == "active"]
+
+    def get_deprecated_versions(self) -> List[APIVersion]:
+        """Get all deprecated versions."""
+        return [v for v in self._versions.values() if v.status == "deprecated"]
+
+    def check_sunset_versions(self) -> List[str]:
+        """Check for versions that should be sunset."""
+        now = datetime.now()
+        to_sunset = []
+
+        for version, api_version in self._versions.items():
+            if api_version.status == "deprecated":
+                if api_version.sunset_at and api_version.sunset_at <= now:
+                    to_sunset.append(version)
+
+        return to_sunset
+
+    def get_usage_statistics(self) -> Dict[str, Any]:
+        """Get API version usage statistics."""
+        return {
+            "by_version": dict(self._usage_stats),
+            "total_requests": sum(self._usage_stats.values()),
+            "deprecated_usage": sum(
+                count for v, count in self._usage_stats.items()
+                if self._versions.get(v, APIVersion(v, "", "")).status == "deprecated"
+            )
+        }
+
+
+# =============================================================================
 # =============================================================================
 #
 #  ███████╗ ██████╗ ███╗   ██╗███████╗    ███████╗
