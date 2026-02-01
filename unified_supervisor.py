@@ -753,6 +753,43 @@ except ImportError:
     cleanup_orphaned_semaphores_on_startup = None
 
 # =============================================================================
+# v185.0: JARVIS SUPERVISOR LIFECYCLE INTEGRATION
+# =============================================================================
+# Integrates with the JARVISSupervisor from backend/core/supervisor for:
+# - Dead Man's Switch (post-update stability verification)
+# - Rollback Manager (version history, snapshots)
+# - Update Engine (staging, validation, classification)
+# - Unified Voice Coordinator (narrator + announcer)
+# This enables the unified kernel to support auto-updates and rollbacks.
+# =============================================================================
+try:
+    from backend.core.supervisor import (
+        JARVISSupervisor,
+        SupervisorConfig,
+        get_supervisor_config,
+        SupervisorState as LegacySupervisorState,
+    )
+    from backend.core.supervisor.rollback_manager import (
+        DeadManSwitch,
+        RollbackManager,
+        RollbackDecision,
+        get_rollback_manager,
+    )
+    from backend.core.supervisor.update_engine import UpdateEngine
+    JARVIS_SUPERVISOR_AVAILABLE = True
+except ImportError:
+    JARVIS_SUPERVISOR_AVAILABLE = False
+    JARVISSupervisor = None
+    SupervisorConfig = None
+    get_supervisor_config = None
+    LegacySupervisorState = None
+    DeadManSwitch = None
+    RollbackManager = None
+    RollbackDecision = None
+    get_rollback_manager = None
+    UpdateEngine = None
+
+# =============================================================================
 # v181.0: EARLY SHUTDOWN HANDLER REGISTRATION
 # =============================================================================
 # Register shutdown handlers at MODULE LOAD TIME - this ensures that even if
