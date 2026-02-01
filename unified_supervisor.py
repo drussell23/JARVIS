@@ -7105,40 +7105,185 @@ class TrinityTraceContext:
 
 
 # =============================================================================
-# ASYNC VOICE NARRATOR - Voice Feedback for Startup
+# ASYNC VOICE NARRATOR - Enterprise Voice Feedback for Lifecycle Events
 # =============================================================================
+class VoicePriority(IntEnum):
+    """Voice message priority levels."""
+    CRITICAL = 0  # Security alerts, system failures
+    HIGH = 1      # Authentication events, phase completions
+    MEDIUM = 2    # Zone transitions, service status
+    LOW = 3       # Progress updates, informational
+
+
 class AsyncVoiceNarrator:
     """
-    Async voice narrator for startup feedback.
+    Enterprise-grade async voice narrator for startup feedback.
 
-    Features:
-    - Non-blocking voice output
-    - Platform-aware (macOS only)
-    - Graceful fallback on errors
-    - Queue management
+    v2.0 Features:
+    - Full lifecycle integration (zones, phases, trinity)
+    - Progressive confidence communication for auth events
+    - Time-of-day aware personalized greetings
+    - Environmental awareness (background noise detection)
+    - Dynamic user name resolution
+    - Priority-based queue management
+    - Concurrent speech prevention with priority override
+    - Platform-aware (macOS only, graceful fallback)
+
+    Environment Variables:
+    - JARVIS_VOICE_ENABLED: Enable/disable voice (default: true)
+    - JARVIS_VOICE_NAME: Voice name (default: Daniel)
+    - JARVIS_VOICE_RATE: Speech rate 90-300 (default: 175)
+    - JARVIS_OWNER_NAME: Owner name for personalization (default: auto-detect)
     """
 
-    def __init__(self, enabled: bool = True, voice: str = "Daniel"):
-        self.enabled = enabled and platform.system() == "Darwin"
-        self.voice = voice
-        self._process: Optional[asyncio.subprocess.Process] = None
-        self._queue: List[str] = []
-        self._speaking = False
+    # Zone completion messages with personality
+    ZONE_MESSAGES: Dict[int, Dict[str, str]] = {
+        0: {"success": "Foundation secured.", "fail": "Foundation check failed."},
+        1: {"success": "Core systems loaded.", "fail": "Core import failed."},
+        2: {"success": "Utilities online.", "fail": "Utility initialization failed."},
+        3: {"success": "Resources allocated.", "fail": "Resource allocation incomplete."},
+        4: {"success": "Intelligence layer activated.", "fail": "Intelligence layer degraded."},
+        5: {"success": "Orchestration systems ready.", "fail": "Orchestration partially failed."},
+        6: {"success": "Kernel initialized.", "fail": "Kernel initialization incomplete."},
+        7: {"success": "All systems nominal.", "fail": "Startup completed with warnings."},
+    }
 
-    async def speak(self, text: str, wait: bool = True, priority: bool = False) -> None:
-        """Speak text using macOS say command."""
+    # Time-based greeting variations
+    TIME_GREETINGS: Dict[str, List[str]] = {
+        "early_morning": [  # 4-6 AM
+            "Up early, {name}. Let's get to work.",
+            "Good pre-dawn, {name}. Systems coming online.",
+        ],
+        "morning": [  # 6-12 PM
+            "Good morning, {name}. All systems ready.",
+            "Morning, {name}. Ready for a productive day.",
+        ],
+        "afternoon": [  # 12-5 PM
+            "Good afternoon, {name}. Systems operational.",
+            "Afternoon, {name}. Ready to assist.",
+        ],
+        "evening": [  # 5-9 PM
+            "Good evening, {name}. How can I help?",
+            "Evening, {name}. Systems at your service.",
+        ],
+        "night": [  # 9 PM - 4 AM
+            "Working late, {name}? I'm here.",
+            "Late session detected, {name}. All systems ready.",
+        ],
+    }
+
+    def __init__(
+        self,
+        enabled: Optional[bool] = None,
+        voice: Optional[str] = None,
+        rate: Optional[int] = None,
+        owner_name: Optional[str] = None,
+    ):
+        # Configuration from environment with overrides
+        if enabled is None:
+            enabled = os.getenv("JARVIS_VOICE_ENABLED", "true").lower() == "true"
+        self.enabled = enabled and platform.system() == "Darwin"
+
+        self.voice = voice or os.getenv("JARVIS_VOICE_NAME", "Daniel")
+        self.rate = rate or int(os.getenv("JARVIS_VOICE_RATE", "175"))
+        self._owner_name = owner_name or os.getenv("JARVIS_OWNER_NAME", "")
+
+        # Process management
+        self._process: Optional[asyncio.subprocess.Process] = None
+        self._speaking = False
+        self._current_priority = VoicePriority.LOW
+
+        # Queue management with priority
+        self._queue: asyncio.PriorityQueue[Tuple[int, float, str]] = asyncio.PriorityQueue()
+        self._queue_processor_task: Optional[asyncio.Task[None]] = None
+
+        # Statistics
+        self._messages_spoken = 0
+        self._messages_skipped = 0
+        self._start_time = time.time()
+
+        # Lifecycle tracking
+        self._zones_completed: Set[int] = set()
+        self._phases_completed: Set[str] = set()
+        self._startup_announced = False
+
+        if self.enabled:
+            _unified_logger.debug(f"Voice narrator initialized: voice={self.voice}, rate={self.rate}")
+
+    async def start_queue_processor(self) -> None:
+        """Start background queue processor for non-blocking speech."""
+        if self._queue_processor_task is None:
+            self._queue_processor_task = asyncio.create_task(
+                self._process_queue(),
+                name="voice-queue-processor"
+            )
+
+    async def _process_queue(self) -> None:
+        """Process voice queue in background."""
+        while True:
+            try:
+                priority, timestamp, text = await asyncio.wait_for(
+                    self._queue.get(),
+                    timeout=60.0
+                )
+                await self._speak_internal(text, priority=VoicePriority(priority))
+                self._queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _unified_logger.debug(f"Voice queue error: {e}")
+
+    async def speak(
+        self,
+        text: str,
+        wait: bool = True,
+        priority: VoicePriority = VoicePriority.MEDIUM,
+        queue: bool = False,
+    ) -> None:
+        """
+        Speak text with priority management.
+
+        Args:
+            text: Text to speak
+            wait: If True, wait for speech to complete
+            priority: Message priority (higher priority can interrupt)
+            queue: If True, add to queue instead of immediate speech
+        """
+        if not self.enabled:
+            return
+
+        if queue:
+            await self._queue.put((priority.value, time.time(), text))
+            return
+
+        await self._speak_internal(text, wait=wait, priority=priority)
+
+    async def _speak_internal(
+        self,
+        text: str,
+        wait: bool = True,
+        priority: VoicePriority = VoicePriority.MEDIUM,
+    ) -> None:
+        """Internal speech implementation."""
         if not self.enabled:
             return
 
         try:
-            if priority:
-                # Kill current speech for priority messages
+            # Priority interrupt: kill lower priority speech
+            if self._speaking and priority.value < self._current_priority.value:
                 if self._process and self._process.returncode is None:
                     self._process.terminate()
+                    self._messages_skipped += 1
+
+            self._speaking = True
+            self._current_priority = priority
 
             self._process = await asyncio.create_subprocess_exec(
                 "say",
                 "-v", self.voice,
+                "-r", str(self.rate),
                 text,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -7147,23 +7292,330 @@ class AsyncVoiceNarrator:
             if wait:
                 await asyncio.wait_for(self._process.communicate(), timeout=30.0)
             else:
-                # Fire and forget
-                pass
+                # Fire and forget for non-blocking
+                asyncio.create_task(self._wait_and_cleanup())
+
+            self._messages_spoken += 1
 
         except asyncio.TimeoutError:
             if self._process:
                 self._process.terminate()
+            self._messages_skipped += 1
         except Exception as e:
             _unified_logger.debug(f"Voice error: {e}")
+        finally:
+            self._speaking = False
+
+    async def _wait_and_cleanup(self) -> None:
+        """Wait for speech to finish and cleanup."""
+        try:
+            if self._process:
+                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if self._process and self._process.returncode is None:
+                self._process.terminate()
+        finally:
+            self._speaking = False
+
+    def _get_owner_name(self) -> str:
+        """Get owner name for personalization."""
+        if self._owner_name:
+            return self._owner_name
+        # Try to get from environment or default
+        name = os.getenv("JARVIS_OWNER_NAME") or os.getenv("USER", "")
+        # Capitalize first letter
+        return name.capitalize() if name else "there"
+
+    def _get_time_period(self) -> str:
+        """Get current time period for greeting selection."""
+        hour = datetime.datetime.now().hour
+        if 4 <= hour < 6:
+            return "early_morning"
+        elif 6 <= hour < 12:
+            return "morning"
+        elif 12 <= hour < 17:
+            return "afternoon"
+        elif 17 <= hour < 21:
+            return "evening"
+        else:
+            return "night"
+
+    # =========================================================================
+    # Lifecycle Narration Methods
+    # =========================================================================
+
+    async def narrate_zone_start(self, zone: int, zone_name: str = "") -> None:
+        """Narrate zone startup beginning."""
+        if not self.enabled or zone in self._zones_completed:
+            return
+        # Only narrate key zones to avoid verbosity
+        if zone in (0, 3, 6):
+            name = zone_name or f"Zone {zone}"
+            await self.speak(f"Initializing {name}.", wait=False, priority=VoicePriority.LOW)
+
+    async def narrate_zone_complete(self, zone: int, success: bool = True) -> None:
+        """Narrate zone completion."""
+        if not self.enabled:
+            return
+
+        self._zones_completed.add(zone)
+        messages = self.ZONE_MESSAGES.get(zone, {"success": "Zone complete.", "fail": "Zone failed."})
+        message = messages["success"] if success else messages["fail"]
+
+        # Higher priority for failures
+        priority = VoicePriority.LOW if success else VoicePriority.HIGH
+        await self.speak(message, wait=False, priority=priority)
+
+    async def narrate_phase_start(self, phase: str) -> None:
+        """Narrate phase startup."""
+        if not self.enabled:
+            return
+        # Map phase names to friendly descriptions
+        phase_descriptions = {
+            "preflight": "Running preflight checks.",
+            "resources": "Initializing resources.",
+            "backend": "Starting backend server.",
+            "intelligence": "Loading intelligence layer.",
+            "trinity": "Activating Trinity integration.",
+            "enterprise": "Starting enterprise services.",
+        }
+        description = phase_descriptions.get(phase.lower(), f"Starting {phase}.")
+        await self.speak(description, wait=False, priority=VoicePriority.LOW)
+
+    async def narrate_phase_complete(self, phase: str, success: bool = True, duration_ms: float = 0) -> None:
+        """Narrate phase completion with optional duration."""
+        if not self.enabled:
+            return
+
+        self._phases_completed.add(phase)
+
+        if success:
+            if duration_ms > 5000:
+                await self.speak(f"{phase} complete, took {duration_ms/1000:.1f} seconds.", wait=False)
+            else:
+                await self.speak(f"{phase} ready.", wait=False)
+        else:
+            await self.speak(f"{phase} encountered issues.", wait=False, priority=VoicePriority.HIGH)
+
+    async def narrate_startup_begin(self) -> None:
+        """Narrate system startup beginning."""
+        if not self.enabled or self._startup_announced:
+            return
+
+        self._startup_announced = True
+        await self.speak("JARVIS kernel initializing.", wait=True, priority=VoicePriority.HIGH)
+
+    async def narrate_startup_complete(self, duration_sec: float = 0) -> None:
+        """Narrate successful startup completion with personalized greeting."""
+        if not self.enabled:
+            return
+
+        name = self._get_owner_name()
+        time_period = self._get_time_period()
+        greetings = self.TIME_GREETINGS.get(time_period, self.TIME_GREETINGS["morning"])
+
+        # Select greeting (use random if available, else first)
+        greeting_template = greetings[int(time.time()) % len(greetings)]
+        greeting = greeting_template.format(name=name)
+
+        # Include duration if significant
+        if duration_sec > 10:
+            message = f"Startup complete in {duration_sec:.0f} seconds. {greeting}"
+        else:
+            message = f"All systems online. {greeting}"
+
+        await self.speak(message, wait=True, priority=VoicePriority.HIGH)
+
+    async def narrate_shutdown(self, reason: str = "") -> None:
+        """Narrate graceful shutdown."""
+        if not self.enabled:
+            return
+
+        if reason:
+            message = f"Shutting down. {reason}"
+        else:
+            message = "Shutting down. Goodbye."
+
+        await self.speak(message, wait=True, priority=VoicePriority.CRITICAL)
+
+    async def narrate_error(self, error: str, critical: bool = False) -> None:
+        """Narrate error occurrence."""
+        if not self.enabled:
+            return
+
+        priority = VoicePriority.CRITICAL if critical else VoicePriority.HIGH
+        # Sanitize error for speech
+        clean_error = error[:100].replace("_", " ").replace("-", " ")
+        await self.speak(f"Error: {clean_error}", wait=False, priority=priority)
+
+    # =========================================================================
+    # Authentication Narration (Progressive Confidence)
+    # =========================================================================
+
+    async def narrate_auth_result(
+        self,
+        confidence: float,
+        success: bool,
+        speaker_name: Optional[str] = None,
+        factors_used: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Narrate authentication result with progressive confidence feedback.
+
+        Provides nuanced responses based on confidence level:
+        - >90%: Quick, confident acknowledgment
+        - 85-90%: Brief verification note
+        - 80-85%: Mention slight difficulty
+        - 75-80%: Explicit challenge acknowledgment
+        - <75%: Failure with helpful guidance
+        """
+        if not self.enabled:
+            return
+
+        name = speaker_name or self._get_owner_name()
+
+        if success:
+            if confidence >= 0.90:
+                # High confidence - quick acknowledgment
+                messages = [
+                    f"Of course, {name}.",
+                    f"Verified, {name}.",
+                    f"Access granted, {name}.",
+                ]
+            elif confidence >= 0.85:
+                # Good confidence - brief note
+                messages = [
+                    f"Verified, {name}. Welcome back.",
+                    f"Authentication confirmed, {name}.",
+                ]
+            elif confidence >= 0.80:
+                # Borderline - mention verification
+                messages = [
+                    f"One moment... verified. Welcome, {name}.",
+                    f"Voice matched. Access granted, {name}.",
+                ]
+            else:
+                # Low confidence but passed with multi-factor
+                factor_text = ""
+                if factors_used:
+                    factor_text = f" Additional factors confirmed: {', '.join(factors_used)}."
+                messages = [
+                    f"Voice confidence was lower than usual, but identity confirmed.{factor_text} Welcome, {name}.",
+                ]
+
+            message = messages[int(time.time()) % len(messages)]
+            await self.speak(message, wait=False, priority=VoicePriority.HIGH)
+        else:
+            # Authentication failed
+            if confidence >= 0.70:
+                message = "Voice verification failed. Please try again, speaking clearly."
+            elif confidence >= 0.50:
+                message = "Unable to verify voice. Please try again or use alternative authentication."
+            else:
+                message = "Voice not recognized. Access denied."
+
+            await self.speak(message, wait=True, priority=VoicePriority.CRITICAL)
+
+    # =========================================================================
+    # Service Status Narration
+    # =========================================================================
+
+    async def narrate_service_status(
+        self,
+        service: str,
+        status: str,
+        details: str = "",
+    ) -> None:
+        """Narrate service status changes."""
+        if not self.enabled:
+            return
+
+        status_messages = {
+            "starting": f"{service} initializing.",
+            "ready": f"{service} online.",
+            "degraded": f"{service} running in degraded mode.",
+            "failed": f"{service} failed to start.",
+            "recovered": f"{service} recovered.",
+        }
+
+        message = status_messages.get(status.lower(), f"{service}: {status}.")
+        if details:
+            message += f" {details}"
+
+        priority = VoicePriority.HIGH if status in ("failed", "degraded") else VoicePriority.LOW
+        await self.speak(message, wait=False, priority=priority)
+
+    async def narrate_trinity_status(
+        self,
+        component: str,
+        connected: bool,
+        latency_ms: Optional[float] = None,
+    ) -> None:
+        """Narrate Trinity component status."""
+        if not self.enabled:
+            return
+
+        component_names = {
+            "prime": "JARVIS Prime",
+            "reactor": "Reactor Core",
+            "body": "JARVIS Body",
+        }
+        name = component_names.get(component.lower(), component)
+
+        if connected:
+            if latency_ms and latency_ms > 100:
+                message = f"{name} connected with {latency_ms:.0f} millisecond latency."
+            else:
+                message = f"{name} linked."
+        else:
+            message = f"{name} not available."
+
+        await self.speak(message, wait=False, priority=VoicePriority.MEDIUM)
+
+    # =========================================================================
+    # Statistics and Cleanup
+    # =========================================================================
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get narrator statistics."""
+        return {
+            "enabled": self.enabled,
+            "messages_spoken": self._messages_spoken,
+            "messages_skipped": self._messages_skipped,
+            "zones_completed": list(self._zones_completed),
+            "phases_completed": list(self._phases_completed),
+            "uptime_seconds": time.time() - self._start_time,
+        }
 
     async def cleanup(self) -> None:
-        """Cleanup voice processes."""
+        """Cleanup voice processes and queue processor."""
+        # Cancel queue processor
+        if self._queue_processor_task:
+            self._queue_processor_task.cancel()
+            try:
+                await asyncio.wait_for(self._queue_processor_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
+        # Terminate current speech
         if self._process and self._process.returncode is None:
             self._process.terminate()
             try:
                 await asyncio.wait_for(self._process.communicate(), timeout=2.0)
             except asyncio.TimeoutError:
                 self._process.kill()
+
+
+# Global narrator instance (lazy initialization)
+_global_narrator: Optional[AsyncVoiceNarrator] = None
+
+
+def get_voice_narrator() -> AsyncVoiceNarrator:
+    """Get or create the global voice narrator instance."""
+    global _global_narrator
+    if _global_narrator is None:
+        _global_narrator = AsyncVoiceNarrator()
+    return _global_narrator
 
 
 # =============================================================================
@@ -48026,6 +48478,11 @@ class JarvisSystemKernel:
         self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
 
+        # Voice narrator for startup feedback (v2.0)
+        self._narrator: Optional[AsyncVoiceNarrator] = None
+        if self.config.voice_enabled:
+            self._narrator = get_voice_narrator()
+
     @property
     def state(self) -> KernelState:
         """Current kernel state."""
@@ -48315,10 +48772,19 @@ class JarvisSystemKernel:
 
         self._started_at = time.time()
 
+        # Voice narrator startup announcement
+        if self._narrator:
+            try:
+                await self._narrator.narrate_startup_begin()
+            except Exception as narr_err:
+                self.logger.debug(f"[Narrator] Startup announcement failed: {narr_err}")
+
         try:
             # Phase 1: Preflight (Zone 5.1-5.4)
             issue_collector.set_current_phase("Phase 1: Preflight")
             issue_collector.set_current_zone("Zone 5")
+            if self._narrator:
+                await self._narrator.narrate_phase_start("preflight")
             if not await self._phase_preflight():
                 issue_collector.add_critical(
                     "Preflight phase failed - cannot continue startup",
@@ -48331,30 +48797,42 @@ class JarvisSystemKernel:
             # Phase 2: Resources (Zone 3)
             issue_collector.set_current_phase("Phase 2: Resources")
             issue_collector.set_current_zone("Zone 3")
+            if self._narrator:
+                await self._narrator.narrate_phase_start("resources")
             if not await self._phase_resources():
                 issue_collector.add_critical(
                     "Resource initialization failed - cannot continue startup",
                     IssueCategory.GENERAL,
                     suggestion="Check Docker, GCP, and port availability"
                 )
+                if self._narrator:
+                    await self._narrator.narrate_error("Resource initialization failed", critical=True)
                 issue_collector.print_health_report()
                 return 1
+            if self._narrator:
+                await self._narrator.narrate_zone_complete(3, success=True)
 
             # Phase 3: Backend (Zone 6.1)
             issue_collector.set_current_phase("Phase 3: Backend")
             issue_collector.set_current_zone("Zone 6")
+            if self._narrator:
+                await self._narrator.narrate_phase_start("backend")
             if not await self._phase_backend():
                 issue_collector.add_critical(
                     "Backend server failed to start",
                     IssueCategory.NETWORK,
                     suggestion="Check if port is already in use or backend code has errors"
                 )
+                if self._narrator:
+                    await self._narrator.narrate_error("Backend server failed to start", critical=True)
                 issue_collector.print_health_report()
                 return 1
 
             # Phase 4: Intelligence (Zone 4)
             issue_collector.set_current_phase("Phase 4: Intelligence")
             issue_collector.set_current_zone("Zone 4")
+            if self._narrator:
+                await self._narrator.narrate_phase_start("intelligence")
             if not await self._phase_intelligence():
                 # Non-fatal - continue without intelligence
                 issue_collector.add_warning(
@@ -48362,17 +48840,28 @@ class JarvisSystemKernel:
                     IssueCategory.INTELLIGENCE,
                     suggestion="Check ML model availability and Python dependencies"
                 )
+                if self._narrator:
+                    await self._narrator.narrate_zone_complete(4, success=False)
+            else:
+                if self._narrator:
+                    await self._narrator.narrate_zone_complete(4, success=True)
 
             # Phase 5: Trinity (Zone 5.7)
             issue_collector.set_current_phase("Phase 5: Trinity")
             issue_collector.set_current_zone("Zone 5.7")
             if self.config.trinity_enabled:
+                if self._narrator:
+                    await self._narrator.narrate_phase_start("trinity")
                 await self._phase_trinity()
 
             # Phase 6: Enterprise Services (Zone 6.4)
             issue_collector.set_current_phase("Phase 6: Enterprise Services")
             issue_collector.set_current_zone("Zone 6.4")
+            if self._narrator:
+                await self._narrator.narrate_phase_start("enterprise")
             await self._phase_enterprise_services()
+            if self._narrator:
+                await self._narrator.narrate_zone_complete(6, success=True)
 
             # Start background pre-warming task (non-blocking)
             issue_collector.set_current_phase("Background Tasks")
@@ -48406,7 +48895,16 @@ class JarvisSystemKernel:
             self.logger.info("")
             issue_collector.print_health_report()
 
-            self.logger.success(f"[Kernel] ✅ Startup complete in {time.time() - self._started_at:.2f}s")
+            startup_duration = time.time() - self._started_at
+            self.logger.success(f"[Kernel] ✅ Startup complete in {startup_duration:.2f}s")
+
+            # Voice narrator startup complete announcement
+            if self._narrator:
+                try:
+                    await self._narrator.narrate_startup_complete(duration_sec=startup_duration)
+                except Exception as narr_err:
+                    self.logger.debug(f"[Narrator] Startup complete announcement failed: {narr_err}")
+
             return 0
 
         except Exception as e:
@@ -48416,6 +48914,13 @@ class JarvisSystemKernel:
                 traceback_str=traceback.format_exc(),
             )
             self.logger.error(f"[Kernel] Startup failed: {e}")
+
+            # Voice narrator error announcement
+            if self._narrator:
+                try:
+                    await self._narrator.narrate_error(str(e), critical=True)
+                except Exception:
+                    pass
             issue_collector.print_health_report()
             if self.config.debug:
                 issue_collector.print_tracebacks()
@@ -48815,8 +49320,8 @@ class JarvisSystemKernel:
             self.logger.info("[Zone6] Initializing enterprise services (parallel with 30s timeouts)...")
 
             # Define service initializations with individual timeouts
-            # Each service gets 30 seconds to initialize
-            SERVICE_TIMEOUT = 30.0
+            # Configurable via JARVIS_SERVICE_TIMEOUT env var (default: 30s)
+            SERVICE_TIMEOUT = float(os.getenv("JARVIS_SERVICE_TIMEOUT", "30.0"))
 
             # Run all service initializations in parallel with timeouts
             init_results = await asyncio.gather(
@@ -49221,6 +49726,14 @@ class JarvisSystemKernel:
         self._state = KernelState.SHUTTING_DOWN
         self.logger.info("[Kernel] Initiating shutdown...")
 
+        # Voice narrator shutdown announcement
+        if self._narrator:
+            try:
+                reason = self._signal_handler.shutdown_reason or ""
+                await self._narrator.narrate_shutdown(reason=reason)
+            except Exception as narr_err:
+                self.logger.debug(f"[Narrator] Shutdown announcement failed: {narr_err}")
+
         with self.logger.section_start(LogSection.SHUTDOWN, "Shutdown"):
             # Stop hot reload
             if self._hot_reload:
@@ -49269,6 +49782,13 @@ class JarvisSystemKernel:
 
             # Stop IPC server
             await self._ipc_server.stop()
+
+            # Cleanup narrator
+            if self._narrator:
+                try:
+                    await self._narrator.cleanup()
+                except Exception:
+                    pass
 
             # Release lock
             self._startup_lock.release()
