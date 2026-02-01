@@ -1,12 +1,12 @@
 {
-  "workflow_name": "Deploy JARVIS to GCP",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/21555775004",
-  "branch": "main",
-  "commit_sha": "b6d270e",
-  "run_number": 1668,
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/21555804081",
+  "branch": "fix/ci/deploy-jarvis-to-gcp-run1668-20260201-032440",
+  "commit_sha": "9e9b5c1",
+  "run_number": 1691,
   "failed_count": 1,
-  "fix_branch": "fix/ci/deploy-jarvis-to-gcp-run1668-20260201-032440",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: Deploy JARVIS to GCP (Run #1668)",
+  "fix_branch": "fix/ci/pr-automation-validation-run1691-20260201-032647",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1691)",
   "analyses": [
     {
       "error_patterns": [
@@ -14,14 +14,14 @@
           "pattern": "ERROR|Error|error",
           "matches": [
             {
-              "line_number": 46,
-              "content": "2026-02-01T03:23:25.6845191Z tar: Exiting with failure status due to previous errors",
+              "line_number": 29,
+              "content": "2026-02-01T03:25:26.9080357Z   subjectPatternError: The PR title must start with a capital letter.",
               "severity": "high",
               "emoji": "\u274c"
             },
             {
-              "line_number": 47,
-              "content": "2026-02-01T03:23:25.6860694Z ##[error]Process completed with exit code 2.",
+              "line_number": 41,
+              "content": "2026-02-01T03:25:27.3416674Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Deploy JARVIS to GCP (Run #1668)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
               "severity": "high",
               "emoji": "\u274c"
             }
@@ -29,55 +29,26 @@
           "count": 2
         },
         {
-          "pattern": "FAIL|Failed|failed",
+          "pattern": "timeout|timed out",
           "matches": [
             {
-              "line_number": 7,
-              "content": "2026-02-01T03:23:24.1257276Z \u001b[36;1m  echo \"\u274c Failed to upload deployment package\"\u001b[0m",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            },
-            {
-              "line_number": 46,
-              "content": "2026-02-01T03:23:25.6845191Z tar: Exiting with failure status due to previous errors",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            },
-            {
-              "line_number": 51,
-              "content": "2026-02-01T03:23:25.6929869Z \u001b[36;1mecho \"- **Status:** \u274c Failed\" >> $GITHUB_STEP_SUMMARY\u001b[0m",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            },
-            {
-              "line_number": 97,
-              "content": "2026-02-01T03:23:25.9242980Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
-              "severity": "high",
-              "emoji": "\ud83d\udca5"
-            }
-          ],
-          "count": 4
-        },
-        {
-          "pattern": "WARN|Warning|warning",
-          "matches": [
-            {
-              "line_number": 97,
-              "content": "2026-02-01T03:23:25.9242980Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "line_number": 33,
+              "content": "- fix: Resolve database connection timeout",
               "severity": "medium",
-              "emoji": "\u26a0\ufe0f"
+              "emoji": "\u23f1\ufe0f"
             }
           ],
           "count": 1
         }
       ],
       "suggested_fixes": [
-        "Review the logs above for specific error messages"
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
       ],
       "severity": "high",
-      "category": "permission_error",
+      "category": "timeout",
       "similar_failures": []
     }
   ],
-  "timestamp": "2026-02-01T03:24:40.956377"
+  "timestamp": "2026-02-01T03:26:47.606258"
 }
