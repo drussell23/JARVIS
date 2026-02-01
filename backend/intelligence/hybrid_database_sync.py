@@ -1194,24 +1194,54 @@ class HybridDatabaseSync:
             return False
 
     async def initialize(self):
-        """Initialize database connections and start background sync"""
-        # Initialize SQLite (always available)
-        await self._init_sqlite()
+        """
+        Initialize database connections and start background sync.
+
+        v113.0: Added per-step timeouts to prevent any single component
+        from blocking startup. Each step has its own timeout with graceful
+        fallback to ensure SQLite-first strategy always succeeds.
+        """
+        # v113.0: Configurable per-step timeouts
+        sqlite_timeout = float(os.getenv("HYBRID_SQLITE_TIMEOUT", "5.0"))
+        cloudsql_timeout = float(os.getenv("HYBRID_CLOUDSQL_TIMEOUT", "10.0"))
+        redis_timeout = float(os.getenv("HYBRID_REDIS_TIMEOUT", "5.0"))
+        faiss_timeout = float(os.getenv("HYBRID_FAISS_TIMEOUT", "5.0"))
+
+        # Initialize SQLite (always available, critical path)
+        try:
+            await asyncio.wait_for(self._init_sqlite(), timeout=sqlite_timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"❌ SQLite init timed out after {sqlite_timeout}s - this should not happen")
+            raise RuntimeError("SQLite initialization timeout - critical failure")
 
         # Initialize CloudSQL connection orchestrator (may fail gracefully)
-        await self._init_cloudsql_with_circuit_breaker()
+        try:
+            await asyncio.wait_for(
+                self._init_cloudsql_with_circuit_breaker(),
+                timeout=cloudsql_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️  CloudSQL init timed out after {cloudsql_timeout}s - using SQLite-only mode")
+            self.circuit_breaker.record_failure()
+            self.metrics.cloudsql_available = False
 
-        # Phase 2: Start Prometheus metrics server
+        # Phase 2: Start Prometheus metrics server (non-blocking)
         if self.prometheus:
             self.prometheus.start_server()
 
-        # Phase 2: Connect to Redis
+        # Phase 2: Connect to Redis with timeout
         if self.redis:
-            await self.redis.connect()
+            try:
+                await asyncio.wait_for(self.redis.connect(), timeout=redis_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️  Redis connect timed out after {redis_timeout}s - distributed metrics disabled")
 
         # Preload FAISS cache from SQLite for <1ms authentication
         if self.faiss_cache:
-            await self._preload_faiss_cache()
+            try:
+                await asyncio.wait_for(self._preload_faiss_cache(), timeout=faiss_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️  FAISS cache preload timed out after {faiss_timeout}s - will load on demand")
 
             # Bootstrap voice profiles from CloudSQL if SQLite cache is empty
             if self.faiss_cache.size() == 0:

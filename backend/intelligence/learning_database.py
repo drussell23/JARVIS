@@ -3376,7 +3376,18 @@ class JARVISLearningDatabase:
         logger.info("SQLite database initialized with enhanced async schema")
 
     async def _init_hybrid_sync(self):
-        """Initialize hybrid database sync for voice biometrics"""
+        """
+        Initialize hybrid database sync for voice biometrics.
+
+        v119.0: Added timeout protection to prevent startup hangs.
+        Uses configurable HYBRID_SYNC_INIT_TIMEOUT (default 15s) to ensure
+        fast startup while allowing Cloud SQL and Redis to init in background.
+        """
+        # v119.0: Configurable timeout to prevent startup hangs
+        # Default: 25s - must be > sum of inner timeouts (SQLite 5s + CloudSQL 10s + Redis 5s + FAISS 5s)
+        # and < VoiceBio enterprise timeout (45s default)
+        init_timeout = float(os.getenv("HYBRID_SYNC_INIT_TIMEOUT", "25.0"))
+
         try:
             from intelligence.hybrid_database_sync import HybridDatabaseSync
             import json
@@ -3410,8 +3421,20 @@ class JARVISLearningDatabase:
                 redis_url="redis://localhost:6379"
             )
 
-            await self.hybrid_sync.initialize()
-            logger.info("✅ Advanced hybrid sync V2.0 enabled - zero live queries mode")
+            # v119.0: Wrap initialize with timeout to prevent startup hangs
+            # SQLite will always work, Cloud SQL and Redis are best-effort
+            try:
+                await asyncio.wait_for(
+                    self.hybrid_sync.initialize(),
+                    timeout=init_timeout
+                )
+                logger.info("✅ Advanced hybrid sync V2.0 enabled - zero live queries mode")
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️  Hybrid sync init timed out after {init_timeout}s")
+                logger.info("   SQLite operational - Cloud SQL/Redis will retry in background")
+                # Don't disable sync - SQLite is working, cloud services will retry
+                return
+
             logger.info(f"   Local: {sqlite_sync_path}")
             logger.info(f"   Cloud: {cloudsql_config.get('instance_name', 'unknown')}")
             logger.info(f"   📊 Phase 2 Features:")
