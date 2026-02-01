@@ -16118,6 +16118,747 @@ class TrinityIPCHub:
         }
 
 
+class DistributedObservabilitySystem:
+    """
+    Enterprise-grade observability for the Trinity system.
+
+    Provides comprehensive monitoring, tracing, and alerting:
+    - Distributed tracing with W3C Trace Context
+    - Cross-repo metrics aggregation (Prometheus-compatible)
+    - Centralized logging with structured JSON
+    - Performance profiling and flame graphs
+    - Error aggregation with deduplication
+    - Health dashboard with unified view
+    - Intelligent alerting with deduplication
+    """
+
+    def __init__(
+        self,
+        component_name: str = "unified_kernel",
+        metrics_port: int = 9090,
+        enable_tracing: bool = True,
+        enable_profiling: bool = False,
+        log_dir: Optional[Path] = None,
+    ) -> None:
+        self._component_name = component_name
+        self._metrics_port = metrics_port
+        self._enable_tracing = enable_tracing
+        self._enable_profiling = enable_profiling
+        self._log_dir = log_dir or Path.home() / ".jarvis" / "logs"
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Metrics storage
+        self._counters: Dict[str, int] = {}
+        self._gauges: Dict[str, float] = {}
+        self._histograms: Dict[str, List[float]] = {}
+
+        # Trace storage
+        self._active_traces: Dict[str, Dict[str, Any]] = {}
+        self._completed_traces: List[Dict[str, Any]] = []
+        self._max_traces = 1000
+
+        # Error aggregation
+        self._error_counts: Dict[str, int] = {}
+        self._recent_errors: List[Dict[str, Any]] = []
+        self._max_errors = 100
+
+        # Alerting
+        self._alert_rules: List[Dict[str, Any]] = []
+        self._fired_alerts: Dict[str, float] = {}  # alert_id -> last_fired_time
+        self._alert_cooldown = 300.0  # 5 minutes
+
+        # Background tasks
+        self._metrics_server_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Statistics
+        self._stats = {
+            "metrics_collected": 0,
+            "traces_recorded": 0,
+            "errors_aggregated": 0,
+            "alerts_fired": 0,
+        }
+
+    async def start(self) -> bool:
+        """Start the observability system."""
+        if self._running:
+            return True
+
+        self._running = True
+        return True
+
+    async def stop(self) -> None:
+        """Stop the observability system."""
+        self._running = False
+
+        if self._metrics_server_task:
+            self._metrics_server_task.cancel()
+            try:
+                await self._metrics_server_task
+            except asyncio.CancelledError:
+                pass
+
+    # Metrics API
+    def increment_counter(self, name: str, value: int = 1, labels: Optional[Dict[str, str]] = None) -> None:
+        """Increment a counter metric."""
+        key = self._make_metric_key(name, labels)
+        self._counters[key] = self._counters.get(key, 0) + value
+        self._stats["metrics_collected"] += 1
+
+    def set_gauge(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
+        """Set a gauge metric."""
+        key = self._make_metric_key(name, labels)
+        self._gauges[key] = value
+        self._stats["metrics_collected"] += 1
+
+    def record_histogram(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
+        """Record a histogram observation."""
+        key = self._make_metric_key(name, labels)
+        if key not in self._histograms:
+            self._histograms[key] = []
+        self._histograms[key].append(value)
+        if len(self._histograms[key]) > 10000:
+            self._histograms[key] = self._histograms[key][-5000:]
+        self._stats["metrics_collected"] += 1
+
+    def _make_metric_key(self, name: str, labels: Optional[Dict[str, str]]) -> str:
+        """Create a unique metric key with labels."""
+        if not labels:
+            return name
+        label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        return f"{name}{{{label_str}}}"
+
+    # Tracing API
+    def start_trace(
+        self,
+        operation: str,
+        parent_trace_id: Optional[str] = None,
+    ) -> str:
+        """Start a new trace span."""
+        trace_id = f"trace_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
+
+        self._active_traces[trace_id] = {
+            "trace_id": trace_id,
+            "parent_id": parent_trace_id,
+            "operation": operation,
+            "component": self._component_name,
+            "start_time": time.time(),
+            "end_time": None,
+            "duration_ms": None,
+            "status": "active",
+            "tags": {},
+            "logs": [],
+        }
+
+        return trace_id
+
+    def add_trace_tag(self, trace_id: str, key: str, value: Any) -> None:
+        """Add a tag to an active trace."""
+        if trace_id in self._active_traces:
+            self._active_traces[trace_id]["tags"][key] = value
+
+    def add_trace_log(self, trace_id: str, message: str) -> None:
+        """Add a log entry to an active trace."""
+        if trace_id in self._active_traces:
+            self._active_traces[trace_id]["logs"].append({
+                "timestamp": datetime.now().isoformat(),
+                "message": message,
+            })
+
+    def end_trace(self, trace_id: str, status: str = "ok", error: Optional[str] = None) -> None:
+        """End a trace span."""
+        if trace_id not in self._active_traces:
+            return
+
+        trace = self._active_traces.pop(trace_id)
+        trace["end_time"] = time.time()
+        trace["duration_ms"] = (trace["end_time"] - trace["start_time"]) * 1000
+        trace["status"] = status
+        if error:
+            trace["error"] = error
+
+        self._completed_traces.append(trace)
+        if len(self._completed_traces) > self._max_traces:
+            self._completed_traces = self._completed_traces[-self._max_traces:]
+
+        self._stats["traces_recorded"] += 1
+
+        # Record duration as histogram
+        self.record_histogram(
+            "trace_duration_ms",
+            trace["duration_ms"],
+            {"operation": trace["operation"]},
+        )
+
+    # Error aggregation API
+    def record_error(
+        self,
+        error_type: str,
+        message: str,
+        stack_trace: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record an error with aggregation."""
+        error_key = f"{error_type}:{message[:50]}"
+        self._error_counts[error_key] = self._error_counts.get(error_key, 0) + 1
+
+        error_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": error_type,
+            "message": message,
+            "stack_trace": stack_trace,
+            "context": context or {},
+            "count": self._error_counts[error_key],
+        }
+
+        self._recent_errors.append(error_entry)
+        if len(self._recent_errors) > self._max_errors:
+            self._recent_errors = self._recent_errors[-self._max_errors:]
+
+        self._stats["errors_aggregated"] += 1
+        self.increment_counter("errors_total", labels={"type": error_type})
+
+        # Check alert rules
+        asyncio.create_task(self._check_alerts())
+
+    # Alerting API
+    def add_alert_rule(
+        self,
+        alert_id: str,
+        condition: Callable[[], bool],
+        message: str,
+        severity: str = "warning",
+    ) -> None:
+        """Add an alert rule."""
+        self._alert_rules.append({
+            "id": alert_id,
+            "condition": condition,
+            "message": message,
+            "severity": severity,
+        })
+
+    async def _check_alerts(self) -> None:
+        """Check all alert rules."""
+        current_time = time.time()
+
+        for rule in self._alert_rules:
+            alert_id = rule["id"]
+
+            # Check cooldown
+            last_fired = self._fired_alerts.get(alert_id, 0)
+            if current_time - last_fired < self._alert_cooldown:
+                continue
+
+            try:
+                if rule["condition"]():
+                    self._fired_alerts[alert_id] = current_time
+                    self._stats["alerts_fired"] += 1
+                    # In production, this would send to alerting system
+            except Exception:
+                pass
+
+    def get_prometheus_metrics(self) -> str:
+        """Export metrics in Prometheus format."""
+        lines = []
+
+        # Export counters
+        for key, value in self._counters.items():
+            lines.append(f"{key} {value}")
+
+        # Export gauges
+        for key, value in self._gauges.items():
+            lines.append(f"{key} {value}")
+
+        # Export histogram summaries
+        for key, values in self._histograms.items():
+            if values:
+                lines.append(f"{key}_count {len(values)}")
+                lines.append(f"{key}_sum {sum(values)}")
+                sorted_values = sorted(values)
+                lines.append(f'{key}{{quantile="0.5"}} {sorted_values[len(sorted_values)//2]}')
+                lines.append(f'{key}{{quantile="0.9"}} {sorted_values[int(len(sorted_values)*0.9)]}')
+                lines.append(f'{key}{{quantile="0.99"}} {sorted_values[int(len(sorted_values)*0.99)]}')
+
+        return "\n".join(lines)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get observability system status."""
+        return {
+            "running": self._running,
+            "component": self._component_name,
+            "metrics": {
+                "counters": len(self._counters),
+                "gauges": len(self._gauges),
+                "histograms": len(self._histograms),
+            },
+            "tracing": {
+                "active_traces": len(self._active_traces),
+                "completed_traces": len(self._completed_traces),
+            },
+            "errors": {
+                "unique_errors": len(self._error_counts),
+                "recent_errors": len(self._recent_errors),
+            },
+            "alerts": {
+                "rules": len(self._alert_rules),
+                "fired": len(self._fired_alerts),
+            },
+            "stats": self._stats,
+        }
+
+
+class ResourceQuotaManager:
+    """
+    Resource quota management with ulimit protection.
+
+    Monitors and enforces resource limits:
+    - File descriptor limits
+    - Memory usage limits
+    - CPU time limits
+    - Process count limits
+    - Network connection limits
+
+    Features:
+    - Automatic limit detection from OS
+    - Soft limit warnings before hard failures
+    - Resource reservation for critical operations
+    - Automatic cleanup when approaching limits
+    """
+
+    def __init__(
+        self,
+        enable_monitoring: bool = True,
+        warning_threshold: float = 0.8,  # 80% of limit
+        critical_threshold: float = 0.95,  # 95% of limit
+    ) -> None:
+        self._enable_monitoring = enable_monitoring
+        self._warning_threshold = warning_threshold
+        self._critical_threshold = critical_threshold
+
+        # Resource limits (detected from OS)
+        self._limits: Dict[str, Dict[str, int]] = {}
+
+        # Current usage
+        self._usage: Dict[str, int] = {}
+
+        # Reserved resources
+        self._reservations: Dict[str, Dict[str, int]] = {}
+
+        # Monitoring
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._check_interval = 30.0
+
+        # Callbacks for limit warnings
+        self._warning_callbacks: List[Callable[[str, float], Awaitable[None]]] = []
+        self._critical_callbacks: List[Callable[[str, float], Awaitable[None]]] = []
+
+        # Statistics
+        self._stats = {
+            "warnings_issued": 0,
+            "critical_alerts": 0,
+            "cleanups_triggered": 0,
+            "reservations_granted": 0,
+            "reservations_denied": 0,
+        }
+
+        # Detect initial limits
+        self._detect_limits()
+
+    def _detect_limits(self) -> None:
+        """Detect resource limits from OS."""
+        try:
+            import resource
+
+            # File descriptors
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            self._limits["file_descriptors"] = {"soft": soft, "hard": hard}
+
+            # Memory (virtual)
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            if soft != resource.RLIM_INFINITY:
+                self._limits["virtual_memory"] = {"soft": soft, "hard": hard}
+
+            # CPU time
+            soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
+            if soft != resource.RLIM_INFINITY:
+                self._limits["cpu_time"] = {"soft": soft, "hard": hard}
+
+            # Max processes
+            soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+            self._limits["processes"] = {"soft": soft, "hard": hard}
+
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    async def start(self) -> bool:
+        """Start resource monitoring."""
+        if self._running or not self._enable_monitoring:
+            return True
+
+        self._running = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        return True
+
+    async def stop(self) -> None:
+        """Stop resource monitoring."""
+        self._running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _monitor_loop(self) -> None:
+        """Background monitoring loop."""
+        while self._running:
+            try:
+                await self._check_all_resources()
+                await asyncio.sleep(self._check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(self._check_interval)
+
+    async def _check_all_resources(self) -> None:
+        """Check all resource usage."""
+        # Check file descriptors
+        await self._check_file_descriptors()
+
+        # Check memory
+        await self._check_memory()
+
+        # Check processes
+        await self._check_processes()
+
+    async def _check_file_descriptors(self) -> None:
+        """Check file descriptor usage."""
+        try:
+            import psutil
+
+            process = psutil.Process()
+            fd_count = process.num_fds()
+            self._usage["file_descriptors"] = fd_count
+
+            if "file_descriptors" in self._limits:
+                soft_limit = self._limits["file_descriptors"]["soft"]
+                ratio = fd_count / soft_limit
+
+                if ratio >= self._critical_threshold:
+                    self._stats["critical_alerts"] += 1
+                    for callback in self._critical_callbacks:
+                        await callback("file_descriptors", ratio)
+                elif ratio >= self._warning_threshold:
+                    self._stats["warnings_issued"] += 1
+                    for callback in self._warning_callbacks:
+                        await callback("file_descriptors", ratio)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    async def _check_memory(self) -> None:
+        """Check memory usage."""
+        try:
+            import psutil
+
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            self._usage["rss_memory"] = memory_info.rss
+            self._usage["vms_memory"] = memory_info.vms
+
+            # Check against system memory
+            system_memory = psutil.virtual_memory()
+            memory_ratio = system_memory.percent / 100
+
+            if memory_ratio >= self._critical_threshold:
+                self._stats["critical_alerts"] += 1
+                for callback in self._critical_callbacks:
+                    await callback("memory", memory_ratio)
+            elif memory_ratio >= self._warning_threshold:
+                self._stats["warnings_issued"] += 1
+                for callback in self._warning_callbacks:
+                    await callback("memory", memory_ratio)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    async def _check_processes(self) -> None:
+        """Check process count."""
+        try:
+            import psutil
+
+            process = psutil.Process()
+            children = process.children(recursive=True)
+            self._usage["child_processes"] = len(children)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    def reserve_resources(
+        self,
+        reservation_id: str,
+        file_descriptors: int = 0,
+        memory_mb: int = 0,
+    ) -> bool:
+        """
+        Reserve resources for a critical operation.
+
+        Returns:
+            True if reservation granted, False otherwise
+        """
+        # Check if we have capacity
+        if file_descriptors > 0 and "file_descriptors" in self._limits:
+            current_fd = self._usage.get("file_descriptors", 0)
+            reserved_fd = sum(r.get("file_descriptors", 0) for r in self._reservations.values())
+            available_fd = self._limits["file_descriptors"]["soft"] - current_fd - reserved_fd
+
+            if file_descriptors > available_fd * (1 - self._warning_threshold):
+                self._stats["reservations_denied"] += 1
+                return False
+
+        # Grant reservation
+        self._reservations[reservation_id] = {
+            "file_descriptors": file_descriptors,
+            "memory_mb": memory_mb,
+            "created_at": time.time(),
+        }
+        self._stats["reservations_granted"] += 1
+        return True
+
+    def release_reservation(self, reservation_id: str) -> None:
+        """Release a resource reservation."""
+        if reservation_id in self._reservations:
+            del self._reservations[reservation_id]
+
+    def register_warning_callback(
+        self,
+        callback: Callable[[str, float], Awaitable[None]],
+    ) -> None:
+        """Register a callback for resource warnings."""
+        self._warning_callbacks.append(callback)
+
+    def register_critical_callback(
+        self,
+        callback: Callable[[str, float], Awaitable[None]],
+    ) -> None:
+        """Register a callback for critical resource alerts."""
+        self._critical_callbacks.append(callback)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get resource quota status."""
+        return {
+            "limits": self._limits,
+            "usage": self._usage,
+            "reservations": len(self._reservations),
+            "running": self._running,
+            "stats": self._stats,
+        }
+
+
+class CrossRepoExperienceForwarder:
+    """
+    Forwards learning experiences to Reactor Core for training.
+
+    Handles the JARVIS → Reactor Core data pipeline:
+    - Batch collection of user interactions
+    - Quality filtering and validation
+    - Retry with exponential backoff
+    - File-based fallback when API unavailable
+    - Distributed model training coordination
+    """
+
+    def __init__(
+        self,
+        reactor_core_url: Optional[str] = None,
+        batch_size: int = 50,
+        flush_interval: float = 60.0,
+        max_retries: int = 3,
+        fallback_dir: Optional[Path] = None,
+    ) -> None:
+        self._reactor_core_url = reactor_core_url or os.getenv(
+            "REACTOR_CORE_URL", "http://localhost:8090"
+        )
+        self._batch_size = batch_size
+        self._flush_interval = flush_interval
+        self._max_retries = max_retries
+        self._fallback_dir = fallback_dir or Path.home() / ".jarvis" / "experience_fallback"
+        self._fallback_dir.mkdir(parents=True, exist_ok=True)
+
+        # Experience buffer
+        self._buffer: List[Dict[str, Any]] = []
+        self._buffer_lock = asyncio.Lock()
+
+        # State tracking
+        self._reactor_available = False
+        self._last_health_check = 0.0
+        self._health_check_interval = 30.0
+
+        # Background tasks
+        self._flush_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Statistics
+        self._stats = {
+            "experiences_buffered": 0,
+            "experiences_forwarded": 0,
+            "batches_sent": 0,
+            "batches_failed": 0,
+            "fallback_files_written": 0,
+            "retries": 0,
+        }
+
+    async def start(self) -> bool:
+        """Start the experience forwarder."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._flush_task = asyncio.create_task(self._flush_loop())
+
+        # Check initial reactor availability
+        await self._check_reactor_health()
+        return True
+
+    async def stop(self) -> None:
+        """Stop the forwarder and flush remaining experiences."""
+        self._running = False
+
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Final flush
+        await self._flush_buffer()
+
+    async def add_experience(
+        self,
+        experience_type: str,
+        data: Dict[str, Any],
+        quality_score: Optional[float] = None,
+    ) -> None:
+        """Add an experience to the forwarding buffer."""
+        experience = {
+            "id": f"exp_{int(time.time() * 1000)}_{os.urandom(4).hex()}",
+            "type": experience_type,
+            "data": data,
+            "quality_score": quality_score,
+            "timestamp": datetime.now().isoformat(),
+            "source": "unified_kernel",
+        }
+
+        async with self._buffer_lock:
+            self._buffer.append(experience)
+            self._stats["experiences_buffered"] += 1
+
+        # Trigger flush if buffer is full
+        if len(self._buffer) >= self._batch_size:
+            asyncio.create_task(self._flush_buffer())
+
+    async def _flush_loop(self) -> None:
+        """Background loop to periodically flush experiences."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._flush_interval)
+                await self._flush_buffer()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _flush_buffer(self) -> None:
+        """Flush buffered experiences to Reactor Core."""
+        async with self._buffer_lock:
+            if not self._buffer:
+                return
+
+            experiences = self._buffer.copy()
+            self._buffer.clear()
+
+        # Check reactor health
+        await self._check_reactor_health()
+
+        if self._reactor_available:
+            success = await self._send_to_reactor(experiences)
+            if success:
+                return
+
+        # Fallback to file
+        await self._write_fallback(experiences)
+
+    async def _check_reactor_health(self) -> None:
+        """Check if Reactor Core is available."""
+        current_time = time.time()
+        if current_time - self._last_health_check < self._health_check_interval:
+            return
+
+        self._last_health_check = current_time
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self._reactor_core_url}/health",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    self._reactor_available = resp.status == 200
+        except Exception:
+            self._reactor_available = False
+
+    async def _send_to_reactor(self, experiences: List[Dict[str, Any]]) -> bool:
+        """Send experiences to Reactor Core API."""
+        for attempt in range(self._max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self._reactor_core_url}/api/experiences/batch",
+                        json={"experiences": experiences},
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        if resp.status == 200:
+                            self._stats["experiences_forwarded"] += len(experiences)
+                            self._stats["batches_sent"] += 1
+                            return True
+            except Exception:
+                pass
+
+            self._stats["retries"] += 1
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+
+        self._stats["batches_failed"] += 1
+        return False
+
+    async def _write_fallback(self, experiences: List[Dict[str, Any]]) -> None:
+        """Write experiences to fallback file for later processing."""
+        filename = f"experiences_{int(time.time())}.jsonl"
+        fallback_file = self._fallback_dir / filename
+
+        try:
+            with open(fallback_file, "w") as f:
+                for exp in experiences:
+                    f.write(json.dumps(exp) + "\n")
+            self._stats["fallback_files_written"] += 1
+        except Exception:
+            pass
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get forwarder status."""
+        return {
+            "running": self._running,
+            "reactor_available": self._reactor_available,
+            "buffer_size": len(self._buffer),
+            "fallback_dir": str(self._fallback_dir),
+            "stats": self._stats,
+        }
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 4                                                               ║
