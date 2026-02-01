@@ -50238,8 +50238,14 @@ class JarvisSystemKernel:
 
                     total = cleanup_stats.get("total_entries", 0)
                     valid = cleanup_stats.get("valid_entries", 0)
-                    removed_dead = cleanup_stats.get("removed_dead_pid", 0)
-                    removed_stale = cleanup_stats.get("removed_stale", 0)
+                    
+                    # v184.0: Registry returns lists of removed items, not counts
+                    # Handle both formats for backwards compatibility
+                    removed_dead_raw = cleanup_stats.get("removed_dead_pid", [])
+                    removed_stale_raw = cleanup_stats.get("removed_stale", [])
+                    removed_dead = len(removed_dead_raw) if isinstance(removed_dead_raw, list) else int(removed_dead_raw or 0)
+                    removed_stale = len(removed_stale_raw) if isinstance(removed_stale_raw, list) else int(removed_stale_raw or 0)
+                    
                     ports_freed = cleanup_stats.get("ports_freed", [])
                     cleanup_time = cleanup_stats.get("cleanup_time_ms", 0)
 
@@ -51811,10 +51817,14 @@ class JarvisSystemKernel:
 
     async def _wait_for_loading_server_health(self, port: int) -> bool:
         """
-        Wait for loading server to become healthy with adaptive backoff.
+        v184.0: Enhanced wait for loading server with intelligent retry.
 
-        Uses exponential backoff starting fast (100ms) and capping at 1s.
-        Total wait budget: 15 seconds.
+        Features:
+        - Adaptive timeout (default 30s, configurable)
+        - Process liveness monitoring during wait
+        - Exponential backoff with jitter
+        - Early success detection
+        - Detailed diagnostic logging
 
         Args:
             port: The loading server port
@@ -51824,72 +51834,48 @@ class JarvisSystemKernel:
         """
         health_url = f"http://localhost:{port}/health"
 
-        # Adaptive retry configuration (from run_supervisor)
-        initial_delay = 0.1    # Start fast
-        max_delay = 1.0        # Cap at 1 second
-        max_wait_time = float(os.getenv("LOADING_SERVER_HEALTH_TIMEOUT", "15.0"))
-        timeout_per_request = 1.0
+        # v184.0: More generous default timeout for cold startup
+        max_wait_time = float(os.getenv("LOADING_SERVER_HEALTH_TIMEOUT", "30.0"))
+        initial_delay = 0.05   # Start very fast (50ms)
+        max_delay = 1.0
+        timeout_per_request = 1.5
 
         start_time = time.time()
         attempt = 0
         current_delay = initial_delay
+        last_error = "unknown"
 
-        # Try aiohttp first (better performance), fallback to urllib
-        if AIOHTTP_AVAILABLE and aiohttp is not None:
-            try:
-                connector = aiohttp.TCPConnector(
-                    limit=1,
-                    enable_cleanup_closed=True,
-                    force_close=False,
+        self.logger.debug(
+            f"[LoadingServer] Waiting for health (timeout: {max_wait_time}s, url: {health_url})"
+        )
+
+        while (time.time() - start_time) < max_wait_time:
+            attempt += 1
+
+            # v184.0: Check if loading server process died during wait
+            if self._loading_server_process and self._loading_server_process.returncode is not None:
+                self.logger.warning(
+                    f"[LoadingServer] Process died during health wait "
+                    f"(code: {self._loading_server_process.returncode})"
                 )
-                async with aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=aiohttp.ClientTimeout(total=timeout_per_request)
-                ) as session:
-                    while (time.time() - start_time) < max_wait_time:
-                        attempt += 1
-                        try:
-                            async with session.get(health_url) as resp:
-                                if resp.status == 200:
-                                    elapsed = time.time() - start_time
-                                    self.logger.info(
-                                        f"[LoadingServer] Healthy after {attempt} attempts "
-                                        f"({elapsed:.2f}s)"
-                                    )
-                                    return True
-                                else:
-                                    self.logger.debug(
-                                        f"[LoadingServer] Health check {attempt}: status {resp.status}"
-                                    )
-                        except aiohttp.ClientConnectorError:
-                            # Server not listening yet - expected during startup
-                            pass
-                        except asyncio.TimeoutError:
-                            self.logger.debug(
-                                f"[LoadingServer] Health check {attempt}: timeout"
-                            )
-                        except Exception as e:
-                            self.logger.debug(
-                                f"[LoadingServer] Health check {attempt}: {type(e).__name__}"
-                            )
+                return False
 
-                        # Adaptive backoff: start fast, slow down over time
-                        await asyncio.sleep(current_delay)
-                        current_delay = min(current_delay * 1.5, max_delay)
-
-                        # Progress indicator every ~2 seconds
-                        if attempt % 5 == 0:
-                            elapsed = time.time() - start_time
-                            self.logger.debug(
-                                f"[LoadingServer] Waiting for health... ({elapsed:.1f}s)"
-                            )
-            except Exception as e:
-                self.logger.debug(f"[LoadingServer] aiohttp health check failed: {e}")
-        else:
-            # Fallback: simple socket check
-            while (time.time() - start_time) < max_wait_time:
-                attempt += 1
-                try:
+            try:
+                if AIOHTTP_AVAILABLE and aiohttp is not None:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=timeout_per_request)
+                    ) as session:
+                        async with session.get(health_url) as resp:
+                            if resp.status == 200:
+                                elapsed = time.time() - start_time
+                                self.logger.info(
+                                    f"[LoadingServer] Healthy after {attempt} attempts ({elapsed:.2f}s)"
+                                )
+                                return True
+                            else:
+                                last_error = f"HTTP {resp.status}"
+                else:
+                    # Fallback socket check
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(timeout_per_request)
                     result = sock.connect_ex(('localhost', port))
@@ -51897,15 +51883,36 @@ class JarvisSystemKernel:
                     if result == 0:
                         elapsed = time.time() - start_time
                         self.logger.info(
-                            f"[LoadingServer] Port ready after {attempt} attempts "
-                            f"({elapsed:.2f}s)"
+                            f"[LoadingServer] Port ready after {attempt} attempts ({elapsed:.2f}s)"
                         )
                         return True
-                except Exception:
-                    pass
-                await asyncio.sleep(current_delay)
-                current_delay = min(current_delay * 1.5, max_delay)
+                    last_error = f"connect_ex={result}"
 
+            except aiohttp.ClientConnectorError:
+                last_error = "connection refused"
+            except asyncio.TimeoutError:
+                last_error = "timeout"
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+
+            # Progress every 5 attempts
+            if attempt % 5 == 0:
+                elapsed = time.time() - start_time
+                self.logger.debug(
+                    f"[LoadingServer] Health check attempt {attempt}: {last_error} ({elapsed:.1f}s)"
+                )
+
+            # v184.0: Exponential backoff with jitter to prevent thundering herd
+            jitter = random.uniform(0, 0.1 * current_delay)
+            await asyncio.sleep(current_delay + jitter)
+            current_delay = min(current_delay * 1.5, max_delay)
+
+        # Timeout - log diagnostics
+        elapsed = time.time() - start_time
+        self.logger.warning(
+            f"[LoadingServer] Health check timeout after {attempt} attempts "
+            f"({elapsed:.1f}s, last error: {last_error})"
+        )
         return False
 
     async def _log_loading_server_errors(self) -> None:
