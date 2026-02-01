@@ -23,7 +23,6 @@ Features:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -33,7 +32,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import wraps
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 # Google Cloud Compute Engine API
@@ -679,48 +677,6 @@ class GCPVMManager:
         self._cloud_offload_active: bool = False
         self._cloud_offload_reason: str = ""
         self._cloud_offload_triggered_at: Optional[float] = None
-
-        # ═══════════════════════════════════════════════════════════════════
-        # v116.0: SESSION TRACKING FOR ORPHAN DETECTION
-        # ═══════════════════════════════════════════════════════════════════
-        # Generate a unique session ID for this VM manager instance.
-        # This is used to label VMs so GCPReconciler knows which session
-        # created them and won't delete them as orphans.
-        # ═══════════════════════════════════════════════════════════════════
-        self._session_id = self._generate_session_id()
-        self._session_lock_file = Path.home() / ".jarvis" / "infra_lock" / f"{self._session_id}.lock"
-        self._vms_created_this_session: set[str] = set()  # Track VM names we created
-
-    def _generate_session_id(self) -> str:
-        """
-        v116.0: Generate unique session ID for this VM manager instance.
-
-        Uses the same algorithm as GCPReconciler for consistency.
-        """
-        import hashlib
-        import socket
-        unique_data = f"{socket.gethostname()}-{os.getpid()}-{time.time()}"
-        return hashlib.sha256(unique_data.encode()).hexdigest()[:12]
-
-    def _ensure_session_lock(self) -> None:
-        """
-        v116.0: Create session lock file so GCPReconciler knows this session is alive.
-
-        This prevents orphan detection from deleting our VMs.
-        """
-        try:
-            self._session_lock_file.parent.mkdir(parents=True, exist_ok=True)
-            lock_data = {
-                "session_id": self._session_id,
-                "pid": os.getpid(),
-                "started_at": time.time(),
-                "hostname": os.uname().nodename,
-                "manager": "GCPVMManager",
-            }
-            with open(self._session_lock_file, "w") as f:
-                json.dump(lock_data, f)
-        except Exception as e:
-            logger.debug(f"[GCPVMManager] Could not create session lock: {e}")
 
     # =========================================================================
     # v86.0: Property accessors for clean interface
@@ -1866,18 +1822,10 @@ class GCPVMManager:
             except Exception as e:
                 logger.debug(f"Rate limit check failed (proceeding): {e}")
 
-        # ═══════════════════════════════════════════════════════════════════
-        # v116.0: Ensure session lock exists before creating VM
-        # This is CRITICAL for orphan detection - without it, GCPReconciler
-        # will delete the VM as an orphan immediately after creation.
-        # ═══════════════════════════════════════════════════════════════════
-        self._ensure_session_lock()
-
         logger.info(f"🚀 Creating GCP Spot VM...")
         logger.info(f"   Components: {', '.join(components)}")
         logger.info(f"   Trigger: {trigger_reason}")
         logger.info(f"   Quota check: {quota_check.message}")
-        logger.info(f"   Session ID: {self._session_id}")
 
         # ═══════════════════════════════════════════════════════════════════════════
         # v1.0: Try to acquire GCP VM creation lock (best-effort, non-blocking)
@@ -2109,12 +2057,7 @@ class GCPVMManager:
     def _build_instance_config(
         self, vm_name: str, components: List[str], trigger_reason: str, metadata: Dict
     ) -> InstanceType:
-        """
-        Build GCP Instance configuration.
-
-        v116.0: Now includes jarvis-session-id label for proper orphan detection.
-        This prevents the GCPReconciler from deleting VMs created by this session.
-        """
+        """Build GCP Instance configuration"""
 
         # Machine type URL
         machine_type_url = f"zones/{self.config.zone}/machineTypes/{self.config.machine_type}"
@@ -2183,18 +2126,6 @@ class GCPVMManager:
                 
             metadata_items.append(compute_v1.Items(key="startup-script", value=startup_script))
 
-        # ═══════════════════════════════════════════════════════════════════
-        # v116.0: CRITICAL - Include session ID in labels for orphan detection
-        # This allows GCPReconciler to identify which session created this VM
-        # and prevents it from being deleted as an orphan.
-        # ═══════════════════════════════════════════════════════════════════
-        vm_labels = {
-            "created-by": "jarvis",
-            "type": "backend",
-            "vm-class": "spot",
-            "jarvis-session-id": self._session_id,  # v116.0: Session tracking
-        }
-
         # Build instance
         instance = compute_v1.Instance(
             name=vm_name,
@@ -2204,7 +2135,7 @@ class GCPVMManager:
             service_accounts=[service_account],
             metadata=compute_v1.Metadata(items=metadata_items),
             tags=compute_v1.Tags(items=["jarvis", "backend", "spot-vm", "jarvis-node"]),
-            labels=vm_labels,
+            labels={"created-by": "jarvis", "type": "backend", "vm-class": "spot"},
         )
 
         # Configure as Spot VM with Hard Duration Limit

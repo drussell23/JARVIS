@@ -751,10 +751,7 @@ WEBSOCKET_PORT_RANGE = (8765, 8800)
 LOADING_SERVER_PORT_RANGE = (8080, 8090)
 
 # Timeouts (seconds)
-# v181.0: Increased default startup timeout for enterprise initialization
-# The intelligent timeout calculation in startup() will compute the actual value
-# based on enabled features. This is the fallback minimum.
-DEFAULT_STARTUP_TIMEOUT = 180.0
+DEFAULT_STARTUP_TIMEOUT = 120.0
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
 DEFAULT_HEALTH_CHECK_INTERVAL = 10.0
 DEFAULT_HOT_RELOAD_INTERVAL = 10.0
@@ -2431,7 +2428,6 @@ class IssueCategory(Enum):
     """Categories for organizing startup issues."""
     GCP = "GCP / Cloud"
     TRINITY = "Trinity Integration"
-    ENTERPRISE = "Enterprise Services"  # v181.0: Added for parallel phase tracking
     DATABASE = "Database / Storage"
     DOCKER = "Docker"
     VOICE = "Voice / Audio"
@@ -48973,7 +48969,6 @@ class JarvisSystemKernel:
         self._state = KernelState.INITIALIZING
         self._started_at: Optional[float] = None
         self._initialized = True
-        self._current_phase: str = "Initialization"  # v181.0: Track current phase for timeout diagnostics
 
         # Core components
         self._startup_lock = StartupLock()
@@ -49000,10 +48995,6 @@ class JarvisSystemKernel:
         # Enterprise status tracking
         self._enterprise_status: Dict[str, Any] = {}
 
-        # v181.0: Voice biometric service (initialized in background)
-        self._voice_bio_service: Optional[Any] = None
-        self._voice_bio_status: Dict[str, Any] = {}
-
         # Background tasks
         self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
@@ -49024,29 +49015,6 @@ class JarvisSystemKernel:
         if self._started_at is None:
             return 0.0
         return time.time() - self._started_at
-
-    @property
-    def voice_bio_ready(self) -> bool:
-        """
-        v181.0: Check if voice biometrics is fully ready (warmed up).
-
-        Returns True if:
-        - Voice bio service is initialized AND
-        - Background warmup has completed
-        """
-        if not self._voice_bio_status:
-            return False
-        return self._voice_bio_status.get("initialized", False)
-
-    @property
-    def voice_bio_warming(self) -> bool:
-        """
-        v181.0: Check if voice biometrics is still warming up.
-
-        During warmup, voice verification may work in degraded mode
-        (e.g., using cloud ECAPA instead of local).
-        """
-        return self._voice_bio_status.get("warming_up", False) and not self.voice_bio_ready
 
     # =========================================================================
     # SAFE PHASE INITIALIZATION (v107.0)
@@ -49365,40 +49333,14 @@ class JarvisSystemKernel:
         - Enterprise startup banner
         - State recovery detection
 
-        v181.0 Enhanced with:
-        - Intelligent timeout calculation based on enabled phases
-        - Parallel phase execution (Trinity + Enterprise run concurrently)
-        - Graceful degradation on timeout (continue with what we have)
-
         Returns:
             Exit code (0 for success, non-zero for failure)
         """
-        # =====================================================================
-        # v181.0: INTELLIGENT TIMEOUT CALCULATION
-        # Calculate startup timeout based on what phases are enabled
-        # =====================================================================
-        base_timeout = 60.0  # Minimum for basic phases (preflight, resources, backend)
-
-        # Add time for optional phases
-        if self.config.trinity_enabled:
-            trinity_timeout = float(os.environ.get("JARVIS_TRINITY_TIMEOUT", "60.0"))
-            base_timeout += trinity_timeout * 0.5  # Trinity runs in parallel, so 50% contribution
-
-        # Enterprise services are always enabled, add their parallel timeout
-        service_timeout = float(os.environ.get("JARVIS_SERVICE_TIMEOUT", "30.0"))
-        base_timeout += service_timeout  # Services run in parallel with Trinity
-
-        # Add buffer for frontend transition and verification
-        base_timeout += 30.0  # Frontend transition + service verification
-
-        # Allow override via environment variable, but calculate intelligent default
+        # Apply global startup timeout to prevent infinite hangs
         startup_timeout = float(os.environ.get(
             "JARVIS_STARTUP_TIMEOUT",
-            str(max(base_timeout, DEFAULT_STARTUP_TIMEOUT))
+            str(DEFAULT_STARTUP_TIMEOUT)
         ))
-
-        self.logger.debug(f"[Kernel] Calculated startup timeout: {startup_timeout}s "
-                         f"(base={base_timeout:.1f}s, trinity={self.config.trinity_enabled})")
 
         try:
             return await asyncio.wait_for(
@@ -49408,12 +49350,7 @@ class JarvisSystemKernel:
         except asyncio.TimeoutError:
             self.logger.error(f"[Kernel] STARTUP TIMEOUT after {startup_timeout}s")
             self.logger.error("[Kernel] This may indicate a hung component or resource lock.")
-            self.logger.error("[Kernel] Increase timeout: JARVIS_STARTUP_TIMEOUT=300")
-            self.logger.error("[Kernel] Or force restart: python unified_supervisor.py --restart --force")
-
-            # Log which phase we were in
-            if hasattr(self, '_current_phase'):
-                self.logger.error(f"[Kernel] Stuck during: {self._current_phase}")
+            self.logger.error("[Kernel] Try: python unified_supervisor.py --restart --force")
 
             # Log diagnostic checkpoint for forensics
             if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
@@ -49523,7 +49460,6 @@ class JarvisSystemKernel:
             )
 
             # Phase 1: Preflight (Zone 5.1-5.4)
-            self._current_phase = "Phase 1: Preflight"
             issue_collector.set_current_phase("Phase 1: Preflight")
             issue_collector.set_current_zone("Zone 5")
             if self._narrator:
@@ -49558,7 +49494,6 @@ class JarvisSystemKernel:
             )
 
             # Phase 2: Resources (Zone 3)
-            self._current_phase = "Phase 2: Resources"
             issue_collector.set_current_phase("Phase 2: Resources")
             issue_collector.set_current_zone("Zone 3")
             if self._narrator:
@@ -49597,7 +49532,6 @@ class JarvisSystemKernel:
             )
 
             # Phase 3: Backend (Zone 6.1)
-            self._current_phase = "Phase 3: Backend"
             issue_collector.set_current_phase("Phase 3: Backend")
             issue_collector.set_current_zone("Zone 6")
             if self._narrator:
@@ -49634,7 +49568,6 @@ class JarvisSystemKernel:
             )
 
             # Phase 4: Intelligence (Zone 4)
-            self._current_phase = "Phase 4: Intelligence"
             issue_collector.set_current_phase("Phase 4: Intelligence")
             issue_collector.set_current_zone("Zone 4")
             if self._narrator:
@@ -49672,134 +49605,65 @@ class JarvisSystemKernel:
                 }
             )
 
-            # =====================================================================
-            # v181.0: PARALLEL PHASE EXECUTION (Trinity + Enterprise)
-            # Trinity and Enterprise Services are INDEPENDENT - run them in parallel
-            # This dramatically reduces startup time (~60s saved)
-            # =====================================================================
-            self._current_phase = "Phase 5+6: Trinity + Enterprise (Parallel)"
-            issue_collector.set_current_phase("Phase 5+6: Parallel Initialization")
-            issue_collector.set_current_zone("Zone 5.7 + 6.4")
+            # Phase 5: Trinity (Zone 5.7)
+            issue_collector.set_current_phase("Phase 5: Trinity")
+            issue_collector.set_current_zone("Zone 5.7")
+            if self.config.trinity_enabled:
+                if self._narrator:
+                    await self._narrator.narrate_phase_start("trinity")
+                await self._phase_trinity()
+            else:
+                # v170.0: Explicitly log when Trinity is disabled
+                self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+                self.logger.info("[Kernel] Phase 5: Trinity - SKIPPED (disabled)")
+                self.logger.info(f"[Kernel]   Set JARVIS_TRINITY_ENABLED=true or --trinity to enable")
+                self.logger.info("[Kernel]   Trinity connects: JARVIS + J-Prime + Reactor-Core")
+                self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
 
-            # Broadcast parallel phase start
             await self._broadcast_startup_progress(
-                stage="parallel_init",
-                message="Initializing Trinity + Enterprise Services in parallel...",
-                progress=70,
+                stage="trinity",
+                message="Trinity connected - starting enterprise services...",
+                progress=80,
                 metadata={
-                    "icon": "zap",
-                    "phase": "5+6",
-                    "parallel": True,
+                    "icon": "link",
+                    "phase": 5,
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
                         "resources": {"status": "complete"},
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
-                        "trinity": {"status": "running"},
+                        "trinity": {"status": "complete"},
                         "enterprise": {"status": "running"},
                         "frontend": {"status": "pending"},
                     }
                 }
             )
 
-            # Define parallel phase coroutines
-            async def _run_trinity_phase() -> bool:
-                """Trinity phase wrapper with narration."""
-                if not self.config.trinity_enabled:
-                    self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
-                    self.logger.info("[Kernel] Phase 5: Trinity - SKIPPED (disabled)")
-                    self.logger.info(f"[Kernel]   Set JARVIS_TRINITY_ENABLED=true or --trinity to enable")
-                    self.logger.info("[Kernel]   Trinity connects: JARVIS + J-Prime + Reactor-Core")
-                    self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
-                    return True  # Not an error, just disabled
+            # Phase 6: Enterprise Services (Zone 6.4)
+            issue_collector.set_current_phase("Phase 6: Enterprise Services")
+            issue_collector.set_current_zone("Zone 6.4")
+            if self._narrator:
+                await self._narrator.narrate_phase_start("enterprise")
+            await self._phase_enterprise_services()
+            if self._narrator:
+                await self._narrator.narrate_zone_complete(6, success=True)
 
-                if self._narrator:
-                    await self._narrator.narrate_phase_start("trinity")
-                try:
-                    await self._phase_trinity()
-                    return True
-                except Exception as e:
-                    self.logger.error(f"[Kernel] Trinity phase failed: {e}")
-                    issue_collector.add_warning(
-                        f"Trinity initialization failed: {e}",
-                        IssueCategory.TRINITY,
-                        suggestion="Check Trinity repo paths and connectivity"
-                    )
-                    return False
-
-            async def _run_enterprise_phase() -> bool:
-                """Enterprise services phase wrapper with narration."""
-                if self._narrator:
-                    await self._narrator.narrate_phase_start("enterprise")
-                try:
-                    await self._phase_enterprise_services()
-                    if self._narrator:
-                        await self._narrator.narrate_zone_complete(6, success=True)
-                    return True
-                except Exception as e:
-                    self.logger.error(f"[Kernel] Enterprise services phase failed: {e}")
-                    issue_collector.add_warning(
-                        f"Enterprise services failed: {e}",
-                        IssueCategory.ENTERPRISE,
-                        suggestion="Check service configurations and dependencies"
-                    )
-                    if self._narrator:
-                        await self._narrator.narrate_zone_complete(6, success=False)
-                    return False
-
-            # Execute Trinity and Enterprise in PARALLEL
-            self.logger.info("[Kernel] ═══════════════════════════════════════════════════════════════")
-            self.logger.info("[Kernel] 🚀 PARALLEL PHASE EXECUTION (v181.0)")
-            self.logger.info("[Kernel]   Phase 5: Trinity + Phase 6: Enterprise Services")
-            self.logger.info("[Kernel]   Running concurrently for faster startup...")
-            self.logger.info("[Kernel] ═══════════════════════════════════════════════════════════════")
-
-            parallel_start = asyncio.get_event_loop().time()
-            trinity_result, enterprise_result = await asyncio.gather(
-                _run_trinity_phase(),
-                _run_enterprise_phase(),
-                return_exceptions=True  # Don't let one failure stop the other
-            )
-            parallel_duration = asyncio.get_event_loop().time() - parallel_start
-
-            # Process results
-            trinity_success = trinity_result is True
-            enterprise_success = enterprise_result is True
-
-            if isinstance(trinity_result, Exception):
-                self.logger.error(f"[Kernel] Trinity raised exception: {trinity_result}")
-                trinity_success = False
-            if isinstance(enterprise_result, Exception):
-                self.logger.error(f"[Kernel] Enterprise raised exception: {enterprise_result}")
-                enterprise_success = False
-
-            # Log parallel execution summary
-            self.logger.info("[Kernel] ───────────────────────────────────────────────────────────────")
-            self.logger.info(f"[Kernel] Parallel phases completed in {parallel_duration:.1f}s")
-            self.logger.info(f"[Kernel]   Trinity: {'✓ Success' if trinity_success else '⚠ Failed/Disabled'}")
-            self.logger.info(f"[Kernel]   Enterprise: {'✓ Success' if enterprise_success else '⚠ Failed'}")
-            self.logger.info("[Kernel] ───────────────────────────────────────────────────────────────")
-
-            # Broadcast completion (both phases done)
             await self._broadcast_startup_progress(
                 stage="enterprise",
-                message="Trinity + Enterprise services initialized - launching frontend...",
+                message="Enterprise services online - launching frontend...",
                 progress=90,
                 metadata={
                     "icon": "building",
                     "phase": 6,
-                    "parallel_duration": parallel_duration,
-                    "trinity_success": trinity_success,
-                    "enterprise_success": enterprise_success,
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
                         "resources": {"status": "complete"},
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
-                        "trinity": {"status": "complete" if trinity_success else "warning"},
-                        "enterprise": {"status": "complete" if enterprise_success else "warning"},
+                        "trinity": {"status": "complete"},
+                        "enterprise": {"status": "complete"},
                         "frontend": {"status": "running"},
                     }
                 }
@@ -49811,7 +49675,6 @@ class JarvisSystemKernel:
             # Start the React frontend and transition browser from loading
             # page to the main JARVIS UI.
             # =================================================================
-            self._current_phase = "Phase 7: Frontend Transition"
             issue_collector.set_current_phase("Phase 7: Frontend Transition")
             issue_collector.set_current_zone("Zone 7")
 
@@ -52420,15 +52283,9 @@ class JarvisSystemKernel:
         """
         Initialize the voice biometric authentication system.
 
-        v181.0 TRULY ASYNC ARCHITECTURE:
-        - Returns immediately with "warming" status (non-blocking)
-        - Heavy ML loading happens in background task
-        - Service becomes "ready" when background init completes
-        - Phase 6 startup never blocked by ECAPA loading
-
-        Features:
+        This enterprise-grade initialization:
         - Loads Cloud SQL database with voiceprint profiles
-        - Initializes ECAPA-TDNN speaker verification model (BACKGROUND)
+        - Initializes ECAPA-TDNN speaker verification model
         - Validates all profile dimensions match model dimensions
         - Detects primary users dynamically (no hardcoding!)
         - Enables BEAST MODE features if available
@@ -52438,29 +52295,15 @@ class JarvisSystemKernel:
         """
         result: Dict[str, Any] = {
             "initialized": False,
-            "warming_up": True,  # v181.0: Indicates background init in progress
             "model_dimension": 0,
             "profiles_loaded": 0,
             "primary_users": [],
             "beast_mode_enabled": False,
             "warnings": [],
             "errors": [],
-            "background_task": None,  # Reference to warmup task
         }
 
-        self.logger.info("[VoiceBio] Initializing voice biometric system (async mode)...")
-
-        # =====================================================================
-        # v181.0: FAST PATH - Quick checks before heavy initialization
-        # Return early if voice biometrics is disabled or dependencies missing
-        # =====================================================================
-        voice_bio_enabled = os.environ.get("JARVIS_VOICE_BIO_ENABLED", "true").lower() == "true"
-        if not voice_bio_enabled:
-            self.logger.info("[VoiceBio] Voice biometrics disabled via JARVIS_VOICE_BIO_ENABLED=false")
-            result["initialized"] = False
-            result["warming_up"] = False
-            result["warnings"].append("Disabled via environment variable")
-            return result
+        self.logger.info("[VoiceBio] Initializing voice biometric system...")
 
         try:
             # Ensure backend dir is in path for imports
@@ -52468,122 +52311,104 @@ class JarvisSystemKernel:
             if str(backend_dir) not in sys.path:
                 sys.path.insert(0, str(backend_dir))
 
-            # =====================================================================
-            # v181.0: BACKGROUND WARMUP TASK
-            # Heavy ML initialization runs in background, returns immediately
-            # =====================================================================
-            async def _background_voice_bio_warmup() -> Dict[str, Any]:
-                """
-                Background task for heavy VoiceBio initialization.
-                This runs AFTER Phase 6 completes, not blocking startup.
-                """
-                warmup_result: Dict[str, Any] = {
-                    "initialized": False,
-                    "model_dimension": 0,
-                    "profiles_loaded": 0,
-                    "primary_users": [],
-                    "beast_mode_enabled": False,
-                    "warmup_time_ms": 0,
-                }
-                warmup_start = time.time()
+            # Initialize learning database (fast mode for parallel initialization)
+            self.logger.info("[VoiceBio] Loading learning database (fast mode)...")
+            try:
+                from intelligence.learning_database import JARVISLearningDatabase
 
-                try:
-                    # Initialize learning database
-                    self.logger.info("[VoiceBio/Warmup] Loading learning database...")
-                    learning_db = None
-                    try:
-                        from intelligence.learning_database import JARVISLearningDatabase
-                        learning_db = JARVISLearningDatabase()
-                        await learning_db.initialize(fast_mode=True)
-                        self.logger.info("[VoiceBio/Warmup] Learning database ready")
-                    except ImportError as e:
-                        self.logger.warning(f"[VoiceBio/Warmup] Learning database not available: {e}")
+                learning_db = JARVISLearningDatabase()
+                # v124.0: Use fast_mode=True for parallel initialization
+                # This reduces startup from 30+ seconds to ~5 seconds
+                await learning_db.initialize(fast_mode=True)
 
-                    # Initialize speaker verification service (this loads ECAPA)
-                    self.logger.info("[VoiceBio/Warmup] Loading speaker verification (ECAPA)...")
-                    try:
-                        from voice.speaker_verification_service import SpeakerVerificationService
-                        speaker_service = SpeakerVerificationService(learning_db)
-                        await speaker_service.initialize_fast()
+                self.logger.success("[VoiceBio] Learning database initialized (fast mode)")
 
-                        warmup_result["model_dimension"] = speaker_service.current_model_dimension
-                        warmup_result["profiles_loaded"] = len(speaker_service.speaker_profiles)
+                # Check for Phase 2 features
+                if hasattr(learning_db, 'hybrid_sync') and learning_db.hybrid_sync:
+                    hs = learning_db.hybrid_sync
+                    result["phase2_features"] = {
+                        "faiss_cache": bool(hs.faiss_cache and getattr(hs.faiss_cache, 'index', None)),
+                        "prometheus": bool(hs.prometheus and hs.prometheus.enabled),
+                        "redis": bool(hs.redis and getattr(hs.redis, 'redis', None)),
+                        "ml_prefetcher": bool(hs.ml_prefetcher),
+                    }
 
-                        # Dynamic primary user detection
-                        primary_users = []
-                        for name, profile in speaker_service.speaker_profiles.items():
-                            is_primary = (
-                                profile.get("is_primary_user", False) or
-                                profile.get("is_owner", False) or
-                                profile.get("security_clearance") == "admin"
-                            )
-                            if is_primary:
-                                primary_users.append(name)
+            except ImportError as e:
+                result["warnings"].append(f"Learning database not available: {e}")
+                learning_db = None
 
-                        if not primary_users:
-                            for name, profile in speaker_service.speaker_profiles.items():
-                                if profile.get("embedding") is not None:
-                                    primary_users.append(name)
+            # Initialize speaker verification service
+            self.logger.info("[VoiceBio] Loading speaker verification service...")
+            try:
+                from voice.speaker_verification_service import SpeakerVerificationService
 
-                        warmup_result["primary_users"] = primary_users
+                speaker_service = SpeakerVerificationService(learning_db)
+                await speaker_service.initialize_fast()  # Background encoder loading
 
-                        # Check BEAST MODE
-                        beast_mode_profiles = []
-                        for name, profile in speaker_service.speaker_profiles.items():
-                            acoustic_features = profile.get("acoustic_features", {})
-                            if any(v is not None for v in acoustic_features.values()):
-                                beast_mode_profiles.append(name)
+                result["model_dimension"] = speaker_service.current_model_dimension
+                result["profiles_loaded"] = len(speaker_service.speaker_profiles)
 
-                        warmup_result["beast_mode_enabled"] = len(beast_mode_profiles) > 0
-                        warmup_result["initialized"] = True
+                self.logger.success(
+                    f"[VoiceBio] Speaker verification ready: "
+                    f"{result['profiles_loaded']} profiles, {result['model_dimension']}D model"
+                )
 
-                        # Store service reference on kernel for later access
-                        self._voice_bio_service = speaker_service
-                        self._voice_bio_status = warmup_result
+                # Validate profile dimensions
+                mismatched = []
+                for name, profile in speaker_service.speaker_profiles.items():
+                    embedding = profile.get('embedding')
+                    if embedding is not None:
+                        import numpy as np
+                        emb_array = np.array(embedding)
+                        emb_dim = emb_array.shape[-1] if emb_array.ndim > 0 else 0
+                        if emb_dim != result["model_dimension"]:
+                            mismatched.append((name, emb_dim))
 
-                    except ImportError as e:
-                        self.logger.warning(f"[VoiceBio/Warmup] Speaker verification not available: {e}")
-
-                except Exception as e:
-                    self.logger.error(f"[VoiceBio/Warmup] Background warmup failed: {e}")
-
-                warmup_result["warmup_time_ms"] = int((time.time() - warmup_start) * 1000)
-
-                # Log completion
-                if warmup_result["initialized"]:
-                    self.logger.success(
-                        f"[VoiceBio/Warmup] ✅ READY in {warmup_result['warmup_time_ms']}ms - "
-                        f"{warmup_result['profiles_loaded']} profiles, "
-                        f"{warmup_result['model_dimension']}D model"
+                if mismatched:
+                    result["warnings"].append(
+                        f"{len(mismatched)} profiles need re-enrollment: "
+                        f"{[m[0] for m in mismatched]}"
                     )
-                    if warmup_result["beast_mode_enabled"]:
-                        self.logger.success("[VoiceBio/Warmup] 🔬 BEAST MODE enabled")
-                else:
-                    self.logger.warning(f"[VoiceBio/Warmup] Completed with errors after {warmup_result['warmup_time_ms']}ms")
 
-                return warmup_result
+                # Dynamic primary user detection (no hardcoding!)
+                primary_users = []
+                for name, profile in speaker_service.speaker_profiles.items():
+                    is_primary = (
+                        profile.get("is_primary_user", False) or
+                        profile.get("is_owner", False) or
+                        profile.get("security_clearance") == "admin"
+                    )
+                    if is_primary:
+                        primary_users.append(name)
 
-            # =====================================================================
-            # v181.0: START BACKGROUND WARMUP (NON-BLOCKING)
-            # This allows Phase 6 to complete immediately while ECAPA loads
-            # =====================================================================
-            warmup_task = asyncio.create_task(
-                _background_voice_bio_warmup(),
-                name="voice-bio-warmup"
-            )
-            self._background_tasks.append(warmup_task)
+                # Fallback: users with valid embeddings
+                if not primary_users:
+                    for name, profile in speaker_service.speaker_profiles.items():
+                        if profile.get("embedding") is not None:
+                            primary_users.append(name)
 
-            # Store task reference for monitoring
-            result["background_task"] = warmup_task
-            result["warming_up"] = True
-            result["initialized"] = True  # Service is "available" (degraded mode)
+                result["primary_users"] = primary_users
 
-            self.logger.info("[VoiceBio] 🔄 Background warmup started - service available in degraded mode")
-            self.logger.info("[VoiceBio]    ECAPA/ML loading will complete in background (~30s)")
+                # Check BEAST MODE (acoustic features)
+                beast_mode_profiles = []
+                for name, profile in speaker_service.speaker_profiles.items():
+                    acoustic_features = profile.get("acoustic_features", {})
+                    if any(v is not None for v in acoustic_features.values()):
+                        beast_mode_profiles.append(name)
+
+                result["beast_mode_enabled"] = len(beast_mode_profiles) > 0
+                if result["beast_mode_enabled"]:
+                    self.logger.success(
+                        f"[VoiceBio] 🔬 BEAST MODE enabled for {len(beast_mode_profiles)} profile(s)"
+                    )
+
+                result["initialized"] = True
+
+            except ImportError as e:
+                result["errors"].append(f"Speaker verification not available: {e}")
 
         except Exception as e:
             result["errors"].append(f"Voice biometric initialization failed: {e}")
-            result["warming_up"] = False
             self.logger.error(f"[VoiceBio] Initialization failed: {e}")
 
         return result
@@ -54825,7 +54650,7 @@ async def async_main(args: argparse.Namespace) -> int:
             if kernel._state not in (KernelState.STOPPED, KernelState.INITIALIZING):
                 kernel.logger.warning("[Kernel] Forcing shutdown in finally block...")
                 try:
-                    await asyncio.wait_for(kernel._emergency_shutdown(), timeout=5.0)
+                    await asyncio.wait_for(kernel.emergency_shutdown(), timeout=5.0)
                 except (asyncio.TimeoutError, Exception) as cleanup_err:
                     kernel.logger.error(f"[Kernel] Emergency shutdown error: {cleanup_err}")
 
