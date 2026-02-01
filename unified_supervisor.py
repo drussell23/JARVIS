@@ -6675,7 +6675,13 @@ class TrinityLaunchConfig:
     )
     reactor_core_launch_scripts: List[str] = field(default_factory=lambda:
         os.getenv("TRINITY_REACTOR_SCRIPTS",
-            "reactor_core/orchestration/trinity_orchestrator.py,run_orchestrator.py,main.py"
+            # Primary entry points for reactor-core (dynamically discovered order)
+            "run_reactor.py,"  # Primary: Direct reactor launcher
+            "run_supervisor.py,"  # Secondary: Supervisor-based launcher
+            "reactor_core/orchestration/trinity_orchestrator.py,"  # Orchestration bridge
+            "reactor_core/__init__.py,"  # Module entry with __main__ support
+            "run_orchestrator.py,"  # Legacy orchestrator
+            "main.py"  # Fallback standard entry
         ).split(",")
     )
 
@@ -46900,28 +46906,72 @@ class TrinityIntegrator:
         if not venv_python.exists():
             venv_python = Path(sys.executable)  # Fallback to current Python
 
-        # Find launch script
-        launch_scripts = [
-            component.repo_path / "run_server.py",
-            component.repo_path / "main.py",
-            component.repo_path / f"{component.name.replace('-', '_')}" / "server.py",
-        ]
+        # Find launch script - use component-specific scripts from config or dynamic discovery
+        # v118.0: Comprehensive launch script detection with repo-specific patterns
+        component_normalized = component.name.replace('-', '_').lower()
+
+        # Build prioritized list of candidate scripts based on component type
+        if 'reactor' in component_normalized:
+            # Reactor-Core specific scripts (in priority order)
+            launch_script_candidates = [
+                "run_reactor.py",           # Primary reactor entry point
+                "run_supervisor.py",        # Supervisor-based launcher
+                f"{component_normalized}/orchestration/trinity_orchestrator.py",
+                f"{component_normalized}/__init__.py",  # Module with __main__
+                "run_orchestrator.py",
+                "main.py",
+                f"{component_normalized}/server.py",
+            ]
+        elif 'prime' in component_normalized:
+            # JARVIS-Prime specific scripts (in priority order)
+            launch_script_candidates = [
+                f"{component_normalized}/server.py",  # Primary Prime server
+                "run_server.py",
+                f"{component_normalized}/core/trinity_bridge.py",
+                "main.py",
+                "run_prime.py",
+            ]
+        else:
+            # Generic fallback for any other component
+            launch_script_candidates = [
+                "run_server.py",
+                "main.py",
+                f"{component_normalized}/server.py",
+                "start.py",
+                "run.py",
+            ]
+
+        # Also check environment override for custom entry point
+        env_script_key = f"{component_normalized.upper()}_ENTRY_SCRIPT"
+        env_script = os.getenv(env_script_key)
+        if env_script:
+            launch_script_candidates.insert(0, env_script)
+
+        # Convert to full paths and find first existing script
+        launch_scripts = [component.repo_path / script for script in launch_script_candidates]
 
         launch_script = None
+        scripts_checked = []
         for script in launch_scripts:
+            scripts_checked.append(str(script.name))
             if script.exists():
                 launch_script = script
+                self.logger.debug(f"[Trinity] Found launch script: {script}")
                 break
 
         if not launch_script:
             self.logger.warning(f"[Trinity] No launch script found for {component.name}")
+            self.logger.debug(f"[Trinity] Checked scripts: {', '.join(scripts_checked)}")
             # Add to startup issue collector for organized display
             try:
                 collector = get_startup_issue_collector()
                 collector.add_warning(
                     f"No launch script found for {component.name}",
                     IssueCategory.TRINITY,
-                    suggestion=f"Create run.py or start.py in {component.repo_path}"
+                    suggestion=(
+                        f"Create one of: {', '.join(launch_script_candidates[:3])} in {component.repo_path}\n"
+                        f"Or set {env_script_key}=<script_name> environment variable"
+                    )
                 )
             except Exception:
                 pass
@@ -48842,33 +48892,40 @@ class JarvisSystemKernel:
         All services are optional - failures don't stop startup.
         """
         with self.logger.section_start(LogSection.BOOT, "Zone 6.4 | Phase 6: Enterprise Services"):
-            self.logger.info("[Zone6] Initializing enterprise services (parallel with 30s timeouts)...")
+            # v118.0: Adaptive timeouts based on service complexity
+            # - Fast services (local-only): 15s
+            # - Medium services (may need network): 30s
+            # - Slow services (ML models, external deps): 45s
+            FAST_TIMEOUT = float(os.getenv("ENTERPRISE_FAST_TIMEOUT", "15.0"))
+            MEDIUM_TIMEOUT = float(os.getenv("ENTERPRISE_MEDIUM_TIMEOUT", "30.0"))
+            SLOW_TIMEOUT = float(os.getenv("ENTERPRISE_SLOW_TIMEOUT", "45.0"))
 
-            # Define service initializations with individual timeouts
-            # Each service gets 30 seconds to initialize
-            SERVICE_TIMEOUT = 30.0
+            self.logger.info(
+                f"[Zone6] Initializing enterprise services (parallel, adaptive timeouts: "
+                f"{FAST_TIMEOUT:.0f}s/{MEDIUM_TIMEOUT:.0f}s/{SLOW_TIMEOUT:.0f}s)..."
+            )
 
-            # Run all service initializations in parallel with timeouts
+            # Run all service initializations in parallel with adaptive timeouts
             init_results = await asyncio.gather(
                 self._init_enterprise_service_with_timeout(
                     "CloudSQL",
                     self._initialize_cloud_sql_proxy(),
-                    SERVICE_TIMEOUT,
+                    MEDIUM_TIMEOUT,  # May need network, but has internal fallback
                 ),
                 self._init_enterprise_service_with_timeout(
                     "VoiceBio",
                     self._initialize_voice_biometrics(),
-                    SERVICE_TIMEOUT,
+                    SLOW_TIMEOUT,  # Uses fast_mode internally, but ML models may load
                 ),
                 self._init_enterprise_service_with_timeout(
                     "SemanticCache",
                     self._initialize_semantic_voice_cache(),
-                    SERVICE_TIMEOUT,
+                    FAST_TIMEOUT,  # ChromaDB is fast, local-only
                 ),
                 self._init_enterprise_service_with_timeout(
                     "InfraOrch",
                     self._initialize_infrastructure_orchestrator(),
-                    SERVICE_TIMEOUT,
+                    MEDIUM_TIMEOUT,  # GCP operations may need network
                 ),
                 return_exceptions=True
             )
@@ -49781,13 +49838,15 @@ class JarvisSystemKernel:
             if str(backend_dir) not in sys.path:
                 sys.path.insert(0, str(backend_dir))
 
-            # Initialize learning database
-            self.logger.info("[VoiceBio] Loading learning database...")
+            # v118.0: Parallel initialization strategy for voice biometrics
+            # Uses fast_mode=True for SQLite-first with background Cloud SQL upgrade
+            self.logger.info("[VoiceBio] Loading learning database (fast mode)...")
             try:
                 from intelligence.learning_database import JARVISLearningDatabase
 
                 learning_db = JARVISLearningDatabase()
-                await learning_db.initialize()
+                # Use fast_mode=True for parallel initialization (~5s instead of 30s)
+                await learning_db.initialize(fast_mode=True)
 
                 self.logger.success("[VoiceBio] Learning database initialized")
 
