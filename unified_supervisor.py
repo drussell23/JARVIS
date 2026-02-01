@@ -751,7 +751,10 @@ WEBSOCKET_PORT_RANGE = (8765, 8800)
 LOADING_SERVER_PORT_RANGE = (8080, 8090)
 
 # Timeouts (seconds)
-DEFAULT_STARTUP_TIMEOUT = 120.0
+# v181.0: Increased default startup timeout for enterprise initialization
+# The intelligent timeout calculation in startup() will compute the actual value
+# based on enabled features. This is the fallback minimum.
+DEFAULT_STARTUP_TIMEOUT = 180.0
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
 DEFAULT_HEALTH_CHECK_INTERVAL = 10.0
 DEFAULT_HOT_RELOAD_INTERVAL = 10.0
@@ -2428,6 +2431,7 @@ class IssueCategory(Enum):
     """Categories for organizing startup issues."""
     GCP = "GCP / Cloud"
     TRINITY = "Trinity Integration"
+    ENTERPRISE = "Enterprise Services"  # v181.0: Added for parallel phase tracking
     DATABASE = "Database / Storage"
     DOCKER = "Docker"
     VOICE = "Voice / Audio"
@@ -48969,6 +48973,7 @@ class JarvisSystemKernel:
         self._state = KernelState.INITIALIZING
         self._started_at: Optional[float] = None
         self._initialized = True
+        self._current_phase: str = "Initialization"  # v181.0: Track current phase for timeout diagnostics
 
         # Core components
         self._startup_lock = StartupLock()
@@ -49333,14 +49338,40 @@ class JarvisSystemKernel:
         - Enterprise startup banner
         - State recovery detection
 
+        v181.0 Enhanced with:
+        - Intelligent timeout calculation based on enabled phases
+        - Parallel phase execution (Trinity + Enterprise run concurrently)
+        - Graceful degradation on timeout (continue with what we have)
+
         Returns:
             Exit code (0 for success, non-zero for failure)
         """
-        # Apply global startup timeout to prevent infinite hangs
+        # =====================================================================
+        # v181.0: INTELLIGENT TIMEOUT CALCULATION
+        # Calculate startup timeout based on what phases are enabled
+        # =====================================================================
+        base_timeout = 60.0  # Minimum for basic phases (preflight, resources, backend)
+
+        # Add time for optional phases
+        if self.config.trinity_enabled:
+            trinity_timeout = float(os.environ.get("JARVIS_TRINITY_TIMEOUT", "60.0"))
+            base_timeout += trinity_timeout * 0.5  # Trinity runs in parallel, so 50% contribution
+
+        # Enterprise services are always enabled, add their parallel timeout
+        service_timeout = float(os.environ.get("JARVIS_SERVICE_TIMEOUT", "30.0"))
+        base_timeout += service_timeout  # Services run in parallel with Trinity
+
+        # Add buffer for frontend transition and verification
+        base_timeout += 30.0  # Frontend transition + service verification
+
+        # Allow override via environment variable, but calculate intelligent default
         startup_timeout = float(os.environ.get(
             "JARVIS_STARTUP_TIMEOUT",
-            str(DEFAULT_STARTUP_TIMEOUT)
+            str(max(base_timeout, DEFAULT_STARTUP_TIMEOUT))
         ))
+
+        self.logger.debug(f"[Kernel] Calculated startup timeout: {startup_timeout}s "
+                         f"(base={base_timeout:.1f}s, trinity={self.config.trinity_enabled})")
 
         try:
             return await asyncio.wait_for(
@@ -49350,7 +49381,12 @@ class JarvisSystemKernel:
         except asyncio.TimeoutError:
             self.logger.error(f"[Kernel] STARTUP TIMEOUT after {startup_timeout}s")
             self.logger.error("[Kernel] This may indicate a hung component or resource lock.")
-            self.logger.error("[Kernel] Try: python unified_supervisor.py --restart --force")
+            self.logger.error("[Kernel] Increase timeout: JARVIS_STARTUP_TIMEOUT=300")
+            self.logger.error("[Kernel] Or force restart: python unified_supervisor.py --restart --force")
+
+            # Log which phase we were in
+            if hasattr(self, '_current_phase'):
+                self.logger.error(f"[Kernel] Stuck during: {self._current_phase}")
 
             # Log diagnostic checkpoint for forensics
             if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
@@ -49460,6 +49496,7 @@ class JarvisSystemKernel:
             )
 
             # Phase 1: Preflight (Zone 5.1-5.4)
+            self._current_phase = "Phase 1: Preflight"
             issue_collector.set_current_phase("Phase 1: Preflight")
             issue_collector.set_current_zone("Zone 5")
             if self._narrator:
@@ -49494,6 +49531,7 @@ class JarvisSystemKernel:
             )
 
             # Phase 2: Resources (Zone 3)
+            self._current_phase = "Phase 2: Resources"
             issue_collector.set_current_phase("Phase 2: Resources")
             issue_collector.set_current_zone("Zone 3")
             if self._narrator:
@@ -49532,6 +49570,7 @@ class JarvisSystemKernel:
             )
 
             # Phase 3: Backend (Zone 6.1)
+            self._current_phase = "Phase 3: Backend"
             issue_collector.set_current_phase("Phase 3: Backend")
             issue_collector.set_current_zone("Zone 6")
             if self._narrator:
@@ -49568,6 +49607,7 @@ class JarvisSystemKernel:
             )
 
             # Phase 4: Intelligence (Zone 4)
+            self._current_phase = "Phase 4: Intelligence"
             issue_collector.set_current_phase("Phase 4: Intelligence")
             issue_collector.set_current_zone("Zone 4")
             if self._narrator:
@@ -49605,65 +49645,134 @@ class JarvisSystemKernel:
                 }
             )
 
-            # Phase 5: Trinity (Zone 5.7)
-            issue_collector.set_current_phase("Phase 5: Trinity")
-            issue_collector.set_current_zone("Zone 5.7")
-            if self.config.trinity_enabled:
-                if self._narrator:
-                    await self._narrator.narrate_phase_start("trinity")
-                await self._phase_trinity()
-            else:
-                # v170.0: Explicitly log when Trinity is disabled
-                self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
-                self.logger.info("[Kernel] Phase 5: Trinity - SKIPPED (disabled)")
-                self.logger.info(f"[Kernel]   Set JARVIS_TRINITY_ENABLED=true or --trinity to enable")
-                self.logger.info("[Kernel]   Trinity connects: JARVIS + J-Prime + Reactor-Core")
-                self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+            # =====================================================================
+            # v181.0: PARALLEL PHASE EXECUTION (Trinity + Enterprise)
+            # Trinity and Enterprise Services are INDEPENDENT - run them in parallel
+            # This dramatically reduces startup time (~60s saved)
+            # =====================================================================
+            self._current_phase = "Phase 5+6: Trinity + Enterprise (Parallel)"
+            issue_collector.set_current_phase("Phase 5+6: Parallel Initialization")
+            issue_collector.set_current_zone("Zone 5.7 + 6.4")
 
+            # Broadcast parallel phase start
             await self._broadcast_startup_progress(
-                stage="trinity",
-                message="Trinity connected - starting enterprise services...",
-                progress=80,
+                stage="parallel_init",
+                message="Initializing Trinity + Enterprise Services in parallel...",
+                progress=70,
                 metadata={
-                    "icon": "link",
-                    "phase": 5,
+                    "icon": "zap",
+                    "phase": "5+6",
+                    "parallel": True,
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
                         "resources": {"status": "complete"},
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
-                        "trinity": {"status": "complete"},
+                        "trinity": {"status": "running"},
                         "enterprise": {"status": "running"},
                         "frontend": {"status": "pending"},
                     }
                 }
             )
 
-            # Phase 6: Enterprise Services (Zone 6.4)
-            issue_collector.set_current_phase("Phase 6: Enterprise Services")
-            issue_collector.set_current_zone("Zone 6.4")
-            if self._narrator:
-                await self._narrator.narrate_phase_start("enterprise")
-            await self._phase_enterprise_services()
-            if self._narrator:
-                await self._narrator.narrate_zone_complete(6, success=True)
+            # Define parallel phase coroutines
+            async def _run_trinity_phase() -> bool:
+                """Trinity phase wrapper with narration."""
+                if not self.config.trinity_enabled:
+                    self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+                    self.logger.info("[Kernel] Phase 5: Trinity - SKIPPED (disabled)")
+                    self.logger.info(f"[Kernel]   Set JARVIS_TRINITY_ENABLED=true or --trinity to enable")
+                    self.logger.info("[Kernel]   Trinity connects: JARVIS + J-Prime + Reactor-Core")
+                    self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+                    return True  # Not an error, just disabled
 
+                if self._narrator:
+                    await self._narrator.narrate_phase_start("trinity")
+                try:
+                    await self._phase_trinity()
+                    return True
+                except Exception as e:
+                    self.logger.error(f"[Kernel] Trinity phase failed: {e}")
+                    issue_collector.add_warning(
+                        f"Trinity initialization failed: {e}",
+                        IssueCategory.TRINITY,
+                        suggestion="Check Trinity repo paths and connectivity"
+                    )
+                    return False
+
+            async def _run_enterprise_phase() -> bool:
+                """Enterprise services phase wrapper with narration."""
+                if self._narrator:
+                    await self._narrator.narrate_phase_start("enterprise")
+                try:
+                    await self._phase_enterprise_services()
+                    if self._narrator:
+                        await self._narrator.narrate_zone_complete(6, success=True)
+                    return True
+                except Exception as e:
+                    self.logger.error(f"[Kernel] Enterprise services phase failed: {e}")
+                    issue_collector.add_warning(
+                        f"Enterprise services failed: {e}",
+                        IssueCategory.ENTERPRISE,
+                        suggestion="Check service configurations and dependencies"
+                    )
+                    if self._narrator:
+                        await self._narrator.narrate_zone_complete(6, success=False)
+                    return False
+
+            # Execute Trinity and Enterprise in PARALLEL
+            self.logger.info("[Kernel] ═══════════════════════════════════════════════════════════════")
+            self.logger.info("[Kernel] 🚀 PARALLEL PHASE EXECUTION (v181.0)")
+            self.logger.info("[Kernel]   Phase 5: Trinity + Phase 6: Enterprise Services")
+            self.logger.info("[Kernel]   Running concurrently for faster startup...")
+            self.logger.info("[Kernel] ═══════════════════════════════════════════════════════════════")
+
+            parallel_start = asyncio.get_event_loop().time()
+            trinity_result, enterprise_result = await asyncio.gather(
+                _run_trinity_phase(),
+                _run_enterprise_phase(),
+                return_exceptions=True  # Don't let one failure stop the other
+            )
+            parallel_duration = asyncio.get_event_loop().time() - parallel_start
+
+            # Process results
+            trinity_success = trinity_result is True
+            enterprise_success = enterprise_result is True
+
+            if isinstance(trinity_result, Exception):
+                self.logger.error(f"[Kernel] Trinity raised exception: {trinity_result}")
+                trinity_success = False
+            if isinstance(enterprise_result, Exception):
+                self.logger.error(f"[Kernel] Enterprise raised exception: {enterprise_result}")
+                enterprise_success = False
+
+            # Log parallel execution summary
+            self.logger.info("[Kernel] ───────────────────────────────────────────────────────────────")
+            self.logger.info(f"[Kernel] Parallel phases completed in {parallel_duration:.1f}s")
+            self.logger.info(f"[Kernel]   Trinity: {'✓ Success' if trinity_success else '⚠ Failed/Disabled'}")
+            self.logger.info(f"[Kernel]   Enterprise: {'✓ Success' if enterprise_success else '⚠ Failed'}")
+            self.logger.info("[Kernel] ───────────────────────────────────────────────────────────────")
+
+            # Broadcast completion (both phases done)
             await self._broadcast_startup_progress(
                 stage="enterprise",
-                message="Enterprise services online - launching frontend...",
+                message="Trinity + Enterprise services initialized - launching frontend...",
                 progress=90,
                 metadata={
                     "icon": "building",
                     "phase": 6,
+                    "parallel_duration": parallel_duration,
+                    "trinity_success": trinity_success,
+                    "enterprise_success": enterprise_success,
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
                         "resources": {"status": "complete"},
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
-                        "trinity": {"status": "complete"},
-                        "enterprise": {"status": "complete"},
+                        "trinity": {"status": "complete" if trinity_success else "warning"},
+                        "enterprise": {"status": "complete" if enterprise_success else "warning"},
                         "frontend": {"status": "running"},
                     }
                 }
@@ -49675,6 +49784,7 @@ class JarvisSystemKernel:
             # Start the React frontend and transition browser from loading
             # page to the main JARVIS UI.
             # =================================================================
+            self._current_phase = "Phase 7: Frontend Transition"
             issue_collector.set_current_phase("Phase 7: Frontend Transition")
             issue_collector.set_current_zone("Zone 7")
 
@@ -54650,7 +54760,7 @@ async def async_main(args: argparse.Namespace) -> int:
             if kernel._state not in (KernelState.STOPPED, KernelState.INITIALIZING):
                 kernel.logger.warning("[Kernel] Forcing shutdown in finally block...")
                 try:
-                    await asyncio.wait_for(kernel.emergency_shutdown(), timeout=5.0)
+                    await asyncio.wait_for(kernel._emergency_shutdown(), timeout=5.0)
                 except (asyncio.TimeoutError, Exception) as cleanup_err:
                     kernel.logger.error(f"[Kernel] Emergency shutdown error: {cleanup_err}")
 
