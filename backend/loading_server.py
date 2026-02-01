@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JARVIS Loading Server v125.0 - Enterprise-Grade Startup Orchestration Hub
+JARVIS Loading Server v182.0 - Enterprise-Grade Startup Orchestration Hub
 ==========================================================================
 
 The ultimate loading server that serves as the central nervous system for
@@ -8,7 +8,7 @@ JARVIS startup coordination across all Trinity components.
 
 Architecture:
     ┌─────────────────────────────────────────────────────────────────────────┐
-    │                    Loading Server v125.0 (Port 3001)                    │
+    │                    Loading Server v182.0 (Port 3001)                    │
     ├─────────────────────────────────────────────────────────────────────────┤
     │  Layer 1: HTTP/WebSocket Server (asyncio native)                        │
     │  ├─ REST API endpoints for health, status, progress                     │
@@ -65,7 +65,7 @@ API Endpoints:
     GET  /sse/progress                - SSE fallback stream
 
 Author: JARVIS Trinity System
-Version: 125.0.0
+Version: 182.0.0
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ logging.basicConfig(
     level=getattr(logging, os.getenv("LOADING_SERVER_LOG_LEVEL", "INFO")),
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
 )
-logger = logging.getLogger("LoadingServer.v125")
+logger = logging.getLogger("LoadingServer.v182")
 
 T = TypeVar('T')
 
@@ -998,7 +998,7 @@ class LoadingServer:
             with suppress(Exception):
                 await writer.wait_closed()
 
-    async def _route_request(self, method: str, path: str, headers: Dict, body: Optional[bytes]) -> str:
+    async def _route_request(self, method: str, path: str, headers: Dict, body: Optional[bytes]) -> Union[str, bytes]:
         """Route HTTP request to appropriate handler."""
 
         # API Routes
@@ -1044,7 +1044,7 @@ class LoadingServer:
         elif path == "/" or path == "/index.html":
             return self._html_response(self._get_loading_page())
 
-        elif path.endswith((".js", ".css", ".png", ".ico")):
+        elif path.endswith((".js", ".css", ".png", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".json")):
             return self._serve_static_file(path)
 
         else:
@@ -1062,7 +1062,7 @@ class LoadingServer:
                 "health_level": state.get("health_level", 0),
             },
             "loading_server": {
-                "version": "125.0.0",
+                "version": "182.0.0",
                 "progress": self._progress,
                 "phase": self._phase,
                 "websocket_clients": self._ws_manager.connection_count,
@@ -1089,7 +1089,7 @@ class LoadingServer:
         return {
             "supervisor": state,
             "loading_server": {
-                "version": "125.0.0",
+                "version": "182.0.0",
                 "startup_time": self._startup_time,
                 "uptime_seconds": time.time() - self._startup_time,
                 "progress": self._progress,
@@ -1280,50 +1280,110 @@ class LoadingServer:
             f"{html}"
         )
 
-    def _serve_static_file(self, path: str) -> str:
-        """Serve static file."""
+    def _serve_static_file(self, path: str) -> Union[str, bytes]:
+        """
+        Serve static file with proper handling for both text and binary files.
+
+        v182.0: Fixed binary file handling for images, fonts, etc.
+        Now uses read_bytes() for binary files and read_text() for text files.
+        """
         static_dir = self.config.jarvis_repo / "frontend" / "public"
         file_path = static_dir / path.lstrip("/")
 
         if file_path.exists() and file_path.is_file():
-            content = file_path.read_text()
-            content_type = {
-                ".js": "application/javascript",
-                ".css": "text/css",
-                ".png": "image/png",
-                ".ico": "image/x-icon",
-            }.get(file_path.suffix, "text/plain")
+            # Content type mapping with binary flag
+            content_types = {
+                ".js": ("application/javascript", False),
+                ".css": ("text/css", False),
+                ".html": ("text/html", False),
+                ".json": ("application/json", False),
+                ".svg": ("image/svg+xml", False),
+                ".png": ("image/png", True),
+                ".ico": ("image/x-icon", True),
+                ".jpg": ("image/jpeg", True),
+                ".jpeg": ("image/jpeg", True),
+                ".gif": ("image/gif", True),
+                ".webp": ("image/webp", True),
+                ".woff": ("font/woff", True),
+                ".woff2": ("font/woff2", True),
+                ".ttf": ("font/ttf", True),
+                ".eot": ("application/vnd.ms-fontobject", True),
+            }
 
-            return (
-                f"HTTP/1.1 200 OK\r\n"
-                f"Content-Type: {content_type}\r\n"
-                f"Content-Length: {len(content.encode())}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
-                f"{content}"
-            )
+            content_type, is_binary = content_types.get(file_path.suffix.lower(), ("text/plain", False))
+
+            try:
+                if is_binary:
+                    # Binary files - read as bytes
+                    content = file_path.read_bytes()
+                    headers = (
+                        f"HTTP/1.1 200 OK\r\n"
+                        f"Content-Type: {content_type}\r\n"
+                        f"Content-Length: {len(content)}\r\n"
+                        f"Cache-Control: public, max-age=3600\r\n"
+                        f"Connection: close\r\n"
+                        f"\r\n"
+                    )
+                    return headers.encode() + content
+                else:
+                    # Text files - read as text
+                    content = file_path.read_text(encoding='utf-8')
+                    return (
+                        f"HTTP/1.1 200 OK\r\n"
+                        f"Content-Type: {content_type}; charset=utf-8\r\n"
+                        f"Content-Length: {len(content.encode('utf-8'))}\r\n"
+                        f"Cache-Control: public, max-age=300\r\n"
+                        f"Connection: close\r\n"
+                        f"\r\n"
+                        f"{content}"
+                    )
+            except Exception as e:
+                logger.warning(f"[v182.0] Error serving static file {path}: {e}")
+                return self._json_response({"error": f"Error reading file: {e}"}, status=500)
 
         return self._json_response({"error": "Not found"}, status=404)
 
     def _get_loading_page(self) -> str:
         """
-        Generate the loading page HTML with dynamic port configuration.
+        Serve the themed loading page HTML (Arc Reactor + Matrix theme).
 
-        v126.0: Fixed hardcoded ports - now uses actual configured ports from
-        environment variables (LOADING_SERVER_PORT, JARVIS_FRONTEND_PORT) for:
-        - WebSocket URL (ws://localhost:{loading_port}/ws/progress)
-        - API URL (http://localhost:{loading_port})
-        - Frontend redirect URL (http://localhost:{frontend_port})
+        v182.0: Now serves the actual themed loading.html from frontend/public/
+        instead of inline basic HTML. The themed page includes:
+        - Arc Reactor animation with rotating rings
+        - Matrix rain background effect
+        - Trinity Components status section
+        - Two-Tier Security status display
+        - Live operations log
+        - Stage indicators grid
+        - Particle effects
+        - Panel minimize/hide functionality
 
-        This ensures the loading page works correctly regardless of which
-        ports are configured.
+        The loading-manager.js handles dynamic port detection automatically
+        using window.location.port, so no port injection is needed.
+
+        Falls back to inline HTML only if the themed file cannot be loaded.
         """
-        # Get actual ports from configuration
+        # v182.0: Try to load the themed loading.html first
+        themed_loading_page = self.config.jarvis_repo / "frontend" / "public" / "loading.html"
+
+        try:
+            if themed_loading_page.exists():
+                html = themed_loading_page.read_text(encoding='utf-8')
+                logger.info(f"[v182.0] Serving themed loading page from {themed_loading_page}")
+                return html
+            else:
+                logger.warning(f"[v182.0] Themed loading page not found at {themed_loading_page}, using fallback")
+        except Exception as e:
+            logger.warning(f"[v182.0] Could not load themed loading page: {e}, using fallback")
+
+        # v182.0: Fallback to inline HTML only if themed page unavailable
+        # Get actual ports from configuration for the fallback
         loading_port = self.config.port
         frontend_port = self.config.frontend_port
 
-        # Use template with placeholders then substitute
-        # (can't use f-string because CSS uses curly braces)
+        logger.info(f"[v182.0] Using fallback inline loading page (ports: loading={loading_port}, frontend={frontend_port})")
+
+        # Fallback inline HTML (simpler version for emergencies)
         html = '''<!DOCTYPE html>
 <html lang="en">
 <head>
