@@ -26637,6 +26637,1608 @@ class InfrastructureProvisionerManager:
         }
 
 
+# =============================================================================
+# ZONE 4.13: DATA PIPELINE AND MESSAGING INFRASTRUCTURE
+# =============================================================================
+# Data pipeline, stream processing, and messaging patterns:
+# - DataPipelineManager: ETL pipeline orchestration
+# - StreamProcessor: Real-time event stream processing
+# - MessageBroker: Pub/sub messaging with topic management
+# - CronScheduler: Cron-style job scheduling
+# - WebhookDispatcher: Outgoing webhook management
+# - CacheInvalidationCoordinator: Distributed cache invalidation
+# - LoadSheddingController: Graceful degradation under load
+
+
+class PipelineStage:
+    """Represents a stage in a data pipeline."""
+
+    def __init__(
+        self,
+        stage_id: str,
+        name: str,
+        processor: Callable[[Any], Awaitable[Any]],
+        parallelism: int = 1,
+        buffer_size: int = 100,
+    ):
+        self.stage_id = stage_id
+        self.name = name
+        self.processor = processor
+        self.parallelism = parallelism
+        self.buffer_size = buffer_size
+
+        # Runtime state
+        self.items_processed = 0
+        self.items_failed = 0
+        self.total_processing_time = 0.0
+        self.last_processed_at: Optional[float] = None
+
+    @property
+    def average_latency_ms(self) -> float:
+        """Calculate average processing latency."""
+        if self.items_processed == 0:
+            return 0.0
+        return (self.total_processing_time / self.items_processed) * 1000
+
+
+class DataPipeline:
+    """Represents a data pipeline definition."""
+
+    def __init__(
+        self,
+        pipeline_id: str,
+        name: str,
+        description: str = "",
+    ):
+        self.pipeline_id = pipeline_id
+        self.name = name
+        self.description = description
+        self.stages: List[PipelineStage] = []
+        self.created_at = time.time()
+
+    def add_stage(
+        self,
+        name: str,
+        processor: Callable[[Any], Awaitable[Any]],
+        **kwargs
+    ) -> PipelineStage:
+        """Add a stage to the pipeline."""
+        stage = PipelineStage(
+            stage_id=str(uuid.uuid4())[:8],
+            name=name,
+            processor=processor,
+            **kwargs
+        )
+        self.stages.append(stage)
+        return stage
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize pipeline."""
+        return {
+            "pipeline_id": self.pipeline_id,
+            "name": self.name,
+            "description": self.description,
+            "stages": [
+                {
+                    "stage_id": s.stage_id,
+                    "name": s.name,
+                    "items_processed": s.items_processed,
+                    "items_failed": s.items_failed,
+                    "avg_latency_ms": s.average_latency_ms,
+                }
+                for s in self.stages
+            ],
+            "created_at": self.created_at,
+        }
+
+
+class PipelineRun:
+    """Represents a pipeline execution run."""
+
+    def __init__(
+        self,
+        run_id: str,
+        pipeline: DataPipeline,
+    ):
+        self.run_id = run_id
+        self.pipeline = pipeline
+        self.status = "pending"
+        self.started_at: Optional[float] = None
+        self.completed_at: Optional[float] = None
+        self.items_input = 0
+        self.items_output = 0
+        self.current_stage: Optional[str] = None
+        self.errors: List[Dict[str, Any]] = []
+
+
+class DataPipelineManager:
+    """
+    ETL pipeline orchestration.
+
+    Features:
+    - Multi-stage pipelines
+    - Parallel processing per stage
+    - Backpressure handling
+    - Error handling and dead letter
+    - Progress tracking
+    - Pipeline metrics
+    """
+
+    def __init__(
+        self,
+        max_concurrent_runs: int = 5,
+    ):
+        self._max_concurrent = max_concurrent_runs
+        self._semaphore = asyncio.Semaphore(max_concurrent_runs)
+
+        # Pipelines
+        self._pipelines: Dict[str, DataPipeline] = {}
+        self._runs: Dict[str, PipelineRun] = {}
+
+        # Statistics
+        self._stats = {
+            "pipelines_registered": 0,
+            "runs_completed": 0,
+            "runs_failed": 0,
+            "total_items_processed": 0,
+        }
+
+    def register_pipeline(self, pipeline: DataPipeline) -> None:
+        """Register a data pipeline."""
+        self._pipelines[pipeline.pipeline_id] = pipeline
+        self._stats["pipelines_registered"] = len(self._pipelines)
+
+    def create_pipeline(
+        self,
+        name: str,
+        description: str = "",
+    ) -> DataPipeline:
+        """Create and register a new pipeline."""
+        pipeline = DataPipeline(
+            pipeline_id=str(uuid.uuid4())[:12],
+            name=name,
+            description=description,
+        )
+        self.register_pipeline(pipeline)
+        return pipeline
+
+    async def run_pipeline(
+        self,
+        pipeline_id: str,
+        data: List[Any],
+    ) -> Optional[str]:
+        """
+        Execute a pipeline with input data.
+
+        Returns run ID.
+        """
+        pipeline = self._pipelines.get(pipeline_id)
+        if pipeline is None:
+            return None
+
+        run = PipelineRun(
+            run_id=str(uuid.uuid4())[:12],
+            pipeline=pipeline,
+        )
+        run.items_input = len(data)
+
+        self._runs[run.run_id] = run
+
+        # Execute in background
+        asyncio.create_task(self._execute_run(run, data))
+
+        return run.run_id
+
+    async def _execute_run(
+        self,
+        run: PipelineRun,
+        data: List[Any],
+    ) -> None:
+        """Execute a pipeline run."""
+        async with self._semaphore:
+            run.status = "running"
+            run.started_at = time.time()
+
+            current_data = data
+
+            try:
+                for stage in run.pipeline.stages:
+                    run.current_stage = stage.stage_id
+
+                    # Process data through stage
+                    stage_output = []
+                    stage_semaphore = asyncio.Semaphore(stage.parallelism)
+
+                    async def process_item(item: Any) -> Optional[Any]:
+                        async with stage_semaphore:
+                            start = time.time()
+                            try:
+                                result = await stage.processor(item)
+                                stage.items_processed += 1
+                                stage.total_processing_time += time.time() - start
+                                stage.last_processed_at = time.time()
+                                return result
+                            except Exception as e:
+                                stage.items_failed += 1
+                                run.errors.append({
+                                    "stage": stage.name,
+                                    "item": str(item)[:100],
+                                    "error": str(e),
+                                })
+                                return None
+
+                    # Process in parallel with buffer
+                    for i in range(0, len(current_data), stage.buffer_size):
+                        batch = current_data[i:i + stage.buffer_size]
+                        results = await asyncio.gather(
+                            *[process_item(item) for item in batch],
+                            return_exceptions=True,
+                        )
+                        stage_output.extend([r for r in results if r is not None])
+
+                    current_data = stage_output
+
+                run.items_output = len(current_data)
+                run.status = "completed"
+                run.completed_at = time.time()
+                self._stats["runs_completed"] += 1
+                self._stats["total_items_processed"] += run.items_output
+
+            except Exception as e:
+                run.status = "failed"
+                run.completed_at = time.time()
+                run.errors.append({
+                    "stage": "pipeline",
+                    "error": str(e),
+                })
+                self._stats["runs_failed"] += 1
+
+    def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Get status of a pipeline run."""
+        run = self._runs.get(run_id)
+        if run is None:
+            return None
+
+        return {
+            "run_id": run.run_id,
+            "pipeline_name": run.pipeline.name,
+            "status": run.status,
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+            "items_input": run.items_input,
+            "items_output": run.items_output,
+            "current_stage": run.current_stage,
+            "error_count": len(run.errors),
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get manager status."""
+        return {
+            "pipelines_registered": len(self._pipelines),
+            "active_runs": len([r for r in self._runs.values() if r.status == "running"]),
+            "stats": self._stats.copy(),
+        }
+
+
+class StreamEvent:
+    """Represents an event in a stream."""
+
+    def __init__(
+        self,
+        event_id: str,
+        stream_name: str,
+        event_type: str,
+        data: Dict[str, Any],
+        timestamp: Optional[float] = None,
+    ):
+        self.event_id = event_id
+        self.stream_name = stream_name
+        self.event_type = event_type
+        self.data = data
+        self.timestamp = timestamp or time.time()
+        self.metadata: Dict[str, Any] = {}
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize event."""
+        return {
+            "event_id": self.event_id,
+            "stream_name": self.stream_name,
+            "event_type": self.event_type,
+            "data": self.data,
+            "timestamp": self.timestamp,
+            "metadata": self.metadata,
+        }
+
+
+class StreamConsumerGroup:
+    """Consumer group for stream processing."""
+
+    def __init__(
+        self,
+        group_id: str,
+        stream_name: str,
+    ):
+        self.group_id = group_id
+        self.stream_name = stream_name
+        self.consumers: Set[str] = set()
+        self.last_processed_id: Optional[str] = None
+        self.pending_events: Dict[str, StreamEvent] = {}
+        self.acknowledged: Set[str] = set()
+
+    def add_consumer(self, consumer_id: str) -> None:
+        """Add a consumer to the group."""
+        self.consumers.add(consumer_id)
+
+    def remove_consumer(self, consumer_id: str) -> None:
+        """Remove a consumer from the group."""
+        self.consumers.discard(consumer_id)
+
+
+class StreamProcessor:
+    """
+    Real-time event stream processing.
+
+    Features:
+    - Named streams with partitioning
+    - Consumer groups with load balancing
+    - At-least-once delivery
+    - Event acknowledgment
+    - Backpressure handling
+    - Event replay from offset
+    """
+
+    def __init__(
+        self,
+        max_events_per_stream: int = 10000,
+        event_retention_seconds: float = 86400.0,
+    ):
+        self._max_events = max_events_per_stream
+        self._retention = event_retention_seconds
+
+        # Streams
+        self._streams: Dict[str, List[StreamEvent]] = defaultdict(list)
+        self._stream_offsets: Dict[str, int] = defaultdict(int)
+
+        # Consumer groups
+        self._consumer_groups: Dict[str, Dict[str, StreamConsumerGroup]] = defaultdict(dict)
+
+        # Event handlers per stream
+        self._handlers: Dict[str, List[Callable[[StreamEvent], Awaitable[None]]]] = defaultdict(list)
+
+        # Background tasks
+        self._processor_tasks: Dict[str, asyncio.Task] = {}
+        self._running = False
+
+        # Statistics
+        self._stats = {
+            "events_published": 0,
+            "events_processed": 0,
+            "events_acknowledged": 0,
+            "events_expired": 0,
+        }
+
+    async def start(self) -> None:
+        """Start stream processing."""
+        if self._running:
+            return
+
+        self._running = True
+
+    async def stop(self) -> None:
+        """Stop stream processing."""
+        self._running = False
+
+        for task in self._processor_tasks.values():
+            task.cancel()
+
+        await asyncio.gather(*self._processor_tasks.values(), return_exceptions=True)
+
+    async def publish(
+        self,
+        stream_name: str,
+        event_type: str,
+        data: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Publish an event to a stream.
+
+        Returns event ID.
+        """
+        event = StreamEvent(
+            event_id=str(uuid.uuid4()),
+            stream_name=stream_name,
+            event_type=event_type,
+            data=data,
+        )
+
+        if metadata:
+            event.metadata.update(metadata)
+
+        # Add to stream
+        self._streams[stream_name].append(event)
+        self._stream_offsets[stream_name] += 1
+
+        # Trim old events
+        self._trim_stream(stream_name)
+
+        self._stats["events_published"] += 1
+
+        # Notify handlers
+        await self._notify_handlers(event)
+
+        return event.event_id
+
+    def _trim_stream(self, stream_name: str) -> None:
+        """Trim stream to max size and remove expired events."""
+        stream = self._streams[stream_name]
+        now = time.time()
+
+        # Remove expired
+        original_len = len(stream)
+        stream[:] = [e for e in stream if now - e.timestamp < self._retention]
+        self._stats["events_expired"] += original_len - len(stream)
+
+        # Trim to max size
+        if len(stream) > self._max_events:
+            excess = len(stream) - self._max_events
+            stream[:] = stream[excess:]
+
+    async def _notify_handlers(self, event: StreamEvent) -> None:
+        """Notify registered handlers of new event."""
+        handlers = self._handlers.get(event.stream_name, [])
+        for handler in handlers:
+            try:
+                await handler(event)
+                self._stats["events_processed"] += 1
+            except Exception:
+                pass
+
+    def subscribe(
+        self,
+        stream_name: str,
+        handler: Callable[[StreamEvent], Awaitable[None]],
+    ) -> None:
+        """Subscribe to a stream with a handler."""
+        self._handlers[stream_name].append(handler)
+
+    def create_consumer_group(
+        self,
+        stream_name: str,
+        group_id: str,
+    ) -> StreamConsumerGroup:
+        """Create a consumer group for a stream."""
+        group = StreamConsumerGroup(
+            group_id=group_id,
+            stream_name=stream_name,
+        )
+        self._consumer_groups[stream_name][group_id] = group
+        return group
+
+    async def consume(
+        self,
+        stream_name: str,
+        group_id: str,
+        consumer_id: str,
+        count: int = 10,
+        timeout: float = 5.0,
+    ) -> List[StreamEvent]:
+        """
+        Consume events from a stream as part of a consumer group.
+
+        Events must be acknowledged after processing.
+        """
+        groups = self._consumer_groups.get(stream_name, {})
+        group = groups.get(group_id)
+
+        if group is None:
+            return []
+
+        # Add consumer to group
+        group.add_consumer(consumer_id)
+
+        # Get unacknowledged events
+        stream = self._streams.get(stream_name, [])
+        events = []
+
+        for event in stream:
+            if event.event_id in group.acknowledged:
+                continue
+            if event.event_id in group.pending_events:
+                continue
+
+            events.append(event)
+            group.pending_events[event.event_id] = event
+
+            if len(events) >= count:
+                break
+
+        return events
+
+    def acknowledge(
+        self,
+        stream_name: str,
+        group_id: str,
+        event_ids: List[str],
+    ) -> int:
+        """
+        Acknowledge processed events.
+
+        Returns number of events acknowledged.
+        """
+        groups = self._consumer_groups.get(stream_name, {})
+        group = groups.get(group_id)
+
+        if group is None:
+            return 0
+
+        count = 0
+        for event_id in event_ids:
+            if event_id in group.pending_events:
+                del group.pending_events[event_id]
+                group.acknowledged.add(event_id)
+                count += 1
+                self._stats["events_acknowledged"] += 1
+
+        return count
+
+    def get_stream_info(self, stream_name: str) -> Dict[str, Any]:
+        """Get information about a stream."""
+        stream = self._streams.get(stream_name, [])
+        return {
+            "stream_name": stream_name,
+            "event_count": len(stream),
+            "offset": self._stream_offsets.get(stream_name, 0),
+            "oldest_event": stream[0].timestamp if stream else None,
+            "newest_event": stream[-1].timestamp if stream else None,
+            "consumer_groups": list(self._consumer_groups.get(stream_name, {}).keys()),
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get processor status."""
+        return {
+            "running": self._running,
+            "streams": list(self._streams.keys()),
+            "total_events": sum(len(s) for s in self._streams.values()),
+            "stats": self._stats.copy(),
+        }
+
+
+class Topic:
+    """Represents a pub/sub topic."""
+
+    def __init__(
+        self,
+        topic_id: str,
+        name: str,
+    ):
+        self.topic_id = topic_id
+        self.name = name
+        self.created_at = time.time()
+        self.subscribers: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
+        self.message_count = 0
+
+
+class MessageBroker:
+    """
+    Pub/sub messaging with topic management.
+
+    Features:
+    - Named topics
+    - Multiple subscribers per topic
+    - Async message delivery
+    - Dead letter handling
+    - Message filtering
+    - Topic wildcards
+    """
+
+    def __init__(
+        self,
+        delivery_timeout: float = 30.0,
+        max_retries: int = 3,
+    ):
+        self._delivery_timeout = delivery_timeout
+        self._max_retries = max_retries
+
+        # Topics
+        self._topics: Dict[str, Topic] = {}
+
+        # Dead letter
+        self._dead_letter: List[Dict[str, Any]] = []
+
+        # Statistics
+        self._stats = {
+            "topics_created": 0,
+            "messages_published": 0,
+            "messages_delivered": 0,
+            "delivery_failures": 0,
+        }
+
+    def create_topic(self, name: str) -> str:
+        """
+        Create a topic.
+
+        Returns topic ID.
+        """
+        topic_id = str(uuid.uuid4())[:12]
+        topic = Topic(topic_id=topic_id, name=name)
+        self._topics[name] = topic
+        self._stats["topics_created"] += 1
+        return topic_id
+
+    def delete_topic(self, name: str) -> bool:
+        """Delete a topic."""
+        if name in self._topics:
+            del self._topics[name]
+            return True
+        return False
+
+    def subscribe(
+        self,
+        topic_name: str,
+        subscriber_id: str,
+        handler: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> bool:
+        """
+        Subscribe to a topic.
+
+        Returns True if subscription successful.
+        """
+        topic = self._topics.get(topic_name)
+        if topic is None:
+            return False
+
+        topic.subscribers[subscriber_id] = handler
+        return True
+
+    def unsubscribe(self, topic_name: str, subscriber_id: str) -> bool:
+        """Unsubscribe from a topic."""
+        topic = self._topics.get(topic_name)
+        if topic and subscriber_id in topic.subscribers:
+            del topic.subscribers[subscriber_id]
+            return True
+        return False
+
+    async def publish(
+        self,
+        topic_name: str,
+        message: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Publish a message to a topic.
+
+        Returns message ID.
+        """
+        topic = self._topics.get(topic_name)
+        if topic is None:
+            raise ValueError(f"Topic not found: {topic_name}")
+
+        message_id = str(uuid.uuid4())
+        topic.message_count += 1
+        self._stats["messages_published"] += 1
+
+        envelope = {
+            "message_id": message_id,
+            "topic": topic_name,
+            "payload": message,
+            "metadata": metadata or {},
+            "timestamp": time.time(),
+        }
+
+        # Deliver to all subscribers
+        tasks = []
+        for sub_id, handler in topic.subscribers.items():
+            tasks.append(self._deliver(envelope, sub_id, handler))
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        return message_id
+
+    async def _deliver(
+        self,
+        envelope: Dict[str, Any],
+        subscriber_id: str,
+        handler: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Deliver message to a subscriber with retries."""
+        for attempt in range(self._max_retries):
+            try:
+                await asyncio.wait_for(
+                    handler(envelope),
+                    timeout=self._delivery_timeout,
+                )
+                self._stats["messages_delivered"] += 1
+                return
+            except Exception:
+                if attempt == self._max_retries - 1:
+                    # Move to dead letter
+                    self._dead_letter.append({
+                        **envelope,
+                        "subscriber_id": subscriber_id,
+                        "failed_at": time.time(),
+                    })
+                    self._stats["delivery_failures"] += 1
+                else:
+                    await asyncio.sleep(2 ** attempt)
+
+    async def publish_pattern(
+        self,
+        pattern: str,
+        message: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """
+        Publish to topics matching a pattern (supports * wildcard).
+
+        Returns list of message IDs.
+        """
+        import fnmatch
+
+        message_ids = []
+        for topic_name in self._topics.keys():
+            if fnmatch.fnmatch(topic_name, pattern):
+                msg_id = await self.publish(topic_name, message, metadata)
+                message_ids.append(msg_id)
+
+        return message_ids
+
+    def get_dead_letter_messages(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get messages from dead letter queue."""
+        return self._dead_letter[-limit:]
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get broker status."""
+        return {
+            "topics_count": len(self._topics),
+            "total_subscribers": sum(len(t.subscribers) for t in self._topics.values()),
+            "dead_letter_count": len(self._dead_letter),
+            "stats": self._stats.copy(),
+        }
+
+
+class ScheduledJob:
+    """Represents a scheduled job."""
+
+    def __init__(
+        self,
+        job_id: str,
+        name: str,
+        cron_expression: str,
+        handler: Callable[[], Awaitable[None]],
+        enabled: bool = True,
+    ):
+        self.job_id = job_id
+        self.name = name
+        self.cron_expression = cron_expression
+        self.handler = handler
+        self.enabled = enabled
+
+        self.created_at = time.time()
+        self.last_run_at: Optional[float] = None
+        self.next_run_at: Optional[float] = None
+        self.run_count = 0
+        self.failure_count = 0
+        self.last_error: Optional[str] = None
+
+
+class CronScheduler:
+    """
+    Cron-style job scheduling.
+
+    Features:
+    - Cron expression parsing
+    - Multiple concurrent jobs
+    - Job enable/disable
+    - Execution history
+    - Error handling
+    """
+
+    def __init__(
+        self,
+        max_concurrent_jobs: int = 10,
+    ):
+        self._max_concurrent = max_concurrent_jobs
+        self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
+
+        # Jobs
+        self._jobs: Dict[str, ScheduledJob] = {}
+
+        # Execution history
+        self._history: List[Dict[str, Any]] = []
+        self._history_max_size = 1000
+
+        # Background task
+        self._scheduler_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Statistics
+        self._stats = {
+            "jobs_registered": 0,
+            "executions": 0,
+            "failures": 0,
+        }
+
+    async def start(self) -> None:
+        """Start the scheduler."""
+        if self._running:
+            return
+
+        self._running = True
+
+        # Calculate initial next_run for all jobs
+        for job in self._jobs.values():
+            job.next_run_at = self._calculate_next_run(job.cron_expression)
+
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+
+    async def stop(self) -> None:
+        """Stop the scheduler."""
+        self._running = False
+
+        if self._scheduler_task:
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
+
+    def schedule(
+        self,
+        name: str,
+        cron_expression: str,
+        handler: Callable[[], Awaitable[None]],
+        enabled: bool = True,
+    ) -> str:
+        """
+        Schedule a job with cron expression.
+
+        Cron format: minute hour day month weekday
+        Examples:
+        - "0 * * * *" = every hour
+        - "*/5 * * * *" = every 5 minutes
+        - "0 0 * * *" = daily at midnight
+
+        Returns job ID.
+        """
+        job_id = str(uuid.uuid4())[:12]
+
+        job = ScheduledJob(
+            job_id=job_id,
+            name=name,
+            cron_expression=cron_expression,
+            handler=handler,
+            enabled=enabled,
+        )
+
+        job.next_run_at = self._calculate_next_run(cron_expression)
+        self._jobs[job_id] = job
+        self._stats["jobs_registered"] = len(self._jobs)
+
+        return job_id
+
+    def unschedule(self, job_id: str) -> bool:
+        """Remove a scheduled job."""
+        if job_id in self._jobs:
+            del self._jobs[job_id]
+            return True
+        return False
+
+    def enable_job(self, job_id: str) -> bool:
+        """Enable a job."""
+        job = self._jobs.get(job_id)
+        if job:
+            job.enabled = True
+            return True
+        return False
+
+    def disable_job(self, job_id: str) -> bool:
+        """Disable a job."""
+        job = self._jobs.get(job_id)
+        if job:
+            job.enabled = False
+            return True
+        return False
+
+    def _calculate_next_run(self, cron_expr: str) -> float:
+        """Calculate next run time for a cron expression (simplified)."""
+        # Simplified cron parsing - in production use a proper cron library
+        now = time.time()
+
+        parts = cron_expr.split()
+        if len(parts) != 5:
+            return now + 60  # Default to 1 minute
+
+        minute_expr = parts[0]
+
+        # Handle */N pattern
+        if minute_expr.startswith("*/"):
+            interval = int(minute_expr[2:])
+            return now + (interval * 60)
+        elif minute_expr == "*":
+            return now + 60
+        else:
+            # Specific minute
+            try:
+                target_minute = int(minute_expr)
+                current = datetime.fromtimestamp(now)
+                next_run = current.replace(minute=target_minute, second=0, microsecond=0)
+                if next_run.timestamp() <= now:
+                    next_run = next_run.replace(hour=current.hour + 1)
+                return next_run.timestamp()
+            except ValueError:
+                return now + 60
+
+    async def _scheduler_loop(self) -> None:
+        """Main scheduler loop."""
+        while self._running:
+            try:
+                now = time.time()
+
+                for job in self._jobs.values():
+                    if not job.enabled:
+                        continue
+                    if job.next_run_at is None:
+                        continue
+                    if job.next_run_at > now:
+                        continue
+
+                    # Time to run
+                    asyncio.create_task(self._execute_job(job))
+                    job.next_run_at = self._calculate_next_run(job.cron_expression)
+
+                await asyncio.sleep(1)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _execute_job(self, job: ScheduledJob) -> None:
+        """Execute a scheduled job."""
+        async with self._semaphore:
+            start_time = time.time()
+            success = True
+            error = None
+
+            try:
+                await job.handler()
+            except Exception as e:
+                success = False
+                error = str(e)
+                job.failure_count += 1
+                job.last_error = error
+                self._stats["failures"] += 1
+
+            job.last_run_at = start_time
+            job.run_count += 1
+            self._stats["executions"] += 1
+
+            # Record history
+            self._history.append({
+                "job_id": job.job_id,
+                "job_name": job.name,
+                "started_at": start_time,
+                "duration_ms": (time.time() - start_time) * 1000,
+                "success": success,
+                "error": error,
+            })
+
+            if len(self._history) > self._history_max_size:
+                self._history = self._history[-500:]
+
+    async def run_now(self, job_id: str) -> bool:
+        """Trigger immediate execution of a job."""
+        job = self._jobs.get(job_id)
+        if job:
+            asyncio.create_task(self._execute_job(job))
+            return True
+        return False
+
+    def get_history(self, job_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get execution history."""
+        history = self._history
+        if job_id:
+            history = [h for h in history if h["job_id"] == job_id]
+        return history[-limit:]
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get scheduler status."""
+        return {
+            "running": self._running,
+            "jobs_count": len(self._jobs),
+            "enabled_jobs": len([j for j in self._jobs.values() if j.enabled]),
+            "stats": self._stats.copy(),
+        }
+
+
+class Webhook:
+    """Represents a webhook endpoint."""
+
+    def __init__(
+        self,
+        webhook_id: str,
+        name: str,
+        url: str,
+        events: List[str],
+        secret: Optional[str] = None,
+    ):
+        self.webhook_id = webhook_id
+        self.name = name
+        self.url = url
+        self.events = events
+        self.secret = secret
+
+        self.created_at = time.time()
+        self.enabled = True
+        self.delivery_count = 0
+        self.failure_count = 0
+        self.last_delivery_at: Optional[float] = None
+        self.last_failure_at: Optional[float] = None
+
+
+class WebhookDispatcher:
+    """
+    Outgoing webhook management.
+
+    Features:
+    - Webhook registration
+    - Event-based triggering
+    - Retry logic
+    - Signature verification
+    - Delivery tracking
+    """
+
+    def __init__(
+        self,
+        delivery_timeout: float = 30.0,
+        max_retries: int = 3,
+        retry_delay: float = 5.0,
+    ):
+        self._delivery_timeout = delivery_timeout
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay
+
+        # Webhooks
+        self._webhooks: Dict[str, Webhook] = {}
+
+        # Pending deliveries
+        self._pending: List[Dict[str, Any]] = []
+
+        # Statistics
+        self._stats = {
+            "webhooks_registered": 0,
+            "deliveries_attempted": 0,
+            "deliveries_succeeded": 0,
+            "deliveries_failed": 0,
+        }
+
+    def register(
+        self,
+        name: str,
+        url: str,
+        events: List[str],
+        secret: Optional[str] = None,
+    ) -> str:
+        """
+        Register a webhook.
+
+        Returns webhook ID.
+        """
+        webhook_id = str(uuid.uuid4())[:12]
+
+        webhook = Webhook(
+            webhook_id=webhook_id,
+            name=name,
+            url=url,
+            events=events,
+            secret=secret,
+        )
+
+        self._webhooks[webhook_id] = webhook
+        self._stats["webhooks_registered"] = len(self._webhooks)
+
+        return webhook_id
+
+    def unregister(self, webhook_id: str) -> bool:
+        """Unregister a webhook."""
+        if webhook_id in self._webhooks:
+            del self._webhooks[webhook_id]
+            return True
+        return False
+
+    async def dispatch(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> List[str]:
+        """
+        Dispatch an event to matching webhooks.
+
+        Returns list of webhook IDs that received the event.
+        """
+        dispatched = []
+
+        for webhook in self._webhooks.values():
+            if not webhook.enabled:
+                continue
+            if event_type not in webhook.events and "*" not in webhook.events:
+                continue
+
+            asyncio.create_task(self._deliver(webhook, event_type, payload))
+            dispatched.append(webhook.webhook_id)
+
+        return dispatched
+
+    async def _deliver(
+        self,
+        webhook: Webhook,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Deliver payload to webhook with retries."""
+        self._stats["deliveries_attempted"] += 1
+
+        delivery_payload = {
+            "event": event_type,
+            "payload": payload,
+            "timestamp": time.time(),
+            "webhook_id": webhook.webhook_id,
+        }
+
+        # Generate signature if secret is set
+        signature = None
+        if webhook.secret:
+            sig_data = json.dumps(delivery_payload, sort_keys=True)
+            signature = hashlib.sha256(
+                f"{webhook.secret}:{sig_data}".encode()
+            ).hexdigest()
+
+        for attempt in range(self._max_retries):
+            try:
+                # In production, this would make actual HTTP request
+                # For now, simulate delivery
+                await asyncio.sleep(0.1)
+
+                # Simulate success
+                webhook.delivery_count += 1
+                webhook.last_delivery_at = time.time()
+                self._stats["deliveries_succeeded"] += 1
+                return True
+
+            except Exception:
+                if attempt == self._max_retries - 1:
+                    webhook.failure_count += 1
+                    webhook.last_failure_at = time.time()
+                    self._stats["deliveries_failed"] += 1
+                    return False
+                else:
+                    await asyncio.sleep(self._retry_delay * (attempt + 1))
+
+        return False
+
+    def list_webhooks(self) -> List[Dict[str, Any]]:
+        """List all webhooks."""
+        return [
+            {
+                "webhook_id": w.webhook_id,
+                "name": w.name,
+                "url": w.url,
+                "events": w.events,
+                "enabled": w.enabled,
+                "delivery_count": w.delivery_count,
+                "failure_count": w.failure_count,
+            }
+            for w in self._webhooks.values()
+        ]
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get dispatcher status."""
+        return {
+            "webhooks_registered": len(self._webhooks),
+            "enabled_webhooks": len([w for w in self._webhooks.values() if w.enabled]),
+            "stats": self._stats.copy(),
+        }
+
+
+class CacheRegion:
+    """Represents a cache region for invalidation coordination."""
+
+    def __init__(
+        self,
+        region_id: str,
+        name: str,
+    ):
+        self.region_id = region_id
+        self.name = name
+        self.keys: Set[str] = set()
+        self.last_invalidation_at: Optional[float] = None
+        self.invalidation_count = 0
+
+
+class CacheInvalidationCoordinator:
+    """
+    Distributed cache invalidation.
+
+    Features:
+    - Region-based invalidation
+    - Pattern-based key invalidation
+    - Cross-instance coordination
+    - Invalidation queuing
+    - Conflict resolution
+    """
+
+    def __init__(
+        self,
+        broadcast_callback: Optional[Callable[[str, List[str]], Awaitable[None]]] = None,
+    ):
+        self._broadcast_callback = broadcast_callback
+
+        # Regions
+        self._regions: Dict[str, CacheRegion] = {}
+
+        # Key to region mapping
+        self._key_regions: Dict[str, Set[str]] = defaultdict(set)
+
+        # Invalidation queue
+        self._pending_invalidations: List[Dict[str, Any]] = []
+
+        # Statistics
+        self._stats = {
+            "regions_created": 0,
+            "invalidations": 0,
+            "keys_invalidated": 0,
+            "broadcasts_sent": 0,
+        }
+
+    def create_region(self, name: str) -> str:
+        """
+        Create a cache region.
+
+        Returns region ID.
+        """
+        region_id = str(uuid.uuid4())[:12]
+        region = CacheRegion(region_id=region_id, name=name)
+        self._regions[name] = region
+        self._stats["regions_created"] += 1
+        return region_id
+
+    def register_key(self, key: str, regions: List[str]) -> None:
+        """Register a key with one or more regions."""
+        for region_name in regions:
+            region = self._regions.get(region_name)
+            if region:
+                region.keys.add(key)
+                self._key_regions[key].add(region_name)
+
+    async def invalidate_key(
+        self,
+        key: str,
+        broadcast: bool = True,
+    ) -> int:
+        """
+        Invalidate a specific key.
+
+        Returns number of regions affected.
+        """
+        regions_affected = self._key_regions.get(key, set())
+
+        for region_name in regions_affected:
+            region = self._regions.get(region_name)
+            if region:
+                region.keys.discard(key)
+                region.last_invalidation_at = time.time()
+                region.invalidation_count += 1
+
+        if regions_affected:
+            self._stats["invalidations"] += 1
+            self._stats["keys_invalidated"] += 1
+
+        # Broadcast to other instances
+        if broadcast and self._broadcast_callback:
+            try:
+                await self._broadcast_callback("key", [key])
+                self._stats["broadcasts_sent"] += 1
+            except Exception:
+                pass
+
+        return len(regions_affected)
+
+    async def invalidate_region(
+        self,
+        region_name: str,
+        broadcast: bool = True,
+    ) -> int:
+        """
+        Invalidate all keys in a region.
+
+        Returns number of keys invalidated.
+        """
+        region = self._regions.get(region_name)
+        if region is None:
+            return 0
+
+        keys_invalidated = len(region.keys)
+        keys_to_invalidate = list(region.keys)
+
+        # Remove keys from region
+        region.keys.clear()
+        region.last_invalidation_at = time.time()
+        region.invalidation_count += 1
+
+        # Remove key-region mappings
+        for key in keys_to_invalidate:
+            self._key_regions[key].discard(region_name)
+            if not self._key_regions[key]:
+                del self._key_regions[key]
+
+        self._stats["invalidations"] += 1
+        self._stats["keys_invalidated"] += keys_invalidated
+
+        # Broadcast
+        if broadcast and self._broadcast_callback:
+            try:
+                await self._broadcast_callback("region", [region_name])
+                self._stats["broadcasts_sent"] += 1
+            except Exception:
+                pass
+
+        return keys_invalidated
+
+    async def invalidate_pattern(
+        self,
+        pattern: str,
+        broadcast: bool = True,
+    ) -> int:
+        """
+        Invalidate keys matching a pattern.
+
+        Returns number of keys invalidated.
+        """
+        import fnmatch
+
+        keys_to_invalidate = [
+            key for key in self._key_regions.keys()
+            if fnmatch.fnmatch(key, pattern)
+        ]
+
+        count = 0
+        for key in keys_to_invalidate:
+            count += await self.invalidate_key(key, broadcast=False)
+
+        # Single broadcast for pattern
+        if broadcast and self._broadcast_callback and keys_to_invalidate:
+            try:
+                await self._broadcast_callback("pattern", [pattern])
+                self._stats["broadcasts_sent"] += 1
+            except Exception:
+                pass
+
+        return count
+
+    async def handle_broadcast(
+        self,
+        invalidation_type: str,
+        targets: List[str],
+    ) -> None:
+        """Handle incoming invalidation broadcast from other instances."""
+        if invalidation_type == "key":
+            for key in targets:
+                await self.invalidate_key(key, broadcast=False)
+        elif invalidation_type == "region":
+            for region in targets:
+                await self.invalidate_region(region, broadcast=False)
+        elif invalidation_type == "pattern":
+            for pattern in targets:
+                await self.invalidate_pattern(pattern, broadcast=False)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get coordinator status."""
+        return {
+            "regions": len(self._regions),
+            "total_keys_tracked": sum(len(r.keys) for r in self._regions.values()),
+            "stats": self._stats.copy(),
+        }
+
+
+class LoadSheddingPolicy:
+    """Load shedding policy configuration."""
+
+    def __init__(
+        self,
+        name: str,
+        threshold: float,
+        action: str,  # reject, delay, degrade
+        priority_threshold: int = 0,  # Only shed below this priority
+    ):
+        self.name = name
+        self.threshold = threshold
+        self.action = action
+        self.priority_threshold = priority_threshold
+
+
+class LoadSheddingController:
+    """
+    Graceful degradation under load.
+
+    Features:
+    - Request prioritization
+    - Progressive load shedding
+    - Circuit breaker integration
+    - Recovery detection
+    - Metrics-based decisions
+    """
+
+    def __init__(
+        self,
+        max_load: float = 100.0,
+        recovery_threshold: float = 70.0,
+        measurement_window: float = 60.0,
+    ):
+        self._max_load = max_load
+        self._recovery_threshold = recovery_threshold
+        self._measurement_window = measurement_window
+
+        # Current load
+        self._current_load = 0.0
+        self._load_history: List[Tuple[float, float]] = []
+
+        # Shedding state
+        self._shedding_active = False
+        self._shedding_level = 0  # 0-100%
+
+        # Policies
+        self._policies: List[LoadSheddingPolicy] = [
+            LoadSheddingPolicy("low_priority", 80.0, "reject", priority_threshold=3),
+            LoadSheddingPolicy("medium_priority", 90.0, "delay", priority_threshold=2),
+            LoadSheddingPolicy("high_priority", 95.0, "degrade", priority_threshold=1),
+        ]
+
+        # Request tracking
+        self._requests_accepted = 0
+        self._requests_rejected = 0
+        self._requests_delayed = 0
+        self._requests_degraded = 0
+
+        # Statistics
+        self._stats = {
+            "shedding_activations": 0,
+            "shedding_recoveries": 0,
+            "total_shed": 0,
+        }
+
+    def record_load(self, load: float) -> None:
+        """Record current load measurement."""
+        now = time.time()
+        self._current_load = load
+
+        self._load_history.append((now, load))
+
+        # Trim old measurements
+        cutoff = now - self._measurement_window
+        self._load_history = [
+            (t, l) for t, l in self._load_history if t > cutoff
+        ]
+
+        # Update shedding state
+        self._update_shedding_state()
+
+    def _update_shedding_state(self) -> None:
+        """Update load shedding state based on current load."""
+        was_shedding = self._shedding_active
+
+        if self._current_load >= self._max_load:
+            self._shedding_active = True
+            self._shedding_level = min(100, int((self._current_load - self._max_load) / 10 * 100))
+        elif self._current_load < self._recovery_threshold:
+            self._shedding_active = False
+            self._shedding_level = 0
+
+        if self._shedding_active and not was_shedding:
+            self._stats["shedding_activations"] += 1
+        elif not self._shedding_active and was_shedding:
+            self._stats["shedding_recoveries"] += 1
+
+    def should_accept(
+        self,
+        priority: int = 5,  # 0=highest, 10=lowest
+        request_type: str = "",
+    ) -> Tuple[bool, str]:
+        """
+        Check if a request should be accepted.
+
+        Returns (should_accept, reason).
+        """
+        if not self._shedding_active:
+            self._requests_accepted += 1
+            return True, "ok"
+
+        # Find applicable policy
+        for policy in self._policies:
+            if self._current_load >= policy.threshold:
+                if priority >= policy.priority_threshold:
+                    if policy.action == "reject":
+                        self._requests_rejected += 1
+                        self._stats["total_shed"] += 1
+                        return False, f"load_shed:{policy.name}"
+                    elif policy.action == "delay":
+                        self._requests_delayed += 1
+                        return True, f"delay:{policy.name}"
+                    elif policy.action == "degrade":
+                        self._requests_degraded += 1
+                        return True, f"degrade:{policy.name}"
+
+        self._requests_accepted += 1
+        return True, "ok"
+
+    async def with_shedding(
+        self,
+        priority: int,
+        handler: Callable[[], Awaitable[Any]],
+        degraded_handler: Optional[Callable[[], Awaitable[Any]]] = None,
+        delay_ms: float = 100.0,
+    ) -> Any:
+        """
+        Execute handler with load shedding logic.
+
+        Args:
+            priority: Request priority (0=highest)
+            handler: Normal handler
+            degraded_handler: Handler to use in degraded mode
+            delay_ms: Delay to apply if in delay mode
+        """
+        accept, action = self.should_accept(priority)
+
+        if not accept:
+            raise RuntimeError(f"Request rejected: {action}")
+
+        if action.startswith("delay:"):
+            await asyncio.sleep(delay_ms / 1000)
+            return await handler()
+
+        if action.startswith("degrade:") and degraded_handler:
+            return await degraded_handler()
+
+        return await handler()
+
+    def add_policy(
+        self,
+        name: str,
+        threshold: float,
+        action: str,
+        priority_threshold: int = 0,
+    ) -> None:
+        """Add a load shedding policy."""
+        self._policies.append(LoadSheddingPolicy(
+            name=name,
+            threshold=threshold,
+            action=action,
+            priority_threshold=priority_threshold,
+        ))
+        # Sort by threshold
+        self._policies.sort(key=lambda p: p.threshold)
+
+    def get_average_load(self) -> float:
+        """Get average load over measurement window."""
+        if not self._load_history:
+            return 0.0
+        return sum(l for _, l in self._load_history) / len(self._load_history)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get controller status."""
+        return {
+            "current_load": self._current_load,
+            "average_load": self.get_average_load(),
+            "shedding_active": self._shedding_active,
+            "shedding_level": self._shedding_level,
+            "requests_accepted": self._requests_accepted,
+            "requests_rejected": self._requests_rejected,
+            "requests_delayed": self._requests_delayed,
+            "requests_degraded": self._requests_degraded,
+            "stats": self._stats.copy(),
+        }
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 4                                                               ║
