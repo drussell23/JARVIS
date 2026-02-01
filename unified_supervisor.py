@@ -49298,7 +49298,20 @@ class JarvisSystemKernel:
                 stage="loading",
                 message="Loading page ready - starting system initialization...",
                 progress=5,
-                metadata={"icon": "rocket", "phase": 0}
+                metadata={
+                    "icon": "rocket",
+                    "phase": 0,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "pending"},
+                        "resources": {"status": "pending"},
+                        "backend": {"status": "pending"},
+                        "intelligence": {"status": "pending"},
+                        "trinity": {"status": "pending"},
+                        "enterprise": {"status": "pending"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
             )
 
             # Phase 1: Preflight (Zone 5.1-5.4)
@@ -49319,7 +49332,20 @@ class JarvisSystemKernel:
                 stage="preflight",
                 message="Preflight complete - initializing resources...",
                 progress=15,
-                metadata={"icon": "check", "phase": 1}
+                metadata={
+                    "icon": "check",
+                    "phase": 1,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "running"},
+                        "backend": {"status": "pending"},
+                        "intelligence": {"status": "pending"},
+                        "trinity": {"status": "pending"},
+                        "enterprise": {"status": "pending"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
             )
 
             # Phase 2: Resources (Zone 3)
@@ -49344,7 +49370,20 @@ class JarvisSystemKernel:
                 stage="resources",
                 message="Resources ready - starting backend server...",
                 progress=30,
-                metadata={"icon": "server", "phase": 2}
+                metadata={
+                    "icon": "server",
+                    "phase": 2,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "running"},
+                        "intelligence": {"status": "pending"},
+                        "trinity": {"status": "pending"},
+                        "enterprise": {"status": "pending"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
             )
 
             # Phase 3: Backend (Zone 6.1)
@@ -49367,7 +49406,20 @@ class JarvisSystemKernel:
                 stage="backend",
                 message="Backend server running - loading intelligence layer...",
                 progress=50,
-                metadata={"icon": "brain", "phase": 3}
+                metadata={
+                    "icon": "brain",
+                    "phase": 3,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "complete"},
+                        "intelligence": {"status": "running"},
+                        "trinity": {"status": "pending"},
+                        "enterprise": {"status": "pending"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
             )
 
             # Phase 4: Intelligence (Zone 4)
@@ -49392,7 +49444,20 @@ class JarvisSystemKernel:
                 stage="intelligence",
                 message="Intelligence layer ready - connecting Trinity components...",
                 progress=65,
-                metadata={"icon": "sparkles", "phase": 4}
+                metadata={
+                    "icon": "sparkles",
+                    "phase": 4,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "complete"},
+                        "intelligence": {"status": "complete"},
+                        "trinity": {"status": "running"},
+                        "enterprise": {"status": "pending"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
             )
 
             # Phase 5: Trinity (Zone 5.7)
@@ -49414,7 +49479,20 @@ class JarvisSystemKernel:
                 stage="trinity",
                 message="Trinity connected - starting enterprise services...",
                 progress=80,
-                metadata={"icon": "link", "phase": 5}
+                metadata={
+                    "icon": "link",
+                    "phase": 5,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "complete"},
+                        "intelligence": {"status": "complete"},
+                        "trinity": {"status": "complete"},
+                        "enterprise": {"status": "running"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
             )
 
             # Phase 6: Enterprise Services (Zone 6.4)
@@ -49430,7 +49508,20 @@ class JarvisSystemKernel:
                 stage="enterprise",
                 message="Enterprise services online - launching frontend...",
                 progress=90,
-                metadata={"icon": "building", "phase": 6}
+                metadata={
+                    "icon": "building",
+                    "phase": 6,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "complete"},
+                        "intelligence": {"status": "complete"},
+                        "trinity": {"status": "complete"},
+                        "enterprise": {"status": "complete"},
+                        "frontend": {"status": "running"},
+                    }
+                }
             )
 
             # =================================================================
@@ -49448,7 +49539,20 @@ class JarvisSystemKernel:
                 stage="complete",
                 message="JARVIS is ready!",
                 progress=100,
-                metadata={"icon": "check-circle", "phase": 7}
+                metadata={
+                    "icon": "check-circle",
+                    "phase": 7,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "complete"},
+                        "intelligence": {"status": "complete"},
+                        "trinity": {"status": "complete"},
+                        "enterprise": {"status": "complete"},
+                        "frontend": {"status": "complete"},
+                    }
+                }
             )
 
             # Start background pre-warming task (non-blocking)
@@ -50146,6 +50250,27 @@ class JarvisSystemKernel:
                             # Step 3: Set environment variable to signal other processes
                             os.environ["JARVIS_SUPERVISOR_LOADING"] = "1"
                             self.logger.debug("[Kernel] Set JARVIS_SUPERVISOR_LOADING=1")
+
+                            # v121.0: Send initial progress broadcast so page shows something
+                            await self._broadcast_startup_progress(
+                                stage="initializing",
+                                message="JARVIS kernel starting...",
+                                progress=3,
+                                metadata={
+                                    "phase": "preflight",
+                                    "icon": "rocket",
+                                    "components": {
+                                        "loading_server": {"status": "complete"},
+                                        "preflight": {"status": "running"},
+                                        "resources": {"status": "pending"},
+                                        "backend": {"status": "pending"},
+                                        "intelligence": {"status": "pending"},
+                                        "trinity": {"status": "pending"},
+                                        "enterprise": {"status": "pending"},
+                                        "frontend": {"status": "pending"},
+                                    }
+                                }
+                            )
                         else:
                             error = result.get("error", "unknown")
                             self.logger.info(f"[Kernel] Chrome not opened: {error}")
@@ -50160,6 +50285,29 @@ class JarvisSystemKernel:
                 # v119.0: Always release browser lock
                 if browser_lock_acquired:
                     self._release_browser_lock()
+
+        # v121.0: Also send initial progress if server started but browser wasn't opened by us
+        # (covers non-macOS platforms and cases where another process opened the browser)
+        if loading_server_started and not browser_lock_acquired:
+            await self._broadcast_startup_progress(
+                stage="initializing",
+                message="JARVIS kernel starting...",
+                progress=3,
+                metadata={
+                    "phase": "preflight",
+                    "icon": "rocket",
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "running"},
+                        "resources": {"status": "pending"},
+                        "backend": {"status": "pending"},
+                        "intelligence": {"status": "pending"},
+                        "trinity": {"status": "pending"},
+                        "enterprise": {"status": "pending"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
+            )
 
         # Step 4: Voice narration (if enabled)
         if self._narrator and loading_server_started:
@@ -50830,21 +50978,30 @@ class JarvisSystemKernel:
         message: str,
         progress: int,
         metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
+    ) -> bool:
         """
-        Broadcast startup progress to connected clients.
+        Broadcast startup progress to loading page via HTTP API.
+
+        v121.0: Fixed to use correct endpoint /api/update-progress (same as run_supervisor).
 
         Args:
             stage: Current startup stage (e.g., "backend", "voice", "trinity")
             message: Human-readable progress message
             progress: Progress percentage (0-100)
-            metadata: Optional additional data (icons, labels, etc.)
-        """
-        if self.config.loading_server_port == 0:
-            return  # No loading server - skip broadcasting
+            metadata: Optional additional data (icons, components, labels, etc.)
 
+        Returns:
+            True if broadcast succeeded, False otherwise
+        """
+        # Skip if no loading server configured or not running
+        if self.config.loading_server_port == 0:
+            return False
+
+        if not hasattr(self, '_loading_server_process') or not self._loading_server_process:
+            return False
+
+        # Build progress data matching loading_server.py expected format
         progress_data = {
-            "type": "startup_progress",
             "stage": stage,
             "message": message,
             "progress": min(100, max(0, progress)),
@@ -50852,18 +51009,54 @@ class JarvisSystemKernel:
             "metadata": metadata or {},
         }
 
-        # Try to broadcast via loading server if available
+        # Try to broadcast via loading server HTTP API
+        # v121.0: Use /api/update-progress (same endpoint as run_supervisor)
         try:
             if AIOHTTP_AVAILABLE and aiohttp is not None:
-                async with aiohttp.ClientSession() as session:
-                    url = f"http://localhost:{self.config.loading_server_port}/api/progress"
-                    await session.post(
-                        url,
-                        json=progress_data,
-                        timeout=aiohttp.ClientTimeout(total=2.0)
-                    )
+                url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=2.0)
+                ) as session:
+                    async with session.post(url, json=progress_data) as resp:
+                        if resp.status == 200:
+                            self.logger.debug(f"[Progress] {stage}: {progress}% - {message}")
+                            return True
+                        else:
+                            self.logger.debug(f"[Progress] Broadcast failed: status {resp.status}")
+                            return False
+            else:
+                # Fallback to urllib if aiohttp not available
+                return await self._broadcast_progress_urllib(progress_data)
+        except Exception as e:
+            self.logger.debug(f"[Progress] Broadcast failed: {e}")
+            return False
+
+    async def _broadcast_progress_urllib(self, progress_data: Dict[str, Any]) -> bool:
+        """Fallback progress broadcast using urllib (when aiohttp unavailable)."""
+        try:
+            import urllib.request
+            import json as _json
+
+            url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
+            data = _json.dumps(progress_data).encode('utf-8')
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+
+            # Run synchronous request in thread to not block event loop
+            def do_request():
+                try:
+                    with urllib.request.urlopen(req, timeout=2.0) as resp:
+                        return resp.status == 200
+                except Exception:
+                    return False
+
+            return await asyncio.to_thread(do_request)
         except Exception:
-            pass  # Non-critical - don't fail if broadcast fails
+            return False
 
     # =========================================================================
     # DIAGNOSTIC LOGGING

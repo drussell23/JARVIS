@@ -1106,7 +1106,26 @@ class LoadingServer:
         }
 
     async def _handle_progress_update(self, body: Optional[bytes]) -> str:
-        """Handle progress update from supervisor."""
+        """Handle progress update from supervisor.
+
+        v127.0: Fixed component handling - now properly extracts 'components' from
+        metadata for display on the loading page.
+
+        Expected format from unified_supervisor:
+        {
+            "stage": "backend",
+            "message": "Starting backend server...",
+            "progress": 50,
+            "metadata": {
+                "icon": "server",
+                "phase": 3,
+                "components": {
+                    "backend": {"status": "running"},
+                    ...
+                }
+            }
+        }
+        """
         if not body:
             return self._json_response({"error": "No body"}, status=400)
 
@@ -1116,8 +1135,15 @@ class LoadingServer:
             self._phase = data.get("stage", data.get("phase", self._phase))
             self._message = data.get("message", self._message)
 
+            # v127.0: Properly handle metadata with nested components
             if "metadata" in data:
-                self._components.update(data["metadata"])
+                metadata = data["metadata"]
+                # If metadata contains a 'components' key, extract and use it
+                if "components" in metadata:
+                    self._components = metadata["components"]
+                else:
+                    # Legacy format: metadata IS the components dict
+                    self._components.update(metadata)
 
             self._eta_engine.update_progress(self._progress)
             await self._broadcast_progress()
