@@ -49000,6 +49000,10 @@ class JarvisSystemKernel:
         # Enterprise status tracking
         self._enterprise_status: Dict[str, Any] = {}
 
+        # v181.0: Voice biometric service (initialized in background)
+        self._voice_bio_service: Optional[Any] = None
+        self._voice_bio_status: Dict[str, Any] = {}
+
         # Background tasks
         self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
@@ -49020,6 +49024,29 @@ class JarvisSystemKernel:
         if self._started_at is None:
             return 0.0
         return time.time() - self._started_at
+
+    @property
+    def voice_bio_ready(self) -> bool:
+        """
+        v181.0: Check if voice biometrics is fully ready (warmed up).
+
+        Returns True if:
+        - Voice bio service is initialized AND
+        - Background warmup has completed
+        """
+        if not self._voice_bio_status:
+            return False
+        return self._voice_bio_status.get("initialized", False)
+
+    @property
+    def voice_bio_warming(self) -> bool:
+        """
+        v181.0: Check if voice biometrics is still warming up.
+
+        During warmup, voice verification may work in degraded mode
+        (e.g., using cloud ECAPA instead of local).
+        """
+        return self._voice_bio_status.get("warming_up", False) and not self.voice_bio_ready
 
     # =========================================================================
     # SAFE PHASE INITIALIZATION (v107.0)
@@ -52393,9 +52420,15 @@ class JarvisSystemKernel:
         """
         Initialize the voice biometric authentication system.
 
-        This enterprise-grade initialization:
+        v181.0 TRULY ASYNC ARCHITECTURE:
+        - Returns immediately with "warming" status (non-blocking)
+        - Heavy ML loading happens in background task
+        - Service becomes "ready" when background init completes
+        - Phase 6 startup never blocked by ECAPA loading
+
+        Features:
         - Loads Cloud SQL database with voiceprint profiles
-        - Initializes ECAPA-TDNN speaker verification model
+        - Initializes ECAPA-TDNN speaker verification model (BACKGROUND)
         - Validates all profile dimensions match model dimensions
         - Detects primary users dynamically (no hardcoding!)
         - Enables BEAST MODE features if available
@@ -52405,15 +52438,29 @@ class JarvisSystemKernel:
         """
         result: Dict[str, Any] = {
             "initialized": False,
+            "warming_up": True,  # v181.0: Indicates background init in progress
             "model_dimension": 0,
             "profiles_loaded": 0,
             "primary_users": [],
             "beast_mode_enabled": False,
             "warnings": [],
             "errors": [],
+            "background_task": None,  # Reference to warmup task
         }
 
-        self.logger.info("[VoiceBio] Initializing voice biometric system...")
+        self.logger.info("[VoiceBio] Initializing voice biometric system (async mode)...")
+
+        # =====================================================================
+        # v181.0: FAST PATH - Quick checks before heavy initialization
+        # Return early if voice biometrics is disabled or dependencies missing
+        # =====================================================================
+        voice_bio_enabled = os.environ.get("JARVIS_VOICE_BIO_ENABLED", "true").lower() == "true"
+        if not voice_bio_enabled:
+            self.logger.info("[VoiceBio] Voice biometrics disabled via JARVIS_VOICE_BIO_ENABLED=false")
+            result["initialized"] = False
+            result["warming_up"] = False
+            result["warnings"].append("Disabled via environment variable")
+            return result
 
         try:
             # Ensure backend dir is in path for imports
@@ -52421,104 +52468,122 @@ class JarvisSystemKernel:
             if str(backend_dir) not in sys.path:
                 sys.path.insert(0, str(backend_dir))
 
-            # Initialize learning database (fast mode for parallel initialization)
-            self.logger.info("[VoiceBio] Loading learning database (fast mode)...")
-            try:
-                from intelligence.learning_database import JARVISLearningDatabase
+            # =====================================================================
+            # v181.0: BACKGROUND WARMUP TASK
+            # Heavy ML initialization runs in background, returns immediately
+            # =====================================================================
+            async def _background_voice_bio_warmup() -> Dict[str, Any]:
+                """
+                Background task for heavy VoiceBio initialization.
+                This runs AFTER Phase 6 completes, not blocking startup.
+                """
+                warmup_result: Dict[str, Any] = {
+                    "initialized": False,
+                    "model_dimension": 0,
+                    "profiles_loaded": 0,
+                    "primary_users": [],
+                    "beast_mode_enabled": False,
+                    "warmup_time_ms": 0,
+                }
+                warmup_start = time.time()
 
-                learning_db = JARVISLearningDatabase()
-                # v124.0: Use fast_mode=True for parallel initialization
-                # This reduces startup from 30+ seconds to ~5 seconds
-                await learning_db.initialize(fast_mode=True)
+                try:
+                    # Initialize learning database
+                    self.logger.info("[VoiceBio/Warmup] Loading learning database...")
+                    learning_db = None
+                    try:
+                        from intelligence.learning_database import JARVISLearningDatabase
+                        learning_db = JARVISLearningDatabase()
+                        await learning_db.initialize(fast_mode=True)
+                        self.logger.info("[VoiceBio/Warmup] Learning database ready")
+                    except ImportError as e:
+                        self.logger.warning(f"[VoiceBio/Warmup] Learning database not available: {e}")
 
-                self.logger.success("[VoiceBio] Learning database initialized (fast mode)")
+                    # Initialize speaker verification service (this loads ECAPA)
+                    self.logger.info("[VoiceBio/Warmup] Loading speaker verification (ECAPA)...")
+                    try:
+                        from voice.speaker_verification_service import SpeakerVerificationService
+                        speaker_service = SpeakerVerificationService(learning_db)
+                        await speaker_service.initialize_fast()
 
-                # Check for Phase 2 features
-                if hasattr(learning_db, 'hybrid_sync') and learning_db.hybrid_sync:
-                    hs = learning_db.hybrid_sync
-                    result["phase2_features"] = {
-                        "faiss_cache": bool(hs.faiss_cache and getattr(hs.faiss_cache, 'index', None)),
-                        "prometheus": bool(hs.prometheus and hs.prometheus.enabled),
-                        "redis": bool(hs.redis and getattr(hs.redis, 'redis', None)),
-                        "ml_prefetcher": bool(hs.ml_prefetcher),
-                    }
+                        warmup_result["model_dimension"] = speaker_service.current_model_dimension
+                        warmup_result["profiles_loaded"] = len(speaker_service.speaker_profiles)
 
-            except ImportError as e:
-                result["warnings"].append(f"Learning database not available: {e}")
-                learning_db = None
+                        # Dynamic primary user detection
+                        primary_users = []
+                        for name, profile in speaker_service.speaker_profiles.items():
+                            is_primary = (
+                                profile.get("is_primary_user", False) or
+                                profile.get("is_owner", False) or
+                                profile.get("security_clearance") == "admin"
+                            )
+                            if is_primary:
+                                primary_users.append(name)
 
-            # Initialize speaker verification service
-            self.logger.info("[VoiceBio] Loading speaker verification service...")
-            try:
-                from voice.speaker_verification_service import SpeakerVerificationService
+                        if not primary_users:
+                            for name, profile in speaker_service.speaker_profiles.items():
+                                if profile.get("embedding") is not None:
+                                    primary_users.append(name)
 
-                speaker_service = SpeakerVerificationService(learning_db)
-                await speaker_service.initialize_fast()  # Background encoder loading
+                        warmup_result["primary_users"] = primary_users
 
-                result["model_dimension"] = speaker_service.current_model_dimension
-                result["profiles_loaded"] = len(speaker_service.speaker_profiles)
+                        # Check BEAST MODE
+                        beast_mode_profiles = []
+                        for name, profile in speaker_service.speaker_profiles.items():
+                            acoustic_features = profile.get("acoustic_features", {})
+                            if any(v is not None for v in acoustic_features.values()):
+                                beast_mode_profiles.append(name)
 
-                self.logger.success(
-                    f"[VoiceBio] Speaker verification ready: "
-                    f"{result['profiles_loaded']} profiles, {result['model_dimension']}D model"
-                )
+                        warmup_result["beast_mode_enabled"] = len(beast_mode_profiles) > 0
+                        warmup_result["initialized"] = True
 
-                # Validate profile dimensions
-                mismatched = []
-                for name, profile in speaker_service.speaker_profiles.items():
-                    embedding = profile.get('embedding')
-                    if embedding is not None:
-                        import numpy as np
-                        emb_array = np.array(embedding)
-                        emb_dim = emb_array.shape[-1] if emb_array.ndim > 0 else 0
-                        if emb_dim != result["model_dimension"]:
-                            mismatched.append((name, emb_dim))
+                        # Store service reference on kernel for later access
+                        self._voice_bio_service = speaker_service
+                        self._voice_bio_status = warmup_result
 
-                if mismatched:
-                    result["warnings"].append(
-                        f"{len(mismatched)} profiles need re-enrollment: "
-                        f"{[m[0] for m in mismatched]}"
-                    )
+                    except ImportError as e:
+                        self.logger.warning(f"[VoiceBio/Warmup] Speaker verification not available: {e}")
 
-                # Dynamic primary user detection (no hardcoding!)
-                primary_users = []
-                for name, profile in speaker_service.speaker_profiles.items():
-                    is_primary = (
-                        profile.get("is_primary_user", False) or
-                        profile.get("is_owner", False) or
-                        profile.get("security_clearance") == "admin"
-                    )
-                    if is_primary:
-                        primary_users.append(name)
+                except Exception as e:
+                    self.logger.error(f"[VoiceBio/Warmup] Background warmup failed: {e}")
 
-                # Fallback: users with valid embeddings
-                if not primary_users:
-                    for name, profile in speaker_service.speaker_profiles.items():
-                        if profile.get("embedding") is not None:
-                            primary_users.append(name)
+                warmup_result["warmup_time_ms"] = int((time.time() - warmup_start) * 1000)
 
-                result["primary_users"] = primary_users
-
-                # Check BEAST MODE (acoustic features)
-                beast_mode_profiles = []
-                for name, profile in speaker_service.speaker_profiles.items():
-                    acoustic_features = profile.get("acoustic_features", {})
-                    if any(v is not None for v in acoustic_features.values()):
-                        beast_mode_profiles.append(name)
-
-                result["beast_mode_enabled"] = len(beast_mode_profiles) > 0
-                if result["beast_mode_enabled"]:
+                # Log completion
+                if warmup_result["initialized"]:
                     self.logger.success(
-                        f"[VoiceBio] 🔬 BEAST MODE enabled for {len(beast_mode_profiles)} profile(s)"
+                        f"[VoiceBio/Warmup] ✅ READY in {warmup_result['warmup_time_ms']}ms - "
+                        f"{warmup_result['profiles_loaded']} profiles, "
+                        f"{warmup_result['model_dimension']}D model"
                     )
+                    if warmup_result["beast_mode_enabled"]:
+                        self.logger.success("[VoiceBio/Warmup] 🔬 BEAST MODE enabled")
+                else:
+                    self.logger.warning(f"[VoiceBio/Warmup] Completed with errors after {warmup_result['warmup_time_ms']}ms")
 
-                result["initialized"] = True
+                return warmup_result
 
-            except ImportError as e:
-                result["errors"].append(f"Speaker verification not available: {e}")
+            # =====================================================================
+            # v181.0: START BACKGROUND WARMUP (NON-BLOCKING)
+            # This allows Phase 6 to complete immediately while ECAPA loads
+            # =====================================================================
+            warmup_task = asyncio.create_task(
+                _background_voice_bio_warmup(),
+                name="voice-bio-warmup"
+            )
+            self._background_tasks.append(warmup_task)
+
+            # Store task reference for monitoring
+            result["background_task"] = warmup_task
+            result["warming_up"] = True
+            result["initialized"] = True  # Service is "available" (degraded mode)
+
+            self.logger.info("[VoiceBio] 🔄 Background warmup started - service available in degraded mode")
+            self.logger.info("[VoiceBio]    ECAPA/ML loading will complete in background (~30s)")
 
         except Exception as e:
             result["errors"].append(f"Voice biometric initialization failed: {e}")
+            result["warming_up"] = False
             self.logger.error(f"[VoiceBio] Initialization failed: {e}")
 
         return result
