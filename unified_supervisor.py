@@ -706,11 +706,51 @@ except ImportError:
 
 # Process Cleanup Manager - circuit breaker, health monitoring, retry logic
 try:
-    from backend.process_cleanup_manager import ProcessCleanupManager
+    from backend.process_cleanup_manager import (
+        ProcessCleanupManager,
+        prevent_multiple_jarvis_instances,
+    )
     PROCESS_CLEANUP_MANAGER_AVAILABLE = True
 except ImportError:
     PROCESS_CLEANUP_MANAGER_AVAILABLE = False
     ProcessCleanupManager = None
+    prevent_multiple_jarvis_instances = None
+
+# v181.0: Graceful Shutdown - orphaned semaphore cleanup
+try:
+    from backend.core.resilience.graceful_shutdown import (
+        cleanup_orphaned_semaphores,
+    )
+    GRACEFUL_SHUTDOWN_AVAILABLE = True
+except ImportError:
+    GRACEFUL_SHUTDOWN_AVAILABLE = False
+    cleanup_orphaned_semaphores = None
+
+# v181.0: Cross-Repo Startup Orchestrator - GCP/Hollow Client/Trinity Protocol
+try:
+    from backend.supervisor.cross_repo_startup_orchestrator import (
+        initialize_cross_repo_orchestration,
+        start_all_repos,
+        get_active_rescue_env_vars,
+    )
+    CROSS_REPO_ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    CROSS_REPO_ORCHESTRATOR_AVAILABLE = False
+    initialize_cross_repo_orchestration = None
+    start_all_repos = None
+    get_active_rescue_env_vars = None
+
+# v181.0: Shutdown Hook - signal handlers for crash recovery
+try:
+    from backend.scripts.shutdown_hook import (
+        register_handlers as register_shutdown_handlers,
+        cleanup_orphaned_semaphores_on_startup,
+    )
+    SHUTDOWN_HOOK_AVAILABLE = True
+except ImportError:
+    SHUTDOWN_HOOK_AVAILABLE = False
+    register_shutdown_handlers = None
+    cleanup_orphaned_semaphores_on_startup = None
 
 # Intelligent Startup Narrator - phase-aware voice narration
 # Note: Import as BackendStartupPhase to avoid conflict with local StartupPhase enum
@@ -751,12 +791,48 @@ WEBSOCKET_PORT_RANGE = (8765, 8800)
 LOADING_SERVER_PORT_RANGE = (8080, 8090)
 
 # Timeouts (seconds)
-DEFAULT_STARTUP_TIMEOUT = 120.0
+# v181.0: Realistic timeouts for Trinity/GCP operations
+DEFAULT_STARTUP_TIMEOUT = 120.0  # Base timeout for simple startups
+DEFAULT_TRINITY_TIMEOUT = 600.0  # 10 minutes for Trinity cross-repo startup
+DEFAULT_GCP_STARTUP_TIMEOUT = 900.0  # 15 minutes for GCP Spot VM provisioning
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
 DEFAULT_HEALTH_CHECK_INTERVAL = 10.0
 DEFAULT_HOT_RELOAD_INTERVAL = 10.0
 DEFAULT_HOT_RELOAD_GRACE_PERIOD = 120.0
 DEFAULT_IDLE_TIMEOUT = 300
+
+
+def _calculate_effective_startup_timeout(
+    config_timeout: float,
+    trinity_enabled: bool = False,
+    gcp_enabled: bool = False,
+) -> float:
+    """
+    v181.0: Calculate effective startup timeout based on enabled features.
+
+    The timeout must account for:
+    - GCP Spot VM provisioning (can take 2-5 minutes)
+    - Large model loading (can take 3-10 minutes)
+    - Trinity cross-repo coordination
+
+    Args:
+        config_timeout: User-configured timeout from JARVIS_STARTUP_TIMEOUT
+        trinity_enabled: Whether Trinity cross-repo is enabled
+        gcp_enabled: Whether GCP cloud provisioning is enabled
+
+    Returns:
+        Effective timeout that accounts for all enabled features
+    """
+    effective = config_timeout
+
+    if gcp_enabled:
+        # GCP provisioning needs the most time
+        effective = max(effective, DEFAULT_GCP_STARTUP_TIMEOUT)
+    elif trinity_enabled:
+        # Trinity cross-repo needs substantial time
+        effective = max(effective, DEFAULT_TRINITY_TIMEOUT)
+
+    return effective
 
 # Memory defaults
 DEFAULT_MEMORY_TARGET_PERCENT = 30.0
@@ -49124,15 +49200,66 @@ class JarvisSystemKernel:
         """
         Emergency shutdown - kill everything fast.
 
+        v181.0 Enhanced with:
+        - Trinity component termination (prevents orphaned J-Prime/Reactor processes)
+        - GCP VM cleanup (prevents orphaned Spot VMs from running up bills)
+        - Crash marker for recovery detection on next startup
+
         Called when:
         - Global timeout exceeded
         - Unhandled exception during startup
         - Critical failure detected
 
-        Does NOT wait for graceful shutdown.
+        Does NOT wait for graceful shutdown - uses kill signals.
         """
         self.logger.warning("[Kernel] ⚠️ Emergency shutdown initiated")
         self._state = KernelState.SHUTTING_DOWN
+
+        # v181.0: Write crash marker for next startup
+        try:
+            crash_marker = LOCKS_DIR / "kernel_crash.marker"
+            crash_marker.parent.mkdir(parents=True, exist_ok=True)
+            crash_marker.write_text(
+                f"Emergency shutdown at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        except Exception:
+            pass
+
+        # v181.0: Stop Trinity components FIRST (prevents orphaned processes)
+        if self._trinity:
+            try:
+                # Give Trinity a short grace period for clean shutdown
+                await asyncio.wait_for(self._trinity.stop(), timeout=5.0)
+                self.logger.info("[Kernel] Trinity components stopped")
+            except asyncio.TimeoutError:
+                self.logger.warning("[Kernel] Trinity stop timed out - force killing")
+                # Force kill Trinity processes if graceful stop fails
+                if hasattr(self._trinity, '_processes'):
+                    for name, proc in getattr(self._trinity, '_processes', {}).items():
+                        try:
+                            proc.kill()
+                            self.logger.debug(f"[Kernel] Force killed Trinity process: {name}")
+                        except Exception:
+                            pass
+            except Exception as e:
+                self.logger.warning(f"[Kernel] Trinity stop failed: {e}")
+
+        # v181.0: Cleanup GCP VMs (prevents orphaned Spot VMs)
+        try:
+            # Try to cleanup session VMs via cross_repo_startup_orchestrator
+            if CROSS_REPO_ORCHESTRATOR_AVAILABLE:
+                from backend.supervisor.cross_repo_startup_orchestrator import (
+                    shutdown_orchestrator,
+                )
+                try:
+                    await asyncio.wait_for(shutdown_orchestrator(), timeout=10.0)
+                    self.logger.info("[Kernel] Cross-repo orchestrator shutdown complete")
+                except Exception as e:
+                    self.logger.debug(f"[Kernel] Orchestrator shutdown error: {e}")
+        except ImportError:
+            pass
+        except Exception as e:
+            self.logger.debug(f"[Kernel] GCP cleanup error: {e}")
 
         # Kill backend immediately
         if self._backend_process:
@@ -49149,6 +49276,16 @@ class JarvisSystemKernel:
         # Cancel all background tasks
         for task in self._background_tasks:
             task.cancel()
+
+        # Wait briefly for task cancellation
+        if self._background_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._background_tasks, return_exceptions=True),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                pass
 
         # v119.0: Release browser lock if held
         self._release_browser_lock()
@@ -49336,11 +49473,25 @@ class JarvisSystemKernel:
         Returns:
             Exit code (0 for success, non-zero for failure)
         """
-        # Apply global startup timeout to prevent infinite hangs
-        startup_timeout = float(os.environ.get(
+        # v181.0: Calculate effective startup timeout based on enabled features
+        # Base timeout from environment or config
+        base_timeout = float(os.environ.get(
             "JARVIS_STARTUP_TIMEOUT",
             str(DEFAULT_STARTUP_TIMEOUT)
         ))
+
+        # Apply dynamic timeout calculation based on enabled features
+        startup_timeout = _calculate_effective_startup_timeout(
+            config_timeout=base_timeout,
+            trinity_enabled=self.config.trinity_enabled,
+            gcp_enabled=self.config.gcp_enabled,
+        )
+
+        if startup_timeout != base_timeout:
+            self.logger.info(
+                f"[Kernel] Startup timeout adjusted: {base_timeout}s → {startup_timeout}s "
+                f"(Trinity: {self.config.trinity_enabled}, GCP: {self.config.gcp_enabled})"
+            )
 
         try:
             return await asyncio.wait_for(
@@ -49351,6 +49502,10 @@ class JarvisSystemKernel:
             self.logger.error(f"[Kernel] STARTUP TIMEOUT after {startup_timeout}s")
             self.logger.error("[Kernel] This may indicate a hung component or resource lock.")
             self.logger.error("[Kernel] Try: python unified_supervisor.py --restart --force")
+            if self.config.trinity_enabled:
+                self.logger.error("[Kernel] Trinity is enabled - consider increasing JARVIS_STARTUP_TIMEOUT")
+            if self.config.gcp_enabled:
+                self.logger.error("[Kernel] GCP is enabled - VM provisioning may need more time")
 
             # Log diagnostic checkpoint for forensics
             if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
@@ -49380,19 +49535,15 @@ class JarvisSystemKernel:
                 pass
 
         # =====================================================================
-        # v180.0: INTELLIGENT STATE RECOVERY / CRASH DETECTION
-        # Check if previous kernel crashed and log diagnostic info.
+        # v181.0: PHASE -1: CLEAN SLATE - Crash Recovery & State Cleanup
         # =====================================================================
-        crash_indicator = LOCKS_DIR / "kernel_crash.marker"
-        if crash_indicator.exists():
-            try:
-                crash_info = crash_indicator.read_text().strip()
-                self.logger.warning(f"[Kernel] Previous crash detected: {crash_info}")
-                crash_indicator.unlink()  # Clear the marker
-                if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
-                    log_startup_checkpoint("crash_recovery_start")
-            except Exception:
-                pass
+        # This MUST run BEFORE any other phase to ensure a clean starting state.
+        # Clears stale state files, orphaned processes, and semaphores.
+        # =====================================================================
+        issue_collector.set_current_phase("Phase -1: Clean Slate")
+        issue_collector.set_current_zone("Zone -1")
+
+        await self._phase_clean_slate()
 
         # =====================================================================
         # v180.0: ENTERPRISE STARTUP BANNER
@@ -50337,14 +50488,15 @@ class JarvisSystemKernel:
         """
         Phase 5: Initialize Trinity cross-repo integration.
 
-        v180.0 Enhanced with:
+        v181.0 Enhanced with:
+        - Cross-repo orchestration (GCP Pre-warm, Hollow Client, Memory Gating)
         - Deep health checks (not just HTTP ping)
         - Auto-restart on crash (background watchdog)
         - Graceful shutdown with wait
         - Diagnostic checkpoints
 
         Starts:
-        - J-Prime (local LLM inference)
+        - J-Prime (local LLM inference or Hollow Client routing to GCP)
         - Reactor-Core (training pipeline)
         """
         self._state = KernelState.STARTING_TRINITY
@@ -50360,10 +50512,34 @@ class JarvisSystemKernel:
 
                 # Log Trinity configuration
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
-                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION (v180.0)")
+                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION (v181.0)")
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
                 self.logger.info(f"[Trinity] Enabled: {self.config.trinity_enabled}")
                 self.logger.info(f"[Trinity] Auto-restart: {os.environ.get('JARVIS_TRINITY_AUTO_RESTART', 'true')}")
+
+                # =====================================================================
+                # v181.0: CROSS-REPO ORCHESTRATION INITIALIZATION
+                # =====================================================================
+                # This sets up GCP Pre-warm, Hollow Client env vars, and Memory Gating
+                # BEFORE starting Trinity components. Critical for 16GB M1 Macs.
+                # =====================================================================
+                if CROSS_REPO_ORCHESTRATOR_AVAILABLE and initialize_cross_repo_orchestration:
+                    try:
+                        self.logger.info("[Trinity] Initializing cross-repo orchestration...")
+                        await initialize_cross_repo_orchestration()
+                        self.logger.success("[Trinity] Cross-repo orchestration ready")
+
+                        # Check if Hollow Client mode was activated
+                        if os.environ.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() == "true":
+                            gcp_endpoint = os.environ.get("GCP_PRIME_ENDPOINT", "")
+                            self.logger.info(
+                                f"[Trinity] Hollow Client mode ACTIVE - "
+                                f"routing to GCP at {gcp_endpoint}"
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"[Trinity] Cross-repo init failed (non-fatal): {e}")
+                else:
+                    self.logger.debug("[Trinity] Cross-repo orchestrator not available - using inline integration")
 
                 # Log repo search paths
                 prime_path = self.config.prime_repo_path
@@ -50402,8 +50578,12 @@ class JarvisSystemKernel:
 
                 self.logger.info("[Trinity] ───────────────────────────────────────────────────────")
 
-                # Start components with bounded timeout
-                trinity_timeout = float(os.environ.get("JARVIS_TRINITY_TIMEOUT", "60.0"))
+                # Start components with bounded timeout (v181.0: use realistic timeout)
+                trinity_timeout = float(os.environ.get(
+                    "JARVIS_TRINITY_TIMEOUT",
+                    str(DEFAULT_TRINITY_TIMEOUT)  # 600s = 10 minutes for GCP/model loading
+                ))
+                self.logger.info(f"[Trinity] Component startup timeout: {trinity_timeout}s")
                 try:
                     results = await asyncio.wait_for(
                         self._trinity.start_components(),
@@ -50411,6 +50591,7 @@ class JarvisSystemKernel:
                     )
                 except asyncio.TimeoutError:
                     self.logger.warning(f"[Trinity] Component start timed out after {trinity_timeout}s")
+                    self.logger.warning("[Trinity] Consider increasing JARVIS_TRINITY_TIMEOUT if GCP/models need more time")
                     results = {}
 
                 # Log start results
@@ -50734,6 +50915,212 @@ class JarvisSystemKernel:
                 self._readiness_manager.mark_component_ready("voice_biometrics", voice_ready)
 
             return True  # Enterprise services are optional
+
+    # =========================================================================
+    # PHASE -1: CLEAN SLATE (v181.0)
+    # =========================================================================
+    # Comprehensive crash recovery and state cleanup that runs BEFORE any
+    # other phase. Ensures a clean starting state by clearing stale files,
+    # orphaned processes, and semaphores from previous crashed runs.
+    # =========================================================================
+
+    async def _phase_clean_slate(self) -> bool:
+        """
+        Phase -1: Clean Slate - Intelligent Crash Recovery (v181.0).
+
+        This phase runs FIRST (before lock acquisition) to ensure clean state:
+        1. Detect crash markers (cloud_lock.json, memory_pressure.json, heartbeat)
+        2. Clear stale state files from crashed runs
+        3. Clean up orphaned semaphores
+        4. Prevent multiple JARVIS instances
+        5. Register shutdown handlers for future crash recovery
+
+        Returns:
+            True (always succeeds with graceful degradation)
+        """
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+        self.logger.info("[Kernel] Phase -1: Clean Slate (v181.0)")
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+
+        recovery_stats = {
+            "crash_detected": False,
+            "files_cleared": 0,
+            "semaphores_cleaned": 0,
+            "actions_taken": [],
+        }
+
+        try:
+            # =================================================================
+            # STEP 1: Detect crash markers and clear stale state files
+            # =================================================================
+            trinity_dir = JARVIS_HOME / "trinity"
+            cross_repo_dir = JARVIS_HOME / "cross_repo"
+
+            # Ensure directories exist
+            trinity_dir.mkdir(parents=True, exist_ok=True)
+            cross_repo_dir.mkdir(parents=True, exist_ok=True)
+
+            # Check 1: kernel_crash.marker
+            crash_marker = LOCKS_DIR / "kernel_crash.marker"
+            if crash_marker.exists():
+                try:
+                    crash_info = crash_marker.read_text().strip()
+                    self.logger.warning(f"[Clean Slate] Previous crash detected: {crash_info}")
+                    crash_marker.unlink()
+                    recovery_stats["crash_detected"] = True
+                    recovery_stats["files_cleared"] += 1
+                    recovery_stats["actions_taken"].append("cleared_crash_marker")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Failed to clear crash marker: {e}")
+
+            # Check 2: cloud_lock.json (OOM/SIGKILL markers)
+            cloud_lock_file = trinity_dir / "cloud_lock.json"
+            if cloud_lock_file.exists():
+                try:
+                    import json as _json
+                    cloud_lock_data = _json.loads(cloud_lock_file.read_text())
+                    lock_reason = cloud_lock_data.get("reason", "")
+                    lock_timestamp = cloud_lock_data.get("timestamp", 0)
+
+                    # Check for crash indicators
+                    crash_indicators = ["OOM", "SIGKILL", "KILLED", "EMERGENCY", "CRASH"]
+                    is_crash = any(ind in lock_reason.upper() for ind in crash_indicators)
+
+                    # Check for stale lock (older than 1 hour)
+                    is_stale = lock_timestamp and (time.time() - lock_timestamp > 3600)
+
+                    if is_crash or is_stale:
+                        self.logger.warning(
+                            f"[Clean Slate] Clearing cloud lock: reason='{lock_reason}', "
+                            f"stale={is_stale}, crash_indicator={is_crash}"
+                        )
+                        cloud_lock_file.unlink()
+                        recovery_stats["crash_detected"] = True
+                        recovery_stats["files_cleared"] += 1
+                        recovery_stats["actions_taken"].append("cleared_cloud_lock")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Failed to process cloud lock: {e}")
+
+            # Check 3: memory_pressure.json
+            memory_pressure_file = cross_repo_dir / "memory_pressure.json"
+            if memory_pressure_file.exists():
+                try:
+                    import json as _json
+                    pressure_data = _json.loads(memory_pressure_file.read_text())
+                    status = pressure_data.get("status", "")
+                    is_emergency = status == "offload_active" or pressure_data.get("emergency", False)
+                    pressure_timestamp = pressure_data.get("timestamp", 0)
+                    is_stale = pressure_timestamp and (time.time() - pressure_timestamp > 1800)
+
+                    if is_emergency or is_stale:
+                        self.logger.warning(
+                            f"[Clean Slate] Clearing memory pressure signal: "
+                            f"status='{status}', emergency={is_emergency}, stale={is_stale}"
+                        )
+                        memory_pressure_file.unlink()
+                        recovery_stats["files_cleared"] += 1
+                        recovery_stats["actions_taken"].append("cleared_memory_pressure")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Failed to process memory pressure: {e}")
+
+            # Check 4: Stale heartbeat file
+            heartbeat_file = trinity_dir / "jarvis_body.json"
+            if heartbeat_file.exists():
+                try:
+                    import json as _json
+                    heartbeat_data = _json.loads(heartbeat_file.read_text())
+                    last_heartbeat = heartbeat_data.get("last_heartbeat", 0)
+                    # Stale if no heartbeat in 5 minutes
+                    if last_heartbeat and (time.time() - last_heartbeat > 300):
+                        self.logger.warning("[Clean Slate] Stale heartbeat detected - previous process died without cleanup")
+                        heartbeat_file.unlink()
+                        recovery_stats["crash_detected"] = True
+                        recovery_stats["files_cleared"] += 1
+                        recovery_stats["actions_taken"].append("cleared_stale_heartbeat")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Failed to process heartbeat: {e}")
+
+            # Check 5: Stale orchestrator state
+            orchestrator_state = cross_repo_dir / "orchestrator_state.json"
+            if orchestrator_state.exists():
+                try:
+                    file_age = time.time() - orchestrator_state.stat().st_mtime
+                    if file_age > 3600:  # Older than 1 hour
+                        orchestrator_state.unlink()
+                        recovery_stats["files_cleared"] += 1
+                        recovery_stats["actions_taken"].append("cleared_stale_orchestrator_state")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Failed to clear orchestrator state: {e}")
+
+            # =================================================================
+            # STEP 2: Clean up orphaned semaphores
+            # =================================================================
+            if GRACEFUL_SHUTDOWN_AVAILABLE and cleanup_orphaned_semaphores:
+                try:
+                    semaphore_result = await cleanup_orphaned_semaphores()
+                    cleaned = semaphore_result.get("cleaned", 0)
+                    if cleaned > 0:
+                        self.logger.info(f"[Clean Slate] Cleaned {cleaned} orphaned semaphore(s)")
+                        recovery_stats["semaphores_cleaned"] = cleaned
+                        recovery_stats["actions_taken"].append(f"cleaned_{cleaned}_semaphores")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Semaphore cleanup failed: {e}")
+            elif SHUTDOWN_HOOK_AVAILABLE and cleanup_orphaned_semaphores_on_startup:
+                try:
+                    # Use sync version from shutdown_hook
+                    semaphore_result = cleanup_orphaned_semaphores_on_startup()
+                    cleaned = semaphore_result.get("cleaned", 0)
+                    if cleaned > 0:
+                        self.logger.info(f"[Clean Slate] Cleaned {cleaned} orphaned semaphore(s)")
+                        recovery_stats["semaphores_cleaned"] = cleaned
+                        recovery_stats["actions_taken"].append(f"cleaned_{cleaned}_semaphores")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Semaphore cleanup failed: {e}")
+
+            # =================================================================
+            # STEP 3: Prevent multiple JARVIS instances
+            # =================================================================
+            if PROCESS_CLEANUP_MANAGER_AVAILABLE and prevent_multiple_jarvis_instances:
+                try:
+                    instance_result = prevent_multiple_jarvis_instances(auto_cleanup=True)
+                    if instance_result:
+                        self.logger.debug("[Clean Slate] Single instance check passed")
+                        recovery_stats["actions_taken"].append("instance_check_passed")
+                except Exception as e:
+                    self.logger.warning(f"[Clean Slate] Instance check failed (non-fatal): {e}")
+
+            # =================================================================
+            # STEP 4: Register shutdown handlers for future crash recovery
+            # =================================================================
+            if SHUTDOWN_HOOK_AVAILABLE and register_shutdown_handlers:
+                try:
+                    register_shutdown_handlers()
+                    self.logger.debug("[Clean Slate] Shutdown handlers registered")
+                    recovery_stats["actions_taken"].append("registered_shutdown_handlers")
+                except Exception as e:
+                    self.logger.debug(f"[Clean Slate] Failed to register shutdown handlers: {e}")
+
+            # =================================================================
+            # STEP 5: Log recovery summary
+            # =================================================================
+            if recovery_stats["crash_detected"]:
+                self.logger.warning(
+                    f"[Clean Slate] Crash recovery completed: "
+                    f"files_cleared={recovery_stats['files_cleared']}, "
+                    f"semaphores_cleaned={recovery_stats['semaphores_cleaned']}"
+                )
+                if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                    try:
+                        log_startup_checkpoint("crash_recovery_complete")
+                    except Exception:
+                        pass
+            else:
+                self.logger.success("[Clean Slate] System state is clean - no recovery needed")
+
+        except Exception as e:
+            self.logger.warning(f"[Clean Slate] Recovery phase error (non-fatal): {e}")
+
+        return True
 
     # =========================================================================
     # PHASE 0: LOADING EXPERIENCE (v117.0)
