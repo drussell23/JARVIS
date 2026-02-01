@@ -1,0 +1,83 @@
+{
+  "workflow_name": "Validate Configuration",
+  "workflow_url": "https://github.com/drussell23/JARVIS-AI/actions/runs/19200169955",
+  "branch": "main",
+  "commit_sha": "c96d3fe",
+  "run_number": 80,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/validate-configuration-run80-20251108-233431",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Validate Configuration (Run #80)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 87,
+              "content": "2025-11-08T23:33:54.3163078Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 70,
+              "content": "2025-11-08T23:33:54.3104741Z \u274c VALIDATION FAILED",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-08T23:33:54.4579902Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 34,
+              "content": "2025-11-08T23:33:49.7142890Z (node:2052) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 35,
+              "content": "2025-11-08T23:33:49.7143860Z (Use `node --trace-deprecation ...` to show where the warning was created)",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 75,
+              "content": "2025-11-08T23:33:54.3107225Z \u26a0\ufe0f  WARNINGS",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-08T23:33:54.4579902Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 4
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-11-08T23:34:31.201049"
+}
