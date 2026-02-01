@@ -51325,33 +51325,117 @@ class JarvisSystemKernel:
         return status
 
     async def _start_trinity_component(self, name: str, repo_path: Path) -> bool:
-        """Start a Trinity component if not already running."""
+        """
+        Start a Trinity component with intelligent script discovery.
+
+        v120.0: Enhanced with dynamic script discovery using TrinityLaunchConfig.
+        Uses configurable launch script lists per component type with intelligent
+        fallback and adaptive port allocation.
+        """
         self.logger.info(f"[Trinity] Starting {name}...")
 
-        # Look for startup script
-        startup_scripts = [
-            repo_path / "start.py",
-            repo_path / "run.py",
-            repo_path / "main.py",
-        ]
+        # v120.0: Get component-specific launch scripts from config
+        trinity_config = getattr(self.config, 'trinity_launch_config', None)
+        component_normalized = name.lower().replace('-', '_').replace(' ', '_')
 
+        # Determine which launch script list to use based on component type
+        if 'reactor' in component_normalized:
+            # Reactor-core component
+            if trinity_config:
+                launch_scripts = trinity_config.reactor_core_launch_scripts
+            else:
+                # Fallback: env-driven or sensible defaults
+                launch_scripts = os.getenv(
+                    "TRINITY_REACTOR_SCRIPTS",
+                    "run_reactor.py,run_supervisor.py,reactor_core/orchestration/trinity_orchestrator.py,"
+                    "reactor_core/__init__.py,run_orchestrator.py,main.py"
+                ).split(",")
+            default_port = int(os.getenv("REACTOR_CORE_PORT", "8090"))
+        elif 'prime' in component_normalized or 'jprime' in component_normalized:
+            # JARVIS Prime component
+            if trinity_config:
+                launch_scripts = trinity_config.jprime_launch_scripts
+            else:
+                launch_scripts = os.getenv(
+                    "TRINITY_JPRIME_SCRIPTS",
+                    "jarvis_prime/server.py,run_server.py,jarvis_prime/core/trinity_bridge.py,main.py"
+                ).split(",")
+            default_port = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
+        else:
+            # Generic component - try all common patterns
+            launch_scripts = os.getenv(
+                f"TRINITY_{component_normalized.upper()}_SCRIPTS",
+                "run.py,start.py,main.py,server.py,app.py"
+            ).split(",")
+            default_port = 8080
+
+        # v120.0: Intelligent script discovery with priority ordering
         script_path = None
-        for script in startup_scripts:
-            if script.exists():
-                script_path = script
+        discovery_attempts = []
+        for script in launch_scripts:
+            script = script.strip()
+            if not script:
+                continue
+            candidate = repo_path / script
+            discovery_attempts.append(str(candidate))
+            if candidate.exists() and candidate.is_file():
+                script_path = candidate
+                self.logger.info(f"[Trinity] Found launch script: {script}")
                 break
 
         if not script_path:
+            # Log detailed discovery failure for debugging
             self.logger.warning(f"[Trinity] No startup script found for {name}")
-            return False
+            self.logger.debug(f"[Trinity] Searched scripts: {discovery_attempts[:5]}...")
+
+            # v120.0: Try dynamic discovery of any .py files that look like entry points
+            for pattern in ["run_*.py", "start_*.py", "*_server.py", "main.py"]:
+                matches = list(repo_path.glob(pattern))
+                if matches:
+                    script_path = matches[0]
+                    self.logger.info(f"[Trinity] Fallback discovery found: {script_path.name}")
+                    break
+
+            if not script_path:
+                # Add to startup issue collector
+                try:
+                    collector = get_startup_issue_collector()
+                    collector.add_warning(
+                        f"No launch script found for Trinity component '{name}'",
+                        IssueCategory.TRINITY,
+                        suggestion=f"Create one of: {', '.join(launch_scripts[:3])} in {repo_path}"
+                    )
+                except Exception:
+                    pass
+                return False
 
         try:
+            # v120.0: Enhanced environment with Trinity coordination
             env = os.environ.copy()
             env["JARVIS_KERNEL_PID"] = str(os.getpid())
             env["TRINITY_COORDINATOR"] = "jarvis"
+            env["TRINITY_COMPONENT_NAME"] = name
+            env["TRINITY_COMPONENT_PORT"] = str(default_port)
+            env["TRINITY_HEARTBEAT_DIR"] = str(Path.home() / ".jarvis" / "trinity" / "components")
+
+            # Ensure heartbeat directory exists
+            Path(env["TRINITY_HEARTBEAT_DIR"]).mkdir(parents=True, exist_ok=True)
+
+            # v120.0: Adaptive launch with port argument if script accepts it
+            cmd_args = [sys.executable, str(script_path)]
+
+            # Check if the script accepts --port argument (heuristic: read first 100 lines)
+            try:
+                script_content = script_path.read_text()[:3000]
+                if '--port' in script_content or 'argparse' in script_content:
+                    cmd_args.extend(['--port', str(default_port)])
+            except Exception:
+                pass  # Can't read script, skip port argument
+
+            self.logger.debug(f"[Trinity] Launch command: {' '.join(cmd_args)}")
 
             process = await asyncio.create_subprocess_exec(
-                sys.executable, str(script_path),
+                *cmd_args,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -51368,14 +51452,34 @@ class JarvisSystemKernel:
                 await self._process_manager.register_process(
                     name,
                     process,
-                    {"type": "trinity", "repo": str(repo_path)}
+                    {
+                        "type": "trinity",
+                        "repo": str(repo_path),
+                        "script": str(script_path),
+                        "port": default_port
+                    }
                 )
 
-            self.logger.success(f"[Trinity] Started {name} (PID: {process.pid})")
+            # v120.0: Brief verification that process didn't crash immediately
+            await asyncio.sleep(0.5)
+            if process.returncode is not None:
+                self.logger.warning(f"[Trinity] {name} exited immediately (code: {process.returncode})")
+                # Try to read stderr for debugging
+                try:
+                    _, stderr = await asyncio.wait_for(process.communicate(), timeout=2.0)
+                    if stderr:
+                        self.logger.debug(f"[Trinity] {name} stderr: {stderr.decode()[:500]}")
+                except Exception:
+                    pass
+                return False
+
+            self.logger.success(f"[Trinity] Started {name} (PID: {process.pid}, port: {default_port})")
             return True
 
         except Exception as e:
             self.logger.error(f"[Trinity] Failed to start {name}: {e}")
+            import traceback
+            self.logger.debug(f"[Trinity] Traceback: {traceback.format_exc()}")
             return False
 
 

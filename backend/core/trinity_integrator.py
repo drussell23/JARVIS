@@ -9246,7 +9246,7 @@ class TrinityUnifiedOrchestrator:
             """Initialize persistent event store."""
             async with self._db_lock: # Lock the database to prevent concurrent access. 
                 # Connect to the database. 
-                self._db_conn = sqlite2.connect(
+                self._db_conn = sqlite3.connect(
                     str(self._store_path),
                     check_same_thread=False,
                     timeout=30.0,
@@ -9297,16 +9297,16 @@ class TrinityUnifiedOrchestrator:
             async with self._db_lock:
                 self._db_conn.execute(
                     """
-                    INSERT OR REPLACE INTO pending_events 
+                    INSERT OR REPLACE INTO pending_events
                     (event_id, event_data, target_component, created_at, next_retry)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
-                        event_id, # Event ID. This is the unique identifier for the event. 
-                        json.dumps(event.to_dict()), # Event data. This is the event that is being processed. 
-                        target_component, # Target component. This is the component that is receiving the event. 
-                        time.time(), # Created at. This is the time when the event was created. 
-                        time.time(), # Next retry. This is the time when the event will be retried. 
+                        event_id, # Event ID. This is the unique identifier for the event.
+                        json.dumps(event.to_dict()), # Event data. This is the event that is being processed.
+                        target_component, # Target component. This is the component that is receiving the event.
+                        time.time(), # Created at. This is the time when the event was created.
+                        time.time(), # Next retry. This is the time when the event will be retried.
                     )
                 )
                 self._db_conn.commit() # Commit the changes to the database. 
@@ -9329,7 +9329,7 @@ class TrinityUnifiedOrchestrator:
                 return True # Return True if acknowledgement is received. 
             else: # If acknowledgement is not received, schedule retry. 
                 # Schedule retry 
-                await self._schedule_retry(event_id) # Schedule retry. This is the event that is being processed. 
+                await self.schedule_retry(event_id) # Schedule retry. This is the event that is being processed. 
                 return False # Return False if acknowledgement is not received. 
         
         async def _send_and_wait_ack(self, event_id: str, target_component: str) -> bool:
@@ -9350,8 +9350,8 @@ class TrinityUnifiedOrchestrator:
                 ack_future = asyncio.Future() 
                 
                 # Create task to wait for acknowledgement. This is the task that is waiting for the ACK. 
-                self._ack_timeouts[event_id] = aysncio.create_task(
-                    self._wait_for_ack(event_id, ack_future, timeout) # Wait for acknowledgement. This is the task that is waiting for the ACK. 
+                self._ack_timeouts[event_id] = asyncio.create_task(
+                    self._wait_for_ack(event_id, ack_future, timeout) # Wait for acknowledgement. This is the task that is waiting for the ACK.
                 )
 
                 try: 
@@ -9480,7 +9480,7 @@ class TrinityUnifiedOrchestrator:
 
                         # Schedule retry if needed 
                         if next_retry <= time.time(): 
-                            await self._schedule_retry(event_id) # Schedule retry. This is the event that is being processed. 
+                            await self.schedule_retry(event_id) # Schedule retry. This is the event that is being processed. 
 
                     except Exception as e: # If an error occurs, log the error. 
                         logger.error(f"Error loading pending even {event_id}: {e}") # Log the error. 
