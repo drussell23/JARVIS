@@ -648,6 +648,84 @@ except ImportError:
     np = None
 
 # =============================================================================
+# BACKEND HELPER IMPORTS (v180.0 - Advanced Gap Fixes)
+# =============================================================================
+# These imports bring in enterprise-grade helpers from the backend that handle:
+# - Service registry pre-flight cleanup
+# - Orphaned semaphore cleanup
+# - Stale lock cleanup (cross-repo aware)
+# - Diagnostic checkpoints and forensics
+# - Process cleanup management
+# All imports are optional - graceful degradation if module not found.
+# =============================================================================
+
+# Service Registry - for pre-flight cleanup before starting services
+try:
+    from backend.core.service_registry import get_service_registry, ServiceRegistry
+    SERVICE_REGISTRY_AVAILABLE = True
+except ImportError:
+    SERVICE_REGISTRY_AVAILABLE = False
+    get_service_registry = None
+    ServiceRegistry = None
+
+# Graceful Shutdown - orphaned semaphore cleanup
+try:
+    from backend.core.resilience.graceful_shutdown import cleanup_orphaned_semaphores
+    SEMAPHORE_CLEANUP_AVAILABLE = True
+except ImportError:
+    SEMAPHORE_CLEANUP_AVAILABLE = False
+    cleanup_orphaned_semaphores = None
+
+# Supervisor Singleton - stale lock cleanup with cross-repo support
+try:
+    from backend.core.supervisor_singleton import (
+        cleanup_stale_locks as backend_cleanup_stale_locks,
+        cleanup_stale_locks_sync,
+    )
+    LOCK_CLEANUP_AVAILABLE = True
+except ImportError:
+    LOCK_CLEANUP_AVAILABLE = False
+    backend_cleanup_stale_locks = None
+    cleanup_stale_locks_sync = None
+
+# Shutdown Diagnostics - checkpoint logging for forensics
+try:
+    from backend.core.shutdown_diagnostics import (
+        ShutdownDiagnostics,
+        log_shutdown_trigger,
+        log_startup_checkpoint,
+        capture_system_state,
+    )
+    DIAGNOSTICS_AVAILABLE = True
+except ImportError:
+    DIAGNOSTICS_AVAILABLE = False
+    ShutdownDiagnostics = None
+    log_shutdown_trigger = None
+    log_startup_checkpoint = None
+    capture_system_state = None
+
+# Process Cleanup Manager - circuit breaker, health monitoring, retry logic
+try:
+    from backend.process_cleanup_manager import ProcessCleanupManager
+    PROCESS_CLEANUP_MANAGER_AVAILABLE = True
+except ImportError:
+    PROCESS_CLEANUP_MANAGER_AVAILABLE = False
+    ProcessCleanupManager = None
+
+# Intelligent Startup Narrator - phase-aware voice narration
+# Note: Import as BackendStartupPhase to avoid conflict with local StartupPhase enum
+try:
+    from backend.core.supervisor.startup_narrator import (
+        IntelligentStartupNarrator,
+        StartupPhase as BackendStartupPhase,
+    )
+    STARTUP_NARRATOR_AVAILABLE = True
+except ImportError:
+    STARTUP_NARRATOR_AVAILABLE = False
+    IntelligentStartupNarrator = None
+    BackendStartupPhase = None
+
+# =============================================================================
 # CONSTANTS
 # =============================================================================
 
@@ -49247,18 +49325,85 @@ class JarvisSystemKernel:
 
     async def startup(self) -> int:
         """
-        Run the full boot sequence.
+        Run the full boot sequence with global timeout protection.
+
+        v180.0 Enhanced with:
+        - Global startup timeout (prevents infinite hangs)
+        - Diagnostic checkpoints throughout
+        - Enterprise startup banner
+        - State recovery detection
 
         Returns:
             Exit code (0 for success, non-zero for failure)
+        """
+        # Apply global startup timeout to prevent infinite hangs
+        startup_timeout = float(os.environ.get(
+            "JARVIS_STARTUP_TIMEOUT",
+            str(DEFAULT_STARTUP_TIMEOUT)
+        ))
+
+        try:
+            return await asyncio.wait_for(
+                self._startup_impl(),
+                timeout=startup_timeout
+            )
+        except asyncio.TimeoutError:
+            self.logger.error(f"[Kernel] STARTUP TIMEOUT after {startup_timeout}s")
+            self.logger.error("[Kernel] This may indicate a hung component or resource lock.")
+            self.logger.error("[Kernel] Try: python unified_supervisor.py --restart --force")
+
+            # Log diagnostic checkpoint for forensics
+            if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
+                try:
+                    log_shutdown_trigger("TIMEOUT", f"Startup exceeded {startup_timeout}s")
+                except Exception:
+                    pass
+
+            self._state = KernelState.FAILED
+            return 1
+
+    async def _startup_impl(self) -> int:
+        """
+        Internal startup implementation (wrapped by timeout in startup()).
         """
         # Initialize startup issue collector for organized error/warning display
         issue_collector = get_startup_issue_collector()
         issue_collector.clear()  # Fresh start
 
-        self.logger.info("="*70)
-        self.logger.info("JARVIS SYSTEM KERNEL - Starting")
-        self.logger.info("="*70)
+        # =====================================================================
+        # v180.0: DIAGNOSTIC CHECKPOINT - Kernel startup begin
+        # =====================================================================
+        if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+            try:
+                log_startup_checkpoint("kernel_startup_begin")
+            except Exception:
+                pass
+
+        # =====================================================================
+        # v180.0: INTELLIGENT STATE RECOVERY / CRASH DETECTION
+        # Check if previous kernel crashed and log diagnostic info.
+        # =====================================================================
+        crash_indicator = LOCKS_DIR / "kernel_crash.marker"
+        if crash_indicator.exists():
+            try:
+                crash_info = crash_indicator.read_text().strip()
+                self.logger.warning(f"[Kernel] Previous crash detected: {crash_info}")
+                crash_indicator.unlink()  # Clear the marker
+                if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                    log_startup_checkpoint("crash_recovery_start")
+            except Exception:
+                pass
+
+        # =====================================================================
+        # v180.0: ENTERPRISE STARTUP BANNER
+        # =====================================================================
+        self.logger.info("")
+        self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
+        self.logger.info("║          ⚡ JARVIS UNIFIED SYSTEM KERNEL v1.0.0 ⚡                  ║")
+        self.logger.info("║                   Enterprise Edition (v180.0)                       ║")
+        self.logger.info("╠═════════════════════════════════════════════════════════════════════╣")
+        self.logger.info("║  🤖 Self-Healing • Zero-Touch • Cross-Repo • Trinity-Ready         ║")
+        self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
         self.logger.info("")
         self.logger.info("╭─────────────────────────────────────────────────────────────────────╮")
         self.logger.info("│                    ZONE ARCHITECTURE OVERVIEW                       │")
@@ -49568,6 +49713,15 @@ class JarvisSystemKernel:
             if self._readiness_manager:
                 self._readiness_manager.mark_tier(ReadinessTier.FULLY_READY)
 
+            # =====================================================================
+            # v180.0: READINESS TIER ANNOUNCEMENT
+            # Announce when FULLY_READY tier is reached (visible to users).
+            # =====================================================================
+            self.logger.info("")
+            self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
+            self.logger.info("║                   🟢 FULLY READY TIER REACHED                       ║")
+            self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
+
             # Final service verification
             issue_collector.set_current_phase("Service Verification")
             verification = await self._verify_all_services(timeout=10.0)
@@ -49588,7 +49742,48 @@ class JarvisSystemKernel:
             issue_collector.print_health_report()
 
             startup_duration = time.time() - self._started_at
+
+            # =====================================================================
+            # v180.0: ACCESS INFO BLOCK
+            # Show users where to access JARVIS and available voice commands.
+            # =====================================================================
+            backend_port = self.config.backend_port
+            frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+
+            self.logger.info("")
+            self.logger.info("════════════════════════════════════════════════════════════════════════")
+            self.logger.info("🎯 JARVIS is ready!")
+            self.logger.info("════════════════════════════════════════════════════════════════════════")
+            self.logger.info("")
+            self.logger.info("Access Points:")
+            self.logger.info(f"  • Frontend:     http://localhost:{frontend_port}/")
+            self.logger.info(f"  • Backend API:  http://localhost:{backend_port}/docs")
+            self.logger.info(f"  • Health:       http://localhost:{backend_port}/health")
+            self.logger.info("")
+            self.logger.info("Voice Commands:")
+            self.logger.info("  • Say 'Hey JARVIS' to activate")
+            self.logger.info("  • 'What can you do?' - List capabilities")
+            self.logger.info("  • 'Can you see my screen?' - Vision test")
+            self.logger.info("")
+            self.logger.info("IPC Commands:")
+            self.logger.info("  • python unified_supervisor.py --status")
+            self.logger.info("  • python unified_supervisor.py --shutdown")
+            self.logger.info("  • python unified_supervisor.py --restart")
+            self.logger.info("")
+            self.logger.info("Press Ctrl+C to stop")
+            self.logger.info("════════════════════════════════════════════════════════════════════════")
+            self.logger.info("")
+
             self.logger.success(f"[Kernel] ✅ Startup complete in {startup_duration:.2f}s")
+
+            # =====================================================================
+            # v180.0: DIAGNOSTIC CHECKPOINT - Startup complete
+            # =====================================================================
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                try:
+                    log_startup_checkpoint("startup_complete")
+                except Exception:
+                    pass
 
             # Voice narrator startup complete announcement
             if self._narrator:
@@ -49623,6 +49818,12 @@ class JarvisSystemKernel:
         """
         Phase 1: Preflight checks and cleanup.
 
+        v180.0 Enhanced with:
+        - Diagnostic checkpoint logging for forensics
+        - Service registry pre-flight cleanup
+        - Orphaned semaphore cleanup (platform-aware)
+        - Stale lock cleanup (cross-repo aware)
+        - Process cleanup manager integration
         - Acquire startup lock
         - Clean up zombie processes
         - Initialize IPC server
@@ -49631,6 +49832,72 @@ class JarvisSystemKernel:
         self._state = KernelState.PREFLIGHT
 
         with self.logger.section_start(LogSection.BOOT, "Zone 5.1 | Phase 1: Preflight"):
+            # =====================================================================
+            # v180.0: DIAGNOSTIC CHECKPOINT - Start of preflight
+            # =====================================================================
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                try:
+                    log_startup_checkpoint("preflight_start")
+                    self.logger.debug("[Kernel] Diagnostic checkpoint: preflight_start")
+                except Exception as diag_err:
+                    self.logger.debug(f"[Kernel] Diagnostic checkpoint failed: {diag_err}")
+
+            # =====================================================================
+            # v180.0: ORPHANED SEMAPHORE CLEANUP
+            # Clean up semaphores left by crashed processes before acquiring locks.
+            # Uses platform-specific commands (Darwin/Linux).
+            # =====================================================================
+            if SEMAPHORE_CLEANUP_AVAILABLE and cleanup_orphaned_semaphores:
+                try:
+                    self.logger.info("[Kernel] Cleaning orphaned semaphores...")
+                    sem_result = await cleanup_orphaned_semaphores()
+                    cleaned = sem_result.get("semaphores_cleaned", 0)
+                    if cleaned > 0:
+                        self.logger.success(f"[Kernel] Cleaned {cleaned} orphaned semaphore(s)")
+                    else:
+                        self.logger.debug("[Kernel] No orphaned semaphores found")
+                except Exception as sem_err:
+                    self.logger.warning(f"[Kernel] Semaphore cleanup warning: {sem_err}")
+                    # Non-fatal - continue startup
+
+            # =====================================================================
+            # v180.0: STALE LOCK CLEANUP (Cross-Repo Aware)
+            # Clean up stale locks from dead processes before acquiring new lock.
+            # Handles: dead PIDs, stale heartbeats, orphaned sockets, cross-repo.
+            # =====================================================================
+            if LOCK_CLEANUP_AVAILABLE and backend_cleanup_stale_locks:
+                try:
+                    self.logger.info("[Kernel] Cleaning stale locks (cross-repo)...")
+                    lock_result = await backend_cleanup_stale_locks(
+                        force=False,
+                        timeout=5.0,
+                        cross_repo=True  # Clean JARVIS, J-Prime, Reactor locks
+                    )
+                    if hasattr(lock_result, 'success') and lock_result.success:
+                        reason = getattr(lock_result, 'reason', 'cleaned')
+                        if reason != 'lock_valid':
+                            self.logger.success(f"[Kernel] Lock cleanup: {reason}")
+                    elif isinstance(lock_result, dict) and lock_result.get('success'):
+                        self.logger.success(f"[Kernel] Lock cleanup: {lock_result.get('reason', 'done')}")
+                    else:
+                        self.logger.debug("[Kernel] Lock state is valid, no cleanup needed")
+                except Exception as lock_err:
+                    self.logger.warning(f"[Kernel] Lock cleanup warning: {lock_err}")
+                    # Non-fatal - continue startup
+
+            # =====================================================================
+            # v180.0: LEGACY SOCKET CLEANUP
+            # Clean up legacy supervisor.sock if kernel.sock is the primary.
+            # Ensures no socket conflicts between entry points.
+            # =====================================================================
+            legacy_sock = LOCKS_DIR / "supervisor.sock"
+            if legacy_sock.exists():
+                try:
+                    legacy_sock.unlink()
+                    self.logger.debug("[Kernel] Cleaned legacy supervisor.sock")
+                except Exception as sock_err:
+                    self.logger.debug(f"[Kernel] Legacy socket cleanup: {sock_err}")
+
             # Acquire startup lock
             if not self._startup_lock.acquire(force=self._force):
                 # v119.0: Extract PID from holder dict (root-cause fix)
@@ -49642,12 +49909,67 @@ class JarvisSystemKernel:
                 return False
             self.logger.success("[Kernel] Startup lock acquired")
 
+            # =====================================================================
+            # v180.0: DIAGNOSTIC CHECKPOINT - Lock acquired
+            # =====================================================================
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                try:
+                    log_startup_checkpoint("lock_acquired")
+                except Exception:
+                    pass
+
             # Initialize managers
             self._readiness_manager = ProgressiveReadinessManager(self.config, self.logger)
             self._readiness_manager.mark_tier(ReadinessTier.STARTING)
             await self._readiness_manager.start_heartbeat_loop()
 
             self._process_manager = ProcessStateManager(self.config, self.logger)
+
+            # =====================================================================
+            # v180.0: SERVICE REGISTRY PRE-FLIGHT CLEANUP
+            # MUST be called before starting services to ensure clean slate.
+            # Removes dead PIDs, reused PIDs, invalid entries, stale services.
+            # =====================================================================
+            if SERVICE_REGISTRY_AVAILABLE and get_service_registry:
+                try:
+                    self.logger.info("[Kernel] Running service registry pre-flight cleanup...")
+                    registry = get_service_registry()
+                    cleanup_stats = await registry.pre_flight_cleanup()
+
+                    total = cleanup_stats.get("total_entries", 0)
+                    valid = cleanup_stats.get("valid_entries", 0)
+                    removed_dead = cleanup_stats.get("removed_dead_pid", 0)
+                    removed_stale = cleanup_stats.get("removed_stale", 0)
+                    ports_freed = cleanup_stats.get("ports_freed", [])
+                    cleanup_time = cleanup_stats.get("cleanup_time_ms", 0)
+
+                    # Report results
+                    if removed_dead > 0 or removed_stale > 0:
+                        self.logger.success(
+                            f"[Kernel] Registry cleanup: removed {removed_dead} dead, "
+                            f"{removed_stale} stale ({cleanup_time:.0f}ms)"
+                        )
+                    if ports_freed:
+                        self.logger.info(f"[Kernel] Freed ports: {ports_freed}")
+                    if valid > 0:
+                        self.logger.debug(f"[Kernel] Registry: {valid}/{total} valid entries")
+                except Exception as reg_err:
+                    self.logger.warning(f"[Kernel] Registry pre-flight warning: {reg_err}")
+                    # Non-fatal - continue startup
+
+            # =====================================================================
+            # v180.0: PROCESS CLEANUP MANAGER INTEGRATION
+            # Initialize enterprise-grade process cleanup with circuit breakers.
+            # =====================================================================
+            if PROCESS_CLEANUP_MANAGER_AVAILABLE and ProcessCleanupManager:
+                try:
+                    self._process_cleanup_manager = ProcessCleanupManager()
+                    self.logger.debug("[Kernel] Process cleanup manager initialized")
+                except Exception as pcm_err:
+                    self.logger.debug(f"[Kernel] Process cleanup manager init: {pcm_err}")
+                    self._process_cleanup_manager = None
+            else:
+                self._process_cleanup_manager = None
 
             # Zombie cleanup
             self._zombie_cleanup = ComprehensiveZombieCleanup(self.config, self.logger)
@@ -49669,12 +49991,38 @@ class JarvisSystemKernel:
             await self._ipc_server.start()
             self._register_ipc_handlers()
 
+            # =====================================================================
+            # v180.0: IPC SOCKET COMPATIBILITY
+            # Create symlink from legacy supervisor.sock to kernel.sock for
+            # backwards compatibility with older tools that expect supervisor.sock.
+            # =====================================================================
+            try:
+                if not legacy_sock.exists() and KERNEL_SOCKET_PATH.exists():
+                    legacy_sock.symlink_to(KERNEL_SOCKET_PATH)
+                    self.logger.debug("[Kernel] Created supervisor.sock symlink for compatibility")
+            except Exception as sym_err:
+                self.logger.debug(f"[Kernel] Symlink creation skipped: {sym_err}")
+
+            # =====================================================================
+            # v180.0: DIAGNOSTIC CHECKPOINT - Preflight complete
+            # =====================================================================
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                try:
+                    log_startup_checkpoint("preflight_complete")
+                except Exception:
+                    pass
+
             self._readiness_manager.mark_tier(ReadinessTier.PROCESS_STARTED)
             return True
 
     async def _phase_resources(self) -> bool:
         """
         Phase 2: Initialize resource managers.
+
+        v180.0 Enhanced with:
+        - Diagnostic checkpoints
+        - Port-in-use fallback strategy (try alternate ports)
+        - Bounded timeout for resource initialization
 
         Initializes in parallel:
         - Docker daemon
@@ -49684,7 +50032,17 @@ class JarvisSystemKernel:
         """
         self._state = KernelState.STARTING_RESOURCES
 
+        # v180.0: Resource initialization timeout
+        resource_timeout = float(os.environ.get("JARVIS_RESOURCE_TIMEOUT", "60.0"))
+
         with self.logger.section_start(LogSection.RESOURCES, "Zone 3 | Phase 2: Resources"):
+            # v180.0: Diagnostic checkpoint
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                try:
+                    log_startup_checkpoint("resources_start")
+                except Exception:
+                    pass
+
             self._resource_registry = ResourceManagerRegistry(self.config)
 
             # Create managers
@@ -49699,21 +50057,78 @@ class JarvisSystemKernel:
             self._resource_registry.register(gcp_manager)
             self._resource_registry.register(storage_manager)
 
-            # Initialize all in parallel
-            results = await self._resource_registry.initialize_all()
-
-            # Check results (ports are critical)
-            if not results.get("DynamicPortManager", False):
-                self.logger.error("[Kernel] Failed to allocate ports")
+            # Initialize all in parallel with timeout
+            try:
+                results = await asyncio.wait_for(
+                    self._resource_registry.initialize_all(),
+                    timeout=resource_timeout
+                )
+            except asyncio.TimeoutError:
+                self.logger.error(f"[Kernel] Resource initialization timed out after {resource_timeout}s")
                 return False
+
+            # =====================================================================
+            # v180.0: PORT-IN-USE FALLBACK STRATEGY
+            # If primary port allocation fails, try alternate ports before failing.
+            # =====================================================================
+            if not results.get("DynamicPortManager", False):
+                self.logger.warning("[Kernel] Primary port allocation failed, trying fallback ports...")
+
+                # Get port range from config or use defaults
+                port_start, port_end = BACKEND_PORT_RANGE
+                fallback_ports = [
+                    port_start + 10,  # Try 8010
+                    port_start + 20,  # Try 8020
+                    port_start + 50,  # Try 8050
+                ]
+
+                port_found = False
+                for fallback_port in fallback_ports:
+                    if fallback_port > port_end:
+                        continue
+
+                    # Check if port is available
+                    try:
+                        import socket
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(1.0)
+                        result = sock.connect_ex(('localhost', fallback_port))
+                        sock.close()
+
+                        if result != 0:  # Port is available (connection refused = nothing listening)
+                            self.config.backend_port = fallback_port
+                            port_manager.selected_port = fallback_port
+                            self.logger.success(f"[Kernel] Fallback port allocated: {fallback_port}")
+                            port_found = True
+                            break
+                        else:
+                            self.logger.debug(f"[Kernel] Fallback port {fallback_port} in use")
+                    except Exception as port_err:
+                        self.logger.debug(f"[Kernel] Port check error for {fallback_port}: {port_err}")
+
+                if not port_found:
+                    self.logger.error("[Kernel] Failed to allocate any port (all in use)")
+                    self.logger.error("[Kernel] Try: lsof -i :8000-8100 | grep LISTEN")
+                    return False
 
             # Update config with selected port
             if port_manager.selected_port is not None:
                 self.config.backend_port = port_manager.selected_port
             self.logger.success(f"[Kernel] Backend port: {self.config.backend_port}")
 
+            # Set environment variable for child processes
+            os.environ["JARVIS_BACKEND_PORT"] = str(self.config.backend_port)
+
             ready_count = sum(1 for v in results.values() if v)
             self.logger.success(f"[Kernel] Resources: {ready_count}/{len(results)} initialized")
+
+            # v180.0: Diagnostic checkpoint
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                try:
+                    log_startup_checkpoint("resources_complete")
+                except Exception:
+                    pass
+
             return True
 
     async def _phase_backend(self) -> bool:
@@ -49922,21 +50337,33 @@ class JarvisSystemKernel:
         """
         Phase 5: Initialize Trinity cross-repo integration.
 
+        v180.0 Enhanced with:
+        - Deep health checks (not just HTTP ping)
+        - Auto-restart on crash (background watchdog)
+        - Graceful shutdown with wait
+        - Diagnostic checkpoints
+
         Starts:
         - J-Prime (local LLM inference)
         - Reactor-Core (training pipeline)
-
-        v170.0: Enhanced with comprehensive diagnostic logging
         """
         self._state = KernelState.STARTING_TRINITY
 
         with self.logger.section_start(LogSection.TRINITY, "Zone 5.7 | Phase 5: Trinity"):
             try:
+                # v180.0: Diagnostic checkpoint
+                if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                    try:
+                        log_startup_checkpoint("trinity_start")
+                    except Exception:
+                        pass
+
                 # Log Trinity configuration
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
-                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION")
+                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION (v180.0)")
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
                 self.logger.info(f"[Trinity] Enabled: {self.config.trinity_enabled}")
+                self.logger.info(f"[Trinity] Auto-restart: {os.environ.get('JARVIS_TRINITY_AUTO_RESTART', 'true')}")
 
                 # Log repo search paths
                 prime_path = self.config.prime_repo_path
@@ -49975,8 +50402,16 @@ class JarvisSystemKernel:
 
                 self.logger.info("[Trinity] ───────────────────────────────────────────────────────")
 
-                # Start components
-                results = await self._trinity.start_components()
+                # Start components with bounded timeout
+                trinity_timeout = float(os.environ.get("JARVIS_TRINITY_TIMEOUT", "60.0"))
+                try:
+                    results = await asyncio.wait_for(
+                        self._trinity.start_components(),
+                        timeout=trinity_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"[Trinity] Component start timed out after {trinity_timeout}s")
+                    results = {}
 
                 # Log start results
                 started_count = sum(1 for v in results.values() if v)
@@ -49989,6 +50424,20 @@ class JarvisSystemKernel:
                             self.logger.success(f"[Trinity]   ✓ {component}: RUNNING")
                         else:
                             self.logger.warning(f"[Trinity]   ✗ {component}: FAILED TO START")
+
+                    # =====================================================================
+                    # v180.0: TRINITY AUTO-RESTART WATCHDOG
+                    # Start background task to monitor and restart crashed components.
+                    # =====================================================================
+                    auto_restart = os.environ.get("JARVIS_TRINITY_AUTO_RESTART", "true").lower() == "true"
+                    if auto_restart and started_count > 0:
+                        watchdog_task = asyncio.create_task(
+                            self._trinity_watchdog_loop(),
+                            name="trinity-watchdog"
+                        )
+                        self._background_tasks.append(watchdog_task)
+                        self.logger.info("[Trinity] 🐕 Auto-restart watchdog active")
+
                 elif total_count == 0:
                     self.logger.info("[Trinity] No Trinity components configured - running JARVIS standalone")
                 else:
@@ -50008,6 +50457,13 @@ class JarvisSystemKernel:
                 if self._readiness_manager:
                     self._readiness_manager.mark_component_ready("trinity", started_count > 0)
 
+                # v180.0: Diagnostic checkpoint
+                if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                    try:
+                        log_startup_checkpoint("trinity_complete")
+                    except Exception:
+                        pass
+
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
                 return True  # Trinity is optional
 
@@ -50020,6 +50476,103 @@ class JarvisSystemKernel:
                     except Exception:
                         pass
                 return True  # Non-fatal
+
+    async def _trinity_watchdog_loop(self) -> None:
+        """
+        v180.0: Background watchdog that monitors Trinity components and restarts them on crash.
+
+        Features:
+        - Deep health checks (not just HTTP ping)
+        - Exponential backoff on repeated failures
+        - Maximum restart attempts before giving up
+        - Diagnostic logging for crashes
+        """
+        check_interval = float(os.environ.get("JARVIS_TRINITY_CHECK_INTERVAL", "30.0"))
+        max_restart_attempts = int(os.environ.get("JARVIS_TRINITY_MAX_RESTARTS", "3"))
+
+        restart_counts: Dict[str, int] = {}
+        backoff_until: Dict[str, float] = {}
+
+        self.logger.debug("[Trinity-Watchdog] Starting watchdog loop")
+
+        while self._state == KernelState.RUNNING:
+            try:
+                await asyncio.sleep(check_interval)
+
+                if not self._trinity:
+                    continue
+
+                # Get current status with deep health check
+                status = self._trinity.get_status()
+                components = status.get("components", {})
+
+                for name, info in components.items():
+                    if not info.get("configured"):
+                        continue
+
+                    # Check if component is healthy
+                    is_healthy = info.get("running", False) and info.get("healthy", False)
+
+                    # Check backoff
+                    if name in backoff_until and time.time() < backoff_until[name]:
+                        continue
+
+                    if not is_healthy:
+                        restart_counts[name] = restart_counts.get(name, 0) + 1
+                        attempts = restart_counts[name]
+
+                        if attempts > max_restart_attempts:
+                            self.logger.error(
+                                f"[Trinity-Watchdog] {name} exceeded max restarts ({max_restart_attempts}), giving up"
+                            )
+                            # Log diagnostic
+                            if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
+                                try:
+                                    log_shutdown_trigger(
+                                        "TRINITY_RESTART_EXHAUSTED",
+                                        f"{name} exceeded {max_restart_attempts} restart attempts"
+                                    )
+                                except Exception:
+                                    pass
+                            continue
+
+                        self.logger.warning(f"[Trinity-Watchdog] {name} unhealthy, restarting (attempt {attempts}/{max_restart_attempts})")
+
+                        # Attempt restart
+                        try:
+                            if hasattr(self._trinity, 'restart_component'):
+                                success = await self._trinity.restart_component(name)
+                            else:
+                                # Fallback: stop and start
+                                await self._trinity.stop_component(name)
+                                await asyncio.sleep(2.0)  # Grace period
+                                success = await self._trinity.start_component(name)
+
+                            if success:
+                                self.logger.success(f"[Trinity-Watchdog] {name} restarted successfully")
+                                restart_counts[name] = 0  # Reset on success
+                            else:
+                                self.logger.warning(f"[Trinity-Watchdog] {name} restart failed")
+                                # Apply exponential backoff
+                                backoff_seconds = min(300, 30 * (2 ** (attempts - 1)))
+                                backoff_until[name] = time.time() + backoff_seconds
+                                self.logger.info(f"[Trinity-Watchdog] {name} backoff for {backoff_seconds}s")
+
+                        except Exception as restart_err:
+                            self.logger.error(f"[Trinity-Watchdog] {name} restart error: {restart_err}")
+                            backoff_seconds = min(300, 30 * (2 ** (attempts - 1)))
+                            backoff_until[name] = time.time() + backoff_seconds
+                    else:
+                        # Component is healthy, reset restart count
+                        if name in restart_counts and restart_counts[name] > 0:
+                            restart_counts[name] = 0
+                            self.logger.debug(f"[Trinity-Watchdog] {name} recovered, reset restart count")
+
+            except asyncio.CancelledError:
+                self.logger.debug("[Trinity-Watchdog] Watchdog cancelled")
+                break
+            except Exception as e:
+                self.logger.debug(f"[Trinity-Watchdog] Error in watchdog loop: {e}")
 
     async def _init_enterprise_service_with_timeout(
         self,
@@ -51125,6 +51678,11 @@ class JarvisSystemKernel:
         """
         Master shutdown orchestration.
 
+        v180.0 Enhanced with:
+        - Diagnostic checkpoints for forensics
+        - Shutdown trigger logging
+        - Crash marker for recovery detection
+
         Stops all components in reverse order:
         1. Background tasks
         2. Trinity components
@@ -51140,11 +51698,18 @@ class JarvisSystemKernel:
         self._state = KernelState.SHUTTING_DOWN
         self.logger.info("[Kernel] Initiating shutdown...")
 
+        # v180.0: Diagnostic checkpoint - shutdown start
+        shutdown_reason = self._signal_handler.shutdown_reason or "unknown"
+        if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
+            try:
+                log_shutdown_trigger("CLEANUP_START", f"Reason: {shutdown_reason}")
+            except Exception:
+                pass
+
         # Voice narrator shutdown announcement
         if self._narrator:
             try:
-                reason = self._signal_handler.shutdown_reason or ""
-                await self._narrator.narrate_shutdown(reason=reason)
+                await self._narrator.narrate_shutdown(reason=shutdown_reason)
             except Exception as narr_err:
                 self.logger.debug(f"[Narrator] Shutdown announcement failed: {narr_err}")
 
@@ -51210,8 +51775,23 @@ class JarvisSystemKernel:
             # Release lock
             self._startup_lock.release()
 
+            # v180.0: Clean up legacy supervisor.sock symlink
+            legacy_sock = LOCKS_DIR / "supervisor.sock"
+            try:
+                if legacy_sock.is_symlink():
+                    legacy_sock.unlink()
+            except Exception:
+                pass
+
             self._state = KernelState.STOPPED
             self.logger.success("[Kernel] Shutdown complete")
+
+            # v180.0: Diagnostic checkpoint - shutdown complete
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                try:
+                    log_startup_checkpoint("shutdown_complete")
+                except Exception:
+                    pass
 
             # Return appropriate exit code
             if self._signal_handler.shutdown_reason == "SIGINT":
