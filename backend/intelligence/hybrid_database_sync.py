@@ -1439,7 +1439,13 @@ class HybridDatabaseSync:
             self.metrics.cloudsql_available = False
 
     async def _preload_faiss_cache(self):
-        """Preload all voice embeddings from SQLite into FAISS cache"""
+        """
+        Preload all voice embeddings from SQLite into FAISS cache.
+
+        v124.0: FAISS operations are now run off the event loop using asyncio.to_thread()
+        to prevent blocking during Phase 6 initialization. The SQLite read is async,
+        but the FAISS add_embedding() calls are batched and run in a thread pool.
+        """
         if not self.faiss_cache:
             return
 
@@ -1447,21 +1453,37 @@ class HybridDatabaseSync:
             logger.info("🔄 Preloading FAISS cache from SQLite...")
             start_time = time.time()
 
-            async with self.sqlite_conn.execute("SELECT speaker_name, voiceprint_embedding, acoustic_features, total_samples FROM speaker_profiles") as cursor:
-                count = 0
+            # Step 1: Async read all profiles from SQLite (non-blocking)
+            profiles_to_load = []
+            async with self.sqlite_conn.execute(
+                "SELECT speaker_name, voiceprint_embedding, acoustic_features, total_samples FROM speaker_profiles"
+            ) as cursor:
                 async for row in cursor:
                     speaker_name, embedding_bytes, features_json, total_samples = row
-
                     if embedding_bytes:
-                        embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
-                        metadata = {
-                            "speaker_name": speaker_name,
-                            "acoustic_features": json.loads(features_json) if features_json else {},
-                            "total_samples": total_samples
-                        }
+                        profiles_to_load.append((speaker_name, embedding_bytes, features_json, total_samples))
 
-                        self.faiss_cache.add_embedding(speaker_name, embedding, metadata)
-                        count += 1
+            if not profiles_to_load:
+                logger.info("✅ FAISS cache: No profiles to preload")
+                return
+
+            # Step 2: Run FAISS add_embedding in thread pool (blocking operation off event loop)
+            # v124.0: This prevents the event loop from being blocked during Phase 6
+            def _add_embeddings_to_faiss_sync():
+                """Sync FAISS operations - runs in thread pool."""
+                count = 0
+                for speaker_name, embedding_bytes, features_json, total_samples in profiles_to_load:
+                    embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
+                    metadata = {
+                        "speaker_name": speaker_name,
+                        "acoustic_features": json.loads(features_json) if features_json else {},
+                        "total_samples": total_samples
+                    }
+                    self.faiss_cache.add_embedding(speaker_name, embedding, metadata)
+                    count += 1
+                return count
+
+            count = await asyncio.to_thread(_add_embeddings_to_faiss_sync)
 
             elapsed = (time.time() - start_time) * 1000
             self.metrics.cache_size = self.faiss_cache.size()
