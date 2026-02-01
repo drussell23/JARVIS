@@ -50336,6 +50336,10 @@ class JarvisSystemKernel:
             env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
             env["LOADING_SERVER_PORT"] = str(loading_port)
 
+            # v120.0: Also set frontend port so loading page knows where to redirect
+            frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+            env["JARVIS_FRONTEND_PORT"] = str(frontend_port)
+
             # Step 3: Create log file for subprocess output (helps debugging)
             logs_dir = project_root / "backend" / "logs"
             logs_dir.mkdir(parents=True, exist_ok=True)

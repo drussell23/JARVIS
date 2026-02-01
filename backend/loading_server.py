@@ -1280,8 +1280,25 @@ class LoadingServer:
         return self._json_response({"error": "Not found"}, status=404)
 
     def _get_loading_page(self) -> str:
-        """Generate the loading page HTML."""
-        return '''<!DOCTYPE html>
+        """
+        Generate the loading page HTML with dynamic port configuration.
+
+        v126.0: Fixed hardcoded ports - now uses actual configured ports from
+        environment variables (LOADING_SERVER_PORT, JARVIS_FRONTEND_PORT) for:
+        - WebSocket URL (ws://localhost:{loading_port}/ws/progress)
+        - API URL (http://localhost:{loading_port})
+        - Frontend redirect URL (http://localhost:{frontend_port})
+
+        This ensures the loading page works correctly regardless of which
+        ports are configured.
+        """
+        # Get actual ports from configuration
+        loading_port = self.config.port
+        frontend_port = self.config.frontend_port
+
+        # Use template with placeholders then substitute
+        # (can't use f-string because CSS uses curly braces)
+        html = '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1403,8 +1420,8 @@ class LoadingServer:
     </div>
 
     <script>
-        const WS_URL = 'ws://localhost:3001/ws/progress';
-        const API_URL = 'http://localhost:3001';
+        const WS_URL = 'ws://localhost:__LOADING_PORT__/ws/progress';
+        const API_URL = 'http://localhost:__LOADING_PORT__';
         let ws = null;
         let reconnectAttempts = 0;
         const MAX_RECONNECT = 10;
@@ -1443,7 +1460,7 @@ class LoadingServer:
 
             if (progress >= 100) {
                 setTimeout(() => {
-                    window.location.href = 'http://localhost:3000';
+                    window.location.href = 'http://localhost:__FRONTEND_PORT__';
                 }, 1500);
             }
         }
@@ -1510,6 +1527,11 @@ class LoadingServer:
     </script>
 </body>
 </html>'''
+
+        # v126.0: Substitute actual port values into the template
+        html = html.replace('__LOADING_PORT__', str(loading_port))
+        html = html.replace('__FRONTEND_PORT__', str(frontend_port))
+        return html
 
     # =========================================================================
     # Background Tasks
