@@ -51793,6 +51793,12 @@ class JarvisSystemKernel:
                     self.logger.warning(
                         "[LoadingServer] Slow to respond - continuing (may still be starting)"
                     )
+                    # v184.0: Start heartbeat even when slow - ensures frontend gets liveness
+                    if self._heartbeat_task is None or self._heartbeat_task.done():
+                        self._heartbeat_task = asyncio.create_task(
+                            self._supervisor_heartbeat_loop()
+                        )
+                        self.logger.debug("[LoadingServer] Heartbeat loop started (slow path)")
                     # Don't fail - let it keep trying in background
                     return True
 
