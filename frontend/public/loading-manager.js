@@ -2898,6 +2898,72 @@ class JARVISLoadingManager {
             if (metadata.enterprise_success !== undefined) {
                 this.state.enterpriseSuccess = metadata.enterprise_success;
             }
+
+            // ===================================================================
+            // v182.0: TRINITY READINESS VERIFICATION
+            // Handle the new trinity metadata object from unified_supervisor
+            // This provides structured data for Trinity component status
+            // ===================================================================
+            if (metadata.trinity) {
+                const trinity = metadata.trinity;
+
+                // Update trinityComponents state with v182.0 format
+                if (!this.state.trinityComponents) {
+                    this.state.trinityComponents = {
+                        jarvis: { status: 'pending' },
+                        prime: { status: 'pending' },
+                        reactor: { status: 'pending' },
+                        overallProgress: 0
+                    };
+                }
+
+                // Map v182.0 trinity object to trinityComponents state
+                if (trinity.jarvis_body) {
+                    this.state.trinityComponents.jarvis = {
+                        status: trinity.jarvis_body.status === 'ready' ? 'complete' : trinity.jarvis_body.status,
+                        label: trinity.jarvis_body.label,
+                        icon: trinity.jarvis_body.icon
+                    };
+                }
+                if (trinity.jarvis_prime) {
+                    this.state.trinityComponents.prime = {
+                        status: trinity.jarvis_prime.status === 'ready' ? 'complete' : trinity.jarvis_prime.status,
+                        label: trinity.jarvis_prime.label,
+                        icon: trinity.jarvis_prime.icon,
+                        message: trinity.jarvis_prime.message
+                    };
+                }
+                if (trinity.reactor_core) {
+                    this.state.trinityComponents.reactor = {
+                        status: trinity.reactor_core.status === 'ready' ? 'complete' : trinity.reactor_core.status,
+                        label: trinity.reactor_core.label,
+                        icon: trinity.reactor_core.icon,
+                        message: trinity.reactor_core.message
+                    };
+                }
+
+                // v182.0: Track Trinity all_ready status
+                this.state.trinityAllReady = trinity.all_ready === true;
+                this.state.trinityComponents.overallProgress = trinity.progress || 0;
+
+                // Update Trinity UI
+                this.updateTrinityComponentsUI();
+
+                // Log when all Trinity components are ready
+                if (trinity.all_ready && !this.state.trinityReadyLogged) {
+                    this.addLogEntry('Trinity', '🔺 All Trinity components ready', 'success');
+                    this.state.trinityReadyLogged = true;
+                }
+            }
+
+            // v182.0: Track trinity_ready flag from server
+            if (metadata.trinity_ready !== undefined) {
+                this.state.trinityAllReady = metadata.trinity_ready === true;
+                if (metadata.trinity_ready && !this.state.trinityReadyLogged) {
+                    this.addLogEntry('Trinity', '🔺 Trinity verification complete', 'success');
+                    this.state.trinityReadyLogged = true;
+                }
+            }
         }
 
         // Handle special log-only stages
@@ -3813,14 +3879,34 @@ class JARVISLoadingManager {
         }
         
         console.log('[Complete] ✓ Backend operationally ready');
+        this.state.progress = 96;
+        this.state.targetProgress = 96;
+        this.updateProgressBar();
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v182.0 STEP 2: Wait for TRINITY components to be ready (if enabled)
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (this.config.isUnifiedSupervisor) {
+            console.log('[Complete] Step 2: Verifying Trinity components...');
+            this.updateStatusText('Verifying Trinity integration...', 'loading');
+
+            const trinityReady = await this.waitForTrinityReady();
+            if (!trinityReady) {
+                console.warn('[Complete] Trinity not fully ready - proceeding with available components');
+                this.addLogEntry('Trinity', 'Some Trinity components may still be initializing', 'warning');
+            } else {
+                console.log('[Complete] ✓ Trinity components verified');
+            }
+        }
+
         this.state.progress = 97;
         this.state.targetProgress = 97;
         this.updateProgressBar();
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // STEP 2: Wait for FRONTEND to be responding
+        // STEP 3: Wait for FRONTEND to be responding
         // ═══════════════════════════════════════════════════════════════════════════
-        console.log('[Complete] Step 2: Waiting for frontend...');
+        console.log('[Complete] Step 3: Waiting for frontend...');
         this.updateStatusText('Waiting for user interface...', 'loading');
         
         const frontendReady = await this.waitForFrontendWithRetries();
@@ -3837,9 +3923,9 @@ class JARVISLoadingManager {
         this.updateProgressBar();
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // STEP 3: FINAL verification - make sure backend STILL responds after frontend wait
+        // STEP 4: FINAL verification - make sure backend STILL responds after frontend wait
         // ═══════════════════════════════════════════════════════════════════════════
-        console.log('[Complete] Step 3: Final system verification...');
+        console.log('[Complete] Step 4: Final system verification...');
         this.updateStatusText('Final system check...', 'verifying');
         
         const finalBackendCheck = await this.quickBackendCheck();
@@ -4096,6 +4182,68 @@ class JARVISLoadingManager {
                 resolve(false);
             }
         });
+    }
+
+    /**
+     * v182.0: Wait for Trinity components to be ready.
+     *
+     * This ensures all Trinity components (JARVIS Body, J-Prime Mind, Reactor-Core)
+     * are fully initialized before proceeding with redirect.
+     *
+     * The unified_supervisor already waits for Trinity on the server side,
+     * but this provides a client-side safety net and visual feedback.
+     *
+     * @returns {Promise<boolean>} True if Trinity is ready or timeout reached
+     */
+    async waitForTrinityReady() {
+        const config = {
+            maxWaitTime: 15000,     // 15 seconds max wait
+            checkInterval: 500,     // Check every 500ms
+        };
+
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < config.maxWaitTime) {
+            // Check if Trinity is already marked as ready
+            if (this.state.trinityAllReady === true) {
+                console.log('[Trinity Wait] ✓ Trinity marked as ready');
+                return true;
+            }
+
+            // Check trinityComponents state
+            if (this.state.trinityComponents) {
+                const jarvisReady = this.state.trinityComponents.jarvis?.status === 'complete' ||
+                                   this.state.trinityComponents.jarvis?.status === 'ready';
+                const primeReady = this.state.trinityComponents.prime?.status === 'complete' ||
+                                  this.state.trinityComponents.prime?.status === 'ready' ||
+                                  this.state.trinityComponents.prime?.status === 'skipped';
+                const reactorReady = this.state.trinityComponents.reactor?.status === 'complete' ||
+                                    this.state.trinityComponents.reactor?.status === 'ready' ||
+                                    this.state.trinityComponents.reactor?.status === 'skipped';
+
+                // JARVIS Body (backend) is required
+                // Prime and Reactor are optional (skipped counts as ready)
+                if (jarvisReady && primeReady && reactorReady) {
+                    console.log('[Trinity Wait] ✓ All Trinity components ready');
+                    this.state.trinityAllReady = true;
+                    return true;
+                }
+
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                console.log(`[Trinity Wait] Waiting... (${elapsed}s) - ` +
+                           `JARVIS:${jarvisReady}, Prime:${primeReady}, Reactor:${reactorReady}`);
+            }
+
+            await this.sleep(config.checkInterval);
+        }
+
+        // Timeout - check one more time
+        if (this.state.trinityAllReady === true) {
+            return true;
+        }
+
+        console.warn('[Trinity Wait] Timeout - Trinity may not be fully ready');
+        return false;
     }
 
     async waitForFrontendWithRetries() {

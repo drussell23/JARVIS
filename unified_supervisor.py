@@ -9786,17 +9786,40 @@ class IntelligentChromeIncognitoManager:
             return []
 
     async def _launch_fresh_incognito(self, url: str) -> bool:
-        """Launch a fresh Chrome incognito window."""
+        """
+        Launch a fresh Chrome incognito window in fullscreen mode.
+
+        v182.0: Enhanced to match legacy start_system.py behavior:
+        - Creates incognito window
+        - Navigates to URL
+        - Activates Chrome
+        - Toggles fullscreen using Cmd+Ctrl+F
+        """
         if sys.platform != 'darwin':
             self._logger.warning("Non-macOS platform - cannot launch Chrome via AppleScript")
             return False
 
+        # v182.0: AppleScript that creates incognito AND toggles fullscreen
         applescript = f'''
         tell application "Google Chrome"
             set newWindow to make new window with properties {{mode:"incognito"}}
             set URL of active tab of newWindow to "{url}"
             activate
         end tell
+
+        -- Wait for window to fully render before fullscreen toggle
+        delay 0.5
+
+        tell application "System Events"
+            tell process "Google Chrome"
+                try
+                    -- Toggle fullscreen mode using keyboard shortcut (Cmd+Ctrl+F)
+                    keystroke "f" using {{command down, control down}}
+                end try
+            end tell
+        end tell
+
+        return "success"
         '''
 
         try:
@@ -9808,7 +9831,10 @@ class IntelligentChromeIncognitoManager:
             _, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
 
             if process.returncode == 0:
-                self._logger.info(f"🔒 Launched fresh incognito window: {url}")
+                self._logger.info(f"🔒 Launched fresh incognito window (fullscreen): {url}")
+                # v182.0: Also call ensure_fullscreen as safety net
+                await asyncio.sleep(0.3)
+                await self._ensure_fullscreen()
                 return True
             else:
                 self._logger.error(f"Failed to launch incognito: {stderr.decode()}")
@@ -9885,17 +9911,45 @@ class IntelligentChromeIncognitoManager:
         return closed
 
     async def _ensure_fullscreen(self) -> bool:
-        """Ensure Chrome window is fullscreen."""
+        """
+        Ensure Chrome window is fullscreen.
+
+        v182.0: Fixed to actually toggle fullscreen like legacy start_system.py:
+        - Activates Chrome
+        - Checks AXFullScreen attribute to detect current state
+        - Toggles fullscreen using Cmd+Ctrl+F if not already fullscreen
+        - Returns status: ALREADY_FULLSCREEN or TOGGLED_FULLSCREEN
+        """
         if sys.platform != 'darwin':
             return False
 
         try:
+            # v182.0: Proper fullscreen detection and toggle
             applescript = '''
+            tell application "Google Chrome"
+                activate
+                delay 0.3
+            end tell
+
             tell application "System Events"
                 tell process "Google Chrome"
-                    if (count of windows) > 0 then
-                        set frontmost to true
-                    end if
+                    try
+                        set frontWindow to front window
+                        -- Check AXFullScreen attribute to detect current fullscreen state
+                        set isFullscreen to value of attribute "AXFullScreen" of frontWindow
+
+                        if isFullscreen then
+                            return "ALREADY_FULLSCREEN"
+                        else
+                            -- Not fullscreen - toggle it on using Cmd+Ctrl+F
+                            keystroke "f" using {command down, control down}
+                            return "TOGGLED_FULLSCREEN"
+                        end if
+                    on error
+                        -- Fallback: just try to toggle fullscreen
+                        keystroke "f" using {command down, control down}
+                        return "TOGGLED_FULLSCREEN"
+                    end try
                 end tell
             end tell
             '''
@@ -9904,9 +9958,17 @@ class IntelligentChromeIncognitoManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            await asyncio.wait_for(process.communicate(), timeout=5)
-            return True
-        except Exception:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+
+            if process.returncode == 0:
+                result = stdout.decode().strip()
+                self._logger.debug(f"[Chrome] Fullscreen result: {result}")
+                return True
+            else:
+                self._logger.warning(f"[Chrome] Fullscreen toggle failed: {stderr.decode()}")
+                return False
+        except Exception as e:
+            self._logger.warning(f"[Chrome] Fullscreen error: {e}")
             return False
 
     def get_status(self) -> Dict[str, Any]:
@@ -49108,6 +49170,28 @@ class JarvisSystemKernel:
         # Enterprise status tracking
         self._enterprise_status: Dict[str, Any] = {}
 
+        # v182.0: Dynamic component status tracking for accurate progress broadcasting
+        # This tracks the REAL status of each component for the loading page
+        self._component_status: Dict[str, Dict[str, Any]] = {
+            "loading_server": {"status": "pending", "message": "Waiting to start"},
+            "preflight": {"status": "pending", "message": "Waiting to start"},
+            "resources": {"status": "pending", "message": "Waiting to start"},
+            "backend": {"status": "pending", "message": "Waiting to start"},
+            "intelligence": {"status": "pending", "message": "Waiting to start"},
+            "trinity": {"status": "pending", "message": "Waiting to start"},
+            "jarvis_prime": {"status": "pending", "message": "Waiting to start"},
+            "reactor_core": {"status": "pending", "message": "Waiting to start"},
+            "enterprise": {"status": "pending", "message": "Waiting to start"},
+            "frontend": {"status": "pending", "message": "Waiting to start"},
+        }
+
+        # v182.0: Trinity readiness flags - ALL must be true before redirect
+        self._trinity_ready: Dict[str, bool] = {
+            "jarvis_body": False,      # Backend + intelligence
+            "jarvis_prime": False,     # Local LLM or Hollow Client
+            "reactor_core": False,     # Training pipeline
+        }
+
         # Background tasks
         self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
@@ -50615,6 +50699,29 @@ class JarvisSystemKernel:
 
                 self.logger.info("[Trinity] ───────────────────────────────────────────────────────")
 
+                # v182.0: Broadcast Trinity discovery status BEFORE starting
+                self._update_component_status("trinity", "running", "Starting Trinity components...")
+                if prime_status.get("configured"):
+                    self._update_component_status(
+                        "jarvis_prime", "running",
+                        f"Starting J-Prime from {prime_status.get('repo_path', 'unknown')[:30]}..."
+                    )
+                else:
+                    self._update_component_status("jarvis_prime", "skipped", "J-Prime not configured")
+
+                if reactor_status.get("configured"):
+                    self._update_component_status(
+                        "reactor_core", "running",
+                        f"Starting Reactor-Core from {reactor_status.get('repo_path', 'unknown')[:30]}..."
+                    )
+                else:
+                    self._update_component_status("reactor_core", "skipped", "Reactor-Core not configured")
+
+                await self._broadcast_component_update(
+                    stage="trinity",
+                    message="Starting Trinity cross-repo components..."
+                )
+
                 # Start components with bounded timeout (v181.0: use realistic timeout)
                 trinity_timeout = float(os.environ.get(
                     "JARVIS_TRINITY_TIMEOUT",
@@ -50640,8 +50747,17 @@ class JarvisSystemKernel:
                     for component, started in results.items():
                         if started:
                             self.logger.success(f"[Trinity]   ✓ {component}: RUNNING")
+                            # v182.0: Update component status based on results
+                            if "prime" in component.lower():
+                                self._update_component_status("jarvis_prime", "complete", "J-Prime running")
+                            elif "reactor" in component.lower():
+                                self._update_component_status("reactor_core", "complete", "Reactor-Core running")
                         else:
                             self.logger.warning(f"[Trinity]   ✗ {component}: FAILED TO START")
+                            if "prime" in component.lower():
+                                self._update_component_status("jarvis_prime", "error", "J-Prime failed to start")
+                            elif "reactor" in component.lower():
+                                self._update_component_status("reactor_core", "error", "Reactor-Core failed to start")
 
                     # =====================================================================
                     # v180.0: TRINITY AUTO-RESTART WATCHDOG
@@ -50658,8 +50774,18 @@ class JarvisSystemKernel:
 
                 elif total_count == 0:
                     self.logger.info("[Trinity] No Trinity components configured - running JARVIS standalone")
+                    # v182.0: Mark as skipped when no components configured
+                    self._update_component_status("jarvis_prime", "skipped", "Not configured")
+                    self._update_component_status("reactor_core", "skipped", "Not configured")
                 else:
                     self.logger.warning(f"[Trinity] ⚠️ 0/{total_count} components started")
+
+                # v182.0: Final Trinity status broadcast
+                self._update_component_status("trinity", "complete", f"{started_count}/{max(total_count, 1)} Trinity components ready")
+                await self._broadcast_component_update(
+                    stage="trinity",
+                    message=f"Trinity integration complete: {started_count} component(s) active"
+                )
 
                 # Voice narration for Trinity components
                 if self._narrator:
@@ -51326,25 +51452,12 @@ class JarvisSystemKernel:
                             os.environ["JARVIS_SUPERVISOR_LOADING"] = "1"
                             self.logger.debug("[Kernel] Set JARVIS_SUPERVISOR_LOADING=1")
 
-                            # v121.0: Send initial progress broadcast so page shows something
-                            await self._broadcast_startup_progress(
+                            # v182.0: Send initial progress with REAL component status
+                            self._update_component_status("loading_server", "complete", "Loading server ready")
+                            self._update_component_status("preflight", "running", "Preflight checks in progress")
+                            await self._broadcast_component_update(
                                 stage="initializing",
                                 message="JARVIS kernel starting...",
-                                progress=3,
-                                metadata={
-                                    "phase": "preflight",
-                                    "icon": "rocket",
-                                    "components": {
-                                        "loading_server": {"status": "complete"},
-                                        "preflight": {"status": "running"},
-                                        "resources": {"status": "pending"},
-                                        "backend": {"status": "pending"},
-                                        "intelligence": {"status": "pending"},
-                                        "trinity": {"status": "pending"},
-                                        "enterprise": {"status": "pending"},
-                                        "frontend": {"status": "pending"},
-                                    }
-                                }
                             )
                         else:
                             error = result.get("error", "unknown")
@@ -51361,27 +51474,14 @@ class JarvisSystemKernel:
                 if browser_lock_acquired:
                     self._release_browser_lock()
 
-        # v121.0: Also send initial progress if server started but browser wasn't opened by us
+        # v182.0: Also send initial progress if server started but browser wasn't opened by us
         # (covers non-macOS platforms and cases where another process opened the browser)
         if loading_server_started and not browser_lock_acquired:
-            await self._broadcast_startup_progress(
+            self._update_component_status("loading_server", "complete", "Loading server ready")
+            self._update_component_status("preflight", "running", "Preflight checks in progress")
+            await self._broadcast_component_update(
                 stage="initializing",
                 message="JARVIS kernel starting...",
-                progress=3,
-                metadata={
-                    "phase": "preflight",
-                    "icon": "rocket",
-                    "components": {
-                        "loading_server": {"status": "complete"},
-                        "preflight": {"status": "running"},
-                        "resources": {"status": "pending"},
-                        "backend": {"status": "pending"},
-                        "intelligence": {"status": "pending"},
-                        "trinity": {"status": "pending"},
-                        "enterprise": {"status": "pending"},
-                        "frontend": {"status": "pending"},
-                    }
-                }
             )
 
         # Step 4: Voice narration (if enabled)
@@ -51430,15 +51530,56 @@ class JarvisSystemKernel:
 
         # Step 1: Start the React frontend
         try:
+            self._update_component_status("frontend", "running", "Starting React frontend...")
+            await self._broadcast_component_update(
+                stage="frontend",
+                message="Starting React frontend..."
+            )
+
             frontend_started = await self._start_frontend()
             if frontend_started:
                 self.logger.success(f"[Kernel] React frontend ready on port {frontend_port}")
+                self._update_component_status("frontend", "complete", f"React frontend ready on port {frontend_port}")
             else:
                 self.logger.info("[Kernel] Frontend not started (directory not found or failed)")
+                self._update_component_status("frontend", "skipped", "Frontend not started")
         except Exception as e:
             self.logger.debug(f"[Kernel] Frontend startup error (non-fatal): {e}")
+            self._update_component_status("frontend", "error", str(e)[:50])
 
-        # Step 2: Mark startup as complete (before redirect)
+        # v182.0: Step 2: Wait for Trinity components to be ready BEFORE redirecting
+        # This ensures the loading page doesn't transition until ALL systems are operational
+        if self.config.trinity_enabled:
+            self.logger.info("[Kernel] Waiting for Trinity components to complete...")
+            trinity_wait_timeout = float(os.environ.get("JARVIS_TRINITY_WAIT_TIMEOUT", "30.0"))
+            trinity_wait_start = time.time()
+
+            while not self._is_trinity_ready():
+                elapsed = time.time() - trinity_wait_start
+                if elapsed > trinity_wait_timeout:
+                    self.logger.warning(
+                        f"[Kernel] Trinity wait timeout ({trinity_wait_timeout}s) - proceeding anyway"
+                    )
+                    break
+
+                # Broadcast waiting status
+                await self._broadcast_component_update(
+                    stage="frontend",
+                    message=f"Waiting for Trinity components ({int(elapsed)}s)..."
+                )
+
+                await asyncio.sleep(1.0)
+
+            if self._is_trinity_ready():
+                self.logger.success("[Kernel] All Trinity components ready")
+                await self._broadcast_component_update(
+                    stage="complete",
+                    message="All systems operational - JARVIS ready"
+                )
+            else:
+                self.logger.info("[Kernel] Proceeding with partial Trinity (some components may still be loading)")
+
+        # Step 3: Mark startup as complete (before redirect)
         # This signals the loading server to allow graceful Chrome disconnect
         os.environ["JARVIS_STARTUP_COMPLETE"] = "true"
         self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true")
@@ -52040,6 +52181,180 @@ class JarvisSystemKernel:
                     await self._frontend_process.wait()
                 self.logger.info("[Frontend] Stopped")
             self._frontend_process = None
+
+    # =========================================================================
+    # v182.0: DYNAMIC COMPONENT TRACKING
+    # =========================================================================
+    # Real-time component status tracking and Trinity readiness verification.
+    # =========================================================================
+
+    def _update_component_status(
+        self,
+        component: str,
+        status: str,
+        message: str = "",
+        **extra: Any
+    ) -> None:
+        """
+        Update a component's status in the tracking system.
+
+        v182.0: Dynamic component tracking for accurate progress display.
+
+        Args:
+            component: Component name (e.g., "backend", "jarvis_prime")
+            status: Status string ("pending", "running", "complete", "error", "skipped")
+            message: Human-readable status message
+            **extra: Additional metadata (latency_ms, health_data, etc.)
+        """
+        if component not in self._component_status:
+            self._component_status[component] = {}
+
+        self._component_status[component] = {
+            "status": status,
+            "message": message or f"{component} {status}",
+            "updated_at": datetime.now().isoformat(),
+            **extra
+        }
+
+        # v182.0: Update Trinity readiness flags for key components
+        if component == "backend" and status == "complete":
+            self._trinity_ready["jarvis_body"] = True
+        elif component == "jarvis_prime" and status == "complete":
+            self._trinity_ready["jarvis_prime"] = True
+        elif component == "reactor_core" and status == "complete":
+            self._trinity_ready["reactor_core"] = True
+
+    def _calculate_dynamic_progress(self) -> int:
+        """
+        Calculate progress percentage based on actual component status.
+
+        v182.0: Weighted progress calculation based on component importance.
+
+        Returns:
+            Progress percentage (0-100)
+        """
+        # Component weights (total = 100)
+        weights = {
+            "loading_server": 3,
+            "preflight": 5,
+            "resources": 10,
+            "backend": 25,
+            "intelligence": 15,
+            "trinity": 5,
+            "jarvis_prime": 12,
+            "reactor_core": 10,
+            "enterprise": 5,
+            "frontend": 10,
+        }
+
+        completed_weight = 0
+        running_weight = 0
+
+        for component, weight in weights.items():
+            status = self._component_status.get(component, {}).get("status", "pending")
+            if status == "complete":
+                completed_weight += weight
+            elif status == "running":
+                running_weight += weight * 0.5  # 50% credit for running
+            elif status == "skipped":
+                completed_weight += weight  # Full credit for intentionally skipped
+
+        return min(100, int(completed_weight + running_weight))
+
+    def _is_trinity_ready(self) -> bool:
+        """
+        Check if all Trinity components are ready.
+
+        v182.0: All three components (JARVIS Body, Prime, Reactor) must be ready
+        before the loading page should redirect to the main UI.
+
+        Returns:
+            True if all Trinity components are ready
+        """
+        # JARVIS Body (backend) is required
+        if not self._trinity_ready.get("jarvis_body", False):
+            return False
+
+        # If Trinity is enabled, check Prime and Reactor
+        if self.config.trinity_enabled:
+            # Prime and Reactor are optional if not configured
+            prime_status = self._component_status.get("jarvis_prime", {})
+            reactor_status = self._component_status.get("reactor_core", {})
+
+            # If configured but not complete, not ready
+            if prime_status.get("status") == "running":
+                return False
+            if reactor_status.get("status") == "running":
+                return False
+
+        return True
+
+    def _get_trinity_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of Trinity component status for broadcasting.
+
+        v182.0: Returns structured data for the loading page Trinity section.
+        """
+        return {
+            "jarvis_body": {
+                "status": "ready" if self._trinity_ready.get("jarvis_body") else "pending",
+                "label": "JARVIS Body",
+                "icon": "🦾",
+            },
+            "jarvis_prime": {
+                "status": self._component_status.get("jarvis_prime", {}).get("status", "pending"),
+                "label": "J-Prime Mind",
+                "icon": "🧠",
+                "message": self._component_status.get("jarvis_prime", {}).get("message", ""),
+            },
+            "reactor_core": {
+                "status": self._component_status.get("reactor_core", {}).get("status", "pending"),
+                "label": "Reactor-Core",
+                "icon": "⚡",
+                "message": self._component_status.get("reactor_core", {}).get("message", ""),
+            },
+            "all_ready": self._is_trinity_ready(),
+            "progress": sum(1 for k, v in self._trinity_ready.items() if v) * 33,
+        }
+
+    async def _broadcast_component_update(
+        self,
+        stage: str,
+        message: str,
+        component: Optional[str] = None,
+        component_status: Optional[str] = None,
+        component_message: Optional[str] = None,
+    ) -> bool:
+        """
+        Update component status and broadcast progress in one call.
+
+        v182.0: Convenience method for updating and broadcasting atomically.
+        """
+        # Update component status if provided
+        if component and component_status:
+            self._update_component_status(
+                component,
+                component_status,
+                component_message or message
+            )
+
+        # Calculate dynamic progress
+        progress = self._calculate_dynamic_progress()
+
+        # Build metadata with real component status
+        metadata = {
+            "phase": stage,
+            "components": self._component_status,
+            "trinity": self._get_trinity_summary(),
+            "trinity_ready": self._is_trinity_ready(),
+        }
+
+        return await self._broadcast_startup_progress(
+            stage=stage,
+            message=message,
+            progress=progress,
+            metadata=metadata
+        )
 
     # =========================================================================
     # PROGRESS BROADCASTING
