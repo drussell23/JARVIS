@@ -1814,6 +1814,240 @@ for _logger_name in ["speechbrain", "transformers", "transformers.modeling_utils
     logging.getLogger(_logger_name).addFilter(_benign_filter)
 
 
+# =============================================================================
+# SECRET REDACTION FILTER
+# =============================================================================
+class SecretRedactionFilter(logging.Filter):
+    """
+    Filter to redact sensitive information from log messages.
+
+    Automatically redacts:
+    - API keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
+    - Database credentials and connection strings
+    - OAuth tokens and bearer tokens
+    - Private keys and secrets
+
+    This ensures that no sensitive data is accidentally logged.
+    """
+
+    # Patterns to redact with their replacement text
+    _REDACTION_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
+        # API Keys (various providers)
+        (re.compile(r'(ANTHROPIC_API_KEY[=:\s]+)[^\s"\']+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(OPENAI_API_KEY[=:\s]+)[^\s"\']+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(GOOGLE_API_KEY[=:\s]+)[^\s"\']+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(AWS_SECRET_ACCESS_KEY[=:\s]+)[^\s"\']+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(JARVIS_SECRET_[A-Z_]+[=:\s]+)[^\s"\']+', re.IGNORECASE), r'\1[REDACTED]'),
+
+        # Generic API key patterns
+        (re.compile(r'(api[_-]?key[=:\s]+)[^\s"\']{20,}', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(secret[_-]?key[=:\s]+)[^\s"\']{20,}', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(access[_-]?token[=:\s]+)[^\s"\']{20,}', re.IGNORECASE), r'\1[REDACTED]'),
+
+        # Bearer tokens
+        (re.compile(r'(Bearer\s+)[A-Za-z0-9_\-\.]+', re.IGNORECASE), r'\1[REDACTED]'),
+        (re.compile(r'(Authorization[=:\s]+Bearer\s+)[^\s"\']+', re.IGNORECASE), r'\1[REDACTED]'),
+
+        # Database connection strings
+        (re.compile(r'(postgres(?:ql)?://[^:]+:)[^@]+(@)', re.IGNORECASE), r'\1[REDACTED]\2'),
+        (re.compile(r'(mysql://[^:]+:)[^@]+(@)', re.IGNORECASE), r'\1[REDACTED]\2'),
+        (re.compile(r'(password[=:\s]+)[^\s"\']+', re.IGNORECASE), r'\1[REDACTED]'),
+
+        # Private keys (detect and redact partial content)
+        (re.compile(r'(-----BEGIN[^-]+PRIVATE KEY-----)[^-]+(-----END)', re.IGNORECASE), r'\1[REDACTED]\2'),
+
+        # JSON key patterns (for structured logs)
+        (re.compile(r'("api_key"\s*:\s*")[^"]+(")', re.IGNORECASE), r'\1[REDACTED]\2'),
+        (re.compile(r'("password"\s*:\s*")[^"]+(")', re.IGNORECASE), r'\1[REDACTED]\2'),
+        (re.compile(r'("secret"\s*:\s*")[^"]+(")', re.IGNORECASE), r'\1[REDACTED]\2'),
+        (re.compile(r'("token"\s*:\s*")[^"]+(")', re.IGNORECASE), r'\1[REDACTED]\2'),
+
+        # Environment variable assignments
+        (re.compile(r'(export\s+[A-Z_]*(?:KEY|SECRET|TOKEN|PASSWORD)[=])[^\s]+', re.IGNORECASE), r'\1[REDACTED]'),
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Redact secrets from the log message and return True to always log."""
+        # Get the original message
+        original_msg = record.getMessage()
+
+        # Apply all redaction patterns
+        redacted_msg = original_msg
+        for pattern, replacement in self._REDACTION_PATTERNS:
+            redacted_msg = pattern.sub(replacement, redacted_msg)
+
+        # If message was redacted, update the record
+        if redacted_msg != original_msg:
+            record.msg = redacted_msg
+            record.args = ()  # Clear args since we've pre-formatted
+
+        return True  # Always allow the record through
+
+
+# Install secret redaction filter globally
+_secret_filter = SecretRedactionFilter()
+logging.getLogger().addFilter(_secret_filter)
+
+
+# =============================================================================
+# ENHANCED TERMINAL UI (Live Spinners & Summary Table)
+# =============================================================================
+class LiveSpinner:
+    """
+    Animated terminal spinner for long-running operations.
+
+    Provides visual feedback during async operations without blocking.
+    """
+
+    SPINNER_CHARS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    SPINNER_CHARS_ALT = ["◐", "◓", "◑", "◒"]
+    SPINNER_CHARS_DOTS = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+
+    def __init__(
+        self,
+        message: str = "Processing",
+        spinner_type: str = "dots",
+        color: str = "\033[36m",  # Cyan
+    ) -> None:
+        self.message = message
+        self.color = color
+        self._running = False
+        self._task: Optional[asyncio.Task[None]] = None
+        self._start_time = 0.0
+
+        # Select spinner characters
+        if spinner_type == "dots":
+            self._chars = self.SPINNER_CHARS_DOTS
+        elif spinner_type == "circle":
+            self._chars = self.SPINNER_CHARS_ALT
+        else:
+            self._chars = self.SPINNER_CHARS
+
+    async def __aenter__(self) -> "LiveSpinner":
+        """Start the spinner."""
+        await self.start()
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Stop the spinner."""
+        await self.stop()
+
+    async def start(self) -> None:
+        """Start the spinner animation."""
+        self._running = True
+        self._start_time = time.time()
+        self._task = asyncio.create_task(self._spin())
+
+    async def stop(self, success: bool = True) -> None:
+        """Stop the spinner and show final status."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+        elapsed = time.time() - self._start_time
+        status = "✓" if success else "✗"
+        status_color = "\033[32m" if success else "\033[31m"
+        reset = "\033[0m"
+
+        # Clear line and print final status
+        sys.stdout.write(f"\r\033[K  {status_color}{status}{reset} {self.message} ({elapsed:.1f}s)\n")
+        sys.stdout.flush()
+
+    def update_message(self, message: str) -> None:
+        """Update the spinner message."""
+        self.message = message
+
+    async def _spin(self) -> None:
+        """Animation loop."""
+        idx = 0
+        reset = "\033[0m"
+
+        while self._running:
+            char = self._chars[idx % len(self._chars)]
+            elapsed = time.time() - self._start_time
+
+            sys.stdout.write(f"\r\033[K  {self.color}{char}{reset} {self.message} ({elapsed:.1f}s)")
+            sys.stdout.flush()
+
+            idx += 1
+            await asyncio.sleep(0.1)
+
+
+class StartupSummaryTable:
+    """
+    Collects and displays a summary table of startup phases.
+
+    Tracks phase name, status, duration, and any notes.
+    """
+
+    def __init__(self) -> None:
+        self._phases: List[Dict[str, Any]] = []
+
+    def add_phase(
+        self,
+        name: str,
+        status: str,
+        duration_ms: float,
+        notes: str = "",
+    ) -> None:
+        """Add a phase result to the summary."""
+        self._phases.append({
+            "name": name,
+            "status": status,
+            "duration_ms": duration_ms,
+            "notes": notes,
+        })
+
+    def print_table(self) -> None:
+        """Print the formatted summary table."""
+        if not self._phases:
+            return
+
+        # Calculate column widths
+        name_width = max(len(p["name"]) for p in self._phases)
+        name_width = max(name_width, 12)  # Minimum width
+
+        # Header
+        print()
+        print("╔" + "═" * (name_width + 2) + "╦" + "═" * 10 + "╦" + "═" * 12 + "╦" + "═" * 30 + "╗")
+        print(f"║ {'Phase':<{name_width}} ║ {'Status':^8} ║ {'Duration':^10} ║ {'Notes':<28} ║")
+        print("╠" + "═" * (name_width + 2) + "╬" + "═" * 10 + "╬" + "═" * 12 + "╬" + "═" * 30 + "╣")
+
+        # Rows
+        for phase in self._phases:
+            name = phase["name"][:name_width]
+            status = phase["status"]
+            duration = f"{phase['duration_ms']:.0f}ms"
+            notes = phase["notes"][:28] if phase["notes"] else ""
+
+            # Color status
+            if status == "✓":
+                status_display = "\033[32m✓ OK\033[0m    "
+            elif status == "✗":
+                status_display = "\033[31m✗ FAIL\033[0m  "
+            elif status == "⚠":
+                status_display = "\033[33m⚠ WARN\033[0m  "
+            else:
+                status_display = f"{status:^8}"
+
+            print(f"║ {name:<{name_width}} ║ {status_display} ║ {duration:>10} ║ {notes:<28} ║")
+
+        # Footer
+        print("╚" + "═" * (name_width + 2) + "╩" + "═" * 10 + "╩" + "═" * 12 + "╩" + "═" * 30 + "╝")
+
+        # Total duration
+        total_ms = sum(p["duration_ms"] for p in self._phases)
+        success_count = sum(1 for p in self._phases if p["status"] == "✓")
+        total_count = len(self._phases)
+
+        print(f"\n  Total: {total_ms:.0f}ms ({total_ms/1000:.2f}s) | Phases: {success_count}/{total_count} successful")
+        print()
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 2                                                               ║
@@ -3620,6 +3854,154 @@ class DynamicPortManager(ResourceManagerBase):
     def get_best_port(self) -> int:
         """Get the best available port (cached or primary)."""
         return self.selected_port or self.primary_port
+
+
+# =============================================================================
+# COORDINATED PORT ASSIGNMENT
+# =============================================================================
+class PortAssignment(NamedTuple):
+    """Result of coordinated port assignment."""
+    backend_port: int
+    websocket_port: int
+    loading_server_port: int
+    frontend_port: int
+    conflicts_resolved: int
+    assignment_method: str  # "explicit", "environment", "dynamic"
+
+
+async def assign_all_ports(
+    config: Optional["SystemKernelConfig"] = None,
+    port_manager: Optional[DynamicPortManager] = None,
+) -> PortAssignment:
+    """
+    Coordinated port assignment for all JARVIS services.
+
+    This function assigns non-overlapping ports for all services in a single
+    atomic operation, preventing race conditions and port conflicts.
+
+    Port Assignment Strategy:
+    1. Check explicit environment variables first
+    2. If not set, use default base ports with conflict resolution
+    3. Ensure minimum 10-port separation between services
+    4. Verify all ports are available before committing
+
+    Args:
+        config: Optional SystemKernelConfig for reading defaults
+        port_manager: Optional DynamicPortManager for availability checking
+
+    Returns:
+        PortAssignment with all assigned ports
+    """
+    import socket
+
+    # Default base ports
+    DEFAULT_BACKEND_PORT = 8000
+    DEFAULT_WEBSOCKET_PORT = 8765
+    DEFAULT_LOADING_PORT = 3000
+    DEFAULT_FRONTEND_PORT = 3001
+
+    # Minimum separation between services
+    MIN_PORT_SEPARATION = 10
+
+    # Read from environment or use defaults
+    backend_port = int(os.getenv("JARVIS_BACKEND_PORT", "0"))
+    websocket_port = int(os.getenv("JARVIS_WEBSOCKET_PORT", "0"))
+    loading_port = int(os.getenv("JARVIS_LOADING_PORT", "0"))
+    frontend_port = int(os.getenv("JARVIS_FRONTEND_PORT", "0"))
+
+    assignment_method = "explicit"
+    conflicts_resolved = 0
+
+    def is_port_available(port: int) -> bool:
+        """Check if a port is available for binding."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(1.0)
+            sock.bind(('127.0.0.1', port))
+            sock.close()
+            return True
+        except (socket.error, OSError):
+            return False
+
+    def find_available_port(start: int, exclude: Set[int]) -> int:
+        """Find an available port starting from the given port."""
+        port = start
+        max_attempts = 100
+        for _ in range(max_attempts):
+            if port not in exclude and is_port_available(port):
+                return port
+            port += 1
+        raise RuntimeError(f"No available port found starting from {start}")
+
+    # Track assigned ports to prevent overlap
+    assigned_ports: Set[int] = set()
+
+    # Assign backend port
+    if backend_port == 0:
+        assignment_method = "dynamic"
+        if port_manager and port_manager.selected_port:
+            backend_port = port_manager.selected_port
+        else:
+            backend_port = DEFAULT_BACKEND_PORT
+
+    if not is_port_available(backend_port):
+        backend_port = find_available_port(backend_port, assigned_ports)
+        conflicts_resolved += 1
+
+    assigned_ports.add(backend_port)
+
+    # Assign websocket port (must be different from backend)
+    if websocket_port == 0:
+        assignment_method = "dynamic"
+        websocket_port = DEFAULT_WEBSOCKET_PORT
+
+    while websocket_port in assigned_ports or not is_port_available(websocket_port):
+        websocket_port = find_available_port(websocket_port + 1, assigned_ports)
+        conflicts_resolved += 1
+
+    # Ensure minimum separation from backend
+    if abs(websocket_port - backend_port) < MIN_PORT_SEPARATION:
+        websocket_port = find_available_port(backend_port + MIN_PORT_SEPARATION, assigned_ports)
+        conflicts_resolved += 1
+
+    assigned_ports.add(websocket_port)
+
+    # Assign loading server port
+    if loading_port == 0:
+        assignment_method = "dynamic"
+        loading_port = DEFAULT_LOADING_PORT
+
+    while loading_port in assigned_ports or not is_port_available(loading_port):
+        loading_port = find_available_port(loading_port + 1, assigned_ports)
+        conflicts_resolved += 1
+
+    assigned_ports.add(loading_port)
+
+    # Assign frontend port
+    if frontend_port == 0:
+        assignment_method = "dynamic"
+        frontend_port = DEFAULT_FRONTEND_PORT
+
+    while frontend_port in assigned_ports or not is_port_available(frontend_port):
+        frontend_port = find_available_port(frontend_port + 1, assigned_ports)
+        conflicts_resolved += 1
+
+    # Ensure frontend is different from loading server
+    if frontend_port == loading_port:
+        frontend_port = find_available_port(loading_port + 1, assigned_ports)
+        conflicts_resolved += 1
+
+    assigned_ports.add(frontend_port)
+
+    return PortAssignment(
+        backend_port=backend_port,
+        websocket_port=websocket_port,
+        loading_server_port=loading_port,
+        frontend_port=frontend_port,
+        conflicts_resolved=conflicts_resolved,
+        assignment_method=assignment_method,
+    )
 
 
 # =============================================================================
@@ -47205,6 +47587,112 @@ class JarvisSystemKernel:
         self._state = KernelState.STOPPED
         self.logger.warning("[Kernel] ⚠️ Emergency shutdown complete")
 
+    def _configure_system_mode(
+        self,
+        in_process: Optional[bool] = None,
+        subprocess_mode: Optional[bool] = None,
+    ) -> str:
+        """
+        Configure the system mode based on CLI arguments.
+
+        This method explicitly supports two operating modes:
+
+        **Supervisor Mode (in-process):**
+        - Starts JARVIS Backend using uvicorn.Server directly
+        - Shares memory space with the kernel
+        - Faster startup, lower overhead
+        - Best for development and single-user deployments
+        - Signals handled centrally by the kernel
+
+        **Standalone Mode (subprocess):**
+        - Starts JARVIS Backend as a separate subprocess
+        - Process isolation for stability
+        - Can survive kernel restarts
+        - Best for production and multi-user deployments
+        - Each process handles its own signals
+
+        Args:
+            in_process: If True, forces Supervisor Mode (in-process uvicorn)
+            subprocess_mode: If True, forces Standalone Mode (subprocess)
+
+        Returns:
+            String describing the configured mode ("supervisor" or "standalone")
+
+        Priority:
+            1. Explicit CLI flags (--in-process or --subprocess)
+            2. Environment variable JARVIS_BACKEND_MODE
+            3. Config file setting
+            4. Default: Supervisor mode for dev, Standalone for production
+        """
+        mode_source = "default"
+        selected_mode = "supervisor"  # Default
+
+        # Priority 1: Explicit CLI flags
+        if in_process is True:
+            self.config.in_process_backend = True
+            selected_mode = "supervisor"
+            mode_source = "CLI flag --in-process"
+        elif subprocess_mode is True:
+            self.config.in_process_backend = False
+            selected_mode = "standalone"
+            mode_source = "CLI flag --subprocess"
+
+        # Priority 2: Environment variable (if no CLI flag)
+        elif os.environ.get("JARVIS_BACKEND_MODE"):
+            env_mode = os.environ.get("JARVIS_BACKEND_MODE", "").lower()
+            if env_mode in ("inprocess", "in-process", "in_process", "supervisor"):
+                self.config.in_process_backend = True
+                selected_mode = "supervisor"
+                mode_source = "environment variable JARVIS_BACKEND_MODE"
+            elif env_mode in ("subprocess", "standalone", "isolated"):
+                self.config.in_process_backend = False
+                selected_mode = "standalone"
+                mode_source = "environment variable JARVIS_BACKEND_MODE"
+
+        # Priority 3: Config already has a setting (from config file)
+        elif hasattr(self.config, "_mode_from_config") and self.config._mode_from_config:
+            # Config was explicitly set from file
+            selected_mode = "supervisor" if self.config.in_process_backend else "standalone"
+            mode_source = "config file"
+
+        # Priority 4: Default based on dev_mode
+        else:
+            if self.config.dev_mode:
+                # Dev mode: in-process for faster iteration
+                self.config.in_process_backend = True
+                selected_mode = "supervisor"
+                mode_source = "default (dev mode)"
+            else:
+                # Production: subprocess for isolation
+                self.config.in_process_backend = False
+                selected_mode = "standalone"
+                mode_source = "default (production mode)"
+
+        # Store the mode in config for reference
+        self.config.mode = selected_mode
+
+        # Log the decision with clear explanation
+        self.logger.info(
+            f"[Kernel] System mode configured: {selected_mode.upper()} ({mode_source})"
+        )
+
+        if selected_mode == "supervisor":
+            self.logger.info(
+                "[Kernel]   → Backend will run IN-PROCESS via uvicorn.Server"
+            )
+            self.logger.info(
+                "[Kernel]   → Shared memory space, central signal handling"
+            )
+        else:
+            self.logger.info(
+                "[Kernel]   → Backend will run as SUBPROCESS via asyncio.subprocess"
+            )
+            self.logger.info(
+                "[Kernel]   → Process isolation, independent signal handling"
+            )
+
+        return selected_mode
+
     async def startup(self) -> int:
         """
         Run the full boot sequence.
@@ -50710,6 +51198,13 @@ async def async_main(args: argparse.Namespace) -> int:
     JarvisSystemKernel._instance = None
 
     kernel = JarvisSystemKernel(config=config, force=force)
+
+    # Configure system mode based on CLI flags
+    # This explicitly sets Supervisor (in-process) vs Standalone (subprocess) mode
+    kernel._configure_system_mode(
+        in_process=args.in_process if hasattr(args, 'in_process') else None,
+        subprocess_mode=args.subprocess if hasattr(args, 'subprocess') else None,
+    )
 
     # Run startup
     exit_code = await kernel.startup()
