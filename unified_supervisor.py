@@ -33172,6 +33172,1923 @@ class APIVersionManager:
 
 
 # =============================================================================
+# ZONE 4.16: RESOURCE MANAGEMENT AND MULTI-TENANCY
+# =============================================================================
+# This zone provides resource management and multi-tenancy capabilities:
+# - ResourceQuotaManager: Resource quota enforcement
+# - TenantManager: Multi-tenant isolation and management
+# - RateLimiterManager: Advanced rate limiting strategies
+# - RequestCoalescer: Request deduplication and coalescing
+# - BackgroundJobManager: Background job processing
+# - RetryPolicyManager: Configurable retry strategies
+# - ResourcePoolManager: Generic resource pooling
+# - CostAccountingManager: Resource usage cost tracking
+# =============================================================================
+
+
+@dataclass
+class ResourceQuota:
+    """Resource quota definition."""
+    quota_id: str
+    resource_type: str  # cpu, memory, storage, api_calls, etc.
+    limit: float
+    unit: str  # cores, bytes, requests, etc.
+    period: Optional[str] = None  # per_second, per_minute, per_hour, per_day
+    scope: str = "global"  # global, tenant, user
+    scope_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ResourceUsage:
+    """Current resource usage."""
+    quota_id: str
+    current_usage: float
+    limit: float
+    percentage: float
+    last_updated: datetime = field(default_factory=datetime.now)
+    history: List[Tuple[datetime, float]] = field(default_factory=list)
+
+
+class ResourceQuotaManager:
+    """
+    Resource quota enforcement system.
+
+    Manages and enforces resource quotas across different scopes
+    (global, tenant, user) with real-time tracking.
+
+    Features:
+    - Multi-level quota enforcement
+    - Usage tracking and history
+    - Quota alerts and notifications
+    - Soft and hard limits
+    - Quota inheritance
+    - Usage forecasting
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._quotas: Dict[str, ResourceQuota] = {}
+        self._usage: Dict[str, ResourceUsage] = {}
+        self._usage_counters: Dict[str, float] = {}
+        self._period_start: Dict[str, datetime] = {}
+        self._alert_handlers: List[Callable[[str, ResourceUsage], Awaitable[None]]] = []
+        self._alert_thresholds: Dict[str, float] = {}  # quota_id -> threshold percentage
+        self._alerted_quotas: Set[str] = set()
+        self._logger = UnifiedLogger(
+            name="ResourceQuotaManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize resource quota manager."""
+        try:
+            async with self._lock:
+                # Register default quotas
+                await self._register_default_quotas()
+                self._initialized = True
+                self._logger.info("Resource quota manager initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize quota manager: {e}")
+            return False
+
+    async def _register_default_quotas(self) -> None:
+        """Register default resource quotas."""
+        default_quotas = [
+            ResourceQuota(
+                quota_id="api_calls_per_minute",
+                resource_type="api_calls",
+                limit=1000,
+                unit="requests",
+                period="per_minute",
+                scope="global"
+            ),
+            ResourceQuota(
+                quota_id="concurrent_connections",
+                resource_type="connections",
+                limit=100,
+                unit="connections",
+                scope="global"
+            ),
+            ResourceQuota(
+                quota_id="memory_usage",
+                resource_type="memory",
+                limit=8 * 1024 * 1024 * 1024,  # 8GB
+                unit="bytes",
+                scope="global"
+            ),
+            ResourceQuota(
+                quota_id="storage_usage",
+                resource_type="storage",
+                limit=100 * 1024 * 1024 * 1024,  # 100GB
+                unit="bytes",
+                scope="global"
+            ),
+        ]
+
+        for quota in default_quotas:
+            await self.register_quota(quota)
+            self._alert_thresholds[quota.quota_id] = 0.80  # Alert at 80%
+
+    async def register_quota(self, quota: ResourceQuota) -> bool:
+        """Register a new quota."""
+        async with self._lock:
+            self._quotas[quota.quota_id] = quota
+            self._usage[quota.quota_id] = ResourceUsage(
+                quota_id=quota.quota_id,
+                current_usage=0,
+                limit=quota.limit,
+                percentage=0
+            )
+            self._usage_counters[quota.quota_id] = 0
+            if quota.period:
+                self._period_start[quota.quota_id] = datetime.now()
+
+        self._logger.debug(f"Registered quota: {quota.quota_id}")
+        return True
+
+    async def check_quota(
+        self,
+        quota_id: str,
+        requested_amount: float = 1
+    ) -> Tuple[bool, str]:
+        """
+        Check if quota allows the requested amount.
+
+        Args:
+            quota_id: Quota to check
+            requested_amount: Amount to consume
+
+        Returns:
+            Tuple of (allowed, reason)
+        """
+        if quota_id not in self._quotas:
+            return True, "Quota not found, allowing"
+
+        quota = self._quotas[quota_id]
+        usage = self._usage[quota_id]
+
+        # Check if period has reset
+        if quota.period and quota_id in self._period_start:
+            await self._check_period_reset(quota_id, quota.period)
+
+        # Check against limit
+        if usage.current_usage + requested_amount > quota.limit:
+            return False, f"Quota exceeded: {usage.current_usage + requested_amount} > {quota.limit} {quota.unit}"
+
+        return True, "Within quota"
+
+    async def consume(
+        self,
+        quota_id: str,
+        amount: float = 1
+    ) -> Tuple[bool, ResourceUsage]:
+        """
+        Consume quota and return updated usage.
+
+        Args:
+            quota_id: Quota to consume
+            amount: Amount to consume
+
+        Returns:
+            Tuple of (success, updated usage)
+        """
+        allowed, reason = await self.check_quota(quota_id, amount)
+        if not allowed:
+            return False, self._usage.get(quota_id, ResourceUsage(
+                quota_id=quota_id, current_usage=0, limit=0, percentage=0
+            ))
+
+        async with self._lock:
+            self._usage_counters[quota_id] = self._usage_counters.get(quota_id, 0) + amount
+
+            usage = self._usage[quota_id]
+            usage.current_usage = self._usage_counters[quota_id]
+            usage.percentage = (usage.current_usage / usage.limit) * 100 if usage.limit > 0 else 0
+            usage.last_updated = datetime.now()
+
+            # Track history
+            usage.history.append((datetime.now(), usage.current_usage))
+            if len(usage.history) > 1000:
+                usage.history = usage.history[-1000:]
+
+        # Check for alerts
+        await self._check_alert(quota_id)
+
+        return True, usage
+
+    async def release(
+        self,
+        quota_id: str,
+        amount: float = 1
+    ) -> ResourceUsage:
+        """Release consumed quota."""
+        async with self._lock:
+            if quota_id in self._usage_counters:
+                self._usage_counters[quota_id] = max(0, self._usage_counters[quota_id] - amount)
+
+                usage = self._usage[quota_id]
+                usage.current_usage = self._usage_counters[quota_id]
+                usage.percentage = (usage.current_usage / usage.limit) * 100 if usage.limit > 0 else 0
+                usage.last_updated = datetime.now()
+
+                # Reset alert if below threshold
+                if usage.percentage < self._alert_thresholds.get(quota_id, 0.80) * 100:
+                    self._alerted_quotas.discard(quota_id)
+
+                return usage
+
+        return ResourceUsage(quota_id=quota_id, current_usage=0, limit=0, percentage=0)
+
+    async def _check_period_reset(self, quota_id: str, period: str) -> None:
+        """Check if period has elapsed and reset counter."""
+        period_start = self._period_start.get(quota_id)
+        if not period_start:
+            return
+
+        now = datetime.now()
+        elapsed = (now - period_start).total_seconds()
+
+        period_seconds = {
+            "per_second": 1,
+            "per_minute": 60,
+            "per_hour": 3600,
+            "per_day": 86400
+        }
+
+        if period in period_seconds and elapsed >= period_seconds[period]:
+            async with self._lock:
+                self._usage_counters[quota_id] = 0
+                self._period_start[quota_id] = now
+                self._usage[quota_id].current_usage = 0
+                self._usage[quota_id].percentage = 0
+                self._alerted_quotas.discard(quota_id)
+
+    async def _check_alert(self, quota_id: str) -> None:
+        """Check if quota usage exceeds alert threshold."""
+        if quota_id in self._alerted_quotas:
+            return
+
+        threshold = self._alert_thresholds.get(quota_id, 0.80)
+        usage = self._usage.get(quota_id)
+
+        if usage and usage.percentage >= threshold * 100:
+            self._alerted_quotas.add(quota_id)
+
+            for handler in self._alert_handlers:
+                try:
+                    await handler(quota_id, usage)
+                except Exception as e:
+                    self._logger.error(f"Alert handler error: {e}")
+
+    def register_alert_handler(
+        self,
+        handler: Callable[[str, ResourceUsage], Awaitable[None]]
+    ) -> None:
+        """Register an alert handler."""
+        self._alert_handlers.append(handler)
+
+    def get_usage(self, quota_id: str) -> Optional[ResourceUsage]:
+        """Get current usage for a quota."""
+        return self._usage.get(quota_id)
+
+    def get_all_usage(self) -> Dict[str, ResourceUsage]:
+        """Get all quota usage."""
+        return dict(self._usage)
+
+    def forecast_usage(
+        self,
+        quota_id: str,
+        hours_ahead: int = 1
+    ) -> Optional[float]:
+        """Forecast future usage based on history."""
+        usage = self._usage.get(quota_id)
+        if not usage or len(usage.history) < 10:
+            return None
+
+        # Simple linear regression on recent history
+        recent = usage.history[-100:]
+        if len(recent) < 2:
+            return None
+
+        # Calculate average rate of change
+        total_change = 0
+        total_time = 0
+        for i in range(1, len(recent)):
+            time_diff = (recent[i][0] - recent[i-1][0]).total_seconds()
+            value_diff = recent[i][1] - recent[i-1][1]
+            if time_diff > 0:
+                total_change += value_diff
+                total_time += time_diff
+
+        if total_time == 0:
+            return usage.current_usage
+
+        rate_per_second = total_change / total_time
+        forecast = usage.current_usage + (rate_per_second * hours_ahead * 3600)
+        return max(0, forecast)
+
+
+@dataclass
+class Tenant:
+    """A tenant in the multi-tenant system."""
+    tenant_id: str
+    name: str
+    tier: str  # free, starter, professional, enterprise
+    settings: Dict[str, Any] = field(default_factory=dict)
+    quotas: Dict[str, float] = field(default_factory=dict)
+    features: List[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    status: str = "active"  # active, suspended, deleted
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TenantContext:
+    """Context for the current tenant."""
+    tenant: Tenant
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    request_id: Optional[str] = None
+
+
+class TenantManager:
+    """
+    Multi-tenant management system.
+
+    Provides tenant isolation, feature gating, and
+    per-tenant resource management.
+
+    Features:
+    - Tenant lifecycle management
+    - Feature flags per tenant
+    - Tier-based limitations
+    - Tenant data isolation
+    - Cross-tenant operations for admins
+    - Tenant metrics and billing
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._tenants: Dict[str, Tenant] = {}
+        self._current_context: contextvars.ContextVar[Optional[TenantContext]] = \
+            contextvars.ContextVar("tenant_context", default=None)
+        self._tier_features: Dict[str, List[str]] = {}
+        self._tier_quotas: Dict[str, Dict[str, float]] = {}
+        self._tenant_metrics: Dict[str, Dict[str, Any]] = {}
+        self._logger = UnifiedLogger(
+            name="TenantManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize tenant manager."""
+        try:
+            async with self._lock:
+                # Define tier features and quotas
+                self._tier_features = {
+                    "free": ["basic_api", "basic_storage"],
+                    "starter": ["basic_api", "basic_storage", "advanced_api", "webhooks"],
+                    "professional": [
+                        "basic_api", "basic_storage", "advanced_api", "webhooks",
+                        "analytics", "priority_support", "custom_integrations"
+                    ],
+                    "enterprise": [
+                        "basic_api", "basic_storage", "advanced_api", "webhooks",
+                        "analytics", "priority_support", "custom_integrations",
+                        "sso", "audit_logs", "dedicated_support", "sla"
+                    ]
+                }
+
+                self._tier_quotas = {
+                    "free": {"api_calls_per_day": 1000, "storage_gb": 1},
+                    "starter": {"api_calls_per_day": 10000, "storage_gb": 10},
+                    "professional": {"api_calls_per_day": 100000, "storage_gb": 100},
+                    "enterprise": {"api_calls_per_day": float("inf"), "storage_gb": 1000}
+                }
+
+                self._initialized = True
+                self._logger.info("Tenant manager initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize tenant manager: {e}")
+            return False
+
+    async def create_tenant(
+        self,
+        name: str,
+        tier: str = "free",
+        settings: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Tenant:
+        """
+        Create a new tenant.
+
+        Args:
+            name: Tenant name
+            tier: Subscription tier
+            settings: Tenant settings
+            metadata: Additional metadata
+
+        Returns:
+            Created Tenant
+        """
+        tenant_id = f"tenant_{secrets.token_hex(8)}"
+
+        features = self._tier_features.get(tier, [])
+        quotas = self._tier_quotas.get(tier, {}).copy()
+
+        tenant = Tenant(
+            tenant_id=tenant_id,
+            name=name,
+            tier=tier,
+            settings=settings or {},
+            quotas=quotas,
+            features=features,
+            metadata=metadata or {}
+        )
+
+        async with self._lock:
+            self._tenants[tenant_id] = tenant
+            self._tenant_metrics[tenant_id] = {
+                "api_calls": 0,
+                "storage_used": 0,
+                "active_users": 0
+            }
+
+        self._logger.info(f"Created tenant: {name} ({tier})")
+        return tenant
+
+    async def get_tenant(self, tenant_id: str) -> Optional[Tenant]:
+        """Get a tenant by ID."""
+        return self._tenants.get(tenant_id)
+
+    async def update_tenant(
+        self,
+        tenant_id: str,
+        updates: Dict[str, Any]
+    ) -> Optional[Tenant]:
+        """Update tenant properties."""
+        tenant = self._tenants.get(tenant_id)
+        if not tenant:
+            return None
+
+        async with self._lock:
+            if "name" in updates:
+                tenant.name = updates["name"]
+            if "tier" in updates:
+                tenant.tier = updates["tier"]
+                tenant.features = self._tier_features.get(updates["tier"], [])
+                tenant.quotas.update(self._tier_quotas.get(updates["tier"], {}))
+            if "settings" in updates:
+                tenant.settings.update(updates["settings"])
+            if "metadata" in updates:
+                tenant.metadata.update(updates["metadata"])
+
+            tenant.updated_at = datetime.now()
+
+        return tenant
+
+    async def suspend_tenant(self, tenant_id: str, reason: str) -> bool:
+        """Suspend a tenant."""
+        tenant = self._tenants.get(tenant_id)
+        if not tenant:
+            return False
+
+        tenant.status = "suspended"
+        tenant.metadata["suspension_reason"] = reason
+        tenant.metadata["suspended_at"] = datetime.now().isoformat()
+        tenant.updated_at = datetime.now()
+
+        self._logger.warning(f"Suspended tenant: {tenant_id} - {reason}")
+        return True
+
+    async def reactivate_tenant(self, tenant_id: str) -> bool:
+        """Reactivate a suspended tenant."""
+        tenant = self._tenants.get(tenant_id)
+        if not tenant:
+            return False
+
+        tenant.status = "active"
+        tenant.metadata.pop("suspension_reason", None)
+        tenant.metadata["reactivated_at"] = datetime.now().isoformat()
+        tenant.updated_at = datetime.now()
+
+        self._logger.info(f"Reactivated tenant: {tenant_id}")
+        return True
+
+    def set_context(self, tenant: Tenant, user_id: Optional[str] = None) -> TenantContext:
+        """Set the current tenant context."""
+        context = TenantContext(
+            tenant=tenant,
+            user_id=user_id,
+            request_id=f"req_{secrets.token_hex(8)}"
+        )
+        self._current_context.set(context)
+        return context
+
+    def get_context(self) -> Optional[TenantContext]:
+        """Get the current tenant context."""
+        return self._current_context.get()
+
+    def clear_context(self) -> None:
+        """Clear the current tenant context."""
+        self._current_context.set(None)
+
+    def has_feature(self, feature: str, tenant_id: Optional[str] = None) -> bool:
+        """Check if tenant has a feature."""
+        context = self.get_context()
+        if tenant_id:
+            tenant = self._tenants.get(tenant_id)
+        elif context:
+            tenant = context.tenant
+        else:
+            return False
+
+        if not tenant:
+            return False
+
+        return feature in tenant.features
+
+    def check_quota(
+        self,
+        quota_name: str,
+        amount: float = 1,
+        tenant_id: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Check if tenant is within quota."""
+        context = self.get_context()
+        if tenant_id:
+            tenant = self._tenants.get(tenant_id)
+        elif context:
+            tenant = context.tenant
+        else:
+            return False, "No tenant context"
+
+        if not tenant:
+            return False, "Tenant not found"
+
+        limit = tenant.quotas.get(quota_name)
+        if limit is None:
+            return True, "No quota defined"
+
+        metrics = self._tenant_metrics.get(tenant.tenant_id, {})
+        current = metrics.get(quota_name.replace("_per_day", ""), 0)
+
+        if current + amount > limit:
+            return False, f"Quota exceeded: {current + amount} > {limit}"
+
+        return True, "Within quota"
+
+    def record_usage(
+        self,
+        metric_name: str,
+        amount: float = 1,
+        tenant_id: Optional[str] = None
+    ) -> None:
+        """Record tenant resource usage."""
+        context = self.get_context()
+        if tenant_id:
+            tid = tenant_id
+        elif context:
+            tid = context.tenant.tenant_id
+        else:
+            return
+
+        if tid not in self._tenant_metrics:
+            self._tenant_metrics[tid] = {}
+
+        self._tenant_metrics[tid][metric_name] = \
+            self._tenant_metrics[tid].get(metric_name, 0) + amount
+
+    def get_metrics(self, tenant_id: str) -> Dict[str, Any]:
+        """Get metrics for a tenant."""
+        return self._tenant_metrics.get(tenant_id, {}).copy()
+
+    def list_tenants(
+        self,
+        tier: Optional[str] = None,
+        status: Optional[str] = None
+    ) -> List[Tenant]:
+        """List tenants with optional filtering."""
+        tenants = list(self._tenants.values())
+
+        if tier:
+            tenants = [t for t in tenants if t.tier == tier]
+        if status:
+            tenants = [t for t in tenants if t.status == status]
+
+        return tenants
+
+
+@dataclass
+class RateLimitRule:
+    """A rate limiting rule."""
+    rule_id: str
+    name: str
+    limit: int
+    window_seconds: int
+    scope: str = "global"  # global, ip, user, api_key
+    burst_limit: Optional[int] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RateLimitState:
+    """Current state of rate limiting for a key."""
+    key: str
+    rule_id: str
+    tokens: float
+    last_update: datetime
+    request_count: int = 0
+
+
+class RateLimiterManager:
+    """
+    Advanced rate limiting system.
+
+    Provides multiple rate limiting algorithms with support for
+    different scopes and burst handling.
+
+    Features:
+    - Token bucket algorithm
+    - Sliding window counter
+    - Fixed window counter
+    - Leaky bucket algorithm
+    - Per-key rate limiting
+    - Burst allowance
+    - Rate limit headers
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._rules: Dict[str, RateLimitRule] = {}
+        self._states: Dict[str, RateLimitState] = {}
+        self._algorithm: str = "token_bucket"  # token_bucket, sliding_window, fixed_window
+        self._logger = UnifiedLogger(
+            name="RateLimiterManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize rate limiter."""
+        try:
+            async with self._lock:
+                # Register default rules
+                default_rules = [
+                    RateLimitRule(
+                        rule_id="default",
+                        name="Default Rate Limit",
+                        limit=100,
+                        window_seconds=60,
+                        burst_limit=150
+                    ),
+                    RateLimitRule(
+                        rule_id="api_key",
+                        name="API Key Rate Limit",
+                        limit=1000,
+                        window_seconds=60,
+                        scope="api_key",
+                        burst_limit=1500
+                    ),
+                    RateLimitRule(
+                        rule_id="auth",
+                        name="Authentication Rate Limit",
+                        limit=10,
+                        window_seconds=60,
+                        scope="ip"
+                    )
+                ]
+
+                for rule in default_rules:
+                    self._rules[rule.rule_id] = rule
+
+                self._initialized = True
+                self._logger.info("Rate limiter initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize rate limiter: {e}")
+            return False
+
+    def register_rule(self, rule: RateLimitRule) -> bool:
+        """Register a rate limit rule."""
+        self._rules[rule.rule_id] = rule
+        self._logger.debug(f"Registered rate limit rule: {rule.name}")
+        return True
+
+    async def check(
+        self,
+        rule_id: str,
+        key: str
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Check if request is allowed under rate limit.
+
+        Args:
+            rule_id: Rule to check against
+            key: Unique key for rate limiting (e.g., IP, user ID)
+
+        Returns:
+            Tuple of (allowed, headers_info)
+        """
+        if rule_id not in self._rules:
+            return True, {"X-RateLimit-Limit": "unlimited"}
+
+        rule = self._rules[rule_id]
+        state_key = f"{rule_id}:{key}"
+
+        if self._algorithm == "token_bucket":
+            return await self._check_token_bucket(rule, state_key)
+        elif self._algorithm == "sliding_window":
+            return await self._check_sliding_window(rule, state_key)
+        else:
+            return await self._check_fixed_window(rule, state_key)
+
+    async def _check_token_bucket(
+        self,
+        rule: RateLimitRule,
+        state_key: str
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Token bucket algorithm."""
+        now = datetime.now()
+
+        async with self._lock:
+            if state_key not in self._states:
+                # Initialize with full bucket
+                self._states[state_key] = RateLimitState(
+                    key=state_key,
+                    rule_id=rule.rule_id,
+                    tokens=float(rule.limit),
+                    last_update=now
+                )
+
+            state = self._states[state_key]
+
+            # Calculate token refill
+            elapsed = (now - state.last_update).total_seconds()
+            refill_rate = rule.limit / rule.window_seconds
+            state.tokens = min(
+                float(rule.burst_limit or rule.limit),
+                state.tokens + (elapsed * refill_rate)
+            )
+            state.last_update = now
+
+            # Check if we have tokens
+            if state.tokens >= 1:
+                state.tokens -= 1
+                state.request_count += 1
+                allowed = True
+            else:
+                allowed = False
+
+            headers = {
+                "X-RateLimit-Limit": str(rule.limit),
+                "X-RateLimit-Remaining": str(max(0, int(state.tokens))),
+                "X-RateLimit-Reset": str(int(rule.window_seconds - elapsed) if elapsed < rule.window_seconds else 0)
+            }
+
+            return allowed, headers
+
+    async def _check_sliding_window(
+        self,
+        rule: RateLimitRule,
+        state_key: str
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Sliding window counter algorithm."""
+        now = datetime.now()
+
+        async with self._lock:
+            if state_key not in self._states:
+                self._states[state_key] = RateLimitState(
+                    key=state_key,
+                    rule_id=rule.rule_id,
+                    tokens=0,
+                    last_update=now
+                )
+
+            state = self._states[state_key]
+
+            # Calculate weighted count from previous window
+            elapsed = (now - state.last_update).total_seconds()
+            if elapsed >= rule.window_seconds:
+                # Reset window
+                state.request_count = 0
+                state.last_update = now
+                elapsed = 0
+
+            # Weight for previous window
+            weight = 1 - (elapsed / rule.window_seconds)
+            effective_count = state.request_count * weight
+
+            if effective_count < rule.limit:
+                state.request_count += 1
+                allowed = True
+                remaining = int(rule.limit - effective_count - 1)
+            else:
+                allowed = False
+                remaining = 0
+
+            headers = {
+                "X-RateLimit-Limit": str(rule.limit),
+                "X-RateLimit-Remaining": str(max(0, remaining)),
+                "X-RateLimit-Reset": str(int(rule.window_seconds - elapsed))
+            }
+
+            return allowed, headers
+
+    async def _check_fixed_window(
+        self,
+        rule: RateLimitRule,
+        state_key: str
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Fixed window counter algorithm."""
+        now = datetime.now()
+
+        async with self._lock:
+            if state_key not in self._states:
+                self._states[state_key] = RateLimitState(
+                    key=state_key,
+                    rule_id=rule.rule_id,
+                    tokens=0,
+                    last_update=now
+                )
+
+            state = self._states[state_key]
+
+            # Check if window has reset
+            elapsed = (now - state.last_update).total_seconds()
+            if elapsed >= rule.window_seconds:
+                state.request_count = 0
+                state.last_update = now
+                elapsed = 0
+
+            if state.request_count < rule.limit:
+                state.request_count += 1
+                allowed = True
+                remaining = rule.limit - state.request_count
+            else:
+                allowed = False
+                remaining = 0
+
+            headers = {
+                "X-RateLimit-Limit": str(rule.limit),
+                "X-RateLimit-Remaining": str(remaining),
+                "X-RateLimit-Reset": str(int(rule.window_seconds - elapsed))
+            }
+
+            return allowed, headers
+
+    def reset(self, rule_id: str, key: str) -> bool:
+        """Reset rate limit for a specific key."""
+        state_key = f"{rule_id}:{key}"
+        if state_key in self._states:
+            del self._states[state_key]
+            return True
+        return False
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get rate limiter statistics."""
+        return {
+            "rules_count": len(self._rules),
+            "active_states": len(self._states),
+            "algorithm": self._algorithm
+        }
+
+
+@dataclass
+class CoalescedRequest:
+    """A coalesced request waiting for result."""
+    request_id: str
+    key: str
+    future: asyncio.Future
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+class RequestCoalescer:
+    """
+    Request coalescing and deduplication system.
+
+    Combines duplicate concurrent requests to reduce
+    backend load and improve response times.
+
+    Features:
+    - Request deduplication
+    - Result sharing across waiters
+    - Configurable coalescing windows
+    - Cache integration
+    - Request batching
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._pending: Dict[str, CoalescedRequest] = {}
+        self._in_flight: Dict[str, asyncio.Task] = {}
+        self._coalesce_window_ms: float = 50.0
+        self._max_waiters: int = 100
+        self._metrics: Dict[str, int] = {
+            "requests": 0,
+            "coalesced": 0,
+            "executions": 0
+        }
+        self._logger = UnifiedLogger(
+            name="RequestCoalescer",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize request coalescer."""
+        try:
+            self._initialized = True
+            self._logger.info("Request coalescer initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize request coalescer: {e}")
+            return False
+
+    async def coalesce(
+        self,
+        key: str,
+        executor: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        """
+        Execute request with coalescing.
+
+        If an identical request is already in flight, wait for its result
+        instead of executing a new request.
+
+        Args:
+            key: Unique key for the request
+            executor: Function to execute if no in-flight request
+
+        Returns:
+            Result from executor (shared if coalesced)
+        """
+        self._metrics["requests"] += 1
+
+        async with self._lock:
+            # Check if request is already in flight
+            if key in self._in_flight:
+                self._metrics["coalesced"] += 1
+
+                # Create waiter
+                future: asyncio.Future = asyncio.Future()
+                request = CoalescedRequest(
+                    request_id=f"req_{secrets.token_hex(4)}",
+                    key=key,
+                    future=future
+                )
+
+                if key not in self._pending:
+                    self._pending[key] = request
+                else:
+                    # Add to existing waiters
+                    pass  # Result will be distributed when task completes
+
+                self._logger.debug(f"Coalesced request for key: {key}")
+
+                # Wait for in-flight request
+                try:
+                    return await self._in_flight[key]
+                except Exception as e:
+                    raise e
+
+            # Start new request
+            task = asyncio.create_task(self._execute_and_distribute(key, executor))
+            self._in_flight[key] = task
+
+        try:
+            return await task
+        finally:
+            async with self._lock:
+                self._in_flight.pop(key, None)
+                self._pending.pop(key, None)
+
+    async def _execute_and_distribute(
+        self,
+        key: str,
+        executor: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        """Execute request and distribute result to waiters."""
+        self._metrics["executions"] += 1
+
+        try:
+            result = await executor()
+
+            # Distribute to waiters
+            async with self._lock:
+                if key in self._pending:
+                    request = self._pending[key]
+                    if not request.future.done():
+                        request.future.set_result(result)
+
+            return result
+
+        except Exception as e:
+            # Distribute exception to waiters
+            async with self._lock:
+                if key in self._pending:
+                    request = self._pending[key]
+                    if not request.future.done():
+                        request.future.set_exception(e)
+
+            raise
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get coalescer metrics."""
+        return {
+            **self._metrics,
+            "in_flight": len(self._in_flight),
+            "coalesce_ratio": (
+                self._metrics["coalesced"] / max(1, self._metrics["requests"])
+            ) * 100
+        }
+
+
+@dataclass
+class BackgroundJob:
+    """A background job definition."""
+    job_id: str
+    name: str
+    handler: Callable[..., Awaitable[Any]]
+    args: Tuple = field(default_factory=tuple)
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+    priority: int = 5  # 1 (highest) to 10 (lowest)
+    max_retries: int = 3
+    retry_delay_seconds: float = 60.0
+    timeout_seconds: float = 300.0
+    scheduled_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    status: str = "pending"  # pending, running, completed, failed, cancelled
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    attempts: int = 0
+
+
+class BackgroundJobManager:
+    """
+    Background job processing system.
+
+    Provides reliable background job execution with retries,
+    prioritization, and monitoring.
+
+    Features:
+    - Priority-based job queue
+    - Automatic retries with backoff
+    - Job scheduling
+    - Timeout handling
+    - Job monitoring and history
+    - Concurrent job limits
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._jobs: Dict[str, BackgroundJob] = {}
+        self._workers: List[asyncio.Task] = []
+        self._num_workers: int = 4
+        self._max_concurrent: int = 10
+        self._running_count: int = 0
+        self._shutdown: bool = False
+        self._job_history: deque = deque(maxlen=10000)
+        self._logger = UnifiedLogger(
+            name="BackgroundJobManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize background job manager."""
+        try:
+            # Start worker tasks
+            for i in range(self._num_workers):
+                worker = asyncio.create_task(self._worker_loop(i))
+                self._workers.append(worker)
+
+            self._initialized = True
+            self._logger.info(f"Background job manager initialized with {self._num_workers} workers")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize job manager: {e}")
+            return False
+
+    async def enqueue(
+        self,
+        name: str,
+        handler: Callable[..., Awaitable[Any]],
+        args: Optional[Tuple] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+        priority: int = 5,
+        max_retries: int = 3,
+        delay_seconds: float = 0,
+        timeout_seconds: float = 300.0
+    ) -> str:
+        """
+        Enqueue a background job.
+
+        Args:
+            name: Job name
+            handler: Async function to execute
+            args: Positional arguments
+            kwargs: Keyword arguments
+            priority: Priority (1-10, lower = higher priority)
+            max_retries: Maximum retry attempts
+            delay_seconds: Delay before execution
+            timeout_seconds: Job timeout
+
+        Returns:
+            Job ID
+        """
+        job_id = f"job_{secrets.token_hex(8)}"
+
+        scheduled_at = None
+        if delay_seconds > 0:
+            scheduled_at = datetime.now() + timedelta(seconds=delay_seconds)
+
+        job = BackgroundJob(
+            job_id=job_id,
+            name=name,
+            handler=handler,
+            args=args or (),
+            kwargs=kwargs or {},
+            priority=priority,
+            max_retries=max_retries,
+            timeout_seconds=timeout_seconds,
+            scheduled_at=scheduled_at
+        )
+
+        async with self._lock:
+            self._jobs[job_id] = job
+
+        # Add to queue (priority, timestamp, job_id)
+        await self._queue.put((priority, time.time(), job_id))
+
+        self._logger.debug(f"Enqueued job: {name} ({job_id})")
+        return job_id
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        """Worker loop for processing jobs."""
+        while not self._shutdown:
+            try:
+                # Get next job with timeout
+                try:
+                    priority, _, job_id = await asyncio.wait_for(
+                        self._queue.get(),
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                job = self._jobs.get(job_id)
+                if not job or job.status == "cancelled":
+                    continue
+
+                # Check scheduled time
+                if job.scheduled_at and job.scheduled_at > datetime.now():
+                    # Re-queue for later
+                    await self._queue.put((priority, time.time(), job_id))
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Check concurrent limit
+                async with self._lock:
+                    if self._running_count >= self._max_concurrent:
+                        await self._queue.put((priority, time.time(), job_id))
+                        await asyncio.sleep(0.1)
+                        continue
+                    self._running_count += 1
+
+                try:
+                    await self._execute_job(job)
+                finally:
+                    async with self._lock:
+                        self._running_count -= 1
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._logger.error(f"Worker {worker_id} error: {e}")
+
+    async def _execute_job(self, job: BackgroundJob) -> None:
+        """Execute a single job."""
+        job.status = "running"
+        job.attempts += 1
+
+        self._logger.debug(f"Executing job: {job.name} (attempt {job.attempts})")
+
+        try:
+            # Execute with timeout
+            result = await asyncio.wait_for(
+                job.handler(*job.args, **job.kwargs),
+                timeout=job.timeout_seconds
+            )
+
+            job.status = "completed"
+            job.result = result
+            self._logger.debug(f"Job completed: {job.name}")
+
+        except asyncio.TimeoutError:
+            job.error = "Job timed out"
+            await self._handle_failure(job)
+
+        except Exception as e:
+            job.error = str(e)
+            await self._handle_failure(job)
+
+        finally:
+            # Record in history
+            self._job_history.append({
+                "job_id": job.job_id,
+                "name": job.name,
+                "status": job.status,
+                "attempts": job.attempts,
+                "completed_at": datetime.now().isoformat()
+            })
+
+    async def _handle_failure(self, job: BackgroundJob) -> None:
+        """Handle job failure with retry logic."""
+        if job.attempts < job.max_retries:
+            # Schedule retry with exponential backoff
+            delay = job.retry_delay_seconds * (2 ** (job.attempts - 1))
+            job.scheduled_at = datetime.now() + timedelta(seconds=delay)
+            job.status = "pending"
+
+            await self._queue.put((job.priority, time.time(), job.job_id))
+            self._logger.warning(f"Job {job.name} failed, retrying in {delay}s")
+
+        else:
+            job.status = "failed"
+            self._logger.error(f"Job {job.name} failed after {job.attempts} attempts: {job.error}")
+
+    async def cancel(self, job_id: str) -> bool:
+        """Cancel a job."""
+        job = self._jobs.get(job_id)
+        if not job:
+            return False
+
+        if job.status in ("completed", "failed"):
+            return False
+
+        job.status = "cancelled"
+        return True
+
+    def get_job(self, job_id: str) -> Optional[BackgroundJob]:
+        """Get job by ID."""
+        return self._jobs.get(job_id)
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get job manager statistics."""
+        status_counts: Dict[str, int] = {}
+        for job in self._jobs.values():
+            status_counts[job.status] = status_counts.get(job.status, 0) + 1
+
+        return {
+            "total_jobs": len(self._jobs),
+            "queue_size": self._queue.qsize(),
+            "running": self._running_count,
+            "by_status": status_counts,
+            "workers": len(self._workers),
+            "history_size": len(self._job_history)
+        }
+
+    async def shutdown(self) -> None:
+        """Shutdown the job manager."""
+        self._shutdown = True
+
+        for worker in self._workers:
+            worker.cancel()
+
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self._logger.info("Background job manager shutdown complete")
+
+
+@dataclass
+class RetryPolicy:
+    """Retry policy configuration."""
+    policy_id: str
+    max_attempts: int = 3
+    initial_delay_seconds: float = 1.0
+    max_delay_seconds: float = 60.0
+    backoff_multiplier: float = 2.0
+    jitter: bool = True
+    retryable_exceptions: List[type] = field(default_factory=list)
+    non_retryable_exceptions: List[type] = field(default_factory=list)
+
+
+class RetryPolicyManager:
+    """
+    Configurable retry policy manager.
+
+    Provides various retry strategies with exponential backoff,
+    jitter, and exception filtering.
+
+    Features:
+    - Exponential backoff with jitter
+    - Configurable retry policies
+    - Exception-based retry decisions
+    - Circuit breaker integration
+    - Retry metrics tracking
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._policies: Dict[str, RetryPolicy] = {}
+        self._metrics: Dict[str, Dict[str, int]] = {}
+        self._logger = UnifiedLogger(
+            name="RetryPolicyManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize retry policy manager."""
+        try:
+            # Register default policies
+            self._policies["default"] = RetryPolicy(
+                policy_id="default",
+                max_attempts=3,
+                initial_delay_seconds=1.0,
+                max_delay_seconds=30.0
+            )
+
+            self._policies["aggressive"] = RetryPolicy(
+                policy_id="aggressive",
+                max_attempts=5,
+                initial_delay_seconds=0.5,
+                max_delay_seconds=60.0,
+                backoff_multiplier=2.5
+            )
+
+            self._policies["conservative"] = RetryPolicy(
+                policy_id="conservative",
+                max_attempts=2,
+                initial_delay_seconds=2.0,
+                max_delay_seconds=10.0,
+                backoff_multiplier=1.5
+            )
+
+            self._initialized = True
+            self._logger.info("Retry policy manager initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize retry policy manager: {e}")
+            return False
+
+    def register_policy(self, policy: RetryPolicy) -> None:
+        """Register a retry policy."""
+        self._policies[policy.policy_id] = policy
+        self._metrics[policy.policy_id] = {"attempts": 0, "successes": 0, "failures": 0}
+
+    async def execute_with_retry(
+        self,
+        func: Callable[..., Awaitable[Any]],
+        policy_id: str = "default",
+        *args: Any,
+        **kwargs: Any
+    ) -> Any:
+        """
+        Execute function with retry policy.
+
+        Args:
+            func: Async function to execute
+            policy_id: Policy to use
+            *args: Positional arguments for func
+            **kwargs: Keyword arguments for func
+
+        Returns:
+            Function result
+
+        Raises:
+            Last exception if all retries exhausted
+        """
+        policy = self._policies.get(policy_id, self._policies["default"])
+
+        if policy_id not in self._metrics:
+            self._metrics[policy_id] = {"attempts": 0, "successes": 0, "failures": 0}
+
+        last_exception: Optional[Exception] = None
+
+        for attempt in range(1, policy.max_attempts + 1):
+            self._metrics[policy_id]["attempts"] += 1
+
+            try:
+                result = await func(*args, **kwargs)
+                self._metrics[policy_id]["successes"] += 1
+                return result
+
+            except Exception as e:
+                last_exception = e
+
+                # Check if exception is retryable
+                if not self._should_retry(e, policy):
+                    self._metrics[policy_id]["failures"] += 1
+                    raise
+
+                if attempt < policy.max_attempts:
+                    delay = self._calculate_delay(attempt, policy)
+                    self._logger.debug(
+                        f"Retry attempt {attempt}/{policy.max_attempts} "
+                        f"for {func.__name__}, delay: {delay:.2f}s"
+                    )
+                    await asyncio.sleep(delay)
+
+        self._metrics[policy_id]["failures"] += 1
+        raise last_exception  # type: ignore
+
+    def _should_retry(self, exception: Exception, policy: RetryPolicy) -> bool:
+        """Determine if exception should trigger retry."""
+        # Check non-retryable exceptions first
+        for exc_type in policy.non_retryable_exceptions:
+            if isinstance(exception, exc_type):
+                return False
+
+        # If retryable list specified, only retry those
+        if policy.retryable_exceptions:
+            for exc_type in policy.retryable_exceptions:
+                if isinstance(exception, exc_type):
+                    return True
+            return False
+
+        # Default: retry all exceptions
+        return True
+
+    def _calculate_delay(self, attempt: int, policy: RetryPolicy) -> float:
+        """Calculate retry delay with exponential backoff and optional jitter."""
+        delay = policy.initial_delay_seconds * (policy.backoff_multiplier ** (attempt - 1))
+        delay = min(delay, policy.max_delay_seconds)
+
+        if policy.jitter:
+            # Add random jitter (0-25% of delay)
+            jitter = secrets.randbelow(int(delay * 250)) / 1000
+            delay += jitter
+
+        return delay
+
+    def get_metrics(self, policy_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get retry metrics."""
+        if policy_id:
+            return self._metrics.get(policy_id, {})
+        return dict(self._metrics)
+
+
+@dataclass
+class PooledResource:
+    """A resource in the pool."""
+    resource_id: str
+    resource: Any
+    created_at: datetime = field(default_factory=datetime.now)
+    last_used: datetime = field(default_factory=datetime.now)
+    use_count: int = 0
+    healthy: bool = True
+
+
+class ResourcePoolManager:
+    """
+    Generic resource pooling manager.
+
+    Provides pooling for any type of resource with health checking,
+    idle timeout, and automatic replenishment.
+
+    Features:
+    - Generic resource pooling
+    - Health checking
+    - Idle resource cleanup
+    - Automatic pool replenishment
+    - Resource lifecycle hooks
+    """
+
+    def __init__(
+        self,
+        config: SystemKernelConfig,
+        name: str,
+        factory: Callable[[], Awaitable[Any]],
+        validator: Optional[Callable[[Any], Awaitable[bool]]] = None,
+        destructor: Optional[Callable[[Any], Awaitable[None]]] = None,
+        min_size: int = 2,
+        max_size: int = 10,
+        idle_timeout_seconds: float = 300.0
+    ):
+        self.config = config
+        self.name = name
+        self._factory = factory
+        self._validator = validator
+        self._destructor = destructor
+        self._min_size = min_size
+        self._max_size = max_size
+        self._idle_timeout = idle_timeout_seconds
+        self._lock = asyncio.Lock()
+        self._pool: deque = deque()
+        self._in_use: Dict[str, PooledResource] = {}
+        self._all_resources: Dict[str, PooledResource] = {}
+        self._maintenance_task: Optional[asyncio.Task] = None
+        self._logger = UnifiedLogger(
+            name=f"ResourcePool[{name}]",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize the resource pool."""
+        try:
+            # Create minimum number of resources
+            for _ in range(self._min_size):
+                await self._create_resource()
+
+            # Start maintenance task
+            self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+
+            self._initialized = True
+            self._logger.info(f"Resource pool initialized with {len(self._pool)} resources")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize resource pool: {e}")
+            return False
+
+    async def _create_resource(self) -> Optional[PooledResource]:
+        """Create a new resource."""
+        try:
+            resource = await self._factory()
+            resource_id = f"res_{secrets.token_hex(4)}"
+
+            pooled = PooledResource(
+                resource_id=resource_id,
+                resource=resource
+            )
+
+            self._all_resources[resource_id] = pooled
+            self._pool.append(pooled)
+            return pooled
+
+        except Exception as e:
+            self._logger.error(f"Failed to create resource: {e}")
+            return None
+
+    async def acquire(self, timeout: float = 30.0) -> Any:
+        """
+        Acquire a resource from the pool.
+
+        Args:
+            timeout: Maximum time to wait for resource
+
+        Returns:
+            The acquired resource
+
+        Raises:
+            TimeoutError if no resource available within timeout
+        """
+        start = time.time()
+
+        while True:
+            async with self._lock:
+                # Try to get from pool
+                while self._pool:
+                    pooled = self._pool.popleft()
+
+                    # Validate if validator provided
+                    if self._validator:
+                        try:
+                            if not await self._validator(pooled.resource):
+                                await self._destroy_resource(pooled)
+                                continue
+                        except Exception:
+                            await self._destroy_resource(pooled)
+                            continue
+
+                    pooled.last_used = datetime.now()
+                    pooled.use_count += 1
+                    self._in_use[pooled.resource_id] = pooled
+                    return pooled.resource
+
+                # Pool empty - try to create new resource if under max
+                if len(self._all_resources) < self._max_size:
+                    pooled = await self._create_resource()
+                    if pooled:
+                        self._pool.remove(pooled)
+                        pooled.last_used = datetime.now()
+                        pooled.use_count += 1
+                        self._in_use[pooled.resource_id] = pooled
+                        return pooled.resource
+
+            # Check timeout
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Could not acquire resource from pool '{self.name}'")
+
+            await asyncio.sleep(0.1)
+
+    async def release(self, resource: Any) -> None:
+        """Return a resource to the pool."""
+        async with self._lock:
+            # Find the pooled resource
+            pooled = None
+            for res_id, p in self._in_use.items():
+                if p.resource is resource:
+                    pooled = p
+                    break
+
+            if not pooled:
+                self._logger.warning("Released resource not found in pool")
+                return
+
+            del self._in_use[pooled.resource_id]
+            pooled.last_used = datetime.now()
+            self._pool.append(pooled)
+
+    async def _destroy_resource(self, pooled: PooledResource) -> None:
+        """Destroy a resource."""
+        try:
+            if self._destructor:
+                await self._destructor(pooled.resource)
+        except Exception as e:
+            self._logger.error(f"Error destroying resource: {e}")
+        finally:
+            self._all_resources.pop(pooled.resource_id, None)
+
+    async def _maintenance_loop(self) -> None:
+        """Maintenance loop for pool health."""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Run every minute
+
+                async with self._lock:
+                    now = datetime.now()
+                    to_remove = []
+
+                    # Check for idle resources
+                    for pooled in list(self._pool):
+                        age = (now - pooled.last_used).total_seconds()
+                        if age > self._idle_timeout and len(self._all_resources) > self._min_size:
+                            to_remove.append(pooled)
+
+                    # Remove idle resources
+                    for pooled in to_remove:
+                        self._pool.remove(pooled)
+                        await self._destroy_resource(pooled)
+
+                    # Replenish if below minimum
+                    while len(self._all_resources) < self._min_size:
+                        await self._create_resource()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._logger.error(f"Maintenance error: {e}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get pool statistics."""
+        return {
+            "name": self.name,
+            "total_resources": len(self._all_resources),
+            "available": len(self._pool),
+            "in_use": len(self._in_use),
+            "min_size": self._min_size,
+            "max_size": self._max_size
+        }
+
+    async def shutdown(self) -> None:
+        """Shutdown the pool and destroy all resources."""
+        if self._maintenance_task:
+            self._maintenance_task.cancel()
+
+        async with self._lock:
+            for pooled in list(self._all_resources.values()):
+                await self._destroy_resource(pooled)
+
+        self._logger.info(f"Resource pool '{self.name}' shutdown complete")
+
+
+@dataclass
+class CostEntry:
+    """A cost accounting entry."""
+    entry_id: str
+    resource_type: str
+    quantity: float
+    unit_cost: float
+    total_cost: float
+    tenant_id: Optional[str]
+    user_id: Optional[str]
+    timestamp: datetime = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class CostAccountingManager:
+    """
+    Resource usage cost tracking system.
+
+    Tracks resource consumption and calculates costs for
+    billing and chargeback purposes.
+
+    Features:
+    - Per-resource cost tracking
+    - Tenant/user cost allocation
+    - Cost aggregation and reporting
+    - Budget alerts
+    - Cost forecasting
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._entries: List[CostEntry] = []
+        self._unit_costs: Dict[str, float] = {}  # resource_type -> unit_cost
+        self._budgets: Dict[str, float] = {}  # tenant_id -> budget
+        self._alerts_sent: Set[str] = set()
+        self._alert_handlers: List[Callable[[str, float, float], Awaitable[None]]] = []
+        self._logger = UnifiedLogger(
+            name="CostAccountingManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize cost accounting manager."""
+        try:
+            # Set default unit costs
+            self._unit_costs = {
+                "api_call": 0.0001,  # $0.0001 per call
+                "storage_gb_hour": 0.023 / 24 / 30,  # ~$0.023/GB/month
+                "compute_hour": 0.10,  # $0.10 per hour
+                "bandwidth_gb": 0.05,  # $0.05 per GB
+                "ml_inference": 0.001  # $0.001 per inference
+            }
+
+            self._initialized = True
+            self._logger.info("Cost accounting manager initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize cost accounting: {e}")
+            return False
+
+    def set_unit_cost(self, resource_type: str, cost: float) -> None:
+        """Set the unit cost for a resource type."""
+        self._unit_costs[resource_type] = cost
+
+    def set_budget(self, tenant_id: str, budget: float) -> None:
+        """Set budget for a tenant."""
+        self._budgets[tenant_id] = budget
+
+    async def record_usage(
+        self,
+        resource_type: str,
+        quantity: float,
+        tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> CostEntry:
+        """
+        Record resource usage.
+
+        Args:
+            resource_type: Type of resource consumed
+            quantity: Quantity consumed
+            tenant_id: Tenant ID for allocation
+            user_id: User ID for allocation
+            metadata: Additional metadata
+
+        Returns:
+            Created CostEntry
+        """
+        unit_cost = self._unit_costs.get(resource_type, 0)
+        total_cost = quantity * unit_cost
+
+        entry = CostEntry(
+            entry_id=f"cost_{secrets.token_hex(6)}",
+            resource_type=resource_type,
+            quantity=quantity,
+            unit_cost=unit_cost,
+            total_cost=total_cost,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            metadata=metadata or {}
+        )
+
+        async with self._lock:
+            self._entries.append(entry)
+
+        # Check budget alerts
+        if tenant_id:
+            await self._check_budget_alert(tenant_id)
+
+        return entry
+
+    async def _check_budget_alert(self, tenant_id: str) -> None:
+        """Check if tenant is approaching budget limit."""
+        budget = self._budgets.get(tenant_id)
+        if not budget:
+            return
+
+        current_cost = self.get_total_cost(tenant_id=tenant_id)
+        percentage = (current_cost / budget) * 100
+
+        alert_thresholds = [80, 90, 100]
+        for threshold in alert_thresholds:
+            alert_key = f"{tenant_id}_{threshold}"
+            if percentage >= threshold and alert_key not in self._alerts_sent:
+                self._alerts_sent.add(alert_key)
+
+                for handler in self._alert_handlers:
+                    try:
+                        await handler(tenant_id, current_cost, budget)
+                    except Exception as e:
+                        self._logger.error(f"Budget alert handler error: {e}")
+
+    def register_alert_handler(
+        self,
+        handler: Callable[[str, float, float], Awaitable[None]]
+    ) -> None:
+        """Register a budget alert handler."""
+        self._alert_handlers.append(handler)
+
+    def get_total_cost(
+        self,
+        tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None
+    ) -> float:
+        """Get total cost with optional filters."""
+        total = 0.0
+
+        for entry in self._entries:
+            if tenant_id and entry.tenant_id != tenant_id:
+                continue
+            if user_id and entry.user_id != user_id:
+                continue
+            if start_date and entry.timestamp < start_date:
+                continue
+            if end_date and entry.timestamp > end_date:
+                continue
+            total += entry.total_cost
+
+        return total
+
+    def get_cost_breakdown(
+        self,
+        tenant_id: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None
+    ) -> Dict[str, float]:
+        """Get cost breakdown by resource type."""
+        breakdown: Dict[str, float] = {}
+
+        for entry in self._entries:
+            if tenant_id and entry.tenant_id != tenant_id:
+                continue
+            if start_date and entry.timestamp < start_date:
+                continue
+            if end_date and entry.timestamp > end_date:
+                continue
+
+            breakdown[entry.resource_type] = \
+                breakdown.get(entry.resource_type, 0) + entry.total_cost
+
+        return breakdown
+
+    def generate_report(
+        self,
+        tenant_id: Optional[str] = None,
+        period_days: int = 30
+    ) -> Dict[str, Any]:
+        """Generate a cost report."""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=period_days)
+
+        total = self.get_total_cost(tenant_id, start_date=start_date, end_date=end_date)
+        breakdown = self.get_cost_breakdown(tenant_id, start_date, end_date)
+
+        # Calculate daily average
+        daily_avg = total / period_days if period_days > 0 else 0
+
+        # Forecast
+        forecast_30_days = daily_avg * 30
+
+        budget = self._budgets.get(tenant_id or "global", float("inf"))
+        budget_remaining = budget - total
+
+        return {
+            "tenant_id": tenant_id,
+            "period_start": start_date.isoformat(),
+            "period_end": end_date.isoformat(),
+            "total_cost": round(total, 4),
+            "breakdown": {k: round(v, 4) for k, v in breakdown.items()},
+            "daily_average": round(daily_avg, 4),
+            "forecast_30_days": round(forecast_30_days, 4),
+            "budget": budget if budget != float("inf") else None,
+            "budget_remaining": round(budget_remaining, 4) if budget != float("inf") else None,
+            "budget_usage_percent": round((total / budget) * 100, 2) if budget != float("inf") else None
+        }
+
+
+# =============================================================================
 # =============================================================================
 #
 #  ███████╗ ██████╗ ███╗   ██╗███████╗    ███████╗
