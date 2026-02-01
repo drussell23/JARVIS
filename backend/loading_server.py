@@ -49,6 +49,8 @@ Features:
 
 API Endpoints:
     GET  /                            - Loading page (HTML)
+    GET  /health                      - Standard health endpoint (v185.0)
+    GET  /ready                       - Kubernetes-style readiness check (v185.0)
     GET  /api/supervisor/health       - Supervisor health status
     GET  /api/supervisor/heartbeat    - Heartbeat for keep-alive
     GET  /api/supervisor/status       - Full supervisor status
@@ -1018,6 +1020,17 @@ class LoadingServer:
     async def _route_request(self, method: str, path: str, headers: Dict, body: Optional[bytes]) -> Union[str, bytes]:
         """Route HTTP request to appropriate handler."""
 
+        # ===========================================================================
+        # v185.0: Standard health endpoint (supervisor calls /health)
+        # This MUST come first for fast health checks during startup
+        # ===========================================================================
+        if path == "/health":
+            return self._json_response(self._get_health_response())
+
+        # v185.0: Kubernetes-style readiness endpoint
+        if path == "/ready":
+            return self._json_response(self._get_readiness_response())
+
         # API Routes
         if path == "/api/supervisor/health":
             return self._json_response(self._get_health_response())
@@ -1087,11 +1100,31 @@ class LoadingServer:
                 "health_level": state.get("health_level", 0),
             },
             "loading_server": {
-                "version": "182.0.0",
+                "version": "185.0.0",
                 "progress": self._progress,
                 "phase": self._phase,
                 "websocket_clients": self._ws_manager.connection_count,
             },
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def _get_readiness_response(self) -> Dict[str, Any]:
+        """
+        v185.0: Generate Kubernetes-style readiness response.
+        
+        Ready means the loading server is fully operational and can accept traffic.
+        This differs from health (liveness) which just means the process is alive.
+        """
+        # Ready = server is up AND has received at least one progress update
+        is_ready = self._progress > 0 or self._phase != "initializing"
+        
+        return {
+            "ready": is_ready,
+            "status": "ready" if is_ready else "initializing",
+            "progress": self._progress,
+            "phase": self._phase,
+            "trinity_ready": self._trinity_ready,
+            "uptime": round(time.time() - self._startup_time, 2),
             "timestamp": datetime.now().isoformat(),
         }
 
