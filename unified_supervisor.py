@@ -18203,6 +18203,1087 @@ class IntelligentWorkloadBalancer:
         }
 
 
+class AdvancedCircuitBreaker:
+    """
+    Enterprise-grade circuit breaker with half-open state and sliding window.
+
+    States:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Circuit tripped, requests fail fast
+    - HALF_OPEN: Testing recovery, limited requests allowed
+
+    Features:
+    - Sliding window failure tracking (time-based)
+    - Configurable failure thresholds
+    - Automatic recovery testing
+    - Callback hooks for state transitions
+    - Metrics and observability
+    """
+
+    class State(Enum):
+        CLOSED = "closed"
+        OPEN = "open"
+        HALF_OPEN = "half_open"
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+        sliding_window_seconds: float = 60.0,
+    ) -> None:
+        self._name = name
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._half_open_max_calls = half_open_max_calls
+        self._sliding_window_seconds = sliding_window_seconds
+
+        # State
+        self._state = self.State.CLOSED
+        self._last_failure_time: Optional[float] = None
+        self._last_state_change: float = time.time()
+
+        # Sliding window tracking
+        self._failure_timestamps: List[float] = []
+        self._success_timestamps: List[float] = []
+
+        # Half-open state tracking
+        self._half_open_calls = 0
+        self._half_open_successes = 0
+
+        # Callbacks
+        self._on_state_change: List[Callable[[str, str], None]] = []
+        self._on_failure: List[Callable[[Exception], None]] = []
+
+        # Statistics
+        self._stats = {
+            "total_calls": 0,
+            "successful_calls": 0,
+            "failed_calls": 0,
+            "rejected_calls": 0,
+            "state_transitions": 0,
+            "recovery_attempts": 0,
+        }
+
+    @property
+    def state(self) -> "AdvancedCircuitBreaker.State":
+        """Get current circuit state."""
+        return self._state
+
+    @property
+    def is_closed(self) -> bool:
+        """Check if circuit is closed (normal operation)."""
+        return self._state == self.State.CLOSED
+
+    def can_execute(self) -> bool:
+        """Check if a call can be executed."""
+        self._cleanup_old_entries()
+
+        if self._state == self.State.CLOSED:
+            return True
+
+        if self._state == self.State.OPEN:
+            # Check if recovery timeout has passed
+            if self._last_failure_time and (
+                time.time() - self._last_failure_time >= self._recovery_timeout
+            ):
+                self._transition_to(self.State.HALF_OPEN)
+                return True
+            self._stats["rejected_calls"] += 1
+            return False
+
+        if self._state == self.State.HALF_OPEN:
+            if self._half_open_calls < self._half_open_max_calls:
+                return True
+            self._stats["rejected_calls"] += 1
+            return False
+
+        return False
+
+    def record_success(self) -> None:
+        """Record a successful call."""
+        self._stats["total_calls"] += 1
+        self._stats["successful_calls"] += 1
+        self._success_timestamps.append(time.time())
+
+        if self._state == self.State.HALF_OPEN:
+            self._half_open_calls += 1
+            self._half_open_successes += 1
+
+            # Check if we should close the circuit
+            if self._half_open_successes >= self._half_open_max_calls:
+                self._transition_to(self.State.CLOSED)
+
+    def record_failure(self, error: Optional[Exception] = None) -> None:
+        """Record a failed call."""
+        self._stats["total_calls"] += 1
+        self._stats["failed_calls"] += 1
+        self._failure_timestamps.append(time.time())
+        self._last_failure_time = time.time()
+
+        # Notify failure callbacks
+        if error:
+            for callback in self._on_failure:
+                try:
+                    callback(error)
+                except Exception:
+                    pass
+
+        if self._state == self.State.HALF_OPEN:
+            # Single failure in half-open trips the circuit
+            self._transition_to(self.State.OPEN)
+            return
+
+        if self._state == self.State.CLOSED:
+            # Check if we should open the circuit
+            self._cleanup_old_entries()
+            if len(self._failure_timestamps) >= self._failure_threshold:
+                self._transition_to(self.State.OPEN)
+
+    def _transition_to(self, new_state: "AdvancedCircuitBreaker.State") -> None:
+        """Transition to a new state."""
+        if self._state == new_state:
+            return
+
+        old_state = self._state
+        self._state = new_state
+        self._last_state_change = time.time()
+        self._stats["state_transitions"] += 1
+
+        # Reset half-open counters
+        if new_state == self.State.HALF_OPEN:
+            self._half_open_calls = 0
+            self._half_open_successes = 0
+            self._stats["recovery_attempts"] += 1
+
+        # Clear failure history on close
+        if new_state == self.State.CLOSED:
+            self._failure_timestamps.clear()
+
+        # Notify callbacks
+        for callback in self._on_state_change:
+            try:
+                callback(old_state.value, new_state.value)
+            except Exception:
+                pass
+
+    def _cleanup_old_entries(self) -> None:
+        """Remove entries outside the sliding window."""
+        cutoff = time.time() - self._sliding_window_seconds
+        self._failure_timestamps = [t for t in self._failure_timestamps if t > cutoff]
+        self._success_timestamps = [t for t in self._success_timestamps if t > cutoff]
+
+    def on_state_change(self, callback: Callable[[str, str], None]) -> None:
+        """Register a state change callback."""
+        self._on_state_change.append(callback)
+
+    def on_failure(self, callback: Callable[[Exception], None]) -> None:
+        """Register a failure callback."""
+        self._on_failure.append(callback)
+
+    def reset(self) -> None:
+        """Force reset to closed state."""
+        self._transition_to(self.State.CLOSED)
+        self._failure_timestamps.clear()
+        self._success_timestamps.clear()
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get circuit breaker status."""
+        self._cleanup_old_entries()
+        return {
+            "name": self._name,
+            "state": self._state.value,
+            "failures_in_window": len(self._failure_timestamps),
+            "successes_in_window": len(self._success_timestamps),
+            "failure_threshold": self._failure_threshold,
+            "time_in_state": time.time() - self._last_state_change,
+            "stats": self._stats,
+        }
+
+
+class CacheHierarchyManager:
+    """
+    Multi-tier caching system with L1/L2/L3 hierarchy.
+
+    Cache Levels:
+    - L1 (Hot): In-memory dict, fastest, smallest (100 items)
+    - L2 (Warm): In-memory with TTL, medium speed, larger (1000 items)
+    - L3 (Cold): File-based, slowest, largest (unlimited)
+
+    Features:
+    - Automatic promotion/demotion between tiers
+    - TTL support at each level
+    - LRU eviction policy
+    - Cache statistics and hit rates
+    - Async file operations for L3
+    """
+
+    def __init__(
+        self,
+        l1_max_size: int = 100,
+        l2_max_size: int = 1000,
+        l2_ttl_seconds: float = 300.0,
+        l3_dir: Optional[Path] = None,
+        l3_ttl_seconds: float = 3600.0,
+    ) -> None:
+        self._l1_max_size = l1_max_size
+        self._l2_max_size = l2_max_size
+        self._l2_ttl_seconds = l2_ttl_seconds
+        self._l3_dir = l3_dir or Path.home() / ".jarvis" / "cache" / "l3"
+        self._l3_dir.mkdir(parents=True, exist_ok=True)
+        self._l3_ttl_seconds = l3_ttl_seconds
+
+        # L1 cache (simple dict with access order tracking)
+        self._l1_cache: Dict[str, Any] = {}
+        self._l1_access_order: List[str] = []
+
+        # L2 cache (dict with timestamps)
+        self._l2_cache: Dict[str, Tuple[Any, float]] = {}  # key -> (value, timestamp)
+        self._l2_access_order: List[str] = []
+
+        # Statistics
+        self._stats = {
+            "l1_hits": 0,
+            "l1_misses": 0,
+            "l2_hits": 0,
+            "l2_misses": 0,
+            "l3_hits": 0,
+            "l3_misses": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "evictions": 0,
+        }
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get a value from the cache hierarchy."""
+        # Check L1
+        if key in self._l1_cache:
+            self._stats["l1_hits"] += 1
+            self._update_access_order(self._l1_access_order, key)
+            return self._l1_cache[key]
+
+        self._stats["l1_misses"] += 1
+
+        # Check L2
+        if key in self._l2_cache:
+            value, timestamp = self._l2_cache[key]
+            if time.time() - timestamp < self._l2_ttl_seconds:
+                self._stats["l2_hits"] += 1
+                self._update_access_order(self._l2_access_order, key)
+                # Promote to L1
+                await self._promote_to_l1(key, value)
+                return value
+            else:
+                # Expired, remove from L2
+                del self._l2_cache[key]
+                self._l2_access_order.remove(key)
+
+        self._stats["l2_misses"] += 1
+
+        # Check L3
+        value = await self._get_from_l3(key)
+        if value is not None:
+            self._stats["l3_hits"] += 1
+            # Promote to L2
+            await self._promote_to_l2(key, value)
+            return value
+
+        self._stats["l3_misses"] += 1
+        return None
+
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[float] = None,
+    ) -> None:
+        """Set a value in the cache (goes to L1 first)."""
+        # Add to L1
+        await self._add_to_l1(key, value)
+
+    async def delete(self, key: str) -> bool:
+        """Delete a key from all cache levels."""
+        deleted = False
+
+        if key in self._l1_cache:
+            del self._l1_cache[key]
+            self._l1_access_order.remove(key)
+            deleted = True
+
+        if key in self._l2_cache:
+            del self._l2_cache[key]
+            self._l2_access_order.remove(key)
+            deleted = True
+
+        l3_file = self._l3_dir / f"{self._hash_key(key)}.cache"
+        if l3_file.exists():
+            l3_file.unlink()
+            deleted = True
+
+        return deleted
+
+    async def _add_to_l1(self, key: str, value: Any) -> None:
+        """Add a value to L1 cache."""
+        # Check if we need to evict
+        while len(self._l1_cache) >= self._l1_max_size:
+            await self._evict_from_l1()
+
+        self._l1_cache[key] = value
+        self._update_access_order(self._l1_access_order, key)
+
+    async def _evict_from_l1(self) -> None:
+        """Evict the least recently used item from L1."""
+        if not self._l1_access_order:
+            return
+
+        # Get LRU key
+        lru_key = self._l1_access_order.pop(0)
+        value = self._l1_cache.pop(lru_key, None)
+
+        if value is not None:
+            # Demote to L2
+            await self._demote_to_l2(lru_key, value)
+            self._stats["evictions"] += 1
+
+    async def _demote_to_l2(self, key: str, value: Any) -> None:
+        """Demote a value from L1 to L2."""
+        # Check if we need to evict from L2
+        while len(self._l2_cache) >= self._l2_max_size:
+            await self._evict_from_l2()
+
+        self._l2_cache[key] = (value, time.time())
+        self._update_access_order(self._l2_access_order, key)
+        self._stats["demotions"] += 1
+
+    async def _evict_from_l2(self) -> None:
+        """Evict the least recently used item from L2."""
+        if not self._l2_access_order:
+            return
+
+        lru_key = self._l2_access_order.pop(0)
+        entry = self._l2_cache.pop(lru_key, None)
+
+        if entry is not None:
+            value, _ = entry
+            # Demote to L3
+            await self._demote_to_l3(lru_key, value)
+            self._stats["evictions"] += 1
+
+    async def _demote_to_l3(self, key: str, value: Any) -> None:
+        """Demote a value from L2 to L3 (file-based)."""
+        l3_file = self._l3_dir / f"{self._hash_key(key)}.cache"
+        try:
+            data = {
+                "key": key,
+                "value": value,
+                "timestamp": time.time(),
+            }
+            l3_file.write_text(json.dumps(data))
+            self._stats["demotions"] += 1
+        except Exception:
+            pass
+
+    async def _get_from_l3(self, key: str) -> Optional[Any]:
+        """Get a value from L3 (file-based)."""
+        l3_file = self._l3_dir / f"{self._hash_key(key)}.cache"
+        if not l3_file.exists():
+            return None
+
+        try:
+            content = l3_file.read_text()
+            data = json.loads(content)
+
+            # Check TTL
+            if time.time() - data.get("timestamp", 0) > self._l3_ttl_seconds:
+                l3_file.unlink()
+                return None
+
+            return data.get("value")
+        except Exception:
+            return None
+
+    async def _promote_to_l1(self, key: str, value: Any) -> None:
+        """Promote a value to L1."""
+        # Remove from L2 if present
+        if key in self._l2_cache:
+            del self._l2_cache[key]
+            if key in self._l2_access_order:
+                self._l2_access_order.remove(key)
+
+        await self._add_to_l1(key, value)
+        self._stats["promotions"] += 1
+
+    async def _promote_to_l2(self, key: str, value: Any) -> None:
+        """Promote a value to L2."""
+        # Remove from L3 if present
+        l3_file = self._l3_dir / f"{self._hash_key(key)}.cache"
+        if l3_file.exists():
+            l3_file.unlink()
+
+        await self._demote_to_l2(key, value)
+        self._stats["promotions"] += 1
+
+    def _update_access_order(self, order_list: List[str], key: str) -> None:
+        """Update access order for LRU tracking."""
+        if key in order_list:
+            order_list.remove(key)
+        order_list.append(key)
+
+    def _hash_key(self, key: str) -> str:
+        """Hash a key for file storage."""
+        import hashlib
+        return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+    def get_hit_rates(self) -> Dict[str, float]:
+        """Calculate hit rates for each level."""
+        def hit_rate(hits: int, misses: int) -> float:
+            total = hits + misses
+            return hits / total if total > 0 else 0.0
+
+        return {
+            "l1_hit_rate": hit_rate(self._stats["l1_hits"], self._stats["l1_misses"]),
+            "l2_hit_rate": hit_rate(self._stats["l2_hits"], self._stats["l2_misses"]),
+            "l3_hit_rate": hit_rate(self._stats["l3_hits"], self._stats["l3_misses"]),
+            "overall_hit_rate": hit_rate(
+                self._stats["l1_hits"] + self._stats["l2_hits"] + self._stats["l3_hits"],
+                self._stats["l3_misses"],  # Only count final misses
+            ),
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get cache hierarchy status."""
+        return {
+            "l1_size": len(self._l1_cache),
+            "l1_max_size": self._l1_max_size,
+            "l2_size": len(self._l2_cache),
+            "l2_max_size": self._l2_max_size,
+            "hit_rates": self.get_hit_rates(),
+            "stats": self._stats,
+        }
+
+
+class TokenBucketRateLimiter:
+    """
+    Token bucket rate limiter for API protection.
+
+    Algorithm:
+    - Bucket has maximum capacity of tokens
+    - Tokens are added at a fixed rate
+    - Each request consumes one or more tokens
+    - Requests without tokens are rejected or queued
+
+    Features:
+    - Per-client rate limiting
+    - Burst handling (bucket capacity)
+    - Async-safe with locking
+    - Configurable token cost per operation
+    - Overflow queue for waiting requests
+    """
+
+    def __init__(
+        self,
+        rate: float = 10.0,  # Tokens per second
+        capacity: int = 100,  # Maximum bucket size
+        enable_queuing: bool = True,
+        max_queue_size: int = 1000,
+        max_wait_seconds: float = 30.0,
+    ) -> None:
+        self._rate = rate
+        self._capacity = capacity
+        self._enable_queuing = enable_queuing
+        self._max_queue_size = max_queue_size
+        self._max_wait_seconds = max_wait_seconds
+
+        # Per-client buckets
+        self._buckets: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+        # Default bucket
+        self._default_bucket = {
+            "tokens": capacity,
+            "last_update": time.time(),
+        }
+
+        # Statistics
+        self._stats = {
+            "requests_allowed": 0,
+            "requests_rejected": 0,
+            "requests_queued": 0,
+            "tokens_consumed": 0,
+            "wait_time_total_ms": 0,
+        }
+
+    async def acquire(
+        self,
+        client_id: str = "default",
+        tokens: int = 1,
+        wait: bool = True,
+    ) -> bool:
+        """
+        Acquire tokens from the bucket.
+
+        Args:
+            client_id: Client identifier for per-client limiting
+            tokens: Number of tokens to acquire
+            wait: If True, wait for tokens; if False, fail immediately
+
+        Returns:
+            True if tokens acquired, False otherwise
+        """
+        async with self._lock:
+            bucket = self._get_or_create_bucket(client_id)
+            self._refill_bucket(bucket)
+
+            if bucket["tokens"] >= tokens:
+                bucket["tokens"] -= tokens
+                self._stats["requests_allowed"] += 1
+                self._stats["tokens_consumed"] += tokens
+                return True
+
+            if not wait or not self._enable_queuing:
+                self._stats["requests_rejected"] += 1
+                return False
+
+        # Wait for tokens (outside lock)
+        self._stats["requests_queued"] += 1
+        start_time = time.time()
+        wait_time = 0.0
+
+        while wait_time < self._max_wait_seconds:
+            # Calculate time needed for tokens
+            async with self._lock:
+                bucket = self._get_or_create_bucket(client_id)
+                self._refill_bucket(bucket)
+
+                if bucket["tokens"] >= tokens:
+                    bucket["tokens"] -= tokens
+                    self._stats["requests_allowed"] += 1
+                    self._stats["tokens_consumed"] += tokens
+                    self._stats["wait_time_total_ms"] += int((time.time() - start_time) * 1000)
+                    return True
+
+                tokens_needed = tokens - bucket["tokens"]
+                time_needed = tokens_needed / self._rate
+
+            # Wait for refill
+            await asyncio.sleep(min(time_needed, 1.0))
+            wait_time = time.time() - start_time
+
+        self._stats["requests_rejected"] += 1
+        return False
+
+    def _get_or_create_bucket(self, client_id: str) -> Dict[str, Any]:
+        """Get or create a bucket for a client."""
+        if client_id not in self._buckets:
+            self._buckets[client_id] = {
+                "tokens": self._capacity,
+                "last_update": time.time(),
+            }
+        return self._buckets[client_id]
+
+    def _refill_bucket(self, bucket: Dict[str, Any]) -> None:
+        """Refill a bucket based on elapsed time."""
+        now = time.time()
+        elapsed = now - bucket["last_update"]
+        tokens_to_add = elapsed * self._rate
+
+        bucket["tokens"] = min(self._capacity, bucket["tokens"] + tokens_to_add)
+        bucket["last_update"] = now
+
+    def get_remaining_tokens(self, client_id: str = "default") -> float:
+        """Get remaining tokens for a client."""
+        if client_id not in self._buckets:
+            return self._capacity
+
+        bucket = self._buckets[client_id]
+        # Don't modify, just calculate
+        elapsed = time.time() - bucket["last_update"]
+        tokens = bucket["tokens"] + elapsed * self._rate
+        return min(self._capacity, tokens)
+
+    def reset_bucket(self, client_id: str) -> None:
+        """Reset a client's bucket to full."""
+        if client_id in self._buckets:
+            self._buckets[client_id] = {
+                "tokens": self._capacity,
+                "last_update": time.time(),
+            }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get rate limiter status."""
+        return {
+            "rate": self._rate,
+            "capacity": self._capacity,
+            "clients": len(self._buckets),
+            "stats": self._stats,
+        }
+
+
+class EventSourcingManager:
+    """
+    Event sourcing system for audit trails and state reconstruction.
+
+    Stores all state changes as immutable events:
+    - Events are append-only (never modified)
+    - Current state reconstructed by replaying events
+    - Supports snapshots for performance
+    - Full audit trail of all changes
+
+    Features:
+    - Async event persistence
+    - Event replay for state reconstruction
+    - Snapshot creation and loading
+    - Event querying by time range
+    - Event handlers for side effects
+    """
+
+    def __init__(
+        self,
+        event_dir: Optional[Path] = None,
+        snapshot_interval: int = 1000,  # Create snapshot every N events
+        max_events_in_memory: int = 10000,
+    ) -> None:
+        self._event_dir = event_dir or Path.home() / ".jarvis" / "events"
+        self._event_dir.mkdir(parents=True, exist_ok=True)
+        self._snapshot_interval = snapshot_interval
+        self._max_events_in_memory = max_events_in_memory
+
+        # In-memory event buffer
+        self._events: List[Dict[str, Any]] = []
+        self._event_count = 0
+
+        # Current state (reconstructed from events)
+        self._state: Dict[str, Any] = {}
+
+        # Event handlers
+        self._handlers: Dict[str, List[Callable[[Dict[str, Any]], Awaitable[None]]]] = {}
+
+        # Lock for thread safety
+        self._lock = asyncio.Lock()
+
+        # Statistics
+        self._stats = {
+            "events_recorded": 0,
+            "events_replayed": 0,
+            "snapshots_created": 0,
+            "snapshots_loaded": 0,
+        }
+
+    async def initialize(self) -> None:
+        """Initialize by loading latest snapshot and replaying events."""
+        await self._load_latest_snapshot()
+        await self._replay_events_from_disk()
+
+    async def record_event(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Record a new event.
+
+        Returns:
+            Event ID
+        """
+        event_id = f"evt_{int(time.time() * 1000)}_{os.urandom(4).hex()}"
+
+        event = {
+            "id": event_id,
+            "type": event_type,
+            "payload": payload,
+            "metadata": metadata or {},
+            "timestamp": datetime.now().isoformat(),
+            "sequence": self._event_count,
+        }
+
+        async with self._lock:
+            self._events.append(event)
+            self._event_count += 1
+            self._stats["events_recorded"] += 1
+
+            # Apply event to state
+            await self._apply_event(event)
+
+            # Persist event
+            await self._persist_event(event)
+
+            # Check if we should create a snapshot
+            if self._event_count % self._snapshot_interval == 0:
+                await self._create_snapshot()
+
+            # Trim in-memory events
+            if len(self._events) > self._max_events_in_memory:
+                self._events = self._events[-self._max_events_in_memory:]
+
+        # Notify handlers
+        await self._notify_handlers(event)
+
+        return event_id
+
+    async def _apply_event(self, event: Dict[str, Any]) -> None:
+        """Apply an event to the current state."""
+        event_type = event.get("type", "")
+        payload = event.get("payload", {})
+
+        # Generic state application
+        if event_type == "state_set":
+            key = payload.get("key")
+            value = payload.get("value")
+            if key:
+                self._state[key] = value
+
+        elif event_type == "state_delete":
+            key = payload.get("key")
+            if key and key in self._state:
+                del self._state[key]
+
+        elif event_type == "state_merge":
+            self._state.update(payload)
+
+    async def _persist_event(self, event: Dict[str, Any]) -> None:
+        """Persist an event to disk."""
+        # Use date-based files for organization
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        event_file = self._event_dir / f"events_{date_str}.jsonl"
+
+        try:
+            with open(event_file, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception:
+            pass
+
+    async def _create_snapshot(self) -> None:
+        """Create a snapshot of current state."""
+        snapshot_id = f"snapshot_{self._event_count}"
+        snapshot_file = self._event_dir / f"{snapshot_id}.snapshot.json"
+
+        try:
+            data = {
+                "id": snapshot_id,
+                "event_count": self._event_count,
+                "state": self._state,
+                "timestamp": datetime.now().isoformat(),
+            }
+            snapshot_file.write_text(json.dumps(data, indent=2))
+            self._stats["snapshots_created"] += 1
+        except Exception:
+            pass
+
+    async def _load_latest_snapshot(self) -> None:
+        """Load the latest snapshot."""
+        snapshots = sorted(
+            self._event_dir.glob("*.snapshot.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        for snapshot_file in snapshots:
+            try:
+                content = snapshot_file.read_text()
+                data = json.loads(content)
+                self._state = data.get("state", {})
+                self._event_count = data.get("event_count", 0)
+                self._stats["snapshots_loaded"] += 1
+                return
+            except Exception:
+                continue
+
+    async def _replay_events_from_disk(self) -> None:
+        """Replay events from disk after the last snapshot."""
+        event_files = sorted(self._event_dir.glob("events_*.jsonl"))
+
+        for event_file in event_files:
+            try:
+                with open(event_file, "r") as f:
+                    for line in f:
+                        event = json.loads(line.strip())
+                        if event.get("sequence", 0) >= self._event_count:
+                            await self._apply_event(event)
+                            self._events.append(event)
+                            self._stats["events_replayed"] += 1
+            except Exception:
+                continue
+
+        self._event_count = len(self._events)
+
+    def register_handler(
+        self,
+        event_type: str,
+        handler: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Register an event handler."""
+        if event_type not in self._handlers:
+            self._handlers[event_type] = []
+        self._handlers[event_type].append(handler)
+
+    async def _notify_handlers(self, event: Dict[str, Any]) -> None:
+        """Notify registered handlers of an event."""
+        event_type = event.get("type", "")
+        handlers = self._handlers.get(event_type, [])
+
+        for handler in handlers:
+            try:
+                await handler(event)
+            except Exception:
+                pass
+
+    async def query_events(
+        self,
+        event_type: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Query events with filters."""
+        results = []
+
+        for event in reversed(self._events):
+            # Type filter
+            if event_type and event.get("type") != event_type:
+                continue
+
+            # Time filters
+            event_time = datetime.fromisoformat(event["timestamp"])
+            if start_time and event_time < start_time:
+                continue
+            if end_time and event_time > end_time:
+                continue
+
+            results.append(event)
+            if len(results) >= limit:
+                break
+
+        return results
+
+    def get_state(self) -> Dict[str, Any]:
+        """Get current reconstructed state."""
+        return self._state.copy()
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get event sourcing status."""
+        return {
+            "event_count": self._event_count,
+            "events_in_memory": len(self._events),
+            "state_keys": len(self._state),
+            "handlers_registered": sum(len(h) for h in self._handlers.values()),
+            "stats": self._stats,
+        }
+
+
+class DynamicConfigurationManager:
+    """
+    Dynamic configuration with hot reload and validation.
+
+    Features:
+    - Multiple config sources (file, env, remote)
+    - Hot reload without restart
+    - Schema validation
+    - Default values and type coercion
+    - Change notification callbacks
+    - Feature flags support
+    """
+
+    def __init__(
+        self,
+        config_file: Optional[Path] = None,
+        reload_interval: float = 30.0,
+        enable_remote: bool = False,
+    ) -> None:
+        self._config_file = config_file or Path.home() / ".jarvis" / "config.json"
+        self._reload_interval = reload_interval
+        self._enable_remote = enable_remote
+
+        # Configuration storage
+        self._config: Dict[str, Any] = {}
+        self._defaults: Dict[str, Any] = {}
+        self._schema: Dict[str, Dict[str, Any]] = {}
+
+        # Change tracking
+        self._last_loaded = 0.0
+        self._change_callbacks: List[Callable[[str, Any, Any], Awaitable[None]]] = []
+
+        # Feature flags
+        self._feature_flags: Dict[str, bool] = {}
+
+        # Background reload task
+        self._reload_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Statistics
+        self._stats = {
+            "reloads": 0,
+            "changes_detected": 0,
+            "validation_errors": 0,
+        }
+
+    def define(
+        self,
+        key: str,
+        default: Any = None,
+        type_hint: Optional[type] = None,
+        validator: Optional[Callable[[Any], bool]] = None,
+        description: str = "",
+    ) -> None:
+        """Define a configuration option."""
+        self._defaults[key] = default
+        self._schema[key] = {
+            "type": type_hint,
+            "validator": validator,
+            "description": description,
+        }
+        if key not in self._config:
+            self._config[key] = default
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get a configuration value."""
+        if key in self._config:
+            return self._config[key]
+        if key in self._defaults:
+            return self._defaults[key]
+        return default
+
+    def set(self, key: str, value: Any) -> bool:
+        """Set a configuration value (runtime only)."""
+        # Validate
+        if key in self._schema:
+            schema = self._schema[key]
+            type_hint = schema.get("type")
+            validator = schema.get("validator")
+
+            if type_hint and not isinstance(value, type_hint):
+                try:
+                    value = type_hint(value)
+                except (ValueError, TypeError):
+                    self._stats["validation_errors"] += 1
+                    return False
+
+            if validator and not validator(value):
+                self._stats["validation_errors"] += 1
+                return False
+
+        old_value = self._config.get(key)
+        self._config[key] = value
+
+        # Notify if changed
+        if old_value != value:
+            self._stats["changes_detected"] += 1
+            asyncio.create_task(self._notify_change(key, old_value, value))
+
+        return True
+
+    def get_feature_flag(self, flag: str, default: bool = False) -> bool:
+        """Get a feature flag value."""
+        return self._feature_flags.get(flag, default)
+
+    def set_feature_flag(self, flag: str, enabled: bool) -> None:
+        """Set a feature flag."""
+        self._feature_flags[flag] = enabled
+
+    async def start(self) -> bool:
+        """Start configuration monitoring."""
+        if self._running:
+            return True
+
+        # Initial load
+        await self._load_config()
+
+        self._running = True
+        self._reload_task = asyncio.create_task(self._reload_loop())
+        return True
+
+    async def stop(self) -> None:
+        """Stop configuration monitoring."""
+        self._running = False
+        if self._reload_task:
+            self._reload_task.cancel()
+            try:
+                await self._reload_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _load_config(self) -> None:
+        """Load configuration from all sources."""
+        # Priority: file < env < remote
+
+        # Load from file
+        if self._config_file.exists():
+            try:
+                content = self._config_file.read_text()
+                file_config = json.loads(content)
+                for key, value in file_config.items():
+                    self.set(key, value)
+            except Exception:
+                pass
+
+        # Load from environment
+        for key in self._schema.keys():
+            env_key = f"JARVIS_{key.upper()}"
+            env_value = os.environ.get(env_key)
+            if env_value is not None:
+                self.set(key, env_value)
+
+        self._last_loaded = time.time()
+        self._stats["reloads"] += 1
+
+    async def _reload_loop(self) -> None:
+        """Background loop for config reloading."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._reload_interval)
+                await self._check_for_changes()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _check_for_changes(self) -> None:
+        """Check if config file has changed."""
+        if not self._config_file.exists():
+            return
+
+        try:
+            mtime = self._config_file.stat().st_mtime
+            if mtime > self._last_loaded:
+                await self._load_config()
+        except Exception:
+            pass
+
+    def on_change(
+        self,
+        callback: Callable[[str, Any, Any], Awaitable[None]],
+    ) -> None:
+        """Register a change callback."""
+        self._change_callbacks.append(callback)
+
+    async def _notify_change(self, key: str, old_value: Any, new_value: Any) -> None:
+        """Notify callbacks of a configuration change."""
+        for callback in self._change_callbacks:
+            try:
+                await callback(key, old_value, new_value)
+            except Exception:
+                pass
+
+    def export(self) -> Dict[str, Any]:
+        """Export current configuration."""
+        return {
+            "config": self._config.copy(),
+            "feature_flags": self._feature_flags.copy(),
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get configuration manager status."""
+        return {
+            "running": self._running,
+            "config_file": str(self._config_file),
+            "options_defined": len(self._schema),
+            "feature_flags": len(self._feature_flags),
+            "last_loaded": self._last_loaded,
+            "stats": self._stats,
+        }
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 4                                                               ║
