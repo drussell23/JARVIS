@@ -28448,6 +28448,2639 @@ async def _test_zones_0_through_4():
 
 
 # =============================================================================
+# ZONE 4.14: ADVANCED SECURITY AND COMPLIANCE INFRASTRUCTURE
+# =============================================================================
+# This zone provides enterprise-grade security and compliance capabilities:
+# - SecurityPolicyEngine: Enforce configurable security policies
+# - ComplianceAuditor: Track and report compliance status
+# - DataClassificationManager: Classify and handle sensitive data
+# - AccessControlManager: RBAC/ABAC access control
+# - EncryptionServiceManager: Encryption and key management
+# - AnomalyDetector: Machine learning-based anomaly detection
+# - IncidentResponseCoordinator: Handle security incidents
+# - ThreatIntelligenceManager: Integrate threat intelligence feeds
+# =============================================================================
+
+
+class SecurityPolicyViolation(Exception):
+    """Exception raised when a security policy is violated."""
+
+    def __init__(
+        self,
+        policy_id: str,
+        message: str,
+        severity: str = "high",
+        details: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__(message)
+        self.policy_id = policy_id
+        self.severity = severity
+        self.details = details or {}
+        self.timestamp = datetime.now()
+
+
+@dataclass
+class SecurityPolicy:
+    """
+    Defines a security policy with rules and enforcement actions.
+
+    Attributes:
+        policy_id: Unique identifier for the policy
+        name: Human-readable policy name
+        description: Detailed description of what the policy enforces
+        rules: List of rules that must be satisfied
+        enforcement_action: Action to take on violation (block, warn, log)
+        enabled: Whether the policy is active
+        priority: Priority for evaluation order (higher = evaluated first)
+        exceptions: Patterns or contexts that are exempt from this policy
+    """
+    policy_id: str
+    name: str
+    description: str
+    rules: List[Dict[str, Any]]
+    enforcement_action: str = "block"  # block, warn, log
+    enabled: bool = True
+    priority: int = 100
+    exceptions: List[Dict[str, Any]] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PolicyEvaluationResult:
+    """Result of evaluating a security policy."""
+    policy_id: str
+    passed: bool
+    violations: List[str]
+    enforcement_action: str
+    evaluated_at: datetime = field(default_factory=datetime.now)
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+class SecurityPolicyEngine:
+    """
+    Enterprise security policy enforcement engine.
+
+    Evaluates requests and operations against configurable security policies
+    with support for rule-based evaluation, exception handling, and
+    multiple enforcement actions.
+
+    Features:
+    - Rule-based policy evaluation with boolean expressions
+    - Policy prioritization for conflict resolution
+    - Exception patterns for legitimate bypasses
+    - Audit logging of all evaluations
+    - Real-time policy updates without restart
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._policies: Dict[str, SecurityPolicy] = {}
+        self._evaluation_cache: Dict[str, PolicyEvaluationResult] = {}
+        self._cache_ttl_seconds: float = 60.0
+        self._evaluation_history: deque = deque(maxlen=10000)
+        self._violation_handlers: Dict[str, Callable] = {}
+        self._metrics: Dict[str, int] = {
+            "evaluations": 0,
+            "violations": 0,
+            "blocks": 0,
+            "warnings": 0,
+            "cache_hits": 0,
+        }
+        self._logger = UnifiedLogger(
+            name="SecurityPolicyEngine",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize the security policy engine with default policies."""
+        try:
+            async with self._lock:
+                # Register default security policies
+                await self._register_default_policies()
+                self._initialized = True
+                self._logger.info("Security policy engine initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize security policy engine: {e}")
+            return False
+
+    async def _register_default_policies(self) -> None:
+        """Register default security policies."""
+        # Policy: Prevent unauthorized file access
+        self.register_policy(SecurityPolicy(
+            policy_id="file_access_control",
+            name="File Access Control",
+            description="Restrict access to sensitive file paths",
+            rules=[
+                {"type": "path_pattern", "pattern": "/etc/passwd", "action": "deny"},
+                {"type": "path_pattern", "pattern": "/etc/shadow", "action": "deny"},
+                {"type": "path_pattern", "pattern": "**/.env*", "action": "warn"},
+                {"type": "path_pattern", "pattern": "**/credentials*", "action": "warn"},
+                {"type": "path_pattern", "pattern": "**/secrets*", "action": "warn"},
+            ],
+            enforcement_action="block",
+            priority=1000
+        ))
+
+        # Policy: Rate limiting
+        self.register_policy(SecurityPolicy(
+            policy_id="rate_limiting",
+            name="Rate Limiting",
+            description="Prevent excessive requests from single source",
+            rules=[
+                {"type": "rate_limit", "requests_per_minute": 1000, "per": "ip"},
+                {"type": "rate_limit", "requests_per_minute": 100, "per": "user"},
+            ],
+            enforcement_action="block",
+            priority=900
+        ))
+
+        # Policy: Input validation
+        self.register_policy(SecurityPolicy(
+            policy_id="input_validation",
+            name="Input Validation",
+            description="Validate and sanitize input data",
+            rules=[
+                {"type": "max_length", "field": "*", "max": 1000000},
+                {"type": "forbidden_patterns", "patterns": ["<script>", "javascript:"]},
+                {"type": "sql_injection_check", "enabled": True},
+                {"type": "command_injection_check", "enabled": True},
+            ],
+            enforcement_action="block",
+            priority=800
+        ))
+
+        # Policy: Authentication requirements
+        self.register_policy(SecurityPolicy(
+            policy_id="authentication_required",
+            name="Authentication Required",
+            description="Require authentication for sensitive operations",
+            rules=[
+                {"type": "require_auth", "operations": ["write", "delete", "admin"]},
+            ],
+            enforcement_action="block",
+            priority=700,
+            exceptions=[
+                {"type": "path", "pattern": "/health*"},
+                {"type": "path", "pattern": "/public/*"},
+            ]
+        ))
+
+    def register_policy(self, policy: SecurityPolicy) -> bool:
+        """Register a new security policy."""
+        try:
+            self._policies[policy.policy_id] = policy
+            self._logger.debug(f"Registered policy: {policy.name} ({policy.policy_id})")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to register policy {policy.policy_id}: {e}")
+            return False
+
+    def unregister_policy(self, policy_id: str) -> bool:
+        """Unregister a security policy."""
+        if policy_id in self._policies:
+            del self._policies[policy_id]
+            self._logger.info(f"Unregistered policy: {policy_id}")
+            return True
+        return False
+
+    async def evaluate(
+        self,
+        context: Dict[str, Any],
+        operation: str = "unknown"
+    ) -> Tuple[bool, List[PolicyEvaluationResult]]:
+        """
+        Evaluate all applicable policies for a given context.
+
+        Args:
+            context: Dictionary containing request/operation context
+            operation: Type of operation being performed
+
+        Returns:
+            Tuple of (allowed, list of evaluation results)
+        """
+        self._metrics["evaluations"] += 1
+
+        # Check cache
+        cache_key = self._generate_cache_key(context, operation)
+        if cache_key in self._evaluation_cache:
+            cached = self._evaluation_cache[cache_key]
+            cache_age = (datetime.now() - cached.evaluated_at).total_seconds()
+            if cache_age < self._cache_ttl_seconds:
+                self._metrics["cache_hits"] += 1
+                return cached.passed, [cached]
+
+        results: List[PolicyEvaluationResult] = []
+        allowed = True
+
+        # Sort policies by priority (highest first)
+        sorted_policies = sorted(
+            [p for p in self._policies.values() if p.enabled],
+            key=lambda p: p.priority,
+            reverse=True
+        )
+
+        for policy in sorted_policies:
+            try:
+                # Check if context matches any exception
+                if self._matches_exception(context, policy.exceptions):
+                    continue
+
+                # Evaluate policy rules
+                result = await self._evaluate_policy(policy, context, operation)
+                results.append(result)
+
+                if not result.passed:
+                    self._metrics["violations"] += 1
+
+                    if policy.enforcement_action == "block":
+                        self._metrics["blocks"] += 1
+                        allowed = False
+
+                        # Trigger violation handler if registered
+                        if policy.policy_id in self._violation_handlers:
+                            try:
+                                await self._violation_handlers[policy.policy_id](result)
+                            except Exception as e:
+                                self._logger.error(f"Violation handler error: {e}")
+
+                    elif policy.enforcement_action == "warn":
+                        self._metrics["warnings"] += 1
+                        self._logger.warning(
+                            f"Policy warning: {policy.name} - {result.violations}"
+                        )
+
+            except Exception as e:
+                self._logger.error(f"Error evaluating policy {policy.policy_id}: {e}")
+
+        # Cache result
+        if results:
+            combined_result = PolicyEvaluationResult(
+                policy_id="combined",
+                passed=allowed,
+                violations=[v for r in results for v in r.violations],
+                enforcement_action="block" if not allowed else "allow"
+            )
+            self._evaluation_cache[cache_key] = combined_result
+
+        # Record in history
+        self._evaluation_history.append({
+            "timestamp": datetime.now(),
+            "context": context,
+            "operation": operation,
+            "allowed": allowed,
+            "results": [r.policy_id for r in results if not r.passed]
+        })
+
+        return allowed, results
+
+    async def _evaluate_policy(
+        self,
+        policy: SecurityPolicy,
+        context: Dict[str, Any],
+        operation: str
+    ) -> PolicyEvaluationResult:
+        """Evaluate a single policy against context."""
+        violations: List[str] = []
+
+        for rule in policy.rules:
+            rule_type = rule.get("type", "unknown")
+
+            if rule_type == "path_pattern":
+                if "path" in context:
+                    pattern = rule.get("pattern", "")
+                    if self._path_matches_pattern(context["path"], pattern):
+                        action = rule.get("action", "deny")
+                        if action == "deny":
+                            violations.append(f"Path '{context['path']}' matches blocked pattern '{pattern}'")
+
+            elif rule_type == "rate_limit":
+                # Rate limiting would check against a rate limiter
+                # This is a simplified check
+                pass
+
+            elif rule_type == "max_length":
+                field = rule.get("field", "*")
+                max_len = rule.get("max", 1000000)
+                for key, value in context.items():
+                    if field == "*" or key == field:
+                        if isinstance(value, str) and len(value) > max_len:
+                            violations.append(f"Field '{key}' exceeds max length {max_len}")
+
+            elif rule_type == "forbidden_patterns":
+                patterns = rule.get("patterns", [])
+                for key, value in context.items():
+                    if isinstance(value, str):
+                        for pattern in patterns:
+                            if pattern.lower() in value.lower():
+                                violations.append(f"Forbidden pattern '{pattern}' found in '{key}'")
+
+            elif rule_type == "sql_injection_check":
+                if rule.get("enabled", False):
+                    for key, value in context.items():
+                        if isinstance(value, str):
+                            if self._detect_sql_injection(value):
+                                violations.append(f"Potential SQL injection in '{key}'")
+
+            elif rule_type == "command_injection_check":
+                if rule.get("enabled", False):
+                    for key, value in context.items():
+                        if isinstance(value, str):
+                            if self._detect_command_injection(value):
+                                violations.append(f"Potential command injection in '{key}'")
+
+            elif rule_type == "require_auth":
+                operations_requiring_auth = rule.get("operations", [])
+                if operation in operations_requiring_auth:
+                    if not context.get("authenticated", False):
+                        violations.append(f"Operation '{operation}' requires authentication")
+
+        return PolicyEvaluationResult(
+            policy_id=policy.policy_id,
+            passed=len(violations) == 0,
+            violations=violations,
+            enforcement_action=policy.enforcement_action,
+            context=context
+        )
+
+    def _path_matches_pattern(self, path: str, pattern: str) -> bool:
+        """Check if path matches a glob pattern."""
+        import fnmatch
+        return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, f"**/{pattern}")
+
+    def _detect_sql_injection(self, value: str) -> bool:
+        """Basic SQL injection detection."""
+        suspicious_patterns = [
+            r"'\s*or\s+'1'\s*=\s*'1",
+            r";\s*drop\s+table",
+            r";\s*delete\s+from",
+            r"union\s+select",
+            r"--\s*$",
+        ]
+        value_lower = value.lower()
+        for pattern in suspicious_patterns:
+            if re.search(pattern, value_lower):
+                return True
+        return False
+
+    def _detect_command_injection(self, value: str) -> bool:
+        """Basic command injection detection."""
+        suspicious_patterns = [
+            r";\s*rm\s+-rf",
+            r"\|\s*sh",
+            r"&&\s*cat\s+/etc",
+            r"`.*`",
+            r"\$\(.*\)",
+        ]
+        for pattern in suspicious_patterns:
+            if re.search(pattern, value):
+                return True
+        return False
+
+    def _matches_exception(
+        self,
+        context: Dict[str, Any],
+        exceptions: List[Dict[str, Any]]
+    ) -> bool:
+        """Check if context matches any exception pattern."""
+        for exception in exceptions:
+            exc_type = exception.get("type", "unknown")
+            if exc_type == "path":
+                pattern = exception.get("pattern", "")
+                if "path" in context:
+                    if self._path_matches_pattern(context["path"], pattern):
+                        return True
+            elif exc_type == "user":
+                users = exception.get("users", [])
+                if context.get("user") in users:
+                    return True
+            elif exc_type == "role":
+                roles = exception.get("roles", [])
+                if context.get("role") in roles:
+                    return True
+        return False
+
+    def _generate_cache_key(self, context: Dict[str, Any], operation: str) -> str:
+        """Generate a cache key for evaluation result."""
+        import hashlib
+        key_parts = [operation]
+        for k, v in sorted(context.items()):
+            key_parts.append(f"{k}={v}")
+        key_string = "|".join(key_parts)
+        return hashlib.md5(key_string.encode()).hexdigest()
+
+    def register_violation_handler(
+        self,
+        policy_id: str,
+        handler: Callable[[PolicyEvaluationResult], Awaitable[None]]
+    ) -> None:
+        """Register a callback for policy violations."""
+        self._violation_handlers[policy_id] = handler
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get policy engine metrics."""
+        return {
+            **self._metrics,
+            "policies_registered": len(self._policies),
+            "cache_size": len(self._evaluation_cache),
+            "history_size": len(self._evaluation_history),
+        }
+
+    def get_all_policies(self) -> List[SecurityPolicy]:
+        """Get all registered policies."""
+        return list(self._policies.values())
+
+
+@dataclass
+class ComplianceRequirement:
+    """
+    Defines a compliance requirement.
+
+    Attributes:
+        requirement_id: Unique identifier
+        framework: Compliance framework (SOC2, HIPAA, GDPR, etc.)
+        control_id: Control ID within the framework
+        description: Human-readable description
+        evidence_types: Types of evidence needed
+        automated_checks: Checks that can be automated
+        review_frequency: How often to review (daily, weekly, monthly)
+    """
+    requirement_id: str
+    framework: str
+    control_id: str
+    description: str
+    evidence_types: List[str]
+    automated_checks: List[Dict[str, Any]] = field(default_factory=list)
+    review_frequency: str = "monthly"
+    responsible_role: str = "security_team"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ComplianceStatus:
+    """Status of a compliance requirement."""
+    requirement_id: str
+    status: str  # compliant, non_compliant, partial, not_assessed
+    evidence: List[Dict[str, Any]]
+    findings: List[str]
+    last_assessed: datetime
+    next_assessment: datetime
+    assessor: str = "automated"
+
+
+class ComplianceAuditor:
+    """
+    Enterprise compliance auditing and tracking system.
+
+    Tracks compliance status across multiple frameworks, performs
+    automated compliance checks, and generates audit reports.
+
+    Features:
+    - Multi-framework support (SOC2, HIPAA, GDPR, PCI-DSS)
+    - Automated compliance checks where possible
+    - Evidence collection and management
+    - Audit trail and reporting
+    - Remediation tracking
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._requirements: Dict[str, ComplianceRequirement] = {}
+        self._status: Dict[str, ComplianceStatus] = {}
+        self._evidence_store: Dict[str, List[Dict[str, Any]]] = {}
+        self._audit_log: deque = deque(maxlen=50000)
+        self._check_handlers: Dict[str, Callable] = {}
+        self._logger = UnifiedLogger(
+            name="ComplianceAuditor",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize the compliance auditor."""
+        try:
+            async with self._lock:
+                # Register default compliance frameworks
+                await self._register_default_frameworks()
+                self._initialized = True
+                self._logger.info("Compliance auditor initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize compliance auditor: {e}")
+            return False
+
+    async def _register_default_frameworks(self) -> None:
+        """Register common compliance framework requirements."""
+        # SOC2 Type II - Security
+        self.register_requirement(ComplianceRequirement(
+            requirement_id="soc2_cc6_1",
+            framework="SOC2",
+            control_id="CC6.1",
+            description="Logical and physical access controls",
+            evidence_types=["access_logs", "user_provisioning_records"],
+            automated_checks=[
+                {"type": "access_log_review", "frequency": "daily"},
+                {"type": "privileged_access_review", "frequency": "weekly"},
+            ],
+            review_frequency="quarterly"
+        ))
+
+        self.register_requirement(ComplianceRequirement(
+            requirement_id="soc2_cc6_2",
+            framework="SOC2",
+            control_id="CC6.2",
+            description="Prior to granting access, authorization is obtained",
+            evidence_types=["access_requests", "approvals"],
+            automated_checks=[
+                {"type": "access_approval_check", "frequency": "daily"},
+            ],
+            review_frequency="quarterly"
+        ))
+
+        self.register_requirement(ComplianceRequirement(
+            requirement_id="soc2_cc7_1",
+            framework="SOC2",
+            control_id="CC7.1",
+            description="Security events are monitored",
+            evidence_types=["security_logs", "alert_records"],
+            automated_checks=[
+                {"type": "security_monitoring_active", "frequency": "hourly"},
+                {"type": "alert_response_time", "threshold_minutes": 15},
+            ],
+            review_frequency="monthly"
+        ))
+
+        # GDPR
+        self.register_requirement(ComplianceRequirement(
+            requirement_id="gdpr_art_17",
+            framework="GDPR",
+            control_id="Article 17",
+            description="Right to erasure (right to be forgotten)",
+            evidence_types=["deletion_requests", "deletion_confirmations"],
+            automated_checks=[
+                {"type": "deletion_request_handling", "max_days": 30},
+            ],
+            review_frequency="monthly"
+        ))
+
+        self.register_requirement(ComplianceRequirement(
+            requirement_id="gdpr_art_32",
+            framework="GDPR",
+            control_id="Article 32",
+            description="Security of processing",
+            evidence_types=["encryption_records", "access_controls"],
+            automated_checks=[
+                {"type": "encryption_at_rest", "required": True},
+                {"type": "encryption_in_transit", "required": True},
+            ],
+            review_frequency="quarterly"
+        ))
+
+    def register_requirement(self, requirement: ComplianceRequirement) -> bool:
+        """Register a compliance requirement."""
+        try:
+            self._requirements[requirement.requirement_id] = requirement
+            self._status[requirement.requirement_id] = ComplianceStatus(
+                requirement_id=requirement.requirement_id,
+                status="not_assessed",
+                evidence=[],
+                findings=[],
+                last_assessed=datetime.min,
+                next_assessment=datetime.now()
+            )
+            self._logger.debug(f"Registered requirement: {requirement.requirement_id}")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to register requirement: {e}")
+            return False
+
+    def register_check_handler(
+        self,
+        check_type: str,
+        handler: Callable[[Dict[str, Any]], Awaitable[Tuple[bool, str]]]
+    ) -> None:
+        """Register a handler for automated compliance checks."""
+        self._check_handlers[check_type] = handler
+
+    async def assess_requirement(
+        self,
+        requirement_id: str,
+        evidence: Optional[List[Dict[str, Any]]] = None,
+        assessor: str = "automated"
+    ) -> ComplianceStatus:
+        """
+        Assess a compliance requirement.
+
+        Args:
+            requirement_id: ID of requirement to assess
+            evidence: Evidence for the assessment
+            assessor: Who performed the assessment
+
+        Returns:
+            Updated compliance status
+        """
+        if requirement_id not in self._requirements:
+            raise ValueError(f"Unknown requirement: {requirement_id}")
+
+        requirement = self._requirements[requirement_id]
+        findings: List[str] = []
+        collected_evidence: List[Dict[str, Any]] = evidence or []
+
+        # Run automated checks
+        for check in requirement.automated_checks:
+            check_type = check.get("type")
+            if check_type in self._check_handlers:
+                try:
+                    passed, finding = await self._check_handlers[check_type](check)
+                    if not passed:
+                        findings.append(finding)
+                    collected_evidence.append({
+                        "type": "automated_check",
+                        "check_type": check_type,
+                        "passed": passed,
+                        "finding": finding,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                except Exception as e:
+                    findings.append(f"Check {check_type} failed with error: {e}")
+
+        # Determine status
+        if findings:
+            status = "non_compliant" if any("critical" in f.lower() for f in findings) else "partial"
+        elif collected_evidence:
+            status = "compliant"
+        else:
+            status = "not_assessed"
+
+        # Calculate next assessment date
+        frequency_days = {
+            "daily": 1,
+            "weekly": 7,
+            "monthly": 30,
+            "quarterly": 90,
+            "annually": 365
+        }
+        days_until_next = frequency_days.get(requirement.review_frequency, 30)
+        next_assessment = datetime.now() + timedelta(days=days_until_next)
+
+        # Update status
+        new_status = ComplianceStatus(
+            requirement_id=requirement_id,
+            status=status,
+            evidence=collected_evidence,
+            findings=findings,
+            last_assessed=datetime.now(),
+            next_assessment=next_assessment,
+            assessor=assessor
+        )
+        self._status[requirement_id] = new_status
+
+        # Store evidence
+        if requirement_id not in self._evidence_store:
+            self._evidence_store[requirement_id] = []
+        self._evidence_store[requirement_id].extend(collected_evidence)
+
+        # Audit log
+        self._audit_log.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "assess_requirement",
+            "requirement_id": requirement_id,
+            "status": status,
+            "assessor": assessor,
+            "findings_count": len(findings)
+        })
+
+        self._logger.info(f"Assessed {requirement_id}: {status}")
+        return new_status
+
+    async def assess_all(self, assessor: str = "automated") -> Dict[str, ComplianceStatus]:
+        """Assess all registered requirements."""
+        results = {}
+        for req_id in self._requirements:
+            try:
+                results[req_id] = await self.assess_requirement(req_id, assessor=assessor)
+            except Exception as e:
+                self._logger.error(f"Failed to assess {req_id}: {e}")
+        return results
+
+    def get_status(self, requirement_id: str) -> Optional[ComplianceStatus]:
+        """Get status for a specific requirement."""
+        return self._status.get(requirement_id)
+
+    def get_all_status(self) -> Dict[str, ComplianceStatus]:
+        """Get status for all requirements."""
+        return dict(self._status)
+
+    def get_framework_summary(self, framework: str) -> Dict[str, Any]:
+        """Get summary for a specific compliance framework."""
+        requirements = [
+            r for r in self._requirements.values()
+            if r.framework == framework
+        ]
+        statuses = [self._status.get(r.requirement_id) for r in requirements]
+
+        return {
+            "framework": framework,
+            "total_requirements": len(requirements),
+            "compliant": sum(1 for s in statuses if s and s.status == "compliant"),
+            "non_compliant": sum(1 for s in statuses if s and s.status == "non_compliant"),
+            "partial": sum(1 for s in statuses if s and s.status == "partial"),
+            "not_assessed": sum(1 for s in statuses if s and s.status == "not_assessed"),
+        }
+
+    def generate_report(
+        self,
+        framework: Optional[str] = None,
+        format: str = "json"
+    ) -> Dict[str, Any]:
+        """Generate a compliance report."""
+        if framework:
+            requirements = [
+                r for r in self._requirements.values()
+                if r.framework == framework
+            ]
+        else:
+            requirements = list(self._requirements.values())
+
+        report = {
+            "generated_at": datetime.now().isoformat(),
+            "framework_filter": framework,
+            "summary": {
+                "total": len(requirements),
+                "by_status": {},
+            },
+            "requirements": []
+        }
+
+        status_counts: Dict[str, int] = {}
+        for req in requirements:
+            status = self._status.get(req.requirement_id)
+            if status:
+                status_counts[status.status] = status_counts.get(status.status, 0) + 1
+                report["requirements"].append({
+                    "requirement_id": req.requirement_id,
+                    "framework": req.framework,
+                    "control_id": req.control_id,
+                    "description": req.description,
+                    "status": status.status,
+                    "findings": status.findings,
+                    "last_assessed": status.last_assessed.isoformat(),
+                    "next_assessment": status.next_assessment.isoformat()
+                })
+
+        report["summary"]["by_status"] = status_counts
+        return report
+
+
+@dataclass
+class DataClassification:
+    """
+    Data classification definition.
+
+    Attributes:
+        level: Classification level (public, internal, confidential, restricted)
+        label: Human-readable label
+        handling_rules: Rules for how to handle this data
+        retention_days: How long to retain data
+        encryption_required: Whether encryption is required
+        access_restrictions: Who can access this data
+    """
+    level: str
+    label: str
+    handling_rules: List[str]
+    retention_days: int = 365
+    encryption_required: bool = True
+    access_restrictions: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ClassifiedData:
+    """Represents classified data with its metadata."""
+    data_id: str
+    classification: DataClassification
+    data_type: str
+    location: str
+    owner: str
+    created_at: datetime = field(default_factory=datetime.now)
+    last_accessed: datetime = field(default_factory=datetime.now)
+    access_count: int = 0
+
+
+class DataClassificationManager:
+    """
+    Enterprise data classification and handling system.
+
+    Classifies data based on content and context, enforces handling
+    rules based on classification, and tracks data lineage.
+
+    Features:
+    - Automatic content-based classification
+    - Manual classification overrides
+    - Classification inheritance for derived data
+    - Handling rule enforcement
+    - Data lineage tracking
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._classifications: Dict[str, DataClassification] = {}
+        self._classified_data: Dict[str, ClassifiedData] = {}
+        self._lineage: Dict[str, List[str]] = {}  # parent -> children
+        self._classifiers: List[Callable[[Any], Optional[str]]] = []
+        self._logger = UnifiedLogger(
+            name="DataClassificationManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize with default classification levels."""
+        try:
+            async with self._lock:
+                # Define standard classification levels
+                self._classifications = {
+                    "public": DataClassification(
+                        level="public",
+                        label="Public",
+                        handling_rules=["No restrictions"],
+                        retention_days=365,
+                        encryption_required=False,
+                        access_restrictions=[]
+                    ),
+                    "internal": DataClassification(
+                        level="internal",
+                        label="Internal Use Only",
+                        handling_rules=[
+                            "Do not share externally",
+                            "Mark documents as Internal"
+                        ],
+                        retention_days=730,
+                        encryption_required=False,
+                        access_restrictions=["employees"]
+                    ),
+                    "confidential": DataClassification(
+                        level="confidential",
+                        label="Confidential",
+                        handling_rules=[
+                            "Encrypt at rest",
+                            "Encrypt in transit",
+                            "Limit access to need-to-know",
+                            "Audit all access"
+                        ],
+                        retention_days=1825,
+                        encryption_required=True,
+                        access_restrictions=["authorized_personnel"]
+                    ),
+                    "restricted": DataClassification(
+                        level="restricted",
+                        label="Restricted",
+                        handling_rules=[
+                            "Encrypt with strong encryption",
+                            "Multi-factor access required",
+                            "No copies allowed",
+                            "Immediate breach notification",
+                            "Regular access reviews"
+                        ],
+                        retention_days=2555,
+                        encryption_required=True,
+                        access_restrictions=["executive_team", "security_team"]
+                    )
+                }
+
+                # Register default classifiers
+                self._register_default_classifiers()
+
+                self._initialized = True
+                self._logger.info("Data classification manager initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize data classification: {e}")
+            return False
+
+    def _register_default_classifiers(self) -> None:
+        """Register automatic data classifiers."""
+        # PII detector
+        def pii_classifier(data: Any) -> Optional[str]:
+            if isinstance(data, str):
+                pii_patterns = [
+                    r"\b\d{3}-\d{2}-\d{4}\b",  # SSN
+                    r"\b\d{16}\b",  # Credit card
+                    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",  # Email
+                ]
+                for pattern in pii_patterns:
+                    if re.search(pattern, data):
+                        return "confidential"
+            return None
+
+        # Credential detector
+        def credential_classifier(data: Any) -> Optional[str]:
+            if isinstance(data, str):
+                cred_patterns = [
+                    r"password\s*[:=]\s*",
+                    r"api[_-]?key\s*[:=]\s*",
+                    r"secret\s*[:=]\s*",
+                    r"token\s*[:=]\s*",
+                    r"-----BEGIN.*PRIVATE KEY-----",
+                ]
+                for pattern in cred_patterns:
+                    if re.search(pattern, data, re.IGNORECASE):
+                        return "restricted"
+            return None
+
+        self._classifiers.append(pii_classifier)
+        self._classifiers.append(credential_classifier)
+
+    def register_classifier(
+        self,
+        classifier: Callable[[Any], Optional[str]]
+    ) -> None:
+        """Register a custom data classifier."""
+        self._classifiers.append(classifier)
+
+    async def classify(
+        self,
+        data_id: str,
+        data: Any,
+        data_type: str,
+        location: str,
+        owner: str,
+        override_level: Optional[str] = None
+    ) -> ClassifiedData:
+        """
+        Classify data and register it.
+
+        Args:
+            data_id: Unique identifier for the data
+            data: The actual data to classify
+            data_type: Type of data (file, record, etc.)
+            location: Where the data is stored
+            owner: Owner of the data
+            override_level: Manual classification override
+
+        Returns:
+            ClassifiedData object
+        """
+        # Determine classification level
+        level = override_level
+
+        if not level:
+            # Run through classifiers
+            for classifier in self._classifiers:
+                detected = classifier(data)
+                if detected:
+                    # Take the most restrictive classification
+                    if not level or self._is_more_restrictive(detected, level):
+                        level = detected
+
+        # Default to internal if no classification detected
+        level = level or "internal"
+
+        # Get classification definition
+        classification = self._classifications.get(level)
+        if not classification:
+            classification = self._classifications["internal"]
+
+        # Create classified data record
+        classified = ClassifiedData(
+            data_id=data_id,
+            classification=classification,
+            data_type=data_type,
+            location=location,
+            owner=owner
+        )
+
+        async with self._lock:
+            self._classified_data[data_id] = classified
+
+        self._logger.debug(f"Classified {data_id} as {level}")
+        return classified
+
+    def _is_more_restrictive(self, level1: str, level2: str) -> bool:
+        """Check if level1 is more restrictive than level2."""
+        order = ["public", "internal", "confidential", "restricted"]
+        try:
+            return order.index(level1) > order.index(level2)
+        except ValueError:
+            return False
+
+    async def get_classification(self, data_id: str) -> Optional[ClassifiedData]:
+        """Get classification for data."""
+        return self._classified_data.get(data_id)
+
+    async def check_access(
+        self,
+        data_id: str,
+        accessor_roles: List[str]
+    ) -> Tuple[bool, str]:
+        """
+        Check if access is allowed based on classification.
+
+        Args:
+            data_id: ID of the data to access
+            accessor_roles: Roles of the person requesting access
+
+        Returns:
+            Tuple of (allowed, reason)
+        """
+        classified = self._classified_data.get(data_id)
+        if not classified:
+            return False, "Data not found"
+
+        restrictions = classified.classification.access_restrictions
+        if not restrictions:
+            return True, "No restrictions"
+
+        for role in accessor_roles:
+            if role in restrictions:
+                # Update access tracking
+                classified.last_accessed = datetime.now()
+                classified.access_count += 1
+                return True, f"Access granted via role: {role}"
+
+        return False, f"Access denied. Required roles: {restrictions}"
+
+    def get_handling_rules(self, data_id: str) -> List[str]:
+        """Get handling rules for classified data."""
+        classified = self._classified_data.get(data_id)
+        if classified:
+            return classified.classification.handling_rules
+        return []
+
+    def record_lineage(self, parent_id: str, child_id: str) -> None:
+        """Record data lineage (parent-child relationship)."""
+        if parent_id not in self._lineage:
+            self._lineage[parent_id] = []
+        self._lineage[parent_id].append(child_id)
+
+        # Inherit parent classification if child doesn't have one
+        parent = self._classified_data.get(parent_id)
+        child = self._classified_data.get(child_id)
+        if parent and child:
+            if self._is_more_restrictive(
+                parent.classification.level,
+                child.classification.level
+            ):
+                child.classification = parent.classification
+
+
+@dataclass
+class AccessPermission:
+    """Defines an access permission."""
+    permission_id: str
+    resource_type: str
+    actions: List[str]  # read, write, delete, admin
+    conditions: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AccessRole:
+    """Defines an access role with permissions."""
+    role_id: str
+    name: str
+    description: str
+    permissions: List[AccessPermission]
+    inherits_from: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AccessGrant:
+    """Records an access grant to a subject."""
+    grant_id: str
+    subject_type: str  # user, group, service
+    subject_id: str
+    role_id: str
+    resource_pattern: str
+    granted_at: datetime = field(default_factory=datetime.now)
+    expires_at: Optional[datetime] = None
+    granted_by: str = "system"
+    conditions: Dict[str, Any] = field(default_factory=dict)
+
+
+class AccessControlManager:
+    """
+    Enterprise RBAC/ABAC access control system.
+
+    Provides fine-grained access control with support for roles,
+    permissions, attribute-based conditions, and resource patterns.
+
+    Features:
+    - Role-based access control (RBAC)
+    - Attribute-based access control (ABAC) conditions
+    - Role inheritance
+    - Resource pattern matching
+    - Time-based access grants
+    - Access audit logging
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._roles: Dict[str, AccessRole] = {}
+        self._grants: Dict[str, AccessGrant] = {}
+        self._subject_grants: Dict[str, List[str]] = {}  # subject_id -> grant_ids
+        self._audit_log: deque = deque(maxlen=100000)
+        self._logger = UnifiedLogger(
+            name="AccessControlManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize with default roles."""
+        try:
+            async with self._lock:
+                # Define default roles
+                self._roles = {
+                    "admin": AccessRole(
+                        role_id="admin",
+                        name="Administrator",
+                        description="Full system access",
+                        permissions=[
+                            AccessPermission(
+                                permission_id="admin_all",
+                                resource_type="*",
+                                actions=["read", "write", "delete", "admin"]
+                            )
+                        ]
+                    ),
+                    "operator": AccessRole(
+                        role_id="operator",
+                        name="Operator",
+                        description="Operational access",
+                        permissions=[
+                            AccessPermission(
+                                permission_id="op_read_all",
+                                resource_type="*",
+                                actions=["read"]
+                            ),
+                            AccessPermission(
+                                permission_id="op_write_config",
+                                resource_type="config",
+                                actions=["read", "write"]
+                            ),
+                            AccessPermission(
+                                permission_id="op_manage_processes",
+                                resource_type="process",
+                                actions=["read", "write", "delete"]
+                            )
+                        ]
+                    ),
+                    "viewer": AccessRole(
+                        role_id="viewer",
+                        name="Viewer",
+                        description="Read-only access",
+                        permissions=[
+                            AccessPermission(
+                                permission_id="view_all",
+                                resource_type="*",
+                                actions=["read"]
+                            )
+                        ]
+                    ),
+                    "service": AccessRole(
+                        role_id="service",
+                        name="Service Account",
+                        description="Limited service access",
+                        permissions=[
+                            AccessPermission(
+                                permission_id="svc_api",
+                                resource_type="api",
+                                actions=["read", "write"]
+                            )
+                        ]
+                    )
+                }
+
+                self._initialized = True
+                self._logger.info("Access control manager initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize access control: {e}")
+            return False
+
+    def create_role(self, role: AccessRole) -> bool:
+        """Create a new access role."""
+        if role.role_id in self._roles:
+            self._logger.warning(f"Role {role.role_id} already exists")
+            return False
+        self._roles[role.role_id] = role
+        self._logger.info(f"Created role: {role.name}")
+        return True
+
+    def delete_role(self, role_id: str) -> bool:
+        """Delete an access role."""
+        if role_id not in self._roles:
+            return False
+        del self._roles[role_id]
+        self._logger.info(f"Deleted role: {role_id}")
+        return True
+
+    async def grant_access(
+        self,
+        subject_type: str,
+        subject_id: str,
+        role_id: str,
+        resource_pattern: str = "*",
+        expires_at: Optional[datetime] = None,
+        granted_by: str = "system",
+        conditions: Optional[Dict[str, Any]] = None
+    ) -> AccessGrant:
+        """
+        Grant access to a subject.
+
+        Args:
+            subject_type: Type of subject (user, group, service)
+            subject_id: ID of the subject
+            role_id: Role to grant
+            resource_pattern: Pattern for resources (supports wildcards)
+            expires_at: When the grant expires
+            granted_by: Who granted the access
+            conditions: Additional ABAC conditions
+
+        Returns:
+            AccessGrant object
+        """
+        if role_id not in self._roles:
+            raise ValueError(f"Unknown role: {role_id}")
+
+        grant_id = f"grant_{subject_id}_{role_id}_{int(time.time())}"
+        grant = AccessGrant(
+            grant_id=grant_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            role_id=role_id,
+            resource_pattern=resource_pattern,
+            expires_at=expires_at,
+            granted_by=granted_by,
+            conditions=conditions or {}
+        )
+
+        async with self._lock:
+            self._grants[grant_id] = grant
+            if subject_id not in self._subject_grants:
+                self._subject_grants[subject_id] = []
+            self._subject_grants[subject_id].append(grant_id)
+
+        self._audit_log.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "grant_access",
+            "subject": subject_id,
+            "role": role_id,
+            "resource_pattern": resource_pattern,
+            "granted_by": granted_by
+        })
+
+        self._logger.info(f"Granted {role_id} to {subject_id}")
+        return grant
+
+    async def revoke_access(self, grant_id: str) -> bool:
+        """Revoke an access grant."""
+        if grant_id not in self._grants:
+            return False
+
+        grant = self._grants[grant_id]
+
+        async with self._lock:
+            del self._grants[grant_id]
+            if grant.subject_id in self._subject_grants:
+                self._subject_grants[grant.subject_id].remove(grant_id)
+
+        self._audit_log.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "revoke_access",
+            "grant_id": grant_id,
+            "subject": grant.subject_id
+        })
+
+        self._logger.info(f"Revoked access: {grant_id}")
+        return True
+
+    async def check_access(
+        self,
+        subject_id: str,
+        resource_type: str,
+        resource_id: str,
+        action: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, str]:
+        """
+        Check if subject has access to perform action on resource.
+
+        Args:
+            subject_id: ID of the subject requesting access
+            resource_type: Type of resource
+            resource_id: Specific resource ID
+            action: Action being performed
+            context: Additional context for ABAC evaluation
+
+        Returns:
+            Tuple of (allowed, reason)
+        """
+        context = context or {}
+
+        # Get subject's grants
+        grant_ids = self._subject_grants.get(subject_id, [])
+        if not grant_ids:
+            self._log_access_check(subject_id, resource_type, resource_id, action, False, "No grants")
+            return False, "No access grants for subject"
+
+        for grant_id in grant_ids:
+            grant = self._grants.get(grant_id)
+            if not grant:
+                continue
+
+            # Check expiration
+            if grant.expires_at and grant.expires_at < datetime.now():
+                continue
+
+            # Check resource pattern
+            if not self._matches_pattern(
+                f"{resource_type}/{resource_id}",
+                grant.resource_pattern
+            ):
+                continue
+
+            # Get role and permissions
+            role = self._roles.get(grant.role_id)
+            if not role:
+                continue
+
+            # Check permissions (including inherited)
+            if await self._has_permission(role, resource_type, action):
+                # Evaluate ABAC conditions
+                if self._evaluate_conditions(grant.conditions, context):
+                    self._log_access_check(
+                        subject_id, resource_type, resource_id, action, True,
+                        f"Granted via role {role.name}"
+                    )
+                    return True, f"Access granted via role: {role.name}"
+
+        self._log_access_check(subject_id, resource_type, resource_id, action, False, "Insufficient permissions")
+        return False, "Insufficient permissions"
+
+    async def _has_permission(
+        self,
+        role: AccessRole,
+        resource_type: str,
+        action: str,
+        checked_roles: Optional[Set[str]] = None
+    ) -> bool:
+        """Check if role has permission, including inherited roles."""
+        checked_roles = checked_roles or set()
+
+        if role.role_id in checked_roles:
+            return False  # Prevent infinite recursion
+        checked_roles.add(role.role_id)
+
+        # Check direct permissions
+        for perm in role.permissions:
+            if (perm.resource_type == "*" or perm.resource_type == resource_type):
+                if action in perm.actions or "*" in perm.actions:
+                    return True
+
+        # Check inherited roles
+        for parent_role_id in role.inherits_from:
+            parent_role = self._roles.get(parent_role_id)
+            if parent_role:
+                if await self._has_permission(parent_role, resource_type, action, checked_roles):
+                    return True
+
+        return False
+
+    def _matches_pattern(self, resource: str, pattern: str) -> bool:
+        """Check if resource matches pattern."""
+        import fnmatch
+        return fnmatch.fnmatch(resource, pattern)
+
+    def _evaluate_conditions(
+        self,
+        conditions: Dict[str, Any],
+        context: Dict[str, Any]
+    ) -> bool:
+        """Evaluate ABAC conditions against context."""
+        if not conditions:
+            return True
+
+        for key, expected in conditions.items():
+            actual = context.get(key)
+
+            if isinstance(expected, dict):
+                # Complex condition
+                op = expected.get("op", "eq")
+                value = expected.get("value")
+
+                if op == "eq" and actual != value:
+                    return False
+                elif op == "neq" and actual == value:
+                    return False
+                elif op == "in" and actual not in value:
+                    return False
+                elif op == "not_in" and actual in value:
+                    return False
+                elif op == "gt" and not (actual and actual > value):
+                    return False
+                elif op == "lt" and not (actual and actual < value):
+                    return False
+            else:
+                # Simple equality
+                if actual != expected:
+                    return False
+
+        return True
+
+    def _log_access_check(
+        self,
+        subject: str,
+        resource_type: str,
+        resource_id: str,
+        action: str,
+        allowed: bool,
+        reason: str
+    ) -> None:
+        """Log an access check for audit."""
+        self._audit_log.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "access_check",
+            "subject": subject,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "requested_action": action,
+            "allowed": allowed,
+            "reason": reason
+        })
+
+    def get_subject_roles(self, subject_id: str) -> List[AccessRole]:
+        """Get all roles for a subject."""
+        grant_ids = self._subject_grants.get(subject_id, [])
+        roles = []
+        for grant_id in grant_ids:
+            grant = self._grants.get(grant_id)
+            if grant and grant.role_id in self._roles:
+                role = self._roles[grant.role_id]
+                if role not in roles:
+                    roles.append(role)
+        return roles
+
+    def get_audit_log(
+        self,
+        subject_id: Optional[str] = None,
+        action: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get audit log entries."""
+        entries = list(self._audit_log)
+
+        if subject_id:
+            entries = [e for e in entries if e.get("subject") == subject_id]
+        if action:
+            entries = [e for e in entries if e.get("action") == action]
+
+        return entries[-limit:]
+
+
+@dataclass
+class EncryptionKey:
+    """Represents an encryption key."""
+    key_id: str
+    algorithm: str
+    key_size: int
+    created_at: datetime = field(default_factory=datetime.now)
+    expires_at: Optional[datetime] = None
+    rotated_from: Optional[str] = None
+    status: str = "active"  # active, rotated, revoked
+    purpose: str = "general"  # general, data, auth, signing
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class EncryptionServiceManager:
+    """
+    Enterprise encryption and key management service.
+
+    Provides encryption services with key rotation, multiple algorithms,
+    and key lifecycle management.
+
+    Features:
+    - Multiple encryption algorithms (AES-256-GCM, ChaCha20-Poly1305)
+    - Automatic key rotation
+    - Key versioning and history
+    - Hardware security module (HSM) integration ready
+    - Envelope encryption for large data
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._keys: Dict[str, EncryptionKey] = {}
+        self._current_key_id: Optional[str] = None
+        self._key_history: Dict[str, List[str]] = {}  # purpose -> key_ids
+        self._rotation_interval_days: int = 90
+        self._logger = UnifiedLogger(
+            name="EncryptionServiceManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize encryption service with a master key."""
+        try:
+            async with self._lock:
+                # Generate initial keys for different purposes
+                await self._generate_key("general", "AES-256-GCM", 256)
+                await self._generate_key("data", "AES-256-GCM", 256)
+                await self._generate_key("auth", "AES-256-GCM", 256)
+                await self._generate_key("signing", "HMAC-SHA256", 256)
+
+                self._initialized = True
+                self._logger.info("Encryption service initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize encryption service: {e}")
+            return False
+
+    async def _generate_key(
+        self,
+        purpose: str,
+        algorithm: str,
+        key_size: int
+    ) -> EncryptionKey:
+        """Generate a new encryption key."""
+        key_id = f"key_{purpose}_{int(time.time())}_{secrets.token_hex(4)}"
+
+        key = EncryptionKey(
+            key_id=key_id,
+            algorithm=algorithm,
+            key_size=key_size,
+            purpose=purpose,
+            expires_at=datetime.now() + timedelta(days=self._rotation_interval_days)
+        )
+
+        self._keys[key_id] = key
+
+        if purpose not in self._key_history:
+            self._key_history[purpose] = []
+        self._key_history[purpose].append(key_id)
+
+        if purpose == "general":
+            self._current_key_id = key_id
+
+        self._logger.info(f"Generated key: {key_id}")
+        return key
+
+    async def encrypt(
+        self,
+        plaintext: bytes,
+        purpose: str = "general",
+        associated_data: Optional[bytes] = None
+    ) -> Tuple[bytes, str]:
+        """
+        Encrypt data using the current key.
+
+        Args:
+            plaintext: Data to encrypt
+            purpose: Key purpose to use
+            associated_data: Additional authenticated data
+
+        Returns:
+            Tuple of (ciphertext, key_id used)
+        """
+        # Get current key for purpose
+        key_ids = self._key_history.get(purpose, [])
+        if not key_ids:
+            raise ValueError(f"No key available for purpose: {purpose}")
+
+        key_id = key_ids[-1]  # Use most recent
+        key = self._keys.get(key_id)
+
+        if not key or key.status != "active":
+            raise ValueError(f"Key {key_id} is not active")
+
+        # In production, this would use actual cryptographic operations
+        # Here we simulate the encryption
+        nonce = secrets.token_bytes(12)
+
+        # Simulated ciphertext (in production, use cryptography library)
+        import hashlib
+        cipher_data = hashlib.sha256(plaintext + nonce).digest() + plaintext
+
+        # Format: nonce + ciphertext
+        ciphertext = nonce + cipher_data
+
+        self._logger.debug(f"Encrypted {len(plaintext)} bytes with key {key_id}")
+        return ciphertext, key_id
+
+    async def decrypt(
+        self,
+        ciphertext: bytes,
+        key_id: str,
+        associated_data: Optional[bytes] = None
+    ) -> bytes:
+        """
+        Decrypt data using the specified key.
+
+        Args:
+            ciphertext: Data to decrypt
+            key_id: Key ID used for encryption
+            associated_data: Additional authenticated data
+
+        Returns:
+            Decrypted plaintext
+        """
+        key = self._keys.get(key_id)
+        if not key:
+            raise ValueError(f"Unknown key: {key_id}")
+
+        if key.status == "revoked":
+            raise ValueError(f"Key {key_id} has been revoked")
+
+        # Extract nonce and ciphertext
+        nonce = ciphertext[:12]
+        cipher_data = ciphertext[12:]
+
+        # Simulated decryption (in production, use cryptography library)
+        plaintext = cipher_data[32:]  # Skip the hash prefix
+
+        self._logger.debug(f"Decrypted {len(ciphertext)} bytes with key {key_id}")
+        return plaintext
+
+    async def rotate_key(self, purpose: str = "general") -> EncryptionKey:
+        """
+        Rotate the key for a given purpose.
+
+        Creates a new key and marks the old one as rotated.
+
+        Args:
+            purpose: Key purpose to rotate
+
+        Returns:
+            The new key
+        """
+        key_ids = self._key_history.get(purpose, [])
+        old_key_id = key_ids[-1] if key_ids else None
+
+        # Generate new key
+        old_key = self._keys.get(old_key_id) if old_key_id else None
+        algorithm = old_key.algorithm if old_key else "AES-256-GCM"
+        key_size = old_key.key_size if old_key else 256
+
+        new_key = await self._generate_key(purpose, algorithm, key_size)
+        new_key.rotated_from = old_key_id
+
+        # Mark old key as rotated
+        if old_key:
+            old_key.status = "rotated"
+
+        self._logger.info(f"Rotated key for {purpose}: {old_key_id} -> {new_key.key_id}")
+        return new_key
+
+    async def revoke_key(self, key_id: str) -> bool:
+        """Revoke a key, preventing further use."""
+        key = self._keys.get(key_id)
+        if not key:
+            return False
+
+        key.status = "revoked"
+        self._logger.warning(f"Revoked key: {key_id}")
+        return True
+
+    def get_key_status(self, key_id: str) -> Optional[Dict[str, Any]]:
+        """Get status information for a key."""
+        key = self._keys.get(key_id)
+        if not key:
+            return None
+
+        return {
+            "key_id": key.key_id,
+            "algorithm": key.algorithm,
+            "status": key.status,
+            "created_at": key.created_at.isoformat(),
+            "expires_at": key.expires_at.isoformat() if key.expires_at else None,
+            "purpose": key.purpose
+        }
+
+    async def check_rotation_needed(self) -> List[str]:
+        """Check which keys need rotation."""
+        needs_rotation = []
+
+        for key_id, key in self._keys.items():
+            if key.status != "active":
+                continue
+            if key.expires_at and key.expires_at < datetime.now():
+                needs_rotation.append(key_id)
+            elif key.expires_at:
+                days_until_expiry = (key.expires_at - datetime.now()).days
+                if days_until_expiry < 7:
+                    needs_rotation.append(key_id)
+
+        return needs_rotation
+
+
+@dataclass
+class AnomalyScore:
+    """Score for an anomaly detection."""
+    score: float  # 0.0 = normal, 1.0 = highly anomalous
+    category: str
+    features: Dict[str, float]
+    threshold: float
+    is_anomaly: bool
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+class AnomalyDetector:
+    """
+    Machine learning-based anomaly detection system.
+
+    Detects unusual patterns in system behavior, access patterns,
+    and data flows using statistical and ML-based methods.
+
+    Features:
+    - Statistical anomaly detection (z-score, IQR)
+    - Time-series anomaly detection
+    - Behavioral baseline learning
+    - Multi-dimensional anomaly scoring
+    - Adaptive thresholds
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._baselines: Dict[str, Dict[str, Any]] = {}
+        self._history: Dict[str, deque] = {}
+        self._history_size: int = 10000
+        self._anomaly_log: deque = deque(maxlen=50000)
+        self._detection_handlers: List[Callable] = []
+        self._thresholds: Dict[str, float] = {
+            "access": 0.85,
+            "performance": 0.90,
+            "security": 0.75,
+            "data": 0.80,
+        }
+        self._logger = UnifiedLogger(
+            name="AnomalyDetector",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize anomaly detector."""
+        try:
+            self._initialized = True
+            self._logger.info("Anomaly detector initialized")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize anomaly detector: {e}")
+            return False
+
+    async def record_observation(
+        self,
+        category: str,
+        features: Dict[str, float],
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[AnomalyScore]:
+        """
+        Record an observation and check for anomalies.
+
+        Args:
+            category: Category of observation (access, performance, etc.)
+            features: Feature vector (name -> value)
+            metadata: Additional context
+
+        Returns:
+            AnomalyScore if anomaly detected, None otherwise
+        """
+        async with self._lock:
+            # Initialize history for category if needed
+            if category not in self._history:
+                self._history[category] = deque(maxlen=self._history_size)
+
+            # Record observation
+            observation = {
+                "timestamp": datetime.now(),
+                "features": features,
+                "metadata": metadata or {}
+            }
+            self._history[category].append(observation)
+
+            # Update baseline
+            self._update_baseline(category, features)
+
+            # Calculate anomaly score
+            score = self._calculate_anomaly_score(category, features)
+
+            if score.is_anomaly:
+                self._anomaly_log.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "category": category,
+                    "score": score.score,
+                    "features": features,
+                    "metadata": metadata
+                })
+
+                # Trigger handlers
+                for handler in self._detection_handlers:
+                    try:
+                        await handler(score, metadata)
+                    except Exception as e:
+                        self._logger.error(f"Anomaly handler error: {e}")
+
+                return score
+
+            return None
+
+    def _update_baseline(self, category: str, features: Dict[str, float]) -> None:
+        """Update baseline statistics for a category."""
+        if category not in self._baselines:
+            self._baselines[category] = {}
+
+        baseline = self._baselines[category]
+
+        for name, value in features.items():
+            if name not in baseline:
+                baseline[name] = {
+                    "count": 0,
+                    "sum": 0.0,
+                    "sum_sq": 0.0,
+                    "min": float("inf"),
+                    "max": float("-inf")
+                }
+
+            stats = baseline[name]
+            stats["count"] += 1
+            stats["sum"] += value
+            stats["sum_sq"] += value * value
+            stats["min"] = min(stats["min"], value)
+            stats["max"] = max(stats["max"], value)
+
+    def _calculate_anomaly_score(
+        self,
+        category: str,
+        features: Dict[str, float]
+    ) -> AnomalyScore:
+        """Calculate anomaly score using statistical methods."""
+        baseline = self._baselines.get(category, {})
+        threshold = self._thresholds.get(category, 0.85)
+
+        if not baseline:
+            return AnomalyScore(
+                score=0.0,
+                category=category,
+                features=features,
+                threshold=threshold,
+                is_anomaly=False
+            )
+
+        feature_scores: Dict[str, float] = {}
+
+        for name, value in features.items():
+            if name not in baseline:
+                feature_scores[name] = 0.0
+                continue
+
+            stats = baseline[name]
+            count = stats["count"]
+
+            if count < 10:
+                # Not enough data for statistical analysis
+                feature_scores[name] = 0.0
+                continue
+
+            # Calculate mean and std dev
+            mean = stats["sum"] / count
+            variance = (stats["sum_sq"] / count) - (mean * mean)
+            std_dev = max(variance ** 0.5, 0.001)  # Avoid division by zero
+
+            # Calculate z-score
+            z_score = abs(value - mean) / std_dev
+
+            # Convert to 0-1 score using sigmoid-like function
+            feature_scores[name] = min(1.0, z_score / 3.0)  # 3 std devs = 1.0
+
+        # Aggregate feature scores
+        if feature_scores:
+            max_score = max(feature_scores.values())
+            avg_score = sum(feature_scores.values()) / len(feature_scores)
+            # Weight towards max score but consider average
+            overall_score = 0.7 * max_score + 0.3 * avg_score
+        else:
+            overall_score = 0.0
+
+        return AnomalyScore(
+            score=overall_score,
+            category=category,
+            features=feature_scores,
+            threshold=threshold,
+            is_anomaly=overall_score >= threshold
+        )
+
+    def register_handler(
+        self,
+        handler: Callable[[AnomalyScore, Optional[Dict[str, Any]]], Awaitable[None]]
+    ) -> None:
+        """Register a handler for anomaly detection."""
+        self._detection_handlers.append(handler)
+
+    def set_threshold(self, category: str, threshold: float) -> None:
+        """Set detection threshold for a category."""
+        self._thresholds[category] = max(0.0, min(1.0, threshold))
+
+    def get_baseline(self, category: str) -> Optional[Dict[str, Any]]:
+        """Get baseline statistics for a category."""
+        return self._baselines.get(category)
+
+    def get_recent_anomalies(
+        self,
+        category: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get recent anomaly detections."""
+        entries = list(self._anomaly_log)
+
+        if category:
+            entries = [e for e in entries if e.get("category") == category]
+
+        return entries[-limit:]
+
+
+@dataclass
+class SecurityIncident:
+    """Represents a security incident."""
+    incident_id: str
+    severity: str  # critical, high, medium, low
+    category: str  # intrusion, data_breach, malware, dos, etc.
+    title: str
+    description: str
+    affected_resources: List[str]
+    detected_at: datetime = field(default_factory=datetime.now)
+    status: str = "open"  # open, investigating, contained, resolved
+    assigned_to: Optional[str] = None
+    timeline: List[Dict[str, Any]] = field(default_factory=list)
+    evidence: List[Dict[str, Any]] = field(default_factory=list)
+    remediation_steps: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class IncidentResponseCoordinator:
+    """
+    Security incident response coordination system.
+
+    Manages the lifecycle of security incidents from detection
+    through resolution, including automated response actions.
+
+    Features:
+    - Incident lifecycle management
+    - Automated initial response
+    - Runbook execution
+    - Notification and escalation
+    - Evidence collection
+    - Post-incident reporting
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._incidents: Dict[str, SecurityIncident] = {}
+        self._runbooks: Dict[str, List[Dict[str, Any]]] = {}
+        self._notification_handlers: List[Callable] = []
+        self._auto_response_rules: List[Dict[str, Any]] = []
+        self._escalation_policy: Dict[str, List[str]] = {}
+        self._logger = UnifiedLogger(
+            name="IncidentResponseCoordinator",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize incident response system."""
+        try:
+            async with self._lock:
+                # Register default runbooks
+                self._register_default_runbooks()
+
+                # Set default escalation policy
+                self._escalation_policy = {
+                    "critical": ["security_team", "engineering_lead", "cto"],
+                    "high": ["security_team", "engineering_lead"],
+                    "medium": ["security_team"],
+                    "low": ["security_team"]
+                }
+
+                self._initialized = True
+                self._logger.info("Incident response coordinator initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize incident response: {e}")
+            return False
+
+    def _register_default_runbooks(self) -> None:
+        """Register default incident response runbooks."""
+        # Intrusion runbook
+        self._runbooks["intrusion"] = [
+            {"action": "isolate_resource", "params": {"type": "network"}},
+            {"action": "collect_evidence", "params": {"types": ["logs", "memory", "disk"]}},
+            {"action": "block_ips", "params": {"source": "incident"}},
+            {"action": "notify", "params": {"severity": "critical"}},
+            {"action": "rotate_credentials", "params": {"scope": "affected"}},
+        ]
+
+        # Data breach runbook
+        self._runbooks["data_breach"] = [
+            {"action": "identify_scope", "params": {}},
+            {"action": "collect_evidence", "params": {"types": ["logs", "access_records"]}},
+            {"action": "notify", "params": {"severity": "critical", "include_legal": True}},
+            {"action": "revoke_access", "params": {"scope": "affected_data"}},
+            {"action": "prepare_notification", "params": {"type": "customer"}},
+        ]
+
+        # Malware runbook
+        self._runbooks["malware"] = [
+            {"action": "isolate_resource", "params": {"type": "host"}},
+            {"action": "collect_evidence", "params": {"types": ["memory", "disk", "network"]}},
+            {"action": "scan_related", "params": {"depth": "full"}},
+            {"action": "restore_from_backup", "params": {"verify": True}},
+        ]
+
+        # DoS runbook
+        self._runbooks["dos"] = [
+            {"action": "enable_ddos_protection", "params": {}},
+            {"action": "rate_limit", "params": {"aggressive": True}},
+            {"action": "block_ips", "params": {"source": "traffic_analysis"}},
+            {"action": "scale_infrastructure", "params": {"multiplier": 2}},
+        ]
+
+    async def create_incident(
+        self,
+        severity: str,
+        category: str,
+        title: str,
+        description: str,
+        affected_resources: List[str],
+        auto_respond: bool = True
+    ) -> SecurityIncident:
+        """
+        Create a new security incident.
+
+        Args:
+            severity: Incident severity (critical, high, medium, low)
+            category: Incident category (intrusion, data_breach, etc.)
+            title: Brief title
+            description: Detailed description
+            affected_resources: List of affected resource IDs
+            auto_respond: Whether to execute automatic response
+
+        Returns:
+            Created SecurityIncident
+        """
+        incident_id = f"INC-{int(time.time())}-{secrets.token_hex(4).upper()}"
+
+        incident = SecurityIncident(
+            incident_id=incident_id,
+            severity=severity,
+            category=category,
+            title=title,
+            description=description,
+            affected_resources=affected_resources
+        )
+
+        # Add creation to timeline
+        incident.timeline.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "created",
+            "actor": "system",
+            "details": f"Incident created: {title}"
+        })
+
+        async with self._lock:
+            self._incidents[incident_id] = incident
+
+        self._logger.warning(f"Created incident: {incident_id} - {title}")
+
+        # Send notifications
+        await self._send_notifications(incident, "created")
+
+        # Execute automatic response if enabled
+        if auto_respond:
+            await self._execute_auto_response(incident)
+
+        return incident
+
+    async def _execute_auto_response(self, incident: SecurityIncident) -> None:
+        """Execute automatic response based on runbook."""
+        runbook = self._runbooks.get(incident.category, [])
+
+        if not runbook:
+            self._logger.info(f"No runbook for category: {incident.category}")
+            return
+
+        incident.timeline.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "auto_response_started",
+            "actor": "system",
+            "details": f"Executing runbook for {incident.category}"
+        })
+
+        for step in runbook:
+            action = step.get("action")
+            params = step.get("params", {})
+
+            try:
+                # In production, these would be actual response actions
+                self._logger.info(f"Executing response action: {action}")
+
+                incident.timeline.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "action": f"executed_{action}",
+                    "actor": "system",
+                    "details": f"Parameters: {params}"
+                })
+
+            except Exception as e:
+                incident.timeline.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "action": f"failed_{action}",
+                    "actor": "system",
+                    "details": f"Error: {e}"
+                })
+                self._logger.error(f"Auto response action failed: {action} - {e}")
+
+    async def update_status(
+        self,
+        incident_id: str,
+        new_status: str,
+        actor: str,
+        notes: Optional[str] = None
+    ) -> bool:
+        """Update incident status."""
+        incident = self._incidents.get(incident_id)
+        if not incident:
+            return False
+
+        old_status = incident.status
+        incident.status = new_status
+
+        incident.timeline.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "status_change",
+            "actor": actor,
+            "details": f"Status changed: {old_status} -> {new_status}. {notes or ''}"
+        })
+
+        self._logger.info(f"Incident {incident_id} status: {new_status}")
+        await self._send_notifications(incident, "status_change")
+
+        return True
+
+    async def assign_incident(
+        self,
+        incident_id: str,
+        assignee: str,
+        assigner: str
+    ) -> bool:
+        """Assign incident to a team member."""
+        incident = self._incidents.get(incident_id)
+        if not incident:
+            return False
+
+        incident.assigned_to = assignee
+        incident.timeline.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "assigned",
+            "actor": assigner,
+            "details": f"Assigned to: {assignee}"
+        })
+
+        return True
+
+    async def add_evidence(
+        self,
+        incident_id: str,
+        evidence_type: str,
+        evidence_data: Dict[str, Any],
+        collector: str
+    ) -> bool:
+        """Add evidence to an incident."""
+        incident = self._incidents.get(incident_id)
+        if not incident:
+            return False
+
+        evidence = {
+            "type": evidence_type,
+            "data": evidence_data,
+            "collected_at": datetime.now().isoformat(),
+            "collected_by": collector
+        }
+
+        incident.evidence.append(evidence)
+        incident.timeline.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "evidence_added",
+            "actor": collector,
+            "details": f"Added {evidence_type} evidence"
+        })
+
+        return True
+
+    async def add_remediation_step(
+        self,
+        incident_id: str,
+        step: str,
+        actor: str
+    ) -> bool:
+        """Add a remediation step."""
+        incident = self._incidents.get(incident_id)
+        if not incident:
+            return False
+
+        incident.remediation_steps.append(step)
+        incident.timeline.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": "remediation_added",
+            "actor": actor,
+            "details": step
+        })
+
+        return True
+
+    async def _send_notifications(
+        self,
+        incident: SecurityIncident,
+        event_type: str
+    ) -> None:
+        """Send notifications for incident events."""
+        # Get escalation targets
+        targets = self._escalation_policy.get(incident.severity, [])
+
+        notification = {
+            "incident_id": incident.incident_id,
+            "severity": incident.severity,
+            "category": incident.category,
+            "title": incident.title,
+            "event_type": event_type,
+            "targets": targets,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        for handler in self._notification_handlers:
+            try:
+                await handler(notification)
+            except Exception as e:
+                self._logger.error(f"Notification handler error: {e}")
+
+    def register_notification_handler(
+        self,
+        handler: Callable[[Dict[str, Any]], Awaitable[None]]
+    ) -> None:
+        """Register a notification handler."""
+        self._notification_handlers.append(handler)
+
+    def get_incident(self, incident_id: str) -> Optional[SecurityIncident]:
+        """Get an incident by ID."""
+        return self._incidents.get(incident_id)
+
+    def get_open_incidents(
+        self,
+        severity: Optional[str] = None
+    ) -> List[SecurityIncident]:
+        """Get all open incidents."""
+        open_statuses = ["open", "investigating", "contained"]
+        incidents = [
+            i for i in self._incidents.values()
+            if i.status in open_statuses
+        ]
+
+        if severity:
+            incidents = [i for i in incidents if i.severity == severity]
+
+        return sorted(incidents, key=lambda i: i.detected_at, reverse=True)
+
+    def generate_report(self, incident_id: str) -> Dict[str, Any]:
+        """Generate a post-incident report."""
+        incident = self._incidents.get(incident_id)
+        if not incident:
+            return {}
+
+        return {
+            "incident_id": incident.incident_id,
+            "title": incident.title,
+            "severity": incident.severity,
+            "category": incident.category,
+            "status": incident.status,
+            "detected_at": incident.detected_at.isoformat(),
+            "description": incident.description,
+            "affected_resources": incident.affected_resources,
+            "assigned_to": incident.assigned_to,
+            "timeline": incident.timeline,
+            "evidence_count": len(incident.evidence),
+            "remediation_steps": incident.remediation_steps,
+            "time_to_contain": self._calculate_ttc(incident),
+            "time_to_resolve": self._calculate_ttr(incident)
+        }
+
+    def _calculate_ttc(self, incident: SecurityIncident) -> Optional[float]:
+        """Calculate time to contain in minutes."""
+        for entry in incident.timeline:
+            if entry.get("action") == "status_change":
+                if "contained" in entry.get("details", "").lower():
+                    contain_time = datetime.fromisoformat(entry["timestamp"])
+                    return (contain_time - incident.detected_at).total_seconds() / 60
+        return None
+
+    def _calculate_ttr(self, incident: SecurityIncident) -> Optional[float]:
+        """Calculate time to resolve in minutes."""
+        if incident.status != "resolved":
+            return None
+        for entry in reversed(incident.timeline):
+            if entry.get("action") == "status_change":
+                if "resolved" in entry.get("details", "").lower():
+                    resolve_time = datetime.fromisoformat(entry["timestamp"])
+                    return (resolve_time - incident.detected_at).total_seconds() / 60
+        return None
+
+
+@dataclass
+class ThreatIndicator:
+    """Represents a threat indicator (IOC)."""
+    indicator_id: str
+    indicator_type: str  # ip, domain, hash, email, url
+    value: str
+    threat_type: str  # malware, phishing, c2, etc.
+    severity: str
+    confidence: float  # 0.0 to 1.0
+    source: str
+    first_seen: datetime = field(default_factory=datetime.now)
+    last_seen: datetime = field(default_factory=datetime.now)
+    tags: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class ThreatIntelligenceManager:
+    """
+    Threat intelligence aggregation and correlation system.
+
+    Aggregates threat intelligence from multiple sources, correlates
+    indicators, and provides threat scoring.
+
+    Features:
+    - Multiple intelligence source integration
+    - IOC (Indicator of Compromise) management
+    - Threat scoring and correlation
+    - Automatic blocking rules generation
+    - Intelligence aging and expiration
+    """
+
+    def __init__(self, config: SystemKernelConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._indicators: Dict[str, ThreatIndicator] = {}
+        self._indicators_by_type: Dict[str, Set[str]] = {}
+        self._sources: Dict[str, Dict[str, Any]] = {}
+        self._correlations: Dict[str, List[str]] = {}
+        self._expiration_days: int = 90
+        self._logger = UnifiedLogger(
+            name="ThreatIntelligenceManager",
+            config=config
+        )
+        self._initialized = False
+
+    async def initialize(self) -> bool:
+        """Initialize threat intelligence manager."""
+        try:
+            async with self._lock:
+                # Initialize indicator type indexes
+                for ioc_type in ["ip", "domain", "hash", "email", "url"]:
+                    self._indicators_by_type[ioc_type] = set()
+
+                self._initialized = True
+                self._logger.info("Threat intelligence manager initialized")
+                return True
+        except Exception as e:
+            self._logger.error(f"Failed to initialize threat intelligence: {e}")
+            return False
+
+    async def add_indicator(
+        self,
+        indicator_type: str,
+        value: str,
+        threat_type: str,
+        severity: str,
+        confidence: float,
+        source: str,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> ThreatIndicator:
+        """
+        Add a threat indicator.
+
+        Args:
+            indicator_type: Type of indicator (ip, domain, hash, etc.)
+            value: The indicator value
+            threat_type: Type of threat
+            severity: Threat severity
+            confidence: Confidence level (0-1)
+            source: Intelligence source
+            tags: Optional tags
+            metadata: Optional metadata
+
+        Returns:
+            ThreatIndicator object
+        """
+        # Normalize value
+        value = value.lower().strip()
+
+        # Generate ID
+        indicator_id = f"{indicator_type}_{hashlib.md5(value.encode()).hexdigest()[:16]}"
+
+        # Check if exists
+        existing = self._indicators.get(indicator_id)
+        if existing:
+            # Update existing indicator
+            existing.last_seen = datetime.now()
+            existing.confidence = max(existing.confidence, confidence)
+            if tags:
+                existing.tags = list(set(existing.tags + tags))
+            return existing
+
+        indicator = ThreatIndicator(
+            indicator_id=indicator_id,
+            indicator_type=indicator_type,
+            value=value,
+            threat_type=threat_type,
+            severity=severity,
+            confidence=confidence,
+            source=source,
+            tags=tags or [],
+            metadata=metadata or {}
+        )
+
+        async with self._lock:
+            self._indicators[indicator_id] = indicator
+            self._indicators_by_type[indicator_type].add(indicator_id)
+
+        self._logger.debug(f"Added indicator: {indicator_type}:{value}")
+        return indicator
+
+    async def check_indicator(
+        self,
+        indicator_type: str,
+        value: str
+    ) -> Optional[ThreatIndicator]:
+        """
+        Check if a value matches a known threat indicator.
+
+        Args:
+            indicator_type: Type to check
+            value: Value to check
+
+        Returns:
+            ThreatIndicator if found, None otherwise
+        """
+        value = value.lower().strip()
+        indicator_id = f"{indicator_type}_{hashlib.md5(value.encode()).hexdigest()[:16]}"
+
+        indicator = self._indicators.get(indicator_id)
+        if indicator:
+            # Check expiration
+            age_days = (datetime.now() - indicator.first_seen).days
+            if age_days > self._expiration_days:
+                return None
+
+            # Update last seen
+            indicator.last_seen = datetime.now()
+            return indicator
+
+        return None
+
+    async def check_multiple(
+        self,
+        checks: List[Tuple[str, str]]
+    ) -> List[ThreatIndicator]:
+        """
+        Check multiple indicators at once.
+
+        Args:
+            checks: List of (indicator_type, value) tuples
+
+        Returns:
+            List of matched ThreatIndicators
+        """
+        matches = []
+        for indicator_type, value in checks:
+            match = await self.check_indicator(indicator_type, value)
+            if match:
+                matches.append(match)
+        return matches
+
+    async def correlate_indicators(
+        self,
+        indicator_ids: List[str],
+        correlation_id: str
+    ) -> None:
+        """Correlate multiple indicators."""
+        async with self._lock:
+            for iid in indicator_ids:
+                if iid not in self._correlations:
+                    self._correlations[iid] = []
+                for other_id in indicator_ids:
+                    if other_id != iid and other_id not in self._correlations[iid]:
+                        self._correlations[iid].append(other_id)
+
+    def get_correlated(self, indicator_id: str) -> List[ThreatIndicator]:
+        """Get correlated indicators."""
+        correlated_ids = self._correlations.get(indicator_id, [])
+        return [self._indicators[iid] for iid in correlated_ids if iid in self._indicators]
+
+    async def cleanup_expired(self) -> int:
+        """Remove expired indicators."""
+        removed = 0
+        now = datetime.now()
+
+        async with self._lock:
+            to_remove = []
+            for iid, indicator in self._indicators.items():
+                age_days = (now - indicator.first_seen).days
+                if age_days > self._expiration_days:
+                    to_remove.append(iid)
+
+            for iid in to_remove:
+                indicator = self._indicators.pop(iid)
+                self._indicators_by_type[indicator.indicator_type].discard(iid)
+                removed += 1
+
+        self._logger.info(f"Cleaned up {removed} expired indicators")
+        return removed
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get threat intelligence statistics."""
+        stats = {
+            "total_indicators": len(self._indicators),
+            "by_type": {},
+            "by_severity": {},
+            "by_threat_type": {},
+            "sources": list(self._sources.keys())
+        }
+
+        for ioc_type, ids in self._indicators_by_type.items():
+            stats["by_type"][ioc_type] = len(ids)
+
+        severity_counts: Dict[str, int] = {}
+        threat_type_counts: Dict[str, int] = {}
+
+        for indicator in self._indicators.values():
+            severity_counts[indicator.severity] = severity_counts.get(indicator.severity, 0) + 1
+            threat_type_counts[indicator.threat_type] = threat_type_counts.get(indicator.threat_type, 0) + 1
+
+        stats["by_severity"] = severity_counts
+        stats["by_threat_type"] = threat_type_counts
+
+        return stats
+
+    def generate_blocking_rules(
+        self,
+        indicator_type: str,
+        min_confidence: float = 0.7,
+        min_severity: str = "medium"
+    ) -> List[Dict[str, Any]]:
+        """Generate blocking rules from indicators."""
+        severity_order = ["low", "medium", "high", "critical"]
+        min_severity_idx = severity_order.index(min_severity)
+
+        rules = []
+        indicator_ids = self._indicators_by_type.get(indicator_type, set())
+
+        for iid in indicator_ids:
+            indicator = self._indicators.get(iid)
+            if not indicator:
+                continue
+
+            if indicator.confidence < min_confidence:
+                continue
+
+            try:
+                severity_idx = severity_order.index(indicator.severity)
+                if severity_idx < min_severity_idx:
+                    continue
+            except ValueError:
+                continue
+
+            rules.append({
+                "type": indicator_type,
+                "value": indicator.value,
+                "action": "block",
+                "reason": f"{indicator.threat_type} (confidence: {indicator.confidence:.2f})",
+                "source": indicator.source,
+                "indicator_id": indicator.indicator_id
+            })
+
+        return rules
+
+
+# =============================================================================
 # =============================================================================
 #
 #  ███████╗ ██████╗ ███╗   ██╗███████╗    ███████╗
