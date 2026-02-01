@@ -1307,7 +1307,12 @@ class LoadingServer:
 
     def _get_loading_page(self) -> str:
         """
-        Generate the loading page HTML with dynamic port configuration.
+        Serve the loading page HTML.
+
+        v127.0: Prioritizes themed loading.html from frontend/public/
+        which has the Arc Reactor + Matrix rain animation matching the
+        main JARVIS UI theme. Falls back to inline basic HTML if file
+        not found.
 
         v126.0: Fixed hardcoded ports - now uses actual configured ports from
         environment variables (LOADING_SERVER_PORT, JARVIS_FRONTEND_PORT) for:
@@ -1318,6 +1323,20 @@ class LoadingServer:
         This ensures the loading page works correctly regardless of which
         ports are configured.
         """
+        # v127.0: Try to serve themed loading.html first (matches main UI theme)
+        themed_loading_path = self.config.jarvis_repo / "frontend" / "public" / "loading.html"
+
+        if themed_loading_path.exists():
+            try:
+                html = themed_loading_path.read_text()
+                logger.debug(f"[LoadingServer] Serving themed loading page from {themed_loading_path}")
+                return html
+            except Exception as e:
+                logger.warning(f"[LoadingServer] Failed to read themed loading.html: {e}, using fallback")
+
+        # Fallback to inline basic loading page
+        logger.debug("[LoadingServer] Using fallback inline loading page")
+
         # Get actual ports from configuration
         loading_port = self.config.port
         frontend_port = self.config.frontend_port
