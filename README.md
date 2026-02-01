@@ -17,6 +17,224 @@
 - **Understanding how repos work together?** → Continue reading below
 - **🆕 Startup architecture & v107.0 improvements?** → See [STARTUP_ARCHITECTURE_V2.md](./docs/STARTUP_ARCHITECTURE_V2.md)
 - **🆕 One-command supervisor, Cloud SQL, asyncpg TLS, Trinity, OOM prevention, or Cloud ECAPA?** → See [§ v131.0 & v131.1](#v1310--v1311-one-command-supervisor-shutdown--start-january-2026), [§ v116.0 Cloud SQL](#v1160-cloud-sql-credential--retry-fixes-january-2026), [§ TLS-Safe Connections](#asyncpg-tls-invalidstateerror-fix-tls-safe-connection-factories-january-2026), [§ Cloud SQL Retry Storm](#cloud-sql-connection-retry-storm-fixes-january-2026), [§ GCP OOM Prevention](#gcp-oom-prevention-bridge-january-2026), [§ v117.5 Trinity](#v1175-trinity-startup-orchestration-persistent-state--distributed-lock-january-2026), [§ v132.0/v132.1](#v1320-parallel-trinity-initialization-january-2026), [§ v116.0 Cloud ECAPA](#v1160-cloud-ecapa-endpoint-priority-fix-january-2026) below
+- **🆕 Unified Supervisor Kernel (50k lines)?** → See [§ Unified Supervisor Kernel](#-unified-supervisor-kernel-50746-lines---monolithic-system-brain-january-2026) below
+
+---
+
+## 🧠 Unified Supervisor Kernel (50,746 Lines) - Monolithic System Brain (January 2026)
+
+**Major Milestone:** JARVIS now operates with a **single, monolithic kernel** (`unified_supervisor.py`) that consolidates all supervisor logic into one authoritative file. This eliminates "import hell" during crashes and ensures the Supervisor has complete context without relying on fragmented external modules.
+
+### The Achievement
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    UNIFIED SUPERVISOR KERNEL                        │
+│                         50,746 Lines                                │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ BEFORE: Two Separate Files (50,330 lines total)             │   │
+│  │   • run_supervisor.py      (27,491 lines) - Supervisor      │   │
+│  │   • start_system.py        (22,839 lines) - System Start    │   │
+│  │   • Import dependencies across files                         │   │
+│  │   • Fragmented error handling                                │   │
+│  │   • Difficult crash recovery                                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ AFTER: Single Unified Kernel (50,746 lines)                 │   │
+│  │   • unified_supervisor.py  (50,746 lines) - Everything      │   │
+│  │   • Zero external dependencies during startup               │   │
+│  │   • Complete system context in one file                     │   │
+│  │   • Instant crash recovery with full state                  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Zone Architecture (7 Zones)
+
+The unified kernel is organized into **7 distinct zones**, each handling specific responsibilities:
+
+```
+unified_supervisor.py (50,746 lines)
+│
+├── ZONE 0: EARLY PROTECTION (Lines 1-500)
+│   ├── Signal protection for CLI commands
+│   ├── Venv auto-activation (before ANY imports)
+│   ├── Fast supervisor check (skip heavy imports if running)
+│   └── Python 3.9 compatibility patches
+│
+├── ZONE 1: FOUNDATION (Lines 500-2000)
+│   ├── All imports (consolidated, no duplicates)
+│   ├── SystemKernelConfig (unified configuration)
+│   ├── Constants, enums, type definitions
+│   └── Environment loading (.env, .env.gcp)
+│
+├── ZONE 2: CORE UTILITIES (Lines 2000-5000)
+│   ├── UnifiedLogger (OrganizedLogger + PerformanceLogger)
+│   ├── RobustVenvDetector (enhanced virtual environment detection)
+│   ├── StartupLock (singleton enforcement with fencing tokens)
+│   ├── RetryWithBackoff, CircuitBreaker (resilience patterns)
+│   └── TerminalUI (visual feedback and progress tracking)
+│
+├── ZONE 3: RESOURCE MANAGERS (Lines 5000-15000)
+│   ├── DockerDaemonManager (Docker lifecycle, auto-start)
+│   ├── GCPInstanceManager (Spot VMs, Cloud Run, Cloud SQL)
+│   ├── ScaleToZeroCostOptimizer (idle detection, budget enforcement)
+│   ├── SemanticVoiceCacheManager (ECAPA embedding cache)
+│   ├── DynamicPortManager (zero-hardcoding port allocation)
+│   └── TieredStorageManager (hot/warm/cold data tiering)
+│
+├── ZONE 4: INTELLIGENCE LAYER (Lines 15000-43000)
+│   ├── HybridWorkloadRouter (local vs cloud vs Spot VM routing)
+│   ├── HybridIntelligenceCoordinator (ML coordination)
+│   ├── GoalInferenceEngine (intent classification)
+│   ├── SAIHybridIntegration (scenario detection)
+│   ├── AdaptiveThresholdManager (dynamic threshold learning)
+│   │
+│   ├── ZONE 4.13-4.20: Enterprise Infrastructure
+│   │   ├── Data Pipeline & Messaging (ETL, pub/sub, CDC)
+│   │   ├── Security & Compliance (RBAC, ABAC, audit, encryption)
+│   │   ├── Integration & API Management (service mesh, GraphQL)
+│   │   ├── Resource Management & Multi-Tenancy (quotas, rate limiting)
+│   │   ├── Monitoring & Testing (A/B testing, feature flags, alerting)
+│   │   ├── Plugin System & Localization (i18n, undo/redo)
+│   │   ├── MLOps & Workflow Orchestration (model registry, BPMN)
+│   │   ├── Document Management & Notifications (versioning, multi-channel)
+│   │   ├── Session & Data Lake Management (distributed sessions)
+│   │   ├── Streaming Analytics & GDPR Compliance (windowed aggregations)
+│   │   └── Health Aggregation & Graceful Degradation
+│   │
+├── ZONE 5: PROCESS ORCHESTRATION (Lines 43000-48000)
+│   ├── UnifiedSignalHandler (SIGINT/SIGTERM with escalation)
+│   ├── ComprehensiveZombieCleanup (stale process detection/termination)
+│   ├── ProcessStateManager (managed process lifecycle tracking)
+│   ├── HotReloadWatcher (file change detection for dev mode)
+│   ├── ProgressiveReadinessManager (STARTING → READY → FULL)
+│   └── TrinityIntegrator (cross-repo Prime/Reactor integration)
+│
+├── ZONE 6: THE KERNEL (Lines 48000-50000)
+│   ├── JarvisSystemKernel (the brain)
+│   │   ├── __init__(): Initialize all managers
+│   │   ├── startup(): Full boot sequence
+│   │   ├── run(): Main event loop
+│   │   └── cleanup(): Master shutdown
+│   └── IPC Server (Unix socket for inter-process communication)
+│
+└── ZONE 7: ENTRY POINT (Lines 50000-50746)
+    ├── Unified CLI argument parser
+    ├── main() function
+    └── if __name__ == "__main__"
+```
+
+### Enterprise Features Included
+
+The unified kernel includes **100+ enterprise-grade managers and utilities**:
+
+| Category | Managers | Key Features |
+|----------|----------|--------------|
+| **Resource Management** | DockerDaemonManager, GCPInstanceManager, DynamicPortManager | Auto-start, Spot VMs, zero-hardcoding ports |
+| **Intelligence** | HybridWorkloadRouter, GoalInferenceEngine, AdaptiveThresholdManager | ML routing, intent detection, dynamic thresholds |
+| **Data Pipeline** | ETLOrchestrator, StreamProcessor, ChangeDataCaptureManager | ETL, real-time streaming, CDC |
+| **Security** | SecurityPolicyEngine, AccessControlManager, EncryptionServiceManager | RBAC/ABAC, encryption, compliance |
+| **Observability** | AlertingManager, PerformanceProfiler, SystemTelemetryCollector | Metrics, traces, health checks |
+| **Multi-Tenancy** | TenantManager, ResourceQuotaManager, RateLimiterManager | Tenant isolation, quotas, rate limiting |
+| **Testing** | ABTestingFramework, FeatureFlagManager, RulesEngine | Experiments, feature flags, business rules |
+| **Plugin System** | PluginManager, LocalizationManager, CommandPatternManager | Extensibility, i18n, undo/redo |
+| **MLOps** | MLOpsModelRegistry, WorkflowOrchestrator | Model versioning, BPMN workflows |
+| **Documents** | DocumentManagementSystem, DigitalSignatureService | Version control, signing |
+| **Sessions** | SessionManager, NotificationHub | Distributed sessions, multi-channel notifications |
+| **Data Lake** | DataLakeManager, StreamingAnalyticsEngine | Partitioned storage, windowed aggregations |
+| **Privacy** | ConsentManagementSystem | GDPR compliance, data subject rights |
+| **Health** | HealthAggregator, GracefulDegradationManager | Parallel health checks, auto-degradation |
+
+### Quick Start
+
+```bash
+# Start JARVIS with the unified kernel
+python3 unified_supervisor.py
+
+# With options
+python3 unified_supervisor.py --mode supervisor --in-process --hot-reload
+
+# Check status
+python3 unified_supervisor.py --status
+
+# Graceful shutdown
+python3 unified_supervisor.py --shutdown
+
+# Run self-tests
+python3 unified_supervisor.py --test all
+```
+
+### CLI Flags (Unified Superset)
+
+All flags from both deprecated files are merged:
+
+```
+Control:     --status, --shutdown, --restart, --cleanup
+Mode:        --mode, --in-process, --subprocess
+Network:     --port, --host, --websocket-port
+Docker:      --skip-docker, --no-docker-auto-start
+GCP:         --skip-gcp, --prefer-cloud-run, --enable-spot-vm
+Cost:        --no-scale-to-zero, --idle-timeout, --daily-budget
+ML:          --goal-preset, --enable-automation, --skip-intelligence
+Voice:       --skip-voice, --no-narrator, --skip-ecapa
+Memory:      --memory-mode, --memory-target
+Trinity:     --skip-trinity, --prime-url
+Dev:         --no-hot-reload, --reload-interval, --debug, --verbose
+Advanced:    --force, --takeover, --dry-run, --config-file
+```
+
+### Design Principles
+
+| Principle | Implementation |
+|-----------|----------------|
+| **Zero Hardcoding** | All values from env vars or dynamic detection |
+| **Async-First** | Parallel initialization where possible |
+| **Graceful Degradation** | Components can fail independently |
+| **Self-Healing** | Auto-restart crashed components |
+| **Observable** | Metrics, logs, health endpoints throughout |
+| **Lazy Loading** | ML models only loaded when needed |
+| **Adaptive** | Thresholds learn from outcomes |
+
+### Migration from Deprecated Files
+
+The following files are now deprecated and will be removed after validation:
+
+| Deprecated File | Lines | Status |
+|-----------------|-------|--------|
+| `_deprecated_run_supervisor.py` | 27,491 | Renamed, pending deletion |
+| `_deprecated_start_system.py` | 22,839 | Renamed, pending deletion |
+
+**Migration Path:**
+1. The unified kernel is now the default entry point
+2. All functionality from both files is preserved
+3. CLI flags are backward-compatible
+4. Environment variables work unchanged
+
+### Architecture Benefits
+
+1. **No Import Hell** - Single file means no circular imports or missing modules during crashes
+2. **Complete Context** - The kernel has full system awareness at all times
+3. **Faster Recovery** - Crash recovery doesn't need to re-import dependencies
+4. **Easier Debugging** - All code in one searchable file
+5. **Atomic Updates** - Update one file, not coordinate across multiple
+6. **Testability** - Self-contained unit tests for each zone
+
+### Verification
+
+```bash
+# Verify the unified kernel compiles
+python3 -m py_compile unified_supervisor.py
+
+# Run self-tests
+python3 unified_supervisor.py --test all
+
+# Check line count
+wc -l unified_supervisor.py
+# Output: 50746 unified_supervisor.py
+```
 
 ---
 
