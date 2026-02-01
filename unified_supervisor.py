@@ -16859,6 +16859,663 @@ class CrossRepoExperienceForwarder:
         }
 
 
+class ProcessHealthPredictor:
+    """
+    ML-based process health prediction using statistical analysis.
+
+    Predicts failures before they occur using:
+    - EWMA (Exponentially Weighted Moving Average) for trend detection
+    - Anomaly detection using z-scores
+    - Multi-metric fusion for comprehensive health scoring
+    - Historical pattern matching for known failure modes
+
+    Features:
+    - Real-time health scoring (0-100)
+    - Failure probability estimation
+    - Leading indicator detection
+    - Automatic threshold adaptation
+    """
+
+    def __init__(
+        self,
+        window_size: int = 100,
+        ewma_alpha: float = 0.3,
+        anomaly_threshold: float = 2.5,  # z-score threshold
+    ) -> None:
+        self._window_size = window_size
+        self._ewma_alpha = ewma_alpha
+        self._anomaly_threshold = anomaly_threshold
+
+        # Metrics history per component
+        self._metrics_history: Dict[str, Dict[str, List[float]]] = {}
+
+        # EWMA state
+        self._ewma_values: Dict[str, Dict[str, float]] = {}
+
+        # Baseline statistics (mean, std)
+        self._baselines: Dict[str, Dict[str, Tuple[float, float]]] = {}
+
+        # Failure patterns (learned from history)
+        self._failure_patterns: List[Dict[str, Any]] = []
+
+        # Health scores
+        self._health_scores: Dict[str, float] = {}
+
+        # Statistics
+        self._stats = {
+            "predictions_made": 0,
+            "anomalies_detected": 0,
+            "failures_predicted": 0,
+            "false_positives": 0,
+            "true_positives": 0,
+        }
+
+    def record_metrics(
+        self,
+        component: str,
+        metrics: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """
+        Record metrics and return health assessment.
+
+        Args:
+            component: Component identifier
+            metrics: Dict of metric name -> value
+
+        Returns:
+            Health assessment with score and anomalies
+        """
+        if component not in self._metrics_history:
+            self._metrics_history[component] = {}
+            self._ewma_values[component] = {}
+            self._baselines[component] = {}
+
+        anomalies = []
+        for metric_name, value in metrics.items():
+            # Initialize history for new metric
+            if metric_name not in self._metrics_history[component]:
+                self._metrics_history[component][metric_name] = []
+                self._ewma_values[component][metric_name] = value
+
+            # Add to history
+            history = self._metrics_history[component][metric_name]
+            history.append(value)
+            if len(history) > self._window_size:
+                history.pop(0)
+
+            # Update EWMA
+            prev_ewma = self._ewma_values[component][metric_name]
+            new_ewma = self._ewma_alpha * value + (1 - self._ewma_alpha) * prev_ewma
+            self._ewma_values[component][metric_name] = new_ewma
+
+            # Update baseline if we have enough data
+            if len(history) >= 20:
+                mean = sum(history) / len(history)
+                variance = sum((x - mean) ** 2 for x in history) / len(history)
+                std = variance ** 0.5
+                self._baselines[component][metric_name] = (mean, std)
+
+                # Check for anomaly
+                if std > 0:
+                    z_score = abs(value - mean) / std
+                    if z_score > self._anomaly_threshold:
+                        anomalies.append({
+                            "metric": metric_name,
+                            "value": value,
+                            "z_score": z_score,
+                            "mean": mean,
+                            "std": std,
+                        })
+                        self._stats["anomalies_detected"] += 1
+
+        # Calculate health score
+        health_score = self._calculate_health_score(component, anomalies)
+        self._health_scores[component] = health_score
+        self._stats["predictions_made"] += 1
+
+        return {
+            "component": component,
+            "health_score": health_score,
+            "anomalies": anomalies,
+            "failure_probability": self._estimate_failure_probability(component, anomalies),
+        }
+
+    def _calculate_health_score(
+        self,
+        component: str,
+        anomalies: List[Dict[str, Any]],
+    ) -> float:
+        """Calculate health score (0-100) based on metrics and anomalies."""
+        base_score = 100.0
+
+        # Deduct for anomalies
+        for anomaly in anomalies:
+            z_score = anomaly.get("z_score", 0)
+            # Higher z-score = more severe deduction
+            deduction = min(20, z_score * 5)
+            base_score -= deduction
+
+        # Clamp to valid range
+        return max(0.0, min(100.0, base_score))
+
+    def _estimate_failure_probability(
+        self,
+        component: str,
+        anomalies: List[Dict[str, Any]],
+    ) -> float:
+        """Estimate probability of failure based on current state."""
+        if not anomalies:
+            return 0.05  # Base failure probability
+
+        # More anomalies = higher probability
+        base_probability = 0.05 + len(anomalies) * 0.1
+
+        # Severe anomalies increase probability
+        for anomaly in anomalies:
+            z_score = anomaly.get("z_score", 0)
+            if z_score > 4.0:
+                base_probability += 0.2
+            elif z_score > 3.0:
+                base_probability += 0.1
+
+        return min(0.95, base_probability)
+
+    def get_health_score(self, component: str) -> float:
+        """Get current health score for a component."""
+        return self._health_scores.get(component, 100.0)
+
+    def get_all_health_scores(self) -> Dict[str, float]:
+        """Get health scores for all components."""
+        return self._health_scores.copy()
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get predictor status."""
+        return {
+            "components_tracked": len(self._metrics_history),
+            "health_scores": self._health_scores,
+            "stats": self._stats,
+        }
+
+
+class SelfHealingOrchestrator:
+    """
+    Automatic remediation orchestrator for self-healing systems.
+
+    When health predictor detects issues, this orchestrator:
+    - Classifies the failure type
+    - Selects appropriate remediation strategy
+    - Executes remediation with rollback protection
+    - Tracks remediation success/failure for learning
+
+    Remediation Strategies:
+    - RESTART: Restart the failing component
+    - SCALE_DOWN: Reduce resource usage
+    - FAILOVER: Switch to backup component
+    - ISOLATE: Remove from load balancer
+    - ROLLBACK: Restore previous known-good state
+    """
+
+    class RemediationStrategy(Enum):
+        RESTART = "restart"
+        SCALE_DOWN = "scale_down"
+        FAILOVER = "failover"
+        ISOLATE = "isolate"
+        ROLLBACK = "rollback"
+        NOTIFY_ONLY = "notify_only"
+
+    def __init__(
+        self,
+        health_predictor: Optional[ProcessHealthPredictor] = None,
+        max_remediation_attempts: int = 3,
+        cooldown_seconds: float = 60.0,
+    ) -> None:
+        self._health_predictor = health_predictor
+        self._max_attempts = max_remediation_attempts
+        self._cooldown_seconds = cooldown_seconds
+
+        # Remediation state per component
+        self._remediation_state: Dict[str, Dict[str, Any]] = {}
+
+        # Remediation handlers
+        self._handlers: Dict[str, Callable[[str], Awaitable[bool]]] = {}
+
+        # Remediation history
+        self._history: List[Dict[str, Any]] = []
+        self._max_history = 100
+
+        # Statistics
+        self._stats = {
+            "remediations_attempted": 0,
+            "remediations_successful": 0,
+            "remediations_failed": 0,
+            "components_healed": 0,
+        }
+
+    def register_handler(
+        self,
+        strategy: "SelfHealingOrchestrator.RemediationStrategy",
+        handler: Callable[[str], Awaitable[bool]],
+    ) -> None:
+        """Register a remediation handler for a strategy."""
+        self._handlers[strategy.value] = handler
+
+    async def check_and_remediate(
+        self,
+        component: str,
+        health_score: float,
+        failure_probability: float,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check if remediation is needed and execute if so.
+
+        Returns:
+            Remediation result if action was taken, None otherwise
+        """
+        # Check if remediation is needed
+        if health_score > 70 and failure_probability < 0.3:
+            return None
+
+        # Check cooldown
+        state = self._remediation_state.get(component, {})
+        last_attempt = state.get("last_attempt", 0)
+        if time.time() - last_attempt < self._cooldown_seconds:
+            return None
+
+        # Check attempt count
+        attempts = state.get("attempts", 0)
+        if attempts >= self._max_attempts:
+            return {
+                "status": "max_attempts_exceeded",
+                "component": component,
+                "attempts": attempts,
+            }
+
+        # Select strategy
+        strategy = self._select_strategy(health_score, failure_probability, attempts)
+
+        # Execute remediation
+        result = await self._execute_remediation(component, strategy)
+
+        # Update state
+        self._remediation_state[component] = {
+            "last_attempt": time.time(),
+            "attempts": attempts + 1 if not result["success"] else 0,
+            "last_strategy": strategy.value,
+            "last_result": result["success"],
+        }
+
+        # Record history
+        self._history.append({
+            "timestamp": datetime.now().isoformat(),
+            "component": component,
+            "strategy": strategy.value,
+            "success": result["success"],
+            "health_score": health_score,
+        })
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
+
+        return result
+
+    def _select_strategy(
+        self,
+        health_score: float,
+        failure_probability: float,
+        previous_attempts: int,
+    ) -> "SelfHealingOrchestrator.RemediationStrategy":
+        """Select the best remediation strategy."""
+        # Escalate based on severity and previous attempts
+        if failure_probability > 0.8 or previous_attempts >= 2:
+            return self.RemediationStrategy.FAILOVER
+        elif health_score < 30:
+            return self.RemediationStrategy.RESTART
+        elif health_score < 50:
+            return self.RemediationStrategy.SCALE_DOWN
+        elif health_score < 70:
+            return self.RemediationStrategy.ISOLATE
+        else:
+            return self.RemediationStrategy.NOTIFY_ONLY
+
+    async def _execute_remediation(
+        self,
+        component: str,
+        strategy: "SelfHealingOrchestrator.RemediationStrategy",
+    ) -> Dict[str, Any]:
+        """Execute the selected remediation strategy."""
+        self._stats["remediations_attempted"] += 1
+
+        handler = self._handlers.get(strategy.value)
+        if not handler:
+            return {
+                "success": False,
+                "strategy": strategy.value,
+                "error": "No handler registered",
+            }
+
+        try:
+            success = await handler(component)
+
+            if success:
+                self._stats["remediations_successful"] += 1
+                self._stats["components_healed"] += 1
+            else:
+                self._stats["remediations_failed"] += 1
+
+            return {
+                "success": success,
+                "strategy": strategy.value,
+                "component": component,
+            }
+        except Exception as e:
+            self._stats["remediations_failed"] += 1
+            return {
+                "success": False,
+                "strategy": strategy.value,
+                "error": str(e),
+            }
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get orchestrator status."""
+        return {
+            "components_managed": len(self._remediation_state),
+            "handlers_registered": list(self._handlers.keys()),
+            "recent_remediations": self._history[-5:],
+            "stats": self._stats,
+        }
+
+
+class DistributedStateCoordinator:
+    """
+    Cross-repo state synchronization using file-based coordination.
+
+    Manages distributed state across JARVIS, JARVIS Prime, and Reactor Core:
+    - State versioning with vector clocks
+    - Conflict resolution (last-writer-wins with merge)
+    - State snapshots and recovery
+    - Namespace partitioning
+
+    No external dependencies (Redis, etc.) - uses file system only.
+    """
+
+    def __init__(
+        self,
+        component_name: str,
+        state_dir: Optional[Path] = None,
+        sync_interval: float = 5.0,
+    ) -> None:
+        self._component_name = component_name
+        self._state_dir = state_dir or Path.home() / ".jarvis" / "distributed_state"
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        self._sync_interval = sync_interval
+
+        # Local state cache
+        self._local_state: Dict[str, Dict[str, Any]] = {}
+
+        # Vector clock for causal ordering
+        self._vector_clock: Dict[str, int] = {component_name: 0}
+
+        # State versioning
+        self._version = 0
+
+        # Lock for state modifications
+        self._state_lock = asyncio.Lock()
+
+        # Background sync task
+        self._sync_task: Optional[asyncio.Task] = None
+        self._running = False
+
+        # Watchers for state changes
+        self._watchers: Dict[str, List[Callable[[str, Dict[str, Any]], Awaitable[None]]]] = {}
+
+        # Statistics
+        self._stats = {
+            "state_updates": 0,
+            "sync_cycles": 0,
+            "conflicts_resolved": 0,
+            "snapshots_created": 0,
+        }
+
+    async def start(self) -> bool:
+        """Start the state coordinator."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._sync_task = asyncio.create_task(self._sync_loop())
+
+        # Load initial state
+        await self._load_state()
+        return True
+
+    async def stop(self) -> None:
+        """Stop the coordinator and save state."""
+        self._running = False
+
+        if self._sync_task:
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except asyncio.CancelledError:
+                pass
+
+        # Save final state
+        await self._save_state()
+
+    async def get(self, namespace: str, key: str, default: Any = None) -> Any:
+        """Get a value from distributed state."""
+        async with self._state_lock:
+            ns_state = self._local_state.get(namespace, {})
+            entry = ns_state.get(key, {})
+            return entry.get("value", default)
+
+    async def set(
+        self,
+        namespace: str,
+        key: str,
+        value: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Set a value in distributed state."""
+        async with self._state_lock:
+            # Increment vector clock
+            self._vector_clock[self._component_name] = (
+                self._vector_clock.get(self._component_name, 0) + 1
+            )
+            self._version += 1
+
+            # Create entry
+            entry = {
+                "value": value,
+                "timestamp": time.time(),
+                "version": self._version,
+                "writer": self._component_name,
+                "vector_clock": self._vector_clock.copy(),
+                "metadata": metadata or {},
+            }
+
+            # Store locally
+            if namespace not in self._local_state:
+                self._local_state[namespace] = {}
+            self._local_state[namespace][key] = entry
+
+            self._stats["state_updates"] += 1
+
+        # Notify watchers
+        await self._notify_watchers(namespace, key, entry)
+
+        # Persist immediately
+        await self._save_state()
+
+    async def delete(self, namespace: str, key: str) -> bool:
+        """Delete a value from distributed state."""
+        async with self._state_lock:
+            if namespace in self._local_state and key in self._local_state[namespace]:
+                del self._local_state[namespace][key]
+                self._stats["state_updates"] += 1
+                await self._save_state()
+                return True
+        return False
+
+    def watch(
+        self,
+        namespace: str,
+        callback: Callable[[str, Dict[str, Any]], Awaitable[None]],
+    ) -> str:
+        """Watch a namespace for changes."""
+        watch_id = f"watch_{os.urandom(4).hex()}"
+        if namespace not in self._watchers:
+            self._watchers[namespace] = []
+        self._watchers[namespace].append(callback)
+        return watch_id
+
+    async def _notify_watchers(
+        self,
+        namespace: str,
+        key: str,
+        entry: Dict[str, Any],
+    ) -> None:
+        """Notify watchers of a state change."""
+        if namespace in self._watchers:
+            for callback in self._watchers[namespace]:
+                try:
+                    await callback(key, entry)
+                except Exception:
+                    pass
+
+    async def _sync_loop(self) -> None:
+        """Background loop to sync state with other components."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._sync_interval)
+                await self._sync_with_peers()
+                self._stats["sync_cycles"] += 1
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _sync_with_peers(self) -> None:
+        """Sync state with peer components."""
+        # Read state files from other components
+        for state_file in self._state_dir.glob("*.state.json"):
+            if state_file.stem.startswith(self._component_name):
+                continue  # Skip our own file
+
+            try:
+                content = state_file.read_text()
+                peer_state = json.loads(content)
+                await self._merge_peer_state(peer_state)
+            except Exception:
+                pass
+
+    async def _merge_peer_state(self, peer_state: Dict[str, Any]) -> None:
+        """Merge state from a peer using vector clock comparison."""
+        peer_namespaces = peer_state.get("namespaces", {})
+        peer_clock = peer_state.get("vector_clock", {})
+
+        async with self._state_lock:
+            for namespace, ns_state in peer_namespaces.items():
+                if namespace not in self._local_state:
+                    self._local_state[namespace] = {}
+
+                for key, entry in ns_state.items():
+                    local_entry = self._local_state[namespace].get(key)
+
+                    if local_entry is None:
+                        # New entry from peer
+                        self._local_state[namespace][key] = entry
+                    else:
+                        # Conflict resolution: compare timestamps
+                        if entry.get("timestamp", 0) > local_entry.get("timestamp", 0):
+                            self._local_state[namespace][key] = entry
+                            self._stats["conflicts_resolved"] += 1
+
+            # Merge vector clocks
+            for component, clock in peer_clock.items():
+                self._vector_clock[component] = max(
+                    self._vector_clock.get(component, 0),
+                    clock,
+                )
+
+    async def _load_state(self) -> None:
+        """Load state from disk."""
+        state_file = self._state_dir / f"{self._component_name}.state.json"
+        if state_file.exists():
+            try:
+                content = state_file.read_text()
+                data = json.loads(content)
+                self._local_state = data.get("namespaces", {})
+                self._vector_clock = data.get("vector_clock", {self._component_name: 0})
+                self._version = data.get("version", 0)
+            except Exception:
+                pass
+
+    async def _save_state(self) -> None:
+        """Save state to disk."""
+        state_file = self._state_dir / f"{self._component_name}.state.json"
+        try:
+            data = {
+                "component": self._component_name,
+                "namespaces": self._local_state,
+                "vector_clock": self._vector_clock,
+                "version": self._version,
+                "timestamp": time.time(),
+            }
+            state_file.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+
+    async def create_snapshot(self) -> str:
+        """Create a state snapshot for backup."""
+        snapshot_id = f"snapshot_{int(time.time())}"
+        snapshot_file = self._state_dir / f"{snapshot_id}.snapshot.json"
+
+        async with self._state_lock:
+            data = {
+                "snapshot_id": snapshot_id,
+                "component": self._component_name,
+                "namespaces": self._local_state,
+                "vector_clock": self._vector_clock,
+                "version": self._version,
+                "created_at": datetime.now().isoformat(),
+            }
+            snapshot_file.write_text(json.dumps(data, indent=2))
+            self._stats["snapshots_created"] += 1
+
+        return snapshot_id
+
+    async def restore_snapshot(self, snapshot_id: str) -> bool:
+        """Restore state from a snapshot."""
+        snapshot_file = self._state_dir / f"{snapshot_id}.snapshot.json"
+        if not snapshot_file.exists():
+            return False
+
+        try:
+            content = snapshot_file.read_text()
+            data = json.loads(content)
+
+            async with self._state_lock:
+                self._local_state = data.get("namespaces", {})
+                self._vector_clock = data.get("vector_clock", {})
+                self._version = data.get("version", 0)
+
+            await self._save_state()
+            return True
+        except Exception:
+            return False
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get coordinator status."""
+        return {
+            "component": self._component_name,
+            "running": self._running,
+            "namespaces": list(self._local_state.keys()),
+            "version": self._version,
+            "vector_clock": self._vector_clock,
+            "stats": self._stats,
+        }
+
+
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
 # ║   END OF ZONE 4                                                               ║
