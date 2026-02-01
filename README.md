@@ -51,6 +51,8 @@
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+**Legacy reference copies:** The original `run_supervisor.py` and `start_system.py` are kept in the repo as **reference only**. Use them when porting behavior into `unified_supervisor.py`. Primary entry point: `python unified_supervisor.py`.
+
 ### Zone Architecture (7 Zones)
 
 The unified kernel is organized into **7 distinct zones**, each handling specific responsibilities:

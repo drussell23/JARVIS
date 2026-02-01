@@ -49142,6 +49142,23 @@ class JarvisSystemKernel:
                 self.logger.debug(f"[Narrator] Startup announcement failed: {narr_err}")
 
         try:
+            # =================================================================
+            # PHASE 0: LOADING EXPERIENCE (v117.0)
+            # =================================================================
+            # Start loading server FIRST so users see progress immediately.
+            # Then open Chrome Incognito to the loading page.
+            # =================================================================
+            issue_collector.set_current_phase("Phase 0: Loading Experience")
+            issue_collector.set_current_zone("Zone 0")
+
+            await self._phase_loading_experience()
+            await self._broadcast_startup_progress(
+                stage="loading",
+                message="Loading page ready - starting system initialization...",
+                progress=5,
+                metadata={"icon": "rocket", "phase": 0}
+            )
+
             # Phase 1: Preflight (Zone 5.1-5.4)
             issue_collector.set_current_phase("Phase 1: Preflight")
             issue_collector.set_current_zone("Zone 5")
@@ -49155,6 +49172,13 @@ class JarvisSystemKernel:
                 )
                 issue_collector.print_health_report()
                 return 1
+
+            await self._broadcast_startup_progress(
+                stage="preflight",
+                message="Preflight complete - initializing resources...",
+                progress=15,
+                metadata={"icon": "check", "phase": 1}
+            )
 
             # Phase 2: Resources (Zone 3)
             issue_collector.set_current_phase("Phase 2: Resources")
@@ -49174,6 +49198,13 @@ class JarvisSystemKernel:
             if self._narrator:
                 await self._narrator.narrate_zone_complete(3, success=True)
 
+            await self._broadcast_startup_progress(
+                stage="resources",
+                message="Resources ready - starting backend server...",
+                progress=30,
+                metadata={"icon": "server", "phase": 2}
+            )
+
             # Phase 3: Backend (Zone 6.1)
             issue_collector.set_current_phase("Phase 3: Backend")
             issue_collector.set_current_zone("Zone 6")
@@ -49189,6 +49220,13 @@ class JarvisSystemKernel:
                     await self._narrator.narrate_error("Backend server failed to start", critical=True)
                 issue_collector.print_health_report()
                 return 1
+
+            await self._broadcast_startup_progress(
+                stage="backend",
+                message="Backend server running - loading intelligence layer...",
+                progress=50,
+                metadata={"icon": "brain", "phase": 3}
+            )
 
             # Phase 4: Intelligence (Zone 4)
             issue_collector.set_current_phase("Phase 4: Intelligence")
@@ -49208,6 +49246,13 @@ class JarvisSystemKernel:
                 if self._narrator:
                     await self._narrator.narrate_zone_complete(4, success=True)
 
+            await self._broadcast_startup_progress(
+                stage="intelligence",
+                message="Intelligence layer ready - connecting Trinity components...",
+                progress=65,
+                metadata={"icon": "sparkles", "phase": 4}
+            )
+
             # Phase 5: Trinity (Zone 5.7)
             issue_collector.set_current_phase("Phase 5: Trinity")
             issue_collector.set_current_zone("Zone 5.7")
@@ -49223,6 +49268,13 @@ class JarvisSystemKernel:
                 self.logger.info("[Kernel]   Trinity connects: JARVIS + J-Prime + Reactor-Core")
                 self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
 
+            await self._broadcast_startup_progress(
+                stage="trinity",
+                message="Trinity connected - starting enterprise services...",
+                progress=80,
+                metadata={"icon": "link", "phase": 5}
+            )
+
             # Phase 6: Enterprise Services (Zone 6.4)
             issue_collector.set_current_phase("Phase 6: Enterprise Services")
             issue_collector.set_current_zone("Zone 6.4")
@@ -49231,6 +49283,31 @@ class JarvisSystemKernel:
             await self._phase_enterprise_services()
             if self._narrator:
                 await self._narrator.narrate_zone_complete(6, success=True)
+
+            await self._broadcast_startup_progress(
+                stage="enterprise",
+                message="Enterprise services online - launching frontend...",
+                progress=90,
+                metadata={"icon": "building", "phase": 6}
+            )
+
+            # =================================================================
+            # PHASE 7: FRONTEND TRANSITION (v117.0)
+            # =================================================================
+            # Start the React frontend and transition browser from loading
+            # page to the main JARVIS UI.
+            # =================================================================
+            issue_collector.set_current_phase("Phase 7: Frontend Transition")
+            issue_collector.set_current_zone("Zone 7")
+
+            await self._phase_frontend_transition()
+
+            await self._broadcast_startup_progress(
+                stage="complete",
+                message="JARVIS is ready!",
+                progress=100,
+                metadata={"icon": "check-circle", "phase": 7}
+            )
 
             # Start background pre-warming task (non-blocking)
             issue_collector.set_current_phase("Background Tasks")
@@ -49850,6 +49927,121 @@ class JarvisSystemKernel:
                 self._readiness_manager.mark_component_ready("voice_biometrics", voice_ready)
 
             return True  # Enterprise services are optional
+
+    # =========================================================================
+    # PHASE 0: LOADING EXPERIENCE (v117.0)
+    # =========================================================================
+    # Starts the loading server and opens Chrome Incognito to show
+    # startup progress to the user immediately.
+    # =========================================================================
+
+    async def _phase_loading_experience(self) -> bool:
+        """
+        Phase 0: Start the loading experience.
+
+        This phase runs FIRST to ensure users see immediate feedback during startup:
+        1. Start the loading server (serves progress page)
+        2. Open Chrome Incognito to the loading page
+        3. Return quickly so startup can continue
+
+        Returns:
+            True (non-blocking, always succeeds with graceful degradation)
+        """
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+        self.logger.info("[Kernel] Phase 0: Loading Experience")
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+
+        # Step 1: Start loading server
+        loading_server_started = False
+        try:
+            loading_server_started = await self._start_loading_server()
+            if loading_server_started:
+                self.logger.success(
+                    f"[Kernel] Loading server ready on port {self.config.loading_server_port}"
+                )
+            else:
+                self.logger.info("[Kernel] Loading server not started (disabled or unavailable)")
+        except Exception as e:
+            self.logger.debug(f"[Kernel] Loading server error (non-fatal): {e}")
+
+        # Step 2: Open Chrome Incognito to loading page
+        if loading_server_started:
+            try:
+                loading_url = f"http://localhost:{self.config.loading_server_port}"
+                chrome_manager = get_chrome_manager()
+                result = await chrome_manager.ensure_single_incognito_window(loading_url)
+                if result.get("success"):
+                    action = result.get("action", "unknown")
+                    self.logger.success(f"[Kernel] Chrome Incognito opened ({action}) → {loading_url}")
+                else:
+                    self.logger.debug(
+                        f"[Kernel] Chrome Incognito not opened: {result.get('error', 'unknown')}"
+                    )
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Chrome Incognito error (non-fatal): {e}")
+
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+        return True  # Always succeed - this is a nice-to-have, not critical
+
+    # =========================================================================
+    # PHASE 7: FRONTEND TRANSITION (v117.0)
+    # =========================================================================
+    # Starts the React frontend and transitions the browser from the
+    # loading page to the main JARVIS UI.
+    # =========================================================================
+
+    async def _phase_frontend_transition(self) -> bool:
+        """
+        Phase 7: Transition from loading page to main frontend.
+
+        This phase:
+        1. Start the React frontend (npm start)
+        2. Wait for frontend to be ready
+        3. Redirect Chrome from loading page to frontend URL
+        4. Stop the loading server (no longer needed)
+
+        Returns:
+            True (non-blocking, always succeeds with graceful degradation)
+        """
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+        self.logger.info("[Kernel] Phase 7: Frontend Transition")
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+
+        frontend_started = False
+        frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+
+        # Step 1: Start the React frontend
+        try:
+            frontend_started = await self._start_frontend()
+            if frontend_started:
+                self.logger.success(f"[Kernel] React frontend ready on port {frontend_port}")
+            else:
+                self.logger.info("[Kernel] Frontend not started (directory not found or failed)")
+        except Exception as e:
+            self.logger.debug(f"[Kernel] Frontend startup error (non-fatal): {e}")
+
+        # Step 2: Redirect Chrome to the main frontend
+        if frontend_started:
+            try:
+                frontend_url = f"http://localhost:{frontend_port}"
+                chrome_manager = get_chrome_manager()
+                result = await chrome_manager.ensure_single_incognito_window(frontend_url)
+                if result.get("success"):
+                    action = result.get("action", "unknown")
+                    self.logger.success(f"[Kernel] Chrome redirected ({action}) → {frontend_url}")
+                else:
+                    self.logger.debug(
+                        f"[Kernel] Chrome redirect not completed: {result.get('error', 'unknown')}"
+                    )
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Chrome redirect error (non-fatal): {e}")
+        else:
+            # No frontend - stop loading server if running, but log that we're in API-only mode
+            self.logger.info("[Kernel] Running in API-only mode (no frontend)")
+            await self._stop_loading_server()
+
+        self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
+        return True  # Always succeed - frontend is optional
 
     # =========================================================================
     # LOADING SERVER AND FRONTEND MANAGEMENT
