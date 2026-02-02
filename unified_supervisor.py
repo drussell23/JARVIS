@@ -10966,6 +10966,57 @@ class IntelligentChromeIncognitoManager:
         except Exception:
             return []
 
+    async def _check_system_health_for_browser(self) -> Tuple[bool, str]:
+        """
+        v197.2: Pre-flight check before launching browser.
+        
+        Prevents crash code 5 (GPU/OOM) by checking system resources BEFORE
+        attempting to launch Chrome. This is proactive crash prevention.
+        
+        Returns:
+            Tuple of (safe_to_launch, reason_if_not_safe)
+        """
+        try:
+            import psutil
+            
+            # Check memory pressure
+            mem = psutil.virtual_memory()
+            if mem.percent > 90:
+                return (False, f"Critical memory pressure: {mem.percent}% used")
+            
+            # Check if Chrome is already consuming excessive resources
+            chrome_memory_mb = 0
+            for proc in psutil.process_iter(['name', 'memory_info']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        chrome_memory_mb += proc.info['memory_info'].rss / (1024 * 1024)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                    continue
+            
+            # If Chrome is already using > 4GB, warn
+            if chrome_memory_mb > 4096:
+                self._logger.warning(
+                    f"[Browser] Chrome already using {chrome_memory_mb:.0f}MB RAM. "
+                    "Consider closing some tabs to prevent crash."
+                )
+            
+            # Check crash rate from monitor
+            try:
+                crash_monitor = get_browser_crash_monitor()
+                stats = crash_monitor.get_statistics()
+                if stats.get("consecutive_failures", 0) >= 2:
+                    return (False, f"Recent browser instability: {stats['consecutive_failures']} consecutive failures")
+            except Exception:
+                pass  # Monitor might not be available
+            
+            return (True, "")
+            
+        except ImportError:
+            return (True, "")  # psutil not available, proceed anyway
+        except Exception as e:
+            self._logger.debug(f"[Browser] Health check error: {e}")
+            return (True, "")  # Non-critical, proceed
+
     async def _launch_fresh_incognito(self, url: str) -> bool:
         """
         Launch a fresh Chrome incognito window in fullscreen mode.
@@ -10975,9 +11026,28 @@ class IntelligentChromeIncognitoManager:
         - Navigates to URL
         - Activates Chrome
         - Toggles fullscreen using Cmd+Ctrl+F
+        
+        v197.2: Added pre-flight health check to prevent crash code 5 (GPU/OOM).
         """
         if sys.platform != 'darwin':
             self._logger.warning("Non-macOS platform - cannot launch Chrome via AppleScript")
+            return False
+
+        # v197.2: Pre-flight health check to prevent crashes
+        safe_to_launch, reason = await self._check_system_health_for_browser()
+        if not safe_to_launch:
+            self._logger.warning(f"[Browser] ⚠️ Skipping browser launch: {reason}")
+            # Report to crash monitor as a prevented crash
+            try:
+                crash_monitor = get_browser_crash_monitor()
+                await crash_monitor.record_crash(
+                    crash_reason="prevented",
+                    crash_code="0",  # Prevented, not actual crash
+                    source="chrome_incognito",
+                    error_message=f"Launch prevented: {reason}",
+                )
+            except Exception:
+                pass
             return False
 
         # v182.0: AppleScript that creates incognito AND toggles fullscreen
@@ -11016,12 +11086,56 @@ class IntelligentChromeIncognitoManager:
                 # v182.0: Also call ensure_fullscreen as safety net
                 await asyncio.sleep(0.3)
                 await self._ensure_fullscreen()
+                self._error_count = 0  # Reset error count on success
                 return True
             else:
-                self._logger.error(f"Failed to launch incognito: {stderr.decode()}")
+                error_msg = stderr.decode() if stderr else "Unknown error"
+                self._logger.error(f"Failed to launch incognito: {error_msg}")
+                self._error_count += 1
                 return False
+        except asyncio.TimeoutError:
+            self._logger.error("[Browser] Chrome launch timed out after 30s")
+            self._error_count += 1
+            # v197.2: Report timeout to crash monitor
+            try:
+                crash_monitor = get_browser_crash_monitor()
+                await crash_monitor.record_crash(
+                    crash_reason="timeout",
+                    crash_code="11",  # Page unresponsive
+                    source="chrome_incognito",
+                    error_message="Chrome launch timed out after 30s",
+                )
+            except Exception:
+                pass
+            return False
         except Exception as e:
             self._logger.error(f"Error launching incognito: {e}")
+            self._error_count += 1
+            # v197.2: Report to crash monitor for tracking
+            try:
+                error_str = str(e).lower()
+                crash_code = "5"  # Default to GPU/OOM
+                if "terminated" in error_str and "crashed" in error_str:
+                    # Parse actual code if available
+                    import re
+                    match = re.search(r"code[:\s]*['\"]?(\d+)['\"]?", error_str)
+                    if match:
+                        crash_code = match.group(1)
+                
+                crash_monitor = get_browser_crash_monitor()
+                event = await crash_monitor.record_crash(
+                    crash_reason="crashed",
+                    crash_code=crash_code,
+                    source="chrome_incognito",
+                    error_message=str(e),
+                )
+                
+                # Attempt automatic recovery for high-severity crashes
+                if event.severity in (BrowserCrashSeverity.HIGH, BrowserCrashSeverity.CRITICAL):
+                    self._logger.info("[Browser] Attempting automatic recovery from crash...")
+                    await crash_monitor.attempt_recovery(event)
+            except Exception as report_err:
+                self._logger.debug(f"[Browser] Crash report failed: {report_err}")
             return False
 
     async def _redirect_incognito_window(self, window_index: int, url: str) -> bool:
@@ -11466,6 +11580,135 @@ class BrowserCrashMonitor:
         if pressures:
             return sum(pressures) / len(pressures)
         return None
+
+    async def proactive_health_check(self) -> Dict[str, Any]:
+        """
+        v197.2: Proactive browser health assessment.
+        
+        Checks Chrome memory usage and crash patterns to predict
+        and prevent crash code 5 (GPU/OOM) before it happens.
+        
+        Returns:
+            Dict with health status and recommended actions
+        """
+        result = {
+            "healthy": True,
+            "risk_level": "low",
+            "chrome_memory_mb": 0,
+            "chrome_process_count": 0,
+            "crash_risk_score": 0.0,
+            "recommended_action": None,
+        }
+        
+        try:
+            import psutil
+            
+            # Check Chrome memory usage
+            for proc in psutil.process_iter(['name', 'memory_info']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        result["chrome_memory_mb"] += proc.info['memory_info'].rss / (1024 * 1024)
+                        result["chrome_process_count"] += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                    continue
+            
+            # Calculate crash risk score (0-1)
+            risk_score = 0.0
+            
+            # Memory contribution to risk
+            if result["chrome_memory_mb"] > 6144:
+                risk_score += 0.5  # Very high memory = high risk
+            elif result["chrome_memory_mb"] > 4096:
+                risk_score += 0.3
+            elif result["chrome_memory_mb"] > 2048:
+                risk_score += 0.1
+            
+            # Recent crash history contribution
+            crash_rate = self._calculate_crash_rate()
+            if crash_rate >= 3:
+                risk_score += 0.4
+            elif crash_rate >= 1:
+                risk_score += 0.2
+            
+            # Consecutive failures contribution
+            if self._consecutive_failures >= 2:
+                risk_score += 0.3
+            elif self._consecutive_failures >= 1:
+                risk_score += 0.1
+            
+            result["crash_risk_score"] = min(risk_score, 1.0)
+            
+            # Determine risk level and action
+            if risk_score >= 0.7:
+                result["healthy"] = False
+                result["risk_level"] = "critical"
+                result["recommended_action"] = "restart_chrome"
+                self._logger.warning(
+                    f"[BrowserHealth] 🔴 CRITICAL risk ({risk_score:.1%}): "
+                    f"Chrome using {result['chrome_memory_mb']:.0f}MB, "
+                    f"{crash_rate} recent crashes. Recommend Chrome restart."
+                )
+            elif risk_score >= 0.4:
+                result["risk_level"] = "high"
+                result["recommended_action"] = "reduce_tabs"
+                self._logger.info(
+                    f"[BrowserHealth] ⚠️ High risk ({risk_score:.1%}): "
+                    f"Consider closing browser tabs."
+                )
+            elif risk_score >= 0.2:
+                result["risk_level"] = "medium"
+                result["recommended_action"] = "monitor"
+            
+        except ImportError:
+            pass  # psutil not available
+        except Exception as e:
+            self._logger.debug(f"[BrowserHealth] Check failed: {e}")
+        
+        return result
+
+    async def preemptive_restart_if_needed(self) -> bool:
+        """
+        v197.2: Preemptively restart Chrome if crash risk is critical.
+        
+        This prevents crash code 5 by gracefully restarting Chrome
+        before it crashes, avoiding data loss and session corruption.
+        
+        Returns:
+            True if restart was performed
+        """
+        health = await self.proactive_health_check()
+        
+        if health["recommended_action"] == "restart_chrome":
+            self._logger.info("[BrowserHealth] Initiating preemptive Chrome restart...")
+            
+            # Trigger recovery callbacks to restart Chrome
+            for callback in self._recovery_callbacks:
+                try:
+                    # Create a synthetic crash event for recovery
+                    synthetic_event = BrowserCrashEvent(
+                        timestamp=datetime.now(),
+                        crash_reason="preemptive_restart",
+                        crash_code="0",
+                        severity=BrowserCrashSeverity.LOW,
+                        source="health_check",
+                        memory_pressure_at_crash=health.get("chrome_memory_mb", 0) / 100,
+                        recovery_attempted=True,
+                    )
+                    
+                    if asyncio.iscoroutinefunction(callback):
+                        result = await callback(synthetic_event)
+                    else:
+                        result = callback(synthetic_event)
+                    
+                    if result:
+                        self._logger.info("[BrowserHealth] ✅ Preemptive restart successful")
+                        return True
+                except Exception as e:
+                    self._logger.error(f"[BrowserHealth] Preemptive restart error: {e}")
+            
+            return False
+        
+        return False
 
 
 # Global browser crash monitor singleton

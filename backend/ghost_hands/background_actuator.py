@@ -798,6 +798,9 @@ class PlaywrightBackend(ActuatorBackend):
         """
         Check if system is under memory pressure before browser operations.
         
+        v197.2: Enhanced to also check Chrome-specific memory usage and
+        proactively detect conditions that lead to crash code 5 (GPU/OOM).
+        
         Returns True if safe to proceed, False if should back off.
         """
         try:
@@ -808,13 +811,38 @@ class PlaywrightBackend(ActuatorBackend):
             if mem.percent > 90:
                 logger.warning(
                     f"[GHOST-HANDS] 🔴 Critical memory pressure: {mem.percent}% used. "
-                    "Skipping browser operation to prevent crash."
+                    "Skipping browser operation to prevent crash code 5."
                 )
                 return False
             elif mem.percent > 80:
                 logger.info(
                     f"[GHOST-HANDS] ⚠️ High memory pressure: {mem.percent}% used. "
                     "Proceeding with caution."
+                )
+            
+            # v197.2: Check Chrome-specific memory usage
+            chrome_memory_mb = 0
+            chrome_process_count = 0
+            for proc in psutil.process_iter(['name', 'memory_info']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        chrome_memory_mb += proc.info['memory_info'].rss / (1024 * 1024)
+                        chrome_process_count += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                    continue
+            
+            # Chrome using > 6GB is a crash risk (GPU process OOM)
+            if chrome_memory_mb > 6144:
+                logger.warning(
+                    f"[GHOST-HANDS] 🔴 Chrome using {chrome_memory_mb:.0f}MB across "
+                    f"{chrome_process_count} processes. HIGH CRASH RISK (code 5). "
+                    "Skipping operation."
+                )
+                return False
+            elif chrome_memory_mb > 4096:
+                logger.info(
+                    f"[GHOST-HANDS] ⚠️ Chrome using {chrome_memory_mb:.0f}MB. "
+                    "Consider closing some tabs."
                 )
             
             return True
