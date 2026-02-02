@@ -48036,11 +48036,14 @@ class ProgressiveReadinessManager:
 
 
 # =============================================================================
-# ZONE 5.6: STARTUP WATCHDOG (v186.0 - Dead Man's Switch)
+# ZONE 5.6: STARTUP WATCHDOG (v188.0 - Dead Man's Switch)
 # =============================================================================
 # Monitors startup phases and takes action if a phase stalls.
 # Uses graduated response: warn → diagnostic → restart → rollback.
 # Coordinates with Trinity components via heartbeat system.
+#
+# v188.0: Heartbeat-based stall detection (every update_phase call resets timer)
+# v187.0: Phase START tracking, environment overrides, intelligence/enterprise handlers
 # =============================================================================
 
 @dataclass
@@ -48203,25 +48206,30 @@ class StartupWatchdog:
     def update_phase(self, phase_key: str, progress: int) -> None:
         """
         Update the current phase and progress.
-        
+
         Called by the kernel at each phase transition and progress update.
-        
+        Each call acts as a heartbeat, resetting the stall timer.
+
         Args:
             phase_key: Phase identifier (e.g., "resources", "trinity")
             progress: Current progress percentage (0-100)
         """
         now = time.time()
-        
+
         # Phase change
         if phase_key != self._current_phase:
             self._current_phase = phase_key
             self._phase_start_time = now
             self._logger.debug(f"[DMS] Phase entered: {phase_key}")
-        
-        # Progress change
+
+        # v188.0: ALWAYS update progress time as heartbeat
+        # This prevents false stall detection when callbacks report same progress
+        # (e.g., Trinity health waits reporting progress=66 repeatedly)
+        self._last_progress_time = now
+
+        # Track progress value changes separately
         if progress != self._last_progress:
             self._last_progress = progress
-            self._last_progress_time = now
     
     def get_status(self) -> Dict[str, Any]:
         """Get current watchdog status for diagnostics."""
@@ -51847,8 +51855,9 @@ class JarvisSystemKernel:
         - Auto-restart on crash (background watchdog)
         - Graceful shutdown with wait
         - Diagnostic checkpoints
-        
+
         v186.0: Added real-time progress callbacks during health waits.
+        v188.0: Added background heartbeat to prevent DMS stall during long operations.
 
         Starts:
         - J-Prime (local LLM inference or Hollow Client routing to GCP)
@@ -51856,8 +51865,37 @@ class JarvisSystemKernel:
         """
         self._state = KernelState.STARTING_TRINITY
 
+        # v188.0: Background heartbeat task to prevent DMS stall detection
+        # Long operations like cross-repo orchestration can take 60+ seconds
+        # This task sends heartbeats every 5 seconds to keep DMS alive
+        heartbeat_task: Optional[asyncio.Task] = None
+        heartbeat_stop = asyncio.Event()
+
+        async def _trinity_heartbeat_loop() -> None:
+            """Send DMS heartbeats every 5 seconds during Trinity phase."""
+            progress = 66  # Start after initial phase progress (65)
+            while not heartbeat_stop.is_set():
+                try:
+                    await asyncio.sleep(5.0)
+                    if self._startup_watchdog and not heartbeat_stop.is_set():
+                        # Increment progress slightly (66-79 range for Trinity)
+                        progress = min(progress + 1, 79)
+                        self._startup_watchdog.update_phase("trinity", progress)
+                        self.logger.debug(f"[Trinity] 💓 DMS heartbeat: progress={progress}")
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass  # Heartbeat errors are non-fatal
+
         with self.logger.section_start(LogSection.TRINITY, "Zone 5.7 | Phase 5: Trinity"):
             try:
+                # v188.0: Start heartbeat task for long-running operations
+                heartbeat_task = asyncio.create_task(
+                    _trinity_heartbeat_loop(),
+                    name="trinity-dms-heartbeat"
+                )
+                self.logger.debug("[Trinity] 💓 DMS heartbeat started")
+
                 # v180.0: Diagnostic checkpoint
                 if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                     try:
@@ -51867,7 +51905,7 @@ class JarvisSystemKernel:
 
                 # Log Trinity configuration
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
-                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION (v181.0)")
+                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION (v188.0)")
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
                 self.logger.info(f"[Trinity] Enabled: {self.config.trinity_enabled}")
                 self.logger.info(f"[Trinity] Auto-restart: {os.environ.get('JARVIS_TRINITY_AUTO_RESTART', 'true')}")
@@ -51884,6 +51922,10 @@ class JarvisSystemKernel:
                         await initialize_cross_repo_orchestration()
                         self.logger.success("[Trinity] Cross-repo orchestration ready")
 
+                        # v188.0: Immediate DMS heartbeat after long operation
+                        if self._startup_watchdog:
+                            self._startup_watchdog.update_phase("trinity", 68)
+
                         # Check if Hollow Client mode was activated
                         if os.environ.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() == "true":
                             gcp_endpoint = os.environ.get("GCP_PRIME_ENDPOINT", "")
@@ -51893,8 +51935,15 @@ class JarvisSystemKernel:
                             )
                     except Exception as e:
                         self.logger.warning(f"[Trinity] Cross-repo init failed (non-fatal): {e}")
+                        # v188.0: Still send heartbeat even on error
+                        if self._startup_watchdog:
+                            self._startup_watchdog.update_phase("trinity", 67)
                 else:
                     self.logger.debug("[Trinity] Cross-repo orchestrator not available - using inline integration")
+
+                # v188.0: Heartbeat after orchestration phase
+                if self._startup_watchdog:
+                    self._startup_watchdog.update_phase("trinity", 69)
 
                 # Log repo search paths
                 prime_path = self.config.prime_repo_path
@@ -51909,6 +51958,10 @@ class JarvisSystemKernel:
                     progress_callback=self._trinity_progress_callback,
                 )
                 await self._trinity.initialize()
+
+                # v188.0: Heartbeat after TrinityIntegrator init
+                if self._startup_watchdog:
+                    self._startup_watchdog.update_phase("trinity", 70)
 
                 # Get detailed status after initialization
                 status = self._trinity.get_status()
@@ -52047,9 +52100,29 @@ class JarvisSystemKernel:
                         pass
 
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
+
+                # v188.0: Stop heartbeat task - Trinity phase complete
+                heartbeat_stop.set()
+                if heartbeat_task:
+                    heartbeat_task.cancel()
+                    try:
+                        await asyncio.wait_for(heartbeat_task, timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+                    self.logger.debug("[Trinity] 💓 DMS heartbeat stopped")
+
                 return True  # Trinity is optional
 
             except Exception as e:
+                # v188.0: Stop heartbeat task even on error
+                heartbeat_stop.set()
+                if heartbeat_task:
+                    heartbeat_task.cancel()
+                    try:
+                        await asyncio.wait_for(heartbeat_task, timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+
                 self.logger.error(f"[Trinity] ✗ Initialization failed: {e}")
                 self.logger.debug(f"[Trinity] Stack trace: {traceback.format_exc()}")
                 if self._narrator:

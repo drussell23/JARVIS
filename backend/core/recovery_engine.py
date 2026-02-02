@@ -308,3 +308,25 @@ class RecoveryEngine:
         if component in self._attempt_count:
             logger.debug(f"Resetting attempt count for {component}")
             del self._attempt_count[component]
+
+
+# =============================================================================
+# Factory Function
+# =============================================================================
+
+def get_recovery_engine(registry: ComponentRegistry) -> RecoveryEngine:
+    """
+    Factory function for RecoveryEngine.
+
+    Creates a RecoveryEngine with a default ErrorClassifier.
+    This provides a consistent way to instantiate the recovery engine
+    across the codebase.
+
+    Args:
+        registry: ComponentRegistry for component lookups
+
+    Returns:
+        RecoveryEngine instance configured with default error classifier
+    """
+    classifier = ErrorClassifier()
+    return RecoveryEngine(registry, classifier)

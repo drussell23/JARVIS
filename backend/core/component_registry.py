@@ -267,3 +267,17 @@ class ComponentRegistry:
 def get_component_registry() -> ComponentRegistry:
     """Get the global ComponentRegistry instance."""
     return ComponentRegistry.get_instance()
+
+
+# Alias for enterprise_hooks compatibility
+def get_registry() -> ComponentRegistry:
+    """
+    Alias for get_component_registry.
+
+    Provides consistent naming with other enterprise factory functions
+    (get_recovery_engine, get_capability_router, etc.)
+
+    Returns:
+        Global ComponentRegistry instance
+    """
+    return ComponentRegistry.get_instance()
