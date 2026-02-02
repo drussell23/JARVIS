@@ -36,7 +36,7 @@ aiohttp==3.9.1
 requests==2.31.0
 
 # RAG dependencies
-sentence-transformers==2.2.2
+sentence-transformers==5.2.2
 faiss-cpu==1.7.4
 chromadb==0.4.22
 tiktoken==0.5.2
