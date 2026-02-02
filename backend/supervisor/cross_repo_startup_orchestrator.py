@@ -717,6 +717,10 @@ _CLOUD_LOCK_FILE = Path.home() / ".jarvis" / "trinity" / "cloud_lock.json"
 _trinity_gcp_prewarm_task: Optional[asyncio.Task] = None
 _trinity_gcp_ready_event: Optional[asyncio.Event] = None
 _trinity_cloud_locked: bool = False
+
+# v193.2: Background GCP retry task tracking to prevent duplicates
+_background_gcp_retry_task: Optional[asyncio.Task] = None
+_background_gcp_retry_lock = threading.Lock()
 _trinity_protocol_active: bool = False
 
 # v148.0: Continuous GCP VM Health Monitor state
@@ -1441,6 +1445,50 @@ async def _background_gcp_retry_for_hollow_client(
             "status": "hollow_client_no_inference",
         }
     )
+
+
+def _start_background_gcp_retry_if_needed() -> None:
+    """
+    v193.2: Start background GCP retry task with duplicate prevention.
+
+    This function ensures only ONE background retry task runs at a time.
+    If a retry task is already running, this is a no-op.
+
+    This prevents the "VM creation blocked: another creation in progress" error
+    when multiple code paths try to start background retry tasks.
+    """
+    global _background_gcp_retry_task
+
+    with _background_gcp_retry_lock:
+        # Check if task already exists and is still running
+        if _background_gcp_retry_task is not None:
+            if not _background_gcp_retry_task.done():
+                logger.info(
+                    "[v193.2] Background GCP retry task already running - skipping duplicate start"
+                )
+                return
+            else:
+                # Previous task finished - clear reference
+                _background_gcp_retry_task = None
+
+        # Check if GCP is already available
+        if _active_rescue_gcp_ready and _active_rescue_gcp_endpoint:
+            logger.info(
+                f"[v193.2] GCP already available at {_active_rescue_gcp_endpoint} - "
+                f"no background retry needed"
+            )
+            return
+
+        # Start new background retry task
+        try:
+            _background_gcp_retry_task = asyncio.create_task(
+                _background_gcp_retry_for_hollow_client(),
+                name="background-gcp-retry"
+            )
+            logger.info("[v193.2] Started background GCP retry task")
+        except RuntimeError as e:
+            # No event loop running
+            logger.warning(f"[v193.2] Cannot start background GCP retry: {e}")
 
 
 def start_trinity_gcp_prewarm() -> Optional[asyncio.Task]:
@@ -17806,8 +17854,8 @@ echo "=== JARVIS Prime started ==="
                         f"to prevent OOM from local model loading on {psutil.virtual_memory().total / (1024**3):.1f}GB system"
                     )
 
-                    # Start background task to retry GCP provisioning
-                    asyncio.create_task(_background_gcp_retry_for_hollow_client())
+                    # v193.2: Start background task to retry GCP provisioning (with duplicate prevention)
+                    _start_background_gcp_retry_if_needed()
 
                     await _emit_event(
                         "ACTIVE_RESCUE_GCP_UNAVAILABLE",

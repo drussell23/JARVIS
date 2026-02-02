@@ -621,6 +621,15 @@ class GCPVMManager:
         self._vm_lock = asyncio.Lock()  # Protect VM state modifications
         self._init_lock = asyncio.Lock()  # Protect initialization
 
+        # v193.2: Smart VM creation waiting - prevents "blocked: another creation in progress" errors
+        # When multiple callers try to create a VM concurrently (e.g., main startup + background retry),
+        # the second caller should WAIT for the first creation to complete instead of failing immediately.
+        # _creation_event: Set when a creation completes (success or failure)
+        # _creation_result: Stores the result of the in-progress creation for waiting callers
+        self._creation_event: Optional[asyncio.Event] = None
+        self._creation_result: Optional[VMInstance] = None
+        self._creation_error: Optional[str] = None
+
         # v9.0: Quota cache to avoid repeated API calls
         self._quota_cache: Dict[str, QuotaInfo] = {}
         self._quota_cache_lock = asyncio.Lock()
@@ -1828,22 +1837,85 @@ class GCPVMManager:
         logger.info(f"   Quota check: {quota_check.message}")
 
         # ═══════════════════════════════════════════════════════════════════════════
-        # v193.0: DUPLICATE CREATION GUARD
+        # v193.2: SMART VM CREATION WITH CONCURRENT REQUEST HANDLING
         # ═══════════════════════════════════════════════════════════════════════════
-        # Use creating_vms dict to track ongoing creations and prevent duplicates.
-        # This fixes a race condition where multiple concurrent calls could each
-        # create a VM because should_create_vm() was never populated with tracking.
+        # When multiple callers try to create a VM concurrently (e.g., main startup
+        # path + background GCP retry task), instead of blocking the second caller
+        # with an error, we make it WAIT for the first creation to complete and
+        # return that result. This prevents "VM_CREATE_FAILED: create_vm returned None"
+        # errors during Trinity protocol initialization.
+        #
+        # Smart waiting behavior:
+        # - First caller: Creates the VM, other callers wait for result
+        # - Waiting callers: Get the same VM instance (or error) as the first caller
+        # - Timeout: Waiting callers give up after 5 minutes (configurable)
         # ═══════════════════════════════════════════════════════════════════════════
         creation_id = f"create_{int(time.time() * 1000)}"
+        wait_timeout = float(os.environ.get("GCP_VM_CREATION_WAIT_TIMEOUT", "300.0"))
+        wait_event: Optional[asyncio.Event] = None
+        should_wait = False
+
         async with self._vm_lock:
             if self.creating_vms:
-                logger.warning(
-                    f"🚫 VM creation blocked: another creation in progress "
-                    f"({list(self.creating_vms.keys())})"
+                existing_creation_ids = list(self.creating_vms.keys())
+                logger.info(
+                    f"⏳ VM creation already in progress ({existing_creation_ids}). "
+                    f"Waiting up to {wait_timeout}s for it to complete..."
+                )
+
+                # Get or create the event to wait on
+                if self._creation_event is None:
+                    self._creation_event = asyncio.Event()
+
+                # Release lock and wait for creation to complete
+                wait_event = self._creation_event
+                should_wait = True
+
+        # If we found an in-progress creation, wait for it
+        if should_wait and wait_event is not None:
+            try:
+                await asyncio.wait_for(wait_event.wait(), timeout=wait_timeout)
+
+                # Check the result of the creation we waited for
+                async with self._vm_lock:
+                    if self._creation_result is not None:
+                        logger.info(
+                            f"✅ Waited for in-progress creation: got VM {self._creation_result.name}"
+                        )
+                        return self._creation_result
+                    elif self._creation_error:
+                        logger.warning(
+                            f"⚠️ In-progress creation failed: {self._creation_error}"
+                        )
+                        return None
+                    else:
+                        # Creation completed but no result - shouldn't happen
+                        logger.warning("⚠️ In-progress creation completed with no result")
+                        return None
+
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"⏰ Timed out waiting {wait_timeout}s for in-progress VM creation. "
+                    f"The other creation may still be running."
                 )
                 return None
-            # Mark that we're creating
-            self.creating_vms[creation_id] = None  # Task will be set if needed
+
+        # Re-acquire lock to mark ourselves as creating
+        async with self._vm_lock:
+            # Double-check no one snuck in
+            if self.creating_vms:
+                logger.warning(
+                    f"🚫 Race condition: another creation started while we waited. "
+                    f"Deferring to: {list(self.creating_vms.keys())}"
+                )
+                return None
+
+            # Mark that we're creating and reset the event
+            self.creating_vms[creation_id] = None
+            self._creation_event = asyncio.Event()
+            self._creation_result = None
+            self._creation_error = None
+            logger.debug(f"[v193.2] Starting VM creation: {creation_id}")
 
         # ═══════════════════════════════════════════════════════════════════════════
         # v1.0: Try to acquire GCP VM creation lock (best-effort, non-blocking)
@@ -2020,11 +2092,31 @@ class GCPVMManager:
 
             return None
         finally:
-            # v193.0: Always clean up creation tracking to prevent blocking future creations
+            # v193.2: Clean up creation tracking AND signal waiting callers
             async with self._vm_lock:
                 if creation_id in self.creating_vms:
                     del self.creating_vms[creation_id]
-                    logger.debug(f"[v193.0] Cleared VM creation guard: {creation_id}")
+                    logger.debug(f"[v193.2] Cleared VM creation guard: {creation_id}")
+
+                # Store result for waiting callers
+                # Note: vm_instance is set on SUCCESS, last_error is set on FAILURE
+                # But last_error might also be set from earlier retry attempts even on success
+                self._creation_result = vm_instance
+                if vm_instance is not None:
+                    # Success - clear any error from previous attempts
+                    self._creation_error = None
+                elif last_error:
+                    self._creation_error = str(last_error)
+                else:
+                    self._creation_error = "VM creation failed (unknown reason)"
+
+                # Signal waiting callers that creation is complete
+                if self._creation_event:
+                    self._creation_event.set()
+                    logger.debug(
+                        f"[v193.2] Signaled creation complete: "
+                        f"success={vm_instance is not None}, error={self._creation_error}"
+                    )
 
     async def _record_vm_creation_safe(
         self,
