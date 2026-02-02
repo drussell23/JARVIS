@@ -1,12 +1,54 @@
 {
-  "workflow_name": "Test JARVIS",
-  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/21607004182",
-  "branch": "main",
-  "commit_sha": "30c3585",
-  "run_number": 2619,
-  "failed_count": 0,
-  "fix_branch": "fix/ci/test-jarvis-run2619-20260202-230423",
-  "pr_title": "\ud83d\udea8 Fix CI/CD: Test JARVIS (Run #2619)",
-  "analyses": [],
-  "timestamp": "2026-02-02T23:04:23.560709"
+  "workflow_name": "PR Automation & Validation",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/21609452545",
+  "branch": "fix/ci/test-jarvis-run2619-20260202-230423",
+  "commit_sha": "c401cb4",
+  "run_number": 1794,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/pr-automation-validation-run1794-20260202-230916",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: PR Automation & Validation (Run #1794)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 29,
+              "content": "2026-02-02T23:05:50.3893775Z   subjectPatternError: The PR title must start with a capital letter.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 41,
+              "content": "2026-02-02T23:05:50.9204504Z ##[error]No release type found in pull request title \"\ud83d\udea8 Fix CI/CD: Test JARVIS (Run #2619)\". Add a prefix to indicate what kind of release this pull request corresponds to. For reference, see https://www.conventionalcommits.org/",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 2
+        },
+        {
+          "pattern": "timeout|timed out",
+          "matches": [
+            {
+              "line_number": 33,
+              "content": "- fix: Resolve database connection timeout",
+              "severity": "medium",
+              "emoji": "\u23f1\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations",
+        "Check service availability and network connectivity"
+      ],
+      "severity": "high",
+      "category": "timeout",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-02-02T23:09:16.855205"
 }
