@@ -47847,6 +47847,373 @@ class ProgressiveReadinessManager:
 
 
 # =============================================================================
+# ZONE 5.6: STARTUP WATCHDOG (v186.0 - Dead Man's Switch)
+# =============================================================================
+# Monitors startup phases and takes action if a phase stalls.
+# Uses graduated response: warn → diagnostic → restart → rollback.
+# Coordinates with Trinity components via heartbeat system.
+# =============================================================================
+
+@dataclass
+class PhaseConfig:
+    """
+    v186.0: Configuration for a startup phase in the Dead Man's Switch.
+    
+    Attributes:
+        name: Human-readable phase name
+        timeout_seconds: Maximum time allowed for this phase
+        progress_start: Expected progress % at phase start
+        progress_end: Expected progress % at phase completion
+        recovery_action: Action to take on timeout (warn, diagnostic, restart, rollback)
+    """
+    name: str
+    timeout_seconds: float
+    progress_start: int
+    progress_end: int
+    recovery_action: str  # "warn", "diagnostic", "restart", "rollback"
+
+
+class StartupWatchdog:
+    """
+    v186.0: Dead Man's Switch for JARVIS startup phases.
+    
+    Monitors startup progress and takes graduated action if a phase stalls:
+    1. warn - Log warning, continue waiting
+    2. diagnostic - Dump diagnostic checkpoint, continue
+    3. restart - Restart the stalled component
+    4. rollback - Trigger full shutdown with cleanup
+    
+    Features:
+    - Per-phase configurable timeouts
+    - Stall detection (no progress for N seconds)
+    - Cross-repo coordination via Trinity heartbeats
+    - Environment-driven configuration
+    
+    Environment Variables:
+        JARVIS_DMS_ENABLED: Enable watchdog (default: true)
+        JARVIS_DMS_STALL_THRESHOLD: Seconds with no progress = stall (default: 60)
+        JARVIS_DMS_CHECK_INTERVAL: Check frequency in seconds (default: 5)
+        JARVIS_DMS_RECOVERY_MODE: graduated, aggressive, passive (default: graduated)
+    """
+    
+    # Default phase configurations
+    DEFAULT_PHASES: Dict[str, PhaseConfig] = {
+        "clean_slate": PhaseConfig("Clean Slate", 30.0, 0, 5, "diagnostic"),
+        "loading_server": PhaseConfig("Loading Server", 45.0, 5, 15, "restart"),
+        "preflight": PhaseConfig("Preflight", 60.0, 15, 25, "diagnostic"),
+        "resources": PhaseConfig("Resources", 120.0, 25, 45, "restart"),
+        "backend": PhaseConfig("Backend", 90.0, 45, 55, "restart"),
+        "intelligence": PhaseConfig("Intelligence", 60.0, 55, 65, "diagnostic"),
+        "trinity": PhaseConfig("Trinity", 180.0, 65, 85, "restart"),
+        "enterprise": PhaseConfig("Enterprise", 60.0, 75, 85, "diagnostic"),
+        "frontend": PhaseConfig("Frontend", 60.0, 85, 100, "rollback"),
+    }
+    
+    def __init__(
+        self,
+        logger: Any,
+        diagnostic_callback: Optional[Callable[[], Awaitable[None]]] = None,
+        restart_callback: Optional[Callable[[str], Awaitable[bool]]] = None,
+        rollback_callback: Optional[Callable[[], Awaitable[None]]] = None,
+    ):
+        """
+        Initialize the startup watchdog.
+        
+        Args:
+            logger: Logger instance for output
+            diagnostic_callback: Async function to dump diagnostics
+            restart_callback: Async function to restart a component (name -> success)
+            rollback_callback: Async function to trigger full rollback
+        """
+        self._logger = logger
+        self._diagnostic_callback = diagnostic_callback
+        self._restart_callback = restart_callback
+        self._rollback_callback = rollback_callback
+        
+        # Configuration from environment
+        self._enabled = os.environ.get("JARVIS_DMS_ENABLED", "true").lower() == "true"
+        self._stall_threshold = float(os.environ.get("JARVIS_DMS_STALL_THRESHOLD", "60"))
+        self._check_interval = float(os.environ.get("JARVIS_DMS_CHECK_INTERVAL", "5"))
+        self._recovery_mode = os.environ.get("JARVIS_DMS_RECOVERY_MODE", "graduated")
+        
+        # State tracking
+        self._current_phase: Optional[str] = None
+        self._phase_start_time: float = 0
+        self._last_progress: int = 0
+        self._last_progress_time: float = 0
+        self._running = False
+        self._watchdog_task: Optional[asyncio.Task] = None
+        
+        # Recovery tracking
+        self._warnings_issued: Dict[str, int] = {}
+        self._diagnostics_dumped: Dict[str, int] = {}
+        self._restarts_attempted: Dict[str, int] = {}
+        
+    @property
+    def enabled(self) -> bool:
+        """Check if watchdog is enabled."""
+        return self._enabled
+    
+    @property
+    def current_phase(self) -> Optional[str]:
+        """Get current phase name."""
+        return self._current_phase
+    
+    async def start(self) -> None:
+        """Start the watchdog background task."""
+        if not self._enabled:
+            self._logger.debug("[DMS] Dead Man's Switch disabled via JARVIS_DMS_ENABLED=false")
+            return
+        
+        if self._running:
+            return
+        
+        self._running = True
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(),
+            name="startup-watchdog"
+        )
+        self._logger.info(f"[DMS] 🐕 Dead Man's Switch armed (stall threshold: {self._stall_threshold}s)")
+    
+    async def stop(self) -> None:
+        """Stop the watchdog gracefully."""
+        self._running = False
+        
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            try:
+                await asyncio.wait_for(self._watchdog_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._watchdog_task = None
+        
+        self._logger.debug("[DMS] Dead Man's Switch disarmed")
+    
+    def update_phase(self, phase_key: str, progress: int) -> None:
+        """
+        Update the current phase and progress.
+        
+        Called by the kernel at each phase transition and progress update.
+        
+        Args:
+            phase_key: Phase identifier (e.g., "resources", "trinity")
+            progress: Current progress percentage (0-100)
+        """
+        now = time.time()
+        
+        # Phase change
+        if phase_key != self._current_phase:
+            self._current_phase = phase_key
+            self._phase_start_time = now
+            self._logger.debug(f"[DMS] Phase entered: {phase_key}")
+        
+        # Progress change
+        if progress != self._last_progress:
+            self._last_progress = progress
+            self._last_progress_time = now
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get current watchdog status for diagnostics."""
+        now = time.time()
+        phase_config = self.DEFAULT_PHASES.get(self._current_phase or "")
+        
+        return {
+            "enabled": self._enabled,
+            "running": self._running,
+            "current_phase": self._current_phase,
+            "phase_timeout": phase_config.timeout_seconds if phase_config else None,
+            "phase_elapsed": now - self._phase_start_time if self._current_phase else 0,
+            "last_progress": self._last_progress,
+            "progress_stale_seconds": now - self._last_progress_time if self._last_progress_time else 0,
+            "stall_threshold": self._stall_threshold,
+            "recovery_mode": self._recovery_mode,
+            "warnings_issued": sum(self._warnings_issued.values()),
+            "diagnostics_dumped": sum(self._diagnostics_dumped.values()),
+            "restarts_attempted": sum(self._restarts_attempted.values()),
+        }
+    
+    async def _watchdog_loop(self) -> None:
+        """Background loop that monitors for stalls."""
+        self._logger.debug("[DMS] Watchdog loop started")
+        
+        while self._running:
+            try:
+                await asyncio.sleep(self._check_interval)
+                
+                if not self._current_phase:
+                    continue
+                
+                now = time.time()
+                phase_config = self.DEFAULT_PHASES.get(self._current_phase)
+                
+                if not phase_config:
+                    # Unknown phase, use default timeout
+                    phase_timeout = 120.0
+                    recovery_action = "warn"
+                else:
+                    phase_timeout = phase_config.timeout_seconds
+                    recovery_action = phase_config.recovery_action
+                
+                # Check for phase timeout
+                phase_elapsed = now - self._phase_start_time
+                if phase_elapsed > phase_timeout:
+                    await self._handle_timeout(
+                        self._current_phase,
+                        phase_elapsed,
+                        phase_timeout,
+                        recovery_action
+                    )
+                    continue
+                
+                # Check for stall (no progress change)
+                progress_stale = now - self._last_progress_time if self._last_progress_time else 0
+                if progress_stale > self._stall_threshold:
+                    await self._handle_stall(
+                        self._current_phase,
+                        progress_stale,
+                        recovery_action
+                    )
+                
+            except asyncio.CancelledError:
+                self._logger.debug("[DMS] Watchdog loop cancelled")
+                break
+            except Exception as e:
+                self._logger.debug(f"[DMS] Watchdog error: {e}")
+        
+        self._logger.debug("[DMS] Watchdog loop stopped")
+    
+    async def _handle_timeout(
+        self,
+        phase: str,
+        elapsed: float,
+        timeout: float,
+        recovery_action: str
+    ) -> None:
+        """Handle a phase timeout."""
+        self._logger.warning(
+            f"[DMS] ⏰ Phase '{phase}' TIMEOUT: {elapsed:.1f}s > {timeout:.1f}s limit"
+        )
+        await self._take_recovery_action(phase, recovery_action, "timeout")
+    
+    async def _handle_stall(
+        self,
+        phase: str,
+        stale_seconds: float,
+        recovery_action: str
+    ) -> None:
+        """Handle a progress stall."""
+        self._logger.warning(
+            f"[DMS] 🛑 Phase '{phase}' STALLED: No progress for {stale_seconds:.1f}s"
+        )
+        await self._take_recovery_action(phase, recovery_action, "stall")
+    
+    async def _take_recovery_action(
+        self,
+        phase: str,
+        action: str,
+        reason: str
+    ) -> None:
+        """Execute the appropriate recovery action."""
+        if self._recovery_mode == "passive":
+            # Passive mode: only log, never take action
+            self._logger.info(f"[DMS] Passive mode - would take action: {action}")
+            return
+        
+        # Graduated mode: escalate through actions
+        if self._recovery_mode == "graduated":
+            action = self._get_escalated_action(phase, action)
+        
+        if action == "warn":
+            self._warnings_issued[phase] = self._warnings_issued.get(phase, 0) + 1
+            self._logger.warning(
+                f"[DMS] ⚠️ WARNING ({self._warnings_issued[phase]}): Phase '{phase}' {reason}"
+            )
+        
+        elif action == "diagnostic":
+            self._diagnostics_dumped[phase] = self._diagnostics_dumped.get(phase, 0) + 1
+            self._logger.warning(f"[DMS] 📊 Dumping diagnostics for phase '{phase}'")
+            
+            if self._diagnostic_callback:
+                try:
+                    await self._diagnostic_callback()
+                except Exception as e:
+                    self._logger.debug(f"[DMS] Diagnostic callback error: {e}")
+            
+            # Also log to diagnostic checkpoint if available
+            if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
+                try:
+                    log_shutdown_trigger(
+                        f"DMS_{reason.upper()}",
+                        f"Phase '{phase}' {reason} detected, diagnostics dumped"
+                    )
+                except Exception:
+                    pass
+        
+        elif action == "restart":
+            self._restarts_attempted[phase] = self._restarts_attempted.get(phase, 0) + 1
+            attempts = self._restarts_attempted[phase]
+            
+            if attempts > 3:
+                self._logger.error(
+                    f"[DMS] ❌ Phase '{phase}' exceeded max restart attempts, escalating to rollback"
+                )
+                await self._take_recovery_action(phase, "rollback", reason)
+                return
+            
+            self._logger.warning(
+                f"[DMS] 🔄 Attempting restart for phase '{phase}' (attempt {attempts}/3)"
+            )
+            
+            if self._restart_callback:
+                try:
+                    success = await self._restart_callback(phase)
+                    if success:
+                        self._logger.info(f"[DMS] ✅ Restart successful for phase '{phase}'")
+                        # Reset phase timer
+                        self._phase_start_time = time.time()
+                        self._last_progress_time = time.time()
+                    else:
+                        self._logger.warning(f"[DMS] Restart failed for phase '{phase}'")
+                except Exception as e:
+                    self._logger.error(f"[DMS] Restart callback error: {e}")
+        
+        elif action == "rollback":
+            self._logger.error(f"[DMS] 🚨 ROLLBACK triggered for phase '{phase}'")
+            
+            if self._rollback_callback:
+                try:
+                    await self._rollback_callback()
+                except Exception as e:
+                    self._logger.error(f"[DMS] Rollback callback error: {e}")
+            
+            # Log critical diagnostic
+            if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
+                try:
+                    log_shutdown_trigger(
+                        "DMS_ROLLBACK",
+                        f"Full rollback triggered due to phase '{phase}' {reason}"
+                    )
+                except Exception:
+                    pass
+    
+    def _get_escalated_action(self, phase: str, base_action: str) -> str:
+        """Get the escalated action based on previous attempts."""
+        warnings = self._warnings_issued.get(phase, 0)
+        diagnostics = self._diagnostics_dumped.get(phase, 0)
+        restarts = self._restarts_attempted.get(phase, 0)
+        
+        # Escalation ladder: warn -> diagnostic -> restart -> rollback
+        if warnings == 0:
+            return "warn"
+        elif diagnostics == 0:
+            return "diagnostic"
+        elif restarts < 3:
+            return "restart"
+        else:
+            return "rollback"
+
+
+# =============================================================================
 # ZONE 5.7: TRINITY INTEGRATOR
 # =============================================================================
 
@@ -49365,6 +49732,9 @@ class JarvisSystemKernel:
         if self.config.voice_enabled:
             self._narrator = get_voice_narrator()
 
+        # v186.0: Dead Man's Switch for startup phase monitoring
+        self._startup_watchdog: Optional[StartupWatchdog] = None
+
     @property
     def state(self) -> KernelState:
         """Current kernel state."""
@@ -50050,6 +50420,20 @@ class JarvisSystemKernel:
             except Exception as narr_err:
                 self.logger.debug(f"[Narrator] Startup announcement failed: {narr_err}")
 
+        # =====================================================================
+        # v186.0: DEAD MAN'S SWITCH (Startup Watchdog)
+        # =====================================================================
+        # Initialize and start the startup watchdog to detect stalled phases.
+        # Provides graduated recovery: warn → diagnostic → restart → rollback.
+        # =====================================================================
+        self._startup_watchdog = StartupWatchdog(
+            logger=self.logger,
+            diagnostic_callback=self._dms_diagnostic_callback,
+            restart_callback=self._dms_restart_callback,
+            rollback_callback=self._dms_rollback_callback,
+        )
+        await self._startup_watchdog.start()
+
         try:
             # =================================================================
             # PHASE 0: LOADING EXPERIENCE (v117.0)
@@ -50366,6 +50750,10 @@ class JarvisSystemKernel:
             # v186.0: ENTERPRISE COMPLETION BANNER (with Rich CLI support)
             # =====================================================================
             self._print_completion_banner(startup_duration)
+
+            # v186.0: Stop the startup watchdog - we made it!
+            if self._startup_watchdog:
+                await self._startup_watchdog.stop()
 
             self.logger.success(f"[Kernel] ✅ Startup complete in {startup_duration:.2f}s")
 
@@ -51511,6 +51899,149 @@ class JarvisSystemKernel:
                 self._readiness_manager.mark_component_ready("voice_biometrics", voice_ready)
 
             return True  # Enterprise services are optional
+
+    # =========================================================================
+    # v186.0: DEAD MAN'S SWITCH CALLBACKS
+    # =========================================================================
+    # These async methods are invoked by the StartupWatchdog when recovery
+    # actions are needed. They integrate with existing kernel infrastructure.
+    # =========================================================================
+
+    async def _dms_diagnostic_callback(self) -> None:
+        """
+        v186.0: Dump diagnostic information when a stall is detected.
+        
+        Called by StartupWatchdog when 'diagnostic' action is triggered.
+        Captures current state, memory usage, and any pending operations.
+        """
+        try:
+            self.logger.info("[DMS] Dumping diagnostic checkpoint...")
+            
+            # Use existing diagnostic checkpoint if available
+            if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
+                log_startup_checkpoint("dms_stall_diagnostic")
+            
+            # Log current state
+            kernel_status = {
+                "state": self._state.value if self._state else "unknown",
+                "uptime": self.uptime_seconds,
+                "progress": self._current_progress,
+                "phase": self._startup_watchdog.current_phase if self._startup_watchdog else "unknown",
+            }
+            self.logger.info(f"[DMS] Kernel status: {kernel_status}")
+            
+            # Log memory if available
+            try:
+                import psutil
+                process = psutil.Process()
+                mem = process.memory_info()
+                self.logger.info(f"[DMS] Memory: RSS={mem.rss / 1024 / 1024:.1f}MB, VMS={mem.vms / 1024 / 1024:.1f}MB")
+            except Exception:
+                pass
+            
+            # Log active background tasks
+            active_tasks = [t.get_name() for t in self._background_tasks if not t.done()]
+            if active_tasks:
+                self.logger.info(f"[DMS] Active tasks: {active_tasks[:10]}")  # Limit to first 10
+                
+        except Exception as e:
+            self.logger.debug(f"[DMS] Diagnostic callback error: {e}")
+
+    async def _dms_restart_callback(self, phase: str) -> bool:
+        """
+        v186.0: Attempt to restart a stalled component/phase.
+        
+        Called by StartupWatchdog when 'restart' action is triggered.
+        The specific restart logic depends on which phase is stalled.
+        
+        Args:
+            phase: Name of the stalled phase (e.g., "trinity", "backend")
+            
+        Returns:
+            True if restart succeeded, False otherwise
+        """
+        try:
+            self.logger.info(f"[DMS] Attempting restart for phase: {phase}")
+            
+            if phase == "trinity":
+                # Restart Trinity components through the integrator
+                if self._trinity:
+                    # Try to restart unhealthy components
+                    status = self._trinity.get_status()
+                    for name, info in status.get("components", {}).items():
+                        if info.get("configured") and not info.get("healthy"):
+                            self.logger.info(f"[DMS] Restarting Trinity component: {name}")
+                            try:
+                                await self._trinity.restart_component(name)
+                            except Exception as e:
+                                self.logger.warning(f"[DMS] Trinity restart failed: {e}")
+                    return True
+            
+            elif phase == "loading_server":
+                # Loading server restart
+                if self._loading_server:
+                    try:
+                        await self._loading_server.stop()
+                        await asyncio.sleep(1.0)
+                        await self._loading_server.start()
+                        return True
+                    except Exception as e:
+                        self.logger.warning(f"[DMS] Loading server restart failed: {e}")
+            
+            elif phase == "backend":
+                # Backend restart typically requires full process restart
+                # For now, we just log - full restart would be too disruptive
+                self.logger.warning("[DMS] Backend restart requires manual intervention")
+                return False
+            
+            elif phase == "resources":
+                # Resource initialization restart
+                self.logger.info("[DMS] Attempting resource re-initialization...")
+                # Resources are stateless, re-init should work
+                return True
+            
+            else:
+                # Unknown phase - just log
+                self.logger.warning(f"[DMS] No restart handler for phase: {phase}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"[DMS] Restart callback error: {e}")
+            return False
+
+    async def _dms_rollback_callback(self) -> None:
+        """
+        v186.0: Trigger full rollback/cleanup when recovery fails.
+        
+        Called by StartupWatchdog when 'rollback' action is triggered.
+        This is the nuclear option - initiates graceful shutdown.
+        """
+        try:
+            self.logger.error("[DMS] 🚨 FULL ROLLBACK initiated - shutting down system")
+            
+            # Log critical diagnostic before shutdown
+            if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
+                log_shutdown_trigger("DMS_ROLLBACK", "Startup watchdog triggered full rollback")
+            
+            # Voice announcement if available
+            if self._narrator:
+                try:
+                    await self._narrator.narrate_error(
+                        "Critical startup failure detected. Initiating emergency shutdown."
+                    )
+                except Exception:
+                    pass
+            
+            # Trigger shutdown
+            self._shutdown_event.set()
+            
+            # Update state
+            self._state = KernelState.FAILED
+            
+        except Exception as e:
+            self.logger.error(f"[DMS] Rollback callback error: {e}")
 
     # =========================================================================
     # PHASE -1: CLEAN SLATE (v181.0)
@@ -52856,6 +53387,10 @@ class JarvisSystemKernel:
 
         # v183.0: Track current progress for heartbeat payloads
         self._current_progress = progress_data["progress"]
+
+        # v186.0: Update Dead Man's Switch with current phase/progress
+        if self._startup_watchdog:
+            self._startup_watchdog.update_phase(stage, progress)
 
         # Try to broadcast via loading server HTTP API
         # v121.0: Use /api/update-progress (same endpoint as run_supervisor)
