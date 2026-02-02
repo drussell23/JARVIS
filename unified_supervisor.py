@@ -56724,6 +56724,7 @@ class JarvisSystemKernel:
     async def _initialize_websocket_hub(self) -> Dict[str, Any]:
         """
         v116.0: Initialize WebSocket hub for Trinity cross-repo communication.
+        v193.1: Added duplicate initialization prevention.
 
         Features:
         - Listens on port 8765 (configurable via JARVIS_WEBSOCKET_PORT)
@@ -56740,6 +56741,15 @@ class JarvisSystemKernel:
             "port": None,
             "topics": [],
         }
+
+        # v193.1: Check if already initialized (prevents duplicate startup)
+        if hasattr(self, '_websocket_coordinator') and self._websocket_coordinator is not None:
+            ws_port = int(os.getenv("JARVIS_WEBSOCKET_PORT", "8765"))
+            self.logger.debug(f"[WebSocket] Already initialized on port {ws_port}")
+            result["enabled"] = True
+            result["running"] = True
+            result["port"] = ws_port
+            return result
 
         # Check if WebSocket is explicitly disabled
         ws_enabled = os.getenv("JARVIS_WEBSOCKET_ENABLED", "true").lower() == "true"
