@@ -208,6 +208,7 @@ class RecoveryEngine:
         component: str,
         error: Exception,
         phase: RecoveryPhase,
+        context: Optional[Dict[str, Any]] = None,
     ) -> RecoveryAction:
         """
         Handle a component failure and determine recovery action.
@@ -216,6 +217,7 @@ class RecoveryEngine:
             component: Name of the failed component
             error: The exception that was raised
             phase: Whether this occurred during startup or runtime
+            context: Optional additional context for custom recovery handlers
 
         Returns:
             RecoveryAction describing what to do next
@@ -243,13 +245,16 @@ class RecoveryEngine:
         # Map error classifications to error type strings for custom handler lookup
         error_types_to_try = self._get_error_types(classification, error)
         for error_type in error_types_to_try:
-            context = {
+            # Merge caller context with internal context (caller takes precedence)
+            handler_context = {
                 "component": component,
                 "phase": phase.value,
                 "error_class": classification.error_class.value,
                 "attempt": self._attempt_count[component] + 1,
             }
-            if await self.try_custom_recovery(error_type, component, error, context):
+            if context:
+                handler_context.update(context)
+            if await self.try_custom_recovery(error_type, component, error, handler_context):
                 logger.info(f"Custom handler handled {error_type} for {component}")
                 return RecoveryAction(
                     strategy=RecoveryStrategy.CUSTOM_HANDLED,

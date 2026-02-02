@@ -104,7 +104,7 @@ Changelog:
     - Slim Mode + GCP Active = Hollow Client that routes to GCP
   - PART 2 ACTIVE RESCUE: GCP VM provisioned BEFORE spawning jarvis-prime on SLIM hardware
     - force_cloud_hybrid flag automatically set when profile is SLIM or CLOUD_ONLY
-    - ensure_gcp_vm_ready_for_prime() waits for GCP VM before spawn (async, timeout 120s)
+    - ensure_gcp_vm_ready_for_prime() waits for GCP VM before spawn (async, timeout from GCP_VM_STARTUP_TIMEOUT)
     - JARVIS_GCP_OFFLOAD_ACTIVE=true and GCP_PRIME_ENDPOINT injected to subprocess
     - On Exit -9 (OOM): NO LOCAL RESTART, force GCP provisioning first
     - OOM Death Handler triggers cloud rescue instead of local retry loop
@@ -1244,15 +1244,19 @@ def set_cloud_lock_after_oom(oom_count: int = 1, consecutive_ooms: int = 0) -> b
     )
 
 
-async def _background_gcp_prewarm_task(timeout: float = 180.0) -> None:
+async def _background_gcp_prewarm_task(timeout: Optional[float] = None) -> None:
     """
     v146.0: Background task that pre-warms the GCP VM.
+    v192.0: Timeout now uses GCP_VM_STARTUP_TIMEOUT env var by default.
 
     This runs in parallel with service startup, ensuring the GCP VM
     is ready by the time jarvis-prime needs it for inference.
 
     CRITICAL: This is NON-BLOCKING - it does not delay service startup.
     """
+    # v192.0: Use dynamic timeout from env var
+    if timeout is None:
+        timeout = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "300.0"))
     global _active_rescue_gcp_endpoint, _active_rescue_gcp_ready, _trinity_gcp_ready_event
 
     logger.info("[v146.0] 🔥 TRINITY PROTOCOL: Starting background GCP pre-warm...")
@@ -1336,9 +1340,10 @@ def start_trinity_gcp_prewarm() -> Optional[asyncio.Task]:
 
     _trinity_protocol_active = True
 
+    # v192.0: Use dynamic timeout from env var (no hardcode)
     # Create background task (NON-BLOCKING)
     _trinity_gcp_prewarm_task = asyncio.create_task(
-        _background_gcp_prewarm_task(timeout=180.0),
+        _background_gcp_prewarm_task(),  # Uses GCP_VM_STARTUP_TIMEOUT env var
         name="trinity_gcp_prewarm"
     )
 
@@ -1385,12 +1390,13 @@ def get_trinity_protocol_status() -> Dict[str, Any]:
 
 
 async def ensure_gcp_vm_ready_for_prime(
-    timeout_seconds: float = 120.0,
+    timeout_seconds: Optional[float] = None,
     force_provision: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """
     v144.0: Ensure GCP VM is ready for jarvis-prime inference offloading.
     v147.0: Enhanced with .env.gcp auto-loading and detailed diagnostics.
+    v192.0: Dynamic timeout calculation from environment variables.
 
     This function is called BEFORE spawning jarvis-prime on SLIM hardware.
     It either:
@@ -1398,7 +1404,9 @@ async def ensure_gcp_vm_ready_for_prime(
     - Provisions a new VM and waits for it to be ready (up to timeout)
 
     Args:
-        timeout_seconds: Maximum time to wait for VM to be ready
+        timeout_seconds: Maximum time to wait for VM to be ready.
+            If None, uses GCP_VM_STARTUP_TIMEOUT env var (default 300s).
+            Fresh provisioning automatically adds buffer time for model loading.
         force_provision: If True, provision new VM even if one exists
 
     Returns:
@@ -1406,6 +1414,18 @@ async def ensure_gcp_vm_ready_for_prime(
         - success=True: VM is ready, endpoint is valid
         - success=False: VM not available, endpoint is None
     """
+    # v192.0: Dynamic timeout calculation
+    # Priority: explicit param > env var > default
+    if timeout_seconds is None:
+        timeout_seconds = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "300.0"))
+        # If force_provision, add extra buffer for model loading
+        if force_provision:
+            model_load_buffer = float(os.environ.get("GCP_MODEL_LOAD_BUFFER", "120.0"))
+            timeout_seconds = timeout_seconds + model_load_buffer
+            logger.debug(
+                f"[v192.0] GCP timeout with model load buffer: {timeout_seconds:.0f}s "
+                f"(base: {timeout_seconds - model_load_buffer:.0f}s + buffer: {model_load_buffer:.0f}s)"
+            )
     global _active_rescue_gcp_endpoint, _active_rescue_gcp_ready
 
     # Check cache first (fast path)
@@ -2415,9 +2435,10 @@ async def _gcp_vm_health_monitor_loop(
                     
                     # Try to re-provision
                     try:
+                        # v192.0: Use dynamic timeout from GCP_VM_STARTUP_TIMEOUT (no hardcode)
                         success, new_endpoint = await ensure_gcp_vm_ready_for_prime(
                             force_provision=True,
-                            timeout_seconds=180.0,
+                            # timeout_seconds uses smart default with model load buffer
                         )
                         
                         if success:
@@ -7131,10 +7152,12 @@ class ProcessOrchestrator:
                 invalidate_active_rescue_cache()
 
                 # Force GCP provisioning
-                logger.info(f"[v144.0] ⏳ Provisioning GCP VM for jarvis-prime offload (timeout: 120s)...")
+                # v192.0: Use dynamic timeout from GCP_VM_STARTUP_TIMEOUT (no hardcode)
+                gcp_timeout = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "300.0"))
+                logger.info(f"[v192.0] ⏳ Provisioning GCP VM for jarvis-prime offload (timeout: {gcp_timeout:.0f}s)...")
                 gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
-                    timeout_seconds=120.0,
                     force_provision=True,  # Force new provisioning
+                    # timeout_seconds uses smart default with model load buffer
                 )
 
                 if gcp_ready and gcp_endpoint:
@@ -7300,9 +7323,10 @@ class ProcessOrchestrator:
                 f"(reason: {cloud_lock.get('reason', 'unknown')}). "
                 f"Ensuring GCP is ready before restart..."
             )
+            # v192.0: Use dynamic timeout from GCP_VM_STARTUP_TIMEOUT (no hardcode)
             gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
-                timeout_seconds=120.0,
                 force_provision=False,
+                # timeout_seconds uses smart default
             )
             if gcp_ready and gcp_endpoint:
                 os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
@@ -14338,8 +14362,11 @@ echo "=== JARVIS Prime started ==="
 
         try:
             # Step 1: Provision GCP VM (async, with timeout)
+            # v192.0: Proactive rescue uses shorter timeout (non-blocking check)
+            # This is intentionally shorter - proactive rescue should not block long
+            proactive_timeout = float(os.environ.get("GCP_PROACTIVE_RESCUE_TIMEOUT", "90.0"))
             gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
-                timeout_seconds=90.0,  # Shorter timeout for proactive rescue
+                timeout_seconds=proactive_timeout,
                 force_provision=False,
             )
 
@@ -14476,9 +14503,10 @@ echo "=== JARVIS Prime started ==="
                 logger.debug("[v149.0] Enterprise hooks not available, using legacy fallback")
 
             # Step 2: Provision GCP VM as primary fallback
+            # v192.0: Use dynamic timeout from GCP_VM_STARTUP_TIMEOUT (no hardcode)
             gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
-                timeout_seconds=120.0,
                 force_provision=False,
+                # timeout_seconds uses smart default
             )
 
             if gcp_ready and gcp_endpoint:
@@ -17143,9 +17171,10 @@ echo "=== JARVIS Prime started ==="
                 )
 
                 # Provision GCP VM (or use existing)
+                # v192.0: Use dynamic timeout from GCP_VM_STARTUP_TIMEOUT (no hardcode)
                 gcp_ready, gcp_endpoint = await ensure_gcp_vm_ready_for_prime(
-                    timeout_seconds=120.0,
                     force_provision=False,
+                    # timeout_seconds uses smart default
                 )
 
                 if gcp_ready and gcp_endpoint:

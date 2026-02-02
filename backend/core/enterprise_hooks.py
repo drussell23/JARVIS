@@ -419,7 +419,7 @@ async def handle_gcp_failure(
 
     # Handle failure through recovery engine
     result = await _RECOVERY_ENGINE.handle_failure(
-        component_name=ctx.component,
+        component=ctx.component,
         error=error,
         phase=phase,
         context={
@@ -472,7 +472,7 @@ async def handle_memory_pressure(
     )
 
     result = await _RECOVERY_ENGINE.handle_failure(
-        component_name="memory_monitor",
+        component="memory_monitor",
         error=error,
         phase=RecoveryPhase.RUNTIME,
         context={
