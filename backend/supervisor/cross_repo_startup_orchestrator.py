@@ -1665,7 +1665,7 @@ async def ensure_gcp_vm_ready_for_prime(
         active_vm = await vm_manager.get_active_vm()
 
         if active_vm and not force_provision:
-            # Verify VM is healthy
+            # Verify VM is healthy AND ready for inference
             is_healthy = await _verify_gcp_vm_health(active_vm.ip_address)
             if is_healthy:
                 endpoint = f"http://{active_vm.ip_address}:8000"
@@ -1699,9 +1699,24 @@ async def ensure_gcp_vm_ready_for_prime(
 
                 return True, endpoint
             else:
+                # v193.0: CRITICAL - Terminate stale VMs that can't serve inference
+                # These VMs are running but have the old startup script that doesn't
+                # return proper readiness fields. They waste money and cause timeouts.
                 logger.warning(
-                    f"[v144.0] ⚠️ Active Rescue: Existing VM {active_vm.ip_address} not healthy, will provision new"
+                    f"[v193.0] ⚠️ Active Rescue: Existing VM {active_vm.ip_address} is NOT inference-ready "
+                    f"(likely has old startup script). Terminating to avoid resource waste..."
                 )
+                try:
+                    vm_name = active_vm.name
+                    await vm_manager.terminate_vm(
+                        vm_name,
+                        reason="VM not inference-ready (old startup script format)"
+                    )
+                    logger.info(
+                        f"[v193.0] 🧹 Terminated stale VM '{vm_name}' - will provision new VM with updated startup script"
+                    )
+                except Exception as term_err:
+                    logger.warning(f"[v193.0] Could not terminate stale VM: {term_err}")
 
         # No healthy VM - need to provision
         logger.info(
@@ -1872,6 +1887,22 @@ async def ensure_gcp_vm_ready_for_prime(
             reason=f"GCP VM startup timeout ({timeout_seconds}s) - VM IP: {vm_ip}",
             gcp_attempts=1,
         )
+        
+        # v193.0: Automatically terminate failed VMs to prevent resource waste
+        # The VM is billed whether it works or not - clean up failed ones
+        if vm_name:
+            try:
+                logger.info(f"[v193.0] 🧹 Terminating failed VM '{vm_name}' to prevent resource waste...")
+                await vm_manager.terminate_vm(
+                    vm_name, 
+                    reason=f"Health check timeout after {timeout_seconds}s"
+                )
+                logger.info(f"[v193.0] ✅ Failed VM '{vm_name}' terminated")
+            except Exception as term_err:
+                logger.warning(
+                    f"[v193.0] ⚠️ Could not terminate failed VM '{vm_name}': {term_err}. "
+                    f"Manual cleanup may be required."
+                )
 
         return False, None
 
@@ -1923,6 +1954,12 @@ async def _verify_gcp_vm_health(
     v144.0: Verify GCP VM is reachable and healthy.
     v147.0: Fixed port mismatch - now checks both 8000 and 8010 (startup script uses 8010)
     v148.0: Added optional inference validation to ensure actual inference works
+    v193.0: CRITICAL - Now validates model readiness, not just HTTP status!
+           Old code only checked HTTP 200, so stale VMs with wrong health format
+           would pass and then cause timeouts later. Now we check for:
+           - model_loaded: true AND ready_for_inference: true (new format)
+           - mode: "inference" AND status: "healthy" (backward compat)
+           This ensures we don't reuse VMs that can't actually serve inference.
 
     Args:
         ip_address: IP address of the VM
@@ -1930,11 +1967,12 @@ async def _verify_gcp_vm_health(
         validate_inference: If True, also validates inference capability (slower but thorough)
 
     Returns:
-        True if VM is healthy (and inference works if validate_inference=True), False otherwise
+        True if VM is healthy AND ready for inference, False otherwise
     """
     # v147.0: Check both ports - startup script uses 8010, but some configs use 8000
     ports_to_check = [8000, 8010]
     working_port = None
+    is_inference_ready = False
     
     for port in ports_to_check:
         try:
@@ -1946,9 +1984,57 @@ async def _verify_gcp_vm_health(
                     timeout=aiohttp.ClientTimeout(total=timeout)
                 ) as response:
                     if response.status == 200:
-                        logger.info(f"[v147.0] ✅ GCP VM health check passed: {health_url}")
-                        working_port = port
-                        break
+                        try:
+                            data = await response.json()
+                        except Exception:
+                            data = {}
+                        
+                        # v193.0: CRITICAL - Validate actual model readiness
+                        # Check for explicit readiness fields
+                        model_loaded = data.get("model_loaded", False)
+                        ready_for_inference = data.get("ready_for_inference", False)
+                        status = data.get("status", "")
+                        phase = data.get("phase", "")
+                        mode = data.get("mode", "")
+                        
+                        # Method 1: New format with explicit readiness fields
+                        if model_loaded and ready_for_inference:
+                            logger.info(
+                                f"[v193.0] ✅ GCP VM model ready: {health_url} "
+                                f"(model_loaded=True, ready_for_inference=True)"
+                            )
+                            working_port = port
+                            is_inference_ready = True
+                            break
+                        
+                        # Method 2: New format with phase=ready
+                        if status == "healthy" and phase == "ready":
+                            logger.info(
+                                f"[v193.0] ✅ GCP VM phase ready: {health_url} "
+                                f"(status=healthy, phase=ready)"
+                            )
+                            working_port = port
+                            is_inference_ready = True
+                            break
+                        
+                        # Method 3: Backward compat - mode="inference" means real server
+                        if mode == "inference" and status == "healthy":
+                            logger.info(
+                                f"[v193.0] ✅ GCP VM inference mode: {health_url} "
+                                f"(mode=inference, status=healthy)"
+                            )
+                            working_port = port
+                            is_inference_ready = True
+                            break
+                        
+                        # If none of the above, the VM is running but NOT ready for inference
+                        # This is the case for stub/ultra-stub modes or VMs with old scripts
+                        logger.warning(
+                            f"[v193.0] ⚠️ GCP VM responding but NOT inference-ready: {health_url} "
+                            f"(status={status}, phase={phase}, mode={mode}, "
+                            f"model_loaded={model_loaded}, ready_for_inference={ready_for_inference})"
+                        )
+                        # Don't break - maybe another port has the real inference server
                     else:
                         logger.debug(f"[v147.0] Health check {health_url} returned status {response.status}")
         except asyncio.TimeoutError:
@@ -1958,7 +2044,16 @@ async def _verify_gcp_vm_health(
         except Exception as e:
             logger.debug(f"[v147.0] Health check error {ip_address}:{port}: {e}")
 
-    if working_port is None:
+    # v193.0: CRITICAL - Only return True if VM is actually ready for inference
+    # Previously we returned True if ANY port responded with HTTP 200
+    # Now we only return True if the VM is in a ready-for-inference state
+    if not is_inference_ready:
+        if working_port is not None:
+            logger.warning(
+                f"[v193.0] ❌ GCP VM {ip_address} is RUNNING but NOT INFERENCE-READY. "
+                f"This VM has the old health format and cannot serve inference. "
+                f"Will provision a new VM instead."
+            )
         return False
     
     # v148.0: Optional inference validation - ensures the VM can actually process requests
@@ -2140,6 +2235,9 @@ async def _check_gcp_vm_readiness(
                     startup_step = data.get("step") or data.get("message", "")
 
                     # v189.0: Intelligent state determination
+                    # v193.0: Also check 'mode' field for backward compatibility
+                    mode = data.get("mode", "")
+                    
                     # Priority 1: Check explicit model readiness fields
                     if model_loaded and ready_for_inference:
                         logger.info(f"[v189.0] ✅ GCP VM fully ready: model_loaded=True, ready_for_inference=True")
@@ -2149,6 +2247,18 @@ async def _check_gcp_vm_readiness(
                             status_text="ready_for_inference",
                             phase=phase,
                             startup_elapsed=startup_elapsed,
+                            raw_data=data
+                        )
+                    
+                    # v193.0: Priority 1.5: Check mode="inference" as sign of readiness
+                    # This provides backward compatibility with older GCP VMs
+                    if mode == "inference" and status == "healthy":
+                        logger.info(f"[v193.0] ✅ GCP VM ready: mode=inference, status=healthy")
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text="inference_ready",
+                            phase=phase or "ready",
                             raw_data=data
                         )
 
@@ -2191,6 +2301,21 @@ async def _check_gcp_vm_readiness(
                             startup_elapsed=startup_elapsed,
                             startup_step=startup_step,
                             startup_progress=progress_pct,
+                            raw_data=data
+                        )
+                    
+                    # v193.0: Priority 3.5: Check for stub modes (ultra-stub, stub)
+                    # These indicate the VM is booting and running intermediate servers
+                    if mode in ("stub", "ultra-stub"):
+                        logger.debug(
+                            f"[v193.0] ⏳ GCP VM in stub mode: mode={mode}, status={status}"
+                        )
+                        return HealthCheckResult(
+                            state=HealthState.STARTING,
+                            is_responding=True,
+                            status_text=f"stub_mode_{mode}",
+                            phase="starting",
+                            startup_step=f"Running {mode} server - full setup in progress",
                             raw_data=data
                         )
 
@@ -2915,14 +3040,6 @@ class GlobalSpawnCoordinator:
         """
         state = self._get_state(service_name)
 
-        # #region agent log
-        try:
-            import json as _json
-            with open("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"cross_repo_startup_orchestrator.py:should_attempt_spawn","message":"spawn_check_state","data":{"service":service_name,"is_spawning":state["is_spawning"],"is_ready":state["is_ready"],"pid":state.get("pid"),"component":component_name},"timestamp":int(time.time()*1000)}) + "\n")
-        except: pass
-        # #endregion
-
         # Check if already spawning
         if state["is_spawning"]:
             return (
@@ -2932,13 +3049,6 @@ class GlobalSpawnCoordinator:
 
         # Check if already ready
         if state["is_ready"]:
-            # #region agent log
-            try:
-                import json as _json
-                with open("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"cross_repo_startup_orchestrator.py:should_attempt_spawn:BLOCKED","message":"spawn_blocked_already_ready","data":{"service":service_name,"is_ready":True,"pid":state.get("pid"),"last_success":state.get("last_spawn_success")},"timestamp":int(time.time()*1000)}) + "\n")
-            except: pass
-            # #endregion
             return (False, "Service already ready")
 
         # Check cooldown
@@ -2993,13 +3103,6 @@ class GlobalSpawnCoordinator:
         port: Optional[int] = None,
     ) -> None:
         """Mark a service as ready (spawn completed successfully)."""
-        # #region agent log
-        try:
-            import json as _json
-            with open("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"cross_repo_startup_orchestrator.py:mark_ready","message":"mark_ready_called","data":{"service":service_name,"pid":pid,"port":port},"timestamp":int(time.time()*1000)}) + "\n")
-        except: pass
-        # #endregion
         with self._state_lock:
             state = self._get_state(service_name)
             state["is_spawning"] = False
@@ -3029,13 +3132,6 @@ class GlobalSpawnCoordinator:
 
     def mark_stopped(self, service_name: str) -> None:
         """Mark a service as stopped (allows respawn)."""
-        # #region agent log
-        try:
-            import json as _json
-            with open("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"cross_repo_startup_orchestrator.py:mark_stopped","message":"mark_stopped_called","data":{"service":service_name},"timestamp":int(time.time()*1000)}) + "\n")
-        except: pass
-        # #endregion
         with self._state_lock:
             state = self._get_state(service_name)
             state["is_ready"] = False
@@ -7311,15 +7407,6 @@ class ProcessOrchestrator:
             # This is CRITICAL - without this, restart attempts fail with "Service already ready"
             mark_service_stopped(service_name)
             
-            # #region agent log
-            try:
-                import json as _json
-                coord = get_spawn_coordinator()
-                state = coord._get_state(service_name)
-                with open("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"cross_repo_startup_orchestrator.py:OOM_DETECTED","message":"oom_detected_coordinator_cleared","data":{"service":service_name,"pid":managed.pid,"is_ready_after_clear":state.get("is_ready"),"is_spawning":state.get("is_spawning"),"mark_stopped_called":True},"timestamp":int(time.time()*1000)}) + "\n")
-            except: pass
-            # #endregion
             # Flag for GCP-assisted restart
             managed._oom_detected = True
 
@@ -19518,14 +19605,6 @@ echo "=== JARVIS Prime started ==="
             logger.error(f"Error stopping {managed.definition.name}: {e}")
 
         managed.status = ServiceStatus.STOPPED
-
-        # #region agent log
-        try:
-            import json as _json
-            with open("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"cross_repo_startup_orchestrator.py:_stop_service:AFTER_KILL","message":"service_stopped_coordinator_notified","data":{"service":managed.definition.name,"pid":managed.pid,"status":"STOPPED","mark_stopped_called":True},"timestamp":int(time.time()*1000)}) + "\n")
-        except: pass
-        # #endregion
 
         # v193.0: FIX - Clear the GlobalSpawnCoordinator state when service stops
         # This allows the service to be respawned. Previously this was missing,

@@ -1828,6 +1828,24 @@ class GCPVMManager:
         logger.info(f"   Quota check: {quota_check.message}")
 
         # ═══════════════════════════════════════════════════════════════════════════
+        # v193.0: DUPLICATE CREATION GUARD
+        # ═══════════════════════════════════════════════════════════════════════════
+        # Use creating_vms dict to track ongoing creations and prevent duplicates.
+        # This fixes a race condition where multiple concurrent calls could each
+        # create a VM because should_create_vm() was never populated with tracking.
+        # ═══════════════════════════════════════════════════════════════════════════
+        creation_id = f"create_{int(time.time() * 1000)}"
+        async with self._vm_lock:
+            if self.creating_vms:
+                logger.warning(
+                    f"🚫 VM creation blocked: another creation in progress "
+                    f"({list(self.creating_vms.keys())})"
+                )
+                return None
+            # Mark that we're creating
+            self.creating_vms[creation_id] = None  # Task will be set if needed
+
+        # ═══════════════════════════════════════════════════════════════════════════
         # v1.0: Try to acquire GCP VM creation lock (best-effort, non-blocking)
         # This prevents duplicate VMs when multiple processes try to create simultaneously
         # ═══════════════════════════════════════════════════════════════════════════
@@ -1843,163 +1861,170 @@ class GCPVMManager:
         last_error = None
         vm_instance = None
 
-        while attempt < self.config.max_create_attempts:
-            attempt += 1
-            try:
-                # Generate unique VM name
-                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                vm_name = f"{self.config.vm_name_prefix}-{timestamp}"
+        try:
+            while attempt < self.config.max_create_attempts:
+                attempt += 1
+                try:
+                    # Generate unique VM name
+                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    vm_name = f"{self.config.vm_name_prefix}-{timestamp}"
 
-                logger.info(
-                    f"🔨 Attempt {attempt}/{self.config.max_create_attempts}: Creating VM '{vm_name}'"
-                )
+                    logger.info(
+                        f"🔨 Attempt {attempt}/{self.config.max_create_attempts}: Creating VM '{vm_name}'"
+                    )
 
-                # Build VM configuration
-                instance_config = self._build_instance_config(
-                    vm_name=vm_name,
-                    components=components,
-                    trigger_reason=trigger_reason,
-                    metadata=metadata or {},
-                )
+                    # Build VM configuration
+                    instance_config = self._build_instance_config(
+                        vm_name=vm_name,
+                        components=components,
+                        trigger_reason=trigger_reason,
+                        metadata=metadata or {},
+                    )
 
-                # Create the VM (async operation)
-                operation = await asyncio.to_thread(
-                    self.instances_client.insert,
-                    project=self.config.project_id,
-                    zone=self.config.zone,
-                    instance_resource=instance_config,
-                )
+                    # Create the VM (async operation)
+                    operation = await asyncio.to_thread(
+                        self.instances_client.insert,
+                        project=self.config.project_id,
+                        zone=self.config.zone,
+                        instance_resource=instance_config,
+                    )
 
-                logger.info(f"⏳ VM creation operation started: {operation.name}")
+                    logger.info(f"⏳ VM creation operation started: {operation.name}")
 
-                # Wait for operation to complete
-                await self._wait_for_operation(operation)
+                    # Wait for operation to complete
+                    await self._wait_for_operation(operation)
 
-                # Get the created instance
-                instance = await asyncio.to_thread(
-                    self.instances_client.get,
-                    project=self.config.project_id,
-                    zone=self.config.zone,
-                    instance=vm_name,
-                )
+                    # Get the created instance
+                    instance = await asyncio.to_thread(
+                        self.instances_client.get,
+                        project=self.config.project_id,
+                        zone=self.config.zone,
+                        instance=vm_name,
+                    )
 
-                # Extract IP addresses
-                ip_address = None
-                internal_ip = None
-                if instance.network_interfaces:
-                    internal_ip = instance.network_interfaces[0].network_i_p
-                    if instance.network_interfaces[0].access_configs:
-                        ip_address = instance.network_interfaces[0].access_configs[0].nat_i_p
+                    # Extract IP addresses
+                    ip_address = None
+                    internal_ip = None
+                    if instance.network_interfaces:
+                        internal_ip = instance.network_interfaces[0].network_i_p
+                        if instance.network_interfaces[0].access_configs:
+                            ip_address = instance.network_interfaces[0].access_configs[0].nat_i_p
 
-                # Create VMInstance tracking object
-                vm_instance = VMInstance(
-                    instance_id=str(instance.id),
-                    name=vm_name,
-                    zone=self.config.zone,
-                    state=VMState.RUNNING,
-                    created_at=time.time(),
-                    ip_address=ip_address,
-                    internal_ip=internal_ip,
-                    components=components,
-                    trigger_reason=trigger_reason,
-                    metadata=metadata or {},
-                )
+                    # Create VMInstance tracking object
+                    vm_instance = VMInstance(
+                        instance_id=str(instance.id),
+                        name=vm_name,
+                        zone=self.config.zone,
+                        state=VMState.RUNNING,
+                        created_at=time.time(),
+                        ip_address=ip_address,
+                        internal_ip=internal_ip,
+                        components=components,
+                        trigger_reason=trigger_reason,
+                        metadata=metadata or {},
+                    )
 
-                # Track the VM with lock protection
-                async with self._vm_lock:
-                    self.managed_vms[vm_name] = vm_instance
-                    self.stats["total_created"] += 1
-                    self.stats["current_active"] += 1
+                    # Track the VM with lock protection
+                    async with self._vm_lock:
+                        self.managed_vms[vm_name] = vm_instance
+                        self.stats["total_created"] += 1
+                        self.stats["current_active"] += 1
 
-                # Record in cost tracker (isolated error handling)
-                await self._record_vm_creation_safe(
-                    vm_instance=vm_instance,
-                    components=components,
-                    trigger_reason=trigger_reason,
-                    metadata=metadata,
-                )
+                    # Record in cost tracker (isolated error handling)
+                    await self._record_vm_creation_safe(
+                        vm_instance=vm_instance,
+                        components=components,
+                        trigger_reason=trigger_reason,
+                        metadata=metadata,
+                    )
 
-                # Circuit breaker success
-                circuit.record_success()
+                    # Circuit breaker success
+                    circuit.record_success()
 
-                logger.info(f"✅ VM created successfully: {vm_name}")
-                logger.info(f"   External IP: {ip_address or 'N/A'}")
-                logger.info(f"   Internal IP: {internal_ip or 'N/A'}")
-                logger.info(f"   Cost: ${vm_instance.cost_per_hour:.3f}/hour")
+                    logger.info(f"✅ VM created successfully: {vm_name}")
+                    logger.info(f"   External IP: {ip_address or 'N/A'}")
+                    logger.info(f"   Internal IP: {internal_ip or 'N/A'}")
+                    logger.info(f"   Cost: ${vm_instance.cost_per_hour:.3f}/hour")
 
-                return vm_instance
+                    return vm_instance
 
-            except Exception as e:
-                last_error = e
-                self.stats["retries"] += 1
-                self.stats["last_error"] = str(e)
-                self.stats["last_error_time"] = datetime.now().isoformat()
-                logger.error(f"❌ Attempt {attempt} failed: {e}")
-                
-                # v9.0: Detect quota exceeded errors and stop retrying immediately
-                is_quota_error, quota_name = self._is_quota_exceeded_error(e)
-                if is_quota_error:
-                    logger.error(f"🚫 QUOTA EXCEEDED ({quota_name}) - stopping retries immediately")
+                except Exception as e:
+                    last_error = e
+                    self.stats["retries"] += 1
+                    self.stats["last_error"] = str(e)
+                    self.stats["last_error_time"] = datetime.now().isoformat()
+                    logger.error(f"❌ Attempt {attempt} failed: {e}")
                     
-                    # Set cooldown to prevent future attempts
-                    self._quota_exceeded_until = time.time() + self._quota_cooldown_seconds
-                    self.stats["quota_blocks"] += 1
+                    # v9.0: Detect quota exceeded errors and stop retrying immediately
+                    is_quota_error, quota_name = self._is_quota_exceeded_error(e)
+                    if is_quota_error:
+                        logger.error(f"🚫 QUOTA EXCEEDED ({quota_name}) - stopping retries immediately")
+                        
+                        # Set cooldown to prevent future attempts
+                        self._quota_exceeded_until = time.time() + self._quota_cooldown_seconds
+                        self.stats["quota_blocks"] += 1
+                        
+                        # Update quota cache with exceeded status
+                        if quota_name:
+                            async with self._quota_cache_lock:
+                                self._quota_cache[quota_name] = QuotaInfo(
+                                    metric=quota_name,
+                                    limit=0,  # Unknown
+                                    usage=0,  # Unknown
+                                    region=self.config.region,
+                                )
+                                self._quota_cache[quota_name].is_exceeded = True  # Force exceeded
+                        
+                        # Report to rate limit manager
+                        if RATE_LIMIT_MANAGER_AVAILABLE:
+                            try:
+                                rate_manager = await get_rate_limit_manager()
+                                rate_manager.handle_quota_exceeded(GCPService.COMPUTE_ENGINE, quota_name)
+                            except Exception:
+                                pass
+                        
+                        # Don't retry - quotas won't change in seconds
+                        break
                     
-                    # Update quota cache with exceeded status
-                    if quota_name:
-                        async with self._quota_cache_lock:
-                            self._quota_cache[quota_name] = QuotaInfo(
-                                metric=quota_name,
-                                limit=0,  # Unknown
-                                usage=0,  # Unknown
-                                region=self.config.region,
-                            )
-                            self._quota_cache[quota_name].is_exceeded = True  # Force exceeded
-                    
-                    # Report to rate limit manager
-                    if RATE_LIMIT_MANAGER_AVAILABLE:
-                        try:
-                            rate_manager = await get_rate_limit_manager()
-                            rate_manager.handle_quota_exceeded(GCPService.COMPUTE_ENGINE, quota_name)
-                        except Exception:
-                            pass
-                    
-                    # Don't retry - quotas won't change in seconds
-                    break
-                
-                # v9.0: Detect rate limit (429) errors
-                is_429 = "429" in str(e) or "too many requests" in str(e).lower()
-                if is_429:
-                    logger.error(f"🚫 RATE LIMITED (429) - entering cooldown")
-                    if RATE_LIMIT_MANAGER_AVAILABLE:
-                        try:
-                            rate_manager = await get_rate_limit_manager()
-                            rate_manager.handle_429_response(GCPService.COMPUTE_ENGINE)
-                        except Exception:
-                            pass
-                    # Still retry after cooldown
-                    await asyncio.sleep(60)  # 60 second cooldown for 429
+                    # v9.0: Detect rate limit (429) errors
+                    is_429 = "429" in str(e) or "too many requests" in str(e).lower()
+                    if is_429:
+                        logger.error(f"🚫 RATE LIMITED (429) - entering cooldown")
+                        if RATE_LIMIT_MANAGER_AVAILABLE:
+                            try:
+                                rate_manager = await get_rate_limit_manager()
+                                rate_manager.handle_429_response(GCPService.COMPUTE_ENGINE)
+                            except Exception:
+                                pass
+                        # Still retry after cooldown
+                        await asyncio.sleep(60)  # 60 second cooldown for 429
 
-                if attempt < self.config.max_create_attempts:
-                    delay = self.config.retry_delay_seconds * attempt
-                    logger.info(f"⏳ Retrying in {delay}s...")
-                    await asyncio.sleep(delay)
+                    if attempt < self.config.max_create_attempts:
+                        delay = self.config.retry_delay_seconds * attempt
+                        logger.info(f"⏳ Retrying in {delay}s...")
+                        await asyncio.sleep(delay)
 
-        # All attempts failed - record in circuit breaker
-        circuit.record_failure(last_error)
-        
-        self.stats["total_failed"] += 1
-        
-        # Check if this was a quota failure
-        is_quota_error, quota_name = self._is_quota_exceeded_error(last_error) if last_error else (False, None)
-        if is_quota_error:
-            logger.error(f"❌ VM creation failed due to quota: {quota_name}")
-            logger.error(f"   Cooldown active for {self._quota_cooldown_seconds}s")
-        else:
-            logger.error(f"❌ Failed to create VM after {self.config.max_create_attempts} attempts")
-            logger.error(f"   Last error: {last_error}")
+            # All attempts failed - record in circuit breaker
+            circuit.record_failure(last_error)
+            
+            self.stats["total_failed"] += 1
+            
+            # Check if this was a quota failure
+            is_quota_error, quota_name = self._is_quota_exceeded_error(last_error) if last_error else (False, None)
+            if is_quota_error:
+                logger.error(f"❌ VM creation failed due to quota: {quota_name}")
+                logger.error(f"   Cooldown active for {self._quota_cooldown_seconds}s")
+            else:
+                logger.error(f"❌ Failed to create VM after {self.config.max_create_attempts} attempts")
+                logger.error(f"   Last error: {last_error}")
 
-        return None
+            return None
+        finally:
+            # v193.0: Always clean up creation tracking to prevent blocking future creations
+            async with self._vm_lock:
+                if creation_id in self.creating_vms:
+                    del self.creating_vms[creation_id]
+                    logger.debug(f"[v193.0] Cleared VM creation guard: {creation_id}")
 
     async def _record_vm_creation_safe(
         self,

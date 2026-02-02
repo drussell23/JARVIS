@@ -75,12 +75,16 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ('/', '/health', '/health/ready'):
+            # v193.0: Include fields expected by _check_gcp_vm_readiness
             response = {
-                "status": "healthy",
+                "status": "starting",
+                "phase": "starting",
                 "mode": "ultra-stub",
+                "model_loaded": False,
+                "ready_for_inference": False,
                 "uptime_seconds": int(time.time() - self.start_time),
-                "version": "v155.0-ultra",
-                "message": "GCP VM ready - pip/fastapi installing in background"
+                "version": "v193.0-ultra",
+                "message": "GCP VM booting - pip/fastapi installing in background"
             }
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -151,12 +155,16 @@ start_time = time.time()
 @app.get("/health")
 async def health():
     """Health check endpoint - supervisor polls this."""
+    # v193.0: Include fields expected by _check_gcp_vm_readiness
     return JSONResponse({
-        "status": "healthy",
+        "status": "starting",
+        "phase": "starting",
         "mode": "stub",
-        "message": "GCP VM ready - full setup in progress",
+        "model_loaded": False,
+        "ready_for_inference": False,
+        "message": "GCP VM ready - full inference setup in progress",
         "uptime_seconds": int(time.time() - start_time),
-        "version": "v147.0-stub",
+        "version": "v193.0-stub",
     })
 
 @app.get("/")
@@ -276,11 +284,15 @@ start_time = time.time()
 
 @app.get("/health")
 async def health():
+    # v193.0: Include fields expected by _check_gcp_vm_readiness
     return JSONResponse({
         "status": "healthy",
+        "phase": "ready",
         "mode": "inference",
+        "model_loaded": True,
+        "ready_for_inference": True,
         "uptime_seconds": int(time.time() - start_time),
-        "version": "v147.0-gcp",
+        "version": "v193.0-gcp",
     })
 
 @app.get("/health/ready")

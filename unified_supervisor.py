@@ -48723,8 +48723,9 @@ class StartupWatchdog:
         "resources": PhaseConfig("Resources", 330.0, 25, 45, "restart"),
         "backend": PhaseConfig("Backend", 120.0, 45, 55, "restart"),  # v192.0: Increased for slower starts
         "intelligence": PhaseConfig("Intelligence", 120.0, 55, 65, "diagnostic"),  # v192.0: Increased
-        # v192.0: Trinity timeout synced with hollow client mode detection (up to 360s)
-        "trinity": PhaseConfig("Trinity", 360.0, 65, 85, "restart"),
+        # v193.0: Trinity timeout increased to cover GCP VM startup (300s) + fallback (120s) + buffer (60s)
+        # This prevents false DMS timeouts when GCP VM health check fails and fallback triggers
+        "trinity": PhaseConfig("Trinity", 480.0, 65, 85, "restart"),
         "enterprise": PhaseConfig("Enterprise", 120.0, 75, 85, "diagnostic"),  # v192.0: Increased
         "frontend": PhaseConfig("Frontend", 60.0, 85, 100, "rollback"),
     }
@@ -48776,13 +48777,15 @@ class StartupWatchdog:
                 except ValueError:
                     self._logger.warning(f"[DMS] Invalid timeout value in {env_key}: {env_value}")
 
-        # v192.0: Auto-detect hollow client mode and extend Trinity timeout
-        # GCP VM startup takes 96+ seconds, so Trinity phase needs 5+ minutes
+        # v193.0: Auto-detect hollow client mode and extend Trinity timeout
+        # GCP VM startup timeout (300s) + fallback processing (120s) + buffer (60s) = 480s
         if self._detect_hollow_client_mode():
             trinity_config = self._phase_configs.get("trinity")
             if trinity_config:
-                # Hollow client mode: Trinity phase needs 300s (5 minutes) for GCP VM startup
-                hollow_client_timeout = max(300.0, trinity_config.timeout_seconds)
+                # v193.0: Hollow client mode needs GCP_VM_STARTUP_TIMEOUT + fallback time
+                gcp_timeout = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "300.0"))
+                fallback_buffer = 180.0  # Fallback processing + safety buffer
+                hollow_client_timeout = max(gcp_timeout + fallback_buffer, trinity_config.timeout_seconds)
                 if hollow_client_timeout > trinity_config.timeout_seconds:
                     self._phase_configs["trinity"] = PhaseConfig(
                         trinity_config.name,
@@ -48793,7 +48796,8 @@ class StartupWatchdog:
                     )
                     self._logger.info(
                         f"[DMS] Hollow client mode detected: Trinity timeout extended "
-                        f"from {trinity_config.timeout_seconds}s to {hollow_client_timeout}s"
+                        f"from {trinity_config.timeout_seconds}s to {hollow_client_timeout}s "
+                        f"(GCP:{gcp_timeout}s + buffer:{fallback_buffer}s)"
                     )
 
         # State tracking
@@ -52347,27 +52351,47 @@ class JarvisSystemKernel:
             # Phase 5: Trinity (Zone 5.7)
             issue_collector.set_current_phase("Phase 5: Trinity")
             issue_collector.set_current_zone("Zone 5.7")
-            # v192.0: Compute Trinity timeout based on hollow client mode detection
-            # Hollow client mode requires extra time for GCP VM startup
+            # v193.0: Compute Trinity timeout based on hollow client mode AND GCP VM timeout
+            # The actual GCP VM startup timeout is GCP_VM_STARTUP_TIMEOUT (default 300s)
+            # When that times out, there's fallback processing (Claude API) that adds ~120s
+            # Total: GCP_TIMEOUT (300s) + FALLBACK_PROCESSING (120s) + BUFFER (60s) = 480s
             trinity_base_timeout = 180.0  # Base: Prime (90s) + Reactor (60s) + buffer (30s)
+            
+            # Read actual GCP timeout from environment (same as cross_repo_startup_orchestrator uses)
+            gcp_vm_timeout = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "300.0"))
+            fallback_processing_buffer = 120.0  # Time for Claude API fallback signal + coordination
+            
             hollow_client_indicators = [
                 os.environ.get("HOLLOW_CLIENT_MODE", "").lower() in ("true", "1", "yes"),
                 os.environ.get("GCP_PRIME_ENDPOINT", "") != "",
                 os.environ.get("USE_GCP_INFERENCE", "").lower() in ("true", "1", "yes"),
+                os.environ.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() in ("true", "1", "yes"),
             ]
+            
+            # Detect if we need extended timeout for GCP operations
+            needs_gcp_timeout = False
             if any(hollow_client_indicators):
-                # Hollow client: Prime (270s) + Reactor (60s) + buffer (30s) = 360s
-                trinity_timeout = 360.0
+                needs_gcp_timeout = True
             else:
-                # Check RAM for auto hollow client detection
+                # Check RAM for auto hollow client detection (16GB RAM triggers GCP offload)
                 try:
                     import psutil
                     if psutil.virtual_memory().total / (1024**3) < 32.0:
-                        trinity_timeout = 360.0
-                    else:
-                        trinity_timeout = trinity_base_timeout
+                        needs_gcp_timeout = True
                 except Exception:
-                    trinity_timeout = trinity_base_timeout
+                    pass
+            
+            if needs_gcp_timeout:
+                # v193.0: Trinity timeout must exceed GCP VM timeout + fallback time
+                # GCP VM timeout (300s) + fallback (120s) + buffer (60s) = 480s
+                trinity_timeout = gcp_vm_timeout + fallback_processing_buffer + 60.0
+                self.logger.info(
+                    f"[Trinity] GCP mode detected: timeout={trinity_timeout:.0f}s "
+                    f"(GCP:{gcp_vm_timeout:.0f}s + fallback:{fallback_processing_buffer:.0f}s + buffer:60s)"
+                )
+            else:
+                trinity_timeout = trinity_base_timeout
+                
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase("trinity", 65, operational_timeout=trinity_timeout)
             if self.config.trinity_enabled:
