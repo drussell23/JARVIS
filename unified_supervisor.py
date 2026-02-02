@@ -53806,7 +53806,7 @@ class JarvisSystemKernel:
                 self.logger.debug(f"[LoadingServer] Using system Python: {python_executable}")
 
             # Step 2: Set up environment with PYTHONPATH for proper imports
-                env = os.environ.copy()
+            env = os.environ.copy()
             pythonpath_parts = [
                 str(project_root),
                 str(project_root / "backend"),
