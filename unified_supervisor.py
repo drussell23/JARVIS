@@ -48702,18 +48702,30 @@ class StartupWatchdog:
         JARVIS_DMS_RECOVERY_MODE: graduated, aggressive, passive (default: graduated)
     """
     
-    # v187.0: Default phase configurations with environment overrides
-    # Phase timeouts can be customized via JARVIS_DMS_TIMEOUT_<PHASE> environment variables
-    # e.g., JARVIS_DMS_TIMEOUT_TRINITY=300 sets Trinity timeout to 5 minutes
+    # v192.0: INTELLIGENT PHASE TIMEOUT SYNCHRONIZATION
+    # Phase timeouts are derived from the actual operational timeouts used by each phase.
+    # This eliminates the mismatch between DMS monitoring and actual phase durations.
+    #
+    # Key principle: Phases register their expected timeout dynamically.
+    # DMS uses registered timeout, falling back to defaults only if not registered.
+    #
+    # Operational timeout sources:
+    # - resources: JARVIS_RESOURCE_TIMEOUT (default 300s)
+    # - trinity: HOLLOW_CLIENT_TIMEOUT_MULTIPLIER * base (up to 300s)
+    # - backend: JARVIS_BACKEND_STARTUP_TIMEOUT (default 90s)
+    #
+    # Environment overrides: JARVIS_DMS_TIMEOUT_<PHASE>=<seconds>
     DEFAULT_PHASES: Dict[str, PhaseConfig] = {
         "clean_slate": PhaseConfig("Clean Slate", 30.0, 0, 5, "diagnostic"),
         "loading_server": PhaseConfig("Loading Server", 45.0, 5, 15, "restart"),
         "preflight": PhaseConfig("Preflight", 60.0, 15, 25, "diagnostic"),
-        "resources": PhaseConfig("Resources", 120.0, 25, 45, "restart"),
-        "backend": PhaseConfig("Backend", 90.0, 45, 55, "restart"),
-        "intelligence": PhaseConfig("Intelligence", 90.0, 55, 65, "diagnostic"),  # v187.0: Increased from 60s
-        "trinity": PhaseConfig("Trinity", 180.0, 65, 85, "restart"),
-        "enterprise": PhaseConfig("Enterprise", 90.0, 75, 85, "diagnostic"),  # v187.0: Increased from 60s
+        # v192.0: Resources timeout synced with JARVIS_RESOURCE_TIMEOUT (default 300s + 30s buffer)
+        "resources": PhaseConfig("Resources", 330.0, 25, 45, "restart"),
+        "backend": PhaseConfig("Backend", 120.0, 45, 55, "restart"),  # v192.0: Increased for slower starts
+        "intelligence": PhaseConfig("Intelligence", 120.0, 55, 65, "diagnostic"),  # v192.0: Increased
+        # v192.0: Trinity timeout synced with hollow client mode detection (up to 360s)
+        "trinity": PhaseConfig("Trinity", 360.0, 65, 85, "restart"),
+        "enterprise": PhaseConfig("Enterprise", 120.0, 75, 85, "diagnostic"),  # v192.0: Increased
         "frontend": PhaseConfig("Frontend", 60.0, 85, 100, "rollback"),
     }
     
@@ -48871,7 +48883,41 @@ class StartupWatchdog:
         
         self._logger.debug("[DMS] Dead Man's Switch disarmed")
     
-    def update_phase(self, phase_key: str, progress: int) -> None:
+    def register_phase_timeout(self, phase_key: str, operational_timeout: float, buffer: float = 30.0) -> None:
+        """
+        v192.0: Dynamically register a phase's operational timeout.
+
+        This allows phases to declare their actual timeout requirements at runtime,
+        ensuring DMS monitoring is synchronized with the real operational constraints.
+
+        The DMS timeout will be set to operational_timeout + buffer to prevent
+        false positives while still catching genuine stalls.
+
+        Args:
+            phase_key: Phase identifier (e.g., "resources", "trinity")
+            operational_timeout: The actual timeout the phase uses (seconds)
+            buffer: Extra time buffer for DMS (default 30s)
+        """
+        phase_config = self._phase_configs.get(phase_key)
+        if not phase_config:
+            self._logger.warning(f"[DMS] Unknown phase '{phase_key}' - cannot register timeout")
+            return
+
+        dms_timeout = operational_timeout + buffer
+        if dms_timeout != phase_config.timeout_seconds:
+            self._phase_configs[phase_key] = PhaseConfig(
+                phase_config.name,
+                dms_timeout,
+                phase_config.progress_start,
+                phase_config.progress_end,
+                phase_config.recovery_action,
+            )
+            self._logger.info(
+                f"[DMS] Phase '{phase_key}' timeout registered: {dms_timeout:.0f}s "
+                f"(operational: {operational_timeout:.0f}s + {buffer:.0f}s buffer)"
+            )
+
+    def update_phase(self, phase_key: str, progress: int, operational_timeout: Optional[float] = None) -> None:
         """
         Update the current phase and progress.
 
@@ -48881,8 +48927,13 @@ class StartupWatchdog:
         Args:
             phase_key: Phase identifier (e.g., "resources", "trinity")
             progress: Current progress percentage (0-100)
+            operational_timeout: Optional - register this phase's operational timeout
         """
         now = time.time()
+
+        # v192.0: Register operational timeout if provided
+        if operational_timeout is not None:
+            self.register_phase_timeout(phase_key, operational_timeout)
 
         # Phase change
         if phase_key != self._current_phase:
@@ -52149,9 +52200,11 @@ class JarvisSystemKernel:
             # Phase 2: Resources (Zone 3)
             issue_collector.set_current_phase("Phase 2: Resources")
             issue_collector.set_current_zone("Zone 3")
-            # v187.0: Update DMS at phase START to fix timeout tracking
+            # v192.0: Compute resource timeout and register with DMS for synchronized monitoring
+            # This ensures DMS timeout >= operational timeout, preventing false timeout triggers
+            resource_timeout = float(os.environ.get("JARVIS_RESOURCE_TIMEOUT", "300.0"))
             if self._startup_watchdog:
-                self._startup_watchdog.update_phase("resources", 15)
+                self._startup_watchdog.update_phase("resources", 15, operational_timeout=resource_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("resources")
             if not await self._phase_resources():
@@ -52190,9 +52243,10 @@ class JarvisSystemKernel:
             # Phase 3: Backend (Zone 6.1)
             issue_collector.set_current_phase("Phase 3: Backend")
             issue_collector.set_current_zone("Zone 6")
-            # v187.0: Update DMS at phase START to fix timeout tracking
+            # v192.0: Register backend operational timeout with DMS
+            backend_timeout = float(os.environ.get("JARVIS_BACKEND_STARTUP_TIMEOUT", "90.0"))
             if self._startup_watchdog:
-                self._startup_watchdog.update_phase("backend", 30)
+                self._startup_watchdog.update_phase("backend", 30, operational_timeout=backend_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("backend")
             if not await self._phase_backend():
@@ -52229,9 +52283,10 @@ class JarvisSystemKernel:
             # Phase 4: Intelligence (Zone 4)
             issue_collector.set_current_phase("Phase 4: Intelligence")
             issue_collector.set_current_zone("Zone 4")
-            # v187.0: Update DMS at phase START to fix timeout tracking
+            # v192.0: Register intelligence operational timeout with DMS
+            intelligence_timeout = float(os.environ.get("JARVIS_INTELLIGENCE_TIMEOUT", "90.0"))
             if self._startup_watchdog:
-                self._startup_watchdog.update_phase("intelligence", 50)
+                self._startup_watchdog.update_phase("intelligence", 50, operational_timeout=intelligence_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("intelligence")
             if not await self._phase_intelligence():
@@ -52270,9 +52325,29 @@ class JarvisSystemKernel:
             # Phase 5: Trinity (Zone 5.7)
             issue_collector.set_current_phase("Phase 5: Trinity")
             issue_collector.set_current_zone("Zone 5.7")
-            # v187.0: Update DMS at phase START to fix timeout tracking
+            # v192.0: Compute Trinity timeout based on hollow client mode detection
+            # Hollow client mode requires extra time for GCP VM startup
+            trinity_base_timeout = 180.0  # Base: Prime (90s) + Reactor (60s) + buffer (30s)
+            hollow_client_indicators = [
+                os.environ.get("HOLLOW_CLIENT_MODE", "").lower() in ("true", "1", "yes"),
+                os.environ.get("GCP_PRIME_ENDPOINT", "") != "",
+                os.environ.get("USE_GCP_INFERENCE", "").lower() in ("true", "1", "yes"),
+            ]
+            if any(hollow_client_indicators):
+                # Hollow client: Prime (270s) + Reactor (60s) + buffer (30s) = 360s
+                trinity_timeout = 360.0
+            else:
+                # Check RAM for auto hollow client detection
+                try:
+                    import psutil
+                    if psutil.virtual_memory().total / (1024**3) < 32.0:
+                        trinity_timeout = 360.0
+                    else:
+                        trinity_timeout = trinity_base_timeout
+                except Exception:
+                    trinity_timeout = trinity_base_timeout
             if self._startup_watchdog:
-                self._startup_watchdog.update_phase("trinity", 65)
+                self._startup_watchdog.update_phase("trinity", 65, operational_timeout=trinity_timeout)
             if self.config.trinity_enabled:
                 if self._narrator:
                     await self._narrator.narrate_phase_start("trinity")
@@ -52308,9 +52383,10 @@ class JarvisSystemKernel:
             # Phase 6: Enterprise Services (Zone 6.4)
             issue_collector.set_current_phase("Phase 6: Enterprise Services")
             issue_collector.set_current_zone("Zone 6.4")
-            # v187.0: Update DMS at phase START to fix timeout tracking
+            # v192.0: Register enterprise operational timeout with DMS
+            enterprise_timeout = float(os.environ.get("JARVIS_ENTERPRISE_TIMEOUT", "90.0"))
             if self._startup_watchdog:
-                self._startup_watchdog.update_phase("enterprise", 80)
+                self._startup_watchdog.update_phase("enterprise", 80, operational_timeout=enterprise_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("enterprise")
             await self._phase_enterprise_services()
