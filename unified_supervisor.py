@@ -3194,6 +3194,275 @@ def get_startup_display(enabled: bool = True) -> StartupProgressDisplay:
 
 
 # =============================================================================
+# v197.1: LIVE PROGRESS DASHBOARD - Real-time multi-component status display
+# =============================================================================
+# Shows live updating status of:
+#   - GCP VM progress (APARS phase, checkpoint, ETA, progress bar)
+#   - Trinity components (JARVIS, Prime, Reactor status)
+#   - Memory usage
+#   - System health
+#
+# This replaces the log spam with a clean, real-time dashboard.
+# =============================================================================
+
+class LiveProgressDashboard:
+    """
+    v197.1: Real-time CLI dashboard showing all component status.
+    
+    Features:
+    - Live-updating progress bars for GCP VM
+    - Component status indicators
+    - Memory/CPU usage
+    - ETA and elapsed time
+    - Color-coded status
+    
+    Usage:
+        dashboard = LiveProgressDashboard()
+        dashboard.start()
+        dashboard.update_gcp_progress(phase=3, progress=45, eta=120)
+        dashboard.update_component("jarvis-prime", "healthy")
+        dashboard.stop()
+    """
+    
+    # Progress bar characters
+    PROGRESS_FULL = "█"
+    PROGRESS_EMPTY = "░"
+    PROGRESS_WIDTH = 30
+    
+    # Status indicators with colors
+    STATUS_COLORS = {
+        "pending": "\033[90m",    # Gray
+        "starting": "\033[36m",   # Cyan
+        "healthy": "\033[32m",    # Green
+        "degraded": "\033[33m",   # Yellow
+        "error": "\033[31m",      # Red
+        "stopped": "\033[90m",    # Gray
+    }
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    
+    def __init__(self, enabled: bool = True, refresh_rate: float = 1.0):
+        self.enabled = enabled and sys.stdout.isatty()
+        self.refresh_rate = refresh_rate
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._lock = threading.Lock()
+        
+        # State
+        self._gcp_state = {
+            "phase": 0,
+            "phase_name": "initializing",
+            "checkpoint": "starting",
+            "progress": 0,
+            "eta_seconds": 0,
+            "elapsed_seconds": 0,
+            "status": "pending",
+        }
+        self._components = {
+            "jarvis-body": {"status": "pending", "port": 8010, "pid": None},
+            "jarvis-prime": {"status": "pending", "port": 8001, "pid": None},
+            "reactor-core": {"status": "pending", "port": 8090, "pid": None},
+            "gcp-vm": {"status": "pending", "ip": None},
+        }
+        self._memory = {"percent": 0.0, "used_gb": 0.0, "total_gb": 0.0}
+        self._start_time = time.time()
+        self._last_render = ""
+        
+    def start(self) -> None:
+        """Start the live dashboard."""
+        if not self.enabled:
+            return
+        self._running = True
+        self._start_time = time.time()
+        self._task = asyncio.create_task(self._render_loop())
+        
+    def stop(self) -> None:
+        """Stop the live dashboard."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+        # Clear and show final state
+        if self.enabled:
+            self._render(final=True)
+    
+    def update_gcp_progress(
+        self,
+        phase: int = None,
+        phase_name: str = None,
+        checkpoint: str = None,
+        progress: float = None,
+        eta_seconds: int = None,
+        elapsed_seconds: int = None,
+        status: str = None,
+    ) -> None:
+        """Update GCP VM progress state."""
+        with self._lock:
+            if phase is not None:
+                self._gcp_state["phase"] = phase
+            if phase_name is not None:
+                self._gcp_state["phase_name"] = phase_name
+            if checkpoint is not None:
+                self._gcp_state["checkpoint"] = checkpoint
+            if progress is not None:
+                self._gcp_state["progress"] = progress
+            if eta_seconds is not None:
+                self._gcp_state["eta_seconds"] = eta_seconds
+            if elapsed_seconds is not None:
+                self._gcp_state["elapsed_seconds"] = elapsed_seconds
+            if status is not None:
+                self._gcp_state["status"] = status
+                self._components["gcp-vm"]["status"] = status
+    
+    def update_component(
+        self,
+        name: str,
+        status: str = None,
+        pid: int = None,
+        port: int = None,
+        ip: str = None,
+    ) -> None:
+        """Update component status."""
+        with self._lock:
+            if name not in self._components:
+                self._components[name] = {"status": "pending"}
+            if status is not None:
+                self._components[name]["status"] = status
+            if pid is not None:
+                self._components[name]["pid"] = pid
+            if port is not None:
+                self._components[name]["port"] = port
+            if ip is not None:
+                self._components[name]["ip"] = ip
+    
+    def update_memory(self, percent: float, used_gb: float = None, total_gb: float = None) -> None:
+        """Update memory usage."""
+        with self._lock:
+            self._memory["percent"] = percent
+            if used_gb is not None:
+                self._memory["used_gb"] = used_gb
+            if total_gb is not None:
+                self._memory["total_gb"] = total_gb
+    
+    async def _render_loop(self) -> None:
+        """Main render loop."""
+        while self._running:
+            try:
+                self._render()
+                await asyncio.sleep(self.refresh_rate)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+    
+    def _render(self, final: bool = False) -> None:
+        """Render the dashboard to terminal."""
+        if not self.enabled:
+            return
+        
+        lines = []
+        elapsed = time.time() - self._start_time
+        
+        # Header
+        lines.append("")
+        lines.append(f"{self.BOLD}╔══════════════════════════════════════════════════════════════════╗{self.RESET}")
+        lines.append(f"{self.BOLD}║  🚀 JARVIS SYSTEM STATUS                      {elapsed:>6.1f}s elapsed  ║{self.RESET}")
+        lines.append(f"{self.BOLD}╠══════════════════════════════════════════════════════════════════╣{self.RESET}")
+        
+        # GCP VM Progress Section
+        gcp = self._gcp_state
+        gcp_status_color = self.STATUS_COLORS.get(gcp["status"], self.STATUS_COLORS["pending"])
+        progress_bar = self._make_progress_bar(gcp["progress"])
+        eta_str = f"{gcp['eta_seconds']}s" if gcp["eta_seconds"] > 0 else "ready"
+        
+        lines.append(f"║  {self.BOLD}☁️  GCP VM:{self.RESET}")
+        lines.append(f"║      Phase {gcp['phase']}: {gcp['phase_name']:<20} {gcp_status_color}[{gcp['status'].upper():^8}]{self.RESET}")
+        lines.append(f"║      {progress_bar} {gcp['progress']:>3.0f}%  ETA: {eta_str:<6}")
+        lines.append(f"║      Checkpoint: {gcp['checkpoint']:<40}")
+        lines.append(f"║")
+        
+        # Components Section
+        lines.append(f"║  {self.BOLD}📦 COMPONENTS:{self.RESET}")
+        for name, comp in self._components.items():
+            if name == "gcp-vm":
+                continue  # Already shown above
+            status = comp.get("status", "pending")
+            status_color = self.STATUS_COLORS.get(status, self.STATUS_COLORS["pending"])
+            port = comp.get("port", "")
+            pid = comp.get("pid", "")
+            pid_str = f"PID:{pid}" if pid else ""
+            port_str = f":{port}" if port else ""
+            lines.append(f"║      {name:<15} {status_color}[{status.upper():^10}]{self.RESET} {port_str:<6} {pid_str}")
+        lines.append(f"║")
+        
+        # Memory Section
+        mem = self._memory
+        mem_bar = self._make_progress_bar(mem["percent"], width=20)
+        mem_color = self.STATUS_COLORS["healthy"] if mem["percent"] < 70 else (
+            self.STATUS_COLORS["degraded"] if mem["percent"] < 85 else self.STATUS_COLORS["error"]
+        )
+        lines.append(f"║  {self.BOLD}🧠 MEMORY:{self.RESET}")
+        lines.append(f"║      {mem_bar} {mem_color}{mem['percent']:>5.1f}%{self.RESET}  ({mem['used_gb']:.1f}/{mem['total_gb']:.1f} GB)")
+        
+        # Footer
+        lines.append(f"{self.BOLD}╚══════════════════════════════════════════════════════════════════╝{self.RESET}")
+        
+        # Render
+        output = "\n".join(lines)
+        
+        # Only update if changed (reduces flicker)
+        if output != self._last_render or final:
+            # Move cursor up and clear
+            if self._last_render:
+                num_lines = self._last_render.count("\n") + 1
+                sys.stdout.write(f"\033[{num_lines}A\033[J")
+            
+            sys.stdout.write(output)
+            sys.stdout.flush()
+            self._last_render = output
+    
+    def _make_progress_bar(self, percent: float, width: int = None) -> str:
+        """Create a progress bar string."""
+        if width is None:
+            width = self.PROGRESS_WIDTH
+        filled = int(width * percent / 100)
+        empty = width - filled
+        return f"[{self.PROGRESS_FULL * filled}{self.PROGRESS_EMPTY * empty}]"
+
+
+# Global live dashboard instance
+_live_dashboard: Optional[LiveProgressDashboard] = None
+
+
+def get_live_dashboard(enabled: bool = True) -> LiveProgressDashboard:
+    """Get or create the global live dashboard instance."""
+    global _live_dashboard
+    if _live_dashboard is None:
+        _live_dashboard = LiveProgressDashboard(enabled=enabled)
+    return _live_dashboard
+
+
+def update_dashboard_gcp_progress(
+    phase: int = None,
+    phase_name: str = None,
+    checkpoint: str = None,
+    progress: float = None,
+    eta_seconds: int = None,
+    **kwargs
+) -> None:
+    """Helper to update GCP progress on the dashboard (if available)."""
+    if _live_dashboard:
+        _live_dashboard.update_gcp_progress(
+            phase=phase,
+            phase_name=phase_name,
+            checkpoint=checkpoint,
+            progress=progress,
+            eta_seconds=eta_seconds,
+            **kwargs
+        )
+
+
+# =============================================================================
 # STARTUP ISSUE COLLECTOR & HEALTH REPORT
 # =============================================================================
 # Enterprise-grade issue collection and display system that:
@@ -50147,10 +50416,31 @@ class TrinityIntegrator:
             if healthy:
                 component.state = "healthy"
                 self.logger.success(f"[Trinity] ✓ {component.name} RUNNING (PID: {component.pid}, Port: {component.port})")
+                
+                # v197.1: Update live dashboard
+                try:
+                    dashboard = get_live_dashboard()
+                    dashboard.update_component(
+                        component.name,
+                        status="healthy",
+                        pid=component.pid,
+                        port=component.port
+                    )
+                except Exception:
+                    pass
+                    
                 return True
             else:
                 component.state = "failed"
                 self.logger.error(f"[Trinity] ✗ {component.name} failed to become healthy (timeout 60s)")
+                
+                # v197.1: Update live dashboard
+                try:
+                    dashboard = get_live_dashboard()
+                    dashboard.update_component(component.name, status="error")
+                except Exception:
+                    pass
+                
                 # Try to capture stderr for debugging
                 if process.returncode is not None:
                     self.logger.error(f"[Trinity]   Process exited with code: {process.returncode}")
@@ -50160,6 +50450,14 @@ class TrinityIntegrator:
             self.logger.error(f"[Trinity] ✗ Failed to start {component.name}: {e}")
             self.logger.debug(f"[Trinity]   Stack trace: {traceback.format_exc()}")
             component.state = "failed"
+            
+            # v197.1: Update live dashboard
+            try:
+                dashboard = get_live_dashboard()
+                dashboard.update_component(component.name, status="error")
+            except Exception:
+                pass
+                
             return False
 
     async def _wait_for_health(self, component: TrinityComponent, timeout: float = 60.0) -> bool:
@@ -52254,6 +52552,22 @@ class JarvisSystemKernel:
         # Initialize startup issue collector for organized error/warning display
         issue_collector = get_startup_issue_collector()
         issue_collector.clear()  # Fresh start
+        
+        # v197.1: Initialize live progress dashboard for real-time CLI feedback
+        dashboard = get_live_dashboard(enabled=sys.stdout.isatty())
+        dashboard.start()
+        
+        # Initialize memory tracking for dashboard
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            dashboard.update_memory(
+                percent=mem.percent,
+                used_gb=mem.used / (1024**3),
+                total_gb=mem.total / (1024**3)
+            )
+        except Exception:
+            pass
 
         # =====================================================================
         # v180.0: DIAGNOSTIC CHECKPOINT - Kernel startup begin
@@ -53672,6 +53986,11 @@ class JarvisSystemKernel:
 
         with self.logger.section_start(LogSection.TRINITY, "Zone 5.7 | Phase 5: Trinity"):
             try:
+                # v197.1: Update live dashboard for Trinity phase
+                dashboard = get_live_dashboard()
+                dashboard.update_component("jarvis-prime", status="starting")
+                dashboard.update_component("reactor-core", status="starting")
+                
                 # v188.0: Start heartbeat task for long-running operations
                 heartbeat_task = asyncio.create_task(
                     _trinity_heartbeat_loop(),
@@ -53688,7 +54007,7 @@ class JarvisSystemKernel:
 
                 # Log Trinity configuration
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
-                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION (v188.0)")
+                self.logger.info("[Trinity] TRINITY CROSS-REPO INTEGRATION (v197.1)")
                 self.logger.info("[Trinity] ═══════════════════════════════════════════════════════")
                 self.logger.info(f"[Trinity] Enabled: {self.config.trinity_enabled}")
                 self.logger.info(f"[Trinity] Auto-restart: {os.environ.get('JARVIS_TRINITY_AUTO_RESTART', 'true')}")
@@ -55875,6 +56194,13 @@ class JarvisSystemKernel:
         """
         self._state = KernelState.SHUTTING_DOWN
         self.logger.info("[Kernel] Initiating shutdown...")
+        
+        # v197.1: Stop live dashboard
+        try:
+            dashboard = get_live_dashboard()
+            dashboard.stop()
+        except Exception:
+            pass
 
         # v180.0: Diagnostic checkpoint - shutdown start
         shutdown_reason = self._signal_handler.shutdown_reason or "unknown"
@@ -56138,6 +56464,19 @@ class JarvisSystemKernel:
                         if self._readiness_manager:
                             self._readiness_manager.mark_component_ready("backend", False)
                             self._readiness_manager.add_error("Backend process died")
+                
+                # v197.1: Update live dashboard with memory stats
+                try:
+                    import psutil
+                    mem = psutil.virtual_memory()
+                    dashboard = get_live_dashboard()
+                    dashboard.update_memory(
+                        percent=mem.percent,
+                        used_gb=mem.used / (1024**3),
+                        total_gb=mem.total / (1024**3)
+                    )
+                except Exception:
+                    pass
 
             except asyncio.CancelledError:
                 break

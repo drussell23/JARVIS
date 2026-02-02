@@ -1341,6 +1341,17 @@ async def _background_gcp_prewarm_task(timeout: Optional[float] = None) -> None:
             # Signal that GCP is ready
             if _trinity_gcp_ready_event:
                 _trinity_gcp_ready_event.set()
+            
+            # v197.1: Update live dashboard
+            try:
+                from unified_supervisor import update_dashboard_gcp_progress, get_live_dashboard
+                update_dashboard_gcp_progress(
+                    phase=5, phase_name="ready", checkpoint="healthy",
+                    progress=100, eta_seconds=0, status="healthy"
+                )
+                get_live_dashboard().update_component("gcp-vm", status="healthy", ip=endpoint.split("//")[-1].split(":")[0])
+            except ImportError:
+                pass
 
             await _emit_event(
                 "TRINITY_GCP_PREWARM_SUCCESS",
@@ -1355,6 +1366,14 @@ async def _background_gcp_prewarm_task(timeout: Optional[float] = None) -> None:
             logger.warning(
                 f"[v146.0] ⚠️ TRINITY PROTOCOL: GCP pre-warm failed after {elapsed:.1f}s"
             )
+            
+            # v197.1: Update live dashboard
+            try:
+                from unified_supervisor import get_live_dashboard
+                get_live_dashboard().update_component("gcp-vm", status="error")
+            except ImportError:
+                pass
+            
             await _emit_event(
                 "TRINITY_GCP_PREWARM_FAILED",
                 priority="HIGH",
@@ -2370,15 +2389,36 @@ class AdaptiveProgressAwareWaiter:
         elapsed = now - self.start_time
         remaining = self.current_deadline - now
         
-        # Log progress
-        logger.info(
-            f"[APARS] Phase {snapshot.phase_number} ({snapshot.phase_name}): "
-            f"{snapshot.total_progress:.1f}% complete, "
-            f"checkpoint={snapshot.checkpoint}, "
-            f"ETA={snapshot.eta_seconds}s, "
-            f"delta=+{progress_delta:.1f}%, "
-            f"remaining={remaining:.0f}s"
+        # Log progress (less verbose - only every 30s or on significant change)
+        should_log = (
+            progress_delta >= 1.0 or  # Progress increased
+            (now - getattr(self, '_last_log_time', 0)) > 30.0  # 30s since last log
         )
+        if should_log:
+            logger.info(
+                f"[APARS] Phase {snapshot.phase_number} ({snapshot.phase_name}): "
+                f"{snapshot.total_progress:.1f}% complete, "
+                f"checkpoint={snapshot.checkpoint}, "
+                f"ETA={snapshot.eta_seconds}s, "
+                f"delta=+{progress_delta:.1f}%, "
+                f"remaining={remaining:.0f}s"
+            )
+            self._last_log_time = now
+        
+        # v197.1: Update live dashboard (if available)
+        try:
+            from unified_supervisor import update_dashboard_gcp_progress
+            update_dashboard_gcp_progress(
+                phase=snapshot.phase_number,
+                phase_name=snapshot.phase_name,
+                checkpoint=snapshot.checkpoint,
+                progress=snapshot.total_progress,
+                eta_seconds=snapshot.eta_seconds,
+                elapsed_seconds=int(elapsed),
+                status="starting" if snapshot.total_progress < 100 else "healthy",
+            )
+        except ImportError:
+            pass  # Dashboard not available
         
         # v197.1 CRITICAL FIX: ALWAYS check ETA-based extension!
         # The VM's ETA is authoritative - if it says it needs more time, grant it.
