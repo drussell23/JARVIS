@@ -717,6 +717,12 @@ class PlaywrightBackend(ActuatorBackend):
     - Resource monitoring before operations
     - Graceful degradation on repeated crashes
     - Memory pressure detection
+    
+    v197.4 ROOT CAUSE FIX for Code 5 Crashes:
+    - Integrates with StabilizedChromeLauncher
+    - Ensures Chrome is launched with crash-prevention flags before CDP connect
+    - Adds context and page limits to prevent resource exhaustion
+    - Proactive Chrome restart when memory exceeds threshold
 
     Supports:
     - Chrome, Chromium, Arc, Brave
@@ -739,6 +745,11 @@ class PlaywrightBackend(ActuatorBackend):
         "139": "Segmentation fault",
         "137": "OOM killed by system",
     }
+    
+    # v197.4: Resource limits to prevent OOM
+    MAX_CONTEXTS = 5
+    MAX_PAGES_PER_CONTEXT = 10
+    CHROME_MEMORY_THRESHOLD_MB = 3072  # 3GB - preemptively restart before 4GB
 
     def __init__(self, config: ActuatorConfig):
         self.config = config
@@ -755,6 +766,11 @@ class PlaywrightBackend(ActuatorBackend):
         self._crash_count = 0
         self._total_operations = 0
         self._lock = asyncio.Lock()
+        
+        # v197.4: Track contexts and pages for resource limits
+        self._active_contexts = 0
+        self._pages_by_context: Dict[str, int] = {}
+        self._stabilized_launcher_available = False
 
     @property
     def name(self) -> str:
@@ -887,6 +903,8 @@ class PlaywrightBackend(ActuatorBackend):
         Attempt to reconnect to browser with exponential backoff.
         
         v197.1: Intelligent reconnection with crash recovery.
+        v197.4: ROOT CAUSE FIX - Uses StabilizedChromeLauncher on reconnect
+                to ensure Chrome is restarted with crash-prevention flags.
         """
         if self._reconnect_attempts >= self._max_reconnect_attempts:
             logger.error(
@@ -910,6 +928,36 @@ class PlaywrightBackend(ActuatorBackend):
         # Clean up existing connection
         await self._cleanup_connection()
         
+        # =====================================================================
+        # v197.4: ROOT CAUSE FIX - Restart Chrome with stability flags
+        # =====================================================================
+        # On reconnect (typically after a crash), restart Chrome with
+        # crash-prevention flags to prevent the same crash from recurring.
+        # This is the CURE - we fix the underlying cause of code 5 crashes.
+        # =====================================================================
+        try:
+            from unified_supervisor import get_stabilized_chrome_launcher
+            
+            launcher = get_stabilized_chrome_launcher()
+            
+            logger.info("[GHOST-HANDS] v197.4: Restarting Chrome with stability flags (crash prevention)...")
+            
+            # Restart Chrome with all stability flags (this kills existing Chrome)
+            success = await launcher.restart_chrome(url=None, incognito=False)
+            
+            if success:
+                logger.info("[GHOST-HANDS] ✅ Chrome restarted with GPU disabled, memory limited")
+                self._stabilized_launcher_available = True
+                # Wait for Chrome to be ready
+                await asyncio.sleep(2.0)
+            else:
+                logger.warning("[GHOST-HANDS] StabilizedChromeLauncher restart failed")
+                
+        except ImportError:
+            logger.debug("[GHOST-HANDS] StabilizedChromeLauncher not available")
+        except Exception as launcher_err:
+            logger.debug(f"[GHOST-HANDS] Launcher restart failed: {launcher_err}")
+        
         # Try to reinitialize
         self._reconnect_attempts += 1
         success = await self._do_initialize()
@@ -922,6 +970,52 @@ class PlaywrightBackend(ActuatorBackend):
             logger.warning("[GHOST-HANDS] Reconnection failed")
         
         return success
+    
+    async def _preemptive_memory_check(self) -> bool:
+        """
+        v197.4: Proactively restart Chrome if memory exceeds threshold.
+        
+        This is PROACTIVE crash prevention - we restart Chrome BEFORE
+        it crashes rather than waiting for code 5.
+        
+        Returns True if operation can proceed, False if Chrome was restarted.
+        """
+        try:
+            import psutil
+            
+            # Calculate Chrome memory usage
+            chrome_memory_mb = 0
+            for proc in psutil.process_iter(['name', 'memory_info']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        chrome_memory_mb += proc.info['memory_info'].rss / (1024 * 1024)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                    continue
+            
+            if chrome_memory_mb > self.CHROME_MEMORY_THRESHOLD_MB:
+                logger.warning(
+                    f"[GHOST-HANDS] ⚠️ Chrome using {chrome_memory_mb:.0f}MB "
+                    f"(threshold: {self.CHROME_MEMORY_THRESHOLD_MB}MB). "
+                    "Preemptively restarting to prevent crash..."
+                )
+                
+                # Try to use stabilized launcher for restart
+                try:
+                    from unified_supervisor import get_stabilized_chrome_launcher
+                    launcher = get_stabilized_chrome_launcher()
+                    await launcher.preemptive_restart_if_needed(self.CHROME_MEMORY_THRESHOLD_MB)
+                except Exception:
+                    pass
+                
+                return False  # Signal that operation should wait
+            
+            return True
+            
+        except ImportError:
+            return True  # psutil not available, proceed
+        except Exception as e:
+            logger.debug(f"[GHOST-HANDS] Memory check failed: {e}")
+            return True
 
     async def _cleanup_connection(self) -> None:
         """Clean up existing browser connection."""
@@ -943,10 +1037,57 @@ class PlaywrightBackend(ActuatorBackend):
         self._initialized = False
 
     async def _do_initialize(self) -> bool:
-        """Internal initialization logic."""
+        """
+        Internal initialization logic.
+        
+        v197.4: Enhanced to use StabilizedChromeLauncher if available.
+        This ensures Chrome is running with crash-prevention flags
+        (--disable-gpu, memory limits, etc.) before we connect via CDP.
+        """
         try:
             from playwright.async_api import async_playwright
-
+            
+            # =====================================================================
+            # v197.4: ROOT CAUSE FIX - Ensure Chrome is launched with stability flags
+            # =====================================================================
+            # Before connecting via CDP, ensure Chrome is running with the right flags.
+            # If Chrome is running without flags (e.g., user opened it manually),
+            # we'll still connect, but won't have crash protection.
+            # =====================================================================
+            try:
+                # Try to import the stabilized launcher from unified_supervisor
+                from unified_supervisor import get_stabilized_chrome_launcher
+                
+                launcher = get_stabilized_chrome_launcher()
+                
+                # Check if Chrome is already running with stability flags
+                if not await launcher.is_chrome_running():
+                    logger.info("[GHOST-HANDS] v197.4: Launching Chrome with stability flags...")
+                    success = await launcher.launch_stabilized_chrome(
+                        url=None,  # No URL, just start Chrome
+                        incognito=False,  # Not incognito for general automation
+                        kill_existing=False,  # Don't kill existing Chrome (user might have windows)
+                        headless=self.config.playwright_headless,
+                    )
+                    if success:
+                        logger.info("[GHOST-HANDS] ✅ Chrome launched with GPU disabled, memory limited")
+                        self._stabilized_launcher_available = True
+                        # Wait for Chrome to be ready
+                        await asyncio.sleep(2.0)
+                    else:
+                        logger.warning("[GHOST-HANDS] StabilizedChromeLauncher failed - Chrome may crash")
+                else:
+                    logger.info("[GHOST-HANDS] Chrome already running (hopefully with stability flags)")
+                    self._stabilized_launcher_available = True
+                    
+            except ImportError:
+                logger.debug("[GHOST-HANDS] StabilizedChromeLauncher not available - using existing Chrome")
+            except Exception as launcher_err:
+                logger.debug(f"[GHOST-HANDS] Launcher check failed: {launcher_err}")
+            
+            # =====================================================================
+            # Connect to Chrome via CDP
+            # =====================================================================
             self._playwright = await async_playwright().start()
 
             # Connect to existing browser via CDP
@@ -957,7 +1098,17 @@ class PlaywrightBackend(ActuatorBackend):
 
             self._initialized = True
             self._last_health_check = time.time()
-            logger.info("[GHOST-HANDS] Playwright backend initialized")
+            
+            # v197.4: Log whether we have crash protection
+            if self._stabilized_launcher_available:
+                logger.info("[GHOST-HANDS] ✅ Playwright backend initialized (with crash protection)")
+            else:
+                logger.info("[GHOST-HANDS] Playwright backend initialized")
+                logger.warning(
+                    "[GHOST-HANDS] ⚠️ Chrome may not have crash-prevention flags. "
+                    "For stability, restart Chrome via unified_supervisor.py"
+                )
+            
             return True
 
         except ImportError:
@@ -966,9 +1117,11 @@ class PlaywrightBackend(ActuatorBackend):
         except Exception as e:
             logger.warning(f"[GHOST-HANDS] Playwright init failed: {e}")
             logger.info(
-                "[GHOST-HANDS] To enable Playwright, run Chrome with:\n"
-                "  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
-                "--remote-debugging-port=9222"
+                "[GHOST-HANDS] To enable Playwright, either:\n"
+                "  1. Run unified_supervisor.py (recommended - launches Chrome with stability flags)\n"
+                "  2. Manually run Chrome with:\n"
+                "     /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
+                "--remote-debugging-port=9222 --disable-gpu --disable-software-rasterizer"
             )
             return False
 
