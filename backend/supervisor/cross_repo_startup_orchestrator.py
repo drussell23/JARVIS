@@ -1554,63 +1554,84 @@ async def ensure_gcp_vm_ready_for_prime(
         vm_ip = result_or_error  # This is the IP address when success=True
         logger.info(f"[v147.0] 🔧 VM provisioned with IP: {vm_ip}, waiting for service to start...")
 
-        # Wait for VM service to be ready with health checks
-        check_count = 0
-        while time.time() - start_time < timeout_seconds:
-            check_count += 1
-            await asyncio.sleep(5.0)  # Check every 5 seconds
+        # v189.0: Use intelligent model readiness detection
+        # This waits for ACTUAL model loading to complete, not just HTTP health
+        # The old approach declared "ready" when HTTP was up, but model might still be loading
+        remaining_timeout = timeout_seconds - (time.time() - start_time)
 
-            elapsed = time.time() - start_time
-            
-            # v147.0: Try direct health check on the IP we got from start_spot_vm
-            # Don't rely on get_active_vm() which requires is_healthy flag
-            if vm_ip:
-                is_healthy = await _verify_gcp_vm_health(vm_ip, timeout=8.0)
-                if is_healthy:
-                    # Try port 8000 first (jarvis-prime), fallback to 8010 (startup script default)
-                    endpoint = f"http://{vm_ip}:8000"
+        if vm_ip:
+            success, result = await _wait_for_gcp_vm_ready(
+                ip_address=vm_ip,
+                port=8000,
+                timeout_seconds=max(remaining_timeout, 60.0),  # At least 60s for model loading
+                check_interval=5.0,
+            )
+
+            if success:
+                endpoint = result  # result is the endpoint URL on success
+                with _active_rescue_lock:
+                    _active_rescue_gcp_endpoint = endpoint
+                    _active_rescue_gcp_ready = True
+
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"[v189.0] ✅ Active Rescue: GCP VM fully ready at {endpoint} "
+                    f"(model loaded, inference ready, took {elapsed:.1f}s)"
+                )
+
+                # v149.0: Record success in enterprise hooks
+                if _ENTERPRISE_HOOKS_AVAILABLE:
+                    _record_provider_success("llm_inference", "gcp_vm")
+                    _update_component_health(
+                        "gcp_vm",
+                        HealthStatus.HEALTHY,
+                        f"VM provisioned, model loaded, inference ready at {endpoint} in {elapsed:.1f}s"
+                    )
+
+                # v148.0: Start continuous health monitor for the VM
+                # Now we can safely validate inference since model is confirmed loaded
+                try:
+                    await start_gcp_vm_health_monitor(
+                        check_interval=30.0,
+                        validate_inference=True,
+                    )
+                except Exception as monitor_err:
+                    logger.warning(f"[v148.0] Could not start health monitor: {monitor_err}")
+
+                return True, endpoint
+            else:
+                # result contains error message on failure
+                logger.warning(f"[v189.0] ⚠️ GCP VM readiness failed: {result}")
+        else:
+            # Fallback: try to get VM from manager
+            active_vm = await vm_manager.get_active_vm()
+            if active_vm and active_vm.ip_address:
+                vm_ip = active_vm.ip_address
+                logger.info(f"[v147.0] 🔍 Found VM IP from manager: {vm_ip}")
+                # Retry with discovered IP
+                success, result = await _wait_for_gcp_vm_ready(
+                    ip_address=vm_ip,
+                    port=8000,
+                    timeout_seconds=60.0,
+                )
+                if success:
+                    endpoint = result
                     with _active_rescue_lock:
                         _active_rescue_gcp_endpoint = endpoint
                         _active_rescue_gcp_ready = True
 
-                    logger.info(
-                        f"[v144.0] ✅ Active Rescue: GCP VM ready at {endpoint} "
-                        f"(took {elapsed:.1f}s, {check_count} health checks)"
-                    )
+                    logger.info(f"[v189.0] ✅ GCP VM ready (discovered IP): {endpoint}")
 
-                    # v149.0: Record success in enterprise hooks
                     if _ENTERPRISE_HOOKS_AVAILABLE:
                         _record_provider_success("llm_inference", "gcp_vm")
-                        _update_component_health(
-                            "gcp_vm",
-                            HealthStatus.HEALTHY,
-                            f"VM provisioned and ready at {endpoint} in {elapsed:.1f}s"
-                        )
+                        _update_component_health("gcp_vm", HealthStatus.HEALTHY, f"Ready at {endpoint}")
 
-                    # v148.0: Start continuous health monitor for the VM
                     try:
-                        await start_gcp_vm_health_monitor(
-                            check_interval=30.0,
-                            validate_inference=True,
-                        )
-                    except Exception as monitor_err:
-                        logger.warning(f"[v148.0] Could not start health monitor: {monitor_err}")
+                        await start_gcp_vm_health_monitor(check_interval=30.0, validate_inference=True)
+                    except Exception:
+                        pass
 
                     return True, endpoint
-                else:
-                    # Log progress every 30 seconds
-                    if check_count % 6 == 0:
-                        logger.info(
-                            f"[v147.0] ⏳ GCP VM {vm_ip} not ready yet "
-                            f"({elapsed:.0f}s elapsed, {check_count} checks). "
-                            f"Startup script may still be running..."
-                        )
-            else:
-                # Fallback: try to get VM from manager
-                active_vm = await vm_manager.get_active_vm()
-                if active_vm and active_vm.ip_address:
-                    vm_ip = active_vm.ip_address
-                    logger.info(f"[v147.0] 🔍 Found VM IP from manager: {vm_ip}")
 
         # Timeout reached - v155.0: Run diagnostics before failing
         logger.warning(f"[v155.0] ⏳ GCP VM health check timeout - running diagnostics...")
@@ -1889,6 +1910,276 @@ async def _validate_inference_capability(
     # This is OK during provisioning but not after
     logger.debug(f"[v148.0] No inference endpoints responding at {ip_address}:{port}")
     return False
+
+
+# =============================================================================
+# v189.0: INTELLIGENT MODEL READINESS DETECTION
+# =============================================================================
+# Enterprise-grade health checking that understands model loading states.
+# Returns detailed HealthCheckResult instead of simple True/False.
+# Enables the startup loop to intelligently wait for actual model readiness.
+# =============================================================================
+
+async def _check_gcp_vm_readiness(
+    ip_address: str,
+    port: int = 8000,
+    timeout: float = 10.0,
+) -> 'HealthCheckResult':
+    """
+    v189.0: Intelligent GCP VM readiness check with model loading awareness.
+
+    Unlike the simple _verify_gcp_vm_health which returns True/False, this
+    function returns detailed state information including:
+    - Whether the VM is STARTING (model still loading)
+    - Whether the VM is HEALTHY (model loaded, inference ready)
+    - Progress information during model loading
+
+    This enables the startup loop to:
+    - Wait intelligently for model loading to complete
+    - Not declare "ready" until inference actually works
+    - Report progress during long model loading phases
+
+    Args:
+        ip_address: IP address of the GCP VM
+        port: Port to check (default 8000 for jarvis-prime)
+        timeout: Request timeout in seconds
+
+    Returns:
+        HealthCheckResult with detailed state information
+    """
+    health_url = f"http://{ip_address}:{port}/health"
+
+    try:
+        connector = aiohttp.TCPConnector(force_close=True)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(
+                health_url,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as response:
+                if response.status == 200:
+                    try:
+                        data = await response.json()
+                    except Exception:
+                        data = {}
+
+                    # Extract key fields from J-Prime health response
+                    status = data.get("status", "unknown")
+                    phase = data.get("phase", "unknown")
+                    model_loaded = data.get("model_loaded", False)
+                    ready_for_inference = data.get("ready_for_inference", False)
+                    startup_elapsed = data.get("startup_elapsed")
+                    startup_step = data.get("step") or data.get("message", "")
+
+                    # v189.0: Intelligent state determination
+                    # Priority 1: Check explicit model readiness fields
+                    if model_loaded and ready_for_inference:
+                        logger.info(f"[v189.0] ✅ GCP VM fully ready: model_loaded=True, ready_for_inference=True")
+                        return HealthCheckResult(
+                            state=HealthState.HEALTHY,
+                            is_responding=True,
+                            status_text="ready_for_inference",
+                            phase=phase,
+                            startup_elapsed=startup_elapsed,
+                            raw_data=data
+                        )
+
+                    # Priority 2: Check status/phase for explicit ready state
+                    if status == "healthy" and phase == "ready":
+                        # Healthy but check if model is actually loaded
+                        if model_loaded or ready_for_inference:
+                            logger.info(f"[v189.0] ✅ GCP VM healthy and ready (phase=ready)")
+                            return HealthCheckResult(
+                                state=HealthState.HEALTHY,
+                                is_responding=True,
+                                status_text=status,
+                                phase=phase,
+                                raw_data=data
+                            )
+                        else:
+                            # Healthy HTTP but model not loaded yet
+                            logger.debug(f"[v189.0] ⏳ GCP VM healthy but model not loaded yet")
+                            return HealthCheckResult(
+                                state=HealthState.STARTING,
+                                is_responding=True,
+                                status_text="healthy_but_loading",
+                                phase=phase,
+                                startup_step="Model loading...",
+                                raw_data=data
+                            )
+
+                    # Priority 3: Check for starting/loading states
+                    if status in ("starting", "loading") or phase in ("starting", "loading", "initializing"):
+                        progress_pct = data.get("progress") or data.get("startup_progress")
+                        logger.debug(
+                            f"[v189.0] ⏳ GCP VM starting: status={status}, phase={phase}, "
+                            f"progress={progress_pct}%, step={startup_step}"
+                        )
+                        return HealthCheckResult(
+                            state=HealthState.STARTING,
+                            is_responding=True,
+                            status_text=status,
+                            phase=phase,
+                            startup_elapsed=startup_elapsed,
+                            startup_step=startup_step,
+                            startup_progress=progress_pct,
+                            raw_data=data
+                        )
+
+                    # Priority 4: Unknown state but responding - treat as starting
+                    logger.debug(f"[v189.0] ⏳ GCP VM responding but unclear state: {data}")
+                    return HealthCheckResult(
+                        state=HealthState.STARTING,
+                        is_responding=True,
+                        status_text=status,
+                        phase=phase,
+                        raw_data=data
+                    )
+
+                elif response.status == 503:
+                    # Service unavailable but responding - likely starting
+                    try:
+                        data = await response.json()
+                    except Exception:
+                        data = {}
+
+                    phase = data.get("phase", "unknown")
+                    message = data.get("message", "")
+
+                    logger.debug(f"[v189.0] ⏳ GCP VM 503 (starting): phase={phase}, message={message}")
+                    return HealthCheckResult(
+                        state=HealthState.STARTING,
+                        is_responding=True,
+                        status_text=f"HTTP 503 ({phase})",
+                        phase=phase,
+                        startup_step=message,
+                        raw_data=data
+                    )
+
+                else:
+                    # Other non-200 status
+                    return HealthCheckResult(
+                        state=HealthState.UNHEALTHY,
+                        is_responding=True,
+                        status_text=f"HTTP {response.status}",
+                        error_message=f"Unexpected status code: {response.status}"
+                    )
+
+    except asyncio.TimeoutError:
+        return HealthCheckResult(
+            state=HealthState.TIMEOUT,
+            is_responding=False,
+            error_message=f"Health check timeout ({timeout}s)"
+        )
+    except aiohttp.ClientConnectorError as e:
+        return HealthCheckResult(
+            state=HealthState.UNREACHABLE,
+            is_responding=False,
+            error_message=f"Connection failed: {type(e).__name__}"
+        )
+    except Exception as e:
+        return HealthCheckResult(
+            state=HealthState.UNREACHABLE,
+            is_responding=False,
+            error_message=f"Health check error: {e}"
+        )
+
+
+async def _wait_for_gcp_vm_ready(
+    ip_address: str,
+    port: int = 8000,
+    timeout_seconds: float = 300.0,
+    check_interval: float = 5.0,
+    progress_callback: Optional[Callable[[str, int], None]] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    v189.0: Wait for GCP VM to be fully ready with intelligent state tracking.
+
+    This function waits for the VM to transition from STARTING to HEALTHY,
+    providing progress updates during model loading. It understands:
+    - HTTP up but model loading = continue waiting
+    - HTTP up and inference ready = success
+    - HTTP down = continue waiting (VM still booting)
+    - Timeout = failure
+
+    Args:
+        ip_address: IP address of the GCP VM
+        port: Port to check (default 8000)
+        timeout_seconds: Maximum time to wait
+        check_interval: Time between health checks
+        progress_callback: Optional callback for progress updates (message, progress_pct)
+
+    Returns:
+        Tuple of (success, endpoint_url or error_message)
+    """
+    start_time = time.time()
+    check_count = 0
+    last_state = None
+    last_log_time = 0
+
+    logger.info(f"[v189.0] 🔍 Waiting for GCP VM {ip_address}:{port} to be fully ready...")
+
+    while time.time() - start_time < timeout_seconds:
+        check_count += 1
+        elapsed = time.time() - start_time
+
+        # Check VM readiness with intelligent state detection
+        result = await _check_gcp_vm_readiness(ip_address, port)
+
+        if result.state == HealthState.HEALTHY:
+            # VM is fully ready - model loaded and inference ready
+            endpoint = f"http://{ip_address}:{port}"
+            logger.info(
+                f"[v189.0] ✅ GCP VM fully ready at {endpoint} "
+                f"(took {elapsed:.1f}s, {check_count} checks)"
+            )
+            if progress_callback:
+                progress_callback("GCP VM ready for inference", 100)
+            return True, endpoint
+
+        elif result.state == HealthState.STARTING:
+            # VM is responding but model still loading - this is expected!
+            # Log progress periodically (every 15 seconds)
+            if time.time() - last_log_time > 15.0 or last_state != HealthState.STARTING:
+                progress_pct = result.startup_progress or int((elapsed / timeout_seconds) * 50) + 25
+                step_info = result.startup_step or result.phase or "loading"
+                logger.info(
+                    f"[v189.0] ⏳ GCP VM starting: {step_info} "
+                    f"({elapsed:.0f}s elapsed, progress ~{progress_pct}%)"
+                )
+                last_log_time = time.time()
+                if progress_callback:
+                    progress_callback(f"Model loading: {step_info}", min(progress_pct, 95))
+
+        elif result.state in (HealthState.UNREACHABLE, HealthState.TIMEOUT):
+            # VM not responding yet - might still be booting
+            if time.time() - last_log_time > 30.0 or last_state != result.state:
+                logger.debug(
+                    f"[v189.0] ⏳ GCP VM not responding yet "
+                    f"({elapsed:.0f}s elapsed, {result.error_message})"
+                )
+                last_log_time = time.time()
+                if progress_callback:
+                    progress_callback("Waiting for VM to boot...", int((elapsed / timeout_seconds) * 25))
+
+        else:
+            # UNHEALTHY or other error state
+            if time.time() - last_log_time > 30.0:
+                logger.warning(
+                    f"[v189.0] ⚠️ GCP VM unhealthy state: {result.state.value} "
+                    f"({result.error_message})"
+                )
+                last_log_time = time.time()
+
+        last_state = result.state
+        await asyncio.sleep(check_interval)
+
+    # Timeout reached
+    elapsed = time.time() - start_time
+    logger.warning(
+        f"[v189.0] ⏰ GCP VM readiness timeout after {elapsed:.1f}s "
+        f"(last state: {last_state.value if last_state else 'unknown'})"
+    )
+    return False, f"Timeout waiting for model to load ({elapsed:.0f}s)"
 
 
 def get_active_rescue_env_vars(gcp_endpoint: Optional[str] = None) -> Dict[str, str]:

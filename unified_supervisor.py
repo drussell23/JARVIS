@@ -48455,6 +48455,414 @@ class TrinityComponent:
         return self.state in ("running", "healthy")
 
 
+# =============================================================================
+# v190.0: SEMANTIC READINESS DETECTION SYSTEM
+# =============================================================================
+# Provides intelligent, component-aware readiness checking that goes beyond
+# simple HTTP 200 checks to understand actual operational state.
+# =============================================================================
+
+
+class ComponentType(Enum):
+    """Trinity component types with their readiness semantics."""
+    PRIME = "prime"      # LLM inference engine (requires model_loaded, ready_for_inference)
+    REACTOR = "reactor"  # Training/data engine (requires training_ready, trinity_connected)
+    GENERIC = "generic"  # Unknown component (HTTP 200 only)
+
+
+class ReadinessState(Enum):
+    """Semantic readiness states for Trinity components."""
+    UNKNOWN = "unknown"           # Cannot determine state
+    UNREACHABLE = "unreachable"   # Network/connection failure
+    STARTING = "starting"         # HTTP up but component still initializing
+    LOADING = "loading"           # Component loading resources (model, data, etc.)
+    DEGRADED = "degraded"         # Partially ready (some features unavailable)
+    READY = "ready"               # Fully operational and ready for requests
+    ERROR = "error"               # Component in error state
+
+
+@dataclass
+class SemanticReadinessResult:
+    """
+    v190.0: Comprehensive readiness assessment for a Trinity component.
+
+    Captures not just binary ready/not-ready but rich semantic information
+    about the component's current state, enabling intelligent decision making.
+    """
+    state: ReadinessState
+    is_ready: bool
+    component_type: ComponentType
+
+    # Detailed status information
+    http_status: Optional[int] = None
+    status_message: Optional[str] = None
+    phase: Optional[str] = None
+
+    # Component-specific readiness flags
+    model_loaded: Optional[bool] = None           # Prime: model loaded into memory
+    ready_for_inference: Optional[bool] = None    # Prime: can handle inference requests
+    training_ready: Optional[bool] = None         # Reactor: training subsystem ready
+    trinity_connected: Optional[bool] = None      # Reactor: connected to Trinity mesh
+
+    # Timing and progress information
+    uptime_seconds: Optional[float] = None
+    startup_progress: Optional[int] = None
+
+    # Raw response for debugging
+    raw_response: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+
+    # Recommendations
+    recommended_action: Optional[str] = None
+    estimated_wait_seconds: Optional[float] = None
+
+    def __post_init__(self):
+        """Derive recommended action based on state."""
+        if self.recommended_action is None:
+            self.recommended_action = self._derive_recommendation()
+
+    def _derive_recommendation(self) -> str:
+        """Intelligently derive recommended action based on state."""
+        if self.state == ReadinessState.READY:
+            return "proceed"
+        elif self.state == ReadinessState.STARTING:
+            return "wait_short"  # Brief wait, startup in progress
+        elif self.state == ReadinessState.LOADING:
+            return "wait_long"   # Longer wait, heavy resource loading
+        elif self.state == ReadinessState.DEGRADED:
+            return "proceed_cautiously"  # May work, but with limitations
+        elif self.state == ReadinessState.ERROR:
+            return "investigate"  # Don't retry blindly
+        elif self.state == ReadinessState.UNREACHABLE:
+            return "retry_connection"  # Network issue, retry
+        else:
+            return "unknown"
+
+
+class SemanticReadinessChecker:
+    """
+    v190.0: Intelligent semantic readiness checker for Trinity components.
+
+    This class understands the specific readiness semantics of each component
+    type and can make intelligent decisions about when a component is truly
+    ready for operation, rather than just checking HTTP 200.
+
+    Features:
+    - Component-type-aware readiness criteria
+    - Progressive readiness detection (STARTING -> LOADING -> READY)
+    - Intelligent wait time estimation
+    - Detailed diagnostic information
+    - Support for custom readiness criteria via callables
+    """
+
+    # Component name to type mapping (extensible via environment)
+    COMPONENT_TYPE_MAP: Dict[str, ComponentType] = {
+        "jarvis-prime": ComponentType.PRIME,
+        "prime": ComponentType.PRIME,
+        "j-prime": ComponentType.PRIME,
+        "reactor-core": ComponentType.REACTOR,
+        "reactor": ComponentType.REACTOR,
+        "nightshift": ComponentType.REACTOR,
+    }
+
+    # Readiness criteria by component type
+    # Each criterion is a tuple of (field_name, required_value, is_critical)
+    READINESS_CRITERIA: Dict[ComponentType, List[Tuple[str, Any, bool]]] = {
+        ComponentType.PRIME: [
+            # Prime must have model loaded AND be ready for inference
+            ("status", "healthy", True),
+            ("phase", "ready", True),
+            ("model_loaded", True, True),
+            ("ready_for_inference", True, True),
+        ],
+        ComponentType.REACTOR: [
+            # Reactor must be running and training subsystem ready
+            ("status", "healthy", True),
+            ("training_ready", True, True),
+            # trinity_connected is desirable but not critical
+            ("trinity_connected", True, False),
+        ],
+        ComponentType.GENERIC: [
+            # Generic just needs healthy status
+            ("status", "healthy", True),
+        ],
+    }
+
+    # Phase-to-state mapping for more accurate state detection
+    PHASE_STATE_MAP: Dict[str, ReadinessState] = {
+        "pre-init": ReadinessState.STARTING,
+        "initializing": ReadinessState.STARTING,
+        "loading_model": ReadinessState.LOADING,
+        "model_loading": ReadinessState.LOADING,
+        "warming_up": ReadinessState.LOADING,
+        "ready": ReadinessState.READY,
+        "healthy": ReadinessState.READY,
+        "running": ReadinessState.READY,
+        "error": ReadinessState.ERROR,
+        "failed": ReadinessState.ERROR,
+    }
+
+    def __init__(self, logger: Optional[logging.Logger] = None):
+        """Initialize the semantic readiness checker."""
+        self._logger = logger or logging.getLogger("jarvis.semantic_readiness")
+
+        # Allow runtime extension of component type mappings
+        self._load_custom_mappings()
+
+    def _load_custom_mappings(self) -> None:
+        """Load custom component type mappings from environment."""
+        # Example: TRINITY_COMPONENT_TYPES="my-service:prime,my-other:reactor"
+        custom_mappings = os.environ.get("TRINITY_COMPONENT_TYPES", "")
+        if custom_mappings:
+            for mapping in custom_mappings.split(","):
+                if ":" in mapping:
+                    name, type_str = mapping.strip().split(":", 1)
+                    try:
+                        component_type = ComponentType(type_str.lower())
+                        self.COMPONENT_TYPE_MAP[name.lower()] = component_type
+                        self._logger.debug(f"Added custom mapping: {name} -> {component_type}")
+                    except ValueError:
+                        self._logger.warning(f"Unknown component type: {type_str}")
+
+    def get_component_type(self, component_name: str) -> ComponentType:
+        """Determine component type from name."""
+        normalized = component_name.lower().replace("_", "-")
+        return self.COMPONENT_TYPE_MAP.get(normalized, ComponentType.GENERIC)
+
+    async def check_readiness(
+        self,
+        health_url: str,
+        component_name: str,
+        timeout: float = 10.0,
+        session: Optional[Any] = None,  # aiohttp.ClientSession
+    ) -> SemanticReadinessResult:
+        """
+        Perform comprehensive semantic readiness check.
+
+        Args:
+            health_url: URL to the component's health endpoint
+            component_name: Name of the component
+            timeout: HTTP request timeout
+            session: Optional aiohttp session to reuse
+
+        Returns:
+            SemanticReadinessResult with detailed state information
+        """
+        component_type = self.get_component_type(component_name)
+
+        try:
+            # Fetch health response
+            response_data, http_status = await self._fetch_health(
+                health_url, timeout, session
+            )
+
+            if response_data is None:
+                return SemanticReadinessResult(
+                    state=ReadinessState.UNREACHABLE,
+                    is_ready=False,
+                    component_type=component_type,
+                    http_status=http_status,
+                    error_message="Failed to connect to health endpoint",
+                    recommended_action="retry_connection",
+                )
+
+            # Analyze response semantically
+            return self._analyze_response(
+                response_data,
+                http_status,
+                component_type,
+                component_name,
+            )
+
+        except asyncio.TimeoutError:
+            return SemanticReadinessResult(
+                state=ReadinessState.UNREACHABLE,
+                is_ready=False,
+                component_type=component_type,
+                error_message=f"Health check timeout after {timeout}s",
+                recommended_action="retry_connection",
+            )
+        except Exception as e:
+            return SemanticReadinessResult(
+                state=ReadinessState.UNKNOWN,
+                is_ready=False,
+                component_type=component_type,
+                error_message=str(e),
+                recommended_action="investigate",
+            )
+
+    async def _fetch_health(
+        self,
+        url: str,
+        timeout: float,
+        session: Optional[Any],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+        """Fetch and parse health endpoint response."""
+        if not AIOHTTP_AVAILABLE:
+            return None, None
+
+        close_session = False
+        if session is None:
+            session = aiohttp.ClientSession()  # type: ignore
+            close_session = True
+
+        try:
+            async with session.get(url, timeout=timeout) as response:  # type: ignore
+                http_status = response.status
+                if http_status == 200:
+                    try:
+                        data = await response.json()
+                        return data, http_status
+                    except Exception:
+                        # Response not JSON, return empty dict
+                        return {}, http_status
+                else:
+                    return None, http_status
+        except Exception:
+            return None, None
+        finally:
+            if close_session:
+                await session.close()
+
+    def _analyze_response(
+        self,
+        response: Dict[str, Any],
+        http_status: int,
+        component_type: ComponentType,
+        component_name: str,
+    ) -> SemanticReadinessResult:
+        """Analyze health response and determine semantic readiness."""
+        # Extract common fields
+        status = response.get("status", "unknown")
+        phase = response.get("phase", status)
+
+        # Determine base state from phase (more specific) or status (fallback)
+        # Priority: phase-based state > status-based state
+        state = self.PHASE_STATE_MAP.get(phase.lower(), ReadinessState.UNKNOWN)
+
+        # Only use status for state determination if phase didn't give us a useful state
+        if state == ReadinessState.UNKNOWN:
+            if status.lower() in ("healthy", "ready"):
+                state = ReadinessState.READY
+            elif status.lower() == "starting":
+                state = ReadinessState.STARTING
+            else:
+                state = ReadinessState.UNKNOWN
+
+        # Check component-specific readiness criteria
+        criteria = self.READINESS_CRITERIA.get(component_type, [])
+        all_critical_met = True
+        any_non_critical_failed = False
+
+        for field_name, required_value, is_critical in criteria:
+            actual_value = response.get(field_name)
+
+            # Handle special "status" comparison (healthy/ready are equivalent)
+            if field_name == "status" and required_value == "healthy":
+                met = actual_value in ("healthy", "ready")
+            else:
+                met = actual_value == required_value
+
+            if not met:
+                if is_critical:
+                    all_critical_met = False
+                    self._logger.debug(
+                        f"[{component_name}] Critical criterion not met: "
+                        f"{field_name}={actual_value} (expected {required_value})"
+                    )
+                else:
+                    any_non_critical_failed = True
+
+        # Determine final readiness
+        is_ready = all_critical_met
+
+        # Refine state based on criteria analysis
+        if is_ready and any_non_critical_failed:
+            state = ReadinessState.DEGRADED
+        elif not is_ready and state == ReadinessState.READY:
+            # Criteria not met but phase says ready - it's actually still loading
+            state = ReadinessState.LOADING
+
+        # Extract component-specific fields
+        model_loaded = response.get("model_loaded")
+        ready_for_inference = response.get("ready_for_inference")
+        training_ready = response.get("training_ready")
+        trinity_connected = response.get("trinity_connected")
+        uptime = response.get("uptime_seconds")
+        progress = response.get("startup_progress")
+
+        # Estimate wait time based on current state
+        estimated_wait = self._estimate_wait_time(
+            state, component_type, response
+        )
+
+        return SemanticReadinessResult(
+            state=state,
+            is_ready=is_ready,
+            component_type=component_type,
+            http_status=http_status,
+            status_message=status,
+            phase=phase,
+            model_loaded=model_loaded,
+            ready_for_inference=ready_for_inference,
+            training_ready=training_ready,
+            trinity_connected=trinity_connected,
+            uptime_seconds=uptime,
+            startup_progress=progress,
+            raw_response=response,
+            estimated_wait_seconds=estimated_wait,
+        )
+
+    def _estimate_wait_time(
+        self,
+        state: ReadinessState,
+        component_type: ComponentType,
+        response: Dict[str, Any],
+    ) -> Optional[float]:
+        """
+        Intelligently estimate remaining wait time based on state and component type.
+
+        Uses heuristics based on typical startup patterns:
+        - Prime model loading: 30-120s depending on model size
+        - Reactor initialization: 10-30s
+        - Generic startup: 5-15s
+        """
+        if state == ReadinessState.READY:
+            return 0.0
+
+        if state == ReadinessState.STARTING:
+            # Early startup phase - estimate based on component type
+            if component_type == ComponentType.PRIME:
+                return 60.0  # Model loading ahead
+            elif component_type == ComponentType.REACTOR:
+                return 20.0
+            else:
+                return 10.0
+
+        if state == ReadinessState.LOADING:
+            # Active loading - check progress if available
+            progress = response.get("startup_progress", 0)
+            if progress and progress > 0:
+                # Estimate remaining based on progress
+                remaining_pct = 100 - progress
+                # Assume linear progress, with safety margin
+                estimated = remaining_pct * 1.0  # 1 second per percent
+                return max(5.0, estimated)
+
+            if component_type == ComponentType.PRIME:
+                return 45.0  # Mid-loading for model
+            elif component_type == ComponentType.REACTOR:
+                return 10.0
+            else:
+                return 5.0
+
+        if state == ReadinessState.DEGRADED:
+            return 5.0  # Might recover quickly
+
+        # Unknown or error - don't estimate
+        return None
+
+
 class TrinityIntegrator:
     """
     Cross-repo integration for JARVIS Trinity architecture.
@@ -48659,13 +49067,29 @@ class TrinityIntegrator:
         self.logger.info(f"[Trinity]   Repo: {component.repo_path}")
         self.logger.info(f"[Trinity]   Port: {component.port}")
 
-        # Find Python executable
-        venv_python = component.repo_path / "venv" / "bin" / "python3"
-        if not venv_python.exists():
-            venv_python = component.repo_path / "venv" / "bin" / "python"
-        if not venv_python.exists():
-            self.logger.warning(f"[Trinity]   No venv found, using system Python")
+        # Find Python executable - check both venv and .venv patterns
+        venv_paths = [
+            component.repo_path / "venv" / "bin" / "python3",
+            component.repo_path / "venv" / "bin" / "python",
+            component.repo_path / ".venv" / "bin" / "python3",
+            component.repo_path / ".venv" / "bin" / "python",
+        ]
+        venv_python = None
+        for venv_path in venv_paths:
+            if venv_path.exists():
+                venv_python = venv_path
+                break
+
+        if venv_python is None:
+            self.logger.warning(
+                f"[Trinity]   ⚠️  No venv found for {component.name} at {component.repo_path}/venv"
+            )
+            self.logger.warning(
+                f"[Trinity]   💡 Run: python3 -m venv {component.repo_path}/venv && "
+                f"{component.repo_path}/venv/bin/pip install -e {component.repo_path}"
+            )
             venv_python = Path(sys.executable)  # Fallback to current Python
+            self.logger.info(f"[Trinity]   Using system Python: {venv_python}")
         else:
             self.logger.info(f"[Trinity]   Python: {venv_python}")
 
@@ -48774,12 +49198,22 @@ class TrinityIntegrator:
 
     async def _wait_for_health(self, component: TrinityComponent, timeout: float = 60.0) -> bool:
         """
-        v186.0: Wait for component to become healthy with progress callbacks.
-        
-        Enhanced with:
-        - Progress callback every 5 seconds for UI feedback
-        - Process liveness check (fail fast if process dies)
-        - Detailed logging of health check attempts
+        v190.0: Wait for component to become SEMANTICALLY READY with intelligent detection.
+
+        This method goes beyond simple HTTP 200 checking to understand the actual
+        operational state of each component type:
+
+        - For Prime: Waits for model_loaded=True AND ready_for_inference=True
+        - For Reactor: Waits for training_ready=True
+        - Provides intelligent progress feedback based on actual state
+
+        Features:
+        - Semantic readiness detection (not just HTTP 200)
+        - Component-type-aware criteria (Prime vs Reactor vs Generic)
+        - Intelligent wait time estimation based on current state
+        - Progressive state logging (STARTING -> LOADING -> READY)
+        - Process liveness monitoring (fail fast if process dies)
+        - Dynamic polling interval based on estimated wait time
         """
         if not component.health_url:
             return True  # No health check configured
@@ -48792,73 +49226,255 @@ class TrinityIntegrator:
         attempt = 0
         last_callback_time = start_time
         callback_interval = 5.0  # Broadcast progress every 5 seconds
-        
+
         # Normalize component name for callback (jarvis-prime -> jarvis_prime)
         component_key = component.name.replace("-", "_")
-        
-        while (time.time() - start_time) < timeout:
-            attempt += 1
-            elapsed = time.time() - start_time
-            
-            # v186.0: Call progress callback every 5 seconds
-            if self._progress_callback and (time.time() - last_callback_time) >= callback_interval:
-                try:
-                    await self._progress_callback(
-                        component_key,
-                        "waiting",
-                        f"Waiting for {component.name} health ({elapsed:.0f}s)...",
-                        attempt,
-                        elapsed
+
+        # Initialize semantic readiness checker
+        readiness_checker = SemanticReadinessChecker(logger=self.logger)
+        last_state: Optional[ReadinessState] = None
+        last_phase: Optional[str] = None
+
+        # Create a reusable session for efficiency
+        async with aiohttp.ClientSession() as session:  # type: ignore
+            while (time.time() - start_time) < timeout:
+                attempt += 1
+                elapsed = time.time() - start_time
+
+                # Check if process died (fail fast)
+                if component.process and component.process.returncode is not None:
+                    self.logger.warning(
+                        f"[Trinity] {component.name} process exited (code: {component.process.returncode}) "
+                        f"during health wait"
+                    )
+                    if self._progress_callback:
+                        await self._safe_callback(
+                            component_key, "failed",
+                            f"{component.name} process died during startup",
+                            attempt, elapsed
+                        )
+                    return False
+
+                # Perform semantic readiness check
+                result = await readiness_checker.check_readiness(
+                    component.health_url,
+                    component.name,
+                    timeout=5.0,
+                    session=session,
+                )
+
+                # Log state transitions
+                if result.state != last_state or result.phase != last_phase:
+                    self._log_state_transition(
+                        component.name, last_state, result.state, last_phase, result.phase
+                    )
+                    last_state = result.state
+                    last_phase = result.phase
+
+                # Check if ready
+                if result.is_ready:
+                    self.logger.info(
+                        f"[Trinity] ✅ {component.name} READY after {elapsed:.1f}s "
+                        f"(state={result.state.value}, phase={result.phase})"
+                    )
+
+                    # Log component-specific readiness details
+                    if result.component_type == ComponentType.PRIME:
+                        self.logger.info(
+                            f"[Trinity]   → model_loaded={result.model_loaded}, "
+                            f"ready_for_inference={result.ready_for_inference}"
+                        )
+                    elif result.component_type == ComponentType.REACTOR:
+                        self.logger.info(
+                            f"[Trinity]   → training_ready={result.training_ready}, "
+                            f"trinity_connected={result.trinity_connected}"
+                        )
+
+                    # Broadcast healthy status
+                    if self._progress_callback:
+                        await self._safe_callback(
+                            component_key, "healthy",
+                            f"{component.name} ready after {elapsed:.1f}s",
+                            attempt, elapsed
+                        )
+                    return True
+
+                # Handle degraded state - may be usable
+                if result.state == ReadinessState.DEGRADED:
+                    self.logger.warning(
+                        f"[Trinity] ⚠️  {component.name} in DEGRADED state after {elapsed:.1f}s"
+                    )
+                    if result.recommended_action == "proceed_cautiously":
+                        self.logger.info(
+                            f"[Trinity]   → Proceeding with degraded component (non-critical criteria not met)"
+                        )
+                        if self._progress_callback:
+                            await self._safe_callback(
+                                component_key, "degraded",
+                                f"{component.name} ready (degraded) after {elapsed:.1f}s",
+                                attempt, elapsed
+                            )
+                        return True
+
+                # Call progress callback periodically
+                if self._progress_callback and (time.time() - last_callback_time) >= callback_interval:
+                    status_msg = self._format_progress_message(component.name, result, elapsed)
+                    await self._safe_callback(
+                        component_key, "waiting", status_msg, attempt, elapsed
                     )
                     last_callback_time = time.time()
-                except Exception as e:
-                    self.logger.debug(f"[Trinity] Progress callback error: {e}")
-            
-            # v186.0: Check if process died (fail fast)
-            if component.process and component.process.returncode is not None:
-                self.logger.warning(
-                    f"[Trinity] {component.name} process exited (code: {component.process.returncode}) "
-                    f"during health wait"
-                )
-                return False
-            
-            try:
-                async with aiohttp.ClientSession() as session:  # type: ignore[union-attr]
-                    async with session.get(component.health_url, timeout=5.0) as response:
-                        if response.status == 200:
-                            # v186.0: Broadcast healthy status
-                            if self._progress_callback:
-                                try:
-                                    await self._progress_callback(
-                                        component_key,
-                                        "healthy",
-                                        f"{component.name} healthy after {elapsed:.1f}s",
-                                        attempt,
-                                        elapsed
-                                    )
-                                except Exception:
-                                    pass
-                            return True
-            except Exception:
-                pass
-            
-            await asyncio.sleep(2.0)
 
-        # Timeout - send failure callback
+                # Dynamic polling interval based on state and estimated wait
+                poll_interval = self._calculate_poll_interval(result)
+                await asyncio.sleep(poll_interval)
+
+        # Timeout - gather diagnostic information
         elapsed = time.time() - start_time
+        self.logger.warning(
+            f"[Trinity] ⏱️  {component.name} did not become ready within {timeout}s"
+        )
+
+        # Final check to get diagnostic info
+        final_result = await readiness_checker.check_readiness(
+            component.health_url, component.name, timeout=5.0
+        )
+        self._log_timeout_diagnostics(component.name, final_result, timeout)
+
         if self._progress_callback:
-            try:
-                await self._progress_callback(
-                    component_key,
-                    "timeout",
-                    f"{component.name} health check timeout after {elapsed:.0f}s",
-                    attempt,
-                    elapsed
-                )
-            except Exception:
-                pass
+            await self._safe_callback(
+                component_key, "timeout",
+                f"{component.name} not ready after {elapsed:.0f}s (state={final_result.state.value})",
+                attempt, elapsed
+            )
 
         return False
+
+    async def _safe_callback(
+        self,
+        component_key: str,
+        status: str,
+        message: str,
+        attempt: int,
+        elapsed: float,
+    ) -> None:
+        """Safely invoke progress callback with error handling."""
+        if not self._progress_callback:
+            return
+        try:
+            await self._progress_callback(component_key, status, message, attempt, elapsed)
+        except Exception as e:
+            self.logger.debug(f"[Trinity] Progress callback error: {e}")
+
+    def _log_state_transition(
+        self,
+        component_name: str,
+        old_state: Optional[ReadinessState],
+        new_state: ReadinessState,
+        old_phase: Optional[str],
+        new_phase: Optional[str],
+    ) -> None:
+        """Log meaningful state transitions for debugging."""
+        if old_state is None:
+            self.logger.info(
+                f"[Trinity] 🔄 {component_name} state: {new_state.value} (phase: {new_phase})"
+            )
+        elif old_state != new_state:
+            self.logger.info(
+                f"[Trinity] 🔄 {component_name} state: {old_state.value} → {new_state.value}"
+            )
+        elif old_phase != new_phase:
+            self.logger.debug(
+                f"[Trinity] {component_name} phase: {old_phase} → {new_phase}"
+            )
+
+    def _format_progress_message(
+        self,
+        component_name: str,
+        result: SemanticReadinessResult,
+        elapsed: float,
+    ) -> str:
+        """Format a human-readable progress message."""
+        base_msg = f"Waiting for {component_name}"
+
+        if result.state == ReadinessState.STARTING:
+            return f"{base_msg} to initialize ({elapsed:.0f}s)..."
+        elif result.state == ReadinessState.LOADING:
+            if result.startup_progress:
+                return f"{base_msg} to load ({result.startup_progress}% complete, {elapsed:.0f}s)..."
+            if result.component_type == ComponentType.PRIME:
+                return f"{base_msg} model to load ({elapsed:.0f}s)..."
+            return f"{base_msg} to load resources ({elapsed:.0f}s)..."
+        elif result.state == ReadinessState.UNREACHABLE:
+            return f"{base_msg} to become reachable ({elapsed:.0f}s)..."
+        else:
+            return f"{base_msg} ({elapsed:.0f}s)..."
+
+    def _calculate_poll_interval(self, result: SemanticReadinessResult) -> float:
+        """
+        Calculate optimal polling interval based on current state.
+
+        Uses intelligent heuristics:
+        - Early startup: Poll frequently (1s) to catch fast transitions
+        - Loading: Poll less frequently (3s) to reduce load
+        - Near ready: Poll frequently again (1s)
+        - Unreachable: Back off (5s) to avoid hammering
+        """
+        if result.state == ReadinessState.UNREACHABLE:
+            return 5.0  # Back off if unreachable
+        elif result.state == ReadinessState.STARTING:
+            return 1.5  # Poll frequently during early startup
+        elif result.state == ReadinessState.LOADING:
+            # If we have estimated wait time, adjust interval
+            if result.estimated_wait_seconds:
+                if result.estimated_wait_seconds < 10:
+                    return 1.0  # Almost ready, poll fast
+                elif result.estimated_wait_seconds < 30:
+                    return 2.0
+                else:
+                    return 3.0
+            return 2.0  # Default for loading
+        elif result.state == ReadinessState.DEGRADED:
+            return 1.0  # Poll frequently to catch full recovery
+        else:
+            return 2.0  # Default interval
+
+    def _log_timeout_diagnostics(
+        self,
+        component_name: str,
+        result: SemanticReadinessResult,
+        timeout: float,
+    ) -> None:
+        """Log detailed diagnostics when a component times out."""
+        self.logger.warning(f"[Trinity] ─── Timeout Diagnostics for {component_name} ───")
+        self.logger.warning(f"[Trinity]   State: {result.state.value}")
+        self.logger.warning(f"[Trinity]   Phase: {result.phase}")
+        self.logger.warning(f"[Trinity]   Component Type: {result.component_type.value}")
+
+        if result.component_type == ComponentType.PRIME:
+            self.logger.warning(f"[Trinity]   model_loaded: {result.model_loaded}")
+            self.logger.warning(f"[Trinity]   ready_for_inference: {result.ready_for_inference}")
+            if not result.model_loaded:
+                self.logger.warning(
+                    "[Trinity]   → Model may still be loading or failed to load"
+                )
+            elif not result.ready_for_inference:
+                self.logger.warning(
+                    "[Trinity]   → Model loaded but inference pipeline not ready"
+                )
+
+        elif result.component_type == ComponentType.REACTOR:
+            self.logger.warning(f"[Trinity]   training_ready: {result.training_ready}")
+            self.logger.warning(f"[Trinity]   trinity_connected: {result.trinity_connected}")
+            if not result.training_ready:
+                self.logger.warning(
+                    "[Trinity]   → Training subsystem not initialized"
+                )
+
+        if result.error_message:
+            self.logger.warning(f"[Trinity]   Error: {result.error_message}")
+
+        self.logger.warning(f"[Trinity]   Recommendation: {result.recommended_action}")
+        self.logger.warning(f"[Trinity] ─────────────────────────────────────────────")
 
     async def _start_health_monitor(self) -> None:
         """Start health monitoring loop."""
@@ -48894,7 +49510,13 @@ class TrinityIntegrator:
                 self.logger.debug(f"[Trinity] Health monitor error: {e}")
 
     async def _check_health(self, component: TrinityComponent) -> bool:
-        """Check if a component is healthy."""
+        """
+        v190.0: Check if a component is semantically healthy.
+
+        Uses the same semantic readiness criteria as startup to ensure
+        consistency between initial readiness detection and ongoing
+        health monitoring.
+        """
         if not component.health_url:
             return True
 
@@ -48902,10 +49524,29 @@ class TrinityIntegrator:
             return True  # Assume healthy if we can't check
 
         try:
-            async with aiohttp.ClientSession() as session:  # type: ignore[union-attr]
-                async with session.get(component.health_url, timeout=5.0) as response:
-                    return response.status == 200
-        except Exception:
+            readiness_checker = SemanticReadinessChecker(logger=self.logger)
+            result = await readiness_checker.check_readiness(
+                component.health_url,
+                component.name,
+                timeout=5.0,
+            )
+
+            # Consider both READY and DEGRADED as "healthy enough" for runtime
+            if result.is_ready:
+                return True
+
+            # DEGRADED state - log but still consider operational
+            if result.state == ReadinessState.DEGRADED:
+                self.logger.debug(
+                    f"[Trinity] {component.name} in degraded state: {result.status_message}"
+                )
+                return True
+
+            # Any other state means unhealthy
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"[Trinity] Health check error for {component.name}: {e}")
             return False
 
     async def stop(self) -> None:
