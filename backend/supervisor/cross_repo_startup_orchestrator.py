@@ -17316,6 +17316,10 @@ echo "=== JARVIS Prime started ==="
                     logger.debug(f"[v192.0] RAM detection failed: {e}")
 
             if force_cloud or slim_mode:
+                # v193.0: Import psutil at start of this block to ensure it's available
+                # for all code paths including the GCP failure fallback at line 17375
+                import psutil
+
                 logger.info(
                     f"[v144.0] 🚀 Active Rescue: Ensuring GCP VM is ready BEFORE spawning {definition.name}..."
                 )

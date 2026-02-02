@@ -32,7 +32,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from backend.core.component_registry import ComponentRegistry
@@ -291,7 +291,9 @@ class CapabilityRouter:
         decision = await self.get_routing_decision(capability)
         return decision.provider
 
-    async def get_routing_decision(self, capability: str) -> RoutingDecision:
+    async def get_routing_decision(
+        self, capability: str, preferred_provider: Optional[str] = None
+    ) -> RoutingDecision:
         """
         Get detailed routing decision.
 
@@ -300,13 +302,28 @@ class CapabilityRouter:
 
         Args:
             capability: The capability to route
+            preferred_provider: Optional preferred provider to use if available
 
         Returns:
             RoutingDecision with full routing details
         """
         from backend.core.component_registry import ComponentStatus
 
-        provider = self.registry.get_provider(capability)
+        # Check if preferred provider is specified and available
+        provider = None
+        if preferred_provider:
+            try:
+                state = self.registry.get_state(preferred_provider)
+                if state.status in (ComponentStatus.HEALTHY, ComponentStatus.DEGRADED):
+                    breaker = self._get_or_create_breaker(preferred_provider)
+                    if breaker.can_execute():
+                        provider = preferred_provider
+            except KeyError:
+                pass  # Preferred provider not registered
+
+        # Fall back to registry lookup if no preferred provider or it's unavailable
+        if not provider:
+            provider = self.registry.get_provider(capability)
 
         if not provider:
             return RoutingDecision(
@@ -489,13 +506,156 @@ class CapabilityRouter:
         if provider in self._circuit_breakers:
             self._circuit_breakers[provider].reset()
 
-    def get_circuit_breaker_status(self) -> Dict[str, Dict[str, Any]]:
+    # =========================================================================
+    # v193.0: MISSING METHODS - Required by enterprise_hooks.py
+    # =========================================================================
+    # These methods were missing causing AttributeError on startup when
+    # enterprise_hooks tried to register Trinity fallback chains.
+    # =========================================================================
+
+    def register_provider(self, capability: str, provider: str) -> None:
         """
-        Get status of all circuit breakers.
+        Register a provider for a capability.
+
+        This is used by enterprise_hooks._register_trinity_fallback_chains()
+        to set up the Trinity fallback chain.
+
+        Args:
+            capability: The capability being provided (e.g., "llm_inference")
+            provider: Name of the provider (e.g., "jarvis-prime")
+        """
+        # Store the capability -> provider mapping
+        # The registry handles the actual component registration
+        if not hasattr(self, '_capability_providers'):
+            self._capability_providers: Dict[str, List[str]] = {}
+
+        if capability not in self._capability_providers:
+            self._capability_providers[capability] = []
+
+        if provider not in self._capability_providers[capability]:
+            self._capability_providers[capability].insert(0, provider)  # Primary goes first
+            logger.debug(f"Registered provider {provider} for capability {capability}")
+
+    def register_fallback(self, capability: str, provider: str) -> None:
+        """
+        Register a fallback provider for a capability.
+
+        Fallback providers are tried in order after the primary provider fails.
+
+        Args:
+            capability: The capability being provided
+            provider: Name of the fallback provider
+        """
+        if not hasattr(self, '_capability_providers'):
+            self._capability_providers: Dict[str, List[str]] = {}
+
+        if capability not in self._capability_providers:
+            self._capability_providers[capability] = []
+
+        if provider not in self._capability_providers[capability]:
+            self._capability_providers[capability].append(provider)  # Fallback goes at end
+            logger.debug(f"Registered fallback {provider} for capability {capability}")
+
+    def record_success(self, capability: str) -> None:
+        """
+        Record a successful call for a capability.
+
+        Finds the provider for the capability and updates its circuit breaker.
+
+        Args:
+            capability: The capability that succeeded
+        """
+        provider = self.registry.get_provider(capability)
+        if provider:
+            breaker = self._get_or_create_breaker(provider)
+            breaker.record_success()
+        else:
+            # Check our internal registry
+            if hasattr(self, '_capability_providers'):
+                providers = self._capability_providers.get(capability, [])
+                if providers:
+                    breaker = self._get_or_create_breaker(providers[0])
+                    breaker.record_success()
+
+    def record_failure(self, capability: str, error: Exception) -> None:
+        """
+        Record a failed call for a capability.
+
+        Finds the provider for the capability and updates its circuit breaker.
+
+        Args:
+            capability: The capability that failed
+            error: The exception that was raised
+        """
+        provider = self.registry.get_provider(capability)
+        if provider:
+            breaker = self._get_or_create_breaker(provider)
+            breaker.record_failure()
+            logger.warning(f"Recorded failure for {capability} via {provider}: {error}")
+        else:
+            # Check our internal registry
+            if hasattr(self, '_capability_providers'):
+                providers = self._capability_providers.get(capability, [])
+                if providers:
+                    breaker = self._get_or_create_breaker(providers[0])
+                    breaker.record_failure()
+                    logger.warning(f"Recorded failure for {capability} via {providers[0]}: {error}")
+
+    def get_circuit_breaker_status_for_capability(
+        self, capability: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get circuit breaker status for a specific capability.
+
+        Args:
+            capability: The capability to get status for
 
         Returns:
-            Dict mapping provider name to circuit breaker status
+            Dict with circuit breaker status, or None if no breaker exists
         """
+        provider = self.registry.get_provider(capability)
+        if not provider:
+            # Check our internal registry
+            if hasattr(self, '_capability_providers'):
+                providers = self._capability_providers.get(capability, [])
+                if providers:
+                    provider = providers[0]
+
+        if provider and provider in self._circuit_breakers:
+            cb = self._circuit_breakers[provider]
+            return {
+                "provider": provider,
+                "state": cb.state.value,
+                "failure_count": cb.failure_count,
+                "success_count": cb.success_count,
+                "last_failure": cb.last_failure.isoformat() if cb.last_failure else None,
+                "last_state_change": (
+                    cb.last_state_change.isoformat() if cb.last_state_change else None
+                ),
+            }
+        return None
+
+    def get_circuit_breaker_status(
+        self, capability: Optional[str] = None
+    ) -> Union[Dict[str, Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Get status of circuit breakers.
+
+        If capability is provided, returns status for that specific capability.
+        Otherwise, returns status for all circuit breakers.
+
+        Args:
+            capability: Optional capability to get status for
+
+        Returns:
+            Dict mapping provider name to circuit breaker status,
+            or single status dict if capability specified
+        """
+        # If capability is specified, delegate to the capability-specific method
+        if capability is not None:
+            return self.get_circuit_breaker_status_for_capability(capability)
+
+        # Return all circuit breaker statuses
         return {
             name: {
                 "state": cb.state.value,
