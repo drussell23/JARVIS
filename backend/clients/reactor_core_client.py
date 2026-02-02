@@ -758,7 +758,7 @@ class ReactorCoreClient:
         Returns:
             Swap result dictionary with success status and details
         """
-        jarvis_prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8000")  # v89.0: Fixed to 8000 (was incorrectly 8002)
+        jarvis_prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8001")  # v192.2: Changed to 8001
 
         try:
             import aiohttp
@@ -809,7 +809,7 @@ class ReactorCoreClient:
         Returns:
             Status dictionary or None if unreachable
         """
-        jarvis_prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8000")  # v89.0: Fixed to 8000 (was incorrectly 8002)
+        jarvis_prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8001")  # v192.2: Changed to 8001
 
         try:
             import aiohttp
@@ -834,7 +834,7 @@ class ReactorCoreClient:
         Returns:
             True if JARVIS Prime is running and healthy
         """
-        jarvis_prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8000")  # v89.0: Fixed to 8000 (was incorrectly 8002)
+        jarvis_prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8001")  # v192.2: Changed to 8001
 
         try:
             import aiohttp
