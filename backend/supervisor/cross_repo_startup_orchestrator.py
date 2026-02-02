@@ -7919,7 +7919,15 @@ class ProcessOrchestrator:
 
     async def _identify_port_conflict(self, port: int) -> str:
         """
-        v95.9: Identify what process is using a port.
+        v193.0: Identify what process is using a port with robust fallbacks.
+
+        CRITICAL FIX: On macOS, psutil.net_connections() can raise AccessDenied
+        for individual processes, which caused "Error identifying process: (pid=XXXX)"
+        messages. This version:
+        1. Handles psutil.AccessDenied gracefully
+        2. Falls back to lsof on macOS (doesn't require elevated permissions)
+        3. Falls back to netstat on Linux
+        4. Provides meaningful diagnostics even when process can't be identified
 
         Args:
             port: Port number
@@ -7927,27 +7935,116 @@ class ProcessOrchestrator:
         Returns:
             Description of conflicting process
         """
+        # Try multiple methods in order of preference
+        result = await self._identify_port_conflict_psutil(port)
+        if result and "Unknown" not in result and "Error" not in result:
+            return result
+
+        # Fallback to lsof (works better on macOS without elevated permissions)
+        result = await self._identify_port_conflict_lsof(port)
+        if result and "Unknown" not in result:
+            return result
+
+        # If all methods fail, check if port is actually in use
+        is_in_use = not await self._check_port_available(port, use_bind_check=True)
+        if is_in_use:
+            return f"Port {port} in use (process identification requires elevated permissions)"
+        else:
+            return f"Port {port} may be in TIME_WAIT or recently closed"
+
+    async def _identify_port_conflict_psutil(self, port: int) -> str:
+        """
+        v193.0: Identify port conflict using psutil with proper error handling.
+        """
         try:
             import psutil
 
-            for conn in psutil.net_connections(kind='inet'):
+            # v193.0: Wrap the entire net_connections call since it can raise
+            # AccessDenied for individual processes during iteration
+            try:
+                connections = list(psutil.net_connections(kind='inet'))
+            except psutil.AccessDenied as e:
+                # On macOS, this happens when we can't access certain processes
+                logger.debug(f"[v193.0] psutil.net_connections() AccessDenied: {e}")
+                return ""  # Empty string signals to try fallback
+            except PermissionError as e:
+                logger.debug(f"[v193.0] psutil.net_connections() PermissionError: {e}")
+                return ""
+
+            for conn in connections:
                 if conn.laddr and hasattr(conn.laddr, 'port') and conn.laddr.port == port:
-                    if conn.status == 'LISTEN':
+                    # v193.0: Check multiple connection states, not just LISTEN
+                    if conn.status in ('LISTEN', 'ESTABLISHED', 'CLOSE_WAIT', 'TIME_WAIT'):
+                        if conn.pid is None:
+                            return f"Port {port} in {conn.status} state (PID unavailable - elevated permissions needed)"
                         try:
                             proc = psutil.Process(conn.pid)
-                            cmdline = ' '.join(proc.cmdline()[:3])
-                            return f"PID={conn.pid}, Name={proc.name()}, Cmd={cmdline}"
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            return f"PID={conn.pid} (details unavailable)"
+                            cmdline = ' '.join(proc.cmdline()[:3]) if proc.cmdline() else proc.name()
+                            return f"PID={conn.pid}, Name={proc.name()}, Cmd={cmdline}, Status={conn.status}"
+                        except psutil.NoSuchProcess:
+                            return f"PID={conn.pid} (process exited, port in {conn.status})"
+                        except psutil.AccessDenied:
+                            return f"PID={conn.pid} (access denied, Status={conn.status})"
+                        except Exception as e:
+                            return f"PID={conn.pid} (error: {type(e).__name__})"
+
             return "Unknown process"
+
         except ImportError:
-            return "psutil not available for process identification"
+            return "psutil not available"
         except Exception as e:
-            return f"Error identifying process: {e}"
+            logger.debug(f"[v193.0] _identify_port_conflict_psutil exception: {type(e).__name__}: {e}")
+            return ""  # Return empty to trigger fallback
+
+    async def _identify_port_conflict_lsof(self, port: int) -> str:
+        """
+        v193.0: Identify port conflict using lsof (macOS/Linux fallback).
+
+        lsof works without elevated permissions for many cases where psutil fails.
+        """
+        try:
+            # Run lsof in thread pool to avoid blocking event loop
+            def _run_lsof():
+                import subprocess
+                try:
+                    # -i :PORT shows all connections on that port
+                    # -n -P prevents DNS/service name lookups (faster)
+                    result = subprocess.run(
+                        ['lsof', '-i', f':{port}', '-n', '-P', '-sTCP:LISTEN'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5.0
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        # Parse lsof output - format: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+                        lines = result.stdout.strip().split('\n')
+                        if len(lines) > 1:  # Skip header
+                            parts = lines[1].split()
+                            if len(parts) >= 2:
+                                command = parts[0]
+                                pid = parts[1]
+                                return f"PID={pid}, Name={command} (via lsof)"
+                    return ""
+                except FileNotFoundError:
+                    return ""  # lsof not available
+                except subprocess.TimeoutExpired:
+                    return ""
+                except Exception as e:
+                    logger.debug(f"[v193.0] lsof error: {e}")
+                    return ""
+
+            # Run in thread pool
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, _run_lsof)
+            return result
+
+        except Exception as e:
+            logger.debug(f"[v193.0] _identify_port_conflict_lsof exception: {e}")
+            return ""
 
     async def _cleanup_stale_process(self, port: int) -> bool:
         """
-        v95.9: Clean up stale JARVIS process on a port.
+        v193.0: Clean up stale JARVIS process on a port.
         v111.3: CRITICAL FIX - Never kill processes spawned in this session.
 
         Args:
@@ -7956,6 +8053,17 @@ class ProcessOrchestrator:
         Returns:
             True if cleanup successful
         """
+        # Try psutil first, fall back to lsof if permission denied
+        result = await self._cleanup_stale_process_psutil(port)
+        if result:
+            return True
+
+        # Fallback: try using lsof to find and kill the process
+        result = await self._cleanup_stale_process_lsof(port)
+        return result
+
+    async def _cleanup_stale_process_psutil(self, port: int) -> bool:
+        """v193.0: Clean up stale process using psutil."""
         try:
             import psutil
 
@@ -7970,7 +8078,14 @@ class ProcessOrchestrator:
             current_pid = os.getpid()
             parent_pid = os.getppid()
 
-            for conn in psutil.net_connections(kind='inet'):
+            # v193.0: Wrap net_connections call to handle AccessDenied
+            try:
+                connections = list(psutil.net_connections(kind='inet'))
+            except (psutil.AccessDenied, PermissionError) as e:
+                logger.debug(f"[v193.0] psutil.net_connections() permission denied: {e}")
+                return False  # Signal to try fallback
+
+            for conn in connections:
                 if conn.laddr and hasattr(conn.laddr, 'port') and conn.laddr.port == port:
                     if conn.status == 'LISTEN':
                         try:
@@ -8025,6 +8140,118 @@ class ProcessOrchestrator:
             return False
         except Exception as e:
             logger.error(f"[v95.9] Error cleaning up stale process: {e}")
+            return False
+
+    async def _cleanup_stale_process_lsof(self, port: int) -> bool:
+        """
+        v193.0: Clean up stale process using lsof (fallback for macOS permission issues).
+
+        This method is used when psutil.net_connections() fails with AccessDenied.
+        lsof can identify processes on ports without requiring elevated permissions.
+        """
+        try:
+            # v193.0: Get PIDs of processes we spawned - NEVER kill our own children
+            spawned_pids = set()
+            for managed in self.processes.values():
+                if managed.pid:
+                    spawned_pids.add(managed.pid)
+
+            current_pid = os.getpid()
+            parent_pid = os.getppid()
+
+            def _run_lsof_and_kill():
+                import subprocess
+                import signal
+
+                try:
+                    # Find process using lsof
+                    result = subprocess.run(
+                        ['lsof', '-i', f':{port}', '-n', '-P', '-sTCP:LISTEN', '-t'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5.0
+                    )
+
+                    if result.returncode != 0 or not result.stdout.strip():
+                        return False
+
+                    pid_str = result.stdout.strip().split('\n')[0]
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        return False
+
+                    # Safety checks
+                    if pid == current_pid:
+                        logger.debug(f"[v193.0] lsof: Skipping self (PID={pid}) on port {port}")
+                        return False
+                    if pid == parent_pid:
+                        logger.debug(f"[v193.0] lsof: Skipping parent (PID={pid}) on port {port}")
+                        return False
+                    if pid in spawned_pids:
+                        logger.info(f"[v193.0] lsof: Skipping spawned PID {pid} on port {port}")
+                        return False
+
+                    # Check GlobalProcessRegistry
+                    try:
+                        from backend.core.supervisor_singleton import GlobalProcessRegistry
+                        if GlobalProcessRegistry.is_ours(pid):
+                            logger.info(f"[v193.0] lsof: Skipping registered PID {pid} on port {port}")
+                            return False
+                    except ImportError:
+                        pass
+
+                    # Get process info to verify it's JARVIS-related
+                    ps_result = subprocess.run(
+                        ['ps', '-p', str(pid), '-o', 'comm='],
+                        capture_output=True,
+                        text=True,
+                        timeout=2.0
+                    )
+
+                    if ps_result.returncode == 0:
+                        proc_name = ps_result.stdout.strip().lower()
+                        if not any(x in proc_name for x in ['python', 'jarvis', 'prime', 'reactor', 'uvicorn']):
+                            logger.debug(f"[v193.0] lsof: PID {pid} ({proc_name}) not JARVIS-related")
+                            return False
+
+                    # Kill the process
+                    logger.info(f"[v193.0] lsof: Terminating stale process PID={pid} on port {port}")
+                    os.kill(pid, signal.SIGTERM)
+
+                    # Wait briefly for graceful shutdown
+                    import time
+                    for _ in range(10):  # 5 second max wait
+                        time.sleep(0.5)
+                        try:
+                            os.kill(pid, 0)  # Check if still alive
+                        except OSError:
+                            return True  # Process exited
+
+                    # Force kill if still alive
+                    try:
+                        logger.warning(f"[v193.0] lsof: Force killing PID={pid}")
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+
+                    return True
+
+                except FileNotFoundError:
+                    return False  # lsof not available
+                except subprocess.TimeoutExpired:
+                    return False
+                except Exception as e:
+                    logger.debug(f"[v193.0] lsof cleanup error: {e}")
+                    return False
+
+            # Run in thread pool
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, _run_lsof_and_kill)
+            return result
+
+        except Exception as e:
+            logger.debug(f"[v193.0] _cleanup_stale_process_lsof exception: {e}")
             return False
 
     async def _find_available_port(self, service_name: str) -> Optional[int]:
