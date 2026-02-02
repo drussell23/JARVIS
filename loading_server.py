@@ -3460,6 +3460,11 @@ class GracefulShutdownManager:
         self._max_idle_after_complete = max_idle_after_complete or float(
             os.getenv('LOADING_SERVER_MAX_IDLE', '30.0')
         )
+        # v198.1: Transition grace period - pause auto-shutdown during Chrome redirect
+        # This prevents premature shutdown when browser briefly disconnects during redirect
+        self._transition_grace_period = float(
+            os.getenv('LOADING_SERVER_TRANSITION_GRACE', '5.0')
+        )
 
         # State tracking
         self._startup_complete = False
@@ -3468,6 +3473,8 @@ class GracefulShutdownManager:
         self._last_connection_count = 0
         self._browser_disconnected_at: Optional[datetime] = None
         self._startup_completed_at: Optional[datetime] = None
+        # v198.1: Track when transition grace period ends
+        self._transition_grace_ends_at: Optional[datetime] = None
 
         # Shutdown coordination - these will be recreated in initialize_async_objects()
         # to ensure they're attached to the correct event loop
@@ -3483,7 +3490,8 @@ class GracefulShutdownManager:
             f"[GracefulShutdown] Initialized - "
             f"auto_delay={self._auto_shutdown_delay}s, "
             f"grace_period={self._disconnect_grace_period}s, "
-            f"max_idle={self._max_idle_after_complete}s"
+            f"max_idle={self._max_idle_after_complete}s, "
+            f"transition_grace={self._transition_grace_period}s"
         )
 
     def initialize_async_objects(self):
@@ -3529,7 +3537,15 @@ class GracefulShutdownManager:
             if not self._startup_complete:
                 self._startup_complete = True
                 self._startup_completed_at = datetime.now()
-                logger.info("[GracefulShutdown] Startup complete - watching for browser disconnect")
+                # v198.1: Set transition grace period to allow Chrome redirect without
+                # triggering premature shutdown from brief browser disconnects
+                self._transition_grace_ends_at = datetime.now() + timedelta(
+                    seconds=self._transition_grace_period
+                )
+                logger.info(
+                    f"[GracefulShutdown] Startup complete - transition grace period "
+                    f"({self._transition_grace_period}s) active for Chrome redirect"
+                )
                 await self._check_shutdown_conditions()
 
     async def notify_connection_change(self, current_count: int):
@@ -3541,12 +3557,27 @@ class GracefulShutdownManager:
             # Detect browser disconnection (went from >0 to 0)
             if previous_count > 0 and current_count == 0:
                 self._browser_disconnected_at = datetime.now()
-                logger.info(
-                    f"[GracefulShutdown] Browser disconnected "
-                    f"(startup_complete={self._startup_complete})"
+                # v198.1: Check if we're in transition grace period
+                in_transition = (
+                    self._transition_grace_ends_at and
+                    datetime.now() < self._transition_grace_ends_at
                 )
+                if in_transition:
+                    remaining = (self._transition_grace_ends_at - datetime.now()).total_seconds()
+                    logger.info(
+                        f"[GracefulShutdown] Browser disconnected during transition "
+                        f"({remaining:.1f}s grace remaining) - ignoring for auto-shutdown"
+                    )
+                else:
+                    logger.info(
+                        f"[GracefulShutdown] Browser disconnected "
+                        f"(startup_complete={self._startup_complete})"
+                    )
             elif current_count > 0:
                 # Browser reconnected, reset disconnect timer
+                # v198.1: Also clear transition grace if browser connects after complete
+                if self._browser_disconnected_at:
+                    logger.info("[GracefulShutdown] Browser reconnected - disconnect timer reset")
                 self._browser_disconnected_at = None
 
             await self._check_shutdown_conditions()
@@ -3597,7 +3628,23 @@ class GracefulShutdownManager:
 
         current_connections = self._connection_manager.count
 
+        # v198.1: Check if we're still in transition grace period
+        # During this period, ignore browser disconnects to allow Chrome redirect
+        in_transition_grace = False
+        if self._transition_grace_ends_at:
+            if datetime.now() < self._transition_grace_ends_at:
+                in_transition_grace = True
+                # Only log once per second to avoid spam
+                if not hasattr(self, '_last_grace_log') or \
+                   (datetime.now() - self._last_grace_log).total_seconds() > 1.0:
+                    remaining = (self._transition_grace_ends_at - datetime.now()).total_seconds()
+                    logger.debug(
+                        f"[GracefulShutdown] In transition grace period ({remaining:.1f}s remaining)"
+                    )
+                    self._last_grace_log = datetime.now()
+
         # Condition 1: Explicit shutdown requested + no connections
+        # This condition is ALLOWED during transition grace (supervisor explicitly requested)
         if self._shutdown_requested and current_connections == 0:
             if self._browser_disconnected_at:
                 elapsed = (datetime.now() - self._browser_disconnected_at).total_seconds()
@@ -3606,13 +3653,15 @@ class GracefulShutdownManager:
                     return
 
         # Condition 2: Startup complete + browser disconnected + grace period passed
-        if self._startup_complete and self._browser_disconnected_at:
+        # v198.1: BLOCKED during transition grace period to allow Chrome redirect
+        if self._startup_complete and self._browser_disconnected_at and not in_transition_grace:
             elapsed = (datetime.now() - self._browser_disconnected_at).total_seconds()
             if elapsed >= self._auto_shutdown_delay:
                 await self._initiate_shutdown("browser_disconnected")
                 return
 
         # Condition 3: Startup complete + max idle time exceeded (safety net)
+        # This condition is NOT affected by transition grace (it's a hard timeout)
         if self._startup_complete and self._startup_completed_at:
             elapsed = (datetime.now() - self._startup_completed_at).total_seconds()
             if elapsed >= self._max_idle_after_complete:
@@ -3674,6 +3723,15 @@ class GracefulShutdownManager:
     @property
     def status(self) -> dict:
         """Get current shutdown manager status."""
+        # v198.1: Calculate transition grace remaining
+        in_transition = False
+        transition_remaining = 0.0
+        if self._transition_grace_ends_at:
+            remaining = (self._transition_grace_ends_at - datetime.now()).total_seconds()
+            if remaining > 0:
+                in_transition = True
+                transition_remaining = remaining
+
         return {
             "startup_complete": self._startup_complete,
             "shutdown_requested": self._shutdown_requested,
@@ -3690,6 +3748,10 @@ class GracefulShutdownManager:
             "auto_shutdown_delay": self._auto_shutdown_delay,
             "disconnect_grace_period": self._disconnect_grace_period,
             "max_idle_after_complete": self._max_idle_after_complete,
+            # v198.1: Transition grace period info
+            "transition_grace_period": self._transition_grace_period,
+            "in_transition_grace": in_transition,
+            "transition_grace_remaining": transition_remaining,
         }
 
 

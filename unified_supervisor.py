@@ -57450,6 +57450,12 @@ class JarvisSystemKernel:
                     self._release_browser_lock()
 
             # Step 4: Gracefully stop the loading server
+            # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
+            # The loading server also has transition grace period protection
+            redirect_stabilization_delay = float(
+                os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "1.0")
+            )
+            await asyncio.sleep(redirect_stabilization_delay)
             # The graceful shutdown will wait for Chrome to naturally disconnect
             await self._stop_loading_server()
 
