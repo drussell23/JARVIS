@@ -723,7 +723,33 @@ _trinity_protocol_active: bool = False
 _gcp_vm_health_monitor_task: Optional[asyncio.Task] = None
 _gcp_vm_health_monitor_running: bool = False
 _gcp_vm_consecutive_failures: int = 0
-_GCP_VM_MAX_FAILURES_BEFORE_REPROVISION = int(os.getenv("GCP_VM_MAX_HEALTH_FAILURES", "3"))
+
+# =============================================================================
+# v193.0: SAFE ENV VAR PARSING - Prevents import failures from malformed env vars
+# =============================================================================
+# All environment variable parsing that uses int() or float() must be wrapped
+# in try/except to prevent module import failures when env vars are malformed.
+# This is a critical robustness fix - module import should never fail due to
+# user configuration errors.
+# =============================================================================
+
+def _safe_int_env(name: str, default: int) -> int:
+    """Safely parse integer environment variable with fallback to default."""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        logger.warning(f"[v193.0] Invalid value for {name}, using default: {default}")
+        return default
+
+def _safe_float_env(name: str, default: float) -> float:
+    """Safely parse float environment variable with fallback to default."""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        logger.warning(f"[v193.0] Invalid value for {name}, using default: {default}")
+        return default
+
+_GCP_VM_MAX_FAILURES_BEFORE_REPROVISION = _safe_int_env("GCP_VM_MAX_HEALTH_FAILURES", 3)
 
 # =============================================================================
 # v149.0: ENTERPRISE-GRADE GCP RESILIENCE
@@ -734,14 +760,15 @@ _GCP_VM_MAX_FAILURES_BEFORE_REPROVISION = int(os.getenv("GCP_VM_MAX_HEALTH_FAILU
 # =============================================================================
 
 # v149.0: Exponential backoff configuration for GCP re-provisioning
-_GCP_REPROVISION_BASE_DELAY = float(os.getenv("GCP_REPROVISION_BASE_DELAY", "30.0"))
-_GCP_REPROVISION_MAX_DELAY = float(os.getenv("GCP_REPROVISION_MAX_DELAY", "600.0"))
-_GCP_REPROVISION_JITTER = float(os.getenv("GCP_REPROVISION_JITTER", "0.3"))
+# v193.0: Using safe parsers to prevent import failures
+_GCP_REPROVISION_BASE_DELAY = _safe_float_env("GCP_REPROVISION_BASE_DELAY", 30.0)
+_GCP_REPROVISION_MAX_DELAY = _safe_float_env("GCP_REPROVISION_MAX_DELAY", 600.0)
+_GCP_REPROVISION_JITTER = _safe_float_env("GCP_REPROVISION_JITTER", 0.3)
 _gcp_reprovision_attempt: int = 0
 _gcp_reprovision_last_failure: float = 0.0
 
 # v149.1: Max re-provision attempts before triggering Claude API fallback
-_GCP_MAX_REPROVISION_ATTEMPTS = int(os.getenv("GCP_MAX_REPROVISION_ATTEMPTS", "3"))
+_GCP_MAX_REPROVISION_ATTEMPTS = _safe_int_env("GCP_MAX_REPROVISION_ATTEMPTS", 3)
 
 # =============================================================================
 # v149.1: CLAUDE API FALLBACK SIGNAL - Cross-repo coordination
@@ -1422,12 +1449,35 @@ def start_trinity_gcp_prewarm() -> Optional[asyncio.Task]:
 
     Call this immediately after detecting SLIM hardware in start_all_services().
     Returns the Task object so it can be awaited or cancelled if needed.
+
+    v193.0: Safe asyncio.Event() creation with proper event loop detection.
     """
     global _trinity_gcp_prewarm_task, _trinity_gcp_ready_event, _trinity_protocol_active
 
-    # Create the ready event if it doesn't exist
+    # v193.0: Create the ready event if it doesn't exist
+    # Use try/except to handle case where no event loop is running
     if _trinity_gcp_ready_event is None:
-        _trinity_gcp_ready_event = asyncio.Event()
+        try:
+            # Check if we're in an async context with a running loop
+            loop = asyncio.get_running_loop()
+            _trinity_gcp_ready_event = asyncio.Event()
+        except RuntimeError:
+            # No running event loop - we're being called from sync context
+            # The event will be created later when asyncio context is available
+            logger.debug("[v193.0] No running event loop, deferring Event creation")
+            try:
+                # Try to get or create a new event loop for non-async context
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    _trinity_gcp_ready_event = asyncio.Event()
+                else:
+                    # Event loop exists but not running - schedule event creation
+                    logger.debug("[v193.0] Event loop exists but not running")
+                    _trinity_gcp_ready_event = asyncio.Event()
+            except RuntimeError:
+                # No event loop at all - this will be created when async context starts
+                logger.warning("[v193.0] Cannot create Event - no event loop available")
+                return None
 
     # Don't start multiple tasks
     if _trinity_gcp_prewarm_task is not None and not _trinity_gcp_prewarm_task.done():
@@ -1437,14 +1487,17 @@ def start_trinity_gcp_prewarm() -> Optional[asyncio.Task]:
     _trinity_protocol_active = True
 
     # v192.0: Use dynamic timeout from env var (no hardcode)
-    # Create background task (NON-BLOCKING)
-    _trinity_gcp_prewarm_task = asyncio.create_task(
-        _background_gcp_prewarm_task(),  # Uses GCP_VM_STARTUP_TIMEOUT env var
-        name="trinity_gcp_prewarm"
-    )
-
-    logger.info("[v146.0] 🚀 TRINITY PROTOCOL: GCP pre-warm task started (background)")
-    return _trinity_gcp_prewarm_task
+    # v193.0: Safely create task with proper loop check
+    try:
+        _trinity_gcp_prewarm_task = asyncio.create_task(
+            _background_gcp_prewarm_task(),  # Uses GCP_VM_STARTUP_TIMEOUT env var
+            name="trinity_gcp_prewarm"
+        )
+        logger.info("[v146.0] 🚀 TRINITY PROTOCOL: GCP pre-warm task started (background)")
+        return _trinity_gcp_prewarm_task
+    except RuntimeError as e:
+        logger.warning(f"[v193.0] Cannot create prewarm task - no running event loop: {e}")
+        return None
 
 
 async def wait_for_gcp_ready(timeout: float = 60.0) -> bool:
@@ -3746,9 +3799,10 @@ def _get_port_from_trinity(service: str, fallback: int) -> int:
     Get port from trinity_config (single source of truth) with fallback.
 
     v5.0: This ensures all services use consistent ports from trinity_config.
+    v193.0: Safe env var parsing to prevent ValueError on malformed input.
     """
     if not _TRINITY_CONFIG_AVAILABLE:
-        return int(os.getenv(f"{service.upper()}_PORT", str(fallback)))
+        return _safe_int_env(f"{service.upper()}_PORT", fallback)
 
     try:
         config = get_trinity_config()
@@ -4773,7 +4827,23 @@ class IntelligentRepoDiscovery:
         if self._initialized:
             return
         self._initialized = True
-        self._discovery_lock = asyncio.Lock() if asyncio.get_event_loop().is_running() else None
+        # v193.0: Safe asyncio.Lock() creation with proper event loop detection
+        # asyncio.get_event_loop() can raise RuntimeError if no loop exists
+        self._discovery_lock: Optional[asyncio.Lock] = None
+        try:
+            loop = asyncio.get_running_loop()
+            self._discovery_lock = asyncio.Lock()
+        except RuntimeError:
+            # No running event loop - try get_event_loop for backwards compat
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    self._discovery_lock = asyncio.Lock()
+                # If loop exists but not running, leave lock as None
+                # It will be lazily created when needed in async context
+            except RuntimeError:
+                # No event loop at all - lock will be created lazily
+                pass
         self._user = os.environ.get("USER", os.environ.get("USERNAME", "user"))
 
         # v95.8: Compute absolute base paths using __file__ (Issue 6)

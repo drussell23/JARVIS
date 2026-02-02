@@ -1259,14 +1259,25 @@ class GCPOOMPreventionBridge:
 # =============================================================================
 
 _bridge_instance: Optional[GCPOOMPreventionBridge] = None
-_bridge_lock = asyncio.Lock()
+# v193.0: Lazy lock creation to avoid RuntimeError when module is imported
+# outside of an async context. The lock will be created on first use.
+_bridge_lock: Optional[asyncio.Lock] = None
+
+
+def _get_bridge_lock() -> asyncio.Lock:
+    """Get or create the bridge lock (lazy initialization for async safety)."""
+    global _bridge_lock
+    if _bridge_lock is None:
+        _bridge_lock = asyncio.Lock()
+    return _bridge_lock
 
 
 async def get_oom_prevention_bridge() -> GCPOOMPreventionBridge:
     """Get or create the global OOM prevention bridge."""
     global _bridge_instance
     if _bridge_instance is None:
-        async with _bridge_lock:
+        lock = _get_bridge_lock()
+        async with lock:
             if _bridge_instance is None:
                 _bridge_instance = GCPOOMPreventionBridge()
                 await _bridge_instance.initialize()
