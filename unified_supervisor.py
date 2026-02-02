@@ -2052,11 +2052,12 @@ class IntelligentKernelTakeover:
                 result.takeover_method = "force_kill_unresponsive"
                 result.processes_cleaned = 1
 
-            elif kernel_info.status == KernelHealthStatus.HEALTHY:
-                # Healthy kernel running
+            elif kernel_info.status in (KernelHealthStatus.HEALTHY, KernelHealthStatus.DEGRADED):
+                # Healthy or degraded kernel running - try graceful takeover
+                status_desc = "healthy" if kernel_info.status == KernelHealthStatus.HEALTHY else "degraded"
                 if force:
                     # User requested force - kill it
-                    self.logger.warning("[Takeover] Force requested - killing healthy kernel")
+                    self.logger.warning(f"[Takeover] Force requested - killing {status_desc} kernel")
                     await self._force_kill_process(holder_pid)
                     await asyncio.sleep(0.5)
                     self.startup_lock.acquire(force=True)
@@ -48763,6 +48764,26 @@ class StartupWatchdog:
                 except ValueError:
                     self._logger.warning(f"[DMS] Invalid timeout value in {env_key}: {env_value}")
 
+        # v192.0: Auto-detect hollow client mode and extend Trinity timeout
+        # GCP VM startup takes 96+ seconds, so Trinity phase needs 5+ minutes
+        if self._detect_hollow_client_mode():
+            trinity_config = self._phase_configs.get("trinity")
+            if trinity_config:
+                # Hollow client mode: Trinity phase needs 300s (5 minutes) for GCP VM startup
+                hollow_client_timeout = max(300.0, trinity_config.timeout_seconds)
+                if hollow_client_timeout > trinity_config.timeout_seconds:
+                    self._phase_configs["trinity"] = PhaseConfig(
+                        trinity_config.name,
+                        hollow_client_timeout,
+                        trinity_config.progress_start,
+                        trinity_config.progress_end,
+                        trinity_config.recovery_action,
+                    )
+                    self._logger.info(
+                        f"[DMS] Hollow client mode detected: Trinity timeout extended "
+                        f"from {trinity_config.timeout_seconds}s to {hollow_client_timeout}s"
+                    )
+
         # State tracking
         self._current_phase: Optional[str] = None
         self._phase_start_time: float = 0
@@ -48776,16 +48797,50 @@ class StartupWatchdog:
         self._diagnostics_dumped: Dict[str, int] = {}
         self._restarts_attempted: Dict[str, int] = {}
         
+    def _detect_hollow_client_mode(self) -> bool:
+        """
+        v192.0: Detect if Prime will run in hollow client mode.
+
+        Hollow client mode is used when:
+        - GCP_PRIME_ENDPOINT is set (routes inference to GCP)
+        - HOLLOW_CLIENT_MODE is explicitly enabled
+        - USE_GCP_INFERENCE is enabled
+        - Machine has limited RAM (< 32GB, auto-activates hollow mode)
+
+        Returns:
+            True if hollow client mode is detected
+        """
+        # Check explicit environment indicators
+        hollow_indicators = [
+            os.environ.get("HOLLOW_CLIENT_MODE", "").lower() in ("true", "1", "yes"),
+            os.environ.get("GCP_PRIME_ENDPOINT", "") != "",
+            os.environ.get("USE_GCP_INFERENCE", "").lower() in ("true", "1", "yes"),
+        ]
+
+        # Check for limited RAM (hollow client mode auto-activates below 32GB)
+        try:
+            import psutil
+            total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            if total_ram_gb < 32.0:
+                hollow_indicators.append(True)
+                self._logger.debug(f"[DMS] Detected limited RAM: {total_ram_gb:.1f}GB (hollow client likely)")
+        except ImportError:
+            pass
+        except Exception as e:
+            self._logger.debug(f"[DMS] Could not detect RAM: {e}")
+
+        return any(hollow_indicators)
+
     @property
     def enabled(self) -> bool:
         """Check if watchdog is enabled."""
         return self._enabled
-    
+
     @property
     def current_phase(self) -> Optional[str]:
         """Get current phase name."""
         return self._current_phase
-    
+
     async def start(self) -> None:
         """Start the watchdog background task."""
         if not self._enabled:
@@ -49180,12 +49235,16 @@ class SemanticReadinessChecker:
 
     # Readiness criteria by component type
     # Each criterion is a tuple of (field_name, required_value, is_critical)
+    # v192.0: Made deployment-aware - hollow client mode changes Prime's requirements
     READINESS_CRITERIA: Dict[ComponentType, List[Tuple[str, Any, bool]]] = {
         ComponentType.PRIME: [
-            # Prime must have model loaded AND be ready for inference
+            # v192.0: Prime readiness depends on deployment mode:
+            # - Normal mode: model_loaded=True AND ready_for_inference=True
+            # - Hollow client mode: ready_for_inference=True (model_loaded will be False)
+            # The model_loaded check is now done dynamically in _check_prime_readiness()
             ("status", "healthy", True),
             ("phase", "ready", True),
-            ("model_loaded", True, True),
+            # model_loaded is now checked dynamically based on hollow_client_mode
             ("ready_for_inference", True, True),
         ],
         ComponentType.REACTOR: [
@@ -49200,6 +49259,9 @@ class SemanticReadinessChecker:
             ("status", "healthy", True),
         ],
     }
+
+    # v192.0: Extended timeout for hollow client mode (GCP VM startup takes 2-3 minutes)
+    HOLLOW_CLIENT_TIMEOUT_MULTIPLIER: float = 3.0
 
     # Phase-to-state mapping for more accurate state detection
     PHASE_STATE_MAP: Dict[str, ReadinessState] = {
@@ -49388,6 +49450,50 @@ class SemanticReadinessChecker:
 
         # Determine final readiness
         is_ready = all_critical_met
+
+        # v192.0: Dynamic hollow client mode detection for Prime
+        # In hollow client mode, model_loaded=False is VALID because inference routes to GCP
+        if component_type == ComponentType.PRIME:
+            hollow_client_active = response.get("hollow_client_mode", False)
+            inference_mode = response.get("inference_mode", "")
+            model_loaded_val = response.get("model_loaded")
+            ready_for_inference_val = response.get("ready_for_inference")
+
+            # Detect hollow client mode from multiple signals
+            is_hollow_client = (
+                hollow_client_active or
+                inference_mode == "cloud_routing" or
+                response.get("details", {}).get("hollow_client_mode", False)
+            )
+
+            if is_hollow_client:
+                # In hollow client mode, Prime is ready when:
+                # 1. status is healthy/ready
+                # 2. ready_for_inference is True (GCP reachable)
+                # model_loaded=False is EXPECTED, not a failure
+                if ready_for_inference_val and status.lower() in ("healthy", "ready"):
+                    is_ready = True
+                    self._logger.debug(
+                        f"[{component_name}] Hollow client mode detected: "
+                        f"model_loaded={model_loaded_val} (expected False), "
+                        f"ready_for_inference={ready_for_inference_val} (OK)"
+                    )
+                else:
+                    # GCP not yet reachable - still starting up
+                    is_ready = False
+                    if not ready_for_inference_val:
+                        self._logger.debug(
+                            f"[{component_name}] Hollow client mode: waiting for GCP "
+                            f"(ready_for_inference={ready_for_inference_val})"
+                        )
+            else:
+                # Normal mode: model_loaded must be True
+                if model_loaded_val is False:
+                    is_ready = False
+                    self._logger.debug(
+                        f"[{component_name}] Normal mode: model_loaded={model_loaded_val} "
+                        f"(expected True)"
+                    )
 
         # Refine state based on criteria analysis
         if is_ready and any_non_critical_failed:
@@ -49661,6 +49767,63 @@ class TrinityIntegrator:
 
         return results
 
+    def _calculate_intelligent_timeout(self, component: TrinityComponent) -> float:
+        """
+        v192.0: Calculate intelligent startup timeout based on component type and deployment mode.
+
+        Timeout strategy:
+        - PRIME normal mode: 90s (local model loading)
+        - PRIME hollow client mode: 180s (GCP VM startup takes 2-3 minutes)
+        - REACTOR: 60s (training initialization)
+        - GENERIC: 30s (basic startup)
+
+        Hollow client mode is detected from environment variables set by Prime
+        or from the HOLLOW_CLIENT_TIMEOUT_MULTIPLIER configuration.
+        """
+        # Base timeouts by component type
+        base_timeouts = {
+            "jarvis-prime": 90.0,   # Model loading can take time
+            "reactor-core": 60.0,   # Training initialization
+        }
+        base_timeout = base_timeouts.get(component.name, 30.0)
+
+        # Check for hollow client mode indicators
+        # Prime sets these env vars when running in hollow client mode
+        hollow_client_indicators = [
+            os.getenv("HOLLOW_CLIENT_MODE", "").lower() in ("true", "1", "yes"),
+            os.getenv("GCP_PRIME_ENDPOINT", "") != "",
+            os.getenv("USE_GCP_INFERENCE", "").lower() in ("true", "1", "yes"),
+            # Also check if machine has limited RAM (hollow client mode auto-activates < 32GB)
+            self._detect_limited_ram(),
+        ]
+
+        is_hollow_client = any(hollow_client_indicators)
+
+        if component.name == "jarvis-prime" and is_hollow_client:
+            # GCP VM startup takes 96+ seconds, use 3x multiplier
+            timeout = base_timeout * SemanticReadinessChecker.HOLLOW_CLIENT_TIMEOUT_MULTIPLIER
+            self.logger.info(
+                f"[Trinity] {component.name}: Hollow client mode detected, "
+                f"using extended timeout: {timeout:.0f}s (GCP VM startup)"
+            )
+        else:
+            timeout = base_timeout
+            self.logger.debug(f"[Trinity] {component.name}: Using standard timeout: {timeout:.0f}s")
+
+        return timeout
+
+    def _detect_limited_ram(self) -> bool:
+        """Detect if machine has limited RAM (hollow client mode auto-activates below 32GB)."""
+        try:
+            import psutil
+            total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            return total_ram_gb < 32.0
+        except ImportError:
+            # If psutil not available, assume normal mode
+            return False
+        except Exception:
+            return False
+
     async def _start_component(self, component: TrinityComponent) -> bool:
         """
         Start a single Trinity component (v170.0 enhanced with detailed logging).
@@ -49790,7 +49953,9 @@ class TrinityIntegrator:
                     self.logger.debug(f"[Trinity] Progress callback error: {e}")
 
             # Wait for health check
-            healthy = await self._wait_for_health(component, timeout=60.0)
+            # v192.0: Use intelligent timeout based on component type and deployment mode
+            component_timeout = self._calculate_intelligent_timeout(component)
+            healthy = await self._wait_for_health(component, timeout=component_timeout)
             if healthy:
                 component.state = "healthy"
                 self.logger.success(f"[Trinity] ✓ {component.name} RUNNING (PID: {component.pid}, Port: {component.port})")
