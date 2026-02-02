@@ -647,6 +647,26 @@ except ImportError:
     NUMPY_AVAILABLE = False
     np = None
 
+# v186.0: rich - enhanced CLI experience
+try:
+    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.live import Live
+    from rich import box
+    RICH_AVAILABLE = True
+    _rich_console = Console()
+except ImportError:
+    RICH_AVAILABLE = False
+    Console = None
+    Progress = None
+    Panel = None
+    Table = None
+    Live = None
+    box = None
+    _rich_console = None
+
 # =============================================================================
 # BACKEND HELPER IMPORTS (v180.0 - Advanced Gap Fixes)
 # =============================================================================
@@ -47863,12 +47883,26 @@ class TrinityIntegrator:
     - JARVIS (Body) - Main AI agent, this codebase
     - J-Prime (Mind) - Local LLM inference, tier-0 brain
     - Reactor-Core (Nerves) - Training pipeline, model optimization
+
+    v186.0: Added progress callback for real-time status updates during health waits.
     """
 
-    def __init__(self, config: SystemKernelConfig, logger: UnifiedLogger) -> None:
+    # Type alias for progress callback
+    # Signature: async def callback(component: str, status: str, message: str, attempt: int, elapsed: float) -> None
+    ProgressCallback = Optional[Callable[[str, str, str, int, float], Awaitable[None]]]
+
+    def __init__(
+        self,
+        config: SystemKernelConfig,
+        logger: UnifiedLogger,
+        progress_callback: Optional[Callable[[str, str, str, int, float], Awaitable[None]]] = None,
+    ) -> None:
         self.config = config
         self.logger = logger
         self._enabled = config.trinity_enabled
+
+        # v186.0: Progress callback for real-time status updates
+        self._progress_callback = progress_callback
 
         # Components
         self._jprime: Optional[TrinityComponent] = None
@@ -48118,6 +48152,20 @@ class TrinityIntegrator:
             self.logger.info(f"[Trinity]   Process started (PID: {component.pid})")
             self.logger.info(f"[Trinity]   Waiting for health check at {component.health_url}...")
 
+            # v186.0: Broadcast "starting" status immediately after spawn
+            component_key = component.name.replace("-", "_")
+            if self._progress_callback:
+                try:
+                    await self._progress_callback(
+                        component_key,
+                        "starting",
+                        f"Process spawned (PID: {component.pid}), waiting for health...",
+                        0,
+                        0.0
+                    )
+                except Exception as e:
+                    self.logger.debug(f"[Trinity] Progress callback error: {e}")
+
             # Wait for health check
             healthy = await self._wait_for_health(component, timeout=60.0)
             if healthy:
@@ -48139,7 +48187,14 @@ class TrinityIntegrator:
             return False
 
     async def _wait_for_health(self, component: TrinityComponent, timeout: float = 60.0) -> bool:
-        """Wait for component to become healthy."""
+        """
+        v186.0: Wait for component to become healthy with progress callbacks.
+        
+        Enhanced with:
+        - Progress callback every 5 seconds for UI feedback
+        - Process liveness check (fail fast if process dies)
+        - Detailed logging of health check attempts
+        """
         if not component.health_url:
             return True  # No health check configured
 
@@ -48148,16 +48203,75 @@ class TrinityIntegrator:
             return True  # Assume healthy if we can't check
 
         start_time = time.time()
+        attempt = 0
+        last_callback_time = start_time
+        callback_interval = 5.0  # Broadcast progress every 5 seconds
+        
+        # Normalize component name for callback (jarvis-prime -> jarvis_prime)
+        component_key = component.name.replace("-", "_")
+        
         while (time.time() - start_time) < timeout:
+            attempt += 1
+            elapsed = time.time() - start_time
+            
+            # v186.0: Call progress callback every 5 seconds
+            if self._progress_callback and (time.time() - last_callback_time) >= callback_interval:
+                try:
+                    await self._progress_callback(
+                        component_key,
+                        "waiting",
+                        f"Waiting for {component.name} health ({elapsed:.0f}s)...",
+                        attempt,
+                        elapsed
+                    )
+                    last_callback_time = time.time()
+                except Exception as e:
+                    self.logger.debug(f"[Trinity] Progress callback error: {e}")
+            
+            # v186.0: Check if process died (fail fast)
+            if component.process and component.process.returncode is not None:
+                self.logger.warning(
+                    f"[Trinity] {component.name} process exited (code: {component.process.returncode}) "
+                    f"during health wait"
+                )
+                return False
+            
             try:
                 async with aiohttp.ClientSession() as session:  # type: ignore[union-attr]
                     async with session.get(component.health_url, timeout=5.0) as response:
                         if response.status == 200:
+                            # v186.0: Broadcast healthy status
+                            if self._progress_callback:
+                                try:
+                                    await self._progress_callback(
+                                        component_key,
+                                        "healthy",
+                                        f"{component.name} healthy after {elapsed:.1f}s",
+                                        attempt,
+                                        elapsed
+                                    )
+                                except Exception:
+                                    pass
                             return True
             except Exception:
                 pass
+            
             await asyncio.sleep(2.0)
 
+        # Timeout - send failure callback
+        elapsed = time.time() - start_time
+        if self._progress_callback:
+            try:
+                await self._progress_callback(
+                    component_key,
+                    "timeout",
+                    f"{component.name} health check timeout after {elapsed:.0f}s",
+                    attempt,
+                    elapsed
+                )
+            except Exception:
+                pass
+        
         return False
 
     async def _start_health_monitor(self) -> None:
@@ -49704,6 +49818,187 @@ class JarvisSystemKernel:
             self._state = KernelState.FAILED
             return 1
 
+    def _print_startup_banner(self) -> None:
+        """
+        v186.0: Print enterprise startup banner with Rich CLI support.
+        
+        Uses Rich library for enhanced visuals if available, otherwise
+        falls back to plain text ASCII art.
+        """
+        if RICH_AVAILABLE and _rich_console:
+            # =========================================================================
+            # RICH CLI BANNER (v186.0)
+            # =========================================================================
+            try:
+                # Build the header panel
+                header_text = (
+                    "[bold cyan]⚡ JARVIS UNIFIED SYSTEM KERNEL v1.0.0 ⚡[/bold cyan]\n"
+                    "[dim]Enterprise Edition (v186.0)[/dim]"
+                )
+                features_text = (
+                    "[green]🤖 Self-Healing[/green] • "
+                    "[yellow]Zero-Touch[/yellow] • "
+                    "[blue]Cross-Repo[/blue] • "
+                    "[magenta]Trinity-Ready[/magenta]"
+                )
+                
+                _rich_console.print()
+                _rich_console.print(Panel(
+                    f"{header_text}\n\n{features_text}",
+                    title="[bold white]JARVIS[/bold white]",
+                    border_style="cyan",
+                    padding=(1, 2),
+                ))
+                
+                # Build the zone architecture table
+                zone_table = Table(
+                    title="Zone Architecture Overview",
+                    box=box.ROUNDED,  # type: ignore[arg-type]
+                    border_style="dim cyan",
+                    show_header=True,
+                    header_style="bold white",
+                )
+                zone_table.add_column("Zone", style="cyan", justify="left")
+                zone_table.add_column("Components", style="white")
+                
+                zone_table.add_row("[dim]Zone 0[/dim]", "Early Protection • Signal guards, venv activation")
+                zone_table.add_row("[dim]Zone 1[/dim]", "Foundation • Imports, SystemKernelConfig")
+                zone_table.add_row("[dim]Zone 2[/dim]", "Core Utilities • Logger, Lock, CircuitBreaker")
+                zone_table.add_row("[dim]Zone 3[/dim]", "Resources • Docker, GCP, Ports, Storage")
+                zone_table.add_row("[dim]Zone 4[/dim]", "Intelligence • ML, Routing, Goal Inference")
+                zone_table.add_row("[dim]Zone 5[/dim]", "Orchestration • Signals, Zombies, Hot Reload, Trinity")
+                zone_table.add_row("[dim]Zone 6[/dim]", "The Kernel • Lock, IPC, JarvisSystemKernel")
+                zone_table.add_row("[dim]Zone 7[/dim]", "Entry Point • CLI, main()")
+                
+                _rich_console.print(zone_table)
+                _rich_console.print()
+                
+                return  # Rich banner printed successfully
+            except Exception as rich_err:
+                self.logger.debug(f"[Kernel] Rich banner failed, using fallback: {rich_err}")
+        
+        # =========================================================================
+        # FALLBACK PLAIN TEXT BANNER
+        # =========================================================================
+        self.logger.info("")
+        self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
+        self.logger.info("║          ⚡ JARVIS UNIFIED SYSTEM KERNEL v1.0.0 ⚡                  ║")
+        self.logger.info("║                   Enterprise Edition (v186.0)                       ║")
+        self.logger.info("╠═════════════════════════════════════════════════════════════════════╣")
+        self.logger.info("║  🤖 Self-Healing • Zero-Touch • Cross-Repo • Trinity-Ready         ║")
+        self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
+        self.logger.info("")
+        self.logger.info("╭─────────────────────────────────────────────────────────────────────╮")
+        self.logger.info("│                    ZONE ARCHITECTURE OVERVIEW                       │")
+        self.logger.info("├─────────────────────────────────────────────────────────────────────┤")
+        self.logger.info("│  Zone 0: Early Protection  │ Signal guards, venv activation         │")
+        self.logger.info("│  Zone 1: Foundation        │ Imports, SystemKernelConfig            │")
+        self.logger.info("│  Zone 2: Core Utilities    │ Logger, Lock, CircuitBreaker           │")
+        self.logger.info("│  Zone 3: Resources         │ Docker, GCP, Ports, Storage            │")
+        self.logger.info("│  Zone 4: Intelligence      │ ML, Routing, Goal Inference            │")
+        self.logger.info("│  Zone 5: Orchestration     │ Signals, Zombies, Hot Reload, Trinity  │")
+        self.logger.info("│  Zone 6: The Kernel        │ Lock, IPC, JarvisSystemKernel          │")
+        self.logger.info("│  Zone 7: Entry Point       │ CLI, main()                            │")
+        self.logger.info("╰─────────────────────────────────────────────────────────────────────╯")
+        self.logger.info("")
+
+    def _print_completion_banner(self, startup_duration: float) -> None:
+        """
+        v186.0: Print startup completion banner with Rich CLI support.
+        
+        Uses Rich library for enhanced visuals if available, otherwise
+        falls back to plain text.
+        
+        Args:
+            startup_duration: Startup time in seconds
+        """
+        backend_port = self.config.backend_port
+        frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+        
+        if RICH_AVAILABLE and _rich_console:
+            # =========================================================================
+            # RICH CLI COMPLETION BANNER (v186.0)
+            # =========================================================================
+            try:
+                _rich_console.print()
+                
+                # Ready tier panel
+                _rich_console.print(Panel(
+                    "[bold green]🟢 FULLY READY TIER REACHED[/bold green]",
+                    border_style="green",
+                    padding=(0, 2),
+                ))
+                
+                # Access points table
+                access_table = Table(
+                    title="[bold cyan]🎯 JARVIS is ready![/bold cyan]",
+                    box=box.ROUNDED,  # type: ignore[arg-type]
+                    border_style="cyan",
+                    show_header=True,
+                    header_style="bold white",
+                )
+                access_table.add_column("Category", style="cyan", justify="left")
+                access_table.add_column("Details", style="white")
+                
+                access_table.add_row(
+                    "[bold]Access Points[/bold]",
+                    f"Frontend: [link=http://localhost:{frontend_port}]http://localhost:{frontend_port}/[/link]\n"
+                    f"Backend API: [link=http://localhost:{backend_port}/docs]http://localhost:{backend_port}/docs[/link]\n"
+                    f"Health: [link=http://localhost:{backend_port}/health]http://localhost:{backend_port}/health[/link]"
+                )
+                access_table.add_row(
+                    "[bold]Voice Commands[/bold]",
+                    "Say [yellow]'Hey JARVIS'[/yellow] to activate\n"
+                    "'What can you do?' - List capabilities\n"
+                    "'Can you see my screen?' - Vision test"
+                )
+                access_table.add_row(
+                    "[bold]IPC Commands[/bold]",
+                    "[dim]python unified_supervisor.py --status[/dim]\n"
+                    "[dim]python unified_supervisor.py --shutdown[/dim]\n"
+                    "[dim]python unified_supervisor.py --restart[/dim]"
+                )
+                
+                _rich_console.print(access_table)
+                _rich_console.print()
+                _rich_console.print(f"[dim]Press [bold]Ctrl+C[/bold] to stop • Startup: {startup_duration:.2f}s[/dim]")
+                _rich_console.print()
+                
+                return  # Rich banner printed successfully
+            except Exception as rich_err:
+                self.logger.debug(f"[Kernel] Rich completion banner failed, using fallback: {rich_err}")
+        
+        # =========================================================================
+        # FALLBACK PLAIN TEXT COMPLETION BANNER
+        # =========================================================================
+        self.logger.info("")
+        self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
+        self.logger.info("║                   🟢 FULLY READY TIER REACHED                       ║")
+        self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
+        self.logger.info("")
+        self.logger.info("════════════════════════════════════════════════════════════════════════")
+        self.logger.info("🎯 JARVIS is ready!")
+        self.logger.info("════════════════════════════════════════════════════════════════════════")
+        self.logger.info("")
+        self.logger.info("Access Points:")
+        self.logger.info(f"  • Frontend:     http://localhost:{frontend_port}/")
+        self.logger.info(f"  • Backend API:  http://localhost:{backend_port}/docs")
+        self.logger.info(f"  • Health:       http://localhost:{backend_port}/health")
+        self.logger.info("")
+        self.logger.info("Voice Commands:")
+        self.logger.info("  • Say 'Hey JARVIS' to activate")
+        self.logger.info("  • 'What can you do?' - List capabilities")
+        self.logger.info("  • 'Can you see my screen?' - Vision test")
+        self.logger.info("")
+        self.logger.info("IPC Commands:")
+        self.logger.info("  • python unified_supervisor.py --status")
+        self.logger.info("  • python unified_supervisor.py --shutdown")
+        self.logger.info("  • python unified_supervisor.py --restart")
+        self.logger.info("")
+        self.logger.info("Press Ctrl+C to stop")
+        self.logger.info("════════════════════════════════════════════════════════════════════════")
+        self.logger.info("")
+
     async def _startup_impl(self) -> int:
         """
         Internal startup implementation (wrapped by timeout in startup()).
@@ -49733,31 +50028,20 @@ class JarvisSystemKernel:
         await self._phase_clean_slate()
 
         # =====================================================================
-        # v180.0: ENTERPRISE STARTUP BANNER
+        # v186.0: ENTERPRISE STARTUP BANNER (with Rich CLI support)
         # =====================================================================
-        self.logger.info("")
-        self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
-        self.logger.info("║          ⚡ JARVIS UNIFIED SYSTEM KERNEL v1.0.0 ⚡                  ║")
-        self.logger.info("║                   Enterprise Edition (v180.0)                       ║")
-        self.logger.info("╠═════════════════════════════════════════════════════════════════════╣")
-        self.logger.info("║  🤖 Self-Healing • Zero-Touch • Cross-Repo • Trinity-Ready         ║")
-        self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
-        self.logger.info("")
-        self.logger.info("╭─────────────────────────────────────────────────────────────────────╮")
-        self.logger.info("│                    ZONE ARCHITECTURE OVERVIEW                       │")
-        self.logger.info("├─────────────────────────────────────────────────────────────────────┤")
-        self.logger.info("│  Zone 0: Early Protection  │ Signal guards, venv activation         │")
-        self.logger.info("│  Zone 1: Foundation        │ Imports, SystemKernelConfig            │")
-        self.logger.info("│  Zone 2: Core Utilities    │ Logger, Lock, CircuitBreaker           │")
-        self.logger.info("│  Zone 3: Resources         │ Docker, GCP, Ports, Storage            │")
-        self.logger.info("│  Zone 4: Intelligence      │ ML, Routing, Goal Inference            │")
-        self.logger.info("│  Zone 5: Orchestration     │ Signals, Zombies, Hot Reload, Trinity  │")
-        self.logger.info("│  Zone 6: The Kernel        │ Lock, IPC, JarvisSystemKernel          │")
-        self.logger.info("│  Zone 7: Entry Point       │ CLI, main()                            │")
-        self.logger.info("╰─────────────────────────────────────────────────────────────────────╯")
-        self.logger.info("")
+        self._print_startup_banner()
 
         self._started_at = time.time()
+
+        # v186.0: Start voice narrator queue processor for non-blocking speech
+        # This MUST be started before any narrate_* calls to prevent blocking
+        if self._narrator:
+            try:
+                await self._narrator.start_queue_processor()
+                self.logger.debug("[Narrator] Queue processor started")
+            except Exception as qp_err:
+                self.logger.debug(f"[Narrator] Queue processor failed to start: {qp_err}")
 
         # Voice narrator startup announcement
         if self._narrator:
@@ -50055,10 +50339,7 @@ class JarvisSystemKernel:
             # v180.0: READINESS TIER ANNOUNCEMENT
             # Announce when FULLY_READY tier is reached (visible to users).
             # =====================================================================
-            self.logger.info("")
-            self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
-            self.logger.info("║                   🟢 FULLY READY TIER REACHED                       ║")
-            self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
+            # v186.0: Moved banner to after health report for better flow
 
             # Final service verification
             issue_collector.set_current_phase("Service Verification")
@@ -50082,35 +50363,9 @@ class JarvisSystemKernel:
             startup_duration = time.time() - self._started_at
 
             # =====================================================================
-            # v180.0: ACCESS INFO BLOCK
-            # Show users where to access JARVIS and available voice commands.
+            # v186.0: ENTERPRISE COMPLETION BANNER (with Rich CLI support)
             # =====================================================================
-            backend_port = self.config.backend_port
-            frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
-
-            self.logger.info("")
-            self.logger.info("════════════════════════════════════════════════════════════════════════")
-            self.logger.info("🎯 JARVIS is ready!")
-            self.logger.info("════════════════════════════════════════════════════════════════════════")
-            self.logger.info("")
-            self.logger.info("Access Points:")
-            self.logger.info(f"  • Frontend:     http://localhost:{frontend_port}/")
-            self.logger.info(f"  • Backend API:  http://localhost:{backend_port}/docs")
-            self.logger.info(f"  • Health:       http://localhost:{backend_port}/health")
-            self.logger.info("")
-            self.logger.info("Voice Commands:")
-            self.logger.info("  • Say 'Hey JARVIS' to activate")
-            self.logger.info("  • 'What can you do?' - List capabilities")
-            self.logger.info("  • 'Can you see my screen?' - Vision test")
-            self.logger.info("")
-            self.logger.info("IPC Commands:")
-            self.logger.info("  • python unified_supervisor.py --status")
-            self.logger.info("  • python unified_supervisor.py --shutdown")
-            self.logger.info("  • python unified_supervisor.py --restart")
-            self.logger.info("")
-            self.logger.info("Press Ctrl+C to stop")
-            self.logger.info("════════════════════════════════════════════════════════════════════════")
-            self.logger.info("")
+            self._print_completion_banner(startup_duration)
 
             self.logger.success(f"[Kernel] ✅ Startup complete in {startup_duration:.2f}s")
 
@@ -50683,6 +50938,100 @@ class JarvisSystemKernel:
                 self.logger.warning(f"[Kernel] Intelligence initialization failed: {e}")
                 return False
 
+    # =========================================================================
+    # v186.0: TRINITY PROGRESS CALLBACK
+    # =========================================================================
+    # Real-time progress updates during Trinity component health waits.
+    # This fixes the "stuck at 65%" issue by broadcasting updates every 5s.
+    # =========================================================================
+
+    async def _trinity_progress_callback(
+        self,
+        component: str,
+        status: str,
+        message: str,
+        attempt: int,
+        elapsed: float,
+    ) -> None:
+        """
+        v186.0: Handle Trinity component progress updates.
+        
+        Called by TrinityIntegrator._wait_for_health every 5 seconds.
+        Updates component status and broadcasts to loading server.
+        
+        Args:
+            component: Component key (e.g., "jarvis_prime", "reactor_core")
+            status: Status string ("starting", "waiting", "healthy", "timeout")
+            message: Human-readable status message
+            attempt: Health check attempt number
+            elapsed: Elapsed time in seconds
+        """
+        # Map status to component status format
+        status_map = {
+            "starting": "running",
+            "waiting": "running",
+            "healthy": "complete",
+            "timeout": "error",
+        }
+        mapped_status = status_map.get(status, "running")
+        
+        # Update component status
+        self._update_component_status(component, mapped_status, message)
+        
+        # Calculate interpolated progress (65% to 80% during Trinity phase)
+        # Base: 65%, Target: 80%, Range: 15%
+        # Progress based on component and elapsed time
+        base_progress = 65
+        
+        if component == "jarvis_prime":
+            # J-Prime: 65% -> 72%
+            if status == "starting":
+                progress = 66
+            elif status == "waiting":
+                # Interpolate 66-71 based on elapsed (max 60s)
+                progress = 66 + min(5, int(elapsed / 12))  # 5% over 60s
+            elif status == "healthy":
+                progress = 72
+            else:
+                progress = 66
+        elif component == "reactor_core":
+            # Reactor: 72% -> 80%
+            if status == "starting":
+                progress = 73
+            elif status == "waiting":
+                progress = 73 + min(6, int(elapsed / 10))  # 6% over 60s
+            elif status == "healthy":
+                progress = 80
+            else:
+                progress = 73
+        else:
+            progress = base_progress
+        
+        # Broadcast to loading server
+        await self._broadcast_component_update(
+            stage="trinity",
+            message=message,
+            component=component,
+            component_status=mapped_status,
+            component_message=message,
+        )
+        
+        # Also broadcast with explicit progress for smoother UI
+        await self._broadcast_startup_progress(
+            stage="trinity",
+            message=message,
+            progress=progress,
+            metadata={
+                "phase": "trinity",
+                "components": self._component_status,
+                "trinity": self._get_trinity_summary(),
+                "trinity_ready": self._is_trinity_ready(),
+                "current_component": component,
+                "health_attempt": attempt,
+                "health_elapsed": round(elapsed, 1),
+            }
+        )
+
     async def _phase_trinity(self) -> bool:
         """
         Phase 5: Initialize Trinity cross-repo integration.
@@ -50693,6 +51042,8 @@ class JarvisSystemKernel:
         - Auto-restart on crash (background watchdog)
         - Graceful shutdown with wait
         - Diagnostic checkpoints
+        
+        v186.0: Added real-time progress callbacks during health waits.
 
         Starts:
         - J-Prime (local LLM inference or Hollow Client routing to GCP)
@@ -50746,8 +51097,12 @@ class JarvisSystemKernel:
                 self.logger.info(f"[Trinity] Prime repo config: {prime_path or 'auto-discover'}")
                 self.logger.info(f"[Trinity] Reactor repo config: {reactor_path or 'auto-discover'}")
 
-                # Initialize TrinityIntegrator
-                self._trinity = TrinityIntegrator(self.config, self.logger)
+                # Initialize TrinityIntegrator with v186.0 progress callback
+                self._trinity = TrinityIntegrator(
+                    self.config,
+                    self.logger,
+                    progress_callback=self._trinity_progress_callback,
+                )
                 await self._trinity.initialize()
 
                 # Get detailed status after initialization
@@ -52705,6 +53060,21 @@ class JarvisSystemKernel:
                 await self._narrator.narrate_shutdown(reason=shutdown_reason)
             except Exception as narr_err:
                 self.logger.debug(f"[Narrator] Shutdown announcement failed: {narr_err}")
+            
+            # v186.0: Stop queue processor gracefully
+            try:
+                if self._narrator._queue_processor_task:
+                    self._narrator._queue_processor_task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            self._narrator._queue_processor_task,
+                            timeout=2.0
+                        )
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+                    self.logger.debug("[Narrator] Queue processor stopped")
+            except Exception as qp_err:
+                self.logger.debug(f"[Narrator] Queue processor stop error: {qp_err}")
 
         with self.logger.section_start(LogSection.SHUTDOWN, "Shutdown"):
             # Stop hot reload
