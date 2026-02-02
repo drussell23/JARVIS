@@ -143,9 +143,256 @@ IPC_THREAD_ENABLED = os.environ.get("JARVIS_IPC_THREAD", "true").lower() in ("1"
 
 import threading
 
+# =============================================================================
+# v193.0: PARENT DEATH DETECTION SYSTEM - Proactive Orphan Prevention
+# =============================================================================
+# This system allows child processes to detect when their parent supervisor
+# has died, enabling them to self-terminate instead of becoming orphans.
+#
+# ROOT CAUSE FIX: Orphaned processes occur because:
+#   1. Children use start_new_session=True (isolates them from parent signals)
+#   2. Supervisor crashes without calling cleanup
+#   3. Children have no way to know parent died
+#
+# SOLUTION:
+#   1. Supervisor writes heartbeat file with its PID and timestamp
+#   2. Children periodically check heartbeat file
+#   3. If heartbeat is stale (>30s) OR supervisor PID is dead → child exits
+#
+# Cross-repo integration:
+#   - JARVIS: Supervisor writes heartbeat
+#   - JARVIS-PRIME: Checks heartbeat via imported module
+#   - REACTOR-CORE: Checks heartbeat via imported module
+# =============================================================================
+
+SUPERVISOR_HEARTBEAT_FILE = LOCK_DIR / "supervisor_heartbeat.json"
+HEARTBEAT_STALE_THRESHOLD = float(os.environ.get("JARVIS_HEARTBEAT_STALE_THRESHOLD", "30.0"))
+
+
+class SupervisorHeartbeat:
+    """
+    v193.0: Supervisor heartbeat writer - used by the supervisor to signal it's alive.
+    
+    The supervisor calls start() which spawns a background thread that writes
+    heartbeat every 5 seconds. Children check this file to detect parent death.
+    """
+    
+    _instance = None
+    _lock = threading.Lock()
+    _running = False
+    _thread: Optional[threading.Thread] = None
+    _supervisor_pid: Optional[int] = None
+    
+    @classmethod
+    def start(cls) -> None:
+        """Start the heartbeat writer thread."""
+        with cls._lock:
+            if cls._running:
+                return
+            
+            cls._supervisor_pid = os.getpid()
+            cls._running = True
+            cls._thread = threading.Thread(
+                target=cls._heartbeat_loop,
+                daemon=True,
+                name="SupervisorHeartbeat"
+            )
+            cls._thread.start()
+            cls._write_heartbeat()  # Write immediately
+            logger.info(f"[v193.0] 💓 Supervisor heartbeat started (PID: {cls._supervisor_pid})")
+    
+    @classmethod
+    def stop(cls) -> None:
+        """Stop the heartbeat writer and clean up file."""
+        with cls._lock:
+            cls._running = False
+            if cls._thread:
+                cls._thread.join(timeout=2.0)
+                cls._thread = None
+            
+            # Remove heartbeat file on clean shutdown
+            try:
+                if SUPERVISOR_HEARTBEAT_FILE.exists():
+                    SUPERVISOR_HEARTBEAT_FILE.unlink()
+                    logger.debug("[v193.0] Supervisor heartbeat file removed (clean shutdown)")
+            except Exception:
+                pass
+    
+    @classmethod
+    def _heartbeat_loop(cls) -> None:
+        """Background thread that writes heartbeat periodically."""
+        while cls._running:
+            try:
+                cls._write_heartbeat()
+            except Exception as e:
+                logger.debug(f"[v193.0] Heartbeat write error: {e}")
+            
+            # Sleep in small increments to allow quick stop
+            for _ in range(10):
+                if not cls._running:
+                    break
+                time.sleep(0.5)
+    
+    @classmethod
+    def _write_heartbeat(cls) -> None:
+        """Write heartbeat data to file."""
+        try:
+            LOCK_DIR.mkdir(parents=True, exist_ok=True)
+            data = {
+                "supervisor_pid": cls._supervisor_pid,
+                "timestamp": time.time(),
+                "iso_time": datetime.now().isoformat(),
+            }
+            # Atomic write
+            temp_file = SUPERVISOR_HEARTBEAT_FILE.with_suffix(".tmp")
+            with open(temp_file, "w") as f:
+                json.dump(data, f)
+            temp_file.replace(SUPERVISOR_HEARTBEAT_FILE)
+        except Exception as e:
+            logger.debug(f"[v193.0] Heartbeat write failed: {e}")
+
+
+class ParentDeathDetector:
+    """
+    v193.0: Parent death detector - used by CHILD PROCESSES to detect supervisor death.
+    
+    Child processes (jarvis-prime, reactor-core) call start() which spawns a
+    background thread that periodically checks if the supervisor is alive.
+    If supervisor is dead, child terminates itself with SIGTERM.
+    
+    Usage in child process (jarvis-prime, reactor-core):
+        from backend.core.supervisor_singleton import ParentDeathDetector
+        ParentDeathDetector.start()  # Call early in startup
+    """
+    
+    _instance = None
+    _lock = threading.Lock()
+    _running = False
+    _thread: Optional[threading.Thread] = None
+    _check_interval = float(os.environ.get("JARVIS_PARENT_CHECK_INTERVAL", "10.0"))
+    _on_orphan_callback: Optional[Callable[[], None]] = None
+    
+    @classmethod
+    def start(cls, on_orphan: Optional[Callable[[], None]] = None) -> None:
+        """
+        Start the parent death detector.
+        
+        Args:
+            on_orphan: Optional callback to run before self-termination.
+                       Use for cleanup (close DB connections, flush logs, etc.)
+        """
+        with cls._lock:
+            if cls._running:
+                return
+            
+            cls._on_orphan_callback = on_orphan
+            cls._running = True
+            cls._thread = threading.Thread(
+                target=cls._detector_loop,
+                daemon=True,
+                name="ParentDeathDetector"
+            )
+            cls._thread.start()
+            logger.info(f"[v193.0] 👀 Parent death detector started (checking every {cls._check_interval}s)")
+    
+    @classmethod
+    def stop(cls) -> None:
+        """Stop the detector thread."""
+        with cls._lock:
+            cls._running = False
+            if cls._thread:
+                cls._thread.join(timeout=2.0)
+                cls._thread = None
+    
+    @classmethod
+    def is_supervisor_alive(cls) -> Tuple[bool, str]:
+        """
+        Check if the supervisor is alive.
+        
+        Returns:
+            Tuple of (is_alive: bool, reason: str)
+        """
+        try:
+            if not SUPERVISOR_HEARTBEAT_FILE.exists():
+                return False, "heartbeat_file_missing"
+            
+            with open(SUPERVISOR_HEARTBEAT_FILE) as f:
+                data = json.load(f)
+            
+            supervisor_pid = data.get("supervisor_pid")
+            timestamp = data.get("timestamp", 0)
+            
+            # Check 1: Is heartbeat recent?
+            age = time.time() - timestamp
+            if age > HEARTBEAT_STALE_THRESHOLD:
+                return False, f"heartbeat_stale_{age:.1f}s"
+            
+            # Check 2: Is supervisor PID still alive?
+            if supervisor_pid:
+                try:
+                    os.kill(supervisor_pid, 0)  # Signal 0 = check existence
+                except OSError:
+                    return False, f"supervisor_pid_{supervisor_pid}_dead"
+            
+            return True, "alive"
+            
+        except Exception as e:
+            return False, f"check_error_{e}"
+    
+    @classmethod
+    def _detector_loop(cls) -> None:
+        """Background thread that checks supervisor health."""
+        # Initial grace period (let supervisor start heartbeat)
+        time.sleep(5.0)
+        
+        consecutive_failures = 0
+        max_consecutive_failures = 3  # Require 3 consecutive failures before terminating
+        
+        while cls._running:
+            try:
+                is_alive, reason = cls.is_supervisor_alive()
+                
+                if not is_alive:
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"[v193.0] ⚠️ Parent death check failed ({consecutive_failures}/{max_consecutive_failures}): {reason}"
+                    )
+                    
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(
+                            f"[v193.0] 💀 PARENT SUPERVISOR DEAD - Self-terminating to prevent orphan process. "
+                            f"Reason: {reason}"
+                        )
+                        
+                        # Run cleanup callback if provided
+                        if cls._on_orphan_callback:
+                            try:
+                                cls._on_orphan_callback()
+                            except Exception as cb_err:
+                                logger.error(f"[v193.0] Orphan callback error: {cb_err}")
+                        
+                        # Self-terminate with SIGTERM (allows cleanup handlers)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
+                else:
+                    if consecutive_failures > 0:
+                        logger.info(f"[v193.0] ✅ Parent supervisor recovered (was {consecutive_failures} failures)")
+                    consecutive_failures = 0
+                    
+            except Exception as e:
+                logger.debug(f"[v193.0] Parent check error: {e}")
+            
+            # Sleep in small increments
+            for _ in range(int(cls._check_interval)):
+                if not cls._running:
+                    return
+                time.sleep(1.0)
+
+
 class GlobalProcessRegistry:
     """
     v116.0: Global registry of spawned process PIDs.
+    v193.0: Enhanced with parent death detection integration.
 
     This singleton tracks all PIDs spawned by this supervisor session to prevent
     the SIGHUP/restart handler from killing our own running services.

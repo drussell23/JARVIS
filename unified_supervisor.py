@@ -51642,6 +51642,14 @@ class JarvisSystemKernel:
         # v119.0: Release browser lock if held
         self._release_browser_lock()
 
+        # v193.0: Stop supervisor heartbeat (allows children to detect death)
+        try:
+            from backend.core.supervisor_singleton import SupervisorHeartbeat
+            SupervisorHeartbeat.stop()
+            self.logger.debug("[Kernel] Supervisor heartbeat stopped")
+        except Exception:
+            pass
+
         # Release lock
         self._startup_lock.release()
 
@@ -52719,6 +52727,20 @@ class JarvisSystemKernel:
                 self.logger.warning(f"[Kernel] {warning}")
 
             self.logger.debug(f"[Kernel] Takeover completed in {takeover_result.duration_ms:.1f}ms")
+
+            # =====================================================================
+            # v193.0: START SUPERVISOR HEARTBEAT - Proactive Orphan Prevention
+            # =====================================================================
+            # This heartbeat file allows spawned child processes to detect when
+            # the supervisor has died (crash, kill, etc.) and self-terminate
+            # instead of becoming orphaned processes.
+            # =====================================================================
+            try:
+                from backend.core.supervisor_singleton import SupervisorHeartbeat
+                SupervisorHeartbeat.start()
+                self.logger.info("[Kernel] 💓 Supervisor heartbeat started for orphan prevention")
+            except Exception as hb_err:
+                self.logger.warning(f"[Kernel] ⚠️ Heartbeat start failed (non-fatal): {hb_err}")
 
             # =====================================================================
             # v180.0: DIAGNOSTIC CHECKPOINT - Lock acquired
