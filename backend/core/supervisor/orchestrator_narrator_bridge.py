@@ -774,7 +774,16 @@ class OrchestratorNarratorBridge:
     """
 
     _instance: Optional['OrchestratorNarratorBridge'] = None
-    _lock = asyncio.Lock()
+    # v193.0: Lazy lock initialization to avoid RuntimeError at module load time
+    # when no event loop is running. Lock is created on first access.
+    _lock: Optional[asyncio.Lock] = None
+
+    @classmethod
+    def _get_lock(cls) -> asyncio.Lock:
+        """Get or create the class lock (lazy initialization for async safety)."""
+        if cls._lock is None:
+            cls._lock = asyncio.Lock()
+        return cls._lock
 
     def __init__(self, config: Optional[BridgeConfig] = None):
         self.config = config or BridgeConfig()
@@ -783,12 +792,26 @@ class OrchestratorNarratorBridge:
         # Announcement state
         self._last_announcement_time: float = 0
         self._announcement_history: deque = deque(maxlen=self.config.max_event_history)
-        self._pending_announcements: asyncio.Queue = asyncio.Queue()
+        # v193.0: Lazy initialization for asyncio primitives
+        self._pending_announcements: Optional[asyncio.Queue] = None
         self._debounce_timers: Dict[str, asyncio.Task] = {}
 
         # Narrator reference (lazy loaded)
         self._narrator = None
-        self._narrator_lock = asyncio.Lock()
+        # v193.0: Lazy lock initialization
+        self._narrator_lock: Optional[asyncio.Lock] = None
+
+    def _get_narrator_lock(self) -> asyncio.Lock:
+        """Get or create narrator lock (lazy initialization)."""
+        if self._narrator_lock is None:
+            self._narrator_lock = asyncio.Lock()
+        return self._narrator_lock
+
+    def _get_pending_queue(self) -> asyncio.Queue:
+        """Get or create pending announcements queue (lazy initialization)."""
+        if self._pending_announcements is None:
+            self._pending_announcements = asyncio.Queue()
+        return self._pending_announcements
 
         # Statistics
         self._stats = {
@@ -805,7 +828,7 @@ class OrchestratorNarratorBridge:
     @classmethod
     async def get_instance(cls) -> 'OrchestratorNarratorBridge':
         """Get or create singleton instance."""
-        async with cls._lock:
+        async with cls._get_lock():
             if cls._instance is None:
                 cls._instance = cls()
                 await cls._instance.start()
@@ -890,7 +913,7 @@ class OrchestratorNarratorBridge:
         """Announce after debounce window."""
         try:
             await asyncio.sleep(self.config.debounce_window)
-            await self._pending_announcements.put((event_data, message))
+            await self._get_pending_queue().put((event_data, message))
         except asyncio.CancelledError:
             pass
         finally:
@@ -902,7 +925,7 @@ class OrchestratorNarratorBridge:
         while self._running:
             try:
                 event_data, message = await asyncio.wait_for(
-                    self._pending_announcements.get(),
+                    self._get_pending_queue().get(),
                     timeout=1.0
                 )
 
@@ -953,7 +976,7 @@ class OrchestratorNarratorBridge:
 
     async def _get_narrator(self):
         """Get or create narrator instance (lazy loading)."""
-        async with self._narrator_lock:
+        async with self._get_narrator_lock():
             if self._narrator is None:
                 try:
                     from .startup_narrator import get_startup_narrator
@@ -1374,9 +1397,12 @@ class OrchestratorNarratorBridge:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get bridge statistics."""
+        pending_count = 0
+        if self._pending_announcements is not None:
+            pending_count = self._pending_announcements.qsize()
         return {
             **self._stats,
-            "pending_announcements": self._pending_announcements.qsize(),
+            "pending_announcements": pending_count,
             "active_debounce_timers": len(self._debounce_timers),
             "history_size": len(self._announcement_history),
         }
