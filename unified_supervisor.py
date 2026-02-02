@@ -10842,18 +10842,44 @@ class StartupPhase(Enum):
 # 6. Provides process lifecycle management (kill, restart, monitor)
 # =============================================================================
 
-# Chrome crash-prevention flags (scientific basis for each)
-CHROME_STABILITY_FLAGS: List[str] = [
-    # === GPU CRASH PREVENTION (Code 5) ===
+# =============================================================================
+# CHROME STABILITY FLAGS - v197.5 PLATFORM-SPECIFIC
+# =============================================================================
+# 
+# v197.4 LESSON LEARNED:
+# The previous flags included Linux-specific options that caused SIGSEGV (code 11)
+# crashes on macOS:
+# - --single-process: Causes NULL pointer dereference on macOS
+# - --no-zygote: Linux-only, crashes on macOS
+# - --disable-setuid-sandbox: Linux-specific
+#
+# v197.5 FIX: Platform-specific flag sets for macOS vs Linux
+# =============================================================================
+
+# === macOS-SPECIFIC FLAGS ===
+# These flags are tested and safe on macOS (Darwin)
+# v197.6: Added Metal API stability flags to prevent CompositorTileWorker SIGSEGV
+CHROME_MACOS_STABILITY_FLAGS: List[str] = [
+    # === GPU & METAL CRASH PREVENTION (Code 5/11/139) ===
+    # v197.6 FIX: The CompositorTileWorker1 SIGSEGV crash at ~2.4s is caused by
+    # Metal API initialization. These flags disable the problematic Metal paths.
     "--disable-gpu",                    # Disable GPU hardware acceleration
-    "--disable-software-rasterizer",    # Disable software GPU fallback
     "--disable-gpu-compositing",        # Disable GPU-based compositing
-    "--disable-gpu-sandbox",            # Disable GPU process sandbox
     "--disable-accelerated-2d-canvas",  # Disable GPU-accelerated canvas
     "--disable-accelerated-video-decode", # Disable GPU video decode
-    
-    # === MEMORY CRASH PREVENTION (Code 5, 137) ===
-    "--disable-dev-shm-usage",          # Don't use /dev/shm (prevents exhaustion)
+    # v197.6: CRITICAL Metal-specific flags for macOS
+    "--disable-features=Metal",                      # Disable Metal rendering entirely
+    "--disable-features=MetalCommandBufferCaches",   # Disable Metal command buffer caching
+    "--disable-features=RawDraw",                    # Disable raw Metal drawing
+    "--disable-features=UseChromeOSDirectVideoDecoder",  # Disable direct video decoder
+    "--use-angle=swiftshader",          # Use SwiftShader software renderer instead of Metal
+    "--disable-threaded-scrolling",     # Prevent compositor thread issues
+    "--disable-threaded-animation",     # Prevent animation thread issues
+    "--disable-checker-imaging",        # Disable checker imaging (compositor related)
+    "--in-process-gpu",                 # Run GPU in main process (safer on macOS)
+    # NOTE: DO NOT use --disable-software-rasterizer on macOS (causes crashes)
+
+    # === MEMORY OPTIMIZATION ===
     "--disable-extensions",             # Reduce memory footprint
     "--disable-plugins",                # Reduce memory footprint
     "--disable-background-networking",  # Reduce background memory
@@ -10861,16 +10887,17 @@ CHROME_STABILITY_FLAGS: List[str] = [
     "--disable-default-apps",           # Don't load default apps
     "--disable-translate",              # Disable translation feature
     "--disable-features=TranslateUI",   # More translate disable
-    "--disable-features=VizDisplayCompositor",  # Memory optimization
-    "--memory-pressure-off",            # Disable memory pressure signals
-    "--single-process",                 # Run in single process (stability over performance)
-    "--no-zygote",                       # Disable zygote process (reduces memory)
-    
-    # === RENDERER CRASH PREVENTION (Code 6, 139) ===
-    "--disable-features=IsolateOrigins,site-per-process",  # Less process isolation
-    "--disable-setuid-sandbox",         # Disable setuid sandbox
-    "--no-sandbox",                     # Disable sandbox (for stability)
-    
+    # NOTE: DO NOT use --single-process on macOS (causes SIGSEGV)
+    # NOTE: DO NOT use --no-zygote on macOS (Linux-only)
+
+    # === RENDERER STABILITY ===
+    "--disable-features=VizDisplayCompositor",  # Stability on macOS
+    "--disable-features=UseSkiaRenderer",       # Use default renderer
+    "--disable-partial-raster",         # Disable partial raster (compositor stability)
+    "--disable-zero-copy",              # Disable zero-copy (memory stability)
+    # NOTE: DO NOT use --no-sandbox on macOS (causes permission issues)
+    # NOTE: DO NOT use --disable-setuid-sandbox (Linux-only)
+
     # === GENERAL STABILITY ===
     "--disable-hang-monitor",           # Disable hang detection
     "--disable-prompt-on-repost",       # Don't prompt on form resubmit
@@ -10880,30 +10907,172 @@ CHROME_STABILITY_FLAGS: List[str] = [
     "--disable-session-crashed-bubble", # Don't show crash bubble
     "--disable-breakpad",               # Disable crash reporting
     "--noerrdialogs",                   # Suppress error dialogs
-    
+    "--disable-background-timer-throttling",  # Prevent timer throttling
+
     # === AUTOMATION FLAGS ===
-    "--remote-debugging-port=9222",     # Enable CDP for Playwright
+    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
+    # The --remote-debugging-port flag is added dynamically at launch time
     "--remote-allow-origins=*",         # Allow all origins for CDP
     "--no-first-run",                   # Skip first run experience
     "--no-default-browser-check",       # Skip default browser check
     "--password-store=basic",           # Use basic password store
-    
-    # === V8 MEMORY LIMITS ===
-    "--js-flags=--max-old-space-size=512",  # Limit V8 heap to 512MB
+    "--use-mock-keychain",              # macOS: Use mock keychain
+
+    # === V8 MEMORY LIMITS (safe on all platforms) ===
+    "--js-flags=--max-old-space-size=1024",  # Limit V8 heap to 1GB (512 was too aggressive)
 ]
 
-# Minimal flags for when stability is more important than features
+# === LINUX-SPECIFIC FLAGS ===
+# These flags are safe on Linux but may crash macOS
+CHROME_LINUX_STABILITY_FLAGS: List[str] = [
+    # === GPU CRASH PREVENTION (Code 5) ===
+    "--disable-gpu",
+    "--disable-software-rasterizer",    # Safe on Linux
+    "--disable-gpu-compositing",
+    "--disable-gpu-sandbox",
+    "--disable-accelerated-2d-canvas",
+    "--disable-accelerated-video-decode",
+
+    # === MEMORY OPTIMIZATION ===
+    "--disable-dev-shm-usage",          # Critical on Linux Docker
+    "--disable-extensions",
+    "--disable-plugins",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-translate",
+    "--disable-features=TranslateUI",
+    "--disable-features=VizDisplayCompositor",
+    "--memory-pressure-off",
+    "--single-process",                 # Safe on Linux
+    "--no-zygote",                      # Linux-only
+
+    # === RENDERER STABILITY ===
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-setuid-sandbox",         # Linux-only
+    "--no-sandbox",                     # Safe on Linux
+
+    # === GENERAL STABILITY ===
+    "--disable-hang-monitor",
+    "--disable-prompt-on-repost",
+    "--disable-popup-blocking",
+    "--disable-infobars",
+    "--disable-notifications",
+    "--disable-session-crashed-bubble",
+    "--disable-breakpad",
+    "--noerrdialogs",
+
+    # === AUTOMATION FLAGS ===
+    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
+    "--remote-allow-origins=*",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--password-store=basic",
+
+    # === V8 MEMORY LIMITS ===
+    "--js-flags=--max-old-space-size=1024",
+]
+
+# === WINDOWS-SPECIFIC FLAGS ===
+CHROME_WINDOWS_STABILITY_FLAGS: List[str] = [
+    "--disable-gpu",
+    "--disable-gpu-compositing",
+    "--disable-accelerated-2d-canvas",
+    "--disable-extensions",
+    "--disable-plugins",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-translate",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-infobars",
+    "--disable-notifications",
+    "--disable-session-crashed-bubble",
+    "--disable-breakpad",
+    "--noerrdialogs",
+    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
+    "--remote-allow-origins=*",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--js-flags=--max-old-space-size=1024",
+]
+
+# === MINIMAL FLAGS (for maximum compatibility) ===
+# Use these if the full flag set causes issues
+# v197.6: Added critical Metal-bypass flags even for minimal mode
 CHROME_MINIMAL_STABILITY_FLAGS: List[str] = [
     "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--disable-dev-shm-usage",
+    "--disable-gpu-compositing",        # v197.6: Critical for compositor crashes
+    "--use-angle=swiftshader",          # v197.6: Software renderer fallback
+    "--disable-features=Metal",         # v197.6: Disable Metal on macOS
     "--disable-extensions",
-    "--remote-debugging-port=9222",
+    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
     "--remote-allow-origins=*",
     "--no-first-run",
     "--disable-session-crashed-bubble",
-    "--memory-pressure-off",
 ]
+
+# === CDP PORT CONFIGURATION ===
+# v197.6: Dynamic CDP port detection to avoid port conflicts
+CDP_PORT_RANGE_START = int(os.environ.get("JARVIS_CDP_PORT_START", "9222"))
+CDP_PORT_RANGE_END = int(os.environ.get("JARVIS_CDP_PORT_END", "9232"))
+_current_cdp_port: Optional[int] = None  # Cached active CDP port
+
+
+def _is_port_available(port: int) -> bool:
+    """Check if a TCP port is available for binding."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            s.bind(("127.0.0.1", port))
+            return True
+    except (OSError, socket.error):
+        return False
+
+
+def _find_available_cdp_port(start: int = CDP_PORT_RANGE_START, end: int = CDP_PORT_RANGE_END) -> Optional[int]:
+    """
+    Find an available CDP port in the specified range.
+
+    v197.6: Dynamic port detection to avoid conflicts when multiple Chrome
+    instances try to bind to the same port (which causes crashes).
+
+    Returns:
+        Available port number, or None if no ports available
+    """
+    for port in range(start, end + 1):
+        if _is_port_available(port):
+            return port
+    return None
+
+
+def get_active_cdp_port() -> int:
+    """Get the currently active CDP port (for external callers like background_actuator)."""
+    global _current_cdp_port
+    return _current_cdp_port or CDP_PORT_RANGE_START
+
+
+def get_chrome_stability_flags() -> List[str]:
+    """
+    v197.5: Get platform-specific Chrome stability flags.
+    
+    Returns the appropriate flag set for the current operating system.
+    This prevents crashes caused by using Linux-specific flags on macOS.
+    """
+    if sys.platform == "darwin":
+        return CHROME_MACOS_STABILITY_FLAGS.copy()
+    elif sys.platform == "linux":
+        return CHROME_LINUX_STABILITY_FLAGS.copy()
+    elif sys.platform == "win32":
+        return CHROME_WINDOWS_STABILITY_FLAGS.copy()
+    else:
+        # Unknown platform, use minimal flags
+        return CHROME_MINIMAL_STABILITY_FLAGS.copy()
+
+
+# Legacy alias for backward compatibility
+CHROME_STABILITY_FLAGS = get_chrome_stability_flags()
 
 # Chrome binary paths by platform
 CHROME_BINARY_PATHS: Dict[str, List[str]] = {
@@ -10928,205 +11097,510 @@ CHROME_BINARY_PATHS: Dict[str, List[str]] = {
 
 class StabilizedChromeLauncher:
     """
-    v197.4: Stabilized Chrome Launcher with crash prevention.
-    
-    This class addresses the ROOT CAUSE of browser crash code 5:
-    - Launches Chrome with GPU disabled
-    - Sets memory limits
-    - Enables remote debugging for Playwright
-    - Manages Chrome process lifecycle
-    - Provides automatic restart on crash
-    
+    v197.6: Enterprise-Grade Stabilized Chrome Launcher with comprehensive crash prevention.
+
+    ROOT CAUSE FIXES (v197.6):
+    - Code 5: GPU process crash / OOM (fixed with --disable-gpu + Metal flags)
+    - Code 11/139: SIGSEGV in CompositorTileWorker1 (fixed with Metal API disable)
+    - Port conflicts: Dynamic CDP port detection (no more hardcoded 9222)
+    - Lock contention: Non-blocking initialization with fine-grained locking
+    - Buffer blocking: Async subprocess stream monitoring
+
+    ARCHITECTURAL IMPROVEMENTS:
+    1. Dynamic CDP port detection - finds available port in range 9222-9232
+    2. Async subprocess stream readers - prevents PIPE buffer blocking
+    3. Continuous crash monitoring - checks every 200ms, not just at checkpoints
+    4. Fine-grained locking - lock only during critical sections, not during sleep
+    5. Metal API bypass - comprehensive flags to disable macOS Metal rendering
+
     Design Philosophy:
     - CURE the problem, don't just detect it
     - Launch Chrome RIGHT from the start
+    - Use PLATFORM-SPECIFIC flags (macOS ≠ Linux ≠ Windows)
+    - Non-blocking async architecture throughout
     - Proactive prevention > reactive recovery
     """
-    
+
+    # Crash codes and their meanings for better diagnostics
+    CRASH_CODE_MEANINGS = {
+        5: "GPU process crash or OOM",
+        6: "Renderer process crash",
+        11: "Segmentation fault (SIGSEGV) - CompositorTileWorker/Metal crash",
+        15: "SIGTERM - terminated by signal",
+        137: "OOM killed by system (128 + SIGKILL)",
+        139: "SIGSEGV (128 + 11) - CompositorTileWorker thread crash",
+    }
+
+    # v197.6: Compositor/Metal crash indicators in stderr
+    COMPOSITOR_CRASH_PATTERNS = [
+        b"CompositorTileWorker",
+        b"Metal",
+        b"MetalCommandBuffer",
+        b"GPU process",
+        b"SIGSEGV",
+        b"EXC_BAD_ACCESS",
+        b"KERN_INVALID_ADDRESS",
+    ]
+
     def __init__(self, use_minimal_flags: bool = False):
         self._logger = logging.getLogger("StabilizedChromeLauncher")
         self._chrome_process: Optional[asyncio.subprocess.Process] = None
         self._chrome_pid: Optional[int] = None
         self._lock = asyncio.Lock()
-        self._flags = CHROME_MINIMAL_STABILITY_FLAGS if use_minimal_flags else CHROME_STABILITY_FLAGS
+
+        # v197.6: Track active CDP port
+        self._cdp_port: Optional[int] = None
+
+        # v197.6: Async stream monitoring tasks
+        self._stdout_monitor_task: Optional[asyncio.Task] = None
+        self._stderr_monitor_task: Optional[asyncio.Task] = None
+        self._crash_monitor_task: Optional[asyncio.Task] = None
+        self._stderr_buffer: List[bytes] = []
+        self._detected_crash_indicators: List[str] = []
+
+        # v197.6: Use platform-specific flags (without hardcoded port)
+        if use_minimal_flags:
+            self._flags = CHROME_MINIMAL_STABILITY_FLAGS.copy()
+            self._logger.info(f"[StabilizedChrome] Using MINIMAL flags ({len(self._flags)} flags)")
+        else:
+            self._flags = get_chrome_stability_flags()
+            self._logger.info(
+                f"[StabilizedChrome] v197.6 Using {sys.platform.upper()} platform-specific flags "
+                f"({len(self._flags)} flags) with Metal API bypass"
+            )
+
         self._started_at: Optional[float] = None
         self._restart_count = 0
         self._max_restarts = 5
         self._last_crash_time: Optional[float] = None
-        
+        self._crash_history: List[Dict[str, Any]] = []
+        self._consecutive_sigsegv_count = 0  # Track SIGSEGV specifically
+        self._launch_in_progress = False  # v197.6: Prevent concurrent launches
+
         # Find Chrome binary
         self._chrome_binary = self._find_chrome_binary()
-        
+
     def _find_chrome_binary(self) -> Optional[str]:
         """Find the Chrome/Chromium binary on this system."""
         platform_paths = CHROME_BINARY_PATHS.get(sys.platform, [])
-        
+
         for path in platform_paths:
             expanded = os.path.expanduser(path)
             if os.path.exists(expanded):
                 self._logger.debug(f"[StabilizedChrome] Found Chrome at: {expanded}")
                 return expanded
-        
+
         self._logger.warning("[StabilizedChrome] Chrome binary not found in standard locations")
         return None
-    
+
+    async def _monitor_stderr_stream(self, process: asyncio.subprocess.Process) -> None:
+        """
+        v197.6: Continuously read stderr to prevent buffer blocking and detect crash indicators.
+
+        This runs as a background task and captures all stderr output, looking for
+        compositor/Metal crash patterns that indicate imminent failure.
+        """
+        try:
+            if process.stderr is None:
+                return
+
+            while process.returncode is None:
+                try:
+                    line = await asyncio.wait_for(process.stderr.readline(), timeout=0.5)
+                    if not line:
+                        break
+
+                    self._stderr_buffer.append(line)
+                    # Keep buffer bounded
+                    if len(self._stderr_buffer) > 100:
+                        self._stderr_buffer = self._stderr_buffer[-50:]
+
+                    # Check for crash indicators
+                    for pattern in self.COMPOSITOR_CRASH_PATTERNS:
+                        if pattern in line:
+                            indicator = f"STDERR: {line.decode(errors='replace')[:100]}"
+                            self._detected_crash_indicators.append(indicator)
+                            self._logger.warning(
+                                f"[StabilizedChrome] 🔴 Crash indicator detected: {pattern.decode()}"
+                            )
+                            break
+
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+        except Exception as e:
+            self._logger.debug(f"[StabilizedChrome] stderr monitor ended: {e}")
+
+    async def _monitor_stdout_stream(self, process: asyncio.subprocess.Process) -> None:
+        """
+        v197.6: Continuously read stdout to prevent buffer blocking.
+        """
+        try:
+            if process.stdout is None:
+                return
+
+            while process.returncode is None:
+                try:
+                    line = await asyncio.wait_for(process.stdout.readline(), timeout=0.5)
+                    if not line:
+                        break
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+        except Exception as e:
+            self._logger.debug(f"[StabilizedChrome] stdout monitor ended: {e}")
+
+    async def _continuous_crash_monitor(
+        self,
+        process: asyncio.subprocess.Process,
+        crash_event: asyncio.Event,
+        monitoring_duration: float = 4.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        v197.6: Continuous crash monitoring with 200ms granularity.
+
+        Instead of checking at 1s, 2s, 3s checkpoints, this monitors every 200ms
+        to catch crashes like the 2.4s CompositorTileWorker SIGSEGV.
+
+        Args:
+            process: The Chrome subprocess to monitor
+            crash_event: Event to signal when crash is detected
+            monitoring_duration: How long to monitor (default 4s)
+
+        Returns:
+            Crash info dict if crash detected, None if process stable
+        """
+        start_time = time.time()
+        check_interval = 0.2  # 200ms granularity
+
+        while time.time() - start_time < monitoring_duration:
+            await asyncio.sleep(check_interval)
+
+            if process.returncode is not None:
+                exit_code = process.returncode
+                elapsed = time.time() - start_time
+
+                # Get any buffered stderr
+                stderr_text = b"".join(self._stderr_buffer[-20:]).decode(errors="replace")[:500]
+
+                crash_info = {
+                    "time": time.time(),
+                    "elapsed_seconds": elapsed,
+                    "code": exit_code,
+                    "meaning": self.CRASH_CODE_MEANINGS.get(exit_code, "Unknown"),
+                    "stderr": stderr_text,
+                    "crash_indicators": self._detected_crash_indicators.copy(),
+                }
+
+                crash_event.set()
+                return crash_info
+
+        # Process survived monitoring period
+        return None
+
     async def kill_all_chrome_processes(self) -> int:
         """
         Kill ALL Chrome processes for a clean slate.
-        
-        This is essential before launching with stability flags - we need
-        to ensure no existing Chrome instances (with default settings) 
-        are running.
-        
+
+        v197.6: Uses non-blocking process termination with timeout.
+
         Returns:
             Number of processes killed
         """
         try:
             import psutil
             killed = 0
-            
-            for proc in psutil.process_iter(['pid', 'name']):
+            pids_to_kill: List[int] = []
+
+            # First pass: collect PIDs (don't block in iterator)
+            for proc in psutil.process_iter(["pid", "name"]):
                 try:
-                    name = proc.info['name'].lower()
-                    if any(browser in name for browser in ['chrome', 'chromium', 'google chrome']):
-                        self._logger.info(f"[StabilizedChrome] Killing Chrome process: PID={proc.pid}")
-                        proc.terminate()
-                        killed += 1
+                    name = proc.info["name"].lower()
+                    if any(browser in name for browser in ["chrome", "chromium", "google chrome"]):
+                        pids_to_kill.append(proc.pid)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-            
+
+            # Second pass: terminate (with limited blocking)
+            for pid in pids_to_kill:
+                try:
+                    proc = psutil.Process(pid)
+                    self._logger.info(f"[StabilizedChrome] Killing Chrome process: PID={pid}")
+                    proc.terminate()
+                    killed += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
             if killed > 0:
-                # Wait for processes to terminate
+                # Wait for processes to terminate (non-blocking sleep)
                 await asyncio.sleep(1.0)
-                
+
                 # Force kill any remaining
-                for proc in psutil.process_iter(['pid', 'name']):
+                for pid in pids_to_kill:
                     try:
-                        name = proc.info['name'].lower()
-                        if any(browser in name for browser in ['chrome', 'chromium']):
+                        proc = psutil.Process(pid)
+                        if proc.is_running():
                             proc.kill()
-                            self._logger.debug(f"[StabilizedChrome] Force killed: PID={proc.pid}")
+                            self._logger.debug(f"[StabilizedChrome] Force killed: PID={pid}")
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
-                
+
                 await asyncio.sleep(0.5)
-            
+
             self._logger.info(f"[StabilizedChrome] Killed {killed} Chrome processes")
             return killed
-            
+
         except ImportError:
             self._logger.warning("[StabilizedChrome] psutil not available - cannot kill Chrome processes")
             return 0
         except Exception as e:
             self._logger.error(f"[StabilizedChrome] Error killing Chrome: {e}")
             return 0
-    
+
+    def _cleanup_monitoring_tasks(self) -> None:
+        """v197.6: Cancel any running monitoring tasks."""
+        for task in [self._stdout_monitor_task, self._stderr_monitor_task, self._crash_monitor_task]:
+            if task is not None and not task.done():
+                task.cancel()
+        self._stdout_monitor_task = None
+        self._stderr_monitor_task = None
+        self._crash_monitor_task = None
+        self._stderr_buffer.clear()
+        self._detected_crash_indicators.clear()
+
     async def launch_stabilized_chrome(
         self,
         url: Optional[str] = None,
         incognito: bool = True,
         kill_existing: bool = True,
         headless: bool = False,
+        _fallback_attempt: bool = False,
     ) -> bool:
         """
-        Launch Chrome with crash-prevention flags.
-        
-        This is the CURE for code 5 crashes - we launch Chrome with proper
-        settings from the very beginning, rather than trying to recover
-        from crashes caused by default settings.
-        
+        v197.6: Launch Chrome with comprehensive crash-prevention flags.
+
+        ROOT CAUSE FIXES:
+        1. Dynamic CDP port detection (avoids port 9222 conflicts)
+        2. Metal API bypass flags (prevents CompositorTileWorker SIGSEGV)
+        3. Non-blocking async architecture (no lock during sleep)
+        4. Continuous crash monitoring (200ms granularity)
+        5. Async subprocess stream readers (prevents buffer blocking)
+
         Args:
             url: Optional URL to open
             incognito: Launch in incognito mode
             kill_existing: Kill existing Chrome processes first
             headless: Run in headless mode
-            
+            _fallback_attempt: Internal flag for fallback to minimal flags
+
         Returns:
             True if Chrome launched successfully
         """
-        async with self._lock:
-            if not self._chrome_binary:
-                self._logger.error("[StabilizedChrome] No Chrome binary found")
+        global _current_cdp_port
+
+        # v197.6: Prevent concurrent launches without blocking
+        if self._launch_in_progress:
+            self._logger.warning("[StabilizedChrome] Launch already in progress - waiting...")
+            for _ in range(50):  # Wait up to 5 seconds
+                await asyncio.sleep(0.1)
+                if not self._launch_in_progress:
+                    break
+            else:
+                self._logger.error("[StabilizedChrome] Concurrent launch timeout")
                 return False
-            
-            # Kill existing Chrome for clean slate
+
+        self._launch_in_progress = True
+        should_fallback = False  # v197.6: Track if we need fallback OUTSIDE the lock
+
+        try:
+            # === PHASE 1: Preparation (brief lock) ===
+            async with self._lock:
+                if not self._chrome_binary:
+                    self._logger.error("[StabilizedChrome] No Chrome binary found")
+                    return False
+
+                # Cleanup any previous monitoring tasks
+                self._cleanup_monitoring_tasks()
+
+                # v197.6: Find available CDP port
+                self._cdp_port = _find_available_cdp_port()
+                if self._cdp_port is None:
+                    self._logger.error(
+                        f"[StabilizedChrome] No available CDP port in range "
+                        f"{CDP_PORT_RANGE_START}-{CDP_PORT_RANGE_END}"
+                    )
+                    return False
+
+                _current_cdp_port = self._cdp_port
+                self._logger.info(f"[StabilizedChrome] Using CDP port: {self._cdp_port}")
+
+            # === PHASE 2: Kill existing (outside lock to avoid blocking) ===
             if kill_existing:
                 await self.kill_all_chrome_processes()
-            
-            # Build command
-            cmd = [self._chrome_binary] + self._flags.copy()
-            
-            if incognito:
-                cmd.append("--incognito")
-            
-            if headless:
-                cmd.extend(["--headless=new", "--disable-gpu"])
-            
-            if url:
-                cmd.append(url)
-            
-            try:
-                self._logger.info(f"[StabilizedChrome] Launching with {len(self._flags)} stability flags...")
-                self._logger.debug(f"[StabilizedChrome] Command: {' '.join(cmd[:5])}... + {len(cmd)-5} more args")
-                
+                await asyncio.sleep(0.5)
+
+            # === PHASE 3: Build command and launch (brief lock) ===
+            async with self._lock:
+                # v197.6: Determine flags (handle SIGSEGV fallback)
+                flags_to_use = self._flags.copy()
+                if self._consecutive_sigsegv_count >= 2 and not _fallback_attempt:
+                    self._logger.warning(
+                        f"[StabilizedChrome] {self._consecutive_sigsegv_count} consecutive SIGSEGV crashes. "
+                        "Falling back to MINIMAL flags for stability."
+                    )
+                    flags_to_use = CHROME_MINIMAL_STABILITY_FLAGS.copy()
+
+                # v197.6: Add dynamic CDP port flag
+                flags_to_use.append(f"--remote-debugging-port={self._cdp_port}")
+
+                # Build command
+                cmd = [self._chrome_binary] + flags_to_use
+
+                if incognito:
+                    cmd.append("--incognito")
+
+                if headless:
+                    cmd.extend(["--headless=new", "--disable-gpu"])
+
+                if url:
+                    cmd.append(url)
+
+                self._logger.info(
+                    f"[StabilizedChrome] v197.6 Launching Chrome ({sys.platform}) with "
+                    f"{len(flags_to_use)} flags, CDP port {self._cdp_port}..."
+                )
+                self._logger.debug(f"[StabilizedChrome] Binary: {self._chrome_binary}")
+
                 # Launch Chrome
                 self._chrome_process = await asyncio.create_subprocess_exec(
                     *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                
+
                 self._chrome_pid = self._chrome_process.pid
                 self._started_at = time.time()
-                
-                # Wait a moment for Chrome to start
-                await asyncio.sleep(1.0)
-                
-                # Verify it's running
-                if self._chrome_process.returncode is not None:
-                    self._logger.error(f"[StabilizedChrome] Chrome exited immediately with code: {self._chrome_process.returncode}")
-                    return False
-                
-                self._logger.info(f"[StabilizedChrome] ✅ Chrome launched successfully (PID={self._chrome_pid})")
-                
-                # Report to crash monitor that we're using stabilized launch
-                try:
-                    crash_monitor = get_browser_crash_monitor()
-                    crash_monitor._logger.info(
-                        f"[BrowserCrashMonitor] Chrome launched with stability flags - "
-                        f"GPU disabled, memory limited, CDP on :9222"
+
+                # v197.6: Start async stream monitors (prevents buffer blocking)
+                self._stdout_monitor_task = asyncio.create_task(
+                    self._monitor_stdout_stream(self._chrome_process)
+                )
+                self._stderr_monitor_task = asyncio.create_task(
+                    self._monitor_stderr_stream(self._chrome_process)
+                )
+
+            # === PHASE 4: Crash monitoring (OUTSIDE lock - non-blocking) ===
+            # v197.6: This is the key fix - monitoring happens outside the lock
+            crash_event = asyncio.Event()
+            crash_info = await self._continuous_crash_monitor(
+                self._chrome_process,
+                crash_event,
+                monitoring_duration=4.0,  # Monitor for 4 seconds (covers 2.4s crash window)
+            )
+
+            # === PHASE 5: Handle result (brief lock for state update) ===
+            async with self._lock:
+                if crash_info is not None:
+                    exit_code = crash_info["code"]
+                    self._crash_history.append(crash_info)
+
+                    # Check for SIGSEGV (code 11 or 139)
+                    if exit_code in (11, 139):
+                        self._consecutive_sigsegv_count += 1
+                        self._logger.error(
+                            f"[StabilizedChrome] 🔴 SIGSEGV detected (code {exit_code}) "
+                            f"at {crash_info['elapsed_seconds']:.2f}s. "
+                            f"Consecutive count: {self._consecutive_sigsegv_count}"
+                        )
+
+                        if crash_info["crash_indicators"]:
+                            self._logger.error(
+                                f"[StabilizedChrome] Crash indicators: "
+                                f"{', '.join(crash_info['crash_indicators'][:3])}"
+                            )
+
+                        # v197.6: Set flag for fallback OUTSIDE this lock
+                        if not _fallback_attempt and self._consecutive_sigsegv_count <= 3:
+                            should_fallback = True
+                            self._flags = CHROME_MINIMAL_STABILITY_FLAGS.copy()
+
+                    self._logger.error(
+                        f"[StabilizedChrome] Chrome crashed on launch "
+                        f"(code {exit_code}: {crash_info['meaning']})"
                     )
-                except Exception:
-                    pass
-                
-                return True
-                
-            except Exception as e:
-                self._logger.error(f"[StabilizedChrome] Launch failed: {e}")
+                    if crash_info["stderr"]:
+                        self._logger.debug(f"[StabilizedChrome] stderr: {crash_info['stderr'][:300]}")
+
+            # v197.6: Handle fallback OUTSIDE the lock (prevents recursive lock)
+            if should_fallback:
+                self._logger.info("[StabilizedChrome] Retrying with MINIMAL flags...")
+                self._launch_in_progress = False  # Allow the retry
+                return await self.launch_stabilized_chrome(
+                    url=url,
+                    incognito=incognito,
+                    kill_existing=True,
+                    headless=headless,
+                    _fallback_attempt=True,
+                )
+
+            if crash_info is not None:
                 return False
-    
+
+            # === SUCCESS ===
+            self._consecutive_sigsegv_count = 0  # Reset on success
+            self._logger.info(
+                f"[StabilizedChrome] ✅ Chrome launched successfully "
+                f"(PID={self._chrome_pid}, CDP port={self._cdp_port}, platform={sys.platform})"
+            )
+
+            # Report to crash monitor
+            try:
+                crash_monitor = get_browser_crash_monitor()
+                crash_monitor._logger.info(
+                    f"[BrowserCrashMonitor] Chrome launched with {len(flags_to_use)} "
+                    f"{sys.platform} stability flags - Metal disabled, CDP on :{self._cdp_port}"
+                )
+            except Exception:
+                pass
+
+            return True
+
+        except Exception as e:
+            self._logger.error(f"[StabilizedChrome] Launch failed: {e}")
+            import traceback
+            self._logger.debug(f"[StabilizedChrome] Traceback: {traceback.format_exc()}")
+            return False
+        finally:
+            self._launch_in_progress = False
+
     async def is_chrome_running(self) -> bool:
         """Check if our stabilized Chrome is still running."""
         if self._chrome_process is None:
             return False
         return self._chrome_process.returncode is None
-    
+
+    def get_cdp_port(self) -> Optional[int]:
+        """v197.6: Get the active CDP port."""
+        return self._cdp_port
+
     async def restart_chrome(self, url: Optional[str] = None, incognito: bool = True) -> bool:
         """
         Restart Chrome with stability flags.
-        
+
         Called automatically after crashes or manually for recovery.
         """
         self._restart_count += 1
         self._last_crash_time = time.time()
-        
+
         if self._restart_count > self._max_restarts:
             self._logger.error(
                 f"[StabilizedChrome] Max restarts ({self._max_restarts}) exceeded. "
                 "Something is fundamentally wrong - check system resources."
             )
             return False
-        
+
         self._logger.info(f"[StabilizedChrome] Restarting Chrome (attempt {self._restart_count}/{self._max_restarts})")
         return await self.launch_stabilized_chrome(url=url, incognito=incognito, kill_existing=True)
     
@@ -11164,15 +11638,19 @@ class StabilizedChromeLauncher:
         return True
     
     def get_statistics(self) -> Dict[str, Any]:
-        """Get launcher statistics."""
+        """Get launcher statistics (v197.6: includes CDP port)."""
         uptime = time.time() - self._started_at if self._started_at else 0
         return {
             "chrome_pid": self._chrome_pid,
+            "cdp_port": self._cdp_port,  # v197.6: Dynamic CDP port
             "is_running": self._chrome_process is not None and self._chrome_process.returncode is None,
             "restart_count": self._restart_count,
             "uptime_seconds": uptime,
             "flags_count": len(self._flags),
             "last_crash_time": self._last_crash_time,
+            "consecutive_sigsegv_count": self._consecutive_sigsegv_count,  # v197.6
+            "crash_history_count": len(self._crash_history),  # v197.6
+            "platform": sys.platform,  # v197.6
         }
 
 
@@ -11999,21 +12477,25 @@ class BrowserCrashMonitor:
     6. Integrates with the LiveProgressDashboard
     
     Crash Codes and Their Meanings:
-    - Code 5: GPU process crash / OOM
-    - Code 6: Renderer process crash
-    - Code 11: Page unresponsive
+    - Code 5: GPU process crash / OOM (Chromium internal)
+    - Code 6: Renderer process crash (Chromium internal)
+    - Code 11: Segmentation fault (SIGSEGV) - often caused by incompatible flags
     - Code 15: Browser terminated by signal (SIGTERM)
-    - Code 137: OOM killed by system (SIGKILL + 128)
-    - Code 139: Segmentation fault (SIGSEGV + 128)
+    - Code 137: OOM killed by system (128 + SIGKILL)
+    - Code 139: Segmentation fault (128 + SIGSEGV)
+    
+    v197.5 Update:
+    - Fixed Code 11 meaning (SIGSEGV, not "page unresponsive")
+    - Added platform-specific flag detection
     """
     
     CRASH_CODE_MEANINGS = {
         "5": ("GPU process crash / OOM", BrowserCrashSeverity.HIGH),
         "6": ("Renderer process crash", BrowserCrashSeverity.MEDIUM),
-        "11": ("Page unresponsive", BrowserCrashSeverity.LOW),
+        "11": ("Segmentation fault (SIGSEGV) - check Chrome flags", BrowserCrashSeverity.CRITICAL),
         "15": ("Browser terminated (SIGTERM)", BrowserCrashSeverity.MEDIUM),
         "137": ("OOM killed by system", BrowserCrashSeverity.CRITICAL),
-        "139": ("Segmentation fault", BrowserCrashSeverity.CRITICAL),
+        "139": ("Segmentation fault (128 + SIGSEGV)", BrowserCrashSeverity.CRITICAL),
     }
     
     def __init__(self):

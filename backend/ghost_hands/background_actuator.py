@@ -1048,21 +1048,27 @@ class PlaywrightBackend(ActuatorBackend):
             from playwright.async_api import async_playwright
             
             # =====================================================================
-            # v197.4: ROOT CAUSE FIX - Ensure Chrome is launched with stability flags
+            # v197.6: ROOT CAUSE FIX - Ensure Chrome is launched with stability flags
             # =====================================================================
             # Before connecting via CDP, ensure Chrome is running with the right flags.
-            # If Chrome is running without flags (e.g., user opened it manually),
-            # we'll still connect, but won't have crash protection.
+            # v197.6 IMPROVEMENTS:
+            # - Dynamic CDP port detection (no more hardcoded 9222)
+            # - Metal API bypass flags (prevents CompositorTileWorker SIGSEGV)
+            # - Proper async coordination (no lock contention)
             # =====================================================================
+            cdp_port = 9222  # Default fallback
             try:
                 # Try to import the stabilized launcher from unified_supervisor
-                from unified_supervisor import get_stabilized_chrome_launcher
-                
+                from unified_supervisor import (
+                    get_stabilized_chrome_launcher,
+                    get_active_cdp_port,
+                )
+
                 launcher = get_stabilized_chrome_launcher()
-                
+
                 # Check if Chrome is already running with stability flags
                 if not await launcher.is_chrome_running():
-                    logger.info("[GHOST-HANDS] v197.4: Launching Chrome with stability flags...")
+                    logger.info("[GHOST-HANDS] v197.6: Launching Chrome with stability flags (Metal bypass)...")
                     success = await launcher.launch_stabilized_chrome(
                         url=None,  # No URL, just start Chrome
                         incognito=False,  # Not incognito for general automation
@@ -1070,29 +1076,38 @@ class PlaywrightBackend(ActuatorBackend):
                         headless=self.config.playwright_headless,
                     )
                     if success:
-                        logger.info("[GHOST-HANDS] ✅ Chrome launched with GPU disabled, memory limited")
+                        # v197.6: Get the dynamically assigned CDP port
+                        cdp_port = launcher.get_cdp_port() or get_active_cdp_port()
+                        logger.info(
+                            f"[GHOST-HANDS] ✅ Chrome launched with Metal bypass, "
+                            f"CDP port {cdp_port}"
+                        )
                         self._stabilized_launcher_available = True
                         # Wait for Chrome to be ready
                         await asyncio.sleep(2.0)
                     else:
                         logger.warning("[GHOST-HANDS] StabilizedChromeLauncher failed - Chrome may crash")
                 else:
-                    logger.info("[GHOST-HANDS] Chrome already running (hopefully with stability flags)")
+                    # v197.6: Get CDP port from running instance
+                    cdp_port = launcher.get_cdp_port() or get_active_cdp_port()
+                    logger.info(f"[GHOST-HANDS] Chrome already running on CDP port {cdp_port}")
                     self._stabilized_launcher_available = True
-                    
+
             except ImportError:
                 logger.debug("[GHOST-HANDS] StabilizedChromeLauncher not available - using existing Chrome")
             except Exception as launcher_err:
                 logger.debug(f"[GHOST-HANDS] Launcher check failed: {launcher_err}")
-            
+
             # =====================================================================
-            # Connect to Chrome via CDP
+            # Connect to Chrome via CDP (v197.6: dynamic port)
             # =====================================================================
             self._playwright = await async_playwright().start()
 
-            # Connect to existing browser via CDP
+            # v197.6: Connect using dynamic CDP port
+            cdp_url = f"http://localhost:{cdp_port}"
+            logger.info(f"[GHOST-HANDS] Connecting to Chrome CDP at {cdp_url}")
             self._browser = await self._playwright.chromium.connect_over_cdp(
-                "http://localhost:9222",
+                cdp_url,
                 timeout=10000  # 10 second timeout
             )
 
@@ -1117,11 +1132,9 @@ class PlaywrightBackend(ActuatorBackend):
         except Exception as e:
             logger.warning(f"[GHOST-HANDS] Playwright init failed: {e}")
             logger.info(
-                "[GHOST-HANDS] To enable Playwright, either:\n"
-                "  1. Run unified_supervisor.py (recommended - launches Chrome with stability flags)\n"
-                "  2. Manually run Chrome with:\n"
-                "     /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
-                "--remote-debugging-port=9222 --disable-gpu --disable-software-rasterizer"
+                "[GHOST-HANDS] To enable Playwright, run unified_supervisor.py\n"
+                "  (recommended - launches Chrome with v197.6 Metal bypass flags)\n"
+                "  This prevents CompositorTileWorker SIGSEGV crashes on macOS."
             )
             return False
 
