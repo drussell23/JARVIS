@@ -52322,6 +52322,28 @@ class JarvisSystemKernel:
                 }
             )
 
+            # =====================================================================
+            # v193.1: WEBSOCKET HUB EARLY INITIALIZATION
+            # =====================================================================
+            # The WebSocket server MUST be started BEFORE Trinity phase because
+            # Trinity's MultiTransport tries to connect to ws://localhost:8765
+            # during initialization. If the server isn't running, WebSocket
+            # transport fails and falls back to slower FileTransport.
+            #
+            # By starting WebSocket here (between Intelligence and Trinity),
+            # we ensure the server is ready when Trinity components connect.
+            # =====================================================================
+            if os.getenv("JARVIS_WEBSOCKET_ENABLED", "true").lower() == "true":
+                try:
+                    self.logger.info("[Kernel] Pre-Trinity WebSocket hub initialization...")
+                    ws_result = await self._initialize_websocket_hub()
+                    if ws_result.get("running"):
+                        self.logger.success(f"[Kernel] WebSocket hub ready on port {ws_result.get('port', 8765)}")
+                    else:
+                        self.logger.info("[Kernel] WebSocket hub not available (Trinity will use FileTransport)")
+                except Exception as ws_err:
+                    self.logger.warning(f"[Kernel] WebSocket pre-init failed (non-fatal): {ws_err}")
+
             # Phase 5: Trinity (Zone 5.7)
             issue_collector.set_current_phase("Phase 5: Trinity")
             issue_collector.set_current_zone("Zone 5.7")

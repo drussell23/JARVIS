@@ -13,8 +13,9 @@ Features:
 - Reconnection with exponential backoff
 - Message deduplication
 - Priority-based transport selection
+- v193.1: Fast-reconnect during startup (retries every 2s for 30s)
 
-Author: JARVIS v77.0
+Author: JARVIS v77.0, v193.1
 """
 
 from __future__ import annotations
@@ -506,6 +507,10 @@ class MultiTransport:
     - Health monitoring
     - Reconnection handling
     - Message deduplication
+
+    v193.1: Enhanced with aggressive fast-reconnect during startup.
+    If WebSocket/Redis fail on initial connect, retry quickly (every 2s)
+    for the first 30 seconds before falling back to normal 30s health checks.
     """
 
     def __init__(
@@ -524,8 +529,10 @@ class MultiTransport:
         self._message_handlers: List[Callable] = []
         self._dedup_cache: deque = deque(maxlen=1000)
         self._health_check_task: Optional[asyncio.Task] = None
+        self._fast_reconnect_task: Optional[asyncio.Task] = None
         self._connected = False
         self._started = False
+        self._startup_time: float = 0.0  # v193.1: Track startup time for fast-reconnect
 
     async def start(self) -> bool:
         """
@@ -559,8 +566,15 @@ class MultiTransport:
         Connect to transports in priority order.
 
         Returns True if at least one transport connects.
+
+        v193.1: Enhanced with fast-reconnect for initially failed transports.
+        If Redis/WebSocket fail initially (common during startup when
+        servers may not be ready yet), we start a fast-reconnect task
+        that retries every 2 seconds for the first 30 seconds.
         """
         connected = False
+        failed_transports: List[TransportType] = []
+        self._startup_time = time.time()
 
         for transport_type in TransportType:
             transport = self.transports[transport_type]
@@ -572,15 +586,36 @@ class MultiTransport:
 
                 # Add message forwarding
                 transport.add_handler(self._forward_message)
+            else:
+                # Track failed transports for fast-reconnect
+                if transport_type != TransportType.FILE:
+                    failed_transports.append(transport_type)
 
         if connected:
             self._connected = True
             self._health_check_task = asyncio.create_task(self._health_check_loop())
 
+            # v193.1: Start fast-reconnect task for initially failed transports
+            # This is especially important for WebSocket which may not be ready
+            # at startup but will be ready shortly after
+            if failed_transports:
+                self._fast_reconnect_task = asyncio.create_task(
+                    self._fast_reconnect_loop(failed_transports)
+                )
+
         return connected
 
     async def disconnect(self) -> None:
         """Disconnect all transports."""
+        # v193.1: Cancel fast-reconnect task if running
+        if self._fast_reconnect_task:
+            self._fast_reconnect_task.cancel()
+            try:
+                await self._fast_reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._fast_reconnect_task = None
+
         if self._health_check_task:
             self._health_check_task.cancel()
             try:
@@ -673,6 +708,69 @@ class MultiTransport:
                 break
             except Exception as e:
                 logger.error(f"[MultiTransport] Health check error: {e}")
+
+    async def _fast_reconnect_loop(self, failed_transports: List[TransportType]) -> None:
+        """
+        v193.1: Fast-reconnect loop for initially failed transports.
+
+        During startup, servers like WebSocket may not be ready yet. This loop
+        retries every 2 seconds for the first 30 seconds to quickly reconnect
+        once the server becomes available.
+
+        This is especially important for Trinity cross-repo communication where
+        WebSocket provides faster IPC than FileTransport fallback.
+
+        Args:
+            failed_transports: List of transport types that failed initial connection
+        """
+        FAST_RECONNECT_INTERVAL = 2.0  # Retry every 2 seconds
+        FAST_RECONNECT_WINDOW = 30.0   # Fast-reconnect for first 30 seconds
+
+        logger.info(f"[MultiTransport] Fast-reconnect started for: {[t.value for t in failed_transports]}")
+
+        try:
+            while self._connected:
+                # Check if we're still in the fast-reconnect window
+                elapsed = time.time() - self._startup_time
+                if elapsed > FAST_RECONNECT_WINDOW:
+                    logger.debug("[MultiTransport] Fast-reconnect window expired, switching to normal health checks")
+                    break
+
+                # Try to reconnect failed transports
+                all_recovered = True
+                for transport_type in failed_transports[:]:  # Copy list to allow modification
+                    transport = self.transports[transport_type]
+                    if transport.status == TransportStatus.FAILED:
+                        all_recovered = False
+                        if await transport.connect():
+                            # Successfully reconnected!
+                            logger.info(f"[MultiTransport] ✓ Fast-reconnected: {transport_type.value}")
+                            failed_transports.remove(transport_type)
+
+                            # Add message forwarding
+                            transport.add_handler(self._forward_message)
+
+                            # Check if this should be primary (Redis > WebSocket > File)
+                            if self._primary is None or transport_type.value < self._primary.value:
+                                old_primary = self._primary
+                                self._primary = transport_type
+                                logger.info(
+                                    f"[MultiTransport] Promoted to primary: {transport_type.value}"
+                                    f" (was: {old_primary.value if old_primary else 'none'})"
+                                )
+
+                # If all recovered, we're done
+                if all_recovered or not failed_transports:
+                    logger.info("[MultiTransport] Fast-reconnect complete: all transports recovered")
+                    break
+
+                # Wait before next retry
+                await asyncio.sleep(FAST_RECONNECT_INTERVAL)
+
+        except asyncio.CancelledError:
+            logger.debug("[MultiTransport] Fast-reconnect cancelled")
+        except Exception as e:
+            logger.error(f"[MultiTransport] Fast-reconnect error: {e}")
 
     def get_status(self) -> Dict[str, Any]:
         """Get transport status."""
