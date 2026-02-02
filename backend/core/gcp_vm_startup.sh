@@ -162,6 +162,8 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
                 model_loaded = state.get("model_loaded", False)
                 ready = state.get("ready_for_inference", False)
                 error = state.get("error")
+                # v197.1: Use ETA from progress file if available (from heartbeat)
+                file_eta = state.get("eta_seconds")
             else:
                 # Default: Phase 0 (ultra-stub just started)
                 phase = 0
@@ -171,9 +173,13 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
                 model_loaded = False
                 ready = False
                 error = None
+                file_eta = None
             
-            # Calculate ETA
-            eta_seconds = calculate_eta(phase, phase_progress, elapsed)
+            # v197.1: Use file ETA if available, otherwise calculate
+            if file_eta is not None and file_eta > 0:
+                eta_seconds = file_eta
+            else:
+                eta_seconds = calculate_eta(phase, phase_progress, elapsed)
             
             # v197.0 APARS response format
             response = {
@@ -364,7 +370,7 @@ def calculate_eta(phase, phase_progress):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint with APARS v197.0 progress reporting."""
+    """Health check endpoint with APARS v197.1 progress reporting."""
     elapsed = int(time.time() - start_time)
     state = read_progress()
     
@@ -376,6 +382,8 @@ async def health():
         model_loaded = state.get("model_loaded", False)
         ready = state.get("ready_for_inference", False)
         error = state.get("error")
+        # v197.1: Use ETA from heartbeat if available
+        file_eta = state.get("eta_seconds")
     else:
         phase = 1
         phase_progress = 50
@@ -384,8 +392,13 @@ async def health():
         model_loaded = False
         ready = False
         error = None
+        file_eta = None
     
-    eta_seconds = calculate_eta(phase, phase_progress)
+    # v197.1: Use file ETA if available (from heartbeat), otherwise calculate
+    if file_eta is not None and file_eta > 0:
+        eta_seconds = file_eta
+    else:
+        eta_seconds = calculate_eta(phase, phase_progress)
     
     return JSONResponse({
         # Core status fields (backward compatibility)
@@ -529,30 +542,116 @@ update_progress 2 100 30 "system_deps_complete"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PHASE 3: ML Dependencies (Progress 30-60%) - This is the longest phase!
+# v197.1: Added heartbeat to prevent timeout during long pip installs
 # ═══════════════════════════════════════════════════════════════════════════
 update_progress 3 0 30 "ml_deps_starting"
 
-echo "📦 Installing ML dependencies (this may take 2-3 minutes)..."
+echo "📦 Installing ML dependencies (this may take 5-8 minutes)..."
 
-update_progress 3 10 33 "pip_installing_torch"
-pip3 install torch 2>&1 | tail -3 || true
+# v197.1: Start a HEARTBEAT that keeps updating progress during long installs
+# This prevents the supervisor from timing out while pip is working
+start_heartbeat() {
+    local phase=$1
+    local start_progress=$2
+    local end_progress=$3
+    local checkpoint=$4
+    local estimated_duration=$5  # in seconds
+    
+    local progress=$start_progress
+    local elapsed=0
+    local increment=$(( (end_progress - start_progress) * 100 / estimated_duration ))
+    
+    while true; do
+        sleep 10  # Update every 10 seconds
+        elapsed=$((elapsed + 10))
+        
+        # Calculate progress (linear interpolation)
+        progress=$(( start_progress + (end_progress - start_progress) * elapsed / estimated_duration ))
+        if [ $progress -gt $end_progress ]; then
+            progress=$end_progress
+        fi
+        
+        # Calculate remaining ETA
+        local remaining=$(( estimated_duration - elapsed ))
+        if [ $remaining -lt 0 ]; then
+            remaining=30  # Always report at least 30s remaining to prevent timeout
+        fi
+        
+        # Calculate total progress (phase 3 is 30-60% of total)
+        local total_progress=$(( 30 + progress * 30 / 100 ))
+        
+        # Update progress file with current state
+        cat > /tmp/jarvis_progress.json << HEARTBEAT_EOF
+{
+    "phase": ${phase},
+    "phase_progress": ${progress},
+    "total_progress": ${total_progress},
+    "checkpoint": "${checkpoint}_heartbeat",
+    "model_loaded": false,
+    "ready_for_inference": false,
+    "eta_seconds": ${remaining},
+    "error": null,
+    "updated_at": $(date +%s)
+}
+HEARTBEAT_EOF
+        echo "[HEARTBEAT] Phase $phase: $progress% (total: $total_progress%, ETA: ${remaining}s)"
+    done
+}
 
+# Stop heartbeat when done
+stop_heartbeat() {
+    if [ -n "$HEARTBEAT_PID" ]; then
+        kill $HEARTBEAT_PID 2>/dev/null || true
+        wait $HEARTBEAT_PID 2>/dev/null || true
+    fi
+}
+
+# TORCH installation (longest: ~3-5 minutes)
+echo "📦 [1/6] Installing PyTorch (this takes 3-5 minutes)..."
+update_progress 3 5 32 "pip_installing_torch"
+start_heartbeat 3 5 35 "pip_torch" 300 &  # 5 min estimated
+HEARTBEAT_PID=$!
+pip3 install torch 2>&1 | tail -5 || true
+stop_heartbeat
+update_progress 3 35 40 "pip_torch_complete"
+
+# TRANSFORMERS installation (~1-2 minutes)
+echo "📦 [2/6] Installing Transformers..."
 update_progress 3 40 42 "pip_installing_transformers"
+start_heartbeat 3 40 55 "pip_transformers" 120 &  # 2 min estimated
+HEARTBEAT_PID=$!
 pip3 install transformers accelerate 2>&1 | tail -3 || true
+stop_heartbeat
+update_progress 3 55 48 "pip_transformers_complete"
 
-update_progress 3 60 48 "pip_installing_nlp_utils"
+# NLP utilities (~30 seconds)
+echo "📦 [3/6] Installing NLP utilities..."
+update_progress 3 58 49 "pip_installing_nlp_utils"
 pip3 install sentencepiece protobuf 2>&1 | tail -3 || true
+update_progress 3 65 51 "pip_nlp_complete"
 
-update_progress 3 75 52 "pip_installing_async"
+# Async libraries (~20 seconds)
+echo "📦 [4/6] Installing async libraries..."
+update_progress 3 68 52 "pip_installing_async"
 pip3 install aiohttp pydantic python-dotenv 2>&1 | tail -3 || true
+update_progress 3 75 54 "pip_async_complete"
 
-update_progress 3 85 55 "pip_installing_gcp"
+# GCP libraries (~30 seconds)
+echo "📦 [5/6] Installing GCP libraries..."
+update_progress 3 78 55 "pip_installing_gcp"
 pip3 install google-cloud-storage 2>&1 | tail -3 || true
+update_progress 3 85 57 "pip_gcp_complete"
 
-update_progress 3 95 58 "pip_installing_llama"
-pip3 install llama-cpp-python 2>&1 | tail -3 || true
-
+# LLAMA-CPP (~1-2 minutes, includes compilation)
+echo "📦 [6/6] Installing llama-cpp-python (includes compilation)..."
+update_progress 3 88 58 "pip_installing_llama"
+start_heartbeat 3 88 98 "pip_llama" 120 &  # 2 min estimated
+HEARTBEAT_PID=$!
+pip3 install llama-cpp-python 2>&1 | tail -5 || true
+stop_heartbeat
 update_progress 3 100 60 "ml_deps_complete"
+
+echo "✅ ML dependencies installed!"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PHASE 4: Repository Clone (Progress 60-80%)

@@ -2353,7 +2353,13 @@ class AdaptiveProgressAwareWaiter:
             self.current_deadline = self.start_time + min(avg_time * 1.2, self.max_extension_time)
     
     def record_progress(self, snapshot: APARSProgressSnapshot) -> None:
-        """Record a progress snapshot and update deadline if appropriate."""
+        """
+        Record a progress snapshot and update deadline if appropriate.
+        
+        v197.1 FIX: ALWAYS check ETA-based extension, not just when progress delta is high.
+        Long operations like `pip install torch` take 5+ minutes with NO intermediate updates.
+        The VM's ETA is the authoritative source for how long it needs.
+        """
         self.progress_history.append(snapshot)
         
         # Calculate progress delta
@@ -2374,53 +2380,89 @@ class AdaptiveProgressAwareWaiter:
             f"remaining={remaining:.0f}s"
         )
         
-        # Check if we should extend the deadline
+        # v197.1 CRITICAL FIX: ALWAYS check ETA-based extension!
+        # The VM's ETA is authoritative - if it says it needs more time, grant it.
+        # This fixes the bug where pip install torch takes 5+ min with no progress delta.
+        self._extend_if_eta_exceeds_remaining(snapshot, remaining)
+        
+        # Check for progress-based extension (additional extension for making progress)
         if progress_delta >= self.progress_extension_threshold:
-            self._maybe_extend_deadline(snapshot, progress_delta)
+            self._extend_for_progress(snapshot, progress_delta)
             self.stall_start_time = None  # Reset stall detection
         else:
-            # Check for stall
-            self._check_for_stall(snapshot)
+            # Check for stall (only if no progress AND ETA not reasonable)
+            self._check_for_stall(snapshot, remaining)
     
-    def _maybe_extend_deadline(self, snapshot: APARSProgressSnapshot, delta: float) -> None:
-        """Extend deadline based on progress and ETA."""
+    def _extend_if_eta_exceeds_remaining(self, snapshot: APARSProgressSnapshot, remaining: float) -> None:
+        """
+        v197.1: ALWAYS extend if VM's ETA exceeds our remaining time.
+        
+        This is the KEY fix: If the VM is responding and says it needs 211s,
+        but we only have 6s remaining, we MUST extend - regardless of progress delta.
+        """
+        now = time.time()
+        elapsed = now - self.start_time
+        vm_eta = snapshot.eta_seconds
+        
+        # Don't extend past hard cap
+        max_remaining = self.max_extension_time - elapsed
+        if max_remaining <= 0:
+            return
+        
+        # v197.1: If VM says it needs more time than we have, EXTEND!
+        if vm_eta > remaining and remaining < 120:  # Only auto-extend when < 2min remaining
+            # Grant extension based on VM's ETA, with buffer
+            extension = min(vm_eta - remaining + 60, max_remaining)  # +60s buffer for safety
+            if extension > 30:  # Only extend if meaningful (>30s)
+                self.current_deadline += extension
+                self.extensions_granted += 1
+                logger.info(
+                    f"[APARS v197.1] ⏰ ETA-BASED EXTENSION: +{extension:.0f}s "
+                    f"(VM ETA={vm_eta}s > remaining={remaining:.0f}s, "
+                    f"extensions={self.extensions_granted})"
+                )
+                self.stall_start_time = None  # VM is working, reset stall detection
+    
+    def _extend_for_progress(self, snapshot: APARSProgressSnapshot, delta: float) -> None:
+        """
+        v197.1: Extend deadline as a reward for making progress.
+        This is IN ADDITION to ETA-based extension.
+        """
         now = time.time()
         elapsed = now - self.start_time
         remaining = self.current_deadline - now
         
         # Don't extend past hard cap
         max_remaining = self.max_extension_time - elapsed
-        if remaining >= max_remaining:
+        if remaining >= max_remaining or max_remaining <= 0:
             return
         
-        # Calculate extension based on VM's ETA
-        vm_eta = snapshot.eta_seconds
-        if vm_eta > remaining:
-            # VM says it needs more time - grant extension
-            extension = min(vm_eta - remaining + 30, max_remaining - remaining)  # +30s buffer
-            if extension > 0:
-                self.current_deadline += extension
+        # Grant bonus extension for making progress
+        if snapshot.total_progress < 90 and delta >= self.progress_extension_threshold:
+            # Bonus: 30s for every 5% progress made
+            bonus = min(30.0 * (delta / 5.0), 60.0, max_remaining - remaining)
+            if bonus > 10:
+                self.current_deadline += bonus
                 self.extensions_granted += 1
                 logger.info(
-                    f"[APARS] ⏰ Extending deadline by {extension:.0f}s "
-                    f"(VM ETA={vm_eta}s, extensions={self.extensions_granted})"
-                )
-        
-        # Also extend if making good progress but ETA is unknown
-        elif snapshot.total_progress < 90 and remaining < 60:
-            # Less than 60s remaining but not near completion - extend
-            extension = min(60.0, max_remaining - remaining)
-            if extension > 0:
-                self.current_deadline += extension
-                self.extensions_granted += 1
-                logger.info(
-                    f"[APARS] ⏰ Extending deadline by {extension:.0f}s "
-                    f"(progress={snapshot.total_progress:.1f}%, making progress)"
+                    f"[APARS] ⏰ Progress bonus: +{bonus:.0f}s "
+                    f"(delta=+{delta:.1f}%, progress={snapshot.total_progress:.1f}%)"
                 )
     
-    def _check_for_stall(self, snapshot: APARSProgressSnapshot) -> None:
-        """Check if progress has stalled."""
+    def _check_for_stall(self, snapshot: APARSProgressSnapshot, remaining: float) -> None:
+        """
+        v197.1: Check if progress has stalled.
+        
+        IMPORTANT: Don't consider it stalled if VM's ETA is reasonable!
+        Long pip installs have no progress delta but are NOT stalled.
+        """
         now = time.time()
+        
+        # v197.1: If VM says ETA is reasonable and we have time, it's not stalled
+        if snapshot.eta_seconds > 0 and remaining > snapshot.eta_seconds * 0.5:
+            # VM says it needs time and we have enough - not stalled
+            self.stall_start_time = None
+            return
         
         if self.stall_start_time is None:
             self.stall_start_time = now
@@ -2428,17 +2470,24 @@ class AdaptiveProgressAwareWaiter:
         
         stall_duration = now - self.stall_start_time
         if stall_duration >= self.stall_detection_window:
-            # Progress has stalled - calculate required rate
+            # Check if VM is REALLY stalled (ETA not decreasing, no response, etc.)
             elapsed_minutes = max(1, (now - self.start_time) / 60)
             actual_rate = snapshot.total_progress / elapsed_minutes
             
-            if actual_rate < self.min_progress_rate:
+            # v197.1: Only warn if rate is very low AND VM's ETA is unreasonable
+            if actual_rate < self.min_progress_rate and snapshot.eta_seconds < 30:
                 logger.warning(
-                    f"[APARS] ⚠️ Progress stall detected: "
+                    f"[APARS] ⚠️ Possible stall detected: "
                     f"{snapshot.total_progress:.1f}% in {elapsed_minutes:.1f}min "
-                    f"(rate={actual_rate:.2f}%/min, min={self.min_progress_rate}%/min)"
+                    f"(rate={actual_rate:.2f}%/min, VM ETA={snapshot.eta_seconds}s)"
                 )
-                # Don't extend deadline when stalled
+            elif actual_rate < self.min_progress_rate:
+                # Low rate but VM says it needs time - trust VM, just log debug
+                logger.debug(
+                    f"[APARS] Progress slow but VM active: "
+                    f"{snapshot.total_progress:.1f}% in {elapsed_minutes:.1f}min, "
+                    f"VM ETA={snapshot.eta_seconds}s"
+                )
     
     def should_continue(self) -> Tuple[bool, str]:
         """

@@ -50079,14 +50079,58 @@ class TrinityIntegrator:
 
                 # Check if process died (fail fast)
                 if component.process and component.process.returncode is not None:
+                    exit_code = component.process.returncode
                     self.logger.warning(
-                        f"[Trinity] {component.name} process exited (code: {component.process.returncode}) "
+                        f"[Trinity] {component.name} process exited (code: {exit_code}) "
                         f"during health wait"
                     )
+                    
+                    # v197.1: Capture and log stderr/stdout for crash diagnosis
+                    try:
+                        stderr_output = ""
+                        stdout_output = ""
+                        if component.process.stderr:
+                            stderr_bytes = await asyncio.wait_for(
+                                component.process.stderr.read(4096),
+                                timeout=2.0
+                            )
+                            stderr_output = stderr_bytes.decode('utf-8', errors='replace').strip()
+                        if component.process.stdout:
+                            stdout_bytes = await asyncio.wait_for(
+                                component.process.stdout.read(4096),
+                                timeout=2.0
+                            )
+                            stdout_output = stdout_bytes.decode('utf-8', errors='replace').strip()
+                        
+                        if stderr_output:
+                            self.logger.error(f"[Trinity]   STDERR: {stderr_output[:500]}")
+                        if stdout_output:
+                            self.logger.info(f"[Trinity]   STDOUT: {stdout_output[:500]}")
+                        
+                        # v197.1: Detect common crash reasons
+                        all_output = (stderr_output + stdout_output).lower()
+                        if "killed" in all_output or exit_code == -9 or exit_code == 137:
+                            self.logger.error(
+                                f"[Trinity]   🔴 LIKELY OOM KILL: {component.name} was killed "
+                                f"(exit code {exit_code}). Consider enabling GCP offload."
+                            )
+                        elif "modulenotfounderror" in all_output or "importerror" in all_output:
+                            self.logger.error(
+                                f"[Trinity]   🔴 MISSING DEPENDENCY: {component.name} has import errors. "
+                                f"Check that all requirements are installed."
+                            )
+                        elif "address already in use" in all_output:
+                            self.logger.error(
+                                f"[Trinity]   🔴 PORT CONFLICT: Port {component.port} already in use. "
+                                f"Another process may be binding to this port."
+                            )
+                    except Exception as diag_err:
+                        self.logger.debug(f"[Trinity] Could not capture process output: {diag_err}")
+                    
                     if self._progress_callback:
                         await self._safe_callback(
                             component_key, "failed",
-                            f"{component.name} process died during startup",
+                            f"{component.name} process died during startup (exit code {exit_code})",
                             attempt, elapsed
                         )
                     return False
