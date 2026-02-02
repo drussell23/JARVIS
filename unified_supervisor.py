@@ -54087,6 +54087,32 @@ class JarvisSystemKernel:
 
             startup_duration = time.time() - self._started_at
 
+            # v197.3: Stop the startup progress heartbeat
+            self._current_startup_phase = "complete"
+            self._current_startup_progress = 100
+            try:
+                heartbeat_stop_event.set()
+                if heartbeat_task and not heartbeat_task.done():
+                    heartbeat_task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(heartbeat_task), timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+            except Exception:
+                pass
+
+            # Send final 100% progress to loading page
+            await self._broadcast_startup_progress(
+                stage="complete",
+                message="JARVIS startup complete!",
+                progress=100,
+                metadata={
+                    "icon": "check",
+                    "phase": "complete",
+                    "startup_duration": startup_duration,
+                }
+            )
+
             # v197.1: Stop the live progress dashboard before completion banner
             try:
                 dashboard = get_live_dashboard()
