@@ -5613,8 +5613,8 @@ class ResourceChecker:
         req = requirements.get(component, requirements["jarvis_body"])
 
         try:
-            # Memory check
-            memory = psutil.virtual_memory()
+            # Memory check (wrapped in to_thread to avoid blocking)
+            memory = await asyncio.to_thread(psutil.virtual_memory)
             available_gb = memory.available / (1024 ** 3)
 
             if available_gb < req["min_memory_gb"]:
@@ -5638,8 +5638,8 @@ class ResourceChecker:
                             f"⚡ Proceeding with cloud offloading despite low memory"
                         )
 
-            # CPU check
-            cpu_percent = psutil.cpu_percent(interval=0.5)
+            # CPU check (wrapped in to_thread - interval=0.5 blocks for 500ms)
+            cpu_percent = await asyncio.to_thread(psutil.cpu_percent, interval=0.5)
 
             if cpu_percent > req["max_cpu_percent"]:
                 warnings.append(
@@ -5661,8 +5661,8 @@ class ResourceChecker:
                             f"⚡ Proceeding with cloud offloading despite saturated CPU"
                         )
 
-            # Disk check
-            disk = psutil.disk_usage("/")
+            # Disk check (wrapped in to_thread to avoid blocking)
+            disk = await asyncio.to_thread(psutil.disk_usage, "/")
             available_disk_gb = disk.free / (1024 ** 3)
 
             if available_disk_gb < req["min_disk_gb"]:
@@ -5956,9 +5956,10 @@ class ResourceAwareLaunchSequencer:
     async def get_current_resource_state(self) -> Dict[str, Any]:
         """Get current resource state with detailed metrics."""
         try:
-            memory = psutil.virtual_memory()
-            cpu_percent = psutil.cpu_percent(interval=0.5)
-            disk = psutil.disk_usage("/")
+            # Wrap blocking psutil calls in to_thread to avoid blocking event loop
+            memory = await asyncio.to_thread(psutil.virtual_memory)
+            cpu_percent = await asyncio.to_thread(psutil.cpu_percent, interval=0.5)
+            disk = await asyncio.to_thread(psutil.disk_usage, "/")
 
             # Calculate effective available resources
             available_memory_gb = memory.available / (1024 ** 3)
