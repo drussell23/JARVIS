@@ -2554,30 +2554,31 @@ def _register_semaphore_cleanup_atexit():
 
     def _final_semaphore_cleanup():
         try:
-            # v201.4: Skip full shutdown initiation in CLI-only mode
-            # CLI commands don't need coordinated shutdown - they're just queries
-            if not is_cli_only_mode():
-                # Mark global shutdown to enable warning suppression
-                try:
-                    initiate_global_shutdown("atexit_semaphore_cleanup")
-                except Exception:
-                    pass
+            # v201.4: Skip ALL cleanup in CLI-only mode
+            # CLI commands don't create semaphores or process pools that need cleanup
+            if is_cli_only_mode():
+                return
+
+            # Mark global shutdown to enable warning suppression
+            try:
+                initiate_global_shutdown("atexit_semaphore_cleanup")
+            except Exception:
+                pass
 
             result = cleanup_all_semaphores_sync()
 
-            # Log only if we actually cleaned something AND not in CLI mode
-            if not is_cli_only_mode():
-                cleaned = (
-                    result.get("executors_cleaned", 0) +
-                    result.get("workers_terminated", 0) +
-                    result.get("mp_children_terminated", 0)
+            # Log only if we actually cleaned something
+            cleaned = (
+                result.get("executors_cleaned", 0) +
+                result.get("workers_terminated", 0) +
+                result.get("mp_children_terminated", 0)
+            )
+            if cleaned > 0:
+                logger.debug(
+                    f"[v128.0] Final cleanup: {result.get('executors_cleaned', 0)} executors, "
+                    f"{result.get('workers_terminated', 0)} workers, "
+                    f"{result.get('mp_children_terminated', 0)} children"
                 )
-                if cleaned > 0:
-                    logger.debug(
-                        f"[v128.0] Final cleanup: {result.get('executors_cleaned', 0)} executors, "
-                        f"{result.get('workers_terminated', 0)} workers, "
-                        f"{result.get('mp_children_terminated', 0)} children"
-                    )
         except Exception:
             pass  # Best effort at exit
 

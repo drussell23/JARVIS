@@ -1038,6 +1038,7 @@ def _atexit_handler() -> None:
 
     v95.17: Enhanced with multiprocessing cleanup as final safety net.
     v109.4: Marks atexit phase to prevent async operations during interpreter shutdown.
+    v201.4: Respects CLI-only mode to suppress output for simple commands.
 
     This is the last line of defense for cleanup.
 
@@ -1049,6 +1050,14 @@ def _atexit_handler() -> None:
     """
     global _shutdown_phase
     _shutdown_phase = 2  # v109.4: Mark atexit phase
+
+    # v201.4: Skip verbose logging in CLI-only mode (--status, --monitor-prime, etc.)
+    try:
+        from backend.core.resilience.graceful_shutdown import is_cli_only_mode
+        if is_cli_only_mode():
+            return  # Skip cleanup for CLI-only commands - they don't start resources
+    except ImportError:
+        pass  # Fall through to normal cleanup
 
     logger.info("🔚 atexit handler: Final cleanup check...")
 

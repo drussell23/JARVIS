@@ -318,6 +318,14 @@ class ShutdownDiagnostics:
 
     def _save_on_exit(self) -> None:
         """Save final diagnostics state on exit."""
+        # v201.4: Skip verbose logging in CLI-only mode
+        try:
+            from backend.core.resilience.graceful_shutdown import is_cli_only_mode
+            if is_cli_only_mode():
+                return  # No diagnostics for CLI-only commands
+        except ImportError:
+            pass  # Fall through to normal behavior
+
         try:
             exit_time = time.time()
 
