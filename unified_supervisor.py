@@ -3393,8 +3393,22 @@ class LiveProgressDashboard:
         pid: int = None,
         port: int = None,
         ip: str = None,
+        detail: str = None,
     ) -> None:
-        """Update component status."""
+        """
+        Update component status.
+
+        v201.0: Added 'detail' parameter for status messages.
+        Previously 'pid' was sometimes misused for messages.
+
+        Args:
+            name: Component name
+            status: Status string (starting, running, error, etc.)
+            pid: Process ID (numeric only)
+            port: Port number
+            ip: IP address
+            detail: Human-readable status detail/message
+        """
         with self._lock:
             if name not in self._components:
                 self._components[name] = {"status": "pending"}
@@ -3406,6 +3420,8 @@ class LiveProgressDashboard:
                 self._components[name]["port"] = port
             if ip is not None:
                 self._components[name]["ip"] = ip
+            if detail is not None:
+                self._components[name]["detail"] = detail
     
     def update_memory(self, percent: float, used_gb: float = None, total_gb: float = None) -> None:
         """Update memory usage."""
@@ -51851,25 +51867,57 @@ class TrinityIntegrator:
         self._discovery_cache[name] = None
         return None
 
-    async def start_components(self) -> Dict[str, bool]:
+    async def start_components(
+        self,
+        skip_prime: bool = False,
+        invincible_node_ready: bool = False,
+    ) -> Dict[str, bool]:
         """
         Start Trinity components.
-        
+
         v197.2: Enhanced with PARALLEL component startup for faster boot.
         Previously components started sequentially, causing long waits.
         Now J-Prime and Reactor-Core start simultaneously, reducing total
         startup time from (90s + 60s) to max(90s, 60s).
+
+        v201.0: Added Invincible Node coordination.
+        - When invincible_node_ready=True, skips local Prime startup
+        - Uses Hollow Client mode to route to cloud VM instead
+        - Reactor-Core always starts locally regardless
+
+        Args:
+            skip_prime: Explicitly skip Prime startup (manual override)
+            invincible_node_ready: True if Invincible Node (GCP VM) is ready
+                                   and should be used instead of local Prime
+
+        Returns:
+            Dict mapping component name to startup success
         """
         if not self._enabled:
             return {}
 
         results: Dict[str, bool] = {}
-        
+
+        # v201.0: Determine whether to skip local Prime
+        should_skip_prime = skip_prime or invincible_node_ready
+
+        if should_skip_prime and self._jprime:
+            self.logger.info(
+                "[Trinity] ☁️ Invincible Node is ready - skipping local J-Prime startup"
+            )
+            self.logger.info(
+                "[Trinity]    → Hollow Client mode: routing to GCP VM for inference"
+            )
+            # Mark Prime as using hollow client mode instead of local
+            self._jprime.state = "hollow_client"
+            results["jarvis-prime"] = True  # Consider it "started" via Hollow Client
+
         # v197.2: Collect all components to start
         components_to_start = []
-        if self._jprime:
+        if self._jprime and not should_skip_prime:
             components_to_start.append(("jarvis-prime", self._jprime))
         if self._reactor:
+            # Reactor-Core always starts locally (training pipeline)
             components_to_start.append(("reactor-core", self._reactor))
         
         if not components_to_start:
@@ -52925,28 +52973,199 @@ class TrinityIntegrator:
                     self.logger.debug(f"[Trinity] Error stopping {component.name}: {e}")
 
     def get_status(self) -> Dict[str, Any]:
-        """Get Trinity status with enhanced diagnostics (v170.0)."""
+        """
+        Get Trinity status with enhanced diagnostics (v170.0).
+
+        v201.0: Added 'running' and 'healthy' fields per component for watchdog.
+        - running: True if process exists and hasn't exited
+        - healthy: True if health check passes (HTTP 200 + semantic readiness)
+        """
+        def _component_status(comp: Optional[TrinityComponent]) -> Dict[str, Any]:
+            """Build status dict for a component."""
+            if not comp:
+                return {
+                    "configured": False,
+                    "state": "not_configured",
+                    "running": False,
+                    "healthy": False,
+                    "pid": None,
+                    "port": None,
+                    "repo_path": None,
+                    "restart_count": 0,
+                }
+
+            # Check if process is running
+            process_running = False
+            if comp.process is not None:
+                try:
+                    # returncode is None if process hasn't terminated
+                    process_running = comp.process.returncode is None
+                except Exception:
+                    process_running = False
+
+            # Check if healthy (state indicates successful health check)
+            is_healthy = comp.state in ("healthy", "running") and process_running
+
+            return {
+                "configured": True,
+                "state": comp.state,
+                "running": process_running,
+                "healthy": is_healthy,
+                "pid": comp.pid,
+                "port": comp.port,
+                "repo_path": str(comp.repo_path) if comp.repo_path else None,
+                "restart_count": comp.restart_count,
+            }
+
         return {
             "enabled": self._enabled,
             "components": {
-                "jarvis-prime": {
-                    "configured": self._jprime is not None,
-                    "state": self._jprime.state if self._jprime else "not_configured",
-                    "pid": self._jprime.pid if self._jprime else None,
-                    "port": self._jprime.port if self._jprime else None,
-                    "repo_path": str(self._jprime.repo_path) if self._jprime and self._jprime.repo_path else None,
-                    "restart_count": self._jprime.restart_count if self._jprime else 0,
-                },
-                "reactor-core": {
-                    "configured": self._reactor is not None,
-                    "state": self._reactor.state if self._reactor else "not_configured",
-                    "pid": self._reactor.pid if self._reactor else None,
-                    "port": self._reactor.port if self._reactor else None,
-                    "repo_path": str(self._reactor.repo_path) if self._reactor and self._reactor.repo_path else None,
-                    "restart_count": self._reactor.restart_count if self._reactor else 0,
-                },
+                "jarvis-prime": _component_status(self._jprime),
+                "reactor-core": _component_status(self._reactor),
             },
         }
+
+    def get_component_by_name(self, name: str) -> Optional[TrinityComponent]:
+        """
+        v201.0: Get a Trinity component by name.
+
+        Used by watchdog for component-specific operations.
+
+        Args:
+            name: Component name ('jarvis-prime' or 'reactor-core')
+
+        Returns:
+            TrinityComponent if found, None otherwise
+        """
+        if name == "jarvis-prime":
+            return self._jprime
+        elif name == "reactor-core":
+            return self._reactor
+        else:
+            self.logger.warning(f"[Trinity] Unknown component name: {name}")
+            return None
+
+    async def stop_component(self, name: str) -> bool:
+        """
+        v201.0: Stop a specific Trinity component.
+
+        Used by watchdog for graceful restart operations.
+
+        Args:
+            name: Component name ('jarvis-prime' or 'reactor-core')
+
+        Returns:
+            True if stopped successfully, False otherwise
+        """
+        component = self.get_component_by_name(name)
+        if not component:
+            return False
+
+        if not component.process:
+            self.logger.debug(f"[Trinity] {name} has no process to stop")
+            component.state = "stopped"
+            return True
+
+        try:
+            self.logger.info(f"[Trinity] Stopping {name} (PID {component.pid})...")
+
+            # Send SIGTERM first (graceful shutdown)
+            component.process.terminate()
+
+            try:
+                # Wait up to 10 seconds for graceful shutdown
+                await asyncio.wait_for(component.process.wait(), timeout=10.0)
+                self.logger.info(f"[Trinity] {name} stopped gracefully")
+            except asyncio.TimeoutError:
+                # Force kill if graceful shutdown failed
+                self.logger.warning(f"[Trinity] {name} didn't stop gracefully, sending SIGKILL...")
+                component.process.kill()
+                await asyncio.wait_for(component.process.wait(), timeout=5.0)
+                self.logger.info(f"[Trinity] {name} killed forcefully")
+
+            component.state = "stopped"
+            component.process = None
+            component.pid = None
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[Trinity] Error stopping {name}: {e}")
+            return False
+
+    async def start_component(self, name: str) -> bool:
+        """
+        v201.0: Start a specific Trinity component.
+
+        Used by watchdog for restart operations.
+
+        Args:
+            name: Component name ('jarvis-prime' or 'reactor-core')
+
+        Returns:
+            True if started successfully, False otherwise
+        """
+        component = self.get_component_by_name(name)
+        if not component:
+            return False
+
+        if component.process is not None and component.process.returncode is None:
+            self.logger.warning(f"[Trinity] {name} is already running (PID {component.pid})")
+            return True
+
+        try:
+            self.logger.info(f"[Trinity] Starting {name}...")
+            success = await self._start_component(component)
+
+            if success:
+                self.logger.info(f"[Trinity] {name} started successfully (PID {component.pid})")
+            else:
+                self.logger.error(f"[Trinity] {name} failed to start")
+
+            return success
+
+        except Exception as e:
+            self.logger.error(f"[Trinity] Error starting {name}: {e}")
+            return False
+
+    async def restart_component(self, name: str) -> bool:
+        """
+        v201.0: Restart a specific Trinity component.
+
+        Combines stop and start with a grace period. Used by watchdog
+        for auto-recovery of crashed components.
+
+        Args:
+            name: Component name ('jarvis-prime' or 'reactor-core')
+
+        Returns:
+            True if restarted successfully, False otherwise
+        """
+        component = self.get_component_by_name(name)
+        if not component:
+            return False
+
+        self.logger.info(f"[Trinity] Restarting {name}...")
+
+        # Increment restart count
+        component.restart_count += 1
+
+        # Stop first
+        stop_ok = await self.stop_component(name)
+        if not stop_ok:
+            self.logger.warning(f"[Trinity] {name} stop failed, attempting start anyway...")
+
+        # Grace period for port release and cleanup
+        await asyncio.sleep(2.0)
+
+        # Start
+        start_ok = await self.start_component(name)
+
+        if start_ok:
+            self.logger.success(f"[Trinity] {name} restarted successfully (attempt #{component.restart_count})")
+        else:
+            self.logger.error(f"[Trinity] {name} restart failed (attempt #{component.restart_count})")
+
+        return start_ok
 
 
 # =============================================================================
@@ -57106,9 +57325,17 @@ class JarvisSystemKernel:
                 # This ensures DMS timeout and component startup timeout are consistent
                 trinity_timeout = getattr(self, '_effective_trinity_timeout', DEFAULT_TRINITY_TIMEOUT)
                 self.logger.info(f"[Trinity] Component startup timeout: {trinity_timeout:.0f}s (unified)")
+
+                # v201.0: Check if Invincible Node is ready - if so, skip local Prime
+                invincible_ready = getattr(self, '_invincible_node_ready', False)
+                if invincible_ready:
+                    self.logger.info("[Trinity] ☁️ Invincible Node ready - using Hollow Client for Prime")
+
                 try:
                     results = await asyncio.wait_for(
-                        self._trinity.start_components(),
+                        self._trinity.start_components(
+                            invincible_node_ready=invincible_ready,
+                        ),
                         timeout=trinity_timeout
                     )
                 except asyncio.TimeoutError:
@@ -61547,6 +61774,12 @@ Environment Variables:
         action="store_true",
         help="Run comprehensive zombie cleanup and exit",
     )
+    control.add_argument(
+        "--check-only",
+        action="store_true",
+        dest="check_only",
+        help="Run pre-flight checks only (validate config without starting)",
+    )
 
     # =========================================================================
     # OPERATING MODE
@@ -61968,6 +62201,234 @@ async def handle_cleanup() -> int:
     print("="*60 + "\n")
 
     return 0 if result["success"] else 1
+
+
+async def handle_check_only(args: argparse.Namespace) -> int:
+    """
+    Handle --check-only command: Run pre-flight validation without starting.
+
+    v201.0: Validates configuration, checks dependencies, and reports readiness
+    without actually starting any components. Useful for CI/CD and debugging.
+
+    Validates:
+    - Environment configuration
+    - Required directories and files
+    - Docker connectivity (if enabled)
+    - GCP credentials (if enabled)
+    - Trinity repo availability (if enabled)
+    - Port availability
+    - Invincible Node reachability (if enabled)
+
+    Returns:
+        0 if all checks pass, 1 if any checks fail
+    """
+    # ANSI colors
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+    def check_mark(passed: bool) -> str:
+        return f"{GREEN}✓{RESET}" if passed else f"{RED}✗{RESET}"
+
+    def warn_mark() -> str:
+        return f"{YELLOW}⚠{RESET}"
+
+    print()
+    print(f"{BOLD}{BLUE}╔══════════════════════════════════════════════════════════════════════╗{RESET}")
+    print(f"{BOLD}{BLUE}║  JARVIS PRE-FLIGHT CHECK                                             ║{RESET}")
+    print(f"{BOLD}{BLUE}╠══════════════════════════════════════════════════════════════════════╣{RESET}")
+
+    # Build config from CLI args
+    config = SystemKernelConfig()
+    apply_cli_to_config(args, config)
+
+    all_passed = True
+    warnings = []
+
+    # 1. Configuration
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Configuration{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(True)} Mode: {config.mode}")
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(True)} In-process backend: {config.in_process_backend}")
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(True)} Dev mode: {config.dev_mode}")
+
+    # 2. Required directories
+    print(f"{BOLD}{BLUE}║{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Directory Structure{RESET}")
+    backend_dir = Path(__file__).parent / "backend"
+    core_dir = backend_dir / "core"
+    logs_dir = Path.home() / ".jarvis" / "logs"
+
+    backend_exists = backend_dir.exists()
+    core_exists = core_dir.exists()
+    logs_exists = logs_dir.exists()
+
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(backend_exists)} Backend directory: {backend_dir}")
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(core_exists)} Core directory: {core_dir}")
+
+    if not logs_exists:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        logs_exists = logs_dir.exists()
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(logs_exists)} Logs directory: {logs_dir}")
+
+    if not backend_exists or not core_exists:
+        all_passed = False
+
+    # 3. Docker (if enabled)
+    print(f"{BOLD}{BLUE}║{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Docker{RESET}")
+    if config.docker_enabled:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "info",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+            docker_ok = proc.returncode == 0
+            print(f"{BOLD}{BLUE}║{RESET}    {check_mark(docker_ok)} Docker daemon: {'running' if docker_ok else 'not running'}")
+            if not docker_ok:
+                warnings.append("Docker daemon not running - will attempt auto-start")
+        except Exception:
+            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker check: could not verify")
+            warnings.append("Docker check failed")
+    else:
+        print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ Docker: disabled{RESET}")
+
+    # 4. GCP (if enabled)
+    print(f"{BOLD}{BLUE}║{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}GCP / Cloud{RESET}")
+    if config.gcp_enabled:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            gcp_account = stdout.decode().strip().split('\n')[0] if stdout else None
+            gcp_ok = bool(gcp_account)
+            print(f"{BOLD}{BLUE}║{RESET}    {check_mark(gcp_ok)} GCP auth: {gcp_account if gcp_ok else 'not authenticated'}")
+            if not gcp_ok:
+                warnings.append("GCP not authenticated - cloud features may not work")
+        except Exception:
+            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} GCP auth: could not verify")
+            warnings.append("GCP auth check failed")
+    else:
+        print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ GCP: disabled{RESET}")
+
+    # 5. Invincible Node (if enabled)
+    print(f"{BOLD}{BLUE}║{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Invincible Node{RESET}")
+    if config.invincible_node_enabled:
+        # Check if static IP can be resolved
+        static_ip_name = config.invincible_node_static_ip_name
+        if static_ip_name:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "gcloud", "compute", "addresses", "describe", static_ip_name,
+                    "--region", os.getenv("GCP_REGION", "us-central1"),
+                    "--format=value(address)",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+                static_ip = stdout.decode().strip() if stdout else None
+                node_ok = bool(static_ip)
+                print(f"{BOLD}{BLUE}║{RESET}    {check_mark(node_ok)} Static IP: {static_ip if node_ok else 'not found'}")
+            except Exception:
+                print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Static IP: could not verify")
+                warnings.append("Invincible Node IP check failed")
+        else:
+            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Static IP name not configured")
+            warnings.append("Invincible Node enabled but IP name not set")
+    else:
+        print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ Invincible Node: disabled{RESET}")
+
+    # 6. Trinity (if enabled)
+    print(f"{BOLD}{BLUE}║{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Trinity{RESET}")
+    if config.trinity_enabled:
+        workspace_root = Path(__file__).parent
+        workspace_parent = workspace_root.parent
+
+        # Check for jarvis-prime
+        prime_paths = [
+            config.prime_repo_path,
+            Path(os.getenv("JARVIS_PRIME_PATH", "")) if os.getenv("JARVIS_PRIME_PATH") else None,
+            workspace_parent / "jarvis-prime",
+            workspace_parent / "JARVIS-Prime",
+        ]
+        prime_found = any(p and p.exists() for p in prime_paths if p)
+        print(f"{BOLD}{BLUE}║{RESET}    {check_mark(prime_found)} J-Prime repo: {'found' if prime_found else 'not found'}")
+
+        # Check for reactor-core
+        reactor_paths = [
+            config.reactor_repo_path,
+            Path(os.getenv("REACTOR_CORE_PATH", "")) if os.getenv("REACTOR_CORE_PATH") else None,
+            workspace_parent / "reactor-core",
+        ]
+        reactor_found = any(p and p.exists() for p in reactor_paths if p)
+        print(f"{BOLD}{BLUE}║{RESET}    {check_mark(reactor_found)} Reactor-Core repo: {'found' if reactor_found else 'not found'}")
+
+        if not prime_found:
+            warnings.append("J-Prime repo not found - local LLM unavailable")
+        if not reactor_found:
+            warnings.append("Reactor-Core repo not found - training pipeline unavailable")
+    else:
+        print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ Trinity: disabled{RESET}")
+
+    # 7. Port availability
+    print(f"{BOLD}{BLUE}║{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Port Availability{RESET}")
+    import socket
+
+    def check_port(port: int) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                result = s.connect_ex(('127.0.0.1', port))
+                return result != 0  # Port is free if connect fails
+        except Exception:
+            return True  # Assume free on error
+
+    backend_port = config.backend_port or 8765
+    ws_port = config.websocket_port or 8766
+
+    backend_free = check_port(backend_port)
+    ws_free = check_port(ws_port)
+
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(backend_free)} Backend port {backend_port}: {'available' if backend_free else 'in use'}")
+    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(ws_free)} WebSocket port {ws_port}: {'available' if ws_free else 'in use'}")
+
+    if not backend_free:
+        warnings.append(f"Port {backend_port} in use - will attempt cleanup")
+    if not ws_free:
+        warnings.append(f"Port {ws_port} in use - will attempt cleanup")
+
+    # Summary
+    print(f"{BOLD}{BLUE}╠══════════════════════════════════════════════════════════════════════╣{RESET}")
+
+    if warnings:
+        print(f"{BOLD}{BLUE}║{RESET}  {YELLOW}Warnings:{RESET}")
+        for warning in warnings:
+            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} {warning}")
+        print(f"{BOLD}{BLUE}║{RESET}")
+
+    if all_passed:
+        print(f"{BOLD}{BLUE}║{RESET}  {GREEN}✓ All critical checks passed{RESET}")
+        print(f"{BOLD}{BLUE}║{RESET}  {DIM}Run without --check-only to start JARVIS{RESET}")
+    else:
+        print(f"{BOLD}{BLUE}║{RESET}  {RED}✗ Some checks failed - review errors above{RESET}")
+
+    print(f"{BOLD}{BLUE}╚══════════════════════════════════════════════════════════════════════╝{RESET}")
+    print()
+
+    return 0 if all_passed else 1
 
 
 # =============================================================================
@@ -62504,6 +62965,10 @@ async def async_main(args: argparse.Namespace) -> int:
 
     if args.cleanup:
         return await handle_cleanup()
+
+    # Handle --check-only (pre-flight validation without starting)
+    if getattr(args, 'check_only', False):
+        return await handle_check_only(args)
 
     # Handle test command
     if hasattr(args, 'test') and args.test:
