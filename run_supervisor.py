@@ -22672,7 +22672,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                         self.logger.debug(f"   Could not read J-Prime state from {jprime_state_file}: {e}")
 
         # v100.0: Use RobustVenvDetector to find Python
-        python_cmd = venv_detector.get_python_executable(jprime_path)
+        # v201.0: Use asyncio.to_thread() to avoid blocking event loop with subprocess calls
+        python_cmd = await asyncio.to_thread(venv_detector.get_python_executable, jprime_path)
         self.logger.debug(f"   [v100] J-Prime Python: {python_cmd}")
 
         # Define launch scripts in order of preference
@@ -22928,7 +22929,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     self.logger.debug(f"   Could not read Reactor-Core state: {e}")
 
         # v100.0: Use RobustVenvDetector to find Python
-        python_cmd = venv_detector.get_python_executable(reactor_core_path)
+        # v201.0: Use asyncio.to_thread() to avoid blocking event loop with subprocess calls
+        python_cmd = await asyncio.to_thread(venv_detector.get_python_executable, reactor_core_path)
         self.logger.debug(f"   [v100] Reactor-Core Python: {python_cmd}")
 
         # Define launch scripts in order of preference
