@@ -59381,6 +59381,9 @@ class JarvisSystemKernel:
             env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
             env["LOADING_SERVER_PORT"] = str(loading_port)
 
+            # v211.0: Set kernel PID for parent death watcher (orphan prevention)
+            env["JARVIS_KERNEL_PID"] = str(os.getpid())
+
             # v120.0: Also set frontend port so loading page knows where to redirect
             frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
             env["JARVIS_FRONTEND_PORT"] = str(frontend_port)

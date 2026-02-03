@@ -1813,6 +1813,27 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
     start_time = time.time()
 
     # =================================================================
+    # v211.0: PARENT DEATH WATCHER - Prevent orphaned processes
+    # =================================================================
+    # When the supervisor (kernel) crashes, this process should exit too.
+    # Without this, child processes become orphans that persist across
+    # restarts, causing "Cleaned N orphaned processes" warnings.
+    # =================================================================
+    parent_watcher = None
+    try:
+        from backend.utils.parent_death_watcher import start_parent_watcher
+        parent_watcher = await start_parent_watcher()
+        if parent_watcher:
+            logger.info("👁️ [v211.0] Parent death watcher started - will auto-exit if supervisor dies")
+            app.state.parent_watcher = parent_watcher
+        else:
+            logger.debug("👁️ [v211.0] Running standalone - no parent watcher needed")
+    except ImportError:
+        logger.debug("Parent death watcher not available")
+    except Exception as e:
+        logger.debug(f"Could not start parent death watcher: {e}")
+
+    # =================================================================
     # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
     # =================================================================
     try:
@@ -3868,6 +3889,21 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
 
     # Cleanup
     logger.info("🛑 Shutting down JARVIS backend...")
+
+    # =================================================================
+    # v211.0: PARENT DEATH WATCHER - Stop monitoring during graceful shutdown
+    # =================================================================
+    # Stop the parent death watcher first to prevent it from interfering
+    # with graceful shutdown. If we don't stop it, it might trigger
+    # SIGTERM while we're in the middle of cleanup.
+    # =================================================================
+    if hasattr(app.state, 'parent_watcher') and app.state.parent_watcher:
+        try:
+            from backend.utils.parent_death_watcher import stop_parent_watcher
+            await stop_parent_watcher()
+            logger.info("👁️ [v211.0] Parent death watcher stopped")
+        except Exception as e:
+            logger.debug(f"Parent death watcher cleanup: {e}")
 
     # =================================================================
     # v95.3: READINESS STATE MANAGER - Shutdown transition

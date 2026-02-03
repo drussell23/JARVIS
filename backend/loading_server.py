@@ -1046,7 +1046,9 @@ class LoadingServer:
             health = await self._health_aggregator.get_unified_health()
             return self._json_response(health)
 
-        elif path == "/api/progress":
+        # v186.0: Endpoint aliases for frontend compatibility
+        # loading-manager.js uses /api/startup-progress, we support both
+        elif path == "/api/progress" or path == "/api/startup-progress":
             return self._json_response(self._get_progress_response())
 
         elif path == "/api/progress/eta":
@@ -1481,6 +1483,9 @@ class LoadingServer:
         """
         Serve the themed loading page HTML (Arc Reactor + Matrix theme).
 
+        v186.0: Now injects port configuration into the HTML so loading-manager.js
+        knows the correct loading server port even when served from a different origin.
+
         v182.0: Now serves the actual themed loading.html from frontend/public/
         instead of inline basic HTML. The themed page includes:
         - Arc Reactor animation with rotating rings
@@ -1492,18 +1497,43 @@ class LoadingServer:
         - Particle effects
         - Panel minimize/hide functionality
 
-        The loading-manager.js handles dynamic port detection automatically
-        using window.location.port, so no port injection is needed.
-
         Falls back to inline HTML only if the themed file cannot be loaded.
         """
+        # v186.0: Port configuration to inject into the page
+        # This is CRITICAL - window.location.port may be wrong when served via proxy
+        port_config_script = f'''<script>
+// v186.0: Server-injected port configuration (loading_server.py)
+// This ensures loading-manager.js uses the correct loading server port
+window.JARVIS_LOADING_SERVER_PORT = {self.config.port};
+window.JARVIS_FRONTEND_PORT = {self.config.frontend_port};
+window.JARVIS_BACKEND_PORT = {self.config.backend_port};
+window.JARVIS_PRIME_PORT = {self.config.prime_port};
+window.JARVIS_REACTOR_PORT = {self.config.reactor_port};
+console.log('[v186.0] Port config injected by loading_server.py:', {{
+    loading: window.JARVIS_LOADING_SERVER_PORT,
+    frontend: window.JARVIS_FRONTEND_PORT,
+    backend: window.JARVIS_BACKEND_PORT,
+    prime: window.JARVIS_PRIME_PORT,
+    reactor: window.JARVIS_REACTOR_PORT
+}});
+</script>
+'''
+
         # v182.0: Try to load the themed loading.html first
         themed_loading_page = self.config.jarvis_repo / "frontend" / "public" / "loading.html"
 
         try:
             if themed_loading_page.exists():
                 html = themed_loading_page.read_text(encoding='utf-8')
-                logger.info(f"[v182.0] Serving themed loading page from {themed_loading_page}")
+                # v186.0: Inject port config right after <head> tag
+                if '<head>' in html:
+                    html = html.replace('<head>', '<head>\n' + port_config_script, 1)
+                elif '<HEAD>' in html:
+                    html = html.replace('<HEAD>', '<HEAD>\n' + port_config_script, 1)
+                else:
+                    # Fallback: prepend to entire HTML
+                    html = port_config_script + html
+                logger.info(f"[v186.0] Serving themed loading page with port injection from {themed_loading_page}")
                 return html
             else:
                 logger.warning(f"[v182.0] Themed loading page not found at {themed_loading_page}, using fallback")
@@ -1777,6 +1807,26 @@ class LoadingServer:
         """Start the loading server."""
         logger.info(f"[v125.0] Starting loading server on {self.config.host}:{self.config.port}")
 
+        # =================================================================
+        # v211.0: PARENT DEATH WATCHER - Prevent orphaned processes
+        # =================================================================
+        # When the supervisor (kernel) crashes, this process should exit too.
+        # Without this, the loading server becomes an orphan that persists
+        # across restarts, causing "Cleaned N orphaned processes" warnings.
+        # =================================================================
+        self._parent_watcher = None
+        try:
+            from backend.utils.parent_death_watcher import start_parent_watcher
+            self._parent_watcher = await start_parent_watcher()
+            if self._parent_watcher:
+                logger.info("👁️ [v211.0] Parent death watcher started - will auto-exit if supervisor dies")
+            else:
+                logger.debug("👁️ [v211.0] Running standalone - no parent watcher needed")
+        except ImportError:
+            logger.debug("Parent death watcher not available")
+        except Exception as e:
+            logger.debug(f"Could not start parent death watcher: {e}")
+
         # Initialize ETA tracking
         self._eta_engine.start_tracking()
 
@@ -1804,6 +1854,17 @@ class LoadingServer:
         """Stop the loading server gracefully."""
         logger.info("[v125.0] Shutting down loading server...")
         self._shutdown_requested = True
+
+        # =================================================================
+        # v211.0: PARENT DEATH WATCHER - Stop monitoring during graceful shutdown
+        # =================================================================
+        if hasattr(self, '_parent_watcher') and self._parent_watcher:
+            try:
+                from backend.utils.parent_death_watcher import stop_parent_watcher
+                await stop_parent_watcher()
+                logger.info("👁️ [v211.0] Parent death watcher stopped")
+            except Exception as e:
+                logger.debug(f"Parent death watcher cleanup: {e}")
 
         # Cancel background tasks
         for task in self._background_tasks:

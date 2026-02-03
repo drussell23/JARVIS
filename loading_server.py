@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 """
-JARVIS Loading Server v87.0 - Trinity Ultra Edition
-====================================================
+JARVIS Loading Server v87.0 - Trinity Ultra Edition (LEGACY)
+============================================================
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ⚠️  DEPRECATION NOTICE (v211.0)                                             ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  This file is the LEGACY loading server. The CANONICAL version is now:       ║
+║                                                                               ║
+║     backend/loading_server.py (v182.0+)                                       ║
+║                                                                               ║
+║  The unified_supervisor.py uses the backend version.                          ║
+║                                                                               ║
+║  This file is kept for:                                                       ║
+║  - Backward compatibility with run_supervisor.py                              ║
+║  - Test imports (tests/test_loading_server_shutdown_fix.py)                   ║
+║  - Reference for advanced features (W3C tracing, SQLite persistence)         ║
+║                                                                               ║
+║  Migration: Update imports to use backend.loading_server                      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
 Serves the loading page independently from frontend/backend during restart.
 Provides real-time progress updates via WebSocket and HTTP polling.
@@ -6597,6 +6614,26 @@ async def on_startup(app: web.Application):
     """Initialize services on startup."""
     logger.info("Starting loading server services...")
 
+    # =================================================================
+    # v211.0: PARENT DEATH WATCHER - Prevent orphaned processes
+    # =================================================================
+    # When the supervisor (kernel) crashes, this process should exit too.
+    # Without this, the loading server becomes an orphan that persists
+    # across restarts, causing "Cleaned N orphaned processes" warnings.
+    # =================================================================
+    try:
+        from backend.utils.parent_death_watcher import start_parent_watcher
+        parent_watcher = await start_parent_watcher()
+        if parent_watcher:
+            logger.info("👁️ [v211.0] Parent death watcher started - will auto-exit if supervisor dies")
+            app['parent_watcher'] = parent_watcher
+        else:
+            logger.debug("👁️ [v211.0] Running standalone - no parent watcher needed")
+    except ImportError:
+        logger.debug("Parent death watcher not available")
+    except Exception as e:
+        logger.debug(f"Could not start parent death watcher: {e}")
+
     # Start health checker
     await health_checker.start()
 
@@ -6616,6 +6653,21 @@ async def on_startup(app: web.Application):
 async def on_shutdown(app: web.Application):
     """Cleanup on shutdown."""
     logger.info("Shutting down loading server...")
+
+    # =================================================================
+    # v211.0: PARENT DEATH WATCHER - Stop monitoring during graceful shutdown
+    # =================================================================
+    # Stop the parent death watcher first to prevent it from interfering
+    # with graceful shutdown. If we don't stop it, it might trigger
+    # SIGTERM while we're in the middle of cleanup.
+    # =================================================================
+    if 'parent_watcher' in app and app['parent_watcher']:
+        try:
+            from backend.utils.parent_death_watcher import stop_parent_watcher
+            await stop_parent_watcher()
+            logger.info("👁️ [v211.0] Parent death watcher stopped")
+        except Exception as e:
+            logger.debug(f"Parent death watcher cleanup: {e}")
 
     # Stop graceful shutdown monitoring (v5.0.1)
     await shutdown_manager.stop_monitoring()
