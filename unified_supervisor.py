@@ -54728,6 +54728,14 @@ class JarvisSystemKernel:
             "approval_manager": False,
         }
 
+        # v210.0: Readiness revocation tracking
+        # Monitors component health post-startup and revokes FULLY_READY if critical
+        # components become unhealthy. Restores readiness when they recover.
+        self._readiness_revoked: bool = False
+        self._last_revocation_time: Optional[float] = None
+        self._consecutive_failures: Dict[str, int] = {}
+        self._readiness_monitor_task: Optional[asyncio.Task] = None
+
     @property
     def state(self) -> KernelState:
         """Current kernel state."""
@@ -60016,6 +60024,120 @@ class JarvisSystemKernel:
             states[name] = status
         return states
 
+    async def _check_and_revoke_readiness(self) -> None:
+        """
+        Check if readiness should be revoked due to unhealthy components.
+
+        v210.0: Monitors component health post-startup and revokes FULLY_READY
+        if critical components become unhealthy.
+
+        Revokes FULLY_READY if:
+        - Critical component has N consecutive failures
+        - Critical component down for T seconds
+
+        Respects cooldown to avoid flapping.
+        """
+        # Defensive imports - don't fail if modules aren't available
+        if not READINESS_CONFIG_AVAILABLE or get_readiness_config is None:
+            return
+        if not READINESS_PREDICATE_AVAILABLE or ReadinessPredicate is None:
+            return
+
+        try:
+            config = get_readiness_config()
+            predicate = ReadinessPredicate()
+
+            # Check cooldown to avoid flapping
+            if self._last_revocation_time:
+                time_since = time.time() - self._last_revocation_time
+                if time_since < config.revocation_cooldown_seconds:
+                    return  # In cooldown, don't revoke or restore yet
+
+            # Evaluate current state using the unified predicate
+            component_states = self._get_component_states_for_readiness()
+            result = predicate.evaluate(component_states)
+
+            if not result.is_fully_ready and not self._readiness_revoked:
+                # Revoke readiness - critical component failed
+                self._readiness_revoked = True
+                self._last_revocation_time = time.time()
+
+                if self._readiness_manager:
+                    self._readiness_manager.mark_tier(ReadinessTier.INTERACTIVE)
+
+                self.logger.warning(f"[Readiness] REVOKED: {result.message}")
+
+                # Notify frontend via WebSocket if available (best-effort)
+                try:
+                    await self._broadcast_startup_progress(
+                        stage="degraded",
+                        message=f"System degraded: {result.message}",
+                        progress=100,
+                        metadata={
+                            "readiness_revoked": True,
+                            "blocking_components": result.blocking_components,
+                        }
+                    )
+                except Exception:
+                    pass  # WebSocket notification is best-effort
+
+            elif result.is_fully_ready and self._readiness_revoked:
+                # Restore readiness - components recovered
+                self._readiness_revoked = False
+
+                if self._readiness_manager:
+                    self._readiness_manager.mark_tier(ReadinessTier.FULLY_READY)
+
+                self.logger.success(f"[Readiness] RESTORED: {result.message}")
+
+                # Notify frontend of recovery (best-effort)
+                try:
+                    await self._broadcast_startup_progress(
+                        stage="ready",
+                        message="System fully ready",
+                        progress=100,
+                        metadata={
+                            "readiness_revoked": False,
+                            "restored": True,
+                        }
+                    )
+                except Exception:
+                    pass  # WebSocket notification is best-effort
+
+        except Exception as e:
+            # Never crash the monitoring loop on evaluation errors
+            self.logger.debug(f"[Readiness] Revocation check error: {e}")
+
+    async def _readiness_monitoring_loop(self) -> None:
+        """
+        Periodic readiness monitoring loop.
+
+        v210.0: Runs continuously while the kernel is in RUNNING state,
+        checking component health every 10 seconds and revoking/restoring
+        FULLY_READY as needed.
+        """
+        # Wait for kernel to be fully running before starting checks
+        while self._state != KernelState.RUNNING:
+            await asyncio.sleep(1.0)
+            # Exit if shutdown started
+            if self._state == KernelState.SHUTTING_DOWN:
+                return
+
+        self.logger.debug("[Readiness] Monitoring loop started")
+
+        while self._state == KernelState.RUNNING:
+            try:
+                await self._check_and_revoke_readiness()
+                await asyncio.sleep(10.0)  # Check every 10 seconds
+            except asyncio.CancelledError:
+                self.logger.debug("[Readiness] Monitoring loop cancelled")
+                break
+            except Exception as e:
+                self.logger.debug(f"[Readiness] Monitor error: {e}")
+                await asyncio.sleep(10.0)  # Sleep even on error to avoid tight loop
+
+        self.logger.debug("[Readiness] Monitoring loop exited")
+
     def _get_verification_timeout(self) -> float:
         """
         Get verification timeout from config or environment.
@@ -60499,6 +60621,14 @@ class JarvisSystemKernel:
             asyncio.create_task(self._health_monitor_loop(), name="health-monitor"),
         ])
 
+        # v210.0: Start readiness monitoring loop for post-startup health tracking
+        # This monitors component health and revokes/restores FULLY_READY as needed
+        self._readiness_monitor_task = asyncio.create_task(
+            self._readiness_monitoring_loop(),
+            name="readiness-monitor"
+        )
+        self._background_tasks.append(self._readiness_monitor_task)
+
         # If readiness manager has heartbeat, it's already running
         # Add cost optimizer if scale-to-zero is enabled
         if self.config.scale_to_zero_enabled:
@@ -60585,6 +60715,15 @@ class JarvisSystemKernel:
             # Stop readiness heartbeat
             if self._readiness_manager:
                 await self._readiness_manager.stop_heartbeat_loop()
+
+            # v210.0: Stop readiness monitoring loop (also in background_tasks but cancel explicitly)
+            if self._readiness_monitor_task and not self._readiness_monitor_task.done():
+                self._readiness_monitor_task.cancel()
+                try:
+                    await asyncio.wait_for(self._readiness_monitor_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                self.logger.debug("[Kernel] Readiness monitor stopped")
 
             # Cancel background tasks
             for task in self._background_tasks:
