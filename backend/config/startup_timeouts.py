@@ -910,6 +910,217 @@ class StartupTimeoutCalculator:
 
 
 # =============================================================================
+# HELPER FUNCTIONS FOR ENV BOOL/FLOAT
+# =============================================================================
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    """
+    Get a boolean value from environment variable.
+
+    Truthy values: "true", "1", "yes", "on" (case-insensitive)
+    Falsy values: "false", "0", "no", "off" (case-insensitive)
+    Other values: logs warning and returns default
+
+    Args:
+        name: Environment variable name
+        default: Default value if not set or invalid
+
+    Returns:
+        Boolean value from environment or default
+    """
+    raw_value = os.environ.get(name)
+
+    if raw_value is None:
+        return default
+
+    lower_value = raw_value.lower().strip()
+
+    if lower_value in ("true", "1", "yes", "on"):
+        return True
+    elif lower_value in ("false", "0", "no", "off"):
+        return False
+    else:
+        logger.warning(
+            f"[StartupConfig] Invalid boolean value for {name}='{raw_value}' "
+            f"(expected true/false/1/0/yes/no), using default: {default}"
+        )
+        return default
+
+
+# =============================================================================
+# STARTUP CONFIG - UNIFIED CONFIGURATION CLASS
+# =============================================================================
+
+
+# Default values for StartupConfig
+_DEFAULT_TRINITY_ENABLED = True
+_DEFAULT_GCP_ENABLED = False
+_DEFAULT_HOLLOW_RAM_THRESHOLD_GB = 32.0
+
+
+@dataclass
+class StartupConfig:
+    """
+    Unified startup configuration combining all startup-related settings.
+
+    This dataclass composes:
+    - Feature flags (Trinity, GCP, Hollow Client)
+    - All phase budgets from PhaseBudgets
+    - All operation timeouts from StartupTimeouts
+
+    It provides a single source of truth for startup configuration and supports
+    environment variable overrides for all values.
+
+    Environment Variables:
+    ----------------------
+    - JARVIS_TRINITY_ENABLED: Enable Trinity components (default: True)
+    - JARVIS_GCP_ENABLED: Enable GCP cloud services (default: False)
+    - JARVIS_HOLLOW_RAM_THRESHOLD_GB: RAM threshold for Hollow Client (default: 32.0)
+
+    All PhaseBudgets and StartupTimeouts env vars are also supported.
+
+    Usage:
+        config = StartupConfig()
+        config.log_config()  # Log all configuration at INFO level
+
+        # Access feature flags
+        if config.trinity_enabled:
+            start_trinity()
+
+        # Access phase budgets
+        budgets = config.get_phase_budgets()
+
+        # Access timeouts via composed objects
+        timeout = config.timeouts.backend_health_timeout
+    """
+
+    # -------------------------------------------------------------------------
+    # Feature Flags
+    # -------------------------------------------------------------------------
+
+    trinity_enabled: bool = field(default_factory=lambda: _get_env_bool(
+        "JARVIS_TRINITY_ENABLED", _DEFAULT_TRINITY_ENABLED
+    ))
+    """Whether Trinity components (JARVIS-Prime, Reactor-Core) are enabled."""
+
+    gcp_enabled: bool = field(default_factory=lambda: _get_env_bool(
+        "JARVIS_GCP_ENABLED", _DEFAULT_GCP_ENABLED
+    ))
+    """Whether GCP cloud services are enabled."""
+
+    hollow_ram_threshold_gb: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_HOLLOW_RAM_THRESHOLD_GB", _DEFAULT_HOLLOW_RAM_THRESHOLD_GB, min_value=0.0
+    ))
+    """RAM threshold in GB for Hollow Client enforcement."""
+
+    # -------------------------------------------------------------------------
+    # Composed Configuration Objects
+    # -------------------------------------------------------------------------
+
+    budgets: PhaseBudgets = field(default_factory=PhaseBudgets)
+    """Phase budgets for startup phases."""
+
+    timeouts: StartupTimeouts = field(default_factory=StartupTimeouts)
+    """Operation timeouts for startup/shutdown operations."""
+
+    # -------------------------------------------------------------------------
+    # Methods
+    # -------------------------------------------------------------------------
+
+    def get_phase_budgets(self) -> dict[str, float]:
+        """
+        Get all phase budgets as a dictionary.
+
+        Returns:
+            Dictionary mapping phase names to budget values in seconds.
+            Keys: PRE_TRINITY, TRINITY_PHASE, GCP_WAIT_BUFFER, POST_TRINITY,
+                  DISCOVERY, HEALTH_CHECK, CLEANUP
+        """
+        return {
+            "PRE_TRINITY": self.budgets.PRE_TRINITY,
+            "TRINITY_PHASE": self.budgets.TRINITY_PHASE,
+            "GCP_WAIT_BUFFER": self.budgets.GCP_WAIT_BUFFER,
+            "POST_TRINITY": self.budgets.POST_TRINITY,
+            "DISCOVERY": self.budgets.DISCOVERY,
+            "HEALTH_CHECK": self.budgets.HEALTH_CHECK,
+            "CLEANUP": self.budgets.CLEANUP,
+        }
+
+    def log_config(self) -> None:
+        """
+        Log all configuration values at INFO level.
+
+        Logs are prefixed with [StartupConfig] for easy filtering.
+        This is useful for debugging startup configuration issues.
+        """
+        logger.info("[StartupConfig] Configuration loaded:")
+        logger.info(f"[StartupConfig]   Trinity enabled: {self.trinity_enabled}")
+        logger.info(f"[StartupConfig]   GCP enabled: {self.gcp_enabled}")
+        logger.info(f"[StartupConfig]   Hollow RAM threshold: {self.hollow_ram_threshold_gb} GB")
+        logger.info(f"[StartupConfig]   Max timeout: {self.timeouts.max_timeout}s")
+        logger.info(f"[StartupConfig]   Phase budgets:")
+        for phase, budget in self.get_phase_budgets().items():
+            logger.info(f"[StartupConfig]     {phase}: {budget}s")
+        logger.info(f"[StartupConfig]   Safety margin: {self.budgets.SAFETY_MARGIN}s")
+        logger.info(f"[StartupConfig]   Hard cap: {self.budgets.HARD_CAP}s")
+
+    def create_timeout_calculator(
+        self,
+        history: Optional[StartupMetricsHistory] = None,
+    ) -> StartupTimeoutCalculator:
+        """
+        Create a StartupTimeoutCalculator using this config's settings.
+
+        Args:
+            history: Optional metrics history for adaptive timeouts
+
+        Returns:
+            Configured StartupTimeoutCalculator instance
+        """
+        return StartupTimeoutCalculator(
+            trinity_enabled=self.trinity_enabled,
+            gcp_enabled=self.gcp_enabled,
+            history=history,
+        )
+
+
+# =============================================================================
+# STARTUP CONFIG SINGLETON
+# =============================================================================
+
+
+_config_instance: Optional[StartupConfig] = None
+
+
+def get_startup_config() -> StartupConfig:
+    """
+    Get the module-level StartupConfig singleton.
+
+    This provides a convenient way to access configuration without
+    creating new instances, while still being lazy-initialized.
+
+    Returns:
+        StartupConfig singleton instance
+    """
+    global _config_instance
+    if _config_instance is None:
+        _config_instance = StartupConfig()
+    return _config_instance
+
+
+def reset_startup_config() -> None:
+    """
+    Reset the module-level StartupConfig singleton (primarily for testing).
+
+    This forces the next get_startup_config() call to create a fresh instance,
+    picking up any environment variable changes.
+    """
+    global _config_instance
+    _config_instance = None
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -920,11 +1131,15 @@ __all__ = [
     "PhaseBudgets",
     "StartupTimeoutCalculator",
     "StartupMetricsHistory",
+    "StartupConfig",
     # Singleton access
     "get_timeouts",
     "reset_timeouts",
+    "get_startup_config",
+    "reset_startup_config",
     # Validation utilities (for testing)
     "_get_env_float",
+    "_get_env_bool",
     # Default values (for reference/testing)
     "_DEFAULT_MAX_TIMEOUT",
     "_DEFAULT_CLEANUP_TIMEOUT_SIGINT",
@@ -961,4 +1176,8 @@ __all__ = [
     "_DEFAULT_CLEANUP_BUDGET",
     "_DEFAULT_SAFETY_MARGIN",
     "_DEFAULT_STARTUP_HARD_CAP",
+    # StartupConfig defaults
+    "_DEFAULT_TRINITY_ENABLED",
+    "_DEFAULT_GCP_ENABLED",
+    "_DEFAULT_HOLLOW_RAM_THRESHOLD_GB",
 ]
