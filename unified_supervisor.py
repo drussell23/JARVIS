@@ -56936,7 +56936,7 @@ class JarvisSystemKernel:
                 else:
                     self.logger.warning("[Kernel] Ollama: unhealthy - background recovery started")
 
-                # Configure Invincible Node resilience (if enabled)
+                # Configure and check Invincible Node resilience (if enabled)
                 if self.config.invincible_node_enabled:
                     try:
                         from backend.core.gcp_vm_manager import get_gcp_vm_manager
@@ -56944,7 +56944,12 @@ class JarvisSystemKernel:
                             get_vm_manager=get_gcp_vm_manager,
                             port=self.config.invincible_node_port,
                         )
-                        self.logger.info("[Kernel] Invincible Node: resilience configured")
+                        # Check Invincible Node health (starts background recovery if not ready)
+                        node_healthy = await self._startup_resilience.check_invincible_node()
+                        if node_healthy:
+                            self.logger.info("[Kernel] Invincible Node: healthy (resilience check)")
+                        else:
+                            self.logger.warning("[Kernel] Invincible Node: unhealthy - background recovery started")
                     except ImportError:
                         self.logger.debug("[Kernel] Invincible Node: GCP module not available")
 
