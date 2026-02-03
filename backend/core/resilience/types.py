@@ -153,3 +153,12 @@ class Recoverable(Protocol):
             True if recovery succeeded, False otherwise
         """
         ...
+
+
+__all__ = [
+    "CircuitState",
+    "CapabilityState",
+    "RecoveryState",
+    "HealthCheckable",
+    "Recoverable",
+]
