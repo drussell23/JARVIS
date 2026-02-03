@@ -232,9 +232,11 @@ async def run_subprocess(
         raise
 
     # Return a CompletedProcess for compatibility with subprocess.run()
+    # Note: After communicate() completes, returncode is guaranteed to be set
+    returncode = process.returncode if process.returncode is not None else -1
     return subprocess.CompletedProcess(
         args=cmd,
-        returncode=process.returncode,
+        returncode=returncode,
         stdout=stdout,
         stderr=stderr,
     )
