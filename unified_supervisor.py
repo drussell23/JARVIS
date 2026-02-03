@@ -62833,6 +62833,8 @@ async def handle_cloud_monitor() -> int:
     - API health check results
     - Model loading status
     - APARS progress (if starting)
+
+    v201.5: Refactored to use centralized CLIBoxDrawing for proper ANSI-aware padding.
     """
     # v201.4: Suppress shutdown diagnostics for CLI-only commands
     set_cli_only_mode(True)
@@ -62840,56 +62842,25 @@ async def handle_cloud_monitor() -> int:
     # Load configuration
     config = SystemKernelConfig()
 
-    # Box drawing characters for clean output
-    BOX_TL = "╔"
-    BOX_TR = "╗"
-    BOX_BL = "╚"
-    BOX_BR = "╝"
-    BOX_H = "═"
-    BOX_V = "║"
-    BOX_SEP_L = "╠"
-    BOX_SEP_R = "╣"
-    BOX_SEP = "╬"
-
-    def box_line(text: str, width: int = 70) -> str:
-        """Create a boxed line with padding."""
-        padded = f" {text}".ljust(width - 2)
-        return f"{BOX_V}{padded}{BOX_V}"
-
-    def header(width: int = 70) -> str:
-        return f"{BOX_TL}{BOX_H * (width - 2)}{BOX_TR}"
-
-    def footer(width: int = 70) -> str:
-        return f"{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}"
-
-    def separator(width: int = 70) -> str:
-        return f"{BOX_SEP_L}{BOX_H * (width - 2)}{BOX_SEP_R}"
-
-    # ANSI colors
-    GREEN = "\033[92m"
-    RED = "\033[91m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    CYAN = "\033[96m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
+    # Use centralized ANSI-aware box drawing
+    box = get_cli_box(width=70)
 
     def status_color(status: str) -> str:
         """Get color for status."""
         status_upper = status.upper() if status else "UNKNOWN"
         if status_upper == "RUNNING":
-            return f"{GREEN}{status_upper}{RESET}"
+            return f"{box.GREEN}{status_upper}{box.RESET}"
         elif status_upper in ("STOPPED", "TERMINATED", "SUSPENDED"):
-            return f"{YELLOW}{status_upper}{RESET}"
+            return f"{box.YELLOW}{status_upper}{box.RESET}"
         elif status_upper in ("NOT_FOUND", "ERROR", "UNKNOWN"):
-            return f"{RED}{status_upper}{RESET}"
+            return f"{box.RED}{status_upper}{box.RESET}"
         else:
-            return f"{CYAN}{status_upper}{RESET}"
+            return f"{box.CYAN}{status_upper}{box.RESET}"
 
     print()
-    print(f"{BOLD}{BLUE}" + header() + RESET)
-    print(f"{BOLD}{BLUE}" + box_line("☁️  JARVIS INVINCIBLE NODE MONITOR") + RESET)
-    print(f"{BOLD}{BLUE}" + separator() + RESET)
+    print(f"{box.BOLD}{box.BLUE}{box.header()}{box.RESET}")
+    print(f"{box.BOLD}{box.BLUE}{box.line('☁️  JARVIS INVINCIBLE NODE MONITOR')}{box.RESET}")
+    print(f"{box.BOLD}{box.BLUE}{box.separator()}{box.RESET}")
 
     # Check if Invincible Node is configured
     if not config.invincible_node_enabled or not config.invincible_node_static_ip_name:
