@@ -61997,6 +61997,12 @@ Environment Variables:
         help="Path to reactor-core repository",
     )
 
+    trinity.add_argument(
+        "--monitor-prime",
+        action="store_true",
+        help="Display J-Prime component status dashboard",
+    )
+
     # =========================================================================
     # DEVELOPMENT
     # =========================================================================
@@ -62709,6 +62715,158 @@ async def handle_cloud_monitor_logs() -> int:
     except Exception as e:
         print(f"\033[91m⚠  Error streaming logs: {e}\033[0m")
         return 1
+async def handle_monitor_prime() -> int:
+    """
+    Handle --monitor-prime command: Display J-Prime status dashboard.
+
+    v201.1: Shows J-Prime status whether kernel is running or not.
+    When kernel is running, uses IPC. When down, does direct HTTP check.
+    """
+    # Box drawing characters for clean output
+    BOX_TL = "\u2554"  # Top-left corner
+    BOX_TR = "\u2557"  # Top-right corner
+    BOX_BL = "\u255a"  # Bottom-left corner
+    BOX_BR = "\u255d"  # Bottom-right corner
+    BOX_H = "\u2550"   # Horizontal line
+    BOX_V = "\u2551"   # Vertical line
+    BOX_SEP_L = "\u2560"  # Left separator
+    BOX_SEP_R = "\u2563"  # Right separator
+
+    # ANSI colors
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+    # Box drawing helpers
+    def box_line(text: str, width: int = 70) -> str:
+        padded = f" {text}".ljust(width - 2)
+        return f"{BOX_V}{padded}{BOX_V}"
+
+    def header(width: int = 70) -> str:
+        return f"{BOX_TL}{BOX_H * (width - 2)}{BOX_TR}"
+
+    def footer(width: int = 70) -> str:
+        return f"{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}"
+
+    def separator(width: int = 70) -> str:
+        return f"{BOX_SEP_L}{BOX_H * (width - 2)}{BOX_SEP_R}"
+
+    print()
+    print(f"{BOLD}{BLUE}" + header() + RESET)
+    print(f"{BOLD}{BLUE}" + box_line("J-PRIME STATUS MONITOR") + RESET)
+    print(f"{BOLD}{BLUE}" + separator() + RESET)
+
+    # Get port from environment (same source as TrinityIntegrator)
+    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", "8000"))
+    prime_host = os.getenv("TRINITY_JPRIME_HOST", "localhost")
+
+    # Try IPC first (kernel running)
+    socket_path = Path.home() / ".jarvis" / "locks" / "kernel.sock"
+    trinity_status = None
+    kernel_running = False
+
+    if socket_path.exists():
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            request = json.dumps({"command": "status"}) + "\n"
+            writer.write(request.encode())
+            await writer.drain()
+            response_data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            response = json.loads(response_data.decode())
+            writer.close()
+            await writer.wait_closed()
+
+            if response.get("success"):
+                result = response.get("result", {})
+                trinity_status = result.get("trinity", {})
+                kernel_running = True
+        except Exception:
+            pass
+
+    # Extract Prime status from IPC
+    prime_data = None
+    if trinity_status:
+        prime_data = trinity_status.get("components", {}).get("jarvis-prime", {})
+
+    # Display kernel status
+    if kernel_running:
+        print(box_line(f"Kernel:       {GREEN}Running{RESET}"))
+    else:
+        print(box_line(f"Kernel:       {YELLOW}Not running{RESET} (direct health check)"))
+
+    print(separator())
+
+    # Display Prime configuration
+    print(box_line(f"Host:         {prime_host}"))
+    print(box_line(f"Port:         {prime_port}"))
+
+    if prime_data:
+        # Use IPC data
+        configured = prime_data.get("configured", False)
+        state = prime_data.get("state", "unknown")
+        running = prime_data.get("running", False)
+        healthy = prime_data.get("healthy", False)
+        pid = prime_data.get("pid")
+        repo_path = prime_data.get("repo_path")
+        restart_count = prime_data.get("restart_count", 0)
+
+        print(box_line(f"Configured:   {GREEN}Yes{RESET}" if configured else f"Configured:   {RED}No{RESET}"))
+        print(box_line(f"State:        {state}"))
+        print(box_line(f"Running:      {GREEN}Yes{RESET}" if running else f"Running:      {RED}No{RESET}"))
+        print(box_line(f"Healthy:      {GREEN}Yes{RESET}" if healthy else f"Healthy:      {RED}No{RESET}"))
+        if pid:
+            print(box_line(f"PID:          {pid}"))
+        if repo_path:
+            print(box_line(f"Repo:         {DIM}{repo_path}{RESET}"))
+        if restart_count > 0:
+            print(box_line(f"Restarts:     {YELLOW}{restart_count}{RESET}"))
+
+    else:
+        # Direct HTTP health check
+        print(separator())
+        print(box_line(f"{CYAN}Direct Health Check{RESET}"))
+
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                url = f"http://{prime_host}:{prime_port}/health"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        health = await resp.json()
+                        print(box_line(f"Reachable:    {GREEN}Yes{RESET}"))
+                        status = health.get("status", "unknown")
+                        if status == "healthy":
+                            print(box_line(f"Status:       {GREEN}{status}{RESET}"))
+                        else:
+                            print(box_line(f"Status:       {YELLOW}{status}{RESET}"))
+                        if health.get("model_loaded"):
+                            print(box_line(f"Model:        {GREEN}Loaded{RESET}"))
+                        if health.get("active_model"):
+                            print(box_line(f"Model:        {health['active_model']}"))
+                    else:
+                        print(box_line(f"Reachable:    {YELLOW}Yes (HTTP {resp.status}){RESET}"))
+        except Exception:
+            print(box_line(f"Reachable:    {RED}No (connection failed){RESET}"))
+
+    print(footer())
+
+    # Quick actions
+    print()
+    print(f"{BOLD}Quick Actions:{RESET}")
+    print(f"  - Full status:  python unified_supervisor.py --status")
+    print(f"  - Start kernel: python unified_supervisor.py")
+    print(f"  - Health check: curl http://{prime_host}:{prime_port}/health")
+    print()
+
+    return 0
+
+
+
 
 
 async def handle_single_task(
@@ -62972,6 +63130,9 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.monitor_logs:
         return await handle_cloud_monitor_logs()
 
+    # Handle --monitor-prime
+    if args.monitor_prime:
+        return await handle_monitor_prime()
     if args.cleanup:
         return await handle_cleanup()
 
