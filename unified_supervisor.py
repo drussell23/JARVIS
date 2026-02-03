@@ -782,13 +782,21 @@ except ImportError:
 # These prevent event loop blocking during startup/shutdown operations.
 # =============================================================================
 try:
-    from backend.utils.async_startup import async_psutil_wait, async_process_wait, async_subprocess_run
+    from backend.utils.async_startup import (
+        async_psutil_wait,
+        async_process_wait,
+        async_subprocess_run,
+        async_check_port,
+        async_check_unix_socket,
+    )
     ASYNC_STARTUP_UTILS_AVAILABLE = True
 except ImportError:
     ASYNC_STARTUP_UTILS_AVAILABLE = False
     async_psutil_wait = None
     async_process_wait = None
     async_subprocess_run = None
+    async_check_port = None
+    async_check_unix_socket = None
 
 # =============================================================================
 # v203.0: CENTRALIZED TIMEOUT CONFIGURATION
@@ -10248,7 +10256,7 @@ class IntelligentResourceOrchestrator:
             return 0.0
 
     async def _check_ports_intelligent(self) -> Tuple[List[int], List[int], List[str]]:
-        """Intelligently check and handle port conflicts."""
+        """Intelligently check and handle port conflicts using async parallel checks."""
         available: List[int] = []
         in_use: List[int] = []
         actions: List[str] = []
@@ -10258,20 +10266,51 @@ class IntelligentResourceOrchestrator:
             int(os.getenv("JARVIS_WS_PORT", "8081")),
         ]
 
-        for port in required_ports:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.5)
-                result = sock.connect_ex(('localhost', port))
-                sock.close()
+        # Use async_check_port for non-blocking parallel port checks
+        if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+            # Check all ports in parallel
+            results = await asyncio.gather(
+                *[async_check_port("localhost", port, timeout=0.5) for port in required_ports],
+                return_exceptions=True
+            )
 
-                if result == 0:
+            for port, result in zip(required_ports, results):
+                if isinstance(result, Exception):
+                    available.append(port)
+                elif result:  # True = something is listening (port in use)
+                    in_use.append(port)
+                    actions.append(f"Port {port}: In use (will recycle)")
+                else:  # False = nothing listening (port available)
+                    available.append(port)
+        else:
+            # Fallback to threaded socket check via asyncio.to_thread
+            async def check_port_fallback(port: int) -> bool:
+                """Check if port is in use (True) or available (False)."""
+                def _sync_check() -> bool:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(0.5)
+                        result = sock.connect_ex(('localhost', port))
+                        sock.close()
+                        return result == 0  # 0 = connected = port in use
+                    except Exception:
+                        return False  # Error = assume available
+
+                return await asyncio.to_thread(_sync_check)
+
+            results = await asyncio.gather(
+                *[check_port_fallback(port) for port in required_ports],
+                return_exceptions=True
+            )
+
+            for port, result in zip(required_ports, results):
+                if isinstance(result, Exception):
+                    available.append(port)
+                elif result:  # True = in use
                     in_use.append(port)
                     actions.append(f"Port {port}: In use (will recycle)")
                 else:
                     available.append(port)
-            except Exception:
-                available.append(port)
 
         return available, in_use, actions
 
@@ -50543,21 +50582,35 @@ class HotReloadWatcher:
 
     async def _is_react_dev_server_running(self) -> bool:
         """
-        Check if React dev server is running.
+        Check if React dev server is running using non-blocking async check.
         If it is, we don't need to trigger rebuilds - React HMR handles it.
         """
         if self._react_dev_server_running is not None:
             return self._react_dev_server_running
 
-        import socket
-
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(('localhost', self.frontend_dev_server_port))
-            sock.close()
+            # Use async_check_port for non-blocking socket check
+            if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                is_running = await async_check_port(
+                    "localhost",
+                    self.frontend_dev_server_port,
+                    timeout=1.0
+                )
+            else:
+                # Fallback to asyncio.to_thread for blocking socket check
+                def _sync_check() -> bool:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(1)
+                        result = sock.connect_ex(('localhost', self.frontend_dev_server_port))
+                        sock.close()
+                        return result == 0
+                    except Exception:
+                        return False
 
-            self._react_dev_server_running = (result == 0)
+                is_running = await asyncio.to_thread(_sync_check)
+
+            self._react_dev_server_running = is_running
 
             if self._react_dev_server_running:
                 self.logger.info(f"🌐 React dev server detected on port {self.frontend_dev_server_port} - HMR active")
@@ -56731,6 +56784,7 @@ class JarvisSystemKernel:
             # =====================================================================
             # v180.0: PORT-IN-USE FALLBACK STRATEGY
             # If primary port allocation fails, try alternate ports before failing.
+            # Uses async parallel port checks for non-blocking operation.
             # =====================================================================
             if not results.get("DynamicPortManager", False):
                 self.logger.warning("[Kernel] Primary port allocation failed, trying fallback ports...")
@@ -56743,29 +56797,54 @@ class JarvisSystemKernel:
                     port_start + 50,  # Try 8050
                 ]
 
+                # Filter to valid ports
+                valid_fallback_ports = [p for p in fallback_ports if p <= port_end]
+
+                # Check all fallback ports in parallel using async
+                if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                    # Parallel async port checks
+                    port_checks = await asyncio.gather(
+                        *[async_check_port("localhost", port, timeout=1.0) for port in valid_fallback_ports],
+                        return_exceptions=True
+                    )
+                else:
+                    # Fallback to asyncio.to_thread for each port
+                    async def _check_port_fallback(port: int) -> bool:
+                        def _sync_check() -> bool:
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                sock.settimeout(1.0)
+                                result = sock.connect_ex(('localhost', port))
+                                sock.close()
+                                return result == 0  # True = in use
+                            except Exception:
+                                return False  # Assume available on error
+
+                        return await asyncio.to_thread(_sync_check)
+
+                    port_checks = await asyncio.gather(
+                        *[_check_port_fallback(port) for port in valid_fallback_ports],
+                        return_exceptions=True
+                    )
+
+                # Find first available port
                 port_found = False
-                for fallback_port in fallback_ports:
-                    if fallback_port > port_end:
-                        continue
-
-                    # Check if port is available
-                    try:
-                        import socket
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(1.0)
-                        result = sock.connect_ex(('localhost', fallback_port))
-                        sock.close()
-
-                        if result != 0:  # Port is available (connection refused = nothing listening)
-                            self.config.backend_port = fallback_port
-                            port_manager.selected_port = fallback_port
-                            self.logger.success(f"[Kernel] Fallback port allocated: {fallback_port}")
-                            port_found = True
-                            break
-                        else:
-                            self.logger.debug(f"[Kernel] Fallback port {fallback_port} in use")
-                    except Exception as port_err:
-                        self.logger.debug(f"[Kernel] Port check error for {fallback_port}: {port_err}")
+                for fallback_port, is_in_use in zip(valid_fallback_ports, port_checks):
+                    if isinstance(is_in_use, Exception):
+                        # On error, try this port (optimistic)
+                        self.config.backend_port = fallback_port
+                        port_manager.selected_port = fallback_port
+                        self.logger.success(f"[Kernel] Fallback port allocated: {fallback_port}")
+                        port_found = True
+                        break
+                    elif not is_in_use:  # False = nothing listening = available
+                        self.config.backend_port = fallback_port
+                        port_manager.selected_port = fallback_port
+                        self.logger.success(f"[Kernel] Fallback port allocated: {fallback_port}")
+                        port_found = True
+                        break
+                    else:
+                        self.logger.debug(f"[Kernel] Fallback port {fallback_port} in use")
 
                 if not port_found:
                     self.logger.error("[Kernel] Failed to allocate any port (all in use)")
@@ -56920,17 +56999,33 @@ class JarvisSystemKernel:
             return False
 
     async def _wait_for_backend_health(self, timeout: float = 60.0) -> bool:
-        """Wait for backend to respond to health checks."""
+        """Wait for backend to respond to health checks using non-blocking async."""
         if not AIOHTTP_AVAILABLE:
-            # Simple socket check
+            # Simple socket check using async_check_port
             start_time = time.time()
             while (time.time() - start_time) < timeout:
                 try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(1.0)
-                    result = sock.connect_ex(('localhost', self.config.backend_port))
-                    sock.close()
-                    if result == 0:
+                    if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                        is_listening = await async_check_port(
+                            "localhost",
+                            self.config.backend_port,
+                            timeout=1.0
+                        )
+                    else:
+                        # Fallback to asyncio.to_thread
+                        def _sync_check() -> bool:
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                sock.settimeout(1.0)
+                                result = sock.connect_ex(('localhost', self.config.backend_port))
+                                sock.close()
+                                return result == 0
+                            except Exception:
+                                return False
+
+                        is_listening = await asyncio.to_thread(_sync_check)
+
+                    if is_listening:
                         return True
                 except Exception:
                     pass
@@ -59023,18 +59118,34 @@ class JarvisSystemKernel:
                             else:
                                 last_error = f"HTTP {resp.status}"
                 else:
-                    # Fallback socket check
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(timeout_per_request)
-                    result = sock.connect_ex(('localhost', port))
-                    sock.close()
-                    if result == 0:
+                    # Fallback socket check using async_check_port
+                    if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                        is_listening = await async_check_port(
+                            "localhost",
+                            port,
+                            timeout=timeout_per_request
+                        )
+                    else:
+                        # Fallback to asyncio.to_thread for blocking socket check
+                        def _sync_check() -> bool:
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                sock.settimeout(timeout_per_request)
+                                result = sock.connect_ex(('localhost', port))
+                                sock.close()
+                                return result == 0
+                            except Exception:
+                                return False
+
+                        is_listening = await asyncio.to_thread(_sync_check)
+
+                    if is_listening:
                         elapsed = time.time() - start_time
                         self.logger.info(
                             f"[LoadingServer] Port ready after {attempt} attempts ({elapsed:.2f}s)"
                         )
                         return True
-                    last_error = f"connect_ex={result}"
+                    last_error = "port not ready"
 
             except aiohttp.ClientConnectorError:
                 last_error = "connection refused"
@@ -59329,19 +59440,34 @@ class JarvisSystemKernel:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            # Wait for frontend to be ready
+            # Wait for frontend to be ready using non-blocking socket check
             deadline = time.time() + 120.0  # 2 minute timeout
             check_interval = 3.0
 
             while time.time() < deadline:
                 try:
-                    # Socket check
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(2.0)
-                    result = sock.connect_ex(('localhost', frontend_port))
-                    sock.close()
+                    # Non-blocking socket check
+                    if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                        is_ready = await async_check_port(
+                            "localhost",
+                            frontend_port,
+                            timeout=2.0
+                        )
+                    else:
+                        # Fallback to asyncio.to_thread
+                        def _sync_check() -> bool:
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                sock.settimeout(2.0)
+                                result = sock.connect_ex(('localhost', frontend_port))
+                                sock.close()
+                                return result == 0
+                            except Exception:
+                                return False
 
-                    if result == 0:
+                        is_ready = await asyncio.to_thread(_sync_check)
+
+                    if is_ready:
                         self.logger.success(
                             f"[Frontend] Ready on port {frontend_port} "
                             f"(PID: {self._frontend_process.pid})"
@@ -61106,18 +61232,34 @@ class JarvisSystemKernel:
 
         start_time = time.time()
 
+        # Helper for non-blocking port check
+        async def _async_port_check(host: str, port: int, timeout: float = 5.0) -> bool:
+            """Non-blocking port check using async_check_port or fallback."""
+            if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                return await async_check_port(host, port, timeout=timeout)
+            else:
+                # Fallback to asyncio.to_thread
+                def _sync_check() -> bool:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(timeout)
+                        result = sock.connect_ex((host, port))
+                        sock.close()
+                        return result == 0
+                    except Exception:
+                        return False
+
+                return await asyncio.to_thread(_sync_check)
+
         # Define service checks
         async def check_backend() -> Dict[str, Any]:
             port = self.config.backend_port
             status: Dict[str, Any] = {"healthy": False, "name": "backend"}
             try:
-                # Socket check
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5.0)
-                conn_result = sock.connect_ex(('localhost', port))
-                sock.close()
+                # Non-blocking socket check
+                port_open = await _async_port_check("localhost", port, timeout=5.0)
 
-                if conn_result == 0:
+                if port_open:
                     # HTTP health check
                     if AIOHTTP_AVAILABLE and aiohttp is not None:
                         async with aiohttp.ClientSession() as session:
@@ -61147,11 +61289,9 @@ class JarvisSystemKernel:
                 status["note"] = "WebSocket port not configured"
                 return status
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5.0)
-                conn_result = sock.connect_ex(('localhost', port))
-                sock.close()
-                status["healthy"] = conn_result == 0
+                # Non-blocking socket check
+                port_open = await _async_port_check("localhost", port, timeout=5.0)
+                status["healthy"] = port_open
                 if not status["healthy"]:
                     status["error"] = f"Port {port} not open"
             except Exception as e:
@@ -61165,11 +61305,9 @@ class JarvisSystemKernel:
                 return status
             port = self.config.prime_api_port
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5.0)
-                conn_result = sock.connect_ex(('localhost', port))
-                sock.close()
-                status["healthy"] = conn_result == 0
+                # Non-blocking socket check
+                port_open = await _async_port_check("localhost", port, timeout=5.0)
+                status["healthy"] = port_open
                 if not status["healthy"]:
                     status["note"] = f"Prime not responding on port {port}"
             except Exception as e:
@@ -61183,11 +61321,9 @@ class JarvisSystemKernel:
                 return status
             port = self.config.reactor_api_port
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5.0)
-                conn_result = sock.connect_ex(('localhost', port))
-                sock.close()
-                status["healthy"] = conn_result == 0
+                # Non-blocking socket check
+                port_open = await _async_port_check("localhost", port, timeout=5.0)
+                status["healthy"] = port_open
                 if not status["healthy"]:
                     status["note"] = f"Reactor not responding on port {port}"
             except Exception as e:
@@ -61430,21 +61566,33 @@ class JarvisSystemKernel:
         return result
 
     async def _check_network_availability(self) -> Dict[str, Any]:
-        """Check network connectivity."""
+        """Check network connectivity using non-blocking socket operations."""
         result: Dict[str, Any] = {"passed": True}
 
-        # Check if we can bind to localhost
-        test_port = 0  # Let OS assign a port
+        # Check if we can bind to localhost - run in thread to avoid blocking
+        def _sync_bind_check() -> Tuple[bool, int, Optional[str]]:
+            """Blocking socket bind check - runs in thread."""
+            test_port = 0  # Let OS assign a port
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind(('localhost', test_port))
+                assigned_port = sock.getsockname()[1]
+                sock.close()
+                return True, assigned_port, None
+            except socket.error as e:
+                return False, 0, str(e)
+
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind(('localhost', test_port))
-            assigned_port = sock.getsockname()[1]
-            sock.close()
-            result["localhost_binding"] = True
-            result["test_port"] = assigned_port
-        except socket.error as e:
+            success, assigned_port, error = await asyncio.to_thread(_sync_bind_check)
+            if success:
+                result["localhost_binding"] = True
+                result["test_port"] = assigned_port
+            else:
+                result["passed"] = False
+                result["error"] = f"Cannot bind to localhost: {error}"
+        except Exception as e:
             result["passed"] = False
-            result["error"] = f"Cannot bind to localhost: {e}"
+            result["error"] = f"Network check failed: {e}"
 
         return result
 
@@ -61776,7 +61924,7 @@ class JarvisSystemKernel:
             services.append(("websocket", f"ws://localhost:{self.config.websocket_port}"))
 
         async def check_http_service(name: str, url: str) -> Dict[str, Any]:
-            """Check an HTTP service health endpoint."""
+            """Check an HTTP service health endpoint using non-blocking operations."""
             start_time = time.time()
             try:
                 if AIOHTTP_AVAILABLE and aiohttp is not None:
@@ -61790,21 +61938,33 @@ class JarvisSystemKernel:
                                 "latency_ms": round(latency, 2),
                             }
                 else:
-                    # Socket-based check
+                    # Non-blocking socket-based check
                     from urllib.parse import urlparse
                     parsed = urlparse(url)
                     host = parsed.hostname or 'localhost'
                     port = parsed.port or 80
 
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(timeout)
-                    result = sock.connect_ex((host, port))
-                    sock.close()
+                    # Use async_check_port for non-blocking check
+                    if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                        is_healthy = await async_check_port(host, port, timeout=timeout)
+                    else:
+                        # Fallback to asyncio.to_thread
+                        def _sync_check() -> bool:
+                            try:
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                sock.settimeout(timeout)
+                                result = sock.connect_ex((host, port))
+                                sock.close()
+                                return result == 0
+                            except Exception:
+                                return False
+
+                        is_healthy = await asyncio.to_thread(_sync_check)
 
                     latency = (time.time() - start_time) * 1000
                     return {
                         "name": name,
-                        "healthy": result == 0,
+                        "healthy": is_healthy,
                         "latency_ms": round(latency, 2),
                     }
 
@@ -61842,7 +62002,7 @@ class JarvisSystemKernel:
         """
         Verify backend is fully ready (not just port open).
 
-        Uses progressive health checks with intelligent retry.
+        Uses progressive health checks with intelligent retry and non-blocking socket checks.
         """
         start_time = time.time()
         check_interval = 1.0
@@ -61850,13 +62010,28 @@ class JarvisSystemKernel:
 
         while (time.time() - start_time) < timeout:
             try:
-                # First check: Port is open
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2.0)
-                result = sock.connect_ex(('localhost', self.config.backend_port))
-                sock.close()
+                # First check: Port is open (non-blocking)
+                if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                    port_open = await async_check_port(
+                        "localhost",
+                        self.config.backend_port,
+                        timeout=2.0
+                    )
+                else:
+                    # Fallback to asyncio.to_thread
+                    def _sync_check() -> bool:
+                        try:
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            sock.settimeout(2.0)
+                            result = sock.connect_ex(('localhost', self.config.backend_port))
+                            sock.close()
+                            return result == 0
+                        except Exception:
+                            return False
 
-                if result != 0:
+                    port_open = await asyncio.to_thread(_sync_check)
+
+                if not port_open:
                     await asyncio.sleep(check_interval)
                     continue
 
@@ -61969,7 +62144,7 @@ class JarvisSystemKernel:
         repo_path: Path,
         port: int
     ) -> Dict[str, Any]:
-        """Check a single Trinity component."""
+        """Check a single Trinity component using non-blocking socket operations."""
         status = {
             "name": name,
             "repo_path": str(repo_path),
@@ -61983,14 +62158,25 @@ class JarvisSystemKernel:
             status["details"]["error"] = "Repository not found"
             return status
 
-        # Check for running process on expected port
+        # Check for running process on expected port (non-blocking)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2.0)
-            result = sock.connect_ex(('localhost', port))
-            sock.close()
+            if ASYNC_STARTUP_UTILS_AVAILABLE and async_check_port is not None:
+                port_open = await async_check_port("localhost", port, timeout=2.0)
+            else:
+                # Fallback to asyncio.to_thread
+                def _sync_check() -> bool:
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(2.0)
+                        result = sock.connect_ex(('localhost', port))
+                        sock.close()
+                        return result == 0
+                    except Exception:
+                        return False
 
-            if result == 0:
+                port_open = await asyncio.to_thread(_sync_check)
+
+            if port_open:
                 status["healthy"] = True
                 status["details"]["port_open"] = True
 
