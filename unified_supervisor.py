@@ -61033,6 +61033,16 @@ Environment Variables:
         action="store_true",
         help="Enable Spot VM provisioning",
     )
+    gcp.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Launch Cloud Monitor dashboard for Invincible Node",
+    )
+    gcp.add_argument(
+        "--monitor-logs",
+        action="store_true",
+        help="Stream live logs from Invincible Node via SSH",
+    )
 
     # =========================================================================
     # COST OPTIMIZATION
@@ -61331,6 +61341,277 @@ async def handle_cleanup() -> int:
     return 0 if result["success"] else 1
 
 
+# =============================================================================
+# CLOUD MONITOR HANDLERS (v199.0)
+# =============================================================================
+# Provides real-time visibility into the Invincible Node from the CLI.
+# =============================================================================
+
+async def handle_cloud_monitor() -> int:
+    """
+    Handle --monitor command: Display Invincible Node dashboard.
+
+    Shows comprehensive status including:
+    - GCP instance status (RUNNING/STOPPED/etc)
+    - Static IP and health endpoint
+    - API health check results
+    - Model loading status
+    - APARS progress (if starting)
+    """
+    # Load configuration
+    config = SystemKernelConfig()
+
+    # Box drawing characters for clean output
+    BOX_TL = "╔"
+    BOX_TR = "╗"
+    BOX_BL = "╚"
+    BOX_BR = "╝"
+    BOX_H = "═"
+    BOX_V = "║"
+    BOX_SEP_L = "╠"
+    BOX_SEP_R = "╣"
+    BOX_SEP = "╬"
+
+    def box_line(text: str, width: int = 70) -> str:
+        """Create a boxed line with padding."""
+        padded = f" {text}".ljust(width - 2)
+        return f"{BOX_V}{padded}{BOX_V}"
+
+    def header(width: int = 70) -> str:
+        return f"{BOX_TL}{BOX_H * (width - 2)}{BOX_TR}"
+
+    def footer(width: int = 70) -> str:
+        return f"{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}"
+
+    def separator(width: int = 70) -> str:
+        return f"{BOX_SEP_L}{BOX_H * (width - 2)}{BOX_SEP_R}"
+
+    # ANSI colors
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+    def status_color(status: str) -> str:
+        """Get color for status."""
+        status_upper = status.upper() if status else "UNKNOWN"
+        if status_upper == "RUNNING":
+            return f"{GREEN}{status_upper}{RESET}"
+        elif status_upper in ("STOPPED", "TERMINATED", "SUSPENDED"):
+            return f"{YELLOW}{status_upper}{RESET}"
+        elif status_upper in ("NOT_FOUND", "ERROR", "UNKNOWN"):
+            return f"{RED}{status_upper}{RESET}"
+        else:
+            return f"{CYAN}{status_upper}{RESET}"
+
+    print()
+    print(f"{BOLD}{BLUE}" + header() + RESET)
+    print(f"{BOLD}{BLUE}" + box_line("☁️  JARVIS INVINCIBLE NODE MONITOR") + RESET)
+    print(f"{BOLD}{BLUE}" + separator() + RESET)
+
+    # Check if Invincible Node is configured
+    if not config.invincible_node_enabled or not config.invincible_node_static_ip_name:
+        print(box_line(f"{RED}⚠  Invincible Node is not configured{RESET}"))
+        print(box_line(""))
+        print(box_line("To enable, set in .env.gcp:"))
+        print(box_line("  JARVIS_INVINCIBLE_NODE_ENABLED=true"))
+        print(box_line("  GCP_VM_STATIC_IP_NAME=jarvis-prime-static"))
+        print(box_line(""))
+        print(box_line("Then deploy with:"))
+        print(box_line("  ./deploy_spot_node.sh"))
+        print(footer())
+        print()
+        return 1
+
+    # Get status from GCP VM Manager
+    try:
+        from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+        manager = await get_gcp_vm_manager_safe()
+
+        if not manager:
+            print(box_line(f"{RED}⚠  GCP VM Manager not available{RESET}"))
+            print(box_line("   Check GCP credentials and configuration"))
+            print(footer())
+            print()
+            return 1
+
+        status = await manager.get_invincible_node_status()
+
+    except ImportError as e:
+        print(box_line(f"{RED}⚠  GCP module import failed: {e}{RESET}"))
+        print(footer())
+        print()
+        return 1
+    except Exception as e:
+        print(box_line(f"{RED}⚠  Error getting status: {e}{RESET}"))
+        print(footer())
+        print()
+        return 1
+
+    # Display instance info
+    print(box_line(f"Instance:     {BOLD}{status['instance_name']}{RESET}"))
+    print(box_line(f"Zone:         {status['zone']}"))
+    print(box_line(f"Project:      {status['project_id']}"))
+    print(separator())
+
+    # Display GCP status
+    gcp_status = status.get("gcp_status", "UNKNOWN")
+    print(box_line(f"GCP Status:   {status_color(gcp_status)}"))
+
+    if status.get("machine_type"):
+        print(box_line(f"Machine:      {status['machine_type']}"))
+
+    if status.get("termination_action"):
+        action = status["termination_action"]
+        action_display = f"{GREEN}STOP (Invincible){RESET}" if action == "STOP" else action
+        print(box_line(f"On Preempt:   {action_display}"))
+
+    if status.get("uptime_seconds"):
+        uptime = status["uptime_seconds"]
+        hours = int(uptime // 3600)
+        minutes = int((uptime % 3600) // 60)
+        secs = int(uptime % 60)
+        print(box_line(f"Uptime:       {hours}h {minutes}m {secs}s"))
+
+    print(separator())
+
+    # Display network info
+    static_ip = status.get("static_ip")
+    port = config.invincible_node_port
+    if static_ip:
+        print(box_line(f"Static IP:    {CYAN}{static_ip}{RESET}"))
+        print(box_line(f"Health URL:   http://{static_ip}:{port}/health"))
+    else:
+        print(box_line(f"Static IP:    {RED}Not found{RESET}"))
+
+    print(separator())
+
+    # Display health check results
+    health = status.get("health", {})
+    if health:
+        reachable = health.get("reachable", False)
+        ready = health.get("ready_for_inference", False)
+
+        if reachable:
+            print(box_line(f"API Health:   {GREEN}✓ Reachable{RESET}"))
+        else:
+            print(box_line(f"API Health:   {RED}✗ Unreachable{RESET}"))
+
+        if ready:
+            print(box_line(f"Inference:    {GREEN}✓ Ready{RESET}"))
+        else:
+            api_status = health.get("status", "unknown")
+            print(box_line(f"Inference:    {YELLOW}○ {api_status}{RESET}"))
+
+        model = health.get("active_model")
+        if model:
+            print(box_line(f"Model:        {GREEN}{model}{RESET}"))
+        elif health.get("model_loaded"):
+            print(box_line(f"Model:        {GREEN}Loaded{RESET}"))
+        else:
+            print(box_line(f"Model:        {YELLOW}Not loaded{RESET}"))
+
+        # Show APARS progress if available
+        apars = health.get("apars")
+        if apars and not ready:
+            phase_name = apars.get("phase_name", "unknown")
+            progress = apars.get("total_progress", 0)
+            eta = apars.get("eta_seconds", 0)
+            print(separator())
+            print(box_line(f"{CYAN}STARTUP PROGRESS{RESET}"))
+            print(box_line(f"Phase:        {phase_name}"))
+            print(box_line(f"Progress:     {progress}%"))
+            print(box_line(f"ETA:          {eta}s"))
+    else:
+        print(box_line(f"API Health:   {YELLOW}○ No data{RESET}"))
+
+    # Display error if any
+    if status.get("error"):
+        print(separator())
+        print(box_line(f"{RED}Error: {status['error']}{RESET}"))
+
+    print(footer())
+
+    # Show quick actions
+    print()
+    print(f"{BOLD}Quick Actions:{RESET}")
+    if gcp_status in ("STOPPED", "TERMINATED", "SUSPENDED"):
+        print(f"  • Wake node:    python unified_supervisor.py (auto-wakes on startup)")
+        print(f"  • Manual wake:  gcloud compute instances start {status['instance_name']} --zone={status['zone']}")
+    elif gcp_status == "RUNNING":
+        print(f"  • View logs:    python unified_supervisor.py --monitor-logs")
+        print(f"  • Health check: curl http://{static_ip}:{port}/health")
+    elif gcp_status == "NOT_FOUND":
+        print(f"  • Deploy node:  ./deploy_spot_node.sh")
+
+    print()
+    return 0
+
+
+async def handle_cloud_monitor_logs() -> int:
+    """
+    Handle --monitor-logs command: Stream logs from Invincible Node.
+
+    Uses SSH to tail the startup/runtime logs from the cloud VM.
+    """
+    config = SystemKernelConfig()
+
+    print()
+    print("\033[1m\033[94m" + "═" * 70 + "\033[0m")
+    print("\033[1m\033[94m  ☁️  JARVIS INVINCIBLE NODE - LIVE LOGS\033[0m")
+    print("\033[1m\033[94m" + "═" * 70 + "\033[0m")
+    print()
+
+    if not config.invincible_node_enabled:
+        print("\033[91m⚠  Invincible Node is not configured\033[0m")
+        return 1
+
+    try:
+        from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+        manager = await get_gcp_vm_manager_safe()
+
+        if not manager:
+            print("\033[91m⚠  GCP VM Manager not available\033[0m")
+            return 1
+
+        # Check if node is running
+        status, _ = await manager._describe_instance(config.invincible_node_instance_name)
+        if status != "RUNNING":
+            print(f"\033[91m⚠  Node is {status} - cannot stream logs\033[0m")
+            print(f"   Start the node first, then retry.")
+            return 1
+
+        print(f"Instance:  {config.invincible_node_instance_name}")
+        print(f"Zone:      {config.gcp_zone}")
+        print(f"Log file:  /var/log/jarvis-startup.log")
+        print()
+        print("\033[93mPress Ctrl+C to stop streaming\033[0m")
+        print("-" * 70)
+        print()
+
+        # Stream logs
+        await manager.stream_invincible_node_logs(
+            log_path="/var/log/jarvis-startup.log",
+            lines=50,
+        )
+
+        return 0
+
+    except KeyboardInterrupt:
+        print()
+        print("\033[93mLog streaming stopped.\033[0m")
+        return 0
+    except ImportError as e:
+        print(f"\033[91m⚠  GCP module import failed: {e}\033[0m")
+        return 1
+    except Exception as e:
+        print(f"\033[91m⚠  Error streaming logs: {e}\033[0m")
+        return 1
+
+
 async def handle_single_task(
     task_goal: str,
     task_mode: str,
@@ -61572,6 +61853,13 @@ async def async_main(args: argparse.Namespace) -> int:
 
     if args.shutdown:
         return await handle_shutdown()
+
+    # Handle cloud monitor commands
+    if args.monitor:
+        return await handle_cloud_monitor()
+
+    if args.monitor_logs:
+        return await handle_cloud_monitor_logs()
 
     if args.cleanup:
         return await handle_cleanup()

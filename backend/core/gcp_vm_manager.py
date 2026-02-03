@@ -3365,6 +3365,255 @@ class GCPVMManager:
         """Check if static VM (Invincible Node) mode is configured."""
         return bool(self.config.static_ip_name)
 
+    # =========================================================================
+    # CLOUD MONITOR: CLI Monitoring Suite
+    # =========================================================================
+    # These methods provide real-time visibility into the Invincible Node
+    # for the unified_supervisor.py --monitor CLI mode.
+    # =========================================================================
+
+    async def get_invincible_node_status(self) -> Dict[str, Any]:
+        """
+        Get comprehensive status of the Invincible Node for monitoring dashboard.
+
+        Returns:
+            Dict with:
+            - instance_name: str
+            - zone: str
+            - project_id: str
+            - static_ip: str or None
+            - gcp_status: RUNNING/STOPPED/TERMINATED/NOT_FOUND/ERROR
+            - machine_type: str or None
+            - uptime_seconds: float or None
+            - termination_action: str or None
+            - health: dict with HTTP health check results
+            - error: str or None
+        """
+        result = {
+            "instance_name": self.config.static_instance_name,
+            "zone": self.config.zone,
+            "project_id": self.config.project_id,
+            "static_ip": None,
+            "gcp_status": "UNKNOWN",
+            "machine_type": None,
+            "uptime_seconds": None,
+            "termination_action": None,
+            "created_at": None,
+            "health": None,
+            "error": None,
+        }
+
+        if not self.is_static_vm_mode:
+            result["error"] = "Invincible Node not configured (GCP_VM_STATIC_IP_NAME not set)"
+            return result
+
+        # Get static IP address
+        try:
+            static_ip = await self._get_static_ip_address(self.config.static_ip_name)
+            result["static_ip"] = static_ip
+        except Exception as e:
+            result["error"] = f"Failed to get static IP: {e}"
+
+        # Get instance details from GCP
+        try:
+            instance = await asyncio.to_thread(
+                self.instances_client.get,
+                project=self.config.project_id,
+                zone=self.config.zone,
+                instance=self.config.static_instance_name,
+            )
+
+            result["gcp_status"] = instance.status
+            result["machine_type"] = instance.machine_type.split("/")[-1] if instance.machine_type else None
+
+            # Extract scheduling info
+            if instance.scheduling:
+                result["termination_action"] = instance.scheduling.instance_termination_action
+
+            # Calculate uptime if running
+            if instance.status == "RUNNING" and instance.last_start_timestamp:
+                try:
+                    from datetime import datetime as dt
+                    # Parse GCP timestamp (RFC3339)
+                    start_time = dt.fromisoformat(instance.last_start_timestamp.replace("Z", "+00:00"))
+                    result["uptime_seconds"] = (dt.now(start_time.tzinfo) - start_time).total_seconds()
+                except Exception:
+                    pass
+
+            # Get creation time
+            if instance.creation_timestamp:
+                result["created_at"] = instance.creation_timestamp
+
+        except Exception as e:
+            error_str = str(e).lower()
+            if "404" in error_str or "not found" in error_str:
+                result["gcp_status"] = "NOT_FOUND"
+            else:
+                result["gcp_status"] = "ERROR"
+                result["error"] = str(e)
+
+        # Perform health check if we have a static IP
+        if result["static_ip"]:
+            port = int(os.environ.get("JARVIS_PRIME_PORT", "8000"))
+            is_healthy, health_data = await self._ping_health_endpoint(
+                result["static_ip"], port, timeout=10.0
+            )
+            result["health"] = {
+                "reachable": is_healthy or "error" not in health_data or health_data.get("error") != "timeout",
+                "ready_for_inference": health_data.get("ready_for_inference", False),
+                "status": health_data.get("status", "unknown"),
+                "model_loaded": health_data.get("model_loaded", False),
+                "active_model": health_data.get("active_model"),
+                "apars": health_data.get("apars"),
+                "raw": health_data,
+            }
+
+        return result
+
+    def get_ssh_logs_command(
+        self,
+        log_path: str = "/var/log/jarvis-startup.log",
+        lines: int = 50,
+        follow: bool = True,
+    ) -> List[str]:
+        """
+        Construct the gcloud SSH command to tail logs from the Invincible Node.
+
+        Args:
+            log_path: Path to the log file on the VM
+            lines: Number of lines to show initially
+            follow: Whether to follow (tail -f) the log
+
+        Returns:
+            List of command arguments for subprocess
+        """
+        instance_name = self.config.static_instance_name
+        zone = self.config.zone
+        project = self.config.project_id
+
+        tail_cmd = f"tail -n {lines}"
+        if follow:
+            tail_cmd += " -f"
+        tail_cmd += f" {log_path}"
+
+        return [
+            "gcloud", "compute", "ssh",
+            instance_name,
+            f"--zone={zone}",
+            f"--project={project}",
+            "--command", tail_cmd,
+        ]
+
+    async def stream_invincible_node_logs(
+        self,
+        log_path: str = "/var/log/jarvis-startup.log",
+        lines: int = 50,
+        callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """
+        Stream logs from the Invincible Node via SSH.
+
+        Args:
+            log_path: Path to the log file on the VM
+            lines: Number of initial lines to show
+            callback: Optional callback for each line (if None, prints to stdout)
+        """
+        import subprocess
+
+        cmd = self.get_ssh_logs_command(log_path, lines, follow=True)
+
+        logger.info(f"[CloudMonitor] Streaming logs: {' '.join(cmd)}")
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        try:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                if callback:
+                    callback(decoded)
+                else:
+                    print(decoded)
+        except asyncio.CancelledError:
+            process.terminate()
+            raise
+        finally:
+            if process.returncode is None:
+                process.terminate()
+
+    async def wake_invincible_node(self) -> Tuple[bool, str]:
+        """
+        Wake up the Invincible Node if it's stopped.
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self.is_static_vm_mode:
+            return False, "Invincible Node not configured"
+
+        # Get current status
+        status, error = await self._describe_instance(self.config.static_instance_name)
+
+        if status == "RUNNING":
+            return True, "Node is already running"
+
+        if status in ("STOPPED", "TERMINATED", "SUSPENDED"):
+            success, err = await self._start_instance(self.config.static_instance_name)
+            if success:
+                return True, f"Node started successfully (was {status})"
+            return False, f"Failed to start node: {err}"
+
+        if status == "NOT_FOUND":
+            return False, "Node does not exist. Run ./deploy_spot_node.sh first"
+
+        return False, f"Node in unexpected state: {status}"
+
+    async def stop_invincible_node(self) -> Tuple[bool, str]:
+        """
+        Stop the Invincible Node (to save costs).
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self.is_static_vm_mode:
+            return False, "Invincible Node not configured"
+
+        instance_name = self.config.static_instance_name
+
+        # Get current status
+        status, error = await self._describe_instance(instance_name)
+
+        if status in ("STOPPED", "TERMINATED", "SUSPENDED"):
+            return True, f"Node is already {status}"
+
+        if status == "NOT_FOUND":
+            return False, "Node does not exist"
+
+        if status != "RUNNING":
+            return False, f"Node in unexpected state: {status}"
+
+        try:
+            logger.info(f"[CloudMonitor] Stopping node: {instance_name}")
+
+            operation = await asyncio.to_thread(
+                self.instances_client.stop,
+                project=self.config.project_id,
+                zone=self.config.zone,
+                instance=instance_name,
+            )
+
+            await self._wait_for_operation(operation, timeout=120)
+            return True, "Node stopped successfully"
+
+        except Exception as e:
+            return False, f"Failed to stop node: {e}"
+
 
 # ============================================================================
 # SINGLETON MANAGEMENT
