@@ -79,7 +79,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -632,15 +632,24 @@ _DEFAULT_STARTUP_HARD_CAP = 900.0
 # =============================================================================
 
 
-class StartupMetricsHistory:
+@runtime_checkable
+class StartupMetricsHistory(Protocol):
     """
-    Protocol/interface for startup metrics history.
+    Protocol for startup metrics history.
 
     This is an optional dependency for StartupTimeoutCalculator that provides
     historical timing data for adaptive timeout calculations.
 
     Implementations should track p95 (95th percentile) timings for each
     startup phase to enable data-driven timeout adjustments.
+
+    Example implementation:
+        class MyMetricsHistory:
+            def has(self, phase: str) -> bool:
+                return phase in self._data
+
+            def get_p95(self, phase: str) -> Optional[float]:
+                return self._data.get(phase)
     """
 
     def has(self, phase: str) -> bool:
@@ -653,7 +662,7 @@ class StartupMetricsHistory:
         Returns:
             True if historical data exists for this phase
         """
-        raise NotImplementedError
+        ...
 
     def get_p95(self, phase: str) -> Optional[float]:
         """
@@ -665,7 +674,7 @@ class StartupMetricsHistory:
         Returns:
             P95 timing in seconds, or None if no data
         """
-        raise NotImplementedError
+        ...
 
 
 # =============================================================================
