@@ -18,7 +18,9 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -286,6 +288,134 @@ class VoiceCoalescer:
             count=len(dominant_msgs),
             latest=dominant_msgs[-1].text[:50],
         )
+
+
+class SerializedSpeaker:
+    """
+    Serialized voice speaker with exclusive lock.
+
+    Guarantees:
+    - Only one voice plays at a time
+    - Lock held for FULL play-through (not just enqueue)
+    - Interruptible via stop_playback()
+    - Non-blocking event loop (TTS runs in executor)
+    """
+
+    def __init__(self, tts_callback: Optional[Callable[[str], Awaitable[None]]] = None):
+        """
+        Initialize speaker.
+
+        Args:
+            tts_callback: Async function to synthesize and play speech
+        """
+        self._tts_callback = tts_callback
+        self._playback_lock = asyncio.Lock()
+
+        # Stop signaling
+        self._stop_event = threading.Event()
+        self._current_task: Optional[asyncio.Task] = None
+
+        # Executor for blocking TTS
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
+
+        # Metrics
+        self._spoken_count = 0
+        self._interrupt_count = 0
+        self._last_spoken_at: Optional[float] = None
+
+    async def speak(self, text: str, timeout_s: Optional[float] = None) -> bool:
+        """
+        Speak text with exclusive lock held for full duration.
+
+        Args:
+            text: Text to speak
+            timeout_s: Max time for playback (default from env)
+
+        Returns:
+            True if completed, False if timeout/interrupted
+        """
+        timeout_s = timeout_s or float(os.environ.get("VOICE_PLAYBACK_TIMEOUT_S", "30"))
+
+        async with self._playback_lock:
+            self._stop_event.clear()
+
+            if not self._tts_callback:
+                # No TTS - just pretend
+                self._spoken_count += 1
+                self._last_spoken_at = time.time()
+                return True
+
+            # Create the task
+            tts_task = asyncio.create_task(self._tts_callback(text))
+            self._current_task = tts_task
+
+            try:
+                # Wait with timeout (don't use wait_for - it cancels)
+                done, pending = await asyncio.wait(
+                    [tts_task],
+                    timeout=timeout_s,
+                )
+
+                if pending:
+                    # Timeout - cancel the task
+                    self._stop_event.set()
+                    tts_task.cancel()
+                    try:
+                        await tts_task
+                    except asyncio.CancelledError:
+                        pass
+                    return False
+
+                self._spoken_count += 1
+                self._last_spoken_at = time.time()
+                return True
+
+            except asyncio.CancelledError:
+                tts_task.cancel()
+                try:
+                    await tts_task
+                except asyncio.CancelledError:
+                    pass
+                raise
+            finally:
+                self._current_task = None
+
+    async def stop_playback(self, timeout_s: float = 2.0) -> bool:
+        """
+        Request stop of current playback.
+
+        Returns True if stopped cleanly, False if timeout.
+        """
+        self._stop_event.set()
+        self._interrupt_count += 1
+
+        if self._current_task:
+            self._current_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._current_task),
+                    timeout=timeout_s,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
+        return True
+
+    def is_stop_requested(self) -> bool:
+        """Check if stop was requested (for TTS implementations)."""
+        return self._stop_event.is_set()
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get speaker metrics."""
+        return {
+            "spoken_count": self._spoken_count,
+            "interrupt_count": self._interrupt_count,
+            "last_spoken_at": self._last_spoken_at,
+        }
+
+    async def shutdown(self) -> None:
+        """Shutdown speaker and executor."""
+        self._executor.shutdown(wait=False)
 
 
 class VoiceOrchestrator:
