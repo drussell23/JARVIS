@@ -62009,6 +62009,12 @@ Environment Variables:
         action="store_true",
         help="Display Reactor-Core component status dashboard",
     )
+
+    trinity.add_argument(
+        "--monitor-trinity",
+        action="store_true",
+        help="Display unified Trinity status dashboard (Prime + Reactor + Invincible)",
+    )
     # =========================================================================
     # DEVELOPMENT
     # =========================================================================
@@ -63007,6 +63013,161 @@ async def handle_monitor_reactor() -> int:
 
 
 
+
+async def handle_monitor_trinity() -> int:
+    """
+    Handle --monitor-trinity command: Unified Trinity dashboard.
+
+    v201.1: Shows Prime, Reactor, and Invincible Node status in one view.
+    """
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+    BOX_TL, BOX_TR, BOX_BL, BOX_BR = "\u2554", "\u2557", "\u255a", "\u255d"
+    BOX_H, BOX_V = "\u2550", "\u2551"
+    BOX_SEP_L, BOX_SEP_R = "\u2560", "\u2563"
+
+    def box_line(text: str, width: int = 70) -> str:
+        padded = f" {text}".ljust(width - 2)
+        return f"{BOX_V}{padded}{BOX_V}"
+
+    def header(width: int = 70) -> str:
+        return f"{BOX_TL}{BOX_H * (width - 2)}{BOX_TR}"
+
+    def footer(width: int = 70) -> str:
+        return f"{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}"
+
+    def separator(width: int = 70) -> str:
+        return f"{BOX_SEP_L}{BOX_H * (width - 2)}{BOX_SEP_R}"
+
+    def section_header(title: str, width: int = 70) -> str:
+        dash = '\u2500'
+
+    print()
+    print(f"{BOLD}{BLUE}" + header() + RESET)
+    print(f"{BOLD}{BLUE}" + box_line("TRINITY UNIFIED STATUS MONITOR") + RESET)
+    print(f"{BOLD}{BLUE}" + separator() + RESET)
+
+    # Try IPC
+    socket_path = Path.home() / ".jarvis" / "locks" / "kernel.sock"
+    ipc_result = None
+    kernel_running = False
+
+    if socket_path.exists():
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            request = json.dumps({"command": "status"}) + "\n"
+            writer.write(request.encode())
+            await writer.drain()
+            response_data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            response = json.loads(response_data.decode())
+            writer.close()
+            await writer.wait_closed()
+
+            if response.get("success"):
+                ipc_result = response.get("result", {})
+                kernel_running = True
+        except Exception:
+            pass
+
+    # Kernel status
+    if kernel_running:
+        state = ipc_result.get("state", "unknown")
+        uptime = ipc_result.get("uptime_seconds", 0)
+        uptime_str = f"{int(uptime // 60)}m {int(uptime % 60)}s"
+        print(box_line(f"Kernel:       {GREEN}{state}{RESET} (uptime: {uptime_str})"))
+    else:
+        print(box_line(f"Kernel:       {YELLOW}Not running{RESET}"))
+
+    trinity_status = ipc_result.get("trinity", {}) if ipc_result else {}
+    invincible_status = ipc_result.get("invincible_node", {}) if ipc_result else {}
+
+    # Prime section
+    print(section_header("J-Prime"))
+    prime_data = trinity_status.get("components", {}).get("jarvis-prime", {})
+    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", "8000"))
+
+    if prime_data:
+        running = prime_data.get("running", False)
+        healthy = prime_data.get("healthy", False)
+        state = prime_data.get("state", "unknown")
+        status_icon = f"{GREEN}*{RESET}" if healthy else (f"{YELLOW}*{RESET}" if running else f"{RED}*{RESET}")
+        print(box_line(f"{status_icon} State: {state}  |  Port: {prime_port}  |  PID: {prime_data.get('pid', '-')}"))
+    else:
+        print(box_line(f"{DIM}Not configured or kernel not running{RESET}"))
+
+    # Reactor section
+    print(section_header("Reactor-Core"))
+    reactor_data = trinity_status.get("components", {}).get("reactor-core", {})
+    reactor_port = int(os.getenv("TRINITY_REACTOR_PORT", "8090"))
+
+    if reactor_data:
+        running = reactor_data.get("running", False)
+        healthy = reactor_data.get("healthy", False)
+        state = reactor_data.get("state", "unknown")
+        status_icon = f"{GREEN}*{RESET}" if healthy else (f"{YELLOW}*{RESET}" if running else f"{RED}*{RESET}")
+        print(box_line(f"{status_icon} State: {state}  |  Port: {reactor_port}  |  PID: {reactor_data.get('pid', '-')}"))
+    else:
+        print(box_line(f"{DIM}Not configured or kernel not running{RESET}"))
+
+    # Invincible Node section
+    print(section_header("Invincible Node"))
+    config = SystemKernelConfig()
+
+    if config.invincible_node_enabled:
+        inv_status_data = invincible_status.get("status", {})
+        if inv_status_data:
+            gcp_status = inv_status_data.get("gcp_status", "UNKNOWN")
+            static_ip = inv_status_data.get("static_ip", "N/A")
+            health = inv_status_data.get("health", {})
+            ready = health.get("ready_for_inference", False)
+
+            if gcp_status == "RUNNING" and ready:
+                status_icon = f"{GREEN}*{RESET}"
+            elif gcp_status == "RUNNING":
+                status_icon = f"{YELLOW}*{RESET}"
+            else:
+                status_icon = f"{RED}*{RESET}"
+
+            print(box_line(f"{status_icon} GCP: {gcp_status}  |  IP: {static_ip}  |  Inference: {'Ready' if ready else 'Not ready'}"))
+        else:
+            print(box_line(f"{YELLOW}*{RESET} Enabled but no status data (run --monitor for details)"))
+    else:
+        print(box_line(f"{DIM}Disabled{RESET}"))
+
+    # Overall health summary
+    print(separator())
+    all_healthy = True
+    if prime_data and not prime_data.get("healthy"):
+        all_healthy = False
+    if reactor_data and not reactor_data.get("healthy"):
+        all_healthy = False
+
+    if all_healthy and kernel_running:
+        print(box_line(f"{GREEN}Trinity System: All components healthy{RESET}"))
+    elif kernel_running:
+        print(box_line(f"{YELLOW}Trinity System: Some components degraded{RESET}"))
+    else:
+        print(box_line(f"{DIM}Cannot determine health - kernel not running{RESET}"))
+
+    print(footer())
+
+    print()
+    print(f"{BOLD}Component Dashboards:{RESET}")
+    print(f"  - J-Prime:     python unified_supervisor.py --monitor-prime")
+    print(f"  - Reactor:     python unified_supervisor.py --monitor-reactor")
+    print(f"  - Invincible:  python unified_supervisor.py --monitor")
+    print()
+
+    return 0
+
+
 async def handle_single_task(
     task_goal: str,
     task_mode: str,
@@ -63275,6 +63436,11 @@ async def async_main(args: argparse.Namespace) -> int:
     # Handle --monitor-reactor
     if args.monitor_reactor:
         return await handle_monitor_reactor()
+
+    # Handle --monitor-trinity
+    if args.monitor_trinity:
+        return await handle_monitor_trinity()
+
     if args.cleanup:
         return await handle_cleanup()
 
