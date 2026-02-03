@@ -782,12 +782,13 @@ except ImportError:
 # These prevent event loop blocking during startup/shutdown operations.
 # =============================================================================
 try:
-    from backend.utils.async_startup import async_psutil_wait, async_process_wait
+    from backend.utils.async_startup import async_psutil_wait, async_process_wait, async_subprocess_run
     ASYNC_STARTUP_UTILS_AVAILABLE = True
 except ImportError:
     ASYNC_STARTUP_UTILS_AVAILABLE = False
     async_psutil_wait = None
     async_process_wait = None
+    async_subprocess_run = None
 
 # =============================================================================
 # v203.0: CENTRALIZED TIMEOUT CONFIGURATION
@@ -14307,17 +14308,32 @@ class ParallelProcessCleaner:
             return 0
 
         try:
-            result = subprocess.run(
-                ["lsof", str(lock_file)],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+            # v204.0: Use async subprocess wrapper to avoid blocking the event loop
+            if ASYNC_STARTUP_UTILS_AVAILABLE and async_subprocess_run is not None:
+                result = await async_subprocess_run(
+                    ["lsof", str(lock_file)],
+                    timeout=5.0
+                )
+                if result.returncode != 0:
+                    return 0
+                stdout_text = result.stdout.decode() if result.stdout else ""
+            else:
+                # Fallback to blocking subprocess.run if async utils unavailable
+                loop = asyncio.get_running_loop()
+                sync_result = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        ["lsof", str(lock_file)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                )
+                if sync_result.returncode != 0:
+                    return 0
+                stdout_text = sync_result.stdout or ""
 
-            if result.returncode != 0:
-                return 0
-
-            for line in result.stdout.strip().split('\n')[1:]:
+            for line in stdout_text.strip().split('\n')[1:]:
                 parts = line.split()
                 if len(parts) < 2:
                     continue
@@ -21010,15 +21026,30 @@ Respond in JSON format:
         return {"status": "error", "message": f"Change not found: {change_id}"}
 
     async def _create_rollback_point(self, change: Dict[str, Any]) -> None:
-        """Create a git stash or commit for rollback."""
+        """Create a git stash or commit for rollback.
+
+        v204.0: Use async subprocess wrapper to avoid blocking the event loop.
+        """
         try:
-            import subprocess
-            subprocess.run(
-                ["git", "stash", "push", "-m", f"ouroboros_backup_{change['id']}"],
-                cwd=self._project_root,
-                capture_output=True,
-                timeout=30,
-            )
+            if ASYNC_STARTUP_UTILS_AVAILABLE and async_subprocess_run is not None:
+                await async_subprocess_run(
+                    ["git", "stash", "push", "-m", f"ouroboros_backup_{change['id']}"],
+                    timeout=30.0,
+                    cwd=str(self._project_root),
+                )
+            else:
+                # Fallback to blocking subprocess.run in executor if async utils unavailable
+                import subprocess
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        ["git", "stash", "push", "-m", f"ouroboros_backup_{change['id']}"],
+                        cwd=self._project_root,
+                        capture_output=True,
+                        timeout=30,
+                    )
+                )
         except Exception:
             pass
 
@@ -21035,22 +21066,41 @@ Respond in JSON format:
             pass
 
     async def _run_tests(self, target_file: str) -> Dict[str, Any]:
-        """Run tests to validate the change."""
+        """Run tests to validate the change.
+
+        v204.0: Use async subprocess wrapper to avoid blocking the event loop.
+        """
         self._stats["tests_run"] += 1
 
         try:
-            import subprocess
+            # Try pytest first - use async subprocess wrapper
+            if ASYNC_STARTUP_UTILS_AVAILABLE and async_subprocess_run is not None:
+                result = await async_subprocess_run(
+                    ["python", "-m", "pytest", "-x", "--tb=short"],
+                    timeout=300.0,
+                    cwd=str(self._project_root),
+                )
+                passed = result.returncode == 0
+                stdout_text = result.stdout.decode() if result.stdout else ""
+                stderr_text = result.stderr.decode() if result.stderr else ""
+            else:
+                # Fallback to blocking subprocess.run in executor if async utils unavailable
+                import subprocess
+                loop = asyncio.get_running_loop()
+                sync_result = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        ["python", "-m", "pytest", "-x", "--tb=short"],
+                        cwd=self._project_root,
+                        capture_output=True,
+                        timeout=300,
+                        text=True,
+                    )
+                )
+                passed = sync_result.returncode == 0
+                stdout_text = sync_result.stdout or ""
+                stderr_text = sync_result.stderr or ""
 
-            # Try pytest first
-            result = subprocess.run(
-                ["python", "-m", "pytest", "-x", "--tb=short"],
-                cwd=self._project_root,
-                capture_output=True,
-                timeout=300,
-                text=True,
-            )
-
-            passed = result.returncode == 0
             if passed:
                 self._stats["tests_passed"] += 1
             else:
@@ -21058,8 +21108,8 @@ Respond in JSON format:
 
             return {
                 "passed": passed,
-                "output": result.stdout[:1000] if result.stdout else "",
-                "errors": result.stderr[:1000] if result.stderr else "",
+                "output": stdout_text[:1000] if stdout_text else "",
+                "errors": stderr_text[:1000] if stderr_text else "",
             }
         except Exception as e:
             self._stats["tests_failed"] += 1
