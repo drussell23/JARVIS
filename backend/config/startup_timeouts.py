@@ -612,13 +612,305 @@ def reset_timeouts() -> None:
 
 
 # =============================================================================
+# PHASE BUDGET DEFAULTS
+# =============================================================================
+
+
+_DEFAULT_PRE_TRINITY_BUDGET = 30.0
+_DEFAULT_TRINITY_PHASE_BUDGET = 300.0
+_DEFAULT_GCP_WAIT_BUFFER = 120.0
+_DEFAULT_POST_TRINITY_BUDGET = 60.0
+_DEFAULT_DISCOVERY_BUDGET = 45.0
+_DEFAULT_HEALTH_CHECK_BUDGET = 30.0
+_DEFAULT_CLEANUP_BUDGET = 30.0
+_DEFAULT_SAFETY_MARGIN = 30.0
+_DEFAULT_STARTUP_HARD_CAP = 900.0
+
+
+# =============================================================================
+# STARTUP METRICS HISTORY PROTOCOL
+# =============================================================================
+
+
+class StartupMetricsHistory:
+    """
+    Protocol/interface for startup metrics history.
+
+    This is an optional dependency for StartupTimeoutCalculator that provides
+    historical timing data for adaptive timeout calculations.
+
+    Implementations should track p95 (95th percentile) timings for each
+    startup phase to enable data-driven timeout adjustments.
+    """
+
+    def has(self, phase: str) -> bool:
+        """
+        Check whether history exists for a given phase.
+
+        Args:
+            phase: Phase name (e.g., "TRINITY_PHASE", "PRE_TRINITY")
+
+        Returns:
+            True if historical data exists for this phase
+        """
+        raise NotImplementedError
+
+    def get_p95(self, phase: str) -> Optional[float]:
+        """
+        Get the 95th percentile timing for a phase.
+
+        Args:
+            phase: Phase name (e.g., "TRINITY_PHASE", "PRE_TRINITY")
+
+        Returns:
+            P95 timing in seconds, or None if no data
+        """
+        raise NotImplementedError
+
+
+# =============================================================================
+# PHASE BUDGETS DATACLASS
+# =============================================================================
+
+
+@dataclass
+class PhaseBudgets:
+    """
+    Startup phase budget configuration.
+
+    Each phase has a default budget (in seconds) that can be overridden
+    via environment variables with JARVIS_ prefix.
+
+    The SAFETY_MARGIN is NOT included in the phase budgets dict - it's
+    added separately to the global_timeout calculation.
+
+    The HARD_CAP represents the absolute maximum timeout regardless of
+    calculated values.
+
+    Environment Variables:
+    - JARVIS_PRE_TRINITY_BUDGET: Pre-Trinity initialization (default: 30s)
+    - JARVIS_TRINITY_PHASE_BUDGET: Trinity component startup (default: 300s)
+    - JARVIS_GCP_WAIT_BUFFER: GCP credential acquisition (default: 120s)
+    - JARVIS_POST_TRINITY_BUDGET: Post-Trinity setup (default: 60s)
+    - JARVIS_DISCOVERY_BUDGET: Service discovery (default: 45s)
+    - JARVIS_HEALTH_CHECK_BUDGET: Health checks (default: 30s)
+    - JARVIS_CLEANUP_BUDGET: Cleanup operations (default: 30s)
+    - JARVIS_SAFETY_MARGIN: Safety buffer (default: 30s)
+    - JARVIS_STARTUP_HARD_CAP: Absolute maximum timeout (default: 900s)
+    """
+
+    PRE_TRINITY: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_PRE_TRINITY_BUDGET", _DEFAULT_PRE_TRINITY_BUDGET, min_value=1.0
+    ))
+    """Budget for pre-Trinity initialization phase."""
+
+    TRINITY_PHASE: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_TRINITY_PHASE_BUDGET", _DEFAULT_TRINITY_PHASE_BUDGET, min_value=10.0
+    ))
+    """Budget for Trinity component startup (JARVIS-Prime, Reactor-Core)."""
+
+    GCP_WAIT_BUFFER: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_GCP_WAIT_BUFFER", _DEFAULT_GCP_WAIT_BUFFER, min_value=10.0
+    ))
+    """Buffer for GCP credential acquisition and cloud service initialization."""
+
+    POST_TRINITY: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_POST_TRINITY_BUDGET", _DEFAULT_POST_TRINITY_BUDGET, min_value=5.0
+    ))
+    """Budget for post-Trinity setup phase."""
+
+    DISCOVERY: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_DISCOVERY_BUDGET", _DEFAULT_DISCOVERY_BUDGET, min_value=5.0
+    ))
+    """Budget for service discovery phase."""
+
+    HEALTH_CHECK: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_HEALTH_CHECK_BUDGET", _DEFAULT_HEALTH_CHECK_BUDGET, min_value=5.0
+    ))
+    """Budget for health check verification phase."""
+
+    CLEANUP: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_CLEANUP_BUDGET", _DEFAULT_CLEANUP_BUDGET, min_value=5.0
+    ))
+    """Budget for cleanup operations during startup."""
+
+    SAFETY_MARGIN: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_SAFETY_MARGIN", _DEFAULT_SAFETY_MARGIN, min_value=5.0
+    ))
+    """Safety buffer added to global_timeout (not in phase budgets)."""
+
+    HARD_CAP: float = field(default_factory=lambda: _get_env_float(
+        "JARVIS_STARTUP_HARD_CAP", _DEFAULT_STARTUP_HARD_CAP, min_value=60.0
+    ))
+    """Absolute maximum timeout cap for any operation."""
+
+    def get_phase_budget(self, phase: str) -> float:
+        """
+        Get the budget for a specific phase.
+
+        Args:
+            phase: Phase name (e.g., "PRE_TRINITY", "TRINITY_PHASE")
+
+        Returns:
+            Budget in seconds
+
+        Raises:
+            KeyError: If phase name is not recognized
+        """
+        budgets = {
+            "PRE_TRINITY": self.PRE_TRINITY,
+            "TRINITY_PHASE": self.TRINITY_PHASE,
+            "GCP_WAIT_BUFFER": self.GCP_WAIT_BUFFER,
+            "POST_TRINITY": self.POST_TRINITY,
+            "DISCOVERY": self.DISCOVERY,
+            "HEALTH_CHECK": self.HEALTH_CHECK,
+            "CLEANUP": self.CLEANUP,
+        }
+        if phase not in budgets:
+            raise KeyError(f"Unknown phase: {phase}")
+        return budgets[phase]
+
+
+# =============================================================================
+# STARTUP TIMEOUT CALCULATOR
+# =============================================================================
+
+
+class StartupTimeoutCalculator:
+    """
+    Calculator for startup phase timeouts with adaptive history support.
+
+    This calculator replaces the arbitrary 900s global timeout with
+    bottom-up per-phase budgets. It supports:
+
+    1. Static phase budgets (from PhaseBudgets dataclass)
+    2. Adaptive timeouts based on historical p95 metrics
+    3. Conditional inclusion of Trinity and GCP phases
+    4. Hard cap enforcement for safety
+
+    The calculator uses the formula for effective timeout:
+    - With history: min(max(base, p95 * 1.2), HARD_CAP)
+    - Without history: min(base, HARD_CAP)
+
+    Example:
+        calculator = StartupTimeoutCalculator(trinity_enabled=True, gcp_enabled=True)
+        global_timeout = calculator.global_timeout  # Sum of all phase budgets
+        trinity_budget = calculator.trinity_budget  # Just Trinity + GCP phases
+    """
+
+    def __init__(
+        self,
+        trinity_enabled: bool = True,
+        gcp_enabled: bool = False,
+        history: Optional[StartupMetricsHistory] = None,
+    ) -> None:
+        """
+        Initialize the timeout calculator.
+
+        Args:
+            trinity_enabled: Whether Trinity components are enabled
+            gcp_enabled: Whether GCP cloud services are enabled
+            history: Optional metrics history for adaptive timeouts
+        """
+        self._trinity_enabled = trinity_enabled
+        self._gcp_enabled = gcp_enabled
+        self._history = history
+        self._budgets = PhaseBudgets()
+
+    def effective(self, phase: str) -> float:
+        """
+        Calculate effective timeout for a phase.
+
+        If history exists and has data for this phase:
+            effective = min(max(base, p95 * 1.2), HARD_CAP)
+
+        Otherwise (no history):
+            effective = min(base, HARD_CAP)
+
+        Args:
+            phase: Phase name (e.g., "TRINITY_PHASE", "PRE_TRINITY")
+
+        Returns:
+            Effective timeout in seconds
+
+        Raises:
+            KeyError: If phase name is not recognized
+        """
+        base = self._budgets.get_phase_budget(phase)
+
+        if self._history is not None and self._history.has(phase):
+            p95 = self._history.get_p95(phase)
+            if p95 is not None:
+                adaptive = p95 * 1.2
+                return min(max(base, adaptive), self._budgets.HARD_CAP)
+
+        return min(base, self._budgets.HARD_CAP)
+
+    @property
+    def trinity_budget(self) -> float:
+        """
+        Calculate Trinity phase budget.
+
+        If trinity_enabled:
+            effective("TRINITY_PHASE") + (effective("GCP_WAIT_BUFFER") if gcp_enabled else 0)
+        Else:
+            0.0
+
+        Returns:
+            Trinity budget in seconds
+        """
+        if not self._trinity_enabled:
+            return 0.0
+
+        budget = self.effective("TRINITY_PHASE")
+        if self._gcp_enabled:
+            budget += self.effective("GCP_WAIT_BUFFER")
+
+        return budget
+
+    @property
+    def global_timeout(self) -> float:
+        """
+        Calculate global startup timeout.
+
+        Sum of effective() for all included phases + SAFETY_MARGIN.
+
+        Excluded phases when disabled:
+        - If NOT trinity_enabled: exclude TRINITY_PHASE and GCP_WAIT_BUFFER
+        - If NOT gcp_enabled: exclude GCP_WAIT_BUFFER
+
+        Returns:
+            Global timeout in seconds
+        """
+        # Always-included phases
+        phases = ["PRE_TRINITY", "POST_TRINITY", "DISCOVERY", "HEALTH_CHECK", "CLEANUP"]
+
+        # Conditionally include Trinity phases
+        if self._trinity_enabled:
+            phases.append("TRINITY_PHASE")
+            if self._gcp_enabled:
+                phases.append("GCP_WAIT_BUFFER")
+
+        # Sum all effective phase timeouts
+        total = sum(self.effective(phase) for phase in phases)
+
+        # Add safety margin (not capped by effective(), just added directly)
+        total += self._budgets.SAFETY_MARGIN
+
+        return total
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
 
 __all__ = [
-    # Main class
+    # Main classes
     "StartupTimeouts",
+    "PhaseBudgets",
+    "StartupTimeoutCalculator",
+    "StartupMetricsHistory",
     # Singleton access
     "get_timeouts",
     "reset_timeouts",
@@ -650,4 +942,14 @@ __all__ = [
     "_DEFAULT_BROADCAST_TIMEOUT",
     "_DEFAULT_PROCESS_WAIT_TIMEOUT",
     "_DEFAULT_SUBPROCESS_TIMEOUT",
+    # Phase budget defaults
+    "_DEFAULT_PRE_TRINITY_BUDGET",
+    "_DEFAULT_TRINITY_PHASE_BUDGET",
+    "_DEFAULT_GCP_WAIT_BUFFER",
+    "_DEFAULT_POST_TRINITY_BUDGET",
+    "_DEFAULT_DISCOVERY_BUDGET",
+    "_DEFAULT_HEALTH_CHECK_BUDGET",
+    "_DEFAULT_CLEANUP_BUDGET",
+    "_DEFAULT_SAFETY_MARGIN",
+    "_DEFAULT_STARTUP_HARD_CAP",
 ]
