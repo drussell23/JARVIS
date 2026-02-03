@@ -77,75 +77,12 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, runtime_checkable
 
+from backend.utils.env_config import get_env_bool, get_env_float
+
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# VALIDATION UTILITIES
-# =============================================================================
-
-
-def _get_env_float(
-    name: str,
-    default: float,
-    min_value: Optional[float] = None,
-    max_value: Optional[float] = None,
-) -> float:
-    """
-    Get a float value from environment variable with validation.
-
-    Args:
-        name: Environment variable name
-        default: Default value if not set or invalid
-        min_value: Minimum allowed value (inclusive)
-        max_value: Maximum allowed value (inclusive)
-
-    Returns:
-        Validated float value (uses default on validation failure)
-    """
-    raw_value = os.environ.get(name)
-
-    if raw_value is None:
-        return default
-
-    try:
-        value = float(raw_value)
-    except ValueError:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}='{raw_value}' "
-            f"(not a valid number), using default: {default}"
-        )
-        return default
-
-    # Validate positive
-    if value <= 0:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}={value} "
-            f"(must be positive), using default: {default}"
-        )
-        return default
-
-    # Validate min
-    if min_value is not None and value < min_value:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}={value} "
-            f"(below minimum {min_value}), using default: {default}"
-        )
-        return default
-
-    # Validate max
-    if max_value is not None and value > max_value:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}={value} "
-            f"(above maximum {max_value}), using default: {default}"
-        )
-        return default
-
-    return value
 
 
 # =============================================================================
@@ -222,8 +159,8 @@ class StartupTimeouts:
     # Global Configuration
     # -------------------------------------------------------------------------
 
-    max_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_MAX_TIMEOUT", _DEFAULT_MAX_TIMEOUT, min_value=1.0
+    max_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_MAX_TIMEOUT", _DEFAULT_MAX_TIMEOUT, min_val=1.0
     ))
     """Maximum allowed timeout for any operation. Safety cap to prevent unbounded waits."""
 
@@ -231,18 +168,18 @@ class StartupTimeouts:
     # Signal Timeouts (Shutdown)
     # -------------------------------------------------------------------------
 
-    cleanup_timeout_sigint: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_CLEANUP_TIMEOUT_SIGINT", _DEFAULT_CLEANUP_TIMEOUT_SIGINT, min_value=0.1
+    cleanup_timeout_sigint: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_CLEANUP_TIMEOUT_SIGINT", _DEFAULT_CLEANUP_TIMEOUT_SIGINT, min_val=0.1
     ))
     """Wait time after sending SIGINT before escalating to SIGTERM."""
 
-    cleanup_timeout_sigterm: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_CLEANUP_TIMEOUT_SIGTERM", _DEFAULT_CLEANUP_TIMEOUT_SIGTERM, min_value=0.1
+    cleanup_timeout_sigterm: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_CLEANUP_TIMEOUT_SIGTERM", _DEFAULT_CLEANUP_TIMEOUT_SIGTERM, min_val=0.1
     ))
     """Wait time after sending SIGTERM before escalating to SIGKILL."""
 
-    cleanup_timeout_sigkill: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_CLEANUP_TIMEOUT_SIGKILL", _DEFAULT_CLEANUP_TIMEOUT_SIGKILL, min_value=0.1
+    cleanup_timeout_sigkill: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_CLEANUP_TIMEOUT_SIGKILL", _DEFAULT_CLEANUP_TIMEOUT_SIGKILL, min_val=0.1
     ))
     """Wait time after sending SIGKILL before giving up on process termination."""
 
@@ -250,18 +187,18 @@ class StartupTimeouts:
     # Port and Network Timeouts
     # -------------------------------------------------------------------------
 
-    port_check_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_PORT_CHECK_TIMEOUT", _DEFAULT_PORT_CHECK_TIMEOUT, min_value=0.1
+    port_check_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_PORT_CHECK_TIMEOUT", _DEFAULT_PORT_CHECK_TIMEOUT, min_val=0.1
     ))
     """Timeout for TCP port availability check (connect_ex)."""
 
-    port_release_wait: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_PORT_RELEASE_WAIT", _DEFAULT_PORT_RELEASE_WAIT, min_value=0.1
+    port_release_wait: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_PORT_RELEASE_WAIT", _DEFAULT_PORT_RELEASE_WAIT, min_val=0.1
     ))
     """Time to wait for port to be released after process exit."""
 
-    ipc_socket_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_IPC_SOCKET_TIMEOUT", _DEFAULT_IPC_SOCKET_TIMEOUT, min_value=0.5
+    ipc_socket_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_IPC_SOCKET_TIMEOUT", _DEFAULT_IPC_SOCKET_TIMEOUT, min_val=0.5
     ))
     """Timeout for Unix socket connections (supervisor IPC)."""
 
@@ -269,13 +206,13 @@ class StartupTimeouts:
     # Tool Timeouts
     # -------------------------------------------------------------------------
 
-    lsof_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_LSOF_TIMEOUT", _DEFAULT_LSOF_TIMEOUT, min_value=0.5
+    lsof_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_LSOF_TIMEOUT", _DEFAULT_LSOF_TIMEOUT, min_val=0.5
     ))
     """Timeout for lsof subprocess calls to check port usage."""
 
-    docker_check_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_DOCKER_CHECK_TIMEOUT", _DEFAULT_DOCKER_CHECK_TIMEOUT, min_value=1.0
+    docker_check_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_DOCKER_CHECK_TIMEOUT", _DEFAULT_DOCKER_CHECK_TIMEOUT, min_val=1.0
     ))
     """Timeout for docker daemon health checks."""
 
@@ -283,18 +220,18 @@ class StartupTimeouts:
     # Health Check Timeouts
     # -------------------------------------------------------------------------
 
-    backend_health_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_BACKEND_HEALTH_TIMEOUT", _DEFAULT_BACKEND_HEALTH_TIMEOUT, min_value=1.0
+    backend_health_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_BACKEND_HEALTH_TIMEOUT", _DEFAULT_BACKEND_HEALTH_TIMEOUT, min_val=1.0
     ))
     """Timeout for backend HTTP health check endpoint."""
 
-    frontend_health_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_FRONTEND_HEALTH_TIMEOUT", _DEFAULT_FRONTEND_HEALTH_TIMEOUT, min_value=1.0
+    frontend_health_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_FRONTEND_HEALTH_TIMEOUT", _DEFAULT_FRONTEND_HEALTH_TIMEOUT, min_val=1.0
     ))
     """Timeout for frontend health check (webpack dev server)."""
 
-    loading_server_health_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_LOADING_SERVER_HEALTH_TIMEOUT", _DEFAULT_LOADING_SERVER_HEALTH_TIMEOUT, min_value=0.5
+    loading_server_health_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_LOADING_SERVER_HEALTH_TIMEOUT", _DEFAULT_LOADING_SERVER_HEALTH_TIMEOUT, min_val=0.5
     ))
     """Timeout for loading server health check."""
 
@@ -302,8 +239,8 @@ class StartupTimeouts:
     # Heartbeat Configuration
     # -------------------------------------------------------------------------
 
-    heartbeat_interval: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_HEARTBEAT_INTERVAL", _DEFAULT_HEARTBEAT_INTERVAL, min_value=1.0
+    heartbeat_interval: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_HEARTBEAT_INTERVAL", _DEFAULT_HEARTBEAT_INTERVAL, min_val=1.0
     ))
     """Interval between heartbeat broadcasts during startup."""
 
@@ -311,18 +248,18 @@ class StartupTimeouts:
     # Trinity Component Timeouts
     # -------------------------------------------------------------------------
 
-    prime_startup_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_PRIME_STARTUP_TIMEOUT", _DEFAULT_PRIME_STARTUP_TIMEOUT, min_value=10.0
+    prime_startup_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_PRIME_STARTUP_TIMEOUT", _DEFAULT_PRIME_STARTUP_TIMEOUT, min_val=10.0
     ))
     """Timeout for JARVIS-Prime startup (includes model loading)."""
 
-    reactor_startup_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_REACTOR_STARTUP_TIMEOUT", _DEFAULT_REACTOR_STARTUP_TIMEOUT, min_value=5.0
+    reactor_startup_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_REACTOR_STARTUP_TIMEOUT", _DEFAULT_REACTOR_STARTUP_TIMEOUT, min_val=5.0
     ))
     """Timeout for Reactor-Core startup."""
 
-    reactor_health_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_REACTOR_HEALTH_TIMEOUT", _DEFAULT_REACTOR_HEALTH_TIMEOUT, min_value=1.0
+    reactor_health_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_REACTOR_HEALTH_TIMEOUT", _DEFAULT_REACTOR_HEALTH_TIMEOUT, min_val=1.0
     ))
     """Timeout for Reactor-Core health check."""
 
@@ -330,33 +267,33 @@ class StartupTimeouts:
     # Lock Timeouts
     # -------------------------------------------------------------------------
 
-    startup_lock_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_STARTUP_LOCK_TIMEOUT", _DEFAULT_STARTUP_LOCK_TIMEOUT, min_value=1.0
+    startup_lock_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_STARTUP_LOCK_TIMEOUT", _DEFAULT_STARTUP_LOCK_TIMEOUT, min_val=1.0
     ))
     """Timeout for acquiring the startup lock (single-instance coordination)."""
 
-    takeover_handover_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_TAKEOVER_HANDOVER_TIMEOUT", _DEFAULT_TAKEOVER_HANDOVER_TIMEOUT, min_value=1.0
+    takeover_handover_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_TAKEOVER_HANDOVER_TIMEOUT", _DEFAULT_TAKEOVER_HANDOVER_TIMEOUT, min_val=1.0
     ))
     """Timeout for graceful handover during instance takeover."""
 
-    max_lock_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_MAX_LOCK_TIMEOUT", _DEFAULT_MAX_LOCK_TIMEOUT, min_value=1.0
+    max_lock_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_MAX_LOCK_TIMEOUT", _DEFAULT_MAX_LOCK_TIMEOUT, min_val=1.0
     ))
     """Maximum allowed lock acquisition timeout."""
 
-    min_lock_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_MIN_LOCK_TIMEOUT", _DEFAULT_MIN_LOCK_TIMEOUT, min_value=0.01
+    min_lock_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_MIN_LOCK_TIMEOUT", _DEFAULT_MIN_LOCK_TIMEOUT, min_val=0.01
     ))
     """Minimum allowed lock acquisition timeout (prevents spin-lock)."""
 
-    default_lock_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_DEFAULT_LOCK_TIMEOUT", _DEFAULT_DEFAULT_LOCK_TIMEOUT, min_value=0.1
+    default_lock_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_DEFAULT_LOCK_TIMEOUT", _DEFAULT_DEFAULT_LOCK_TIMEOUT, min_val=0.1
     ))
     """Default lock acquisition timeout when not specified."""
 
-    stale_lock_retry_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_STALE_LOCK_RETRY_TIMEOUT", _DEFAULT_STALE_LOCK_RETRY_TIMEOUT, min_value=0.1
+    stale_lock_retry_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_STALE_LOCK_RETRY_TIMEOUT", _DEFAULT_STALE_LOCK_RETRY_TIMEOUT, min_val=0.1
     ))
     """Timeout for retry attempt after removing a stale lock."""
 
@@ -364,8 +301,8 @@ class StartupTimeouts:
     # Broadcast Timeout
     # -------------------------------------------------------------------------
 
-    broadcast_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_BROADCAST_TIMEOUT", _DEFAULT_BROADCAST_TIMEOUT, min_value=0.1
+    broadcast_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_BROADCAST_TIMEOUT", _DEFAULT_BROADCAST_TIMEOUT, min_val=0.1
     ))
     """Timeout for progress/status broadcasts to clients."""
 
@@ -373,13 +310,13 @@ class StartupTimeouts:
     # Async Utility Timeouts
     # -------------------------------------------------------------------------
 
-    process_wait_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_PROCESS_WAIT_TIMEOUT", _DEFAULT_PROCESS_WAIT_TIMEOUT, min_value=0.1
+    process_wait_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_PROCESS_WAIT_TIMEOUT", _DEFAULT_PROCESS_WAIT_TIMEOUT, min_val=0.1
     ))
     """Default timeout for async_process_wait operations."""
 
-    subprocess_timeout: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_SUBPROCESS_TIMEOUT", _DEFAULT_SUBPROCESS_TIMEOUT, min_value=1.0
+    subprocess_timeout: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_SUBPROCESS_TIMEOUT", _DEFAULT_SUBPROCESS_TIMEOUT, min_val=1.0
     ))
     """Default timeout for async_subprocess_run operations."""
 
@@ -708,48 +645,48 @@ class PhaseBudgets:
     - JARVIS_STARTUP_HARD_CAP: Absolute maximum timeout (default: 900s)
     """
 
-    PRE_TRINITY: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_PRE_TRINITY_BUDGET", _DEFAULT_PRE_TRINITY_BUDGET, min_value=1.0
+    PRE_TRINITY: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_PRE_TRINITY_BUDGET", _DEFAULT_PRE_TRINITY_BUDGET, min_val=1.0
     ))
     """Budget for pre-Trinity initialization phase."""
 
-    TRINITY_PHASE: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_TRINITY_PHASE_BUDGET", _DEFAULT_TRINITY_PHASE_BUDGET, min_value=10.0
+    TRINITY_PHASE: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_TRINITY_PHASE_BUDGET", _DEFAULT_TRINITY_PHASE_BUDGET, min_val=10.0
     ))
     """Budget for Trinity component startup (JARVIS-Prime, Reactor-Core)."""
 
-    GCP_WAIT_BUFFER: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_GCP_WAIT_BUFFER", _DEFAULT_GCP_WAIT_BUFFER, min_value=10.0
+    GCP_WAIT_BUFFER: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_GCP_WAIT_BUFFER", _DEFAULT_GCP_WAIT_BUFFER, min_val=10.0
     ))
     """Buffer for GCP credential acquisition and cloud service initialization."""
 
-    POST_TRINITY: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_POST_TRINITY_BUDGET", _DEFAULT_POST_TRINITY_BUDGET, min_value=5.0
+    POST_TRINITY: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_POST_TRINITY_BUDGET", _DEFAULT_POST_TRINITY_BUDGET, min_val=5.0
     ))
     """Budget for post-Trinity setup phase."""
 
-    DISCOVERY: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_DISCOVERY_BUDGET", _DEFAULT_DISCOVERY_BUDGET, min_value=5.0
+    DISCOVERY: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_DISCOVERY_BUDGET", _DEFAULT_DISCOVERY_BUDGET, min_val=5.0
     ))
     """Budget for service discovery phase."""
 
-    HEALTH_CHECK: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_HEALTH_CHECK_BUDGET", _DEFAULT_HEALTH_CHECK_BUDGET, min_value=5.0
+    HEALTH_CHECK: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_HEALTH_CHECK_BUDGET", _DEFAULT_HEALTH_CHECK_BUDGET, min_val=5.0
     ))
     """Budget for health check verification phase."""
 
-    CLEANUP: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_CLEANUP_BUDGET", _DEFAULT_CLEANUP_BUDGET, min_value=5.0
+    CLEANUP: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_CLEANUP_BUDGET", _DEFAULT_CLEANUP_BUDGET, min_val=5.0
     ))
     """Budget for cleanup operations during startup."""
 
-    SAFETY_MARGIN: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_SAFETY_MARGIN", _DEFAULT_SAFETY_MARGIN, min_value=5.0
+    SAFETY_MARGIN: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_SAFETY_MARGIN", _DEFAULT_SAFETY_MARGIN, min_val=5.0
     ))
     """Safety buffer added to global_timeout (not in phase budgets)."""
 
-    HARD_CAP: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_STARTUP_HARD_CAP", _DEFAULT_STARTUP_HARD_CAP, min_value=60.0
+    HARD_CAP: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_STARTUP_HARD_CAP", _DEFAULT_STARTUP_HARD_CAP, min_val=60.0
     ))
     """Absolute maximum timeout cap for any operation."""
 
@@ -910,45 +847,6 @@ class StartupTimeoutCalculator:
 
 
 # =============================================================================
-# HELPER FUNCTIONS FOR ENV BOOL/FLOAT
-# =============================================================================
-
-
-def _get_env_bool(name: str, default: bool) -> bool:
-    """
-    Get a boolean value from environment variable.
-
-    Truthy values: "true", "1", "yes", "on" (case-insensitive)
-    Falsy values: "false", "0", "no", "off" (case-insensitive)
-    Other values: logs warning and returns default
-
-    Args:
-        name: Environment variable name
-        default: Default value if not set or invalid
-
-    Returns:
-        Boolean value from environment or default
-    """
-    raw_value = os.environ.get(name)
-
-    if raw_value is None:
-        return default
-
-    lower_value = raw_value.lower().strip()
-
-    if lower_value in ("true", "1", "yes", "on"):
-        return True
-    elif lower_value in ("false", "0", "no", "off"):
-        return False
-    else:
-        logger.warning(
-            f"[StartupConfig] Invalid boolean value for {name}='{raw_value}' "
-            f"(expected true/false/1/0/yes/no), using default: {default}"
-        )
-        return default
-
-
-# =============================================================================
 # STARTUP CONFIG - UNIFIED CONFIGURATION CLASS
 # =============================================================================
 
@@ -999,18 +897,18 @@ class StartupConfig:
     # Feature Flags
     # -------------------------------------------------------------------------
 
-    trinity_enabled: bool = field(default_factory=lambda: _get_env_bool(
+    trinity_enabled: bool = field(default_factory=lambda: get_env_bool(
         "JARVIS_TRINITY_ENABLED", _DEFAULT_TRINITY_ENABLED
     ))
     """Whether Trinity components (JARVIS-Prime, Reactor-Core) are enabled."""
 
-    gcp_enabled: bool = field(default_factory=lambda: _get_env_bool(
+    gcp_enabled: bool = field(default_factory=lambda: get_env_bool(
         "JARVIS_GCP_ENABLED", _DEFAULT_GCP_ENABLED
     ))
     """Whether GCP cloud services are enabled."""
 
-    hollow_ram_threshold_gb: float = field(default_factory=lambda: _get_env_float(
-        "JARVIS_HOLLOW_RAM_THRESHOLD_GB", _DEFAULT_HOLLOW_RAM_THRESHOLD_GB, min_value=0.0
+    hollow_ram_threshold_gb: float = field(default_factory=lambda: get_env_float(
+        "JARVIS_HOLLOW_RAM_THRESHOLD_GB", _DEFAULT_HOLLOW_RAM_THRESHOLD_GB, min_val=0.0
     ))
     """RAM threshold in GB for Hollow Client enforcement."""
 
@@ -1121,6 +1019,16 @@ def reset_startup_config() -> None:
 
 
 # =============================================================================
+# BACKWARD COMPATIBILITY ALIASES
+# =============================================================================
+
+# Re-export centralized env functions as aliases for backward compatibility
+# Tests may import these from this module
+_get_env_float = get_env_float
+_get_env_bool = get_env_bool
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -1137,7 +1045,7 @@ __all__ = [
     "reset_timeouts",
     "get_startup_config",
     "reset_startup_config",
-    # Validation utilities (for testing)
+    # Centralized env functions (re-exported for backward compatibility)
     "_get_env_float",
     "_get_env_bool",
     # Default values (for reference/testing)

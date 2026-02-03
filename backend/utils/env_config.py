@@ -250,8 +250,8 @@ def get_env_float(
 # =============================================================================
 
 # Case-insensitive truthy values
-_TRUE_VALUES = frozenset({"true", "1", "yes"})
-_FALSE_VALUES = frozenset({"false", "0", "no", ""})
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off", ""})
 
 
 def get_env_bool(key: str, default: bool = False) -> bool:
@@ -259,8 +259,8 @@ def get_env_bool(key: str, default: bool = False) -> bool:
     Get boolean environment variable.
 
     Case-insensitive parsing:
-        True:  "true", "1", "yes"
-        False: "false", "0", "no", "" (empty), unset
+        True:  "true", "1", "yes", "on"
+        False: "false", "0", "no", "off", "" (empty), unset
 
     On unrecognized value: logs warning, returns default.
 
@@ -279,7 +279,8 @@ def get_env_bool(key: str, default: bool = False) -> bool:
     if raw is None:
         return default
 
-    normalized = raw.lower()
+    # Normalize: lowercase and strip whitespace
+    normalized = raw.lower().strip()
 
     if normalized in _TRUE_VALUES:
         return True
@@ -289,7 +290,7 @@ def get_env_bool(key: str, default: bool = False) -> bool:
 
     # Unrecognized value
     logger.warning(
-        "Unrecognized boolean value for %s: %r (using default: %s)",
+        "Invalid boolean value for %s: %r (using default: %s)",
         key,
         raw,
         default,
