@@ -59699,6 +59699,15 @@ class JarvisSystemKernel:
             "approval_manager": self._agi_os_status.get("approval_manager", False),
         }
 
+        # v201.1: Invincible Node status
+        status["invincible_node"] = {
+            "enabled": self.config.invincible_node_enabled,
+            "instance_name": self.config.invincible_node_instance_name,
+            "port": self.config.invincible_node_port,
+            "static_ip_name": self.config.invincible_node_static_ip_name,
+            "status": self.invincible_node_status,
+        }
+
         return status
 
     async def _ipc_shutdown(self) -> Dict[str, Any]:
