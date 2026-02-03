@@ -54736,6 +54736,13 @@ class JarvisSystemKernel:
         self._consecutive_failures: Dict[str, int] = {}
         self._readiness_monitor_task: Optional[asyncio.Task] = None
 
+        # v210.0: Broadcast error tracking for diagnostics
+        self._last_broadcast_error: Optional[str] = None
+
+        # v210.0: Track if loading server is actually accepting HTTP connections
+        # This prevents broadcast attempts before server is ready
+        self._loading_server_ready: bool = False
+
     @property
     def state(self) -> KernelState:
         """Current kernel state."""
@@ -59464,6 +59471,8 @@ class JarvisSystemKernel:
                                 self.logger.info(
                                     f"[LoadingServer] Healthy after {attempt} attempts ({elapsed:.2f}s)"
                                 )
+                                # v210.0: Mark as truly ready for broadcasts
+                                self._loading_server_ready = True
                                 return True
                             else:
                                 last_error = f"HTTP {resp.status}"
@@ -59494,6 +59503,8 @@ class JarvisSystemKernel:
                         self.logger.info(
                             f"[LoadingServer] Port ready after {attempt} attempts ({elapsed:.2f}s)"
                         )
+                        # v210.0: Mark as truly ready for broadcasts
+                        self._loading_server_ready = True
                         return True
                     last_error = "port not ready"
 
@@ -60261,6 +60272,11 @@ class JarvisSystemKernel:
         if not hasattr(self, '_loading_server_process') or not self._loading_server_process:
             return False
 
+        # v210.0: Skip if loading server isn't confirmed ready (health check passed)
+        # This prevents broadcast attempts before the server is accepting connections
+        if not getattr(self, '_loading_server_ready', False):
+            return False
+
         # Single clamp point - enforce progress bounds
         progress = min(100, max(0, progress))
 
@@ -60309,26 +60325,30 @@ class JarvisSystemKernel:
                         self.logger.debug(f"[Progress] {stage}: {progress}% - {message}")
                     return True
                 else:
+                    # v210.0: Include actual error reason in debug log
+                    error_reason = getattr(self, '_last_broadcast_error', 'unknown')
                     self.logger.debug(
-                        f"[Broadcast] Attempt {attempt + 1}/{max_retries} returned False"
+                        f"[Broadcast] Attempt {attempt + 1}/{max_retries} failed: {error_reason}"
                     )
 
             except asyncio.TimeoutError:
                 self.logger.debug(
-                    f"[Broadcast] Attempt {attempt + 1}/{max_retries} timed out"
+                    f"[Broadcast] Attempt {attempt + 1}/{max_retries} timed out (outer)"
                 )
             except Exception as e:
                 self.logger.debug(
-                    f"[Broadcast] Attempt {attempt + 1}/{max_retries} failed: {e}"
+                    f"[Broadcast] Attempt {attempt + 1}/{max_retries} exception: {e}"
                 )
 
             # Brief pause before retry (if not last attempt)
             if attempt < max_retries - 1:
                 await asyncio.sleep(0.1)
 
-        # All retries failed - log and continue (NON-FATAL)
-        self.logger.warning(
-            f"[Broadcast] Failed after {max_retries} attempts for {stage}, continuing..."
+        # v210.0: Downgrade to debug - broadcast failure is NON-FATAL and shouldn't pollute logs
+        # The loading page is informational only; startup continues regardless
+        error_reason = getattr(self, '_last_broadcast_error', 'unknown')
+        self.logger.debug(
+            f"[Broadcast] Failed for {stage}: {error_reason} (non-fatal, continuing)"
         )
         return False
 
@@ -60341,6 +60361,7 @@ class JarvisSystemKernel:
         Synchronous HTTP POST to loading server.
 
         v205.0: This runs in a thread via asyncio.to_thread to never block the event loop.
+        v210.0: Enhanced error tracking for diagnostics.
 
         Args:
             progress_data: The progress data to send
@@ -60350,7 +60371,16 @@ class JarvisSystemKernel:
             True if broadcast succeeded, False otherwise
         """
         import urllib.request
+        import urllib.error
         import json as _json
+
+        # v210.0: Check if loading server process is still running
+        if hasattr(self, '_loading_server_process') and self._loading_server_process:
+            poll_result = self._loading_server_process.poll()
+            if poll_result is not None:
+                # Process has exited - store reason for diagnostic
+                self._last_broadcast_error = f"Loading server exited (code: {poll_result})"
+                return False
 
         try:
             url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
@@ -60363,9 +60393,27 @@ class JarvisSystemKernel:
             )
 
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status == 200
+                if resp.status == 200:
+                    self._last_broadcast_error = None
+                    # v210.0: If broadcast succeeds, server is definitely ready
+                    self._loading_server_ready = True
+                    return True
+                else:
+                    self._last_broadcast_error = f"HTTP {resp.status}"
+                    return False
 
-        except Exception:
+        except urllib.error.URLError as e:
+            # Connection refused, timeout, etc.
+            self._last_broadcast_error = f"URLError: {e.reason}"
+            return False
+        except urllib.error.HTTPError as e:
+            self._last_broadcast_error = f"HTTP {e.code}: {e.reason}"
+            return False
+        except TimeoutError:
+            self._last_broadcast_error = "Connection timeout"
+            return False
+        except Exception as e:
+            self._last_broadcast_error = f"{type(e).__name__}: {e}"
             return False
 
     async def _broadcast_progress_urllib(self, progress_data: Dict[str, Any]) -> bool:
