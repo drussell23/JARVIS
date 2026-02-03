@@ -37,6 +37,9 @@
 
 set -euo pipefail
 
+# Suppress gcloud Python deprecation warnings
+export CLOUDSDK_PYTHON_SITEPACKAGES=1
+
 # ============================================================================
 # CONFIGURATION (All from environment with sensible defaults)
 # ============================================================================
@@ -116,10 +119,13 @@ get_instance_status() {
 
 # Get static IP address
 get_static_ip_address() {
-    gcloud compute addresses describe "$STATIC_IP_NAME" \
+    local result
+    result=$(gcloud compute addresses describe "$STATIC_IP_NAME" \
         --project="$PROJECT_ID" \
         --region="$REGION" \
-        --format="value(address)" 2>/dev/null || echo ""
+        --format="value(address)" 2>/dev/null) || true
+    # Clean up any whitespace/newlines
+    echo "$result" | tr -d '[:space:]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo ""
 }
 
 # Check if static IP exists
@@ -182,29 +188,29 @@ preflight_checks() {
 # ============================================================================
 
 ensure_static_ip() {
-    log_header "Static IP Management"
+    log_header "Static IP Management" >&2
 
     if static_ip_exists; then
         local ip_address
         ip_address=$(get_static_ip_address)
-        log_success "Static IP exists: $STATIC_IP_NAME ($ip_address)"
+        log_success "Static IP exists: $STATIC_IP_NAME ($ip_address)" >&2
         echo "$ip_address"
         return 0
     fi
 
-    log_info "Reserving regional static IP: $STATIC_IP_NAME"
+    log_info "Reserving regional static IP: $STATIC_IP_NAME" >&2
 
     if ! gcloud compute addresses create "$STATIC_IP_NAME" \
         --project="$PROJECT_ID" \
         --region="$REGION" \
         --description="JARVIS Prime Invincible Node Static IP"; then
-        log_error "Failed to reserve static IP"
+        log_error "Failed to reserve static IP" >&2
         exit 1
     fi
 
     local ip_address
     ip_address=$(get_static_ip_address)
-    log_success "Static IP reserved: $ip_address"
+    log_success "Static IP reserved: $ip_address" >&2
     echo "$ip_address"
 }
 
