@@ -874,10 +874,64 @@ try:
     _ASYNC_STARTUP_AVAILABLE = True
 except ImportError:
     _ASYNC_STARTUP_AVAILABLE = False
-    # Fallback: run in executor manually if module not available
+
+# =============================================================================
+# v153.0: ASYNC I/O UTILITIES - Non-blocking psutil wrappers
+# =============================================================================
+# These async wrappers convert blocking psutil calls to non-blocking operations
+# by running them in a thread pool. This prevents event loop stalls during:
+# - Process discovery and termination
+# - Memory/CPU monitoring
+# - Network connection scanning
+# =============================================================================
+try:
+    from backend.utils.async_io import (
+        pid_exists as async_pid_exists,
+        get_process as async_get_process,
+        process_is_running as async_process_is_running,
+        iter_processes as async_iter_processes,
+        get_net_connections as async_get_net_connections,
+        get_cpu_percent as async_get_cpu_percent,
+        get_virtual_memory as async_get_virtual_memory,
+        run_sync,
+    )
+    _ASYNC_IO_AVAILABLE = True
+except ImportError:
+    _ASYNC_IO_AVAILABLE = False
+    # Fallbacks: use blocking calls directly (less ideal but functional)
+    async def async_pid_exists(pid: int) -> bool:  # noqa: E731
+        import psutil
+        return psutil.pid_exists(pid)
+    async def async_get_process(pid: int):  # noqa: E731
+        import psutil
+        try:
+            return psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return None
+    async def async_process_is_running(pid: int) -> bool:  # noqa: E731
+        proc = await async_get_process(pid)
+        return proc is not None and proc.is_running()
+    async def async_iter_processes(attrs=None):  # noqa: E731
+        import psutil
+        attrs = attrs or ["pid", "name"]
+        for proc in psutil.process_iter(attrs):
+            yield proc.info
+    async def async_get_net_connections(kind: str = "inet"):  # noqa: E731
+        import psutil
+        return psutil.net_connections(kind)
+    async def async_get_cpu_percent(interval: float = 0.1) -> float:  # noqa: E731
+        import psutil
+        return psutil.cpu_percent(interval=interval)
+    async def async_get_virtual_memory():  # noqa: E731
+        import psutil
+        return psutil.virtual_memory()
+    async def run_sync(func, *args, **kwargs):  # noqa: E731
+        return func(*args, **kwargs)
+
+# Fallback for async_psutil_wait and async_process_wait if async_startup not available
+if not _ASYNC_STARTUP_AVAILABLE:
     async def async_psutil_wait(proc, timeout: float = 10.0) -> bool:  # noqa: E731
         """Fallback async_psutil_wait using default executor."""
-        import asyncio
         loop = asyncio.get_running_loop()
         def _wait():
             try:
@@ -889,9 +943,6 @@ except ImportError:
 
     async def async_process_wait(pid: int, timeout: float = 10.0) -> bool:  # noqa: E731
         """Fallback async_process_wait using default executor."""
-        import asyncio
-        import os
-        import time
         loop = asyncio.get_running_loop()
         def _wait():
             deadline = time.monotonic() + timeout
@@ -3460,6 +3511,9 @@ class ParallelProcessCleaner:
         v132.4: Added SystemExit protection for thread pool workers.
         During interpreter shutdown, workers can receive SystemExit which breaks
         the thread pool. We catch and suppress it, returning empty result.
+
+        Note: Called via run_in_executor from async context.
+        Blocking psutil calls are acceptable here as this runs in a thread pool.
         """
         try:
             import psutil
@@ -3540,6 +3594,9 @@ class ParallelProcessCleaner:
         Scan process list for JARVIS processes (runs in thread).
 
         v132.4: Added SystemExit protection for thread pool workers.
+
+        Note: Called via run_in_executor from async context.
+        Blocking psutil calls are acceptable here as this runs in a thread pool.
         """
         try:
             import psutil
@@ -3580,6 +3637,9 @@ class ParallelProcessCleaner:
         Discover processes holding critical ports.
 
         v132.4: Added SystemExit protection for thread pool workers.
+
+        Note: Called via run_in_executor from async context.
+        Blocking psutil calls are acceptable here as this runs in a thread pool.
         """
         try:
             import psutil
@@ -3663,22 +3723,26 @@ class ParallelProcessCleaner:
         RACE CONDITION FIX: Previous implementation had race between checking process
         existence and sending signals. Now validates PID before each signal.
 
+        v153.0: Uses async wrappers to avoid blocking the event loop.
+
         Strategy: SIGINT → wait → SIGTERM → wait → SIGKILL
         """
         try:
             import psutil
 
-            # v79.0: Helper to safely send signal with PID validation
-            def _safe_kill(target_pid: int, sig: int) -> bool:
-                """Send signal with race-safe PID validation."""
+            # v79.0/v153.0: Helper to safely send signal with async PID validation
+            async def _safe_kill(target_pid: int, sig: int) -> bool:
+                """Send signal with race-safe PID validation (async)."""
                 try:
                     # Re-validate process exists before each signal
-                    proc = psutil.Process(target_pid)
+                    proc = await async_get_process(target_pid)
+                    if proc is None:
+                        return True  # Process already gone
 
                     # Extra validation: check process matches expected info
                     if info and info.cmdline:
                         try:
-                            current_cmdline = " ".join(proc.cmdline())
+                            current_cmdline = await run_sync(lambda: " ".join(proc.cmdline()))
                             # If cmdline completely changed, it's a different process
                             if info.cmdline and info.cmdline[0] not in current_cmdline:
                                 self.logger.debug(
@@ -3701,9 +3765,11 @@ class ParallelProcessCleaner:
             timeouts = get_timeouts()
 
             # Phase 1: SIGINT (graceful)
-            if _safe_kill(pid, signal.SIGINT):
+            if await _safe_kill(pid, signal.SIGINT):
                 try:
-                    proc = psutil.Process(pid)
+                    proc = await async_get_process(pid)
+                    if proc is None:
+                        return True  # Process already gone
                     await asyncio.sleep(0.1)  # Brief pause
                     # v152.0: Non-blocking wait using async_psutil_wait
                     exited = await async_psutil_wait(proc, timeouts.cleanup_timeout_sigint)
@@ -3713,9 +3779,11 @@ class ParallelProcessCleaner:
                     return True  # Process already gone
 
             # Phase 2: SIGTERM
-            if _safe_kill(pid, signal.SIGTERM):
+            if await _safe_kill(pid, signal.SIGTERM):
                 try:
-                    proc = psutil.Process(pid)
+                    proc = await async_get_process(pid)
+                    if proc is None:
+                        return True  # Process already gone
                     # v152.0: Non-blocking wait using async_psutil_wait
                     exited = await async_psutil_wait(proc, timeouts.cleanup_timeout_sigterm)
                     if exited:
@@ -3724,11 +3792,12 @@ class ParallelProcessCleaner:
                     return True  # Process already gone
 
             # Phase 3: SIGKILL (force)
-            if _safe_kill(pid, signal.SIGKILL):
+            if await _safe_kill(pid, signal.SIGKILL):
                 try:
-                    proc = psutil.Process(pid)
-                    # v152.0: Non-blocking wait using async_psutil_wait
-                    await async_psutil_wait(proc, timeouts.cleanup_timeout_sigkill)
+                    proc = await async_get_process(pid)
+                    if proc is not None:
+                        # v152.0: Non-blocking wait using async_psutil_wait
+                        await async_psutil_wait(proc, timeouts.cleanup_timeout_sigkill)
                 except psutil.NoSuchProcess:
                     pass  # Process already gone
             return True
@@ -3805,10 +3874,12 @@ class ParallelProcessCleaner:
                     continue
 
                 # Check if this is a supervisor process
+                # v153.0: Use async wrappers to avoid blocking the event loop
                 try:
-                    import psutil
-                    proc = psutil.Process(holder_pid)
-                    cmdline = " ".join(proc.cmdline())
+                    proc = await async_get_process(holder_pid)
+                    if proc is None:
+                        continue
+                    cmdline = await run_sync(lambda: " ".join(proc.cmdline()))
 
                     # Only kill if it's a supervisor process
                     if "run_supervisor.py" in cmdline or "start_system.py" in cmdline:
@@ -3833,7 +3904,8 @@ class ParallelProcessCleaner:
                             await asyncio.sleep(0.5)
 
                             # Force kill if still alive
-                            if psutil.pid_exists(holder_pid):
+                            # v153.0: Use async pid_exists to avoid blocking
+                            if await async_pid_exists(holder_pid):
                                 os.kill(holder_pid, signal.SIGKILL)
                                 await asyncio.sleep(0.2)
 
@@ -3844,7 +3916,8 @@ class ParallelProcessCleaner:
                             # Process already dead
                             killed_count += 1
 
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except Exception:
+                    # Process no longer exists or access denied
                     pass
 
             # Also clean up the lock file itself if we killed holders
@@ -4297,6 +4370,9 @@ class ComprehensiveZombieCleanup:
         Discover processes holding Trinity ports.
 
         v132.4: Added SystemExit protection for thread pool workers.
+
+        Note: Called via run_in_executor from async context.
+        Blocking psutil calls are acceptable here as this runs in a thread pool.
         """
         try:
             import psutil
@@ -4354,6 +4430,9 @@ class ComprehensiveZombieCleanup:
         Discover processes matching repo patterns.
 
         v132.4: Added SystemExit protection for thread pool workers.
+
+        Note: Called via run_in_executor from async context.
+        Blocking psutil calls are acceptable here as this runs in a thread pool.
         """
         try:
             import psutil
@@ -4409,6 +4488,9 @@ class ComprehensiveZombieCleanup:
         Discover zombie-like processes using heuristics.
 
         v132.4: Added SystemExit protection for thread pool workers.
+
+        Note: Called via run_in_executor from async context.
+        Blocking psutil calls are acceptable here as this runs in a thread pool.
 
         A process is zombie-like if:
         - Orphaned (PPID=1) AND sleeping AND has stale connections
@@ -4527,10 +4609,12 @@ class ComprehensiveZombieCleanup:
     async def _terminate_zombie(
         self, pid: int, info: ZombieProcessInfo
     ) -> bool:
-        """Terminate a single zombie with cascade strategy."""
-        try:
-            import psutil
+        """
+        Terminate a single zombie with cascade strategy.
 
+        v153.0: Uses async_pid_exists to avoid blocking the event loop.
+        """
+        try:
             self.logger.info(
                 f"[v109.7] Killing zombie PID {pid} "
                 f"(repo={info.repo_origin}, source={info.detection_source})"
@@ -4540,7 +4624,8 @@ class ComprehensiveZombieCleanup:
             try:
                 os.kill(pid, signal.SIGINT)
                 await asyncio.sleep(0.5)
-                if not psutil.pid_exists(pid):
+                # v153.0: Use async pid_exists to avoid blocking
+                if not await async_pid_exists(pid):
                     return True
             except (ProcessLookupError, OSError):
                 return True
@@ -4549,7 +4634,8 @@ class ComprehensiveZombieCleanup:
             try:
                 os.kill(pid, signal.SIGTERM)
                 await asyncio.sleep(1.0)
-                if not psutil.pid_exists(pid):
+                # v153.0: Use async pid_exists to avoid blocking
+                if not await async_pid_exists(pid):
                     return True
             except (ProcessLookupError, OSError):
                 return True
@@ -4570,13 +4656,10 @@ class ComprehensiveZombieCleanup:
     async def _verify_and_free_ports(self) -> List[int]:
         """
         Phase 4: Verify Trinity ports are free, force-free if needed.
+
+        v153.0: Uses async_get_net_connections to avoid blocking the event loop.
         """
         freed_ports = []
-
-        try:
-            import psutil
-        except ImportError:
-            return freed_ports
 
         # Check all Trinity ports
         all_ports = []
@@ -4585,7 +4668,9 @@ class ComprehensiveZombieCleanup:
 
         for port in all_ports:
             try:
-                for conn in psutil.net_connections(kind='inet'):
+                # v153.0: Use async net_connections to avoid blocking
+                connections = await async_get_net_connections(kind='inet')
+                for conn in connections:
                     if conn.laddr.port == port and conn.pid:
                         pid = conn.pid
                         if pid in (self._my_pid, self._my_parent):
@@ -4601,7 +4686,7 @@ class ComprehensiveZombieCleanup:
                             await asyncio.sleep(0.2)
                         except (ProcessLookupError, OSError):
                             pass
-            except (psutil.AccessDenied, PermissionError):
+            except (PermissionError, OSError):
                 pass
 
         return freed_ports
@@ -4609,14 +4694,14 @@ class ComprehensiveZombieCleanup:
     async def _memory_aware_cleanup(self) -> Dict[str, Any]:
         """
         Phase 5: Memory-aware cleanup using IntelligentMemoryController.
+
+        v153.0: Uses async_get_virtual_memory to avoid blocking the event loop.
         """
         result = {"actions_taken": []}
 
         try:
-            import psutil
-
-            # Check memory pressure
-            memory = psutil.virtual_memory()
+            # v153.0: Use async virtual_memory to avoid blocking
+            memory = await async_get_virtual_memory()
             available_gb = memory.available / (1024**3)
 
             if available_gb < 2.0:
@@ -4941,10 +5026,14 @@ class IntelligentResourceOrchestrator:
         )
 
     async def _check_memory_detailed(self) -> Dict[str, Any]:
-        """Get detailed memory analysis."""
+        """
+        Get detailed memory analysis.
+
+        v153.0: Uses async_get_virtual_memory to avoid blocking the event loop.
+        """
         try:
-            import psutil
-            mem = psutil.virtual_memory()
+            # v153.0: Use async virtual_memory to avoid blocking
+            mem = await async_get_virtual_memory()
 
             # Calculate memory pressure
             pressure = (mem.used / mem.total) * 100 if mem.total > 0 else 0
@@ -5007,15 +5096,23 @@ class IntelligentResourceOrchestrator:
         return available, in_use, actions
 
     async def _is_jarvis_port(self, port: int) -> bool:
-        """Check if a port is being used by a JARVIS process."""
+        """
+        Check if a port is being used by a JARVIS process.
+
+        v153.0: Uses async wrappers to avoid blocking the event loop.
+        """
         try:
-            import psutil
-            for conn in psutil.net_connections(kind='inet'):
+            # v153.0: Use async net_connections to avoid blocking
+            connections = await async_get_net_connections(kind='inet')
+            for conn in connections:
                 if conn.laddr.port == port and conn.status == 'LISTEN':
                     try:
-                        proc = psutil.Process(conn.pid)
-                        cmdline = " ".join(proc.cmdline()).lower()
-                        return any(p in cmdline for p in ["jarvis", "main.py", "start_system"])
+                        # v153.0: Use async get_process to avoid blocking
+                        proc = await async_get_process(conn.pid)
+                        if proc is not None:
+                            # Note: cmdline() is still blocking but brief
+                            cmdline = await run_sync(lambda: " ".join(proc.cmdline()).lower())
+                            return any(p in cmdline for p in ["jarvis", "main.py", "start_system"])
                     except Exception:
                         pass
         except Exception:
@@ -6943,6 +7040,8 @@ class SupervisorBootstrapper:
         Increases timeout when system is under heavy load to prevent
         false timeouts during legitimate slow operations.
 
+        v153.0: Uses async wrappers to avoid blocking the event loop.
+
         Args:
             base_timeout: Base timeout in seconds
 
@@ -6950,11 +7049,9 @@ class SupervisorBootstrapper:
             Adjusted timeout (potentially higher if system is loaded)
         """
         try:
-            import psutil
-
-            # Quick CPU and memory check (non-blocking)
-            cpu_percent = psutil.cpu_percent(interval=0.05)
-            memory = psutil.virtual_memory()
+            # v153.0: Use async wrappers to avoid blocking
+            cpu_percent = await async_get_cpu_percent(interval=0.05)
+            memory = await async_get_virtual_memory()
 
             # Calculate load multiplier
             if cpu_percent > 90 or memory.percent > 95:
@@ -6974,8 +7071,6 @@ class SupervisorBootstrapper:
                 )
             return adjusted
 
-        except ImportError:
-            return base_timeout  # psutil not available
         except Exception:
             return base_timeout  # Any error, use base timeout
 
@@ -7744,7 +7839,12 @@ class SupervisorBootstrapper:
             return markers
     
     def _is_process_running(self, pid: int) -> bool:
-        """Check if a process is running by PID."""
+        """
+        Check if a process is running by PID.
+
+        Note: This is a sync helper typically called from sync context or during
+        crash detection (non-critical path). For async contexts, use async_process_is_running.
+        """
         try:
             import psutil
             return psutil.pid_exists(pid) and psutil.Process(pid).is_running()
@@ -11613,31 +11713,34 @@ class SupervisorBootstrapper:
         """
         v91.0: Record health metrics for all managed processes.
 
+        v153.0: Uses async wrappers to avoid blocking the event loop.
+
         Feeds data to the ML predictor for failure prediction.
         """
         if not self._health_predictor:
             return
 
         try:
-            psutil = _get_psutil()
-            if not psutil:
-                return
-
             # Record metrics for J-Prime if running
             if self._jprime_orchestrator_process and self._jprime_orchestrator_process.returncode is None:
                 try:
                     pid = self._jprime_orchestrator_process.pid
-                    if pid and psutil.pid_exists(pid):
-                        proc = psutil.Process(pid)
-                        self._health_predictor.record_metric("jprime", "cpu", proc.cpu_percent())
-                        self._health_predictor.record_metric("jprime", "memory", proc.memory_percent())
+                    # v153.0: Use async pid_exists and get_process to avoid blocking
+                    if pid and await async_pid_exists(pid):
+                        proc = await async_get_process(pid)
+                        if proc is not None:
+                            # Run cpu_percent and memory_percent in thread
+                            cpu = await run_sync(proc.cpu_percent)
+                            mem = await run_sync(proc.memory_percent)
+                            self._health_predictor.record_metric("jprime", "cpu", cpu)
+                            self._health_predictor.record_metric("jprime", "memory", mem)
 
-                        # Check for failure prediction
-                        failure_prob = self._health_predictor.predict_failure_probability("jprime")
-                        if failure_prob > 0.7:
-                            self.logger.warning(
-                                f"[v91] J-Prime failure prediction: {failure_prob*100:.1f}% probability in next 60s"
-                            )
+                            # Check for failure prediction
+                            failure_prob = self._health_predictor.predict_failure_probability("jprime")
+                            if failure_prob > 0.7:
+                                self.logger.warning(
+                                    f"[v91] J-Prime failure prediction: {failure_prob*100:.1f}% probability in next 60s"
+                                )
                 except Exception:
                     pass
 
@@ -11645,25 +11748,35 @@ class SupervisorBootstrapper:
             if self._reactor_core_orchestrator_process and self._reactor_core_orchestrator_process.returncode is None:
                 try:
                     pid = self._reactor_core_orchestrator_process.pid
-                    if pid and psutil.pid_exists(pid):
-                        proc = psutil.Process(pid)
-                        self._health_predictor.record_metric("reactor_core", "cpu", proc.cpu_percent())
-                        self._health_predictor.record_metric("reactor_core", "memory", proc.memory_percent())
+                    # v153.0: Use async pid_exists and get_process to avoid blocking
+                    if pid and await async_pid_exists(pid):
+                        proc = await async_get_process(pid)
+                        if proc is not None:
+                            # Run cpu_percent and memory_percent in thread
+                            cpu = await run_sync(proc.cpu_percent)
+                            mem = await run_sync(proc.memory_percent)
+                            self._health_predictor.record_metric("reactor_core", "cpu", cpu)
+                            self._health_predictor.record_metric("reactor_core", "memory", mem)
 
-                        failure_prob = self._health_predictor.predict_failure_probability("reactor_core")
-                        if failure_prob > 0.7:
-                            self.logger.warning(
-                                f"[v91] Reactor-Core failure prediction: {failure_prob*100:.1f}% probability in next 60s"
-                            )
+                            failure_prob = self._health_predictor.predict_failure_probability("reactor_core")
+                            if failure_prob > 0.7:
+                                self.logger.warning(
+                                    f"[v91] Reactor-Core failure prediction: {failure_prob*100:.1f}% probability in next 60s"
+                                )
                 except Exception:
                     pass
 
             # Record metrics for main JARVIS process
             try:
-                main_proc = psutil.Process()
-                self._health_predictor.record_metric("jarvis_main", "cpu", main_proc.cpu_percent())
-                self._health_predictor.record_metric("jarvis_main", "memory", main_proc.memory_percent())
-                self._health_predictor.record_metric("jarvis_main", "fd_count", main_proc.num_fds() if hasattr(main_proc, 'num_fds') else 0)
+                # v153.0: Use async get_process to avoid blocking
+                main_proc = await async_get_process(os.getpid())
+                if main_proc is not None:
+                    cpu = await run_sync(main_proc.cpu_percent)
+                    mem = await run_sync(main_proc.memory_percent)
+                    fd_count = await run_sync(lambda: main_proc.num_fds() if hasattr(main_proc, 'num_fds') else 0)
+                    self._health_predictor.record_metric("jarvis_main", "cpu", cpu)
+                    self._health_predictor.record_metric("jarvis_main", "memory", mem)
+                    self._health_predictor.record_metric("jarvis_main", "fd_count", fd_count)
             except Exception:
                 pass
 
@@ -11983,20 +12096,20 @@ class SupervisorBootstrapper:
                     heartbeat = json.load(f)
                 pid = heartbeat.get("pid")
                 if pid:
-                    import psutil
+                    # v153.0: Use async wrappers to avoid blocking
                     try:
-                        proc = psutil.Process(pid)
-                        if proc.is_running():
+                        proc = await async_get_process(pid)
+                        if proc is not None and await async_process_is_running(pid):
                             self.logger.debug(f"[v100.4] Terminating J-Prime via heartbeat PID: {pid}")
-                            proc.terminate()
+                            await run_sync(proc.terminate)
                             # v152.0: Non-blocking wait using async_psutil_wait
                             timeouts = get_timeouts()
                             exited = await async_psutil_wait(proc, timeouts.process_wait_timeout)
                             if not exited:
                                 # Timeout expired, force kill
-                                proc.kill()
+                                await run_sync(proc.kill)
                                 await async_psutil_wait(proc, timeouts.cleanup_timeout_sigkill)
-                    except psutil.NoSuchProcess:
+                    except Exception:
                         pass
             except Exception as e:
                 self.logger.debug(f"[v100.4] Heartbeat-based stop failed: {e}")
@@ -12050,20 +12163,20 @@ class SupervisorBootstrapper:
                     heartbeat = json.load(f)
                 pid = heartbeat.get("pid")
                 if pid:
-                    import psutil
+                    # v153.0: Use async wrappers to avoid blocking
                     try:
-                        proc = psutil.Process(pid)
-                        if proc.is_running():
+                        proc = await async_get_process(pid)
+                        if proc is not None and await async_process_is_running(pid):
                             self.logger.debug(f"[v100.4] Terminating Reactor-Core via heartbeat PID: {pid}")
-                            proc.terminate()
+                            await run_sync(proc.terminate)
                             # v152.0: Non-blocking wait using async_psutil_wait
                             timeouts = get_timeouts()
                             exited = await async_psutil_wait(proc, timeouts.process_wait_timeout)
                             if not exited:
                                 # Timeout expired, force kill
-                                proc.kill()
+                                await run_sync(proc.kill)
                                 await async_psutil_wait(proc, timeouts.cleanup_timeout_sigkill)
-                    except psutil.NoSuchProcess:
+                    except Exception:
                         pass
             except Exception as e:
                 self.logger.debug(f"[v100.4] Heartbeat-based stop failed: {e}")
@@ -17454,12 +17567,11 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                             details["heartbeat_fresh"] = True
 
                             # Check PID validity
+                            # v153.0: Use async wrappers to avoid blocking
                             pid = heartbeat_data.get("pid")
                             if pid:
                                 try:
-                                    import psutil
-                                    proc = psutil.Process(pid)
-                                    if proc.is_running():
+                                    if await async_process_is_running(pid):
                                         details["pid_valid"] = True
                                         details["pid"] = pid
                                 except Exception:
@@ -18029,8 +18141,9 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 interval = base_interval
                 if self._heartbeat_adaptive_enabled:
                     # Increase interval if system is under load
+                    # v153.0: Use async_get_cpu_percent to avoid blocking
                     try:
-                        cpu_percent = psutil.cpu_percent(interval=0.1)
+                        cpu_percent = await async_get_cpu_percent(interval=0.1)
                         if cpu_percent > 80:
                             interval = min(base_interval * 2, 60.0)  # Max 60s under heavy load
                         elif cpu_percent > 60:
@@ -18047,9 +18160,11 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
                 # Collect current metrics
                 uptime = time.time() - self._last_heartbeat_metrics.get("start_time", time.time())
+                # v153.0: Use async wrappers to avoid blocking
                 try:
-                    cpu_percent = psutil.cpu_percent(interval=0.1)
-                    memory_percent = psutil.virtual_memory().percent
+                    cpu_percent = await async_get_cpu_percent(interval=0.1)
+                    mem = await async_get_virtual_memory()
+                    memory_percent = mem.percent
                 except Exception:
                     cpu_percent = 0.0
                     memory_percent = 0.0
@@ -19398,9 +19513,10 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
 
             # v95.0: Pre-initialize VM manager if memory pressure is high
             # This ensures the _gcp_vm_manager global is set for monitoring displays
+            # v153.0: Use async_get_virtual_memory to avoid blocking
             try:
-                import psutil
-                mem_percent = psutil.virtual_memory().percent
+                mem = await async_get_virtual_memory()
+                mem_percent = mem.percent
                 if mem_percent >= 70:  # Same threshold as GCPHybridPrimeRouter
                     self.logger.info(f"[v95.0] High memory ({mem_percent:.1f}%) - pre-initializing GCP VM manager")
                     from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
@@ -21628,6 +21744,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
             - 8000: J-Prime default server port
             - 8002: J-Prime alternate port
             - 8090: Reactor-Core API port
+
+        v153.0: Uses async wrappers to avoid blocking the event loop.
         """
         import psutil
 
@@ -21644,19 +21762,26 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         for port, name in zombie_ports.items():
             try:
                 # Find processes with connections on this port
-                for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                # v153.0: Use async_iter_processes to avoid blocking
+                async for proc_info in async_iter_processes(['pid', 'name', 'cmdline']):
                     try:
+                        pid = proc_info['pid']
                         # Skip current process and its children
-                        if proc.pid == current_pid:
+                        if pid == current_pid:
+                            continue
+
+                        # v153.0: Get process to check connections
+                        proc = await async_get_process(pid)
+                        if proc is None:
                             continue
 
                         # Check if this process has connections on the port
-                        connections = proc.connections()
+                        connections = await run_sync(proc.connections)
                         for conn in connections:
                             if hasattr(conn, 'laddr') and conn.laddr and conn.laddr.port == port:
                                 # Found a zombie holding our port
-                                proc_name = proc.name()
-                                proc_cmdline = ' '.join(proc.cmdline()[:3]) if proc.cmdline() else ''
+                                proc_name = proc_info.get('name', '')
+                                proc_cmdline = ' '.join(proc_info.get('cmdline', [])[:3])
 
                                 # Verify it's a Trinity-related process (not something else)
                                 trinity_patterns = [
@@ -21671,26 +21796,29 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                                 if is_trinity:
                                     self.logger.warning(
                                         f"🧟 Found zombie {name} on port {port} "
-                                        f"(PID: {proc.pid}, cmd: {proc_cmdline[:50]})"
+                                        f"(PID: {pid}, cmd: {proc_cmdline[:50]})"
                                     )
                                     print(
                                         f"  {TerminalUI.YELLOW}🧟 Killing zombie {name} "
-                                        f"(PID: {proc.pid}) on port {port}{TerminalUI.RESET}"
+                                        f"(PID: {pid}) on port {port}{TerminalUI.RESET}"
                                     )
 
                                     # Graceful termination first
-                                    proc.terminate()
+                                    await run_sync(proc.terminate)
                                     await asyncio.sleep(1.0)
 
                                     # Force kill if still running
-                                    if proc.is_running():
-                                        self.logger.warning(f"   Force killing stubborn zombie PID {proc.pid}")
-                                        proc.kill()
+                                    # v153.0: Use async process_is_running
+                                    if await async_process_is_running(pid):
+                                        self.logger.warning(f"   Force killing stubborn zombie PID {pid}")
+                                        await run_sync(proc.kill)
 
                                     reaped_count += 1
                                 break  # One match per port is enough
 
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+                    except Exception:
                         continue
 
             except Exception as e:
@@ -21748,20 +21876,31 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     heartbeat_age = time_module.time() - state.get("timestamp", 0)
                     if heartbeat_age < 30:
                         # v100.1: FIX RACE CONDITION - Validate process is actually running
+                        # v153.0: Use async wrappers to avoid blocking
                         pid = state.get("pid")
                         if pid:
                             try:
-                                import psutil
-                                proc = psutil.Process(pid)
-                                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                                    # Process exists and is not zombie
-                                    self.logger.info(f"   🧠 J-Prime already running (heartbeat: {jprime_state_file.name}, PID: {pid})")
-                                    print(f"  {TerminalUI.GREEN}✓ J-Prime: Already running (heartbeat: {heartbeat_age:.1f}s ago, PID: {pid}){TerminalUI.RESET}")
-                                    return
+                                proc = await async_get_process(pid)
+                                if proc is not None:
+                                    status = await run_sync(proc.status)
+                                    import psutil
+                                    if status != psutil.STATUS_ZOMBIE and await async_process_is_running(pid):
+                                        # Process exists and is not zombie
+                                        self.logger.info(f"   🧠 J-Prime already running (heartbeat: {jprime_state_file.name}, PID: {pid})")
+                                        print(f"  {TerminalUI.GREEN}✓ J-Prime: Already running (heartbeat: {heartbeat_age:.1f}s ago, PID: {pid}){TerminalUI.RESET}")
+                                        return
+                                    else:
+                                        self.logger.warning(f"   J-Prime PID {pid} exists but is zombie/stopped - relaunching")
                                 else:
-                                    self.logger.warning(f"   J-Prime PID {pid} exists but is zombie/stopped - relaunching")
-                            except (ImportError, Exception) as e:
-                                # psutil not available or process doesn't exist
+                                    # psutil couldn't get process, fall back to os.kill check
+                                    try:
+                                        os.kill(pid, 0)  # Just checks if process exists
+                                        self.logger.info(f"   🧠 J-Prime already running (heartbeat: {jprime_state_file.name}, PID: {pid})")
+                                        print(f"  {TerminalUI.GREEN}✓ J-Prime: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
+                                        return
+                                    except OSError:
+                                        self.logger.warning(f"   J-Prime PID {pid} no longer exists - relaunching")
+                            except Exception as e:
                                 # Fall back to os.kill check
                                 try:
                                     os.kill(pid, 0)  # Just checks if process exists
@@ -21897,19 +22036,31 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                 heartbeat_age = time_module.time() - state.get("timestamp", 0)
                 if heartbeat_age < 30:
                     # v100.1: FIX RACE CONDITION - Validate process is actually running
+                    # v153.0: Use async wrappers to avoid blocking
                     pid = state.get("pid")
                     if pid:
                         try:
-                            import psutil
-                            proc = psutil.Process(pid)
-                            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                                self.logger.info(f"   ⚡ Reactor-Core already running (heartbeat detected, PID: {pid})")
-                                print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running (heartbeat: {heartbeat_age:.1f}s ago, PID: {pid}){TerminalUI.RESET}")
-                                return
+                            proc = await async_get_process(pid)
+                            if proc is not None:
+                                status = await run_sync(proc.status)
+                                import psutil
+                                if status != psutil.STATUS_ZOMBIE and await async_process_is_running(pid):
+                                    self.logger.info(f"   ⚡ Reactor-Core already running (heartbeat detected, PID: {pid})")
+                                    print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running (heartbeat: {heartbeat_age:.1f}s ago, PID: {pid}){TerminalUI.RESET}")
+                                    return
+                                else:
+                                    self.logger.warning(f"   Reactor-Core PID {pid} exists but is zombie/stopped - relaunching")
                             else:
-                                self.logger.warning(f"   Reactor-Core PID {pid} exists but is zombie/stopped - relaunching")
-                        except (ImportError, Exception):
-                            # psutil not available, fall back to os.kill check
+                                # Process not found, fall back to os.kill check
+                                try:
+                                    os.kill(pid, 0)
+                                    self.logger.info(f"   ⚡ Reactor-Core already running (heartbeat detected, PID: {pid})")
+                                    print(f"  {TerminalUI.GREEN}✓ Reactor-Core: Already running (heartbeat: {heartbeat_age:.1f}s ago){TerminalUI.RESET}")
+                                    return
+                                except OSError:
+                                    self.logger.warning(f"   Reactor-Core PID {pid} no longer exists - relaunching")
+                        except Exception:
+                            # Fall back to os.kill check
                             try:
                                 os.kill(pid, 0)
                                 self.logger.info(f"   ⚡ Reactor-Core already running (heartbeat detected, PID: {pid})")
@@ -22578,16 +22729,22 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         - Graceful shutdown with configurable timeout
         - Process ancestry checking to avoid killing current session children
         - Detailed logging with trace context support
+
+        v153.0: Uses async wrappers to avoid blocking the event loop.
         """
         import psutil
 
         current_pid = os.getpid()
-        current_process = psutil.Process(current_pid)
+        # v153.0: Use async_get_process to avoid blocking
+        current_process = await async_get_process(current_pid)
 
         # Get children of current process (don't kill our own children)
         try:
-            current_children = {p.pid for p in current_process.children(recursive=True)}
-        except psutil.Error:
+            if current_process is not None:
+                current_children = await run_sync(lambda: {p.pid for p in current_process.children(recursive=True)})
+            else:
+                current_children = set()
+        except Exception:
             current_children = set()
 
         reaped_count = 0
@@ -22605,23 +22762,31 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
         for port, component_name in zombie_ports.items():
             try:
                 # Find processes with connections on this port
-                for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+                # v153.0: Use async_iter_processes to avoid blocking
+                async for proc_info in async_iter_processes(['pid', 'name', 'cmdline', 'create_time']):
                     try:
-                        pid = proc.pid
+                        pid = proc_info['pid']
 
                         # Skip current process and its children
                         if pid == current_pid or pid in current_children:
                             continue
 
+                        # v153.0: Get process to check connections
+                        proc = await async_get_process(pid)
+                        if proc is None:
+                            continue
+
                         # Check if this process has connections on the port
-                        connections = proc.connections()
+                        connections = await run_sync(proc.connections)
                         for conn in connections:
                             if (hasattr(conn, 'laddr') and conn.laddr and
                                 conn.laddr.port == port and
                                 conn.status in ('LISTEN', 'ESTABLISHED')):
 
-                                proc_name = proc.name()
-                                proc_cmdline = ' '.join(proc.cmdline()[:5]) if proc.cmdline() else ''
+                                # v153.0: Use run_sync for proc.name() and proc.cmdline()
+                                proc_name = await run_sync(proc.name)
+                                cmdline_list = await run_sync(proc.cmdline)
+                                proc_cmdline = ' '.join(cmdline_list[:5]) if cmdline_list else ''
 
                                 # Verify it's a Trinity-related process
                                 is_trinity = any(
@@ -22641,7 +22806,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                                     )
 
                                     # Graceful termination first
-                                    proc.terminate()
+                                    # v153.0: Use run_sync for proc.terminate()
+                                    await run_sync(proc.terminate)
 
                                     # v152.0: Non-blocking wait for graceful shutdown
                                     # Uses async_psutil_wait to keep event loop responsive
@@ -22652,7 +22818,7 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                                     if not exited:
                                         # Force kill if still running
                                         self.logger.warning(f"   Force killing stubborn zombie PID {pid}")
-                                        proc.kill()
+                                        await run_sync(proc.kill)
                                         # Wait for SIGKILL with centralized timeout
                                         await async_psutil_wait(
                                             proc, timeouts.cleanup_timeout_sigkill
@@ -22662,6 +22828,8 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                                 break  # One match per port is enough
 
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+                    except Exception:
                         continue
 
             except Exception as e:
@@ -25279,7 +25447,13 @@ uvicorn.run(app, host="0.0.0.0", port={self._reactor_core_port}, log_level="warn
                     metadata_file.write_text(json.dumps(self.model_registry, indent=2, default=str))
 
                 def get_available_memory_gb(self) -> float:
-                    """Get available system memory in GB."""
+                    """
+                    Get available system memory in GB.
+
+                    Note: Sync method called from sync context within model selection.
+                    Blocking psutil call is acceptable here as model selection happens
+                    during initialization or in isolated paths.
+                    """
                     mem = psutil.virtual_memory()
                     return mem.available / (1024 ** 3)
 
