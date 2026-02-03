@@ -1,5 +1,5 @@
 """
-Distributed Lock Manager for Cross-Repo Coordination v2.0
+Distributed Lock Manager for Cross-Repo Coordination v3.0
 ===========================================================
 
 Production-grade distributed lock manager for coordinating operations across
@@ -18,10 +18,18 @@ Features:
 - v2.0: Exponential backoff with jitter (reduces contention)
 - v2.0: Orphaned temp file cleanup (prevents disk clutter)
 - v2.0: Cross-repo coordination improvements
+- v3.0: Redis backend support for distributed environments
+- v3.0: Automatic backend selection (Redis → File fallback)
+- v3.0: Cross-repo lock bridge for JARVIS-Prime and Reactor-Core
+- v3.0: Fencing tokens for monotonic ordering
+- v3.0: Lock lease extension (keepalive)
 
 Problem Solved:
     Before: Process crashes while holding lock → other processes blocked forever
     After: Locks auto-expire after TTL → stale locks cleaned up automatically
+
+    Before (v2.0): Only file-based locks, limited to single machine
+    After (v3.0): Redis + File hybrid, works across VMs, GCP instances, Docker
 
 Example Usage:
     ```python
@@ -37,21 +45,52 @@ Example Usage:
     ```
 
 Architecture:
-    ┌─────────────────────────────────────────────────────────────┐
-    │  ~/.jarvis/cross_repo/locks/                                │
-    │  ├── vbia_events.lock        (Lock file with metadata)     │
-    │  │   {                                                      │
-    │  │     "acquired_at": 1736895345.123,                      │
-    │  │     "expires_at": 1736895355.123,  # TTL = 10s          │
-    │  │     "owner": "jarvis-core-pid-12345",                   │
-    │  │     "token": "f47ac10b-58cc-4372-a567-0e02b2c3d479"     │
-    │  │   }                                                      │
-    │  ├── prime_state.lock                                      │
-    │  └── reactor_state.lock                                    │
-    └─────────────────────────────────────────────────────────────┘
+    v3.0 Unified Cross-Repo Lock System:
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                      UNIFIED LOCK MANAGER v3.0                          │
+    │                                                                         │
+    │  ┌───────────────────┐       ┌───────────────────┐                      │
+    │  │  Redis Backend    │  OR   │   File Backend    │                      │
+    │  │  (Distributed)    │ ←──→  │   (Local/NFS)     │                      │
+    │  │                   │       │                   │                      │
+    │  │  - Fencing tokens │       │  - JSON metadata  │                      │
+    │  │  - Keepalive      │       │  - PID validation │                      │
+    │  │  - SETNX + TTL    │       │  - Atomic rename  │                      │
+    │  └───────────────────┘       └───────────────────┘                      │
+    │           ↑                           ↑                                 │
+    │           │   Automatic Fallback      │                                 │
+    │           └───────────┬───────────────┘                                 │
+    │                       │                                                 │
+    │  ┌────────────────────┴────────────────────┐                            │
+    │  │         Lock Coordinator                │                            │
+    │  │  - Backend selection                    │                            │
+    │  │  - Cross-repo coordination              │                            │
+    │  │  - Health monitoring                    │                            │
+    │  └────────────────────┬────────────────────┘                            │
+    │                       │                                                 │
+    │  ┌────────────┬───────┴───────┬────────────┐                            │
+    │  │  JARVIS    │  JARVIS-Prime │ Reactor    │                            │
+    │  │  (Body)    │  (Mind)       │ Core       │                            │
+    │  └────────────┴───────────────┴────────────┘                            │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    File-based locks (fallback):
+    ~/.jarvis/cross_repo/locks/
+    ├── vbia_events.dlm.lock     (Lock file with metadata)
+    │   {
+    │     "acquired_at": 1736895345.123,
+    │     "expires_at": 1736895355.123,
+    │     "owner": "jarvis-12345-1736895300.5",
+    │     "token": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    │     "fencing_token": 42,
+    │     "backend": "file"
+    │   }
+    ├── prime_state.dlm.lock
+    └── reactor_training.dlm.lock
 
 Author: JARVIS AI System
-Version: 2.0.0
+Version: 3.0.0
 
 v2.0.0 CRITICAL FIX (Race Condition Resolution):
     Before: Multiple async tasks used same temp file path `{lock}.tmp.{pid}`
@@ -59,6 +98,13 @@ v2.0.0 CRITICAL FIX (Race Condition Resolution):
             when concurrent tasks stepped on each other's temp files.
     After: Each write uses UUID-based temp file + per-lock semaphore
            Eliminates all inter-task race conditions.
+
+v3.0.0 CROSS-REPO UNIFICATION:
+    Before: JARVIS used file locks, Reactor-Core used Redis locks, no coordination.
+    After: Unified lock manager with automatic backend selection:
+           - Redis available → Use Redis (distributed across machines)
+           - Redis unavailable → Fall back to file locks (single machine)
+           - Both repos can import this module for consistent locking
 """
 
 from __future__ import annotations
@@ -68,17 +114,228 @@ import json
 import logging
 import os
 import random
+import socket
+import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import AsyncIterator, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import aiofiles
 import aiofiles.os
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# v3.0: Backend Configuration
+# =============================================================================
+
+# Redis configuration from environment
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+REDIS_LOCK_DB = int(os.getenv("REDIS_LOCK_DB", "1"))  # Separate DB for locks
+
+# Lock configuration from environment
+DEFAULT_LOCK_TTL = float(os.getenv("DISTRIBUTED_LOCK_TTL", "10.0"))
+DEFAULT_ACQUIRE_TIMEOUT = float(os.getenv("DISTRIBUTED_LOCK_TIMEOUT", "5.0"))
+DEFAULT_RETRY_INTERVAL = float(os.getenv("DISTRIBUTED_LOCK_RETRY_INTERVAL", "0.1"))
+KEEPALIVE_INTERVAL = float(os.getenv("DISTRIBUTED_LOCK_KEEPALIVE", "3.0"))
+
+# Cross-repo lock key prefixes
+LOCK_PREFIX = "jarvis:lock:"
+TRINITY_LOCK_PREFIX = f"{LOCK_PREFIX}trinity:"
+
+
+class LockBackend(Enum):
+    """v3.0: Available lock backends."""
+    REDIS = "redis"
+    FILE = "file"
+    AUTO = "auto"  # Automatic selection: Redis if available, else file
+
+
+class LockState(Enum):
+    """v3.0: States of a distributed lock."""
+    RELEASED = "released"
+    ACQUIRING = "acquiring"
+    ACQUIRED = "acquired"
+    EXTENDING = "extending"
+    FAILED = "failed"
+
+
+# =============================================================================
+# v3.0: Redis Client Wrapper
+# =============================================================================
+
+class AsyncRedisLockClient:
+    """
+    v3.0: Async Redis client wrapper for distributed locks.
+
+    Falls back gracefully when Redis is unavailable.
+    Thread-safe singleton pattern.
+    """
+
+    _instance: Optional["AsyncRedisLockClient"] = None
+    _lock = threading.Lock()
+
+    def __new__(cls) -> "AsyncRedisLockClient":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+
+        self.host = REDIS_HOST
+        self.port = REDIS_PORT
+        self.password = REDIS_PASSWORD
+        self.db = REDIS_LOCK_DB
+        self._client = None
+        self._available = False
+        self._connect_lock = asyncio.Lock()
+        self._last_check = 0.0
+        self._check_interval = 30.0  # Re-check availability every 30s
+        self._initialized = True
+
+    async def connect(self) -> bool:
+        """Connect to Redis. Returns True if successful."""
+        async with self._connect_lock:
+            if self._client is not None and self._available:
+                return True
+
+            # Rate limit connection attempts
+            now = time.time()
+            if now - self._last_check < self._check_interval and not self._available:
+                return False
+            self._last_check = now
+
+            try:
+                # Try importing redis-py async (preferred) or aioredis (legacy)
+                redis_module = None
+                try:
+                    import redis.asyncio as redis_module  # type: ignore
+                except ImportError:
+                    try:
+                        import aioredis as redis_module  # type: ignore
+                    except ImportError:
+                        logger.debug("[v3.0] Redis client not available (redis/aioredis not installed)")
+                        self._available = False
+                        return False
+
+                url = f"redis://{self.host}:{self.port}/{self.db}"
+                self._client = await redis_module.from_url(
+                    url,
+                    password=self.password,
+                    encoding="utf-8",
+                    decode_responses=True,
+                )
+
+                # Test connection
+                await self._client.ping()
+                self._available = True
+                logger.info(f"[v3.0] Connected to Redis at {self.host}:{self.port}")
+                return True
+
+            except Exception as e:
+                logger.debug(f"[v3.0] Redis connection failed: {e}")
+                self._available = False
+                self._client = None
+                return False
+
+    async def disconnect(self) -> None:
+        """Disconnect from Redis."""
+        async with self._connect_lock:
+            if self._client:
+                try:
+                    await self._client.close()
+                except Exception:
+                    pass
+                self._client = None
+                self._available = False
+
+    @property
+    def is_available(self) -> bool:
+        return self._available and self._client is not None
+
+    async def set_nx(self, key: str, value: str, ttl_seconds: float) -> bool:
+        """Set if not exists with TTL (SETNX + EXPIRE)."""
+        if not self.is_available or self._client is None:
+            return False
+
+        try:
+            result = await self._client.set(key, value, nx=True, ex=int(ttl_seconds))
+            return result is not None
+        except Exception as e:
+            logger.debug(f"[v3.0] Redis SETNX failed: {e}")
+            self._available = False
+            return False
+
+    async def get(self, key: str) -> Optional[str]:
+        """Get value by key."""
+        if not self.is_available or self._client is None:
+            return None
+
+        try:
+            result = await self._client.get(key)
+            return str(result) if result else None
+        except Exception as e:
+            logger.debug(f"[v3.0] Redis GET failed: {e}")
+            return None
+
+    async def delete(self, key: str) -> bool:
+        """Delete key."""
+        if not self.is_available or self._client is None:
+            return False
+
+        try:
+            result = await self._client.delete(key)
+            return int(result) > 0
+        except Exception as e:
+            logger.debug(f"[v3.0] Redis DELETE failed: {e}")
+            return False
+
+    async def expire(self, key: str, ttl_seconds: int) -> bool:
+        """Set TTL on key."""
+        if not self.is_available or self._client is None:
+            return False
+
+        try:
+            result = await self._client.expire(key, ttl_seconds)
+            return bool(result)
+        except Exception as e:
+            logger.debug(f"[v3.0] Redis EXPIRE failed: {e}")
+            return False
+
+    async def incr(self, key: str) -> int:
+        """Increment and return new value (for fencing tokens)."""
+        if not self.is_available or self._client is None:
+            return 0
+
+        try:
+            result = await self._client.incr(key)
+            return int(result)
+        except Exception as e:
+            logger.debug(f"[v3.0] Redis INCR failed: {e}")
+            return 0
+
+
+# Global Redis client instance
+_redis_client: Optional[AsyncRedisLockClient] = None
+
+
+def get_redis_client() -> AsyncRedisLockClient:
+    """Get the global Redis client instance."""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = AsyncRedisLockClient()
+    return _redis_client
 
 
 # =============================================================================
@@ -93,6 +350,8 @@ class LockConfig:
     v96.2: Lock files now use `.dlm.lock` extension to avoid collision with
     flock-based locks from other systems (e.g., AtomicFileWriter in unified_loop_manager.py).
 
+    v3.0: Added backend selection, Redis configuration, and cross-repo settings.
+
     Lock File Naming:
     - DistributedLockManager: {lock_name}.dlm.lock (JSON metadata)
     - Other systems (flock): {name}.lock (empty flock files)
@@ -100,19 +359,19 @@ class LockConfig:
     This prevents "corrupted lock file" errors when both systems share the same lock directory.
     """
     # Lock directory
-    lock_dir: Path = Path.home() / ".jarvis" / "cross_repo" / "locks"
+    lock_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "cross_repo" / "locks")
 
     # v96.2: Lock file extension - distinct from flock-based locks
     lock_extension: str = ".dlm.lock"
 
     # Default lock timeout (how long to wait for lock acquisition)
-    default_timeout_seconds: float = 5.0
+    default_timeout_seconds: float = DEFAULT_ACQUIRE_TIMEOUT
 
     # Default lock TTL (how long lock is valid before auto-expiration)
-    default_ttl_seconds: float = 10.0
+    default_ttl_seconds: float = DEFAULT_LOCK_TTL
 
     # Retry settings
-    retry_delay_seconds: float = 0.1
+    retry_delay_seconds: float = DEFAULT_RETRY_INTERVAL
 
     # Stale lock cleanup settings
     cleanup_enabled: bool = True
@@ -120,6 +379,27 @@ class LockConfig:
 
     # Lock health check
     health_check_enabled: bool = True
+
+    # v3.0: Backend selection
+    backend: LockBackend = LockBackend.AUTO  # AUTO tries Redis first, falls back to file
+
+    # v3.0: Redis configuration
+    redis_host: str = REDIS_HOST
+    redis_port: int = REDIS_PORT
+    redis_db: int = REDIS_LOCK_DB
+    redis_password: Optional[str] = REDIS_PASSWORD
+
+    # v3.0: Cross-repo identification
+    repo_source: str = field(default_factory=lambda: os.getenv("JARVIS_REPO_SOURCE", "jarvis"))
+
+    # v3.0: Keepalive settings (for long-running operations)
+    keepalive_enabled: bool = True
+    keepalive_interval_seconds: float = KEEPALIVE_INTERVAL
+
+    # v3.0: Fencing token counter file (for file-based backend)
+    fencing_counter_file: Path = field(
+        default_factory=lambda: Path.home() / ".jarvis" / "cross_repo" / "locks" / ".fencing_counter"
+    )
 
 
 # =============================================================================
@@ -129,7 +409,7 @@ class LockConfig:
 @dataclass
 class LockMetadata:
     """
-    v96.0: Enhanced metadata stored in lock file.
+    v3.0: Enhanced metadata stored in lock file.
 
     CRITICAL FIX for Problem 19 (Startup lock not released on crash):
     - Added process_start_time for PID reuse detection
@@ -137,17 +417,27 @@ class LockMetadata:
     - Added machine_id for distributed environments
     - Enhanced stale detection with multiple signals
 
-    Lock File Format (v96.0):
+    v3.0 Additions:
+    - backend: Which backend was used to acquire the lock (redis/file)
+    - fencing_token: Monotonically increasing token for ordering
+    - repo_source: Which repo acquired the lock (jarvis/jarvis-prime/reactor-core)
+    - extensions: Number of times the lock TTL was extended
+
+    Lock File Format (v3.0):
     {
         "acquired_at": 1736895345.123,
         "expires_at": 1736895355.123,
-        "owner": "jarvis-12345-1736895300.5",  # pid-process_start_time
+        "owner": "jarvis-12345-1736895300.5",
         "token": "f47ac10b-58cc-4372-a567...",
         "lock_name": "vbia_events",
-        "process_start_time": 1736895300.5,  # v96.0
-        "process_name": "python3",            # v96.0
-        "process_cmdline": "python3 -m ...",  # v96.0
-        "machine_id": "darwin-hostname"       # v96.0
+        "process_start_time": 1736895300.5,
+        "process_name": "python3",
+        "process_cmdline": "python3 -m ...",
+        "machine_id": "darwin-hostname",
+        "backend": "redis",                   # v3.0
+        "fencing_token": 42,                  # v3.0
+        "repo_source": "jarvis",              # v3.0
+        "extensions": 0                       # v3.0
     }
     """
     acquired_at: float  # Timestamp when lock was acquired
@@ -161,6 +451,12 @@ class LockMetadata:
     process_name: str = ""              # Process name (e.g., "python3")
     process_cmdline: str = ""           # Command line (truncated)
     machine_id: str = ""                # Machine identifier
+
+    # v3.0: Cross-repo and backend tracking
+    backend: str = "file"               # Which backend: "redis" or "file"
+    fencing_token: int = 0              # Monotonically increasing token
+    repo_source: str = "jarvis"         # Which repo: jarvis, jarvis-prime, reactor-core
+    extensions: int = 0                 # Number of TTL extensions
 
     def is_expired(self) -> bool:
         """Check if lock has expired."""
@@ -210,7 +506,7 @@ class LockMetadata:
 
 class DistributedLockManager:
     """
-    v96.0: Production-grade distributed lock manager for cross-repo coordination.
+    v3.0: Production-grade distributed lock manager for cross-repo coordination.
 
     Features:
     - Automatic lock expiration (TTL-based)
@@ -225,11 +521,20 @@ class DistributedLockManager:
     - v96.0: Process fingerprint in lock metadata
     - v96.0: Machine ID tracking for distributed environments
     - v96.0: Enhanced owner ID format: "jarvis-{pid}-{start_time}"
+    - v3.0: Redis backend support with automatic fallback
+    - v3.0: Fencing tokens for monotonic ordering
+    - v3.0: Lock keepalive for long-running operations
+    - v3.0: Cross-repo identification (jarvis/jarvis-prime/reactor-core)
 
     CRITICAL FIX (v96.0) - Problem 19: Startup lock not released on crash
     ════════════════════════════════════════════════════════════════════════
     Before: Process crash → PID reused → stale lock appears valid → deadlock
     After: Process start time validated → PID reuse detected → stale lock cleaned
+
+    v3.0 CROSS-REPO UNIFICATION:
+    ════════════════════════════════════════════════════════════════════════
+    Before: Each repo had its own locking mechanism
+    After: Unified lock manager with Redis (distributed) + File (fallback)
     """
 
     def __init__(self, config: Optional[LockConfig] = None):
@@ -239,7 +544,7 @@ class DistributedLockManager:
 
         # v96.0: Enhanced owner ID with process start time for PID reuse detection
         self._process_start_time = self._get_own_process_start_time()
-        self._owner_id = f"jarvis-{os.getpid()}-{self._process_start_time:.1f}"
+        self._owner_id = f"{self.config.repo_source}-{os.getpid()}-{self._process_start_time:.1f}"
         self._process_name = self._get_own_process_name()
         self._process_cmdline = self._get_own_process_cmdline()
         self._machine_id = self._get_machine_id()
@@ -255,7 +560,27 @@ class DistributedLockManager:
         # v2.0: Counter for unique temp file naming (backup to UUID)
         self._write_counter = 0
 
-        logger.info(f"Distributed Lock Manager v2.0 initialized (owner: {self._owner_id})")
+        # v3.0: Backend selection state
+        self._active_backend: LockBackend = LockBackend.FILE
+        self._redis_client: Optional[AsyncRedisLockClient] = None
+        self._redis_available = False
+
+        # v3.0: Fencing token counter (monotonically increasing)
+        self._fencing_token_counter = 0
+        self._fencing_lock = asyncio.Lock()
+
+        # v3.0: Active keepalive tasks (lock_name -> task)
+        self._keepalive_tasks: Dict[str, asyncio.Task] = {}
+
+        # v3.0: Callbacks for lock events
+        self._on_lock_acquired: List[Callable[[str, LockMetadata], None]] = []
+        self._on_lock_released: List[Callable[[str], None]] = []
+        self._on_lock_failed: List[Callable[[str, str], None]] = []
+
+        logger.info(
+            f"Distributed Lock Manager v3.0 initialized "
+            f"(owner: {self._owner_id}, backend: {self.config.backend.value})"
+        )
 
     def _get_own_process_start_time(self) -> float:
         """v96.0: Get our own process start time for owner ID."""
@@ -1309,6 +1634,296 @@ class DistributedLockManager:
             logger.error(f"Error listing locks: {e}")
             return locks
 
+    # =========================================================================
+    # v3.0: Redis Backend Support
+    # =========================================================================
+
+    async def _select_backend(self) -> LockBackend:
+        """
+        v3.0: Select the best available lock backend.
+
+        Priority: Redis (if available) > File (fallback)
+        """
+        if self.config.backend == LockBackend.FILE:
+            return LockBackend.FILE
+
+        if self.config.backend == LockBackend.REDIS:
+            self._redis_client = get_redis_client()
+            if await self._redis_client.connect():
+                self._redis_available = True
+                return LockBackend.REDIS
+            logger.warning("[v3.0] Redis backend requested but unavailable")
+            return LockBackend.REDIS
+
+        # AUTO mode: Try Redis first, fall back to file
+        if self.config.backend == LockBackend.AUTO:
+            self._redis_client = get_redis_client()
+            if await self._redis_client.connect():
+                self._redis_available = True
+                logger.info("[v3.0] Using Redis backend (distributed mode)")
+                return LockBackend.REDIS
+            else:
+                logger.info("[v3.0] Redis unavailable, using file backend (local mode)")
+                return LockBackend.FILE
+
+        return LockBackend.FILE
+
+    async def _get_next_fencing_token(self, lock_name: str) -> int:
+        """v3.0: Get the next monotonically increasing fencing token."""
+        async with self._fencing_lock:
+            if self._redis_available and self._redis_client:
+                token = await self._redis_client.incr(f"{TRINITY_LOCK_PREFIX}fencing:{lock_name}")
+                if token > 0:
+                    return token
+
+            # Fall back to file-based counter
+            self._fencing_token_counter += 1
+            return self._fencing_token_counter
+
+    async def _try_acquire_redis(
+        self,
+        lock_name: str,
+        token: str,
+        ttl: float,
+    ) -> Optional[LockMetadata]:
+        """v3.0: Try to acquire lock via Redis backend."""
+        if not self._redis_available or not self._redis_client:
+            return None
+
+        redis_key = f"{TRINITY_LOCK_PREFIX}{lock_name}"
+        fencing_token = await self._get_next_fencing_token(lock_name)
+        now = time.time()
+
+        metadata = LockMetadata(
+            acquired_at=now,
+            expires_at=now + ttl,
+            owner=self._owner_id,
+            token=token,
+            lock_name=lock_name,
+            process_start_time=self._process_start_time,
+            process_name=self._process_name,
+            process_cmdline=self._process_cmdline,
+            machine_id=self._machine_id,
+            backend="redis",
+            fencing_token=fencing_token,
+            repo_source=self.config.repo_source,
+        )
+
+        value = json.dumps(asdict(metadata))
+
+        if await self._redis_client.set_nx(redis_key, value, ttl):
+            logger.debug(f"[v3.0] Redis lock acquired: {lock_name} (fencing={fencing_token})")
+            return metadata
+
+        # Check if existing lock is stale
+        existing_value = await self._redis_client.get(redis_key)
+        if existing_value:
+            try:
+                existing = LockMetadata(**json.loads(existing_value))
+                if existing.is_expired() or not self._is_process_alive(existing.owner, existing):
+                    if await self._redis_client.delete(redis_key):
+                        if await self._redis_client.set_nx(redis_key, value, ttl):
+                            logger.info(f"[v3.0] Redis lock acquired after stale cleanup: {lock_name}")
+                            return metadata
+            except (json.JSONDecodeError, TypeError):
+                await self._redis_client.delete(redis_key)
+                if await self._redis_client.set_nx(redis_key, value, ttl):
+                    return metadata
+
+        return None
+
+    async def _release_redis(self, lock_name: str, token: str) -> bool:
+        """v3.0: Release lock from Redis backend."""
+        if not self._redis_available or not self._redis_client:
+            return False
+
+        redis_key = f"{TRINITY_LOCK_PREFIX}{lock_name}"
+        value = await self._redis_client.get(redis_key)
+
+        if not value:
+            return True
+
+        try:
+            metadata = LockMetadata(**json.loads(value))
+            if metadata.token == token:
+                return await self._redis_client.delete(redis_key)
+            return False
+        except (json.JSONDecodeError, TypeError):
+            return await self._redis_client.delete(redis_key)
+
+    @asynccontextmanager
+    async def acquire_unified(
+        self,
+        lock_name: str,
+        timeout: Optional[float] = None,
+        ttl: Optional[float] = None,
+        enable_keepalive: bool = True,
+    ) -> AsyncIterator[Tuple[bool, Optional[LockMetadata]]]:
+        """
+        v3.0: Acquire lock using best available backend with optional keepalive.
+
+        Yields:
+            Tuple of (acquired: bool, metadata: Optional[LockMetadata])
+        """
+        timeout = timeout or self.config.default_timeout_seconds
+        ttl = ttl or self.config.default_ttl_seconds
+        token = str(uuid4())
+
+        if not self._initialized:
+            await self.initialize()
+
+        if self._active_backend == LockBackend.FILE:
+            self._active_backend = await self._select_backend()
+
+        acquired = False
+        metadata: Optional[LockMetadata] = None
+        keepalive_task: Optional[asyncio.Task] = None
+
+        start_time = time.time()
+        attempt = 0
+
+        try:
+            while time.time() - start_time < timeout:
+                # Try Redis first if available
+                if self._redis_available and self._redis_client:
+                    metadata = await self._try_acquire_redis(lock_name, token, ttl)
+                    if metadata:
+                        acquired = True
+                        break
+
+                # Fall back to file-based lock
+                lock_file = self.config.lock_dir / f"{lock_name}{self.config.lock_extension}"
+                if await self._try_acquire_lock(lock_file, lock_name, token, ttl):
+                    acquired = True
+                    fencing_token = await self._get_next_fencing_token(lock_name)
+                    now = time.time()
+                    metadata = LockMetadata(
+                        acquired_at=now,
+                        expires_at=now + ttl,
+                        owner=self._owner_id,
+                        token=token,
+                        lock_name=lock_name,
+                        process_start_time=self._process_start_time,
+                        process_name=self._process_name,
+                        process_cmdline=self._process_cmdline,
+                        machine_id=self._machine_id,
+                        backend="file",
+                        fencing_token=fencing_token,
+                        repo_source=self.config.repo_source,
+                    )
+                    break
+
+                attempt += 1
+                base_delay = self.config.retry_delay_seconds
+                jitter = random.uniform(0, base_delay * 0.5)
+                await asyncio.sleep(base_delay + jitter)
+
+            if acquired and metadata:
+                logger.debug(
+                    f"[v3.0] Lock acquired: {lock_name} "
+                    f"(backend={metadata.backend}, fencing={metadata.fencing_token})"
+                )
+
+                # Start keepalive if enabled
+                if enable_keepalive and self.config.keepalive_enabled:
+                    keepalive_task = asyncio.create_task(
+                        self._keepalive_loop(lock_name, token, ttl, metadata.backend),
+                        name=f"keepalive_{lock_name}"
+                    )
+                    self._keepalive_tasks[lock_name] = keepalive_task
+            else:
+                logger.warning(f"[v3.0] Lock acquisition timeout: {lock_name}")
+
+            yield acquired, metadata
+
+        finally:
+            if keepalive_task and not keepalive_task.done():
+                keepalive_task.cancel()
+                try:
+                    await asyncio.wait_for(keepalive_task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+
+            if lock_name in self._keepalive_tasks:
+                del self._keepalive_tasks[lock_name]
+
+            if acquired:
+                if metadata and metadata.backend == "redis":
+                    await self._release_redis(lock_name, token)
+                else:
+                    lock_file = self.config.lock_dir / f"{lock_name}{self.config.lock_extension}"
+                    await self._release_lock(lock_file, token)
+                logger.debug(f"[v3.0] Lock released: {lock_name}")
+
+    async def _keepalive_loop(
+        self,
+        lock_name: str,
+        token: str,
+        ttl: float,
+        backend: str,
+    ) -> None:
+        """v3.0: Background task to extend lock TTL periodically."""
+        interval = self.config.keepalive_interval_seconds
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                if backend == "redis" and self._redis_client:
+                    redis_key = f"{TRINITY_LOCK_PREFIX}{lock_name}"
+                    value = await self._redis_client.get(redis_key)
+                    if value:
+                        try:
+                            meta = LockMetadata(**json.loads(value))
+                            if meta.token == token:
+                                await self._redis_client.expire(redis_key, int(ttl))
+                                logger.debug(f"[v3.0] Redis lock TTL extended: {lock_name}")
+                        except (json.JSONDecodeError, TypeError):
+                            break
+                else:
+                    lock_file = self.config.lock_dir / f"{lock_name}{self.config.lock_extension}"
+                    metadata = await self._read_lock_metadata(lock_file)
+                    if metadata and metadata.token == token:
+                        metadata.expires_at = time.time() + ttl
+                        metadata.extensions += 1
+                        await self._write_lock_metadata(lock_file, metadata)
+                        logger.debug(f"[v3.0] File lock TTL extended: {lock_name}")
+                    else:
+                        break
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[v3.0] Keepalive error for {lock_name}: {e}")
+                break
+
+    def get_active_backend(self) -> LockBackend:
+        """v3.0: Get the currently active lock backend."""
+        return self._active_backend
+
+    def is_redis_available(self) -> bool:
+        """v3.0: Check if Redis backend is available."""
+        return self._redis_available
+
+    async def get_cross_repo_status(self) -> Dict[str, Any]:
+        """v3.0: Get comprehensive cross-repo lock status."""
+        status: Dict[str, Any] = {
+            "backend": self._active_backend.value,
+            "redis_available": self._redis_available,
+            "repo_source": self.config.repo_source,
+            "owner_id": self._owner_id,
+            "machine_id": self._machine_id,
+            "active_keepalives": list(self._keepalive_tasks.keys()),
+            "locks": [],
+        }
+
+        file_locks = await self.list_all_locks()
+        for lock in file_locks:
+            lock["backend"] = "file"
+        status["locks"].extend(file_locks)
+
+        return status
+
 
 # =============================================================================
 # Global Instance (Singleton Pattern)
@@ -1317,12 +1932,16 @@ class DistributedLockManager:
 _lock_manager_instance: Optional[DistributedLockManager] = None
 
 
-async def get_lock_manager() -> DistributedLockManager:
-    """Get or create global lock manager instance."""
+async def get_lock_manager(config: Optional[LockConfig] = None) -> DistributedLockManager:
+    """
+    Get or create global lock manager instance.
+
+    v3.0: Supports optional config for cross-repo initialization.
+    """
     global _lock_manager_instance
 
     if _lock_manager_instance is None:
-        _lock_manager_instance = DistributedLockManager()
+        _lock_manager_instance = DistributedLockManager(config)
         await _lock_manager_instance.initialize()
 
     return _lock_manager_instance
@@ -1335,3 +1954,38 @@ async def shutdown_lock_manager() -> None:
     if _lock_manager_instance:
         await _lock_manager_instance.shutdown()
         _lock_manager_instance = None
+
+
+# =============================================================================
+# v3.0: Cross-Repo Convenience Functions
+# =============================================================================
+
+@asynccontextmanager
+async def acquire_cross_repo_lock(
+    lock_name: str,
+    repo_source: str = "jarvis",
+    timeout: float = 5.0,
+    ttl: float = 10.0,
+) -> AsyncIterator[Tuple[bool, Optional[LockMetadata]]]:
+    """
+    v3.0: Convenience function for cross-repo lock acquisition.
+
+    Makes it easy for JARVIS-Prime and Reactor-Core to acquire locks consistently.
+
+    Example (from JARVIS-Prime):
+        from backend.core.distributed_lock_manager import acquire_cross_repo_lock
+
+        async with acquire_cross_repo_lock("training_job", "jarvis-prime") as (acquired, meta):
+            if acquired:
+                await run_training()
+    """
+    config = LockConfig(repo_source=repo_source)
+    manager = await get_lock_manager(config)
+
+    async with manager.acquire_unified(lock_name, timeout, ttl) as result:
+        yield result
+
+
+def get_trinity_lock_prefix() -> str:
+    """v3.0: Get the Trinity lock prefix for Redis keys."""
+    return TRINITY_LOCK_PREFIX
