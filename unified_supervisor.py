@@ -59291,6 +59291,35 @@ class JarvisSystemKernel:
         except Exception:
             return False
 
+    async def _broadcast_progress(
+        self,
+        progress: int,
+        stage: str,
+        message: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        v201.2: Convenience wrapper for _broadcast_startup_progress.
+
+        This method accepts arguments in (progress, stage, message) order
+        which is more intuitive for callers tracking percentage-first.
+
+        Args:
+            progress: Progress percentage (0-100)
+            stage: Current startup stage identifier
+            message: Human-readable progress message
+            metadata: Optional additional data
+
+        Returns:
+            True if broadcast succeeded, False otherwise
+        """
+        return await self._broadcast_startup_progress(
+            stage=stage,
+            message=message,
+            progress=progress,
+            metadata=metadata
+        )
+
     async def _supervisor_heartbeat_loop(self) -> None:
         """
         v183.0: Send periodic heartbeats to loading server.
