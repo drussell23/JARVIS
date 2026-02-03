@@ -749,6 +749,14 @@ except ImportError:
     cleanup_orphaned_semaphores = None
     set_cli_only_mode = lambda *args: None  # No-op fallback
 
+# v207.0: Startup Resilience Coordinator - Non-blocking health checks with auto-recovery
+try:
+    from backend.core.resilience.startup import StartupResilience
+    STARTUP_RESILIENCE_AVAILABLE = True
+except ImportError:
+    STARTUP_RESILIENCE_AVAILABLE = False
+    StartupResilience = None  # type: ignore
+
 # v181.0: Cross-Repo Startup Orchestrator - GCP/Hollow Client/Trinity Protocol
 # v200.0: Added ProcessOrchestrator and StartupLockError for Pillar 1 lock-guarded startup
 try:
@@ -54617,6 +54625,13 @@ class JarvisSystemKernel:
         self._invincible_node_ready: bool = False
         self._invincible_node_ip: Optional[str] = None
 
+        # v207.0: Startup Resilience Coordinator
+        # Provides non-blocking health checks and background auto-recovery for:
+        # - Docker daemon
+        # - Ollama LLM server
+        # - Invincible Node (GCP VM)
+        self._startup_resilience: Optional["StartupResilience"] = None
+
         # v183.0/v204.0: Heartbeat task for loading server
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._current_progress: int = 0  # Track progress for heartbeat payload
@@ -54976,6 +54991,16 @@ class JarvisSystemKernel:
             pass
         except Exception as e:
             self.logger.debug(f"[Kernel] GCP cleanup error: {e}")
+
+        # v207.0: Stop startup resilience coordinator (stops background recovery tasks)
+        if self._startup_resilience:
+            try:
+                await asyncio.wait_for(self._startup_resilience.stop(), timeout=5.0)
+                self.logger.info("[Kernel] Startup resilience coordinator stopped")
+            except asyncio.TimeoutError:
+                self.logger.debug("[Kernel] Startup resilience stop timed out")
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Startup resilience cleanup error: {e}")
 
         # Kill backend immediately
         if self._backend_process:
@@ -56534,6 +56559,19 @@ class JarvisSystemKernel:
                     pass
 
             # =====================================================================
+            # v207.0: STARTUP RESILIENCE COORDINATOR
+            # Initialize non-blocking health checks with background auto-recovery.
+            # This allows startup to continue even if Docker/Ollama are unavailable.
+            # =====================================================================
+            if STARTUP_RESILIENCE_AVAILABLE and self._startup_resilience is None:
+                try:
+                    self._startup_resilience = StartupResilience(logger=self.logger)
+                    await self._startup_resilience.start()
+                    self.logger.info("[Kernel] Startup resilience coordinator initialized")
+                except Exception as e:
+                    self.logger.warning(f"[Kernel] Failed to initialize startup resilience: {e}")
+
+            # =====================================================================
             # v188.0: RESOURCE PROGRESS CALLBACK
             # This callback is invoked as each resource manager completes initialization.
             # It updates the DMS watchdog and broadcasts to the loading server to
@@ -56877,6 +56915,38 @@ class JarvisSystemKernel:
 
             ready_count = sum(1 for v in results.values() if v)
             self.logger.success(f"[Kernel] Resources: {ready_count}/{len(results)} initialized")
+
+            # =====================================================================
+            # v207.0: RESILIENCE HEALTH CHECKS WITH AUTO-RECOVERY
+            # Non-blocking health checks that start background recovery if services
+            # are unavailable. Startup continues regardless of service status.
+            # =====================================================================
+            if self._startup_resilience:
+                # Docker health check (starts background recovery if not healthy)
+                docker_healthy = await self._startup_resilience.check_docker()
+                if docker_healthy:
+                    self.logger.info("[Kernel] Docker: healthy (resilience check)")
+                else:
+                    self.logger.warning("[Kernel] Docker: unhealthy - background recovery started")
+
+                # Ollama health check (starts background recovery if not healthy)
+                ollama_healthy = await self._startup_resilience.check_ollama()
+                if ollama_healthy:
+                    self.logger.info("[Kernel] Ollama: healthy (resilience check)")
+                else:
+                    self.logger.warning("[Kernel] Ollama: unhealthy - background recovery started")
+
+                # Configure Invincible Node resilience (if enabled)
+                if self.config.invincible_node_enabled:
+                    try:
+                        from backend.core.gcp_vm_manager import get_gcp_vm_manager
+                        self._startup_resilience.configure_invincible_node(
+                            get_vm_manager=get_gcp_vm_manager,
+                            port=self.config.invincible_node_port,
+                        )
+                        self.logger.info("[Kernel] Invincible Node: resilience configured")
+                    except ImportError:
+                        self.logger.debug("[Kernel] Invincible Node: GCP module not available")
 
             # v180.0: Diagnostic checkpoint
             if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
