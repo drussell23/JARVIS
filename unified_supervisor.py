@@ -776,6 +776,34 @@ except ImportError:
     cleanup_orphaned_semaphores_on_startup = None
 
 # =============================================================================
+# v203.0: ASYNC STARTUP UTILITIES
+# =============================================================================
+# Non-blocking async wrappers for process wait and subprocess operations.
+# These prevent event loop blocking during startup/shutdown operations.
+# =============================================================================
+try:
+    from backend.utils.async_startup import async_psutil_wait, async_process_wait
+    ASYNC_STARTUP_UTILS_AVAILABLE = True
+except ImportError:
+    ASYNC_STARTUP_UTILS_AVAILABLE = False
+    async_psutil_wait = None
+    async_process_wait = None
+
+# =============================================================================
+# v203.0: CENTRALIZED TIMEOUT CONFIGURATION
+# =============================================================================
+# Environment-driven timeout configuration with validation.
+# All timeouts configurable via JARVIS_* environment variables.
+# =============================================================================
+try:
+    from backend.config.startup_timeouts import get_timeouts, StartupTimeouts
+    STARTUP_TIMEOUTS_AVAILABLE = True
+except ImportError:
+    STARTUP_TIMEOUTS_AVAILABLE = False
+    get_timeouts = None
+    StartupTimeouts = None
+
+# =============================================================================
 # v185.0: JARVIS SUPERVISOR LIFECYCLE INTEGRATION
 # =============================================================================
 # Integrates with the JARVISSupervisor from backend/core/supervisor for:
@@ -2543,6 +2571,7 @@ class IntelligentKernelTakeover:
         Force kill a process with escalating signals.
 
         Tries SIGTERM first, then SIGKILL if needed.
+        Uses async wrappers to avoid blocking the event loop (v203.0).
         """
         try:
             import psutil
@@ -2552,22 +2581,53 @@ class IntelligentKernelTakeover:
 
             proc = psutil.Process(pid)
 
+            # Get configured timeouts (v203.0)
+            sigterm_timeout = 5.0
+            sigkill_timeout = 2.0
+            if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
+                timeouts = get_timeouts()
+                sigterm_timeout = timeouts.cleanup_timeout_sigterm
+                sigkill_timeout = timeouts.cleanup_timeout_sigkill
+
             # Try SIGTERM first
             self.logger.debug(f"[Takeover] Sending SIGTERM to PID {pid}")
             proc.terminate()
 
-            # Wait up to 5 seconds
+            # Wait using async wrapper to avoid blocking event loop (v203.0)
             try:
-                proc.wait(timeout=5)
-                self.logger.debug(f"[Takeover] PID {pid} terminated gracefully")
-                return True
-            except psutil.TimeoutExpired:
+                if ASYNC_STARTUP_UTILS_AVAILABLE and async_psutil_wait is not None:
+                    exited = await async_psutil_wait(proc, timeout=sigterm_timeout)
+                    if exited:
+                        self.logger.debug(f"[Takeover] PID {pid} terminated gracefully")
+                        return True
+                else:
+                    # Fallback: run in executor
+                    loop = asyncio.get_running_loop()
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: proc.wait(timeout=sigterm_timeout)),
+                        timeout=sigterm_timeout + 1.0
+                    )
+                    self.logger.debug(f"[Takeover] PID {pid} terminated gracefully")
+                    return True
+            except (psutil.TimeoutExpired, asyncio.TimeoutError):
                 pass
 
             # Force kill
             self.logger.debug(f"[Takeover] Sending SIGKILL to PID {pid}")
             proc.kill()
-            proc.wait(timeout=2)
+
+            # Wait for SIGKILL with async wrapper (v203.0)
+            try:
+                if ASYNC_STARTUP_UTILS_AVAILABLE and async_psutil_wait is not None:
+                    await async_psutil_wait(proc, timeout=sigkill_timeout)
+                else:
+                    loop = asyncio.get_running_loop()
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: proc.wait(timeout=sigkill_timeout)),
+                        timeout=sigkill_timeout + 1.0
+                    )
+            except (psutil.TimeoutExpired, asyncio.TimeoutError):
+                pass
             self.logger.debug(f"[Takeover] PID {pid} killed")
             return True
 
@@ -6442,6 +6502,8 @@ class DynamicPortManager(ResourceManagerBase):
 
         Returns:
             True if port was freed, False if process is unkillable
+
+        v203.0: Uses async wrappers to avoid blocking the event loop.
         """
         if not self._psutil:
             return False
@@ -6462,6 +6524,14 @@ class DynamicPortManager(ResourceManagerBase):
             self.blacklisted_ports.add(port)
             return False
 
+        # Get configured timeouts (v203.0)
+        sigterm_timeout = 5.0
+        sigkill_timeout = 3.0
+        if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
+            timeouts = get_timeouts()
+            sigterm_timeout = timeouts.cleanup_timeout_sigterm
+            sigkill_timeout = timeouts.cleanup_timeout_sigkill
+
         # Try to kill the process
         try:
             proc = self._psutil.Process(pid)
@@ -6470,22 +6540,45 @@ class DynamicPortManager(ResourceManagerBase):
             self._logger.info(f"Sending SIGTERM to process {pid} on port {port}")
             proc.terminate()
 
+            # Wait using async wrapper to avoid blocking event loop (v203.0)
             try:
-                proc.wait(timeout=5.0)
-                self._logger.info(f"Process {pid} terminated gracefully")
-                return True
-            except self._psutil.TimeoutExpired:
+                if ASYNC_STARTUP_UTILS_AVAILABLE and async_psutil_wait is not None:
+                    exited = await async_psutil_wait(proc, timeout=sigterm_timeout)
+                    if exited:
+                        self._logger.info(f"Process {pid} terminated gracefully")
+                        return True
+                else:
+                    # Fallback: run in executor
+                    loop = asyncio.get_running_loop()
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: proc.wait(timeout=sigterm_timeout)),
+                        timeout=sigterm_timeout + 1.0
+                    )
+                    self._logger.info(f"Process {pid} terminated gracefully")
+                    return True
+            except (self._psutil.TimeoutExpired, asyncio.TimeoutError):
                 pass
 
             # Force kill
             self._logger.warning(f"Process {pid} didn't terminate gracefully, sending SIGKILL")
             proc.kill()
 
+            # Wait for SIGKILL with async wrapper (v203.0)
             try:
-                proc.wait(timeout=3.0)
-                self._logger.info(f"Process {pid} killed with SIGKILL")
-                return True
-            except self._psutil.TimeoutExpired:
+                if ASYNC_STARTUP_UTILS_AVAILABLE and async_psutil_wait is not None:
+                    exited = await async_psutil_wait(proc, timeout=sigkill_timeout)
+                    if exited:
+                        self._logger.info(f"Process {pid} killed with SIGKILL")
+                        return True
+                else:
+                    loop = asyncio.get_running_loop()
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, lambda: proc.wait(timeout=sigkill_timeout)),
+                        timeout=sigkill_timeout + 1.0
+                    )
+                    self._logger.info(f"Process {pid} killed with SIGKILL")
+                    return True
+            except (self._psutil.TimeoutExpired, asyncio.TimeoutError):
                 self._logger.error(f"Failed to kill process {pid} - may be in unkillable state")
                 self.blacklisted_ports.add(port)
                 return False
@@ -14120,6 +14213,8 @@ class ParallelProcessCleaner:
         Terminate a single process with cascade strategy.
 
         Strategy: SIGINT → wait → SIGTERM → wait → SIGKILL
+
+        v203.0: Uses async wrappers to avoid blocking the event loop.
         """
         try:
             import psutil
@@ -14133,13 +14228,33 @@ class ParallelProcessCleaner:
                 except (Exception, ProcessLookupError, OSError):
                     return True  # Process already gone
 
+            async def _async_wait(proc: Any, timeout: float) -> bool:
+                """
+                Wait for process exit without blocking event loop (v203.0).
+
+                Returns True if process exited, False if timed out.
+                """
+                if ASYNC_STARTUP_UTILS_AVAILABLE and async_psutil_wait is not None:
+                    return await async_psutil_wait(proc, timeout=timeout)
+                else:
+                    # Fallback: run in executor
+                    loop = asyncio.get_running_loop()
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, lambda: proc.wait(timeout=timeout)),
+                            timeout=timeout + 1.0
+                        )
+                        return True
+                    except (asyncio.TimeoutError, psutil.TimeoutExpired):
+                        return False
+
             # Phase 1: SIGINT (graceful)
             if _safe_kill(pid, signal.SIGINT):
                 try:
                     proc = psutil.Process(pid)
                     await asyncio.sleep(0.1)
-                    proc.wait(timeout=self.cleanup_timeout_sigint)
-                    return True
+                    if await _async_wait(proc, self.cleanup_timeout_sigint):
+                        return True
                 except Exception:
                     pass
 
@@ -14147,8 +14262,8 @@ class ParallelProcessCleaner:
             if _safe_kill(pid, signal.SIGTERM):
                 try:
                     proc = psutil.Process(pid)
-                    proc.wait(timeout=self.cleanup_timeout_sigterm)
-                    return True
+                    if await _async_wait(proc, self.cleanup_timeout_sigterm):
+                        return True
                 except Exception:
                     pass
 
@@ -14156,7 +14271,7 @@ class ParallelProcessCleaner:
             if _safe_kill(pid, signal.SIGKILL):
                 try:
                     proc = psutil.Process(pid)
-                    proc.wait(timeout=self.cleanup_timeout_sigkill)
+                    await _async_wait(proc, self.cleanup_timeout_sigkill)
                 except Exception:
                     pass
             return True
@@ -62643,13 +62758,17 @@ async def handle_check_only(args: argparse.Namespace) -> int:
     print(f"{BOLD}{BLUE}║{RESET}")
     print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Docker{RESET}")
     if config.docker_enabled:
+        # Get configured timeout (v203.0)
+        docker_timeout = 10.0
+        if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
+            docker_timeout = get_timeouts().docker_check_timeout
         try:
             proc = await asyncio.create_subprocess_exec(
                 "docker", "info",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
+            await asyncio.wait_for(proc.wait(), timeout=docker_timeout)
             docker_ok = proc.returncode == 0
             print(f"{BOLD}{BLUE}║{RESET}    {check_mark(docker_ok)} Docker daemon: {'running' if docker_ok else 'not running'}")
             if not docker_ok:
@@ -63207,7 +63326,10 @@ async def _fetch_preflight_status() -> Dict[str, Any]:
         if not backend_dir.exists() or not core_dir.exists():
             result["passed"] = False
 
-        # Docker check (with timeout)
+        # Docker check (with timeout) - v203.0: use configured timeout
+        docker_timeout = 10.0
+        if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
+            docker_timeout = get_timeouts().docker_check_timeout
         if config.docker_enabled:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -63215,7 +63337,7 @@ async def _fetch_preflight_status() -> Dict[str, Any]:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
+                await asyncio.wait_for(proc.wait(), timeout=docker_timeout)
                 result["checks"]["docker"] = proc.returncode == 0
                 if proc.returncode != 0:
                     result["warnings"].append("Docker daemon not running")
