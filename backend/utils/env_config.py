@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from typing import Any, ClassVar, Type, TypeVar, get_type_hints
 
 logger = logging.getLogger(__name__)
@@ -416,20 +416,43 @@ class EnvConfig:
             # Build env key: prefix + UPPER_SNAKE_CASE
             env_key = cls._env_prefix + field.name.upper()
 
-            # Get the field type and default
+            # Get the field type
             field_type = hints.get(field.name, str)
-            default_value = field.default
+
+            # Determine default value, handling MISSING sentinel
+            # We need to resolve the default before type dispatch
+            has_default = True
+            if field.default is not MISSING:
+                raw_default: Any = field.default
+            elif field.default_factory is not MISSING:
+                raw_default = field.default_factory()
+            else:
+                # Required field with no default - check if env var is set
+                raw_env = os.environ.get(env_key)
+                if raw_env is None:
+                    raise ValueError(
+                        f"EnvConfig field '{field.name}' has no default and "
+                        f"env var '{env_key}' is not set"
+                    )
+                # Mark that we have no default (env var will provide value)
+                has_default = False
+                raw_default = None  # Placeholder, won't be used
 
             # Read from environment with appropriate parser
+            # Each branch uses explicit casting to satisfy type checkers
             if field_type is int:
-                kwargs[field.name] = get_env_int(env_key, default_value)
+                int_default: int = int(raw_default) if has_default else 0
+                kwargs[field.name] = get_env_int(env_key, int_default)
             elif field_type is float:
-                kwargs[field.name] = get_env_float(env_key, default_value)
+                float_default: float = float(raw_default) if has_default else 0.0
+                kwargs[field.name] = get_env_float(env_key, float_default)
             elif field_type is bool:
-                kwargs[field.name] = get_env_bool(env_key, default_value)
+                bool_default: bool = bool(raw_default) if has_default else False
+                kwargs[field.name] = get_env_bool(env_key, bool_default)
             else:
                 # Default to string
-                kwargs[field.name] = get_env_str(env_key, default_value)
+                str_default: str = str(raw_default) if has_default else ""
+                kwargs[field.name] = get_env_str(env_key, str_default)
 
         return cls(**kwargs)
 
