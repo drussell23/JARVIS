@@ -62864,15 +62864,15 @@ async def handle_cloud_monitor() -> int:
 
     # Check if Invincible Node is configured
     if not config.invincible_node_enabled or not config.invincible_node_static_ip_name:
-        print(box_line(f"{RED}⚠  Invincible Node is not configured{RESET}"))
-        print(box_line(""))
-        print(box_line("To enable, set in .env.gcp:"))
-        print(box_line("  JARVIS_INVINCIBLE_NODE_ENABLED=true"))
-        print(box_line("  GCP_VM_STATIC_IP_NAME=jarvis-prime-static"))
-        print(box_line(""))
-        print(box_line("Then deploy with:"))
-        print(box_line("  ./deploy_spot_node.sh"))
-        print(footer())
+        print(box.line(f"{box.RED}⚠  Invincible Node is not configured{box.RESET}"))
+        print(box.line(""))
+        print(box.line("To enable, set in .env.gcp:"))
+        print(box.line("  JARVIS_INVINCIBLE_NODE_ENABLED=true"))
+        print(box.line("  GCP_VM_STATIC_IP_NAME=jarvis-prime-static"))
+        print(box.line(""))
+        print(box.line("Then deploy with:"))
+        print(box.line("  ./deploy_spot_node.sh"))
+        print(box.footer())
         print()
         return 1
 
@@ -62882,62 +62882,62 @@ async def handle_cloud_monitor() -> int:
         manager = await get_gcp_vm_manager_safe()
 
         if not manager:
-            print(box_line(f"{RED}⚠  GCP VM Manager not available{RESET}"))
-            print(box_line("   Check GCP credentials and configuration"))
-            print(footer())
+            print(box.line(f"{box.RED}⚠  GCP VM Manager not available{box.RESET}"))
+            print(box.line("   Check GCP credentials and configuration"))
+            print(box.footer())
             print()
             return 1
 
         status = await manager.get_invincible_node_status()
 
     except ImportError as e:
-        print(box_line(f"{RED}⚠  GCP module import failed: {e}{RESET}"))
-        print(footer())
+        print(box.line(f"{box.RED}⚠  GCP module import failed: {e}{box.RESET}"))
+        print(box.footer())
         print()
         return 1
     except Exception as e:
-        print(box_line(f"{RED}⚠  Error getting status: {e}{RESET}"))
-        print(footer())
+        print(box.line(f"{box.RED}⚠  Error getting status: {e}{box.RESET}"))
+        print(box.footer())
         print()
         return 1
 
     # Display instance info
-    print(box_line(f"Instance:     {BOLD}{status['instance_name']}{RESET}"))
-    print(box_line(f"Zone:         {status['zone']}"))
-    print(box_line(f"Project:      {status['project_id']}"))
-    print(separator())
+    print(box.line(f"Instance:     {box.BOLD}{status['instance_name']}{box.RESET}"))
+    print(box.line(f"Zone:         {status['zone']}"))
+    print(box.line(f"Project:      {status['project_id']}"))
+    print(box.separator())
 
     # Display GCP status
     gcp_status = status.get("gcp_status", "UNKNOWN")
-    print(box_line(f"GCP Status:   {status_color(gcp_status)}"))
+    print(box.line(f"GCP Status:   {status_color(gcp_status)}"))
 
     if status.get("machine_type"):
-        print(box_line(f"Machine:      {status['machine_type']}"))
+        print(box.line(f"Machine:      {status['machine_type']}"))
 
     if status.get("termination_action"):
         action = status["termination_action"]
-        action_display = f"{GREEN}STOP (Invincible){RESET}" if action == "STOP" else action
-        print(box_line(f"On Preempt:   {action_display}"))
+        action_display = f"{box.GREEN}STOP (Invincible){box.RESET}" if action == "STOP" else action
+        print(box.line(f"On Preempt:   {action_display}"))
 
     if status.get("uptime_seconds"):
         uptime = status["uptime_seconds"]
         hours = int(uptime // 3600)
         minutes = int((uptime % 3600) // 60)
         secs = int(uptime % 60)
-        print(box_line(f"Uptime:       {hours}h {minutes}m {secs}s"))
+        print(box.line(f"Uptime:       {hours}h {minutes}m {secs}s"))
 
-    print(separator())
+    print(box.separator())
 
     # Display network info
     static_ip = status.get("static_ip")
     port = config.invincible_node_port
     if static_ip:
-        print(box_line(f"Static IP:    {CYAN}{static_ip}{RESET}"))
-        print(box_line(f"Health URL:   http://{static_ip}:{port}/health"))
+        print(box.line(f"Static IP:    {box.CYAN}{static_ip}{box.RESET}"))
+        print(box.line(f"Health URL:   http://{static_ip}:{port}/health"))
     else:
-        print(box_line(f"Static IP:    {RED}Not found{RESET}"))
+        print(box.line(f"Static IP:    {box.RED}Not found{box.RESET}"))
 
-    print(separator())
+    print(box.separator())
 
     # Display health check results
     health = status.get("health", {})
@@ -62946,23 +62946,23 @@ async def handle_cloud_monitor() -> int:
         ready = health.get("ready_for_inference", False)
 
         if reachable:
-            print(box_line(f"API Health:   {GREEN}✓ Reachable{RESET}"))
+            print(box.line(f"API Health:   {box.GREEN}✓ Reachable{box.RESET}"))
         else:
-            print(box_line(f"API Health:   {RED}✗ Unreachable{RESET}"))
+            print(box.line(f"API Health:   {box.RED}✗ Unreachable{box.RESET}"))
 
         if ready:
-            print(box_line(f"Inference:    {GREEN}✓ Ready{RESET}"))
+            print(box.line(f"Inference:    {box.GREEN}✓ Ready{box.RESET}"))
         else:
             api_status = health.get("status", "unknown")
-            print(box_line(f"Inference:    {YELLOW}○ {api_status}{RESET}"))
+            print(box.line(f"Inference:    {box.YELLOW}○ {api_status}{box.RESET}"))
 
         model = health.get("active_model")
         if model:
-            print(box_line(f"Model:        {GREEN}{model}{RESET}"))
+            print(box.line(f"Model:        {box.GREEN}{model}{box.RESET}"))
         elif health.get("model_loaded"):
-            print(box_line(f"Model:        {GREEN}Loaded{RESET}"))
+            print(box.line(f"Model:        {box.GREEN}Loaded{box.RESET}"))
         else:
-            print(box_line(f"Model:        {YELLOW}Not loaded{RESET}"))
+            print(box.line(f"Model:        {box.YELLOW}Not loaded{box.RESET}"))
 
         # Show APARS progress if available
         apars = health.get("apars")
@@ -62970,24 +62970,24 @@ async def handle_cloud_monitor() -> int:
             phase_name = apars.get("phase_name", "unknown")
             progress = apars.get("total_progress", 0)
             eta = apars.get("eta_seconds", 0)
-            print(separator())
-            print(box_line(f"{CYAN}STARTUP PROGRESS{RESET}"))
-            print(box_line(f"Phase:        {phase_name}"))
-            print(box_line(f"Progress:     {progress}%"))
-            print(box_line(f"ETA:          {eta}s"))
+            print(box.separator())
+            print(box.line(f"{box.CYAN}STARTUP PROGRESS{box.RESET}"))
+            print(box.line(f"Phase:        {phase_name}"))
+            print(box.line(f"Progress:     {progress}%"))
+            print(box.line(f"ETA:          {eta}s"))
     else:
-        print(box_line(f"API Health:   {YELLOW}○ No data{RESET}"))
+        print(box.line(f"API Health:   {box.YELLOW}○ No data{box.RESET}"))
 
     # Display error if any
     if status.get("error"):
-        print(separator())
-        print(box_line(f"{RED}Error: {status['error']}{RESET}"))
+        print(box.separator())
+        print(box.line(f"{box.RED}Error: {status['error']}{box.RESET}"))
 
-    print(footer())
+    print(box.footer())
 
     # Show quick actions
     print()
-    print(f"{BOLD}Quick Actions:{RESET}")
+    print(f"{box.BOLD}Quick Actions:{box.RESET}")
     if gcp_status in ("STOPPED", "TERMINATED", "SUSPENDED"):
         print(f"  • Wake node:    python unified_supervisor.py (auto-wakes on startup)")
         print(f"  • Manual wake:  gcloud compute instances start {status['instance_name']} --zone={status['zone']}")
