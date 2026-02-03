@@ -200,6 +200,10 @@ core.*
 !docs/core/
 !docs/core/**
 !docs/core/**/*
+# Exception: Allow tests/unit/core directory (unit tests for backend/core)
+!tests/unit/core/
+!tests/unit/core/**
+!tests/unit/core/**/*
 # Exception: Allow backend/context_intelligence/core directory
 !backend/context_intelligence/core/
 !backend/context_intelligence/core/**

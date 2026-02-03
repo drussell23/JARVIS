@@ -249,6 +249,22 @@ from backend.core.resilience.supervisor_integration import (
     SupervisorResilienceContext,
 )
 
+# v3.0: Resilience Primitives Core Types
+# These are foundational types for the new primitives layer (RetryPolicy, HealthProbe, etc.)
+# Note: CircuitState here uses auto() values, distinct from the string-based CircuitState
+# in distributed_circuit_breaker. Import from types.py directly for the primitives version.
+from backend.core.resilience.types import (
+    # Primitives CircuitState (uses auto() - distinct from distributed_circuit_breaker's)
+    CircuitState as PrimitivesCircuitState,
+    # Capability management states
+    CapabilityState,
+    # Recovery process states
+    RecoveryState,
+    # Protocols for health and recovery
+    HealthCheckable,
+    Recoverable,
+)
+
 __all__ = [
     # Distributed Lock
     "DistributedLock",
@@ -446,4 +462,14 @@ __all__ = [
     "get_supervisor_resilience_health",
     # Context Manager
     "SupervisorResilienceContext",
+    # =========================================================================
+    # v3.0: RESILIENCE PRIMITIVES CORE TYPES
+    # =========================================================================
+    # State Enums (for new primitives layer)
+    "PrimitivesCircuitState",  # Aliased to avoid collision with distributed_circuit_breaker
+    "CapabilityState",
+    "RecoveryState",
+    # Protocols
+    "HealthCheckable",
+    "Recoverable",
 ]
