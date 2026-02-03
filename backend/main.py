@@ -6774,6 +6774,59 @@ async def autonomous_services():
         return {"error": str(e)}
 
 
+# =============================================================================
+# VOICE ORCHESTRATOR METRICS
+# =============================================================================
+
+@app.get("/api/voice/metrics")
+async def get_voice_metrics():
+    """
+    Get voice orchestrator metrics.
+
+    Returns 503 if kernel/orchestrator unavailable.
+    """
+    from fastapi.responses import JSONResponse
+
+    try:
+        import json
+        from backend.core.voice_client import VoiceClient
+
+        client = VoiceClient(source="api")
+        socket_path = client._get_socket_path()
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(socket_path),
+            timeout=2.0,
+        )
+
+        # Request metrics
+        writer.write(b'{"command":"metrics"}\n')
+        await writer.drain()
+
+        response = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        writer.close()
+        await writer.wait_closed()
+
+        data = json.loads(response)
+        return JSONResponse(data)
+
+    except (FileNotFoundError, ConnectionRefusedError):
+        return JSONResponse(
+            {"error": "voice_orchestrator_unavailable", "message": "Kernel not running"},
+            status_code=503,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "voice_orchestrator_timeout", "message": "Kernel not responding"},
+            status_code=504,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": "internal_error", "message": str(e)},
+            status_code=500,
+        )
+
+
 # Mount routers based on available components
 def mount_routers():
     """Mount API routers based on loaded components"""
