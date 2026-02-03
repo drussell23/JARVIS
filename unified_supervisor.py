@@ -54574,9 +54574,12 @@ class JarvisSystemKernel:
         self._invincible_node_ready: bool = False
         self._invincible_node_ip: Optional[str] = None
 
-        # v183.0: Heartbeat task for loading server
+        # v183.0/v204.0: Heartbeat task for loading server
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._current_progress: int = 0  # Track progress for heartbeat payload
+        self._current_startup_phase: str = "initializing"  # Current startup phase name
+        self._current_startup_progress: int = 0  # Base progress for heartbeat calculations
+        self._heartbeat_last_sent_progress: int = 0  # Track monotonic progress enforcement
 
         # Voice narrator for startup feedback (v2.0)
         self._narrator: Optional[AsyncVoiceNarrator] = None
@@ -55518,76 +55521,25 @@ class JarvisSystemKernel:
             )
 
             # =====================================================================
-            # v197.3: STARTUP PROGRESS HEARTBEAT - Keeps loading page alive
+            # v197.3/v204.0: STARTUP PROGRESS HEARTBEAT - Keeps loading page alive
             # =====================================================================
-            # This background task sends progress updates every 3 seconds to the
+            # This background task sends progress updates periodically to the
             # loading page. This fixes the "stuck at 5%" issue by ensuring the
             # loading page always has fresh data, even during blocking operations.
+            # v204.0: Uses monotonic time, enforces monotonic progress, and uses
+            # StartupTimeouts for configurable interval.
             # =====================================================================
-            heartbeat_stop_event = asyncio.Event()
             self._current_startup_phase = "preflight"
             self._current_startup_progress = 5
-            
-            async def _startup_progress_heartbeat() -> None:
-                """Background task to keep loading page updated during startup."""
-                last_progress = 5
-                start_time = time.time()
-                
-                while not heartbeat_stop_event.is_set():
-                    try:
-                        await asyncio.sleep(3.0)  # Every 3 seconds
-                        
-                        if heartbeat_stop_event.is_set():
-                            break
-                        
-                        elapsed = time.time() - start_time
-                        current_phase = getattr(self, '_current_startup_phase', 'unknown')
-                        base_progress = getattr(self, '_current_startup_progress', last_progress)
-                        
-                        # Slightly increment progress to show activity (max +2% per heartbeat)
-                        # This gives visual feedback that system is working
-                        increment = min(2, max(0.5, 0.1 * elapsed / 10))
-                        effective_progress = min(95, base_progress + increment)
-                        
-                        # Build component status from dashboard
-                        components = {}
-                        try:
-                            dash = get_live_dashboard()
-                            for name, comp in dash._components.items():
-                                components[name] = {"status": comp.get("status", "pending")}
-                        except Exception:
-                            pass
-                        
-                        # Send heartbeat
-                        await self._broadcast_startup_progress(
-                            stage=current_phase,
-                            message=f"Phase: {current_phase} (elapsed: {elapsed:.0f}s)...",
-                            progress=int(effective_progress),
-                            metadata={
-                                "icon": "spinner",
-                                "phase_name": current_phase,
-                                "elapsed_seconds": int(elapsed),
-                                "components": components,
-                                "heartbeat": True,
-                            }
-                        )
-                        
-                        # Also update dashboard log
-                        add_dashboard_log(f"Heartbeat: {current_phase} @ {effective_progress:.0f}%", "DEBUG")
-                        
-                        last_progress = effective_progress
-                        
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        self.logger.debug(f"[Heartbeat] Error: {e}")
-            
-            # Start heartbeat in background
+            self._heartbeat_last_sent_progress = 0  # Track last sent progress for monotonic enforcement
+
+            # Start heartbeat in background using instance method
             heartbeat_task = asyncio.create_task(
-                _startup_progress_heartbeat(),
+                self._progress_heartbeat_task(),
                 name="startup-progress-heartbeat"
             )
             self._background_tasks.append(heartbeat_task)
+            self._heartbeat_task = heartbeat_task  # Store reference for cancellation
 
             # Phase 1: Preflight (Zone 5.1-5.4)
             self._current_startup_phase = "preflight"
@@ -56114,17 +56066,18 @@ class JarvisSystemKernel:
 
             startup_duration = time.time() - self._started_at
 
-            # v197.3: Stop the startup progress heartbeat
+            # v197.3/v204.0: Stop the startup progress heartbeat
             self._current_startup_phase = "complete"
             self._current_startup_progress = 100
             try:
-                heartbeat_stop_event.set()
-                if heartbeat_task and not heartbeat_task.done():
-                    heartbeat_task.cancel()
+                if self._heartbeat_task and not self._heartbeat_task.done():
+                    self._heartbeat_task.cancel()
                     try:
-                        await asyncio.wait_for(asyncio.shield(heartbeat_task), timeout=1.0)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        pass
+                        await self._heartbeat_task
+                    except asyncio.CancelledError:
+                        self.logger.debug("[Heartbeat] Task cancelled successfully")
+                    except Exception as e:
+                        self.logger.debug(f"[Heartbeat] Task cleanup exception: {e}")
             except Exception:
                 pass
 
@@ -59864,7 +59817,7 @@ class JarvisSystemKernel:
         """Send single heartbeat to loading server."""
         if self.config.loading_server_port == 0:
             return
-        
+
         heartbeat_data = {
             "type": "heartbeat",
             "pid": os.getpid(),
@@ -59872,7 +59825,7 @@ class JarvisSystemKernel:
             "progress": self._current_progress,
             "timestamp": time.time(),
         }
-        
+
         try:
             if AIOHTTP_AVAILABLE and aiohttp is not None:
                 url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
@@ -59884,6 +59837,107 @@ class JarvisSystemKernel:
                             self.logger.debug("[Heartbeat] Sent successfully")
         except Exception:
             pass  # Heartbeat failures are not critical
+
+    async def _progress_heartbeat_task(self) -> None:
+        """
+        v204.0: Background task that sends periodic heartbeats during startup.
+
+        Ensures the event loop appears responsive even when other operations
+        are running in executors. Uses monotonic time and enforces progress
+        never decreases.
+
+        Key features:
+        - Uses time.monotonic() for reliable elapsed time measurement
+        - Enforces monotonic progress (never sends lower than previous)
+        - Uses StartupTimeouts.heartbeat_interval for configurable interval
+        - Resilient to exceptions - logs and continues on error
+        - Clean shutdown via shutdown_event or CancelledError
+        """
+        start_time = time.monotonic()
+        last_sent_progress = 0
+
+        # Get heartbeat interval from StartupTimeouts if available
+        if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
+            timeouts = get_timeouts()
+            interval = timeouts.heartbeat_interval
+        else:
+            interval = 5.0  # Default fallback
+
+        self.logger.debug(f"[Heartbeat] Starting progress heartbeat task (interval: {interval}s)")
+
+        while not self._shutdown_event.is_set():
+            try:
+                # Wait for interval, but wake up early if shutdown requested
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=interval
+                    )
+                    # If we get here, shutdown was requested
+                    self.logger.debug("[Heartbeat] Shutdown event set, exiting heartbeat loop")
+                    break
+                except asyncio.TimeoutError:
+                    pass  # Normal timeout - continue with heartbeat
+
+                # Check shutdown again after sleep
+                if self._shutdown_event.is_set():
+                    break
+
+                elapsed = time.monotonic() - start_time
+                current_phase = getattr(self, '_current_startup_phase', 'unknown')
+                base_progress = getattr(self, '_current_startup_progress', last_sent_progress)
+
+                # Slightly increment progress to show activity (max +2% per heartbeat)
+                # This gives visual feedback that system is working
+                increment = min(2, max(0.5, 0.1 * elapsed / 10))
+                effective_progress = min(95, base_progress + increment)
+
+                # Enforce monotonic: never send lower than previous
+                progress_to_send = max(last_sent_progress, int(effective_progress))
+
+                # Build component status from dashboard
+                components = {}
+                try:
+                    dash = get_live_dashboard()
+                    for name, comp in dash._components.items():
+                        components[name] = {"status": comp.get("status", "pending")}
+                except Exception:
+                    pass
+
+                # Broadcast heartbeat
+                await self._broadcast_startup_progress(
+                    stage=current_phase,
+                    message=f"Phase: {current_phase} (elapsed: {elapsed:.1f}s)...",
+                    progress=progress_to_send,
+                    metadata={
+                        "icon": "spinner",
+                        "phase_name": current_phase,
+                        "elapsed_seconds": int(elapsed),
+                        "components": components,
+                        "heartbeat": True,
+                        "is_heartbeat": True,  # Additional flag for downstream filtering
+                    }
+                )
+
+                # Update tracking
+                last_sent_progress = progress_to_send
+
+                # Also update dashboard log (at debug level to avoid spam)
+                add_dashboard_log(f"Heartbeat: {current_phase} @ {progress_to_send}%", "DEBUG")
+
+            except asyncio.CancelledError:
+                self.logger.debug("[Heartbeat] Task cancelled, exiting")
+                break
+            except Exception as e:
+                # Log warning but continue - heartbeat should be resilient
+                self.logger.warning(f"[Heartbeat] Error in heartbeat loop: {e}")
+                # Still sleep to avoid tight error loop
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    break
+
+        self.logger.debug("[Heartbeat] Progress heartbeat task stopped")
 
     # =========================================================================
     # DIAGNOSTIC LOGGING
