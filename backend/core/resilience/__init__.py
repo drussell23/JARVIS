@@ -285,6 +285,12 @@ from backend.core.resilience.health import (
     HealthProbe,
 )
 
+# v3.0: BackgroundRecovery with adaptive backoff
+from backend.core.resilience.recovery import (
+    RecoveryConfig,
+    BackgroundRecovery,
+)
+
 __all__ = [
     # Distributed Lock
     "DistributedLock",
@@ -509,4 +515,10 @@ __all__ = [
     # =========================================================================
     # Cached health checks with failure tracking
     "HealthProbe",
+    # =========================================================================
+    # v3.0: BACKGROUND RECOVERY
+    # =========================================================================
+    # Adaptive background recovery with safety valves
+    "RecoveryConfig",
+    "BackgroundRecovery",
 ]
