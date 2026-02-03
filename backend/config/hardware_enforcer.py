@@ -40,9 +40,10 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import psutil
+
+from backend.utils.env_config import get_env_float
 
 logger = logging.getLogger(__name__)
 
@@ -56,60 +57,6 @@ _DEFAULT_RAM_THRESHOLD_GB = 32.0
 
 _BYTES_PER_GB = 1024**3
 """Number of bytes per gigabyte."""
-
-
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
-
-def _get_env_float(
-    name: str,
-    default: float,
-    min_value: Optional[float] = None,
-) -> float:
-    """
-    Get a float value from environment variable with validation.
-
-    Args:
-        name: Environment variable name
-        default: Default value if not set or invalid
-        min_value: Minimum allowed value (inclusive)
-
-    Returns:
-        Validated float value (uses default on validation failure)
-    """
-    raw_value = os.environ.get(name)
-
-    if raw_value is None:
-        return default
-
-    try:
-        value = float(raw_value)
-    except ValueError:
-        logger.warning(
-            f"[HardwareEnforcer] Invalid value for {name}='{raw_value}' "
-            f"(not a valid number), using default: {default}"
-        )
-        return default
-
-    # Validate non-negative (allow zero for edge cases)
-    if value < 0:
-        logger.warning(
-            f"[HardwareEnforcer] Invalid value for {name}={value} "
-            f"(must be non-negative), using default: {default}"
-        )
-        return default
-
-    # Validate min
-    if min_value is not None and value < min_value:
-        logger.warning(
-            f"[HardwareEnforcer] Invalid value for {name}={value} "
-            f"(below minimum {min_value}), using default: {default}"
-        )
-        return default
-
-    return value
 
 
 # =============================================================================
@@ -169,10 +116,10 @@ def enforce_hollow_client(source: str = "unknown") -> bool:
         return True
 
     # Get configurable threshold
-    threshold_gb = _get_env_float(
+    threshold_gb = get_env_float(
         "JARVIS_HOLLOW_RAM_THRESHOLD_GB",
         _DEFAULT_RAM_THRESHOLD_GB,
-        min_value=0.0,  # Allow zero (edge case testing)
+        min_val=0.0,  # Allow zero (edge case testing)
     )
 
     # Get system RAM
