@@ -67,6 +67,7 @@ import aiofiles.os
 
 # v6.4: Import distributed lock manager for cross-process locking
 from backend.core.distributed_lock_manager import get_lock_manager, DistributedLockManager
+from backend.core.robust_file_lock import RobustFileLock
 
 logger = logging.getLogger(__name__)
 
@@ -571,7 +572,7 @@ class CrossRepoStateInitializer:
                 logger.debug(f"[CrossRepoState] Event emitted (unlocked): {event.event_type.value}")
                 return
 
-            async with self._lock_manager.acquire("vbia_events", timeout=5.0, ttl=10.0) as acquired:
+            async with RobustFileLock("vbia_events", source="jarvis") as acquired:
                 if not acquired:
                     logger.warning("Could not acquire vbia_events lock, skipping emit")
                     return
@@ -957,8 +958,8 @@ class CrossRepoStateInitializer:
             self._jarvis_state.last_update = datetime.now().isoformat()
             await self._write_json_file(state_file, asdict(self._jarvis_state))
             return
-        # v6.4: Use distributed lock
-        async with self._lock_manager.acquire("vbia_state", timeout=5.0, ttl=10.0) as acquired:
+        # v6.4: Use RobustFileLock (fcntl.flock-based, fixes temp file race conditions)
+        async with RobustFileLock("vbia_state", source="jarvis") as acquired:
             if not acquired:
                 logger.warning("Could not acquire vbia_state lock")
                 return
