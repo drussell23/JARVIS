@@ -62936,17 +62936,28 @@ async def _direct_health_check(host: str, port: int, timeout: float = 5.0) -> Di
                     except Exception:
                         result["data"] = {"raw": await resp.text()}
     except ImportError:
-        # Fallback to urllib if aiohttp not available
+        # Fallback to urllib if aiohttp not available - run in thread to avoid blocking
         import urllib.request
         import urllib.error
+
+        def _sync_health_check() -> Dict[str, Any]:
+            """Synchronous health check for thread execution."""
+            sync_result: Dict[str, Any] = {"reachable": False, "status": "unknown", "data": {}}
+            try:
+                check_url = f"http://{host}:{port}/health"
+                req = urllib.request.Request(check_url, method='GET')
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    sync_result["reachable"] = True
+                    sync_result["status"] = "healthy" if resp.status == 200 else f"http_{resp.status}"
+            except urllib.error.URLError:
+                sync_result["status"] = "unreachable"
+            except Exception:
+                sync_result["status"] = "error"
+            return sync_result
+
         try:
-            url = f"http://{host}:{port}/health"
-            req = urllib.request.Request(url, method='GET')
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                result["reachable"] = True
-                result["status"] = "healthy" if resp.status == 200 else f"http_{resp.status}"
-        except urllib.error.URLError:
-            result["status"] = "unreachable"
+            # v206.0: Run blocking urllib in thread to avoid blocking event loop
+            result = await asyncio.to_thread(_sync_health_check)
         except Exception:
             result["status"] = "error"
     except Exception as e:
