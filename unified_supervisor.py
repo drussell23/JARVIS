@@ -62107,6 +62107,53 @@ Environment Variables:
 # ZONE 7.2: CLI COMMAND HANDLERS
 # =============================================================================
 
+async def _direct_health_check(host: str, port: int, timeout: float = 5.0) -> Dict[str, Any]:
+    """
+    v201.1: Perform direct HTTP health check (used when kernel not running).
+
+    Args:
+        host: Hostname or IP address
+        port: Port number
+        timeout: Request timeout in seconds
+
+    Returns:
+        Dict with 'reachable', 'status', 'data' keys
+    """
+    result: Dict[str, Any] = {"reachable": False, "status": "unknown", "data": {}}
+
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            url = f"http://{host}:{port}/health"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                result["reachable"] = True
+                result["status"] = "healthy" if resp.status == 200 else f"http_{resp.status}"
+                if resp.status == 200:
+                    try:
+                        result["data"] = await resp.json()
+                    except Exception:
+                        result["data"] = {"raw": await resp.text()}
+    except ImportError:
+        # Fallback to urllib if aiohttp not available
+        import urllib.request
+        import urllib.error
+        try:
+            url = f"http://{host}:{port}/health"
+            req = urllib.request.Request(url, method='GET')
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result["reachable"] = True
+                result["status"] = "healthy" if resp.status == 200 else f"http_{resp.status}"
+        except urllib.error.URLError:
+            result["status"] = "unreachable"
+        except Exception:
+            result["status"] = "error"
+    except Exception as e:
+        result["status"] = f"error: {type(e).__name__}"
+
+    return result
+
+
+
 async def handle_status() -> int:
     """Handle --status command."""
     logger = UnifiedLogger()
