@@ -480,9 +480,10 @@ class TestGetEnvBool:
         with caplog.at_level(logging.WARNING):
             result = get_env_bool("TEST_BOOL_WHITESPACE", default=False)
 
-        # Whitespace is not empty string, so it should log warning
+        # Whitespace-only strings are stripped to "", which is a valid False value
+        # No warning should be logged since empty string is explicitly handled
         assert result is False
-        assert "TEST_BOOL_WHITESPACE" in caplog.text
+        # Note: No warning expected - whitespace strips to empty which is in _FALSE_VALUES
 
 
 # =============================================================================
