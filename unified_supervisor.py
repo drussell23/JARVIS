@@ -54883,12 +54883,18 @@ class JarvisSystemKernel:
         self._state = KernelState.SHUTTING_DOWN
 
         # v181.0: Write crash marker for next startup
+        # v205.0: Use asyncio.to_thread to avoid blocking the event loop
         try:
             crash_marker = LOCKS_DIR / "kernel_crash.marker"
-            crash_marker.parent.mkdir(parents=True, exist_ok=True)
-            crash_marker.write_text(
-                f"Emergency shutdown at {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+
+            def _write_crash_marker() -> None:
+                """Sync helper for crash marker write."""
+                crash_marker.parent.mkdir(parents=True, exist_ok=True)
+                crash_marker.write_text(
+                    f"Emergency shutdown at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+            await asyncio.to_thread(_write_crash_marker)
         except Exception:
             pass
 
@@ -54947,6 +54953,12 @@ class JarvisSystemKernel:
         # v183.0: Cancel heartbeat task
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
+            try:
+                await asyncio.wait_for(self._heartbeat_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Heartbeat task cleanup error: {e}")
 
         # Wait briefly for task cancellation
         if self._background_tasks:
@@ -54959,18 +54971,26 @@ class JarvisSystemKernel:
                 pass
 
         # v119.0: Release browser lock if held
-        self._release_browser_lock()
+        # v205.0: Use asyncio.to_thread to avoid blocking the event loop
+        try:
+            await asyncio.to_thread(self._release_browser_lock)
+        except Exception as e:
+            self.logger.debug(f"[Kernel] Browser lock release error: {e}")
 
         # v193.0: Stop supervisor heartbeat (allows children to detect death)
+        # v205.0: Use asyncio.to_thread since stop() does thread join + file unlink
         try:
             from backend.core.supervisor_singleton import SupervisorHeartbeat
-            SupervisorHeartbeat.stop()
+            await asyncio.to_thread(SupervisorHeartbeat.stop)
             self.logger.debug("[Kernel] Supervisor heartbeat stopped")
         except Exception:
             pass
 
-        # Release lock
-        self._startup_lock.release()
+        # Release lock (v205.0: use asyncio.to_thread to avoid blocking)
+        try:
+            await asyncio.to_thread(self._startup_lock.release)
+        except Exception as e:
+            self.logger.debug(f"[Kernel] Lock release error: {e}")
 
         self._state = KernelState.STOPPED
         self.logger.warning("[Kernel] ⚠️ Emergency shutdown complete")
@@ -60246,24 +60266,37 @@ class JarvisSystemKernel:
                     pass
 
             # v119.0: Release browser lock if held
-            self._release_browser_lock()
+            # v205.0: Use asyncio.to_thread to avoid blocking the event loop
+            try:
+                await asyncio.to_thread(self._release_browser_lock)
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Browser lock release error: {e}")
 
             # v193.0: Stop supervisor heartbeat (clean shutdown path)
+            # v205.0: Use asyncio.to_thread since stop() does thread join + file unlink
             try:
                 from backend.core.supervisor_singleton import SupervisorHeartbeat
-                SupervisorHeartbeat.stop()
+                await asyncio.to_thread(SupervisorHeartbeat.stop)
                 self.logger.debug("[Kernel] Supervisor heartbeat stopped")
             except Exception:
                 pass
 
-            # Release lock
-            self._startup_lock.release()
+            # Release lock (v205.0: use asyncio.to_thread to avoid blocking)
+            try:
+                await asyncio.to_thread(self._startup_lock.release)
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Lock release error: {e}")
 
             # v180.0: Clean up legacy supervisor.sock symlink
+            # v205.0: Use asyncio.to_thread for non-blocking file operations
             legacy_sock = LOCKS_DIR / "supervisor.sock"
             try:
-                if legacy_sock.is_symlink():
-                    legacy_sock.unlink()
+                def _cleanup_legacy_sock() -> None:
+                    """Sync helper to cleanup legacy socket."""
+                    if legacy_sock.is_symlink():
+                        legacy_sock.unlink()
+
+                await asyncio.to_thread(_cleanup_legacy_sock)
             except Exception:
                 pass
 
@@ -65080,13 +65113,14 @@ async def async_main(args: argparse.Namespace) -> int:
             if hasattr(kernel, '_startup_lock') and kernel._startup_lock._acquired:
                 kernel.logger.info("[Kernel] Releasing startup lock in finally block...")
                 # v193.0: Stop heartbeat before releasing lock
+                # v205.0: Use asyncio.to_thread for non-blocking operations
                 try:
                     from backend.core.supervisor_singleton import SupervisorHeartbeat
-                    SupervisorHeartbeat.stop()
+                    await asyncio.to_thread(SupervisorHeartbeat.stop)
                 except Exception:
                     pass
                 try:
-                    kernel._startup_lock.release()
+                    await asyncio.to_thread(kernel._startup_lock.release)
                 except Exception as lock_err:
                     kernel.logger.error(f"[Kernel] Lock release error: {lock_err}")
 
