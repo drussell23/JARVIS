@@ -150,72 +150,14 @@ def _get_env_float(
     return value
 
 
-def _get_env_int(
-    name: str,
-    default: int,
-    min_value: Optional[int] = None,
-    max_value: Optional[int] = None,
-) -> int:
-    """
-    Get an int value from environment variable with validation.
-
-    Args:
-        name: Environment variable name
-        default: Default value if not set or invalid
-        min_value: Minimum allowed value (inclusive)
-        max_value: Maximum allowed value (inclusive)
-
-    Returns:
-        Validated int value (uses default on validation failure)
-    """
-    raw_value = os.environ.get(name)
-
-    if raw_value is None:
-        return default
-
-    try:
-        value = int(raw_value)
-    except ValueError:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}='{raw_value}' "
-            f"(not a valid integer), using default: {default}"
-        )
-        return default
-
-    # Validate positive
-    if value <= 0:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}={value} "
-            f"(must be positive), using default: {default}"
-        )
-        return default
-
-    # Validate min
-    if min_value is not None and value < min_value:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}={value} "
-            f"(below minimum {min_value}), using default: {default}"
-        )
-        return default
-
-    # Validate max
-    if max_value is not None and value > max_value:
-        logger.warning(
-            f"[StartupTimeouts] Invalid value for {name}={value} "
-            f"(above maximum {max_value}), using default: {default}"
-        )
-        return default
-
-    return value
-
-
 # =============================================================================
 # DEFAULT VALUES
 # =============================================================================
 
 
 # Maximum timeout - safety cap for all operations
-_DEFAULT_MAX_TIMEOUT = 300.0
+# Must be >= largest default timeout (prime_startup_timeout = 600.0)
+_DEFAULT_MAX_TIMEOUT = 900.0
 
 # Signal timeouts (shutdown)
 _DEFAULT_CLEANUP_TIMEOUT_SIGINT = 10.0
@@ -449,6 +391,44 @@ class StartupTimeouts:
 
     def __post_init__(self) -> None:
         """Validate timeout relationships after initialization."""
+        # Validate all timeout fields are <= max_timeout (per spec requirement)
+        # Get all fields except max_timeout itself
+        timeout_fields = [
+            "cleanup_timeout_sigint",
+            "cleanup_timeout_sigterm",
+            "cleanup_timeout_sigkill",
+            "port_check_timeout",
+            "port_release_wait",
+            "ipc_socket_timeout",
+            "lsof_timeout",
+            "docker_check_timeout",
+            "backend_health_timeout",
+            "frontend_health_timeout",
+            "loading_server_health_timeout",
+            "heartbeat_interval",
+            "prime_startup_timeout",
+            "reactor_startup_timeout",
+            "reactor_health_timeout",
+            "startup_lock_timeout",
+            "takeover_handover_timeout",
+            "max_lock_timeout",
+            "min_lock_timeout",
+            "default_lock_timeout",
+            "stale_lock_retry_timeout",
+            "broadcast_timeout",
+            "process_wait_timeout",
+            "subprocess_timeout",
+        ]
+
+        for field_name in timeout_fields:
+            value = getattr(self, field_name)
+            if value > self.max_timeout:
+                logger.warning(
+                    f"[StartupTimeouts] {field_name}={value} exceeds max_timeout={self.max_timeout}, "
+                    f"capping to max_timeout"
+                )
+                object.__setattr__(self, field_name, self.max_timeout)
+
         # Ensure lock timeout bounds are consistent
         if self.min_lock_timeout >= self.max_lock_timeout:
             logger.warning(
@@ -633,10 +613,6 @@ def reset_timeouts() -> None:
     _timeouts_instance = None
 
 
-# Convenience alias for direct import
-TIMEOUTS = property(lambda self: get_timeouts())
-
-
 # =============================================================================
 # EXPORTS
 # =============================================================================
@@ -650,7 +626,6 @@ __all__ = [
     "reset_timeouts",
     # Validation utilities (for testing)
     "_get_env_float",
-    "_get_env_int",
     # Default values (for reference/testing)
     "_DEFAULT_MAX_TIMEOUT",
     "_DEFAULT_CLEANUP_TIMEOUT_SIGINT",

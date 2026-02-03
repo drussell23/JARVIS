@@ -77,7 +77,7 @@ class TestDefaultValues:
         timeouts = StartupTimeouts()
 
         assert timeouts.max_timeout == _DEFAULT_MAX_TIMEOUT
-        assert timeouts.max_timeout == 300.0
+        assert timeouts.max_timeout == 900.0  # Must be >= prime_startup_timeout (600.0)
 
     def test_signal_timeouts_defaults(self, clean_env) -> None:
         """Test signal timeout defaults."""
@@ -233,8 +233,9 @@ class TestEnvOverrides:
         from backend.config.startup_timeouts import reset_timeouts
         reset_timeouts()
 
+        # Note: All individual timeouts must be <= max_timeout to avoid capping
         env_overrides = {
-            "JARVIS_MAX_TIMEOUT": "500.0",
+            "JARVIS_MAX_TIMEOUT": "1000.0",  # Set high enough for all other timeouts
             "JARVIS_CLEANUP_TIMEOUT_SIGINT": "15.0",
             "JARVIS_CLEANUP_TIMEOUT_SIGTERM": "7.0",
             "JARVIS_CLEANUP_TIMEOUT_SIGKILL": "3.0",
@@ -265,7 +266,7 @@ class TestEnvOverrides:
             from backend.config.startup_timeouts import StartupTimeouts
             timeouts = StartupTimeouts()
 
-            assert timeouts.max_timeout == 500.0
+            assert timeouts.max_timeout == 1000.0
             assert timeouts.cleanup_timeout_sigint == 15.0
             assert timeouts.cleanup_timeout_sigterm == 7.0
             assert timeouts.cleanup_timeout_sigkill == 3.0
@@ -302,14 +303,14 @@ class TestValidationInvalidValues:
 
     def test_negative_value_uses_default(self, clean_env, caplog_warning) -> None:
         """Test that negative values trigger warning and use default."""
-        from backend.config.startup_timeouts import reset_timeouts
+        from backend.config.startup_timeouts import reset_timeouts, _DEFAULT_MAX_TIMEOUT
         reset_timeouts()
 
         with patch.dict(os.environ, {"JARVIS_MAX_TIMEOUT": "-5.0"}):
             from backend.config.startup_timeouts import StartupTimeouts
             timeouts = StartupTimeouts()
 
-            assert timeouts.max_timeout == 300.0  # Default
+            assert timeouts.max_timeout == _DEFAULT_MAX_TIMEOUT  # Default (900.0)
             assert "must be positive" in caplog_warning.text
 
     def test_zero_value_uses_default(self, clean_env, caplog_warning) -> None:
@@ -450,6 +451,78 @@ class TestLockTimeoutRelationships:
             # default should be adjusted to max
             assert timeouts.default_lock_timeout == 300.0
             assert "adjusting to max" in caplog_warning.text
+
+
+# =============================================================================
+# Test: MAX_TIMEOUT Validation at Initialization
+# =============================================================================
+
+
+class TestMaxTimeoutValidation:
+    """Tests for MAX_TIMEOUT validation during __post_init__."""
+
+    def test_timeout_exceeding_max_is_capped(self, clean_env, caplog_warning) -> None:
+        """Test that timeouts exceeding max_timeout are capped during init."""
+        from backend.config.startup_timeouts import reset_timeouts
+        reset_timeouts()
+
+        # Set a low max_timeout but high individual timeout
+        with patch.dict(os.environ, {
+            "JARVIS_MAX_TIMEOUT": "50.0",
+            "JARVIS_PRIME_STARTUP_TIMEOUT": "600.0",  # Exceeds 50.0
+        }):
+            from backend.config.startup_timeouts import StartupTimeouts
+            timeouts = StartupTimeouts()
+
+            # prime_startup_timeout should be capped to max_timeout
+            assert timeouts.prime_startup_timeout == 50.0
+            assert "capping to max_timeout" in caplog_warning.text
+
+    def test_multiple_timeouts_exceeding_max_all_capped(self, clean_env, caplog_warning) -> None:
+        """Test that multiple timeouts exceeding max are all capped."""
+        from backend.config.startup_timeouts import reset_timeouts
+        reset_timeouts()
+
+        with patch.dict(os.environ, {
+            "JARVIS_MAX_TIMEOUT": "100.0",
+            "JARVIS_PRIME_STARTUP_TIMEOUT": "600.0",  # Exceeds
+            "JARVIS_REACTOR_STARTUP_TIMEOUT": "120.0",  # Exceeds
+            "JARVIS_FRONTEND_HEALTH_TIMEOUT": "60.0",  # Within limit
+        }):
+            from backend.config.startup_timeouts import StartupTimeouts
+            timeouts = StartupTimeouts()
+
+            assert timeouts.prime_startup_timeout == 100.0
+            assert timeouts.reactor_startup_timeout == 100.0
+            assert timeouts.frontend_health_timeout == 60.0  # Not capped
+
+    def test_timeout_at_max_is_not_capped(self, clean_env) -> None:
+        """Test that timeouts at exactly max_timeout are not capped."""
+        from backend.config.startup_timeouts import reset_timeouts
+        reset_timeouts()
+
+        with patch.dict(os.environ, {
+            "JARVIS_MAX_TIMEOUT": "100.0",
+            "JARVIS_PRIME_STARTUP_TIMEOUT": "100.0",  # Exactly at max
+        }):
+            from backend.config.startup_timeouts import StartupTimeouts
+            timeouts = StartupTimeouts()
+
+            assert timeouts.prime_startup_timeout == 100.0
+
+    def test_timeout_below_max_is_not_capped(self, clean_env) -> None:
+        """Test that timeouts below max_timeout are not modified."""
+        from backend.config.startup_timeouts import reset_timeouts
+        reset_timeouts()
+
+        with patch.dict(os.environ, {
+            "JARVIS_MAX_TIMEOUT": "100.0",
+            "JARVIS_PRIME_STARTUP_TIMEOUT": "50.0",
+        }):
+            from backend.config.startup_timeouts import StartupTimeouts
+            timeouts = StartupTimeouts()
+
+            assert timeouts.prime_startup_timeout == 50.0
 
 
 # =============================================================================
@@ -694,22 +767,6 @@ class TestValidationUtilities:
             assert result == 10.0  # Falls back to default
             assert "above maximum" in caplog_warning.text
 
-    def test_get_env_int_valid(self, clean_env) -> None:
-        """Test _get_env_int with valid value."""
-        from backend.config.startup_timeouts import _get_env_int
-
-        with patch.dict(os.environ, {"TEST_VAR": "42"}):
-            result = _get_env_int("TEST_VAR", 10)
-            assert result == 42
-
-    def test_get_env_int_invalid_uses_default(self, clean_env, caplog_warning) -> None:
-        """Test _get_env_int uses default for invalid value."""
-        from backend.config.startup_timeouts import _get_env_int
-
-        with patch.dict(os.environ, {"TEST_VAR": "not_an_int"}):
-            result = _get_env_int("TEST_VAR", 99)
-            assert result == 99
-            assert "not a valid integer" in caplog_warning.text
 
 
 # =============================================================================
