@@ -8800,12 +8800,16 @@ class ProcessOrchestrator:
                                 logger.info(f"[v95.9] Terminating stale process: {proc.name()} (PID={conn.pid})")
                                 proc.terminate()
 
-                                # Wait for graceful shutdown
-                                try:
-                                    proc.wait(timeout=5)
-                                except psutil.TimeoutExpired:
-                                    logger.warning(f"[v95.9] Force killing process {conn.pid}")
-                                    proc.kill()
+                                # v201.0: Wait for graceful shutdown in thread to avoid blocking event loop
+                                def _wait_for_termination():
+                                    try:
+                                        proc.wait(timeout=5)
+                                    except psutil.TimeoutExpired:
+                                        logger.warning(f"[v95.9] Force killing process {conn.pid}")
+                                        proc.kill()
+
+                                loop = asyncio.get_event_loop()
+                                await loop.run_in_executor(None, _wait_for_termination)
 
                                 return True
                         except (psutil.NoSuchProcess, psutil.AccessDenied):

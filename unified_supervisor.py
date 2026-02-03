@@ -52292,7 +52292,8 @@ class TrinityIntegrator:
 
         async def _kill_process_on_port(port: int) -> bool:
             """Kill the process holding a port if it's a JARVIS process."""
-            pid = _get_pid_on_port(port)
+            # v201.0: Use asyncio.to_thread() to avoid blocking the event loop
+            pid = await asyncio.to_thread(_get_pid_on_port, port)
             if not pid:
                 return True  # Port already free
 
@@ -52304,7 +52305,9 @@ class TrinityIntegrator:
                 return False
 
             # Only kill JARVIS-related processes
-            if not _is_jarvis_process(pid):
+            # v201.0: Use asyncio.to_thread() to avoid blocking
+            is_jarvis = await asyncio.to_thread(_is_jarvis_process, pid)
+            if not is_jarvis:
                 self.logger.warning(
                     f"[Trinity]   Port {port} held by non-JARVIS process (PID {pid}) - "
                     f"will try fallback port"
@@ -52318,18 +52321,21 @@ class TrinityIntegrator:
                 await asyncio.sleep(0.5)  # Give it time to terminate
 
                 # Check if it's really gone
-                if _get_pid_on_port(port) == pid:
+                # v201.0: Use asyncio.to_thread() to avoid blocking
+                still_on_port = await asyncio.to_thread(_get_pid_on_port, port)
+                if still_on_port == pid:
                     self.logger.warning(f"[Trinity]   SIGTERM didn't work, using SIGKILL...")
                     os.kill(pid, signal.SIGKILL)
                     await asyncio.sleep(0.3)
 
-                return _is_port_free(port)
+                return await asyncio.to_thread(_is_port_free, port)
             except (ProcessLookupError, PermissionError) as e:
                 self.logger.debug(f"[Trinity]   Kill failed (process may have exited): {e}")
-                return _is_port_free(port)
+                return await asyncio.to_thread(_is_port_free, port)
 
         # Attempt 1: Check if port is already free
-        if _is_port_free(original_port):
+        # v201.0: Use asyncio.to_thread() to avoid blocking the event loop
+        if await asyncio.to_thread(_is_port_free, original_port):
             self.logger.info(f"[Trinity] ✅ Port {original_port} is available")
             return original_port
 
@@ -52338,7 +52344,7 @@ class TrinityIntegrator:
             self.logger.info(f"[Trinity]   Port {original_port} in use, cleanup attempt {attempt + 1}/{max_attempts}...")
 
             if await _kill_process_on_port(original_port):
-                if _is_port_free(original_port):
+                if await asyncio.to_thread(_is_port_free, original_port):
                     self.logger.success(f"[Trinity] ✅ Port {original_port} freed after cleanup")
                     return original_port
 
@@ -52351,7 +52357,8 @@ class TrinityIntegrator:
 
         for offset in range(1, fallback_range + 1):
             fallback_port = original_port + offset
-            if _is_port_free(fallback_port):
+            # v201.0: Use asyncio.to_thread() to avoid blocking
+            if await asyncio.to_thread(_is_port_free, fallback_port):
                 self.logger.warning(
                     f"[Trinity] 🔄 Using fallback port {fallback_port} instead of {original_port}"
                 )
