@@ -352,15 +352,18 @@ class TestValidationInvalidValues:
 
     def test_empty_string_uses_default(self, clean_env) -> None:
         """Test that empty string uses default (no warning for missing)."""
-        from backend.config.startup_timeouts import reset_timeouts
+        from backend.config.startup_timeouts import (
+            StartupTimeouts,
+            _DEFAULT_MAX_TIMEOUT,
+            reset_timeouts,
+        )
         reset_timeouts()
 
         # Empty string should be treated as not set
         with patch.dict(os.environ, {"JARVIS_MAX_TIMEOUT": ""}):
-            from backend.config.startup_timeouts import StartupTimeouts
             # Empty string converts to ValueError in float(), so uses default
             timeouts = StartupTimeouts()
-            # Note: Empty string causes float("") to fail
+            assert timeouts.max_timeout == _DEFAULT_MAX_TIMEOUT
 
 
 # =============================================================================

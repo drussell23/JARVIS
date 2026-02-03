@@ -16,7 +16,7 @@ Environment Variables:
 ----------------------
 
 ### Global Timeout Configuration
-- JARVIS_MAX_TIMEOUT: Maximum allowed timeout for any operation (default: 300.0s)
+- JARVIS_MAX_TIMEOUT: Maximum allowed timeout for any operation (default: 900.0s)
     Purpose: Safety cap to prevent unbounded waits
 
 ### Signal Timeouts (Shutdown)
@@ -79,11 +79,9 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Optional, TypeVar
+from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T", float, int)
 
 
 # =============================================================================
