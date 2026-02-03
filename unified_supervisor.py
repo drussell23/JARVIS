@@ -59159,10 +59159,11 @@ class JarvisSystemKernel:
         This method implements the graceful shutdown protocol that prevents
         the "window terminated unexpectedly (reason: 'killed', code: '15')" error:
 
-        1. Request graceful shutdown via HTTP POST /api/shutdown/graceful
-        2. The loading server waits for browser to naturally disconnect
-        3. Then auto-shuts down cleanly without killing active connections
-        4. Falls back to signal-based shutdown if HTTP fails
+        1. v205.0: Send final progress (100%) to signal completion
+        2. Request graceful shutdown via HTTP POST /api/shutdown/graceful
+        3. The loading server waits for browser to naturally disconnect
+        4. Then auto-shuts down cleanly without killing active connections
+        5. Falls back to signal-based shutdown if HTTP fails
 
         Also cleans up the log file handle.
         """
@@ -59173,6 +59174,21 @@ class JarvisSystemKernel:
         loading_port = self.config.loading_server_port
         shutdown_url = f"http://localhost:{loading_port}/api/shutdown/graceful"
         status_url = f"http://localhost:{loading_port}/api/shutdown/status"
+
+        # v205.0: Send final 100% progress before stopping
+        # This allows the loading page to show completion before being terminated
+        try:
+            await self._broadcast_startup_progress(
+                stage="complete",
+                message="JARVIS startup complete",
+                progress=100,
+                metadata={"final": True}
+            )
+            # Brief wait for the progress update to be received and processed
+            await asyncio.sleep(1.0)
+            self.logger.debug("[LoadingServer] Sent final 100% progress before shutdown")
+        except Exception as e:
+            self.logger.debug(f"[LoadingServer] Could not send final progress: {e}")
 
         # Try HTTP graceful shutdown first
         http_shutdown_success = False
@@ -59668,21 +59684,27 @@ class JarvisSystemKernel:
         stage: str,
         message: str,
         progress: int,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        is_heartbeat: bool = False
     ) -> bool:
         """
         Broadcast startup progress to loading page via HTTP API.
 
         v121.0: Fixed to use correct endpoint /api/update-progress (same as run_supervisor).
+        v205.0: Made NON-FATAL with bounded retries - never blocks startup.
+                - 2 attempts max with configurable timeout from StartupTimeouts
+                - HTTP POST runs in thread via asyncio.to_thread to never block event loop
+                - Progress clamped at single point: min(100, max(0, progress))
 
         Args:
             stage: Current startup stage (e.g., "backend", "voice", "trinity")
             message: Human-readable progress message
             progress: Progress percentage (0-100)
             metadata: Optional additional data (icons, components, labels, etc.)
+            is_heartbeat: If True, indicates this is a heartbeat (less verbose logging)
 
         Returns:
-            True if broadcast succeeded, False otherwise
+            True if broadcast succeeded, False otherwise (but never blocks startup)
         """
         # Skip if no loading server configured or not running
         if self.config.loading_server_port == 0:
@@ -59691,50 +59713,98 @@ class JarvisSystemKernel:
         if not hasattr(self, '_loading_server_process') or not self._loading_server_process:
             return False
 
+        # Single clamp point - enforce progress bounds
+        progress = min(100, max(0, progress))
+
         # Build progress data matching loading_server.py expected format
         progress_data = {
             "stage": stage,
             "message": message,
-            "progress": min(100, max(0, progress)),
+            "progress": progress,
             "timestamp": datetime.now().isoformat(),
             "metadata": metadata or {},
         }
 
         # v183.0: Track current progress for heartbeat payloads
-        self._current_progress = progress_data["progress"]
+        self._current_progress = progress
 
         # v186.0: Update Dead Man's Switch with current phase/progress
         if self._startup_watchdog:
             self._startup_watchdog.update_phase(stage, progress)
 
-        # Try to broadcast via loading server HTTP API
-        # v121.0: Use /api/update-progress (same endpoint as run_supervisor)
-        try:
-            if AIOHTTP_AVAILABLE and aiohttp is not None:
-                url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
-                async with aiohttp.ClientSession(
-                        timeout=aiohttp.ClientTimeout(total=2.0)
-                ) as session:
-                    async with session.post(url, json=progress_data) as resp:
-                        if resp.status == 200:
-                            self.logger.debug(f"[Progress] {stage}: {progress}% - {message}")
-                            return True
-                        else:
-                            self.logger.debug(f"[Progress] Broadcast failed: status {resp.status}")
-                            return False
-            else:
-                # Fallback to urllib if aiohttp not available
-                return await self._broadcast_progress_urllib(progress_data)
-        except Exception as e:
-            self.logger.debug(f"[Progress] Broadcast failed: {e}")
-            return False
+        # v205.0: Get timeout from StartupTimeouts if available, default 2.0s
+        timeout = 2.0
+        if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
+            try:
+                timeouts = get_timeouts()
+                timeout = timeouts.broadcast_timeout
+            except Exception:
+                pass
 
-    async def _broadcast_progress_urllib(self, progress_data: Dict[str, Any]) -> bool:
-        """Fallback progress broadcast using urllib (when aiohttp unavailable)."""
-        try:
-            import urllib.request
-            import json as _json
+        # v205.0: Bounded retries - max 2 attempts, NON-FATAL
+        max_retries = 2
 
+        for attempt in range(max_retries):
+            try:
+                # Run HTTP POST in thread to never block event loop
+                success = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._sync_broadcast_progress,
+                        progress_data,
+                        timeout
+                    ),
+                    timeout=timeout + 0.5  # Slightly longer outer timeout
+                )
+
+                if success:
+                    if not is_heartbeat:
+                        self.logger.debug(f"[Progress] {stage}: {progress}% - {message}")
+                    return True
+                else:
+                    self.logger.debug(
+                        f"[Broadcast] Attempt {attempt + 1}/{max_retries} returned False"
+                    )
+
+            except asyncio.TimeoutError:
+                self.logger.debug(
+                    f"[Broadcast] Attempt {attempt + 1}/{max_retries} timed out"
+                )
+            except Exception as e:
+                self.logger.debug(
+                    f"[Broadcast] Attempt {attempt + 1}/{max_retries} failed: {e}"
+                )
+
+            # Brief pause before retry (if not last attempt)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.1)
+
+        # All retries failed - log and continue (NON-FATAL)
+        self.logger.warning(
+            f"[Broadcast] Failed after {max_retries} attempts for {stage}, continuing..."
+        )
+        return False
+
+    def _sync_broadcast_progress(
+        self,
+        progress_data: Dict[str, Any],
+        timeout: float
+    ) -> bool:
+        """
+        Synchronous HTTP POST to loading server.
+
+        v205.0: This runs in a thread via asyncio.to_thread to never block the event loop.
+
+        Args:
+            progress_data: The progress data to send
+            timeout: HTTP request timeout in seconds
+
+        Returns:
+            True if broadcast succeeded, False otherwise
+        """
+        import urllib.request
+        import json as _json
+
+        try:
             url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
             data = _json.dumps(progress_data).encode('utf-8')
             req = urllib.request.Request(
@@ -59744,15 +59814,33 @@ class JarvisSystemKernel:
                 method='POST'
             )
 
-            # Run synchronous request in thread to not block event loop
-            def do_request():
-                try:
-                    with urllib.request.urlopen(req, timeout=2.0) as resp:
-                        return resp.status == 200
-                except Exception:
-                    return False
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status == 200
 
-            return await asyncio.to_thread(do_request)
+        except Exception:
+            return False
+
+    async def _broadcast_progress_urllib(self, progress_data: Dict[str, Any]) -> bool:
+        """
+        Fallback progress broadcast using urllib (when aiohttp unavailable).
+
+        v205.0: Deprecated - use _sync_broadcast_progress via asyncio.to_thread instead.
+                Kept for backward compatibility.
+        """
+        try:
+            timeout = 2.0
+            if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
+                try:
+                    timeouts = get_timeouts()
+                    timeout = timeouts.broadcast_timeout
+                except Exception:
+                    pass
+
+            return await asyncio.to_thread(
+                self._sync_broadcast_progress,
+                progress_data,
+                timeout
+            )
         except Exception:
             return False
 
