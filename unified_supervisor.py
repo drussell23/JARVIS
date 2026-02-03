@@ -406,24 +406,32 @@ del _fast_kernel_check
 # =============================================================================
 # PYTHON 3.9 COMPATIBILITY PATCH
 # =============================================================================
-# Patches importlib.metadata.packages_distributions() for Python 3.9
+# v210.0: Use full python39_compat module for comprehensive patching and
+# warning suppression (Google API Core, urllib3, Pydantic, etc.)
+# Falls back to minimal inline patch if module unavailable.
 # =============================================================================
 import sys as _sys
 if _sys.version_info < (3, 10):
     try:
-        from importlib import metadata as _metadata
-        if not hasattr(_metadata, 'packages_distributions'):
-            def _packages_distributions_fallback():
-                try:
-                    import importlib_metadata as _backport
-                    if hasattr(_backport, 'packages_distributions'):
-                        return _backport.packages_distributions()
-                except ImportError:
-                    pass
-                return {}
-            _metadata.packages_distributions = _packages_distributions_fallback
-    except Exception:
-        pass
+        # Try to use the full compatibility module (preferred)
+        from backend.utils.python39_compat import ensure_python39_compatibility
+        ensure_python39_compatibility()
+    except ImportError:
+        # Fallback to minimal inline patch
+        try:
+            from importlib import metadata as _metadata
+            if not hasattr(_metadata, 'packages_distributions'):
+                def _packages_distributions_fallback():
+                    try:
+                        import importlib_metadata as _backport
+                        if hasattr(_backport, 'packages_distributions'):
+                            return _backport.packages_distributions()
+                    except ImportError:
+                        pass
+                    return {}
+                _metadata.packages_distributions = _packages_distributions_fallback
+        except Exception:
+            pass
 del _sys
 
 
@@ -11584,13 +11592,27 @@ class StabilizedChromeLauncher:
     """
 
     # Crash codes and their meanings for better diagnostics
+    # Positive codes: Chromium internal codes
+    # Negative codes: macOS signal codes (exit_code = -signal_number)
     CRASH_CODE_MEANINGS = {
+        # Chromium internal exit codes
         5: "GPU process crash or OOM",
         6: "Renderer process crash",
         11: "Segmentation fault (SIGSEGV) - CompositorTileWorker/Metal crash",
         15: "SIGTERM - terminated by signal",
         137: "OOM killed by system (128 + SIGKILL)",
         139: "SIGSEGV (128 + 11) - CompositorTileWorker thread crash",
+        # macOS signal codes (negative = killed by signal)
+        -1: "SIGHUP - terminal hangup",
+        -2: "SIGINT - keyboard interrupt",
+        -3: "SIGQUIT - quit with core dump",
+        -4: "SIGILL - illegal instruction",
+        -5: "SIGTRAP - debugger breakpoint/code signing issue",
+        -6: "SIGABRT - abort signal",
+        -9: "SIGKILL - killed by system",
+        -10: "SIGBUS - bus error (bad memory access)",
+        -11: "SIGSEGV - segmentation fault",
+        -15: "SIGTERM - terminated by signal",
     }
 
     # v197.6: Compositor/Metal crash indicators in stderr
@@ -11968,11 +11990,13 @@ class StabilizedChromeLauncher:
                     exit_code = crash_info["code"]
                     self._crash_history.append(crash_info)
 
-                    # Check for SIGSEGV (code 11 or 139)
-                    if exit_code in (11, 139):
+                    # Check for SIGSEGV (code 11 or 139) or SIGTRAP (code -5)
+                    # SIGTRAP (-5) on macOS can indicate code signing issues
+                    if exit_code in (11, 139, -5, -11):
                         self._consecutive_sigsegv_count += 1
+                        crash_type = "SIGTRAP (code signing issue)" if exit_code == -5 else "SIGSEGV"
                         self._logger.error(
-                            f"[StabilizedChrome] 🔴 SIGSEGV detected (code {exit_code}) "
+                            f"[StabilizedChrome] 🔴 {crash_type} detected (code {exit_code}) "
                             f"at {crash_info['elapsed_seconds']:.2f}s. "
                             f"Consecutive count: {self._consecutive_sigsegv_count}"
                         )
