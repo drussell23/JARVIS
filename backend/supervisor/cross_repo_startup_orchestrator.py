@@ -2523,8 +2523,22 @@ class AdaptiveProgressAwareWaiter:
         v197.1 FIX: ALWAYS check ETA-based extension, not just when progress delta is high.
         Long operations like `pip install torch` take 5+ minutes with NO intermediate updates.
         The VM's ETA is the authoritative source for how long it needs.
+        
+        v1.0.0: Detect container deployments with pre-baked deps and log faster expected
+        completion time. Container deployments skip Phase 3 (ml_deps) which normally
+        takes 5-8 minutes.
         """
         self.progress_history.append(snapshot)
+        
+        # v1.0.0: Detect container deployment on first progress snapshot
+        if len(self.progress_history) == 1 and snapshot.deps_prebaked:
+            logger.info(
+                f"[APARS v1.0.0] 🐳 Container deployment detected! "
+                f"Skipped phases: {snapshot.skipped_phases}. "
+                f"Expected startup time: ~2-3 min (vs ~8-10 min for standard)"
+            )
+            # Reduce max extension time for container deployments (they should be fast)
+            self.max_extension_time = min(self.max_extension_time, 300.0)  # 5 min max
         
         # Calculate progress delta
         progress_delta = snapshot.total_progress - self.last_progress
@@ -2540,8 +2554,10 @@ class AdaptiveProgressAwareWaiter:
             (now - getattr(self, '_last_log_time', 0)) > 30.0  # 30s since last log
         )
         if should_log:
+            # v1.0.0: Include deployment mode in log
+            deployment_indicator = "🐳" if snapshot.deps_prebaked else "📜"
             logger.info(
-                f"[APARS] Phase {snapshot.phase_number} ({snapshot.phase_name}): "
+                f"[APARS] {deployment_indicator} Phase {snapshot.phase_number} ({snapshot.phase_name}): "
                 f"{snapshot.total_progress:.1f}% complete, "
                 f"checkpoint={snapshot.checkpoint}, "
                 f"ETA={snapshot.eta_seconds}s, "
@@ -2797,13 +2813,42 @@ class AdaptiveProgressAwareWaiter:
 def _parse_apars_response(data: Dict[str, Any], elapsed: int = 0) -> Optional[APARSProgressSnapshot]:
     """
     v197.0: Parse APARS data from health response.
+    v1.0.0: Added support for container-based deployment detection (deps_prebaked).
     
     Returns APARSProgressSnapshot if APARS data is present, None otherwise.
     Falls back to inferring progress from legacy fields.
+    
+    Container-based deployments with pre-baked ML dependencies will report:
+      - deps_prebaked: true
+      - skipped_phases: [0, 1, 2, 3]  (phases skipped due to prebaking)
+      - deployment_mode: "container"
+    
+    This allows the APARS waiter to use shorter timeouts since Phase 3 (ml_deps)
+    is eliminated (saves 5-8 minutes).
     """
     # Check for explicit APARS data
     apars = data.get("apars")
     if apars and isinstance(apars, dict):
+        # v1.0.0: Extract container deployment info
+        deps_prebaked = apars.get("deps_prebaked", False)
+        skipped_phases = apars.get("skipped_phases", [])
+        
+        # Also check top-level fields for backward compatibility
+        if not deps_prebaked:
+            deps_prebaked = data.get("is_docker", False) and data.get("is_gcp_inference", False)
+        
+        # Infer deployment mode
+        deployment_mode = "container" if deps_prebaked else "startup-script"
+        if data.get("server_type") == "docker_stub":
+            deployment_mode = "container"
+        
+        # Log when we detect a container deployment (helpful for debugging)
+        if deps_prebaked:
+            logger.debug(
+                f"[APARS v1.0.0] 🐳 Container deployment detected: "
+                f"deps_prebaked={deps_prebaked}, skipped_phases={skipped_phases}"
+            )
+        
         return APARSProgressSnapshot(
             timestamp=time.time(),
             phase_number=apars.get("phase_number", 0),
@@ -2815,6 +2860,11 @@ def _parse_apars_response(data: Dict[str, Any], elapsed: int = 0) -> Optional[AP
             elapsed_seconds=apars.get("elapsed_seconds", elapsed),
             error=apars.get("error"),
             raw_data=data,
+            # v1.0.0: Container deployment fields
+            deps_prebaked=deps_prebaked,
+            skipped_phases=skipped_phases if isinstance(skipped_phases, list) else [],
+            deployment_mode=deployment_mode,
+            container_image=data.get("container_image"),
         )
     
     # Fallback: Infer progress from legacy fields
@@ -2822,6 +2872,11 @@ def _parse_apars_response(data: Dict[str, Any], elapsed: int = 0) -> Optional[AP
     mode = data.get("mode", "unknown")
     model_loaded = data.get("model_loaded", False)
     ready = data.get("ready_for_inference", False)
+    
+    # v1.0.0: Check for container deployment indicators in legacy response
+    is_docker = data.get("is_docker", False)
+    is_gcp_inference = data.get("is_gcp_inference", False)
+    deps_prebaked = is_docker and is_gcp_inference
     
     # Estimate phase and progress from legacy fields
     if ready and model_loaded:
@@ -2849,9 +2904,19 @@ def _parse_apars_response(data: Dict[str, Any], elapsed: int = 0) -> Optional[AP
         total_progress = 10
         checkpoint = "starting"
     
-    # Estimate ETA based on typical durations
-    eta_by_phase = {0: 280, 1: 260, 2: 200, 3: 120, 4: 60, 5: 30, 6: 0}
-    eta = eta_by_phase.get(phase_number, 300)
+    # v1.0.0: Adjust ETA for container deployments (Phase 3 is skipped)
+    # Standard ETAs (startup script deployment)
+    eta_by_phase_standard = {0: 280, 1: 260, 2: 200, 3: 120, 4: 60, 5: 30, 6: 0}
+    # Faster ETAs (container deployment with pre-baked deps)
+    eta_by_phase_container = {0: 30, 1: 20, 2: 10, 3: 0, 4: 60, 5: 30, 6: 0}
+    
+    if deps_prebaked:
+        eta = eta_by_phase_container.get(phase_number, 100)
+        # If we're past Phase 3 in container mode, progress starts higher
+        if phase_number >= 3:
+            total_progress = max(total_progress, 60)  # Phase 3 is pre-complete
+    else:
+        eta = eta_by_phase_standard.get(phase_number, 300)
     
     return APARSProgressSnapshot(
         timestamp=time.time(),
@@ -2864,6 +2929,11 @@ def _parse_apars_response(data: Dict[str, Any], elapsed: int = 0) -> Optional[AP
         elapsed_seconds=elapsed,
         error=None,
         raw_data=data,
+        # v1.0.0: Container deployment fields
+        deps_prebaked=deps_prebaked,
+        skipped_phases=[0, 1, 2, 3] if deps_prebaked else [],
+        deployment_mode="container" if deps_prebaked else "startup-script",
+        container_image=None,
     )
 
 
