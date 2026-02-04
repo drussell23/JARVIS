@@ -4310,7 +4310,10 @@ class LiveProgressDashboard:
             self._render_overlay(final)
     
     def _render_compact(self, final: bool = False) -> None:
-        """Render a single-line status bar (minimal intrusion)."""
+        """
+        Render a single-line status bar (minimal intrusion).
+        v220.0: Enhanced to show model loading progress.
+        """
         elapsed = time.time() - self._start_time
         
         # Count component statuses
@@ -4321,14 +4324,27 @@ class LiveProgressDashboard:
         # Build compact status
         gcp = self._gcp_state
         mem = self._memory
+        model_state = self._model_loading_state
         
-        status_line = (
-            f"\r{self.BOLD}[JARVIS]{self.RESET} "
-            f"{elapsed:>5.0f}s | "
-            f"GCP:{gcp['progress']:>3.0f}% | "
-            f"Components: {self.GREEN}{healthy}{self.RESET}/{self.CYAN}{starting}{self.RESET}/{total} | "
-            f"Mem: {mem['percent']:.0f}%"
-        )
+        # v220.0: Include model loading progress when active
+        if model_state.get("active", False):
+            model_pct = model_state.get("progress_pct", 0)
+            model_name = (model_state.get("model_name") or "LLM")[:10]
+            status_line = (
+                f"\r{self.BOLD}[JARVIS]{self.RESET} "
+                f"{elapsed:>5.0f}s | "
+                f"GCP:{gcp['progress']:>3.0f}% | "
+                f"{self.CYAN}🧠 {model_name}:{model_pct}%{self.RESET} | "
+                f"Mem: {mem['percent']:.0f}%"
+            )
+        else:
+            status_line = (
+                f"\r{self.BOLD}[JARVIS]{self.RESET} "
+                f"{elapsed:>5.0f}s | "
+                f"GCP:{gcp['progress']:>3.0f}% | "
+                f"Components: {self.GREEN}{healthy}{self.RESET}/{self.CYAN}{starting}{self.RESET}/{total} | "
+                f"Mem: {mem['percent']:.0f}%"
+            )
         
         if status_line != self._last_status_line or final:
             # Clear line and print
@@ -4339,15 +4355,21 @@ class LiveProgressDashboard:
     def _render_passthrough(self, final: bool = False) -> None:
         """
         v197.3: Passthrough mode - prints dashboard periodically but lets logs flow.
+        v220.0: Enhanced to update more frequently during model loading.
         
         This mode:
-        - Prints full dashboard every N seconds
+        - Prints full dashboard every N seconds (or 2s during model loading)
         - Doesn't overwrite previous output
         - Shows recent logs from buffer
         - Logs from logger still appear normally
         """
-        # Only print full dashboard periodically (every 5 renders = 5 seconds)
-        if self._render_count % self._passthrough_interval != 0 and not final:
+        # v220.0: During model loading, update more frequently for real-time progress
+        model_loading_active = self._model_loading_state.get("active", False)
+        
+        # Determine interval: every 2 renders (2s) during model loading, else every 5
+        effective_interval = 2 if model_loading_active else self._passthrough_interval
+        
+        if self._render_count % effective_interval != 0 and not final:
             return
         
         lines = []
@@ -52699,15 +52721,30 @@ class SemanticReadinessChecker:
     HOLLOW_CLIENT_TIMEOUT_MULTIPLIER: float = 3.0
 
     # Phase-to-state mapping for more accurate state detection
+    # v220.0: Extended to catch more loading phase variations
     PHASE_STATE_MAP: Dict[str, ReadinessState] = {
         "pre-init": ComponentReadinessState.STARTING,
+        "pre_init": ComponentReadinessState.STARTING,
         "initializing": ComponentReadinessState.STARTING,
+        "starting": ComponentReadinessState.STARTING,
+        "startup": ComponentReadinessState.STARTING,
+        # v220.0: Comprehensive loading phase detection for real-time progress
+        "loading": ComponentReadinessState.LOADING,
         "loading_model": ComponentReadinessState.LOADING,
         "model_loading": ComponentReadinessState.LOADING,
+        "loading_weights": ComponentReadinessState.LOADING,
+        "downloading": ComponentReadinessState.LOADING,
+        "downloading_model": ComponentReadinessState.LOADING,
         "warming_up": ComponentReadinessState.LOADING,
+        "warming": ComponentReadinessState.LOADING,
+        "model_init": ComponentReadinessState.LOADING,
+        "weight_loading": ComponentReadinessState.LOADING,
+        "gpu_loading": ComponentReadinessState.LOADING,
+        "memory_allocation": ComponentReadinessState.LOADING,
         "ready": ComponentReadinessState.READY,
         "healthy": ComponentReadinessState.READY,
         "running": ComponentReadinessState.READY,
+        "online": ComponentReadinessState.READY,
         "error": ComponentReadinessState.ERROR,
         "failed": ComponentReadinessState.ERROR,
     }
@@ -54068,27 +54105,74 @@ class TrinityIntegrator:
                     )
                     last_state = result.state
                     last_phase = result.phase
+
+                # v220.0: REAL-TIME model loading dashboard updates for Prime
+                # Update on EVERY poll iteration when loading (not just state transitions)
+                # This provides smooth, real-time progress bar updates
+                if result.component_type == ComponentType.PRIME:
+                    # Show loading progress when:
+                    # 1. State is LOADING, or
+                    # 2. model_loaded is False (model still loading even if status says healthy)
+                    is_model_loading = (
+                        result.state == ComponentReadinessState.LOADING or
+                        (result.model_loaded is False and not result.is_ready)
+                    )
                     
-                    # v220.0: Update model loading dashboard for Prime when in LOADING state
-                    if result.component_type == ComponentType.PRIME:
-                        if result.state == ComponentReadinessState.LOADING:
-                            # Show model loading progress in dashboard
-                            update_dashboard_model_loading(
-                                active=True,
-                                model_name=result.raw_response.get("active_model", "LLM") if result.raw_response else "LLM",
-                                progress_pct=int(result.raw_response.get("startup_progress", 0)) if result.raw_response else int(elapsed / 7.2),  # ~720s total
-                                stage="loading_weights",
-                                stage_detail=result.phase or "Loading model into memory",
-                                estimated_total_seconds=720,  # 12 minutes typical
-                                elapsed_seconds=int(elapsed),
-                                reason="Loading large language model parameters into memory (this is normal for ML models)"
-                            )
-                        elif result.state == ComponentReadinessState.READY:
-                            # Clear model loading display
-                            update_dashboard_model_loading(active=False)
+                    if is_model_loading:
+                        # Extract progress from health response
+                        raw = result.raw_response or {}
+                        
+                        # Try multiple sources for progress info
+                        startup_progress = raw.get("startup_progress", 0)
+                        model_load_progress = raw.get("model_load_progress_pct", 0)
+                        loading_progress = raw.get("loading_progress", 0)
+                        
+                        # Use the best available progress value
+                        if model_load_progress > 0:
+                            progress_pct = int(model_load_progress)
+                        elif startup_progress > 0:
+                            progress_pct = int(startup_progress)
+                        elif loading_progress > 0:
+                            progress_pct = int(loading_progress)
+                        else:
+                            # Fallback: estimate based on elapsed time (~720s total)
+                            progress_pct = min(95, int((elapsed / 720.0) * 100))
+                        
+                        # Get model name and stage from response
+                        model_name = raw.get("active_model") or raw.get("model") or raw.get("model_name") or "LLM"
+                        loading_stage = raw.get("loading_stage") or raw.get("startup_phase") or result.phase or "loading_weights"
+                        stage_detail = raw.get("loading_detail") or raw.get("status_message") or f"Loading {model_name} into memory"
+                        
+                        # Calculate ETA
+                        if progress_pct > 5 and elapsed > 10:
+                            # Based on actual progress rate
+                            rate = progress_pct / elapsed
+                            remaining_seconds = int((100 - progress_pct) / rate) if rate > 0 else 600
+                        else:
+                            remaining_seconds = 720 - int(elapsed)
+                        
+                        # Update dashboard with real-time progress
+                        update_dashboard_model_loading(
+                            active=True,
+                            model_name=model_name,
+                            model_size_gb=raw.get("model_size_gb", 0.0),
+                            progress_pct=progress_pct,
+                            stage=loading_stage,
+                            stage_detail=stage_detail,
+                            estimated_total_seconds=720,
+                            elapsed_seconds=int(elapsed),
+                            reason=f"Loading ~7B parameters into memory ({progress_pct}% complete, ~{remaining_seconds//60}m {remaining_seconds%60}s remaining)"
+                        )
+                    elif result.is_ready or result.state == ComponentReadinessState.READY:
+                        # Clear model loading display when ready
+                        update_dashboard_model_loading(active=False)
 
                 # Check if ready
                 if result.is_ready:
+                    # v220.0: Ensure model loading display is cleared
+                    if result.component_type == ComponentType.PRIME:
+                        update_dashboard_model_loading(active=False)
+                    
                     self.logger.info(
                         f"[Trinity] ✅ {component.name} READY after {elapsed:.1f}s "
                         f"(state={result.state.value}, phase={result.phase})"
@@ -54247,24 +54331,27 @@ class TrinityIntegrator:
 
         Uses intelligent heuristics:
         - Early startup: Poll frequently (1s) to catch fast transitions
-        - Loading: Poll less frequently (3s) to reduce load
-        - Near ready: Poll frequently again (1s)
+        - Loading: Poll frequently (1.5s) for real-time progress updates (v220.0)
+        - Near ready: Poll frequently (1s)
         - Unreachable: Back off (5s) to avoid hammering
+        
+        v220.0: Reduced LOADING interval to 1.5s for smoother real-time
+        progress bar updates in the dashboard during model loading.
         """
         if result.state == ComponentReadinessState.UNREACHABLE:
             return 5.0  # Back off if unreachable
         elif result.state == ComponentReadinessState.STARTING:
             return 1.5  # Poll frequently during early startup
         elif result.state == ComponentReadinessState.LOADING:
-            # If we have estimated wait time, adjust interval
+            # v220.0: More frequent polling for real-time dashboard progress
             if result.estimated_wait_seconds:
                 if result.estimated_wait_seconds < 10:
                     return 1.0  # Almost ready, poll fast
                 elif result.estimated_wait_seconds < 30:
-                    return 2.0
+                    return 1.5  # Close to ready
                 else:
-                    return 3.0
-            return 2.0  # Default for loading
+                    return 1.5  # v220.0: Changed from 3.0 to 1.5 for smoother updates
+            return 1.5  # v220.0: Changed from 2.0 to 1.5 for real-time progress
         elif result.state == ComponentReadinessState.DEGRADED:
             return 1.0  # Poll frequently to catch full recovery
         else:
