@@ -468,6 +468,38 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
+# v210.0: Import safe task wrapper to prevent "Future exception was never retrieved"
+try:
+    from backend.core.async_safety import create_safe_task
+except ImportError:
+    # Fallback if async_safety is not available
+    _raw_create_task = asyncio.create_task
+    _fallback_tasks: set = set()
+    
+    def create_safe_task(coro, name=None, **kwargs):
+        """Fallback for create_safe_task with proper exception handling."""
+        task_name = name or "unnamed"
+        try:
+            task = _raw_create_task(coro, name=task_name)
+        except TypeError:
+            task = _raw_create_task(coro)
+        
+        _fallback_tasks.add(task)
+        
+        def _handle_done(t):
+            _fallback_tasks.discard(t)
+            if t.cancelled():
+                return
+            try:
+                exc = t.exception()
+                if exc is not None:
+                    logging.warning(f"[SafeTask] {task_name} error: {type(exc).__name__}: {exc}")
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
+        
+        task.add_done_callback(_handle_done)
+        return task
+
 # DEBUG: Print location info
 print(f"[STARTUP-DEBUG] Running from: {os.path.abspath(__file__)}")
 print(f"[STARTUP-DEBUG] Working directory: {os.getcwd()}")
@@ -1547,7 +1579,7 @@ async def parallel_lifespan(app: FastAPI):
                 logger.debug(f"Orchestrator background init: {e}")
 
         # Launch orchestrator in background
-        asyncio.create_task(_init_orchestrator_background(), name="orchestrator_init")
+        create_safe_task(_init_orchestrator_background(), name="orchestrator_init")
 
         # =================================================================
         # v77.4 UNIFIED CODING COUNCIL: Background initialization
@@ -1579,7 +1611,7 @@ async def parallel_lifespan(app: FastAPI):
                 app.state.coding_council_initialized = False
 
         # Launch Coding Council initialization in background
-        asyncio.create_task(_init_coding_council_background(), name="coding_council_init")
+        create_safe_task(_init_coding_council_background(), name="coding_council_init")
 
         # =================================================================
         # TRINITY ECOSYSTEM: Initialize Prime Router & Graceful Degradation
@@ -1714,7 +1746,7 @@ async def parallel_lifespan(app: FastAPI):
                 app.state.trinity_initialized = False
 
         # Launch Trinity initialization in background
-        asyncio.create_task(_init_trinity_background(), name="trinity_init_v85")
+        create_safe_task(_init_trinity_background(), name="trinity_init_v85")
 
         yield
 
@@ -1732,7 +1764,7 @@ async def parallel_lifespan(app: FastAPI):
                         logger.debug(f"Deferred task failed: {e}")
         
         # Start deferred tasks without awaiting
-        asyncio.create_task(run_deferred_tasks())
+        create_safe_task(run_deferred_tasks())
         
         # =================================================================
         # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
@@ -2158,7 +2190,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 dynamic_component_manager.start_monitoring()
             )
         else:
-            asyncio.create_task(
+            create_safe_task(
                 dynamic_component_manager.start_monitoring(),
                 name="dynamic_component_monitor"
             )
@@ -2293,14 +2325,14 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             except Exception as e:
                 logger.warning(f"⚠️ Memory manager task spawn failed: {e}")
                 # Fallback: spawn untracked task
-                asyncio.create_task(
+                create_safe_task(
                     app.state.memory_manager.start_monitoring(),
                     name="memory_manager_monitor"
                 )
                 logger.info("✅ Memory manager initialized (fallback)")
         else:
             # Fallback without TaskLifecycleManager
-            asyncio.create_task(
+            create_safe_task(
                 app.state.memory_manager.start_monitoring(),
                 name="memory_manager_monitor"
             )
@@ -2597,8 +2629,8 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 await task_mgr.spawn_monitor("goal_inference_db_cleanup", periodic_database_cleanup())
                 await task_mgr.spawn_monitor("goal_inference_pattern_analysis", periodic_pattern_analysis())
             else:
-                asyncio.create_task(periodic_database_cleanup(), name="goal_inference_db_cleanup")
-                asyncio.create_task(periodic_pattern_analysis(), name="goal_inference_pattern_analysis")
+                create_safe_task(periodic_database_cleanup(), name="goal_inference_db_cleanup")
+                create_safe_task(periodic_pattern_analysis(), name="goal_inference_pattern_analysis")
 
             logger.info("✅ Goal Inference background tasks started")
             logger.info("   • Database cleanup: every 1 hour")
@@ -3073,7 +3105,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 app.state.state_intelligence = state_intelligence
 
                 # Start stuck state monitoring
-                asyncio.create_task(state_intelligence.start_stuck_state_monitoring())
+                create_safe_task(state_intelligence.start_stuck_state_monitoring())
 
                 logger.info("✅ StateIntelligence v2.0 initialized")
                 logger.info("   • Auto-recording, stuck state detection, productivity tracking")
@@ -3248,7 +3280,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
 
                 # Generate and deliver intelligent startup message
                 if getattr(app.state, 'voice_enabled', True):
-                    asyncio.create_task(announcer.announce_startup(StartupType.COLD_BOOT))
+                    create_safe_task(announcer.announce_startup(StartupType.COLD_BOOT))
 
                 logger.info("✅ IntelligentStartupAnnouncer: Dynamic context-aware greetings enabled")
 
@@ -3263,7 +3295,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                     app.state.startup_greeter = greeter
 
                     if getattr(app.state, 'voice_enabled', True):
-                        asyncio.create_task(greeter.greet_on_startup())
+                        create_safe_task(greeter.greet_on_startup())
 
                     logger.info("✅ StartupGreeter (legacy): Initialized with wake detection")
 
@@ -3271,7 +3303,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                     logger.warning(f"⚠️ All startup greeters failed: {e2}")
                     # Final fallback to simple greeting
                     if voice and getattr(app.state, 'voice_enabled', True):
-                        asyncio.create_task(
+                        create_safe_task(
                             voice.speak(
                                 f"JARVIS online. Ready for your command, {owner_name}.",
                                 mode=VoiceMode.NORMAL
@@ -3330,7 +3362,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 setup_vision_status_callbacks(app)
                 logger.info("✅ Vision status manager initialized and connected")
 
-        asyncio.create_task(setup_vision_status())
+        create_safe_task(setup_vision_status())
     except Exception as e:
         logger.warning(f"⚠️ Could not initialize vision status manager: {e}")
 
@@ -3350,7 +3382,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 logger.info("Target: <35% memory usage (5.6GB of 16GB)")
                 logger.info("Strategy: Load models one-at-a-time, only when needed")
                 logger.info("Watch the console for real-time loading details...\n")
-            asyncio.create_task(init_func())
+            create_safe_task(init_func())
             logger.info("✅ ML models initialization started")
 
     elapsed = time.time() - start_time
@@ -4631,7 +4663,7 @@ async def lock_with_context(request: Request):
             from voice_unlock.cloud_ecapa_client import get_recent_speaker_cache
             cache = get_recent_speaker_cache()
             if cache:
-                asyncio.create_task(cache.invalidate())  # Fire-and-forget
+                create_safe_task(cache.invalidate())  # Fire-and-forget
         except Exception:
             pass
 
@@ -5148,7 +5180,7 @@ try:
 
                 # Fire-and-forget recording to avoid blocking the response
                 try:
-                    asyncio.create_task(profiler.record(sample))
+                    create_safe_task(profiler.record(sample))
                 except Exception:
                     pass  # Never block on profiling
 
@@ -6711,7 +6743,7 @@ async def flywheel_trigger(
 
         # Run in background task
         import asyncio
-        asyncio.create_task(
+        create_safe_task(
             flywheel.run_full_cycle(
                 include_web_scraping=include_web_scraping,
                 include_training=include_training,
@@ -7319,7 +7351,7 @@ def mount_routers():
                     logger.info("   ⚡ Smart caching enabled (3-5x performance)")
                     logger.info("   🔍 Detection methods: AppleScript, CoreGraphics, Yabai")
 
-                asyncio.create_task(start_display_monitoring())
+                create_safe_task(start_display_monitoring())
                 logger.info("✅ Advanced Display Monitor configured")
             else:
                 logger.warning("   ⚠️ Display monitor factories not available")
@@ -7379,7 +7411,7 @@ def mount_routers():
                 await orchestrator.start()
                 logger.info("✅ Memory-optimized orchestrator started (400MB limit)")
 
-            asyncio.create_task(start_orchestrator())
+            create_safe_task(start_orchestrator())
             logger.info("🚀 Using memory-optimized autonomous orchestrator")
 
         # Always mount the API router
@@ -7401,7 +7433,7 @@ def mount_routers():
         logger.info("✅ Hybrid Cloud Cost Monitoring API mounted at /hybrid")
 
         # Initialize cost tracking database
-        asyncio.create_task(initialize_cost_tracking())
+        create_safe_task(initialize_cost_tracking())
 
     except ImportError as e:
         logger.warning(f"Hybrid Cloud API not available: {e}")
@@ -7529,7 +7561,7 @@ async def process_command(request: dict):
         if mgr.advanced_predictor:
             try:
                 # Predict and preload next 1-3 components in background
-                asyncio.create_task(mgr.predict_and_preload(command, steps_ahead=3))
+                create_safe_task(mgr.predict_and_preload(command, steps_ahead=3))
                 logger.debug(f"🔮 Advanced preloading triggered for: '{command[:50]}'")
             except Exception as e:
                 logger.debug(f"Advanced preloading failed: {e}")
