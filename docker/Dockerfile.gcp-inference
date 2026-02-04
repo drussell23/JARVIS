@@ -1,0 +1,268 @@
+# JARVIS GCP Inference Image - Pre-baked ML Dependencies v1.0.0
+# ==============================================================
+#
+# Enterprise-grade container for JARVIS-Prime GCP VM inference.
+# ELIMINATES Phase 3 (ml_deps) ~5-8 minute install during startup.
+#
+# Key Features:
+# - Multi-stage build for optimized image size
+# - ALL ML dependencies pre-installed (torch, transformers, llama-cpp)
+# - Pre-warmed Python package cache
+# - Dynamic version detection with fallback defaults
+# - Supports both GPU (CUDA) and CPU inference
+# - Strict offline mode for zero network latency at runtime
+# - APARS-compatible health endpoint built-in
+# - Non-root user for security
+#
+# Architecture:
+#   ┌─────────────────────────────────────────────────────────────────────┐
+#   │              GCP VM Inference Container (Port 8000)                 │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │  Layer 1: Pre-baked ML Dependencies                                 │
+#   │  ├─ PyTorch 2.x (CPU/CUDA auto-detect)                              │
+#   │  ├─ Transformers + Accelerate                                       │
+#   │  ├─ llama-cpp-python (pre-compiled)                                 │
+#   │  └─ All supporting libraries                                        │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │  Layer 2: JARVIS-Prime Inference Server                             │
+#   │  ├─ FastAPI-based inference API                                     │
+#   │  ├─ APARS progress reporting                                        │
+#   │  ├─ Health checks with model status                                 │
+#   │  └─ Graceful shutdown handling                                      │
+#   ├─────────────────────────────────────────────────────────────────────┤
+#   │  Layer 3: Runtime Configuration                                     │
+#   │  ├─ Environment-driven configuration                                │
+#   │  ├─ Model path discovery                                            │
+#   │  └─ Cache optimization                                              │
+#   └─────────────────────────────────────────────────────────────────────┘
+#
+# Build:
+#   docker build -f docker/Dockerfile.gcp-inference -t jarvis-gcp-inference .
+#
+# Build with GPU support:
+#   docker build --build-arg COMPUTE_PLATFORM=cuda -f docker/Dockerfile.gcp-inference -t jarvis-gcp-inference:cuda .
+#
+# Push to GCR:
+#   docker tag jarvis-gcp-inference gcr.io/${PROJECT_ID}/jarvis-gcp-inference:latest
+#   docker push gcr.io/${PROJECT_ID}/jarvis-gcp-inference:latest
+#
+# Version: 1.0.0
+
+# =============================================================================
+# BUILD ARGUMENTS - Dynamic configuration
+# =============================================================================
+ARG PYTHON_VERSION=3.11
+ARG COMPUTE_PLATFORM=cpu
+ARG TORCH_VERSION=2.1.2
+ARG TRANSFORMERS_VERSION=4.36.2
+ARG LLAMA_CPP_VERSION=0.2.32
+ARG CACHE_DIR=/opt/jarvis_cache
+ARG MODEL_CACHE_DIR=/opt/jarvis_cache/models
+
+# =============================================================================
+# Stage 1: Build environment with all ML dependencies
+# =============================================================================
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+
+# Re-declare ARGs after FROM
+ARG COMPUTE_PLATFORM
+ARG TORCH_VERSION
+ARG TRANSFORMERS_VERSION
+ARG LLAMA_CPP_VERSION
+ARG CACHE_DIR
+ARG MODEL_CACHE_DIR
+
+# Metadata
+LABEL stage="builder"
+LABEL description="ML dependency builder for JARVIS GCP Inference"
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    wget \
+    pkg-config \
+    libssl-dev \
+    libffi-dev \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment for isolation
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Upgrade pip and install build tools
+RUN pip install --upgrade pip setuptools wheel
+
+# =============================================================================
+# ML DEPENDENCIES INSTALLATION (This is what we're pre-baking!)
+# =============================================================================
+# Install PyTorch (CPU or CUDA based on build arg)
+RUN if [ "${COMPUTE_PLATFORM}" = "cuda" ]; then \
+        pip install torch==${TORCH_VERSION}+cu121 --index-url https://download.pytorch.org/whl/cu121; \
+    else \
+        pip install torch==${TORCH_VERSION}+cpu --index-url https://download.pytorch.org/whl/cpu; \
+    fi
+
+# Install Transformers ecosystem
+RUN pip install \
+    transformers==${TRANSFORMERS_VERSION} \
+    accelerate>=0.25.0 \
+    tokenizers>=0.15.0 \
+    safetensors>=0.4.0 \
+    sentencepiece>=0.1.99 \
+    protobuf>=4.25.0
+
+# Install llama-cpp-python (pre-compiled for faster startup)
+# Uses CMAKE_ARGS for optimized build
+RUN if [ "${COMPUTE_PLATFORM}" = "cuda" ]; then \
+        CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install llama-cpp-python==${LLAMA_CPP_VERSION}; \
+    else \
+        CMAKE_ARGS="-DLLAMA_BLAS=ON -DLLAMA_BLAS_VENDOR=OpenBLAS" pip install llama-cpp-python==${LLAMA_CPP_VERSION}; \
+    fi
+
+# Install inference server dependencies
+RUN pip install \
+    fastapi>=0.109.0 \
+    uvicorn[standard]>=0.27.0 \
+    pydantic>=2.5.0 \
+    pydantic-settings>=2.1.0 \
+    aiohttp>=3.9.0 \
+    httpx>=0.26.0 \
+    python-dotenv>=1.0.0 \
+    python-multipart>=0.0.6
+
+# Install GCP and async utilities
+RUN pip install \
+    google-cloud-storage>=2.14.0 \
+    google-auth>=2.25.0 \
+    aiocache>=0.12.0 \
+    orjson>=3.9.0 \
+    msgpack>=1.0.0
+
+# Install monitoring and observability
+RUN pip install \
+    prometheus-client>=0.19.0 \
+    structlog>=24.1.0 \
+    rich>=13.7.0
+
+# Create cache directories
+RUN mkdir -p ${CACHE_DIR} ${MODEL_CACHE_DIR}
+
+# Pre-warm Python imports to generate .pyc files
+RUN python -c "import torch; import transformers; import fastapi; import uvicorn; print('Pre-warm complete')"
+
+# Generate manifest of installed packages for verification
+RUN pip freeze > ${CACHE_DIR}/requirements.frozen.txt && \
+    python -c "import torch; print(f'PyTorch: {torch.__version__}')" >> ${CACHE_DIR}/versions.txt && \
+    python -c "import transformers; print(f'Transformers: {transformers.__version__}')" >> ${CACHE_DIR}/versions.txt && \
+    echo "Build timestamp: $(date -Iseconds)" >> ${CACHE_DIR}/versions.txt
+
+# =============================================================================
+# Stage 2: Production image (minimal, secure)
+# =============================================================================
+FROM python:${PYTHON_VERSION}-slim-bookworm AS production
+
+# Re-declare ARGs
+ARG CACHE_DIR
+ARG MODEL_CACHE_DIR
+ARG COMPUTE_PLATFORM
+
+# Metadata
+LABEL maintainer="JARVIS AI Agent Team"
+LABEL version="1.0.0"
+LABEL description="JARVIS GCP Inference - Pre-baked ML Dependencies"
+LABEL compute_platform="${COMPUTE_PLATFORM}"
+
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create non-root user for security
+RUN groupadd -r jarvis && useradd -r -g jarvis -m -d /home/jarvis jarvis
+
+# Copy virtual environment from builder (this is the magic - all deps pre-installed!)
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy pre-baked cache
+COPY --from=builder ${CACHE_DIR} ${CACHE_DIR}
+
+# Create application directory structure
+WORKDIR /opt/jarvis-prime
+
+# Create directories for runtime
+RUN mkdir -p \
+    /opt/jarvis-prime/logs \
+    /opt/jarvis-prime/data \
+    ${MODEL_CACHE_DIR} \
+    /tmp/jarvis_runtime && \
+    chown -R jarvis:jarvis /opt/jarvis-prime ${CACHE_DIR} /tmp/jarvis_runtime
+
+# =============================================================================
+# EMBEDDED INFERENCE SERVER (Minimal stub that reports APARS progress)
+# This gets replaced when jarvis-prime repo is cloned, but provides immediate
+# health endpoint for fast startup detection
+# =============================================================================
+COPY --chown=jarvis:jarvis docker/gcp_inference_stub.py /opt/jarvis-prime/stub_server.py
+
+# =============================================================================
+# ENVIRONMENT CONFIGURATION
+# =============================================================================
+# Python optimization
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/opt/jarvis-prime
+
+# Cache configuration (use pre-baked cache)
+ENV HF_HOME="${CACHE_DIR}/huggingface"
+ENV TRANSFORMERS_CACHE="${CACHE_DIR}/huggingface"
+ENV TORCH_HOME="${CACHE_DIR}/torch"
+ENV XDG_CACHE_HOME="${CACHE_DIR}/xdg"
+
+# Offline mode (no network calls for model downloads)
+ENV HF_HUB_OFFLINE="1"
+ENV TRANSFORMERS_OFFLINE="1"
+ENV HF_DATASETS_OFFLINE="1"
+
+# JARVIS-specific configuration
+ENV JARVIS_DOCKER="true"
+ENV JARVIS_GCP_INFERENCE="true"
+ENV JARVIS_CACHE_DIR="${CACHE_DIR}"
+ENV JARVIS_MODEL_CACHE="${MODEL_CACHE_DIR}"
+ENV JARVIS_DEPS_PREBAKED="true"
+ENV JARVIS_SKIP_ML_DEPS_INSTALL="true"
+ENV JARVIS_PORT="8000"
+
+# APARS configuration for progress reporting
+ENV APARS_ENABLED="true"
+ENV APARS_SKIP_PHASE_3="true"
+ENV APARS_PREBAKED_PHASE="ml_deps"
+
+# Compute platform indicator
+ENV COMPUTE_PLATFORM="${COMPUTE_PLATFORM}"
+
+# Set ownership and switch to non-root user
+RUN chown -R jarvis:jarvis /opt/jarvis-prime
+USER jarvis
+
+# Expose inference port
+EXPOSE 8000
+
+# Health check (matches APARS expected format)
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -sf http://localhost:8000/health | grep -q '"status"' || exit 1
+
+# Volume for model storage (can be pre-populated or downloaded at runtime)
+VOLUME ["${MODEL_CACHE_DIR}"]
+
+# Default command: Run stub server (gets replaced by real server when repo is mounted/cloned)
+CMD ["python", "stub_server.py"]

@@ -2413,7 +2413,12 @@ async def _validate_inference_capability(
 
 @dataclass
 class APARSProgressSnapshot:
-    """Snapshot of APARS progress data from a health check."""
+    """
+    Snapshot of APARS progress data from a health check.
+    
+    v1.0.0: Added deps_prebaked and skipped_phases fields to support
+    container-based deployments with pre-baked ML dependencies.
+    """
     timestamp: float
     phase_number: int
     phase_name: str
@@ -2424,6 +2429,12 @@ class APARSProgressSnapshot:
     elapsed_seconds: int
     error: Optional[str] = None
     raw_data: Optional[Dict[str, Any]] = None
+    
+    # v1.0.0: Container-based deployment detection
+    deps_prebaked: bool = False  # True if ML deps were pre-baked (Docker image)
+    skipped_phases: List[int] = field(default_factory=list)  # Phases skipped due to prebaking
+    deployment_mode: str = "startup-script"  # "container" or "startup-script"
+    container_image: Optional[str] = None  # Docker image if container mode
 
 
 class AdaptiveProgressAwareWaiter:

@@ -515,6 +515,97 @@ PROGRESS_EOF
 echo "=== JARVIS Full Setup Started at $(date) ==="
 echo "=== APARS v197.0: Progress tracking enabled ==="
 
+# =============================================================================
+# v1.0.0: SMART DEPENDENCY DETECTION (Eliminates 5-8 min ml_deps install!)
+# =============================================================================
+# This is the KEY OPTIMIZATION: Detect if ML deps are already installed
+# (either via Docker pre-baked image or persistent disk cache)
+#
+# Detection methods:
+#   1. JARVIS_DEPS_PREBAKED=true env var (set by Docker image)
+#   2. JARVIS_SKIP_ML_DEPS_INSTALL=true env var (manual override)
+#   3. /.dockerenv file exists (running in Docker container)
+#   4. torch and transformers packages already installed
+#
+# When deps are pre-baked, we skip directly to Phase 4 (repo_clone),
+# reducing startup time from ~8min to ~2min!
+# =============================================================================
+
+check_ml_deps_installed() {
+    # Check if torch is installed and importable
+    python3 -c "import torch; print(f\"PyTorch {torch.__version__} found\")" 2>/dev/null
+    return $?
+}
+
+check_transformers_installed() {
+    # Check if transformers is installed and importable
+    python3 -c "import transformers; print(f\"Transformers {transformers.__version__} found\")" 2>/dev/null
+    return $?
+}
+
+check_llama_cpp_installed() {
+    # Check if llama-cpp-python is installed
+    python3 -c "import llama_cpp; print(\"llama-cpp-python found\")" 2>/dev/null
+    return $?
+}
+
+# SMART DETECTION: Determine if we can skip Phase 3
+SKIP_ML_DEPS=false
+SKIP_REASON=""
+
+# Method 1: Explicit environment variable from Docker image
+if [ "${JARVIS_DEPS_PREBAKED:-false}" = "true" ]; then
+    SKIP_ML_DEPS=true
+    SKIP_REASON="JARVIS_DEPS_PREBAKED=true (Docker pre-baked image)"
+fi
+
+# Method 2: Manual skip override
+if [ "${JARVIS_SKIP_ML_DEPS_INSTALL:-false}" = "true" ]; then
+    SKIP_ML_DEPS=true
+    SKIP_REASON="JARVIS_SKIP_ML_DEPS_INSTALL=true (manual override)"
+fi
+
+# Method 3: Docker container detection + package verification
+if [ -f "/.dockerenv" ] && [ "$SKIP_ML_DEPS" = "false" ]; then
+    echo "[SMART-DETECT] Running in Docker container, checking for pre-installed packages..."
+    if check_ml_deps_installed && check_transformers_installed; then
+        SKIP_ML_DEPS=true
+        SKIP_REASON="Docker container with torch+transformers pre-installed"
+    fi
+fi
+
+# Method 4: Package presence check (catches custom VM images with deps baked in)
+if [ "$SKIP_ML_DEPS" = "false" ]; then
+    echo "[SMART-DETECT] Checking if ML packages are already installed..."
+    if check_ml_deps_installed && check_transformers_installed; then
+        SKIP_ML_DEPS=true
+        SKIP_REASON="ML packages already present (custom VM image or cached)"
+    fi
+fi
+
+# Log detection result
+if [ "$SKIP_ML_DEPS" = "true" ]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════════════"
+    echo "🚀 SMART DEPENDENCY DETECTION: SKIPPING PHASE 3 (ml_deps)"
+    echo "═══════════════════════════════════════════════════════════════════════════"
+    echo "   Reason: $SKIP_REASON"
+    echo "   Estimated time saved: 5-8 minutes"
+    echo ""
+    # Verify what we have
+    python3 -c "import torch; print(f\"   - PyTorch: {torch.__version__}\")" 2>/dev/null || echo "   - PyTorch: NOT FOUND"
+    python3 -c "import transformers; print(f\"   - Transformers: {transformers.__version__}\")" 2>/dev/null || echo "   - Transformers: NOT FOUND"
+    python3 -c "import llama_cpp; print(\"   - llama-cpp-python: installed\")" 2>/dev/null || echo "   - llama-cpp-python: NOT FOUND (optional)"
+    echo "═══════════════════════════════════════════════════════════════════════════"
+    echo ""
+else
+    echo ""
+    echo "[SMART-DETECT] ML dependencies not found - will install in Phase 3"
+    echo "   This will take approximately 5-8 minutes."
+    echo "   TIP: Use Docker image gcr.io/\$PROJECT/jarvis-gcp-inference for faster startup!"
+    echo ""
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PHASE 2: System Dependencies (Progress 16-30%)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -543,10 +634,8 @@ update_progress 2 100 30 "system_deps_complete"
 # ═══════════════════════════════════════════════════════════════════════════
 # PHASE 3: ML Dependencies (Progress 30-60%) - This is the longest phase!
 # v197.1: Added heartbeat to prevent timeout during long pip installs
+# v1.0.0: SMART SKIP - Bypasses entire phase if deps are pre-baked!
 # ═══════════════════════════════════════════════════════════════════════════
-update_progress 3 0 30 "ml_deps_starting"
-
-echo "📦 Installing ML dependencies (this may take 5-8 minutes)..."
 
 # v197.1: Start a HEARTBEAT that keeps updating progress during long installs
 # This prevents the supervisor from timing out while pip is working
@@ -606,52 +695,111 @@ stop_heartbeat() {
     fi
 }
 
-# TORCH installation (longest: ~3-5 minutes)
-echo "📦 [1/6] Installing PyTorch (this takes 3-5 minutes)..."
-update_progress 3 5 32 "pip_installing_torch"
-start_heartbeat 3 5 35 "pip_torch" 300 &  # 5 min estimated
-HEARTBEAT_PID=$!
-pip3 install torch 2>&1 | tail -5 || true
-stop_heartbeat
-update_progress 3 35 40 "pip_torch_complete"
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 3 EXECUTION (or SKIP if deps are pre-baked)
+# ═══════════════════════════════════════════════════════════════════════════
 
-# TRANSFORMERS installation (~1-2 minutes)
-echo "📦 [2/6] Installing Transformers..."
-update_progress 3 40 42 "pip_installing_transformers"
-start_heartbeat 3 40 55 "pip_transformers" 120 &  # 2 min estimated
-HEARTBEAT_PID=$!
-pip3 install transformers accelerate 2>&1 | tail -3 || true
-stop_heartbeat
-update_progress 3 55 48 "pip_transformers_complete"
+if [ "$SKIP_ML_DEPS" = "true" ]; then
+    # =========================================================================
+    # FAST PATH: Skip ML deps installation entirely!
+    # This saves 5-8 minutes of startup time when using Docker pre-baked image
+    # =========================================================================
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════════"
+    echo "⚡ PHASE 3: SKIPPED - ML dependencies already installed"
+    echo "═══════════════════════════════════════════════════════════════════════"
+    echo "   Reason: $SKIP_REASON"
+    echo ""
+    
+    # Update progress to show Phase 3 complete
+    update_progress 3 0 30 "ml_deps_prebaked_detected"
+    sleep 1
+    update_progress 3 50 45 "ml_deps_verification"
+    
+    # Quick verification of installed packages
+    echo "   Verifying pre-installed packages..."
+    VERIFY_OK=true
+    
+    if ! check_ml_deps_installed; then
+        echo "   ⚠️  Warning: torch import failed - may need installation"
+        VERIFY_OK=false
+    fi
+    
+    if ! check_transformers_installed; then
+        echo "   ⚠️  Warning: transformers import failed - may need installation"
+        VERIFY_OK=false
+    fi
+    
+    if [ "$VERIFY_OK" = "true" ]; then
+        update_progress 3 100 60 "ml_deps_prebaked_verified"
+        echo "   ✅ All ML dependencies verified successfully!"
+    else
+        echo "   ⚠️  Some packages may need attention, but continuing..."
+        update_progress 3 100 60 "ml_deps_prebaked_partial"
+    fi
+    
+    echo ""
+    echo "   Time saved: ~5-8 minutes"
+    echo "═══════════════════════════════════════════════════════════════════════"
+    echo ""
 
-# NLP utilities (~30 seconds)
-echo "📦 [3/6] Installing NLP utilities..."
-update_progress 3 58 49 "pip_installing_nlp_utils"
-pip3 install sentencepiece protobuf 2>&1 | tail -3 || true
-update_progress 3 65 51 "pip_nlp_complete"
-
-# Async libraries (~20 seconds)
-echo "📦 [4/6] Installing async libraries..."
-update_progress 3 68 52 "pip_installing_async"
-pip3 install aiohttp pydantic python-dotenv 2>&1 | tail -3 || true
-update_progress 3 75 54 "pip_async_complete"
-
-# GCP libraries (~30 seconds)
-echo "📦 [5/6] Installing GCP libraries..."
-update_progress 3 78 55 "pip_installing_gcp"
-pip3 install google-cloud-storage 2>&1 | tail -3 || true
-update_progress 3 85 57 "pip_gcp_complete"
-
-# LLAMA-CPP (~1-2 minutes, includes compilation)
-echo "📦 [6/6] Installing llama-cpp-python (includes compilation)..."
-update_progress 3 88 58 "pip_installing_llama"
-start_heartbeat 3 88 98 "pip_llama" 120 &  # 2 min estimated
-HEARTBEAT_PID=$!
-pip3 install llama-cpp-python 2>&1 | tail -5 || true
-stop_heartbeat
-update_progress 3 100 60 "ml_deps_complete"
-
-echo "✅ ML dependencies installed!"
+else
+    # =========================================================================
+    # SLOW PATH: Install ML dependencies from scratch
+    # This is the original Phase 3 code, takes 5-8 minutes
+    # =========================================================================
+    update_progress 3 0 30 "ml_deps_starting"
+    
+    echo "📦 Installing ML dependencies (this may take 5-8 minutes)..."
+    echo "   TIP: Use Docker image for faster startup next time!"
+    
+    # TORCH installation (longest: ~3-5 minutes)
+    echo "📦 [1/6] Installing PyTorch (this takes 3-5 minutes)..."
+    update_progress 3 5 32 "pip_installing_torch"
+    start_heartbeat 3 5 35 "pip_torch" 300 &  # 5 min estimated
+    HEARTBEAT_PID=$!
+    pip3 install torch 2>&1 | tail -5 || true
+    stop_heartbeat
+    update_progress 3 35 40 "pip_torch_complete"
+    
+    # TRANSFORMERS installation (~1-2 minutes)
+    echo "📦 [2/6] Installing Transformers..."
+    update_progress 3 40 42 "pip_installing_transformers"
+    start_heartbeat 3 40 55 "pip_transformers" 120 &  # 2 min estimated
+    HEARTBEAT_PID=$!
+    pip3 install transformers accelerate 2>&1 | tail -3 || true
+    stop_heartbeat
+    update_progress 3 55 48 "pip_transformers_complete"
+    
+    # NLP utilities (~30 seconds)
+    echo "📦 [3/6] Installing NLP utilities..."
+    update_progress 3 58 49 "pip_installing_nlp_utils"
+    pip3 install sentencepiece protobuf 2>&1 | tail -3 || true
+    update_progress 3 65 51 "pip_nlp_complete"
+    
+    # Async libraries (~20 seconds)
+    echo "📦 [4/6] Installing async libraries..."
+    update_progress 3 68 52 "pip_installing_async"
+    pip3 install aiohttp pydantic python-dotenv 2>&1 | tail -3 || true
+    update_progress 3 75 54 "pip_async_complete"
+    
+    # GCP libraries (~30 seconds)
+    echo "📦 [5/6] Installing GCP libraries..."
+    update_progress 3 78 55 "pip_installing_gcp"
+    pip3 install google-cloud-storage 2>&1 | tail -3 || true
+    update_progress 3 85 57 "pip_gcp_complete"
+    
+    # LLAMA-CPP (~1-2 minutes, includes compilation)
+    echo "📦 [6/6] Installing llama-cpp-python (includes compilation)..."
+    update_progress 3 88 58 "pip_installing_llama"
+    start_heartbeat 3 88 98 "pip_llama" 120 &  # 2 min estimated
+    HEARTBEAT_PID=$!
+    pip3 install llama-cpp-python 2>&1 | tail -5 || true
+    stop_heartbeat
+    update_progress 3 100 60 "ml_deps_complete"
+    
+    echo "✅ ML dependencies installed!"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PHASE 4: Repository Clone (Progress 60-80%)
