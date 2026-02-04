@@ -27173,17 +27173,17 @@ class HealthGatedInitializer:
 
         for attempt in range(self._retry_count):
             try:
-                async with asyncio.timeout(self._health_timeout):
-                    is_healthy = await check_fn()
+                # v211.0: Use asyncio.wait_for for Python 3.9 compatibility
+                is_healthy = await asyncio.wait_for(check_fn(), timeout=self._health_timeout)
 
-                    self._health_status[component] = {
-                        "healthy": is_healthy,
-                        "last_check": time.time(),
-                        "attempts": attempt + 1,
-                    }
+                self._health_status[component] = {
+                    "healthy": is_healthy,
+                    "last_check": time.time(),
+                    "attempts": attempt + 1,
+                }
 
-                    if is_healthy:
-                        return True
+                if is_healthy:
+                    return True
 
             except asyncio.TimeoutError:
                 self.logger.warning(

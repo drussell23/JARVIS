@@ -311,32 +311,39 @@ class ParallelTierExecutor:
         done_results: List[TierResult] = []
         pending = set(tasks.values())
 
+        # v211.0: Use asyncio.wait_for for Python 3.9 compatibility
+        async def _race_for_first_success():
+            nonlocal pending, done_results
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in done:
+                    try:
+                        result = task.result()
+                        done_results.append(result)
+
+                        if result.success:
+                            # First success - cancel remaining tasks
+                            for remaining_task in pending:
+                                remaining_task.cancel()
+
+                            # Wait for cancellation to complete
+                            if pending:
+                                await asyncio.gather(*pending, return_exceptions=True)
+
+                            return result
+
+                    except Exception as e:
+                        logger.warning(f"Tier task failed: {e}")
+            return None
+
         try:
-            async with asyncio.timeout(timeout):
-                while pending:
-                    done, pending = await asyncio.wait(
-                        pending,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    for task in done:
-                        try:
-                            result = task.result()
-                            done_results.append(result)
-
-                            if result.success:
-                                # First success - cancel remaining tasks
-                                for remaining_task in pending:
-                                    remaining_task.cancel()
-
-                                # Wait for cancellation to complete
-                                if pending:
-                                    await asyncio.gather(*pending, return_exceptions=True)
-
-                                return result
-
-                        except Exception as e:
-                            logger.warning(f"Tier task failed: {e}")
+            result = await asyncio.wait_for(_race_for_first_success(), timeout=timeout)
+            if result is not None:
+                return result
 
         except asyncio.TimeoutError:
             # Cancel all remaining tasks

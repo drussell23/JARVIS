@@ -1106,14 +1106,17 @@ class CrossRepoStateInitializer:
         startup_start = time.time()
 
         # Phase 1: Initialize JARVIS (local) - This is required
+        # v211.0: Use asyncio.wait_for for Python 3.9 compatibility
         try:
-            async with asyncio.timeout(self.config.repo_startup_timeout_seconds):
-                jarvis_success = await self._initialize_jarvis_local()
-                results[RepoType.JARVIS] = jarvis_success
+            jarvis_success = await asyncio.wait_for(
+                self._initialize_jarvis_local(),
+                timeout=self.config.repo_startup_timeout_seconds
+            )
+            results[RepoType.JARVIS] = jarvis_success
 
-                if not jarvis_success:
-                    logger.error("[CrossRepoState] JARVIS local initialization failed - aborting")
-                    return results
+            if not jarvis_success:
+                logger.error("[CrossRepoState] JARVIS local initialization failed - aborting")
+                return results
         except asyncio.TimeoutError:
             logger.error("[CrossRepoState] JARVIS local initialization timed out")
             results[RepoType.JARVIS] = False
@@ -1125,18 +1128,21 @@ class CrossRepoStateInitializer:
             self._initialize_reactor_core_with_retry(),
         ]
 
+        # v211.0: Use asyncio.wait_for for Python 3.9 compatibility
         try:
-            async with asyncio.timeout(self.config.repo_startup_timeout_seconds * 2):
-                external_results = await asyncio.gather(*external_init_tasks, return_exceptions=True)
+            external_results = await asyncio.wait_for(
+                asyncio.gather(*external_init_tasks, return_exceptions=True),
+                timeout=self.config.repo_startup_timeout_seconds * 2
+            )
 
-                # Process results
-                for i, result in enumerate(external_results):
-                    repo_type = RepoType.JARVIS_PRIME if i == 0 else RepoType.REACTOR_CORE
-                    if isinstance(result, Exception):
-                        logger.warning(f"[CrossRepoState] {repo_type.value} initialization failed: {result}")
-                        results[repo_type] = False
-                    else:
-                        results[repo_type] = result
+            # Process results
+            for i, result in enumerate(external_results):
+                repo_type = RepoType.JARVIS_PRIME if i == 0 else RepoType.REACTOR_CORE
+                if isinstance(result, Exception):
+                    logger.warning(f"[CrossRepoState] {repo_type.value} initialization failed: {result}")
+                    results[repo_type] = False
+                else:
+                    results[repo_type] = result
 
         except asyncio.TimeoutError:
             logger.warning("[CrossRepoState] External repo initialization timed out")
@@ -1249,48 +1255,53 @@ class CrossRepoStateInitializer:
         1. Prime state file exists and has recent heartbeat
         2. (Optional) HTTP health check if endpoint configured
         """
-        try:
-            async with asyncio.timeout(self.config.repo_health_probe_timeout_seconds):
-                # Method 1: Check heartbeat file
-                heartbeat_data = await self._read_json_file(self._state_files["heartbeat"], default={})
-                prime_heartbeat = heartbeat_data.get("jarvis_prime", {})
+        # v211.0: Use asyncio.wait_for for Python 3.9 compatibility
+        async def _do_health_probe() -> bool:
+            # Method 1: Check heartbeat file
+            heartbeat_data = await self._read_json_file(self._state_files["heartbeat"], default={})
+            prime_heartbeat = heartbeat_data.get("jarvis_prime", {})
 
-                if prime_heartbeat:
-                    last_heartbeat = prime_heartbeat.get("timestamp", "")
-                    if last_heartbeat:
-                        try:
-                            heartbeat_time = datetime.fromisoformat(last_heartbeat)
-                            age = datetime.now() - heartbeat_time
-                            if age < timedelta(seconds=self.config.heartbeat_timeout_seconds):
-                                logger.debug("[CrossRepoState] JARVIS Prime heartbeat valid")
-                                return True
-                        except (ValueError, TypeError):
-                            pass
-
-                # Method 2: Check Prime state file
-                prime_state = await self._read_json_file(self._state_files["prime_state"], default={})
-                if prime_state.get("status") in ("ready", "active"):
-                    logger.debug("[CrossRepoState] JARVIS Prime state valid")
-                    return True
-
-                # Method 3: Try HTTP health check if configured
-                prime_url = _get_env("JARVIS_PRIME_HEALTH_URL", "")
-                if prime_url:
+            if prime_heartbeat:
+                last_heartbeat = prime_heartbeat.get("timestamp", "")
+                if last_heartbeat:
                     try:
-                        import aiohttp
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(
-                                prime_url,
-                                timeout=aiohttp.ClientTimeout(total=self.config.repo_health_probe_timeout_seconds)
-                            ) as resp:
-                                if resp.status == 200:
-                                    logger.debug("[CrossRepoState] JARVIS Prime HTTP health check passed")
-                                    return True
-                    except Exception:
+                        heartbeat_time = datetime.fromisoformat(last_heartbeat)
+                        age = datetime.now() - heartbeat_time
+                        if age < timedelta(seconds=self.config.heartbeat_timeout_seconds):
+                            logger.debug("[CrossRepoState] JARVIS Prime heartbeat valid")
+                            return True
+                    except (ValueError, TypeError):
                         pass
 
-                return False
+            # Method 2: Check Prime state file
+            prime_state = await self._read_json_file(self._state_files["prime_state"], default={})
+            if prime_state.get("status") in ("ready", "active"):
+                logger.debug("[CrossRepoState] JARVIS Prime state valid")
+                return True
 
+            # Method 3: Try HTTP health check if configured
+            prime_url = _get_env("JARVIS_PRIME_HEALTH_URL", "")
+            if prime_url:
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            prime_url,
+                            timeout=aiohttp.ClientTimeout(total=self.config.repo_health_probe_timeout_seconds)
+                        ) as resp:
+                            if resp.status == 200:
+                                logger.debug("[CrossRepoState] JARVIS Prime HTTP health check passed")
+                                return True
+                except Exception:
+                    pass
+
+            return False
+
+        try:
+            return await asyncio.wait_for(
+                _do_health_probe(),
+                timeout=self.config.repo_health_probe_timeout_seconds
+            )
         except asyncio.TimeoutError:
             logger.debug("[CrossRepoState] JARVIS Prime health probe timed out")
             return False
@@ -1306,48 +1317,53 @@ class CrossRepoStateInitializer:
         1. Reactor state file exists and has recent heartbeat
         2. (Optional) HTTP health check if endpoint configured
         """
-        try:
-            async with asyncio.timeout(self.config.repo_health_probe_timeout_seconds):
-                # Method 1: Check heartbeat file
-                heartbeat_data = await self._read_json_file(self._state_files["heartbeat"], default={})
-                reactor_heartbeat = heartbeat_data.get("reactor_core", {})
+        # v211.0: Use asyncio.wait_for for Python 3.9 compatibility
+        async def _do_health_probe() -> bool:
+            # Method 1: Check heartbeat file
+            heartbeat_data = await self._read_json_file(self._state_files["heartbeat"], default={})
+            reactor_heartbeat = heartbeat_data.get("reactor_core", {})
 
-                if reactor_heartbeat:
-                    last_heartbeat = reactor_heartbeat.get("timestamp", "")
-                    if last_heartbeat:
-                        try:
-                            heartbeat_time = datetime.fromisoformat(last_heartbeat)
-                            age = datetime.now() - heartbeat_time
-                            if age < timedelta(seconds=self.config.heartbeat_timeout_seconds):
-                                logger.debug("[CrossRepoState] Reactor Core heartbeat valid")
-                                return True
-                        except (ValueError, TypeError):
-                            pass
-
-                # Method 2: Check Reactor state file
-                reactor_state = await self._read_json_file(self._state_files["reactor_state"], default={})
-                if reactor_state.get("status") in ("ready", "active"):
-                    logger.debug("[CrossRepoState] Reactor Core state valid")
-                    return True
-
-                # Method 3: Try HTTP health check if configured
-                reactor_url = _get_env("REACTOR_CORE_HEALTH_URL", "")
-                if reactor_url:
+            if reactor_heartbeat:
+                last_heartbeat = reactor_heartbeat.get("timestamp", "")
+                if last_heartbeat:
                     try:
-                        import aiohttp
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(
-                                reactor_url,
-                                timeout=aiohttp.ClientTimeout(total=self.config.repo_health_probe_timeout_seconds)
-                            ) as resp:
-                                if resp.status == 200:
-                                    logger.debug("[CrossRepoState] Reactor Core HTTP health check passed")
-                                    return True
-                    except Exception:
+                        heartbeat_time = datetime.fromisoformat(last_heartbeat)
+                        age = datetime.now() - heartbeat_time
+                        if age < timedelta(seconds=self.config.heartbeat_timeout_seconds):
+                            logger.debug("[CrossRepoState] Reactor Core heartbeat valid")
+                            return True
+                    except (ValueError, TypeError):
                         pass
 
-                return False
+            # Method 2: Check Reactor state file
+            reactor_state = await self._read_json_file(self._state_files["reactor_state"], default={})
+            if reactor_state.get("status") in ("ready", "active"):
+                logger.debug("[CrossRepoState] Reactor Core state valid")
+                return True
 
+            # Method 3: Try HTTP health check if configured
+            reactor_url = _get_env("REACTOR_CORE_HEALTH_URL", "")
+            if reactor_url:
+                try:
+                    import aiohttp
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            reactor_url,
+                            timeout=aiohttp.ClientTimeout(total=self.config.repo_health_probe_timeout_seconds)
+                        ) as resp:
+                            if resp.status == 200:
+                                logger.debug("[CrossRepoState] Reactor Core HTTP health check passed")
+                                return True
+                except Exception:
+                    pass
+
+            return False
+
+        try:
+            return await asyncio.wait_for(
+                _do_health_probe(),
+                timeout=self.config.repo_health_probe_timeout_seconds
+            )
         except asyncio.TimeoutError:
             logger.debug("[CrossRepoState] Reactor Core health probe timed out")
             return False
