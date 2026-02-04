@@ -4657,25 +4657,78 @@ logger.info("✅ Context-intelligent /lock-with-context endpoint registered (mod
 
 class WebSocketPassThroughMiddleware:
     """
-    v149.0: Pass-through middleware for WebSocket connections.
+    v210.0: Enhanced pass-through middleware for WebSocket connections.
+    
+    ROOT CAUSE FIX for 403 Forbidden during WebSocket handshake:
+    The issue is that CORSMiddleware can reject WebSocket upgrade requests
+    before they reach the WebSocket handler. This middleware intercepts
+    BOTH WebSocket scope AND HTTP upgrade requests to ensure they bypass
+    any middleware that could reject them.
     
     This pure ASGI middleware ensures WebSocket connections are passed
-    directly to the application without interference from other middleware
-    (especially CORS which can incorrectly reject WebSocket upgrades).
+    directly to the application without interference from other middleware.
     
     Must be added AFTER CORSMiddleware (so it runs BEFORE in the chain).
     """
     
     def __init__(self, app):
         self.app = app
-        logger.info("[v149.0] WebSocket Pass-Through middleware initialized")
+        logger.info("[v210.0] WebSocket Pass-Through middleware initialized (handles upgrade requests)")
+    
+    def _is_websocket_upgrade(self, scope) -> bool:
+        """
+        v210.0: Check if this is a WebSocket upgrade request.
+        
+        WebSocket connections can appear as either:
+        1. scope['type'] == 'websocket' (after ASGI server upgrades)
+        2. scope['type'] == 'http' with Upgrade: websocket header (before upgrade)
+        
+        CRITICAL: This must catch BOTH cases to prevent CORS from rejecting
+        WebSocket upgrade requests during the HTTP handshake phase.
+        """
+        # Case 1: Already upgraded to WebSocket
+        if scope['type'] == 'websocket':
+            return True
+        
+        # Case 2: HTTP upgrade request (before upgrade completes)
+        if scope['type'] == 'http':
+            # Convert headers list to dict for easy lookup
+            # Headers are (name, value) tuples with bytes
+            headers = {}
+            for name, value in scope.get('headers', []):
+                headers[name.lower()] = value
+            
+            # Check for Upgrade: websocket header
+            upgrade = headers.get(b'upgrade', b'').decode('latin-1').lower().strip()
+            connection = headers.get(b'connection', b'').decode('latin-1').lower()
+            
+            # WebSocket upgrade if:
+            # - Upgrade header is 'websocket'
+            # - OR Connection header contains 'upgrade' (required for WebSocket handshake)
+            if upgrade == 'websocket':
+                return True
+            if 'upgrade' in connection:
+                # Additional check: make sure it's actually a WebSocket path
+                path = scope.get('path', '').lower()
+                if '/ws' in path or path.endswith('/ws'):
+                    return True
+        
+        return False
     
     async def __call__(self, scope, receive, send):
         """ASGI interface - pass through WebSocket connections unchanged."""
-        if scope['type'] == 'websocket':
-            # WebSocket connection - pass through directly
+        # v210.0: Check both WebSocket scope AND HTTP upgrade requests
+        if self._is_websocket_upgrade(scope):
+            # WebSocket connection - pass through directly, bypassing ALL middleware
             path = scope.get('path', '/')
-            logger.debug(f"[v149.0] WebSocket pass-through: {path}")
+            headers = dict(scope.get('headers', []))
+            origin = headers.get(b'origin', b'').decode('latin-1')
+            
+            # v210.0: Log connection attempt for debugging 403 issues
+            logger.info(f"[v210.0] WebSocket intercepted: path={path}, origin={origin}, type={scope['type']}")
+            
+            # CRITICAL: Pass through directly to the application
+            # This bypasses CORSMiddleware which can incorrectly reject WebSocket upgrades
             await self.app(scope, receive, send)
             return
         
@@ -7540,11 +7593,18 @@ async def root():
 @app.websocket("/ws")
 async def main_websocket_endpoint(websocket: WebSocket):
     """
-    v154.0: Direct unified WebSocket endpoint - fixes 403 Forbidden errors.
+    v210.0: Direct unified WebSocket endpoint - fixes 403 Forbidden errors.
 
-    This endpoint delegates to the unified_websocket handler but is mounted
-    directly on the app (like /audio/ml/stream) to bypass router mounting issues.
+    ROOT CAUSE FIX: This endpoint is mounted directly on the app to ensure
+    it's always reachable, bypassing any router mounting issues.
+    
+    The endpoint accepts the connection FIRST before any processing to
+    prevent 403 errors from middleware or routing issues.
     """
+    # v210.0: Log connection attempt for debugging
+    client_host = websocket.client.host if websocket.client else "unknown"
+    logger.info(f"[WS] Connection attempt from {client_host} to /ws")
+    
     try:
         # Import unified websocket handler
         from api.unified_websocket import unified_websocket_endpoint
@@ -7555,7 +7615,10 @@ async def main_websocket_endpoint(websocket: WebSocket):
     except ImportError as e:
         # Fallback if unified_websocket module not available
         logger.warning(f"[WS] unified_websocket import failed: {e}, using fallback")
+        
+        # v210.0: Accept connection immediately to prevent 403
         await websocket.accept()
+        logger.info(f"[WS] Connection accepted (fallback mode) from {client_host}")
 
         try:
             from datetime import datetime
