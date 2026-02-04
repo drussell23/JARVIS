@@ -64177,7 +64177,7 @@ async def handle_check_only(args: argparse.Namespace) -> int:
     if not backend_exists or not core_exists:
         all_passed = False
 
-    # 3. Docker (if enabled)
+    # 3. Docker (if enabled) - v212.0: Intelligent auto-start with progress
     print(f"{BOLD}{BLUE}║{RESET}")
     print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Docker{RESET}")
     if config.docker_enabled:
@@ -64186,6 +64186,7 @@ async def handle_check_only(args: argparse.Namespace) -> int:
         if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
             docker_timeout = get_timeouts().docker_check_timeout
         try:
+            # Quick check first
             proc = await asyncio.create_subprocess_exec(
                 "docker", "info",
                 stdout=asyncio.subprocess.DEVNULL,
@@ -64193,10 +64194,25 @@ async def handle_check_only(args: argparse.Namespace) -> int:
             )
             await asyncio.wait_for(proc.wait(), timeout=docker_timeout)
             docker_ok = proc.returncode == 0
-            print(f"{BOLD}{BLUE}║{RESET}    {check_mark(docker_ok)} Docker daemon: {'running' if docker_ok else 'not running'}")
-            if not docker_ok:
-                warnings.append("Docker daemon not running - will attempt auto-start")
-        except Exception:
+
+            if docker_ok:
+                print(f"{BOLD}{BLUE}║{RESET}    {check_mark(True)} Docker daemon: running")
+            else:
+                # v212.0: Attempt intelligent auto-start
+                docker_manager = DockerDaemonManager(config)
+                if docker_manager.auto_start:
+                    print(f"{BOLD}{BLUE}║{RESET}    {YELLOW}⏳ Docker daemon: starting...{RESET}")
+                    started = await docker_manager._start_daemon()
+                    if started:
+                        print(f"{BOLD}{BLUE}║{RESET}    {check_mark(True)} Docker daemon: auto-started successfully")
+                    else:
+                        print(f"{BOLD}{BLUE}║{RESET}    {check_mark(False)} Docker daemon: auto-start failed")
+                        warnings.append("Docker auto-start failed - may need manual start")
+                else:
+                    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(False)} Docker daemon: not running (auto-start disabled)")
+                    warnings.append("Docker daemon not running")
+
+        except Exception as e:
             print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker check: could not verify")
             warnings.append("Docker check failed")
     else:
@@ -64749,27 +64765,49 @@ async def _fetch_preflight_status() -> Dict[str, Any]:
         if not backend_dir.exists() or not core_dir.exists():
             result["passed"] = False
 
-        # Docker check (with timeout) - v203.0: use configured timeout
+        # Docker check with intelligent auto-start (v212.0)
+        # Uses DockerDaemonManager for robust platform-specific startup
         docker_timeout = 10.0
         if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
             docker_timeout = get_timeouts().docker_check_timeout
         if config.docker_enabled:
             try:
+                # Quick check first
                 proc = await asyncio.create_subprocess_exec(
                     "docker", "info",
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 await asyncio.wait_for(proc.wait(), timeout=docker_timeout)
-                result["checks"]["docker"] = proc.returncode == 0
-                if proc.returncode != 0:
-                    result["warnings"].append("Docker daemon not running")
+                docker_running = proc.returncode == 0
+
+                if docker_running:
+                    result["checks"]["docker"] = True
+                else:
+                    # v212.0: Auto-start Docker using DockerDaemonManager
+                    result["checks"]["docker_autostart_attempted"] = True
+                    docker_manager = DockerDaemonManager(config)
+
+                    if docker_manager.auto_start:
+                        # Attempt intelligent auto-start
+                        started = await docker_manager._start_daemon()
+                        result["checks"]["docker"] = started
+                        result["checks"]["docker_autostart_success"] = started
+
+                        if started:
+                            result["warnings"].append("Docker daemon auto-started successfully")
+                        else:
+                            result["warnings"].append("Docker auto-start failed - manual start required")
+                    else:
+                        result["checks"]["docker"] = False
+                        result["warnings"].append("Docker not running (auto-start disabled)")
+
             except asyncio.TimeoutError:
                 result["checks"]["docker"] = False
                 result["warnings"].append("Docker check timed out")
-            except Exception:
+            except Exception as e:
                 result["checks"]["docker"] = False
-                result["warnings"].append("Docker check failed")
+                result["warnings"].append(f"Docker check failed: {str(e)[:50]}")
         else:
             result["checks"]["docker"] = None  # Disabled
 
@@ -64886,6 +64924,12 @@ async def _fetch_invincible_status_direct(timeout: float = 10.0) -> Dict[str, An
             result["health"] = status.get("health", {})
             result["machine_type"] = status.get("machine_type")
             result["uptime_seconds"] = status.get("uptime_seconds")
+
+            # v212.0: Propagate errors from get_invincible_node_status()
+            # This ensures configuration errors (e.g., missing GCP_VM_STATIC_IP_NAME)
+            # are properly surfaced instead of being silently ignored
+            if status.get("error"):
+                result["error"] = status.get("error")
 
         except asyncio.TimeoutError:
             result["error"] = "gcp_timeout"
@@ -65115,13 +65159,16 @@ def _format_dashboard_output(
 
         if gcp_status == "RUNNING":
             status_color = GREEN if ready else YELLOW
-        elif gcp_status in ("STOPPED", "TERMINATED"):
+        elif gcp_status in ("STOPPED", "TERMINATED", "NOT_FOUND"):
+            # v212.0: NOT_FOUND is normal - VM will be created on first use
             status_color = YELLOW
         else:
             status_color = RED
 
         lines.append(box_line(f"  Instance: {invincible_status.get('instance_name', '?')}"))
-        lines.append(box_line(f"  GCP: {status_color}{gcp_status}{RESET}  |  IP: {static_ip or 'N/A'}"))
+        # v212.0: Show user-friendly status for NOT_FOUND
+        display_status = "Not created" if gcp_status == "NOT_FOUND" else gcp_status
+        lines.append(box_line(f"  GCP: {status_color}{display_status}{RESET}  |  IP: {static_ip or 'N/A'}"))
 
         if gcp_status == "RUNNING":
             inference_status = f"{GREEN}Ready{RESET}" if ready else f"{YELLOW}Not ready{RESET}"
@@ -65294,10 +65341,12 @@ async def _show_startup_dashboard() -> None:
             return f"{DIM}\u25cb{RESET}"
         return status_icon(val)
 
-    # Fetch data with shorter timeouts for startup (don't block too long)
+    # Fetch data with appropriate timeouts
+    # v212.0: Increased invincible timeout to 15s because GCP manager initialization
+    # takes ~10-14s on cold start (credentials, API client setup, cost tracker init)
     lock_task = asyncio.create_task(_fetch_lock_status_readonly())
     preflight_task = asyncio.create_task(_fetch_preflight_status())
-    invincible_task = asyncio.create_task(_fetch_invincible_status_direct(timeout=5.0))  # Shorter timeout
+    invincible_task = asyncio.create_task(_fetch_invincible_status_direct(timeout=15.0))  # GCP init takes ~14s
 
     results = await asyncio.gather(
         lock_task, preflight_task, invincible_task,
@@ -65338,19 +65387,50 @@ async def _show_startup_dashboard() -> None:
         ready = health.get("ready_for_inference", False)
 
         if error:
-            status_str = f"{YELLOW}Check failed{RESET}"
+            # v212.0: Show more specific error messages instead of generic "Check failed"
+            if error == "gcp_timeout":
+                status_str = f"{YELLOW}Timeout{RESET}"
+            elif error == "gcp_manager_unavailable":
+                status_str = f"{YELLOW}GCP unavailable{RESET}"
+            elif error == "gcp_module_not_found":
+                status_str = f"{YELLOW}GCP module missing{RESET}"
+            elif "GCP_VM_STATIC_IP_NAME" in str(error):
+                status_str = f"{YELLOW}IP name not set{RESET}"
+            elif "static IP" in str(error).lower():
+                status_str = f"{YELLOW}Static IP error{RESET}"
+            else:
+                # Truncate long errors for status line
+                error_short = str(error)[:30] + "..." if len(str(error)) > 30 else str(error)
+                status_str = f"{YELLOW}{error_short}{RESET}"
         elif gcp_status == "RUNNING" and ready:
             status_str = f"{GREEN}Ready{RESET}"
         elif gcp_status == "RUNNING":
             status_str = f"{YELLOW}Starting{RESET}"
         elif gcp_status in ("STOPPED", "TERMINATED"):
             status_str = f"{YELLOW}{gcp_status}{RESET}"
+        elif gcp_status == "NOT_FOUND":
+            # v212.0: NOT_FOUND is normal - VM will be created on first use
+            status_str = f"{YELLOW}Not created{RESET}"
         elif gcp_status == "UNKNOWN":
             status_str = f"{YELLOW}Unknown{RESET}"
         else:
             status_str = f"{RED}{gcp_status}{RESET}"
 
-        print(f"  {status_opt(gcp_status == 'RUNNING' and not error)} Invincible Node: {status_str}")
+        # v212.0: Intelligent status icon based on GCP status
+        # - RUNNING: show ✓ (green) if healthy, ○ (neutral) if starting
+        # - NOT_FOUND: show ○ (neutral) - valid initial state, VM will be created on demand
+        # - STOPPED/TERMINATED: show ○ (neutral) - VM exists but not running
+        # - Error states: show ✗ (red)
+        if gcp_status == "RUNNING" and ready and not error:
+            invincible_icon = f"{GREEN}✓{RESET}"
+        elif gcp_status in ("RUNNING", "NOT_FOUND", "STOPPED", "TERMINATED") and not error:
+            invincible_icon = f"{DIM}○{RESET}"  # Valid state, not an error
+        elif error:
+            invincible_icon = f"{RED}✗{RESET}"
+        else:
+            invincible_icon = f"{YELLOW}⚠{RESET}"  # Unknown/unexpected state
+
+        print(f"  {invincible_icon} Invincible Node: {status_str}")
 
     # Warnings summary
     if warnings:

@@ -63,8 +63,10 @@ class ContainerAwareness:
 
     @property
     def is_containerized(self) -> bool:
-        """Property accessor for container detection (calls the method)."""
-        return self._is_containerized()
+        """Property accessor for container detection."""
+        if self._in_container is not None:
+            return self._in_container
+        return self._check_is_containerized()
 
     @property
     def container_type(self) -> Optional[str]:
@@ -125,7 +127,7 @@ class ContainerAwareness:
         return False
 
     @lru_cache(maxsize=1)
-    def _is_containerized(self) -> bool:
+    def _check_is_containerized(self) -> bool:
         """
         Check if running in container (Docker/K8s/etc).
 
@@ -321,7 +323,7 @@ class ContainerAwareness:
         Returns:
             Multiplier to apply to base timeouts
         """
-        if not self.is_containerized():
+        if not self.is_containerized:
             return 1.0
 
         multiplier = 1.0
@@ -365,7 +367,7 @@ class ContainerAwareness:
         memory_usage = self.get_memory_usage()
 
         return {
-            "is_containerized": self.is_containerized(),
+            "is_containerized": self.is_containerized,
             "container_runtime": self.get_container_runtime(),
             "cgroup_version": self.get_cgroup_version(),
             "memory": {
@@ -410,7 +412,7 @@ class ContainerAwareness:
         cpu_count = self.get_cpu_count()
 
         # In containers, be more conservative with workers
-        if self.is_containerized():
+        if self.is_containerized:
             # Use at most half of available CPUs, minimum 1
             return max(1, min(4, cpu_count // 2))
 
