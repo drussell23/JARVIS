@@ -53539,6 +53539,28 @@ class TrinityIntegrator:
             env["TRINITY_PORT"] = str(component.port)
             env["TRINITY_ENABLED"] = "true"
 
+            # v216.0: jarvis-prime specific optimizations
+            # These enable local ML on hardware with <32GB RAM (e.g., 16GB MacBooks)
+            # and speed up startup since JARVIS body is already running
+            if component.name == "jarvis-prime":
+                # Allow local ML model loading even on 16GB RAM
+                # This enables TinyLlama/small models to run locally
+                if "JARVIS_HARDWARE_PROFILE" not in env:
+                    env["JARVIS_HARDWARE_PROFILE"] = "FULL"
+                    self.logger.debug("[Trinity]   → Set JARVIS_HARDWARE_PROFILE=FULL for local ML")
+
+                # Reduce startup grace period since JARVIS body is already running
+                # Default is 120s, but we only need ~30s when launched by supervisor
+                if "JARVIS_STARTUP_GRACE_PERIOD" not in env:
+                    env["JARVIS_STARTUP_GRACE_PERIOD"] = "30"
+                    self.logger.debug("[Trinity]   → Set JARVIS_STARTUP_GRACE_PERIOD=30s")
+
+                # Reduce retry attempts for faster startup
+                # Default is 10, but 3 is enough when launched by supervisor
+                if "JARVIS_MAX_STARTUP_RETRIES" not in env:
+                    env["JARVIS_MAX_STARTUP_RETRIES"] = "3"
+                    self.logger.debug("[Trinity]   → Set JARVIS_MAX_STARTUP_RETRIES=3")
+
             self.logger.info(f"[Trinity]   Launching: {venv_python} {launch_script} --port {component.port}")
 
             process = await asyncio.create_subprocess_exec(
