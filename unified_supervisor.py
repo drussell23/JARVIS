@@ -68114,14 +68114,19 @@ async def async_main(args: argparse.Namespace) -> int:
         await asyncio.sleep(2.0)  # Wait for shutdown
 
     # v220.3: Handle --force flag for forceful takeover
-    if getattr(args, 'force', False):
-        print(f"{YELLOW}[Force Mode] Attempting forceful takeover...{RESET}")
+    if getattr(args, 'force', False) or getattr(args, 'takeover', False):
+        # Define colors locally
+        _YELLOW = "\033[93m"
+        _GREEN = "\033[92m"
+        _RESET = "\033[0m"
+        
+        print(f"{_YELLOW}[Force Mode] Attempting forceful takeover...{_RESET}")
         
         lock = StartupLock("kernel")
         is_locked, holder_pid = lock.is_locked()
         
         if is_locked and holder_pid:
-            print(f"{YELLOW}[Force Mode] Killing existing kernel (PID {holder_pid})...{RESET}")
+            print(f"{_YELLOW}[Force Mode] Killing existing kernel (PID {holder_pid})...{_RESET}")
             try:
                 os.kill(holder_pid, signal.SIGTERM)
                 await asyncio.sleep(1.0)
@@ -68132,26 +68137,26 @@ async def async_main(args: argparse.Namespace) -> int:
                     await asyncio.sleep(0.5)
                 except (OSError, ProcessLookupError):
                     pass  # Already dead
-                print(f"{GREEN}[Force Mode] Previous kernel terminated{RESET}")
+                print(f"{_GREEN}[Force Mode] Previous kernel terminated{_RESET}")
             except (OSError, ProcessLookupError):
-                print(f"{YELLOW}[Force Mode] PID {holder_pid} already dead{RESET}")
+                print(f"{_YELLOW}[Force Mode] PID {holder_pid} already dead{_RESET}")
         
         # Clean up lock file
         if lock.lock_path.exists():
             lock.lock_path.unlink()
-            print(f"{GREEN}[Force Mode] Lock file cleaned{RESET}")
+            print(f"{_GREEN}[Force Mode] Lock file cleaned{_RESET}")
         
         # Also clean up any child processes
         import subprocess
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["pkill", "-9", "-f", "run_server.py|loading_server.py"],
                 capture_output=True, timeout=3
             )
         except Exception:
             pass
         
-        print(f"{GREEN}[Force Mode] Ready for fresh start{RESET}")
+        print(f"{_GREEN}[Force Mode] Ready for fresh start{_RESET}")
         await asyncio.sleep(0.5)
 
     # v201.3: Show dashboard before startup (unless --no-dashboard)
