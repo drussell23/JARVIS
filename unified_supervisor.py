@@ -830,6 +830,245 @@ except ImportError:
     cleanup_orphaned_semaphores_on_startup = None
 
 # =============================================================================
+# v210.0: ENTERPRISE MODULAR KERNEL INTEGRATION
+# =============================================================================
+# The monolithic kernel is being refactored into modular packages:
+#   - backend.kernel - Core kernel components (config, signals, circuit breaker)
+#   - backend.orchestrator - Cross-repo orchestration (service registry, health)
+#   - backend.core.browser_stability - Browser crash prevention
+#
+# This integration imports the modular versions where available, with fallback
+# to inline implementations for backward compatibility. Over time, the inline
+# implementations will be deprecated in favor of the modular versions.
+#
+# Philosophy: "Single command, unified control plane, modular architecture"
+# =============================================================================
+
+# --- Modular Kernel Package ---
+# Provides: configuration, signal handling, circuit breakers
+try:
+    from backend.kernel import (
+        get_kernel_config as _modular_get_kernel_config,
+        get_kernel_instance as _modular_get_kernel_instance,
+    )
+    from backend.kernel.config import (
+        SystemKernelConfig as ModularSystemKernelConfig,
+        StartupMode as ModularStartupMode,
+        HardwareProfile as ModularHardwareProfile,
+        get_config as _get_modular_config,
+    )
+    from backend.kernel.signals import (
+        SignalProtector as ModularSignalProtector,
+        ShutdownCoordinator as ModularShutdownCoordinator,
+        KernelSignalHandler as ModularKernelSignalHandler,
+        ShutdownReason,
+    )
+    from backend.kernel.circuit_breaker import (
+        CircuitBreaker as ModularCircuitBreaker,
+        CircuitBreakerState as ModularCircuitBreakerState,
+        CircuitBreakerConfig as ModularCircuitBreakerConfig,
+        RetryWithBackoff as ModularRetryWithBackoff,
+        RetryConfig as ModularRetryConfig,
+        get_circuit_breaker as _get_modular_circuit_breaker,
+    )
+    MODULAR_KERNEL_AVAILABLE = True
+    _kernel_logger = logging.getLogger("unified_supervisor.modular")
+    _kernel_logger.debug("[ModularKernel] Enterprise kernel modules loaded successfully")
+except ImportError as e:
+    MODULAR_KERNEL_AVAILABLE = False
+    ModularSystemKernelConfig = None
+    ModularStartupMode = None
+    ModularHardwareProfile = None
+    ModularSignalProtector = None
+    ModularShutdownCoordinator = None
+    ModularKernelSignalHandler = None
+    ShutdownReason = None
+    ModularCircuitBreaker = None
+    ModularCircuitBreakerState = None
+    ModularCircuitBreakerConfig = None
+    ModularRetryWithBackoff = None
+    ModularRetryConfig = None
+    _get_modular_circuit_breaker = None
+    _get_modular_config = None
+    _modular_get_kernel_config = None
+    _modular_get_kernel_instance = None
+    # Note: This is expected during initial migration - inline versions will be used
+    pass
+
+# --- Modular Orchestrator Package ---
+# Provides: service registry, health coordination, crash recovery
+try:
+    from backend.orchestrator import (
+        get_service_registry as _modular_get_service_registry,
+        get_health_coordinator as _modular_get_health_coordinator,
+        start_all_services as _modular_start_all_services,
+        stop_all_services as _modular_stop_all_services,
+        get_aggregate_health as _modular_get_aggregate_health,
+        DEFAULT_PORTS as MODULAR_DEFAULT_PORTS,
+    )
+    from backend.orchestrator.service_registry import (
+        ServiceRegistry as ModularServiceRegistry,
+        ServiceInfo as ModularServiceInfo,
+        ServiceStatus as ModularServiceStatus,
+        ServiceType as ModularServiceType,
+    )
+    from backend.orchestrator.health_coordinator import (
+        HealthCoordinator as ModularHealthCoordinator,
+        HealthLevel as ModularHealthLevel,
+        ComponentHealth as ModularComponentHealth,
+        AggregateHealth as ModularAggregateHealth,
+    )
+    from backend.orchestrator.crash_recovery import (
+        CrashRecoveryCoordinator as ModularCrashRecoveryCoordinator,
+        RecoveryDecisionEngine as ModularRecoveryDecisionEngine,
+        RecoveryDecision as ModularRecoveryDecision,
+        RecoveryStrategy as ModularRecoveryStrategy,
+        CrashType as ModularCrashType,
+        CrashInfo as ModularCrashInfo,
+        ComponentCriticality as ModularComponentCriticality,
+        get_crash_recovery_coordinator as _modular_get_crash_recovery,
+        handle_component_crash as _modular_handle_crash,
+    )
+    MODULAR_ORCHESTRATOR_AVAILABLE = True
+    _orch_logger = logging.getLogger("unified_supervisor.orchestrator")
+    _orch_logger.debug("[ModularOrchestrator] Enterprise orchestrator modules loaded successfully")
+except ImportError as e:
+    MODULAR_ORCHESTRATOR_AVAILABLE = False
+    _modular_get_service_registry = None
+    _modular_get_health_coordinator = None
+    _modular_start_all_services = None
+    _modular_stop_all_services = None
+    _modular_get_aggregate_health = None
+    MODULAR_DEFAULT_PORTS = None
+    ModularServiceRegistry = None
+    ModularServiceInfo = None
+    ModularServiceStatus = None
+    ModularServiceType = None
+    ModularHealthCoordinator = None
+    ModularHealthLevel = None
+    ModularComponentHealth = None
+    ModularAggregateHealth = None
+    ModularCrashRecoveryCoordinator = None
+    ModularRecoveryDecisionEngine = None
+    ModularRecoveryDecision = None
+    ModularRecoveryStrategy = None
+    ModularCrashType = None
+    ModularCrashInfo = None
+    ModularComponentCriticality = None
+    _modular_get_crash_recovery = None
+    _modular_handle_crash = None
+    pass
+
+# --- Modular Browser Stability ---
+# Provides: Chrome crash prevention, memory monitoring, circuit breaker for browser ops
+try:
+    from backend.core.browser_stability import (
+        BrowserStabilityManager as ModularBrowserStabilityManager,
+        StabilizedChromeLauncher as ModularStabilizedChromeLauncher,
+        MemoryPressureMonitor as ModularMemoryPressureMonitor,
+        BrowserCircuitBreaker as ModularBrowserCircuitBreaker,
+        BrowserStabilityConfig as ModularBrowserStabilityConfig,
+        get_stability_manager as _modular_get_stability_manager,
+        get_chrome_stability_flags as _modular_get_chrome_flags,
+        get_chrome_binary_path as _modular_get_chrome_binary,
+        CRASH_CODE_INFO as MODULAR_CRASH_CODE_INFO,
+        CrashSeverity as ModularCrashSeverity,
+        CrashInfo as ModularBrowserCrashInfo,
+    )
+    MODULAR_BROWSER_STABILITY_AVAILABLE = True
+    _browser_logger = logging.getLogger("unified_supervisor.browser")
+    _browser_logger.debug("[ModularBrowser] Enterprise browser stability modules loaded successfully")
+except ImportError as e:
+    MODULAR_BROWSER_STABILITY_AVAILABLE = False
+    ModularBrowserStabilityManager = None
+    ModularStabilizedChromeLauncher = None
+    ModularMemoryPressureMonitor = None
+    ModularBrowserCircuitBreaker = None
+    ModularBrowserStabilityConfig = None
+    _modular_get_stability_manager = None
+    _modular_get_chrome_flags = None
+    _modular_get_chrome_binary = None
+    MODULAR_CRASH_CODE_INFO = None
+    ModularCrashSeverity = None
+    ModularBrowserCrashInfo = None
+    pass
+
+# --- Async Safety Utilities ---
+# Provides: timeout management, retry engines, backpressure control
+try:
+    from backend.core.async_safety import (
+        TimeoutConfig as AsyncTimeoutConfig,
+        PersistentCircuitBreaker as AsyncPersistentCircuitBreaker,
+        RetryEngine as AsyncRetryEngine,
+        BackpressureController as AsyncBackpressureController,
+        LazyAsyncLock as AsyncLazyAsyncLock,
+        LazyAsyncEvent as AsyncLazyAsyncEvent,
+        with_timeout as async_with_timeout,
+        with_retry as async_with_retry,
+        with_backpressure as async_with_backpressure,
+        safe_operation as async_safe_operation,
+    )
+    ASYNC_SAFETY_AVAILABLE = True
+except ImportError:
+    ASYNC_SAFETY_AVAILABLE = False
+    AsyncTimeoutConfig = None
+    AsyncPersistentCircuitBreaker = None
+    AsyncRetryEngine = None
+    AsyncBackpressureController = None
+    AsyncLazyAsyncLock = None
+    AsyncLazyAsyncEvent = None
+    async_with_timeout = None
+    async_with_retry = None
+    async_with_backpressure = None
+    async_safe_operation = None
+
+# =============================================================================
+# v210.0: MODULAR INTEGRATION HELPERS
+# =============================================================================
+# These functions provide unified access to either modular or inline implementations.
+# They abstract away the migration state, allowing calling code to work seamlessly.
+# =============================================================================
+
+def _use_modular_circuit_breaker() -> bool:
+    """Check if we should use the modular circuit breaker implementation."""
+    if not MODULAR_KERNEL_AVAILABLE:
+        return False
+    # Environment variable to force inline implementation (for debugging)
+    return not _get_env_bool("JARVIS_FORCE_INLINE_CIRCUIT_BREAKER", False)
+
+
+def _use_modular_browser_stability() -> bool:
+    """Check if we should use the modular browser stability implementation."""
+    if not MODULAR_BROWSER_STABILITY_AVAILABLE:
+        return False
+    return not _get_env_bool("JARVIS_FORCE_INLINE_BROWSER_STABILITY", False)
+
+
+def _use_modular_crash_recovery() -> bool:
+    """Check if we should use the modular crash recovery implementation."""
+    if not MODULAR_ORCHESTRATOR_AVAILABLE:
+        return False
+    return not _get_env_bool("JARVIS_FORCE_INLINE_CRASH_RECOVERY", False)
+
+
+# Log modular integration status at startup
+_integration_logger = logging.getLogger("unified_supervisor.integration")
+_integration_status = []
+if MODULAR_KERNEL_AVAILABLE:
+    _integration_status.append("kernel")
+if MODULAR_ORCHESTRATOR_AVAILABLE:
+    _integration_status.append("orchestrator")
+if MODULAR_BROWSER_STABILITY_AVAILABLE:
+    _integration_status.append("browser_stability")
+if ASYNC_SAFETY_AVAILABLE:
+    _integration_status.append("async_safety")
+
+if _integration_status:
+    _integration_logger.debug(
+        f"[v210.0] Enterprise modular integration active: {', '.join(_integration_status)}"
+    )
+
+# =============================================================================
 # v203.0: ASYNC STARTUP UTILITIES
 # =============================================================================
 # Non-blocking async wrappers for process wait and subprocess operations.
@@ -2848,165 +3087,191 @@ class IntelligentKernelTakeover:
 # =============================================================================
 # CIRCUIT BREAKER STATE
 # =============================================================================
-class CircuitBreakerState(Enum):
-    """Circuit breaker states."""
-    CLOSED = "closed"      # Normal operation
-    OPEN = "open"          # Failing, reject requests
-    HALF_OPEN = "half_open"  # Testing recovery
+# v210.0: Uses modular implementation from backend.kernel.circuit_breaker when available
+if MODULAR_KERNEL_AVAILABLE and ModularCircuitBreakerState is not None:
+    # Use the modular implementation
+    CircuitBreakerState = ModularCircuitBreakerState
+else:
+    # Fallback to inline implementation
+    class CircuitBreakerState(Enum):
+        """Circuit breaker states."""
+        CLOSED = "closed"      # Normal operation
+        OPEN = "open"          # Failing, reject requests
+        HALF_OPEN = "half_open"  # Testing recovery
 
 
 # =============================================================================
 # CIRCUIT BREAKER
 # =============================================================================
-class CircuitBreaker:
-    """
-    Circuit breaker pattern for fault tolerance.
+# v210.0: Uses modular implementation from backend.kernel.circuit_breaker when available
+# The modular version includes additional features like state persistence and metrics.
+if MODULAR_KERNEL_AVAILABLE and ModularCircuitBreaker is not None and _use_modular_circuit_breaker():
+    # Use the modular implementation directly
+    CircuitBreaker = ModularCircuitBreaker
+    _circuit_breaker_logger = logging.getLogger("unified_supervisor.circuit_breaker")
+    _circuit_breaker_logger.debug("[v210.0] Using modular CircuitBreaker from backend.kernel")
+else:
+    class CircuitBreaker:
+        """
+        Circuit breaker pattern for fault tolerance.
 
-    Prevents cascade failures by stopping requests to failing services.
-    """
+        Prevents cascade failures by stopping requests to failing services.
+        
+        v210.0: This is the inline fallback implementation. When backend.kernel is
+        available, the modular version with enhanced features is used instead.
+        """
 
-    def __init__(
-        self,
-        name: str,
-        failure_threshold: int = 5,
-        recovery_timeout: float = 30.0,
-        half_open_max_calls: int = 3,
-    ):
-        self.name = name
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_max_calls = half_open_max_calls
+        def __init__(
+            self,
+            name: str,
+            failure_threshold: int = 5,
+            recovery_timeout: float = 30.0,
+            half_open_max_calls: int = 3,
+        ):
+            self.name = name
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self.half_open_max_calls = half_open_max_calls
 
-        self._state = CircuitBreakerState.CLOSED
-        self._failure_count = 0
-        self._success_count = 0
-        self._last_failure_time: Optional[float] = None
-        self._half_open_calls = 0
-        self._lock = threading.Lock()
+            self._state = CircuitBreakerState.CLOSED
+            self._failure_count = 0
+            self._success_count = 0
+            self._last_failure_time: Optional[float] = None
+            self._half_open_calls = 0
+            self._lock = threading.Lock()
 
-    @property
-    def state(self) -> CircuitBreakerState:
-        """Get current state (may transition from OPEN to HALF_OPEN)."""
-        with self._lock:
-            if self._state == CircuitBreakerState.OPEN:
-                if self._last_failure_time and \
-                   time.time() - self._last_failure_time >= self.recovery_timeout:
-                    self._state = CircuitBreakerState.HALF_OPEN
-                    self._half_open_calls = 0
-            return self._state
-
-    def can_execute(self) -> bool:
-        """Check if execution is allowed."""
-        state = self.state
-        if state == CircuitBreakerState.CLOSED:
-            return True
-        if state == CircuitBreakerState.HALF_OPEN:
+        @property
+        def state(self) -> CircuitBreakerState:
+            """Get current state (may transition from OPEN to HALF_OPEN)."""
             with self._lock:
-                if self._half_open_calls < self.half_open_max_calls:
-                    self._half_open_calls += 1
-                    return True
-        return False
+                if self._state == CircuitBreakerState.OPEN:
+                    if self._last_failure_time and \
+                       time.time() - self._last_failure_time >= self.recovery_timeout:
+                        self._state = CircuitBreakerState.HALF_OPEN
+                        self._half_open_calls = 0
+                return self._state
 
-    def record_success(self) -> None:
-        """Record successful execution."""
-        with self._lock:
-            if self._state == CircuitBreakerState.HALF_OPEN:
-                self._success_count += 1
-                if self._success_count >= self.half_open_max_calls:
-                    self._state = CircuitBreakerState.CLOSED
-                    self._failure_count = 0
-                    self._success_count = 0
-            elif self._state == CircuitBreakerState.CLOSED:
-                self._failure_count = max(0, self._failure_count - 1)
+        def can_execute(self) -> bool:
+            """Check if execution is allowed."""
+            state = self.state
+            if state == CircuitBreakerState.CLOSED:
+                return True
+            if state == CircuitBreakerState.HALF_OPEN:
+                with self._lock:
+                    if self._half_open_calls < self.half_open_max_calls:
+                        self._half_open_calls += 1
+                        return True
+            return False
 
-    def record_failure(self) -> None:
-        """Record failed execution."""
-        with self._lock:
-            self._failure_count += 1
-            self._last_failure_time = time.time()
+        def record_success(self) -> None:
+            """Record successful execution."""
+            with self._lock:
+                if self._state == CircuitBreakerState.HALF_OPEN:
+                    self._success_count += 1
+                    if self._success_count >= self.half_open_max_calls:
+                        self._state = CircuitBreakerState.CLOSED
+                        self._failure_count = 0
+                        self._success_count = 0
+                elif self._state == CircuitBreakerState.CLOSED:
+                    self._failure_count = max(0, self._failure_count - 1)
 
-            if self._state == CircuitBreakerState.HALF_OPEN:
-                self._state = CircuitBreakerState.OPEN
-            elif self._failure_count >= self.failure_threshold:
-                self._state = CircuitBreakerState.OPEN
+        def record_failure(self) -> None:
+            """Record failed execution."""
+            with self._lock:
+                self._failure_count += 1
+                self._last_failure_time = time.time()
 
-    async def execute(self, coro: Awaitable[T]) -> T:
-        """Execute with circuit breaker protection."""
-        if not self.can_execute():
-            raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+                if self._state == CircuitBreakerState.HALF_OPEN:
+                    self._state = CircuitBreakerState.OPEN
+                elif self._failure_count >= self.failure_threshold:
+                    self._state = CircuitBreakerState.OPEN
 
-        try:
-            result = await coro
-            self.record_success()
-            return result
-        except Exception:
-            self.record_failure()
-            raise
+        async def execute(self, coro: Awaitable[T]) -> T:
+            """Execute with circuit breaker protection."""
+            if not self.can_execute():
+                raise RuntimeError(f"Circuit breaker {self.name} is OPEN")
+
+            try:
+                result = await coro
+                self.record_success()
+                return result
+            except Exception:
+                self.record_failure()
+                raise
 
 
 # =============================================================================
 # RETRY WITH BACKOFF
 # =============================================================================
-class RetryWithBackoff:
-    """
-    Retry logic with exponential backoff.
+# v210.0: Uses modular implementation from backend.kernel.circuit_breaker when available
+if MODULAR_KERNEL_AVAILABLE and ModularRetryWithBackoff is not None and _use_modular_circuit_breaker():
+    # Use the modular implementation
+    RetryWithBackoff = ModularRetryWithBackoff
+    _retry_logger = logging.getLogger("unified_supervisor.retry")
+    _retry_logger.debug("[v210.0] Using modular RetryWithBackoff from backend.kernel")
+else:
+    class RetryWithBackoff:
+        """
+        Retry logic with exponential backoff.
 
-    Features:
-    - Configurable max retries and delays
-    - Exponential backoff with jitter
-    - Exception filtering
-    """
+        Features:
+        - Configurable max retries and delays
+        - Exponential backoff with jitter
+        - Exception filtering
+        
+        v210.0: This is the inline fallback implementation.
+        """
 
-    def __init__(
-        self,
-        max_retries: int = 3,
-        base_delay: float = 1.0,
-        max_delay: float = 30.0,
-        exponential_base: float = 2.0,
-        jitter: float = 0.1,
-        retry_exceptions: Optional[Tuple[Type[Exception], ...]] = None,
-    ):
-        self.max_retries = max_retries
-        self.base_delay = base_delay
-        self.max_delay = max_delay
-        self.exponential_base = exponential_base
-        self.jitter = jitter
-        self.retry_exceptions = retry_exceptions or (Exception,)
+        def __init__(
+            self,
+            max_retries: int = 3,
+            base_delay: float = 1.0,
+            max_delay: float = 30.0,
+            exponential_base: float = 2.0,
+            jitter: float = 0.1,
+            retry_exceptions: Optional[Tuple[Type[Exception], ...]] = None,
+        ):
+            self.max_retries = max_retries
+            self.base_delay = base_delay
+            self.max_delay = max_delay
+            self.exponential_base = exponential_base
+            self.jitter = jitter
+            self.retry_exceptions = retry_exceptions or (Exception,)
 
-    def _calculate_delay(self, attempt: int) -> float:
-        """Calculate delay for given attempt with jitter."""
-        delay = min(
-            self.base_delay * (self.exponential_base ** attempt),
-            self.max_delay
-        )
-        # Add jitter
-        jitter_range = delay * self.jitter
-        delay += (time.time() % 1) * jitter_range * 2 - jitter_range
-        return max(0, delay)
+        def _calculate_delay(self, attempt: int) -> float:
+            """Calculate delay for given attempt with jitter."""
+            delay = min(
+                self.base_delay * (self.exponential_base ** attempt),
+                self.max_delay
+            )
+            # Add jitter
+            jitter_range = delay * self.jitter
+            delay += (time.time() % 1) * jitter_range * 2 - jitter_range
+            return max(0, delay)
 
-    async def execute(
-        self,
-        coro_factory: Callable[[], Awaitable[T]],
-        operation_name: str = "operation",
-    ) -> T:
-        """Execute with retry logic."""
-        last_exception: Optional[Exception] = None
+        async def execute(
+            self,
+            coro_factory: Callable[[], Awaitable[T]],
+            operation_name: str = "operation",
+        ) -> T:
+            """Execute with retry logic."""
+            last_exception: Optional[Exception] = None
 
-        for attempt in range(self.max_retries + 1):
-            try:
-                return await coro_factory()
-            except self.retry_exceptions as e:
-                last_exception = e
+            for attempt in range(self.max_retries + 1):
+                try:
+                    return await coro_factory()
+                except self.retry_exceptions as e:
+                    last_exception = e
 
-                if attempt < self.max_retries:
-                    delay = self._calculate_delay(attempt)
-                    logging.debug(
-                        f"Retry {attempt + 1}/{self.max_retries} for {operation_name} "
-                        f"after {delay:.1f}s: {e}"
-                    )
-                    await asyncio.sleep(delay)
+                    if attempt < self.max_retries:
+                        delay = self._calculate_delay(attempt)
+                        logging.debug(
+                            f"Retry {attempt + 1}/{self.max_retries} for {operation_name} "
+                            f"after {delay:.1f}s: {e}"
+                        )
+                        await asyncio.sleep(delay)
 
-        raise last_exception or RuntimeError(f"Retries exhausted for {operation_name}")
+            raise last_exception or RuntimeError(f"Retries exhausted for {operation_name}")
 
 
 # =============================================================================
@@ -10923,16 +11188,79 @@ class ProcessRestartManager:
         return restarted
 
     async def _handle_unexpected_exit(self, name: str, managed: RestartableManagedProcess) -> bool:
-        """Handle an unexpected process exit with exponential backoff restart."""
+        """
+        Handle an unexpected process exit with intelligent recovery.
+        
+        v210.0: Enhanced with modular crash recovery integration.
+        Uses CrashRecoveryCoordinator when available for:
+        - Intelligent crash classification (OOM, SEGFAULT, etc.)
+        - Recovery strategy decisions (restart, slim mode, GCP failover)
+        - Crash history tracking and analysis
+        """
         current_time = time.time()
-
+        exit_code = managed.exit_code or -1
+        
+        # v210.0: Integrate with modular crash recovery coordinator
+        recovery_decision = None
+        if _use_modular_crash_recovery() and _modular_handle_crash is not None:
+            try:
+                # Determine criticality based on component name
+                criticality = ModularComponentCriticality.REQUIRED
+                if "optional" in name.lower() or "cache" in name.lower():
+                    criticality = ModularComponentCriticality.OPTIONAL
+                elif "prime" in name.lower() or "reactor" in name.lower():
+                    criticality = ModularComponentCriticality.DEGRADED_OK
+                
+                recovery_decision = await _modular_handle_crash(
+                    component=name,
+                    exit_code=exit_code,
+                    criticality=criticality,
+                    restart_count=managed.restart_count,
+                )
+                
+                self._logger.info(
+                    f"[v210.0] Crash recovery decision for '{name}': "
+                    f"{recovery_decision.strategy.value} - {recovery_decision.reason}"
+                )
+                
+                # Handle modular recovery strategies
+                if recovery_decision.strategy == ModularRecoveryStrategy.NO_ACTION:
+                    return False  # Clean exit, no restart needed
+                
+                if recovery_decision.strategy == ModularRecoveryStrategy.GRACEFUL_DEGRADE:
+                    self._logger.warning(
+                        f"[v210.0] Disabling '{name}' due to repeated failures"
+                    )
+                    self.unregister(name)
+                    return False
+                
+                if recovery_decision.strategy == ModularRecoveryStrategy.MANUAL_INTERVENTION:
+                    self._logger.error(
+                        f"❌ Process '{name}' requires manual intervention: "
+                        f"{recovery_decision.reason}"
+                    )
+                    return False
+                
+                if recovery_decision.strategy == ModularRecoveryStrategy.GCP_FAILOVER:
+                    self._logger.warning(
+                        f"[v210.0] OOM detected for '{name}' - GCP failover recommended"
+                    )
+                    # Continue with restart but signal GCP mode
+                    os.environ["JARVIS_FORCE_GCP_MODE"] = "1"
+                
+            except Exception as e:
+                self._logger.debug(f"[v210.0] Crash recovery coordinator error: {e}")
+                # Fall through to standard handling
+        
+        # Standard restart limit check
         if managed.restart_count >= managed.max_restarts:
             self._logger.error(
                 f"❌ Process '{name}' exceeded restart limit ({managed.max_restarts}). "
-                f"Last exit code: {managed.exit_code}. Manual intervention required."
+                f"Last exit code: {exit_code}. Manual intervention required."
             )
             return False
 
+        # Reset restart count after stability period
         if current_time - managed.last_restart > self.restart_cooldown:
             if managed.restart_count > 0:
                 self._logger.info(
@@ -10941,18 +11269,31 @@ class ProcessRestartManager:
                 )
             managed.restart_count = 0
 
-        backoff = min(
-            self.base_backoff * (2 ** managed.restart_count),
-            self.max_backoff
-        )
+        # Calculate backoff (use recovery decision delay if available)
+        if recovery_decision and recovery_decision.delay_seconds > 0:
+            backoff = recovery_decision.delay_seconds
+        else:
+            backoff = min(
+                self.base_backoff * (2 ** managed.restart_count),
+                self.max_backoff
+            )
 
         managed.restart_count += 1
         managed.last_restart = current_time
 
+        # v210.0: Enhanced logging with crash type classification
+        crash_type_msg = ""
+        if exit_code in (-9, 137):
+            crash_type_msg = " [OOM]"
+        elif exit_code in (-11, 139, 11):
+            crash_type_msg = " [SEGFAULT]"
+        elif exit_code == 5:
+            crash_type_msg = " [GPU CRASH]"
+
         self._logger.warning(
             f"🔄 Restarting '{name}' in {backoff:.1f}s "
             f"(attempt {managed.restart_count}/{managed.max_restarts}, "
-            f"exit code: {managed.exit_code})"
+            f"exit code: {exit_code}{crash_type_msg})"
         )
 
         await asyncio.sleep(backoff)
@@ -11529,7 +11870,18 @@ def get_chrome_stability_flags() -> List[str]:
     
     Returns the appropriate flag set for the current operating system.
     This prevents crashes caused by using Linux-specific flags on macOS.
+    
+    v210.0: Uses modular implementation from backend.core.browser_stability when available.
+    The modular version includes enhanced macOS Metal API bypass flags.
     """
+    # v210.0: Use modular implementation if available
+    if MODULAR_BROWSER_STABILITY_AVAILABLE and _modular_get_chrome_flags is not None:
+        try:
+            return _modular_get_chrome_flags()
+        except Exception:
+            pass  # Fall through to inline implementation
+    
+    # Inline fallback implementation
     if sys.platform == "darwin":
         return CHROME_MACOS_STABILITY_FLAGS.copy()
     elif sys.platform == "linux":
@@ -12145,8 +12497,28 @@ _stabilized_chrome_launcher: Optional[StabilizedChromeLauncher] = None
 
 
 def get_stabilized_chrome_launcher() -> StabilizedChromeLauncher:
-    """Get or create the global StabilizedChromeLauncher instance."""
+    """
+    Get or create the global StabilizedChromeLauncher instance.
+    
+    v210.0: Uses modular implementation from backend.core.browser_stability when available.
+    The modular version includes:
+    - Proactive memory pressure monitoring
+    - Browser-specific circuit breaker
+    - Enhanced crash recovery with intelligent strategies
+    - Integration with crash recovery coordinator
+    """
     global _stabilized_chrome_launcher
+    
+    # v210.0: Use modular implementation if available
+    if _use_modular_browser_stability() and _modular_get_stability_manager is not None:
+        try:
+            manager = _modular_get_stability_manager()
+            return manager.chrome_launcher
+        except Exception as e:
+            _logger = logging.getLogger("unified_supervisor.browser")
+            _logger.debug(f"[v210.0] Modular browser stability unavailable: {e}, using inline")
+    
+    # Inline fallback
     if _stabilized_chrome_launcher is None:
         _stabilized_chrome_launcher = StabilizedChromeLauncher()
     return _stabilized_chrome_launcher
@@ -13346,11 +13718,56 @@ _browser_crash_monitor: Optional[BrowserCrashMonitor] = None
 
 
 def get_browser_crash_monitor() -> BrowserCrashMonitor:
-    """Get the global browser crash monitor."""
+    """
+    Get the global browser crash monitor.
+    
+    v210.0: The modular BrowserStabilityManager from backend.core.browser_stability
+    provides an enhanced, integrated stability system. Use get_stability_manager()
+    for the full feature set including:
+    - Proactive memory monitoring
+    - Circuit breaker for browser operations
+    - Intelligent restart with stability flags
+    - Integration with crash recovery coordinator
+    
+    This function returns the legacy BrowserCrashMonitor for backward compatibility.
+    """
     global _browser_crash_monitor
+    
+    # v210.0: Suggest using modular implementation
+    if MODULAR_BROWSER_STABILITY_AVAILABLE and _modular_get_stability_manager is not None:
+        _logger = logging.getLogger("unified_supervisor.browser")
+        _logger.debug(
+            "[v210.0] Consider using get_stability_manager() from backend.core.browser_stability "
+            "for enhanced crash prevention"
+        )
+    
     if _browser_crash_monitor is None:
         _browser_crash_monitor = BrowserCrashMonitor()
     return _browser_crash_monitor
+
+
+# v210.0: NEW - Get the modular browser stability manager
+def get_browser_stability_manager():
+    """
+    v210.0: Get the enterprise-grade BrowserStabilityManager.
+    
+    Returns the modular stability manager from backend.core.browser_stability
+    which provides:
+    - Proactive memory pressure monitoring
+    - Chrome stability flags with Metal API bypass
+    - Browser-specific circuit breaker
+    - Intelligent recovery strategies
+    - Integration with crash recovery coordinator
+    
+    Falls back to None if modular implementation is not available.
+    """
+    if MODULAR_BROWSER_STABILITY_AVAILABLE and _modular_get_stability_manager is not None:
+        try:
+            return _modular_get_stability_manager()
+        except Exception as e:
+            _logger = logging.getLogger("unified_supervisor.browser")
+            _logger.warning(f"[v210.0] Failed to get stability manager: {e}")
+    return None
 
 
 # =============================================================================
@@ -49371,6 +49788,54 @@ class ResourceCleanupCoordinator:
 # - 2nd signal: Faster shutdown (shorter timeouts)
 # - 3rd signal: Immediate exit (sys.exit)
 # =============================================================================
+# v210.0: MODULAR SIGNAL HANDLING INTEGRATION
+# =============================================================================
+# The modular signal handling from backend.kernel.signals provides:
+# - SignalProtector: Context manager for signal-safe critical sections
+# - ShutdownCoordinator: Orchestrates graceful shutdown of child processes
+# - KernelSignalHandler: Global signal handler installation
+#
+# When available, these integrate with the existing UnifiedSignalHandler.
+# =============================================================================
+
+def get_modular_signal_protector():
+    """
+    v210.0: Get the modular SignalProtector for signal-safe critical sections.
+    
+    The SignalProtector provides:
+    - Context manager for protecting critical code from signal interruption
+    - Decorator for signal-safe functions
+    - Deferred signal delivery after protected sections
+    
+    Returns None if modular implementation is not available.
+    """
+    if MODULAR_KERNEL_AVAILABLE and ModularSignalProtector is not None:
+        try:
+            return ModularSignalProtector()
+        except Exception:
+            pass
+    return None
+
+
+def get_modular_shutdown_coordinator():
+    """
+    v210.0: Get the modular ShutdownCoordinator for graceful shutdown.
+    
+    The ShutdownCoordinator provides:
+    - Registration of child processes for cleanup
+    - Ordered shutdown callbacks
+    - Timeout-based termination escalation
+    - Integration with crash recovery
+    
+    Returns None if modular implementation is not available.
+    """
+    if MODULAR_KERNEL_AVAILABLE and ModularShutdownCoordinator is not None:
+        try:
+            return ModularShutdownCoordinator()
+        except Exception:
+            pass
+    return None
+
 
 class UnifiedSignalHandler:
     """
@@ -49392,6 +49857,8 @@ class UnifiedSignalHandler:
     - Callback registration for custom cleanup
     - Timeout tracking for fast vs slow shutdown
     - Idempotent installation (safe to call multiple times)
+    
+    v210.0: Integrates with modular backend.kernel.signals when available.
     """
 
     def __init__(self) -> None:
@@ -54261,11 +54728,101 @@ _trinity_connector: Optional[UnifiedTrinityConnector] = None
 
 
 def get_trinity_connector() -> UnifiedTrinityConnector:
-    """Get the global Trinity connector."""
+    """
+    Get the global Trinity connector.
+    
+    v210.0: The connector now integrates with modular orchestrator components:
+    - ServiceRegistry: Dynamic service discovery for Trinity components
+    - HealthCoordinator: Cross-service health monitoring
+    - CrashRecoveryCoordinator: Intelligent crash recovery
+    
+    Use get_service_registry() and get_health_coordinator() for direct access
+    to these modular components.
+    """
     global _trinity_connector
     if _trinity_connector is None:
         _trinity_connector = UnifiedTrinityConnector()
+        
+        # v210.0: Register with modular service registry if available
+        if MODULAR_ORCHESTRATOR_AVAILABLE and _modular_get_service_registry is not None:
+            try:
+                registry = _modular_get_service_registry()
+                # Register JARVIS as the local service
+                registry.register(
+                    name="jarvis",
+                    service_type=ModularServiceType.JARVIS,
+                    host="localhost",
+                    port=int(os.getenv("JARVIS_BACKEND_PORT", "8000")),
+                    health_endpoint="/health",
+                )
+                _logger = logging.getLogger("unified_supervisor.trinity")
+                _logger.debug("[v210.0] Trinity connector registered with modular service registry")
+            except Exception as e:
+                _logger = logging.getLogger("unified_supervisor.trinity")
+                _logger.debug(f"[v210.0] Service registry integration: {e}")
+    
     return _trinity_connector
+
+
+# v210.0: NEW - Direct access to modular orchestrator components
+def get_service_registry():
+    """
+    v210.0: Get the modular ServiceRegistry for dynamic service discovery.
+    
+    The ServiceRegistry provides:
+    - Dynamic registration/discovery of Trinity services
+    - Heartbeat-based health tracking
+    - Port probing for auto-discovery
+    - Callbacks for status changes
+    
+    Returns None if modular implementation is not available.
+    """
+    if MODULAR_ORCHESTRATOR_AVAILABLE and _modular_get_service_registry is not None:
+        try:
+            return _modular_get_service_registry()
+        except Exception:
+            pass
+    return None
+
+
+def get_health_coordinator():
+    """
+    v210.0: Get the modular HealthCoordinator for cross-service health monitoring.
+    
+    The HealthCoordinator provides:
+    - Parallel health checks across all Trinity components
+    - Aggregate health status calculation
+    - Component criticality awareness
+    - Readiness gates for startup coordination
+    
+    Returns None if modular implementation is not available.
+    """
+    if MODULAR_ORCHESTRATOR_AVAILABLE and _modular_get_health_coordinator is not None:
+        try:
+            return _modular_get_health_coordinator()
+        except Exception:
+            pass
+    return None
+
+
+def get_crash_recovery_coordinator():
+    """
+    v210.0: Get the modular CrashRecoveryCoordinator.
+    
+    The CrashRecoveryCoordinator provides:
+    - Intelligent crash classification (OOM, SEGFAULT, etc.)
+    - Recovery strategy decisions
+    - Crash history tracking
+    - GCP failover management
+    
+    Returns None if modular implementation is not available.
+    """
+    if MODULAR_ORCHESTRATOR_AVAILABLE and _modular_get_crash_recovery is not None:
+        try:
+            return _modular_get_crash_recovery()
+        except Exception:
+            pass
+    return None
 
 
 async def initialize_trinity_connector(
