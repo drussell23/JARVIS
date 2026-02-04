@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Advanced Cloud SQL Proxy Manager
-=================================
+Advanced Cloud SQL Proxy Manager v218.0
+========================================
 
 Dynamic, robust proxy lifecycle management with:
 - Zero hardcoding - all config from database_config.json
@@ -11,6 +11,12 @@ Dynamic, robust proxy lifecycle management with:
 - Graceful degradation to SQLite fallback
 - Port conflict resolution
 - Multi-platform support
+
+v218.0 CRITICAL FIX:
+- Intelligent credential type detection (authorized_user vs service_account)
+- authorized_user credentials work via ADC, NOT --credentials-file
+- service_account credentials use --credentials-file
+- This fixes the "exit code 1" crash when using gcloud auth credentials
 """
 
 import asyncio
@@ -25,10 +31,279 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# v218.0: INTELLIGENT CREDENTIAL TYPE SYSTEM
+# =============================================================================
+
+class GCPCredentialType(Enum):
+    """Types of GCP credentials with different proxy authentication strategies."""
+    SERVICE_ACCOUNT = "service_account"      # Use --credentials-file
+    AUTHORIZED_USER = "authorized_user"       # Use ADC (env var or implicit)
+    EXTERNAL_ACCOUNT = "external_account"     # Workload identity federation
+    IMPERSONATED = "impersonated_service_account"  # Service account impersonation
+    METADATA_SERVER = "metadata_server"       # GCE/GKE metadata (no file needed)
+    UNKNOWN = "unknown"                       # Fallback
+
+
+@dataclass
+class GCPCredentialInfo:
+    """
+    Detailed information about discovered GCP credentials.
+    
+    v218.0: Provides intelligent credential routing for Cloud SQL Proxy.
+    """
+    type: GCPCredentialType
+    path: Optional[str]
+    project_id: Optional[str]
+    account: Optional[str]
+    is_valid: bool
+    error_message: Optional[str] = None
+    
+    @property
+    def requires_credentials_file_flag(self) -> bool:
+        """
+        Determine if this credential type requires --credentials-file flag.
+        
+        CRITICAL: authorized_user credentials must NOT use --credentials-file
+        because cloud-sql-proxy expects a service account JSON, not OAuth2 tokens.
+        """
+        return self.type == GCPCredentialType.SERVICE_ACCOUNT
+    
+    @property
+    def uses_application_default_credentials(self) -> bool:
+        """
+        Determine if credentials work via Application Default Credentials.
+        
+        ADC is used for:
+        - authorized_user (from gcloud auth application-default login)
+        - external_account (workload identity)
+        - impersonated credentials
+        """
+        return self.type in (
+            GCPCredentialType.AUTHORIZED_USER,
+            GCPCredentialType.EXTERNAL_ACCOUNT,
+            GCPCredentialType.IMPERSONATED,
+        )
+    
+    @property
+    def proxy_env_vars(self) -> Dict[str, str]:
+        """
+        Get environment variables needed for the proxy based on credential type.
+        """
+        env = {}
+        
+        if self.uses_application_default_credentials and self.path:
+            # Set GOOGLE_APPLICATION_CREDENTIALS for ADC
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = self.path
+        
+        if self.project_id:
+            env["GOOGLE_CLOUD_PROJECT"] = self.project_id
+            env["GCLOUD_PROJECT"] = self.project_id
+        
+        return env
+    
+    def get_proxy_auth_args(self) -> list:
+        """
+        Get command-line arguments for cloud-sql-proxy authentication.
+        
+        CRITICAL FIX v218.0:
+        - authorized_user: NO --credentials-file (causes exit code 1!)
+        - service_account: YES --credentials-file
+        """
+        args = []
+        
+        if self.requires_credentials_file_flag and self.path:
+            args.append(f"--credentials-file={self.path}")
+        
+        # For ADC types, don't add --credentials-file
+        # The proxy will use GOOGLE_APPLICATION_CREDENTIALS automatically
+        
+        return args
+
+
+class IntelligentCredentialDetector:
+    """
+    v218.0: Enterprise-grade GCP credential detection with type awareness.
+    
+    Fixes the root cause of proxy crashes by correctly identifying credential
+    types and using appropriate authentication strategies.
+    """
+    
+    # Standard credential search paths
+    CREDENTIAL_SEARCH_PATHS = [
+        # gcloud ADC (most common for developers)
+        Path.home() / ".config" / "gcloud" / "application_default_credentials.json",
+        # Alternative gcloud location
+        Path.home() / ".gcloud" / "application_default_credentials.json",
+        # Service account key (common in CI/CD)
+        Path.home() / ".jarvis" / "gcp" / "service_account.json",
+        # System-wide credentials
+        Path("/etc/google/auth/application_default_credentials.json"),
+    ]
+    
+    @classmethod
+    def detect_credentials(cls) -> GCPCredentialInfo:
+        """
+        Detect and validate GCP credentials with type identification.
+        
+        Returns:
+            GCPCredentialInfo with type, path, and validation status.
+        """
+        # Check environment variable first
+        env_creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if env_creds_path:
+            path = Path(env_creds_path)
+            if path.exists():
+                return cls._analyze_credentials_file(str(path))
+            else:
+                logger.warning(
+                    f"[CredentialDetector] GOOGLE_APPLICATION_CREDENTIALS set but file not found: {env_creds_path}"
+                )
+        
+        # Check if running on GCE/GKE (metadata server)
+        if cls._has_metadata_server():
+            return GCPCredentialInfo(
+                type=GCPCredentialType.METADATA_SERVER,
+                path=None,
+                project_id=cls._get_project_from_metadata(),
+                account=None,
+                is_valid=True,
+            )
+        
+        # Search standard locations
+        for search_path in cls.CREDENTIAL_SEARCH_PATHS:
+            if search_path.exists():
+                result = cls._analyze_credentials_file(str(search_path))
+                if result.is_valid:
+                    logger.info(
+                        f"[CredentialDetector] ✅ Found valid {result.type.value} credentials at {search_path}"
+                    )
+                    return result
+        
+        # No credentials found
+        return GCPCredentialInfo(
+            type=GCPCredentialType.UNKNOWN,
+            path=None,
+            project_id=None,
+            account=None,
+            is_valid=False,
+            error_message="No GCP credentials found. Run: gcloud auth application-default login",
+        )
+    
+    @classmethod
+    def _analyze_credentials_file(cls, path: str) -> GCPCredentialInfo:
+        """
+        Analyze a credentials file to determine its type and validity.
+        
+        CRITICAL: This properly identifies authorized_user vs service_account
+        to prevent the proxy crash caused by using OAuth tokens with --credentials-file.
+        """
+        try:
+            with open(path) as f:
+                creds = json.load(f)
+            
+            cred_type_str = creds.get("type", "")
+            project_id = creds.get("quota_project_id") or creds.get("project_id")
+            account = creds.get("client_email") or creds.get("account")
+            
+            # Map string type to enum
+            type_mapping = {
+                "service_account": GCPCredentialType.SERVICE_ACCOUNT,
+                "authorized_user": GCPCredentialType.AUTHORIZED_USER,
+                "external_account": GCPCredentialType.EXTERNAL_ACCOUNT,
+                "impersonated_service_account": GCPCredentialType.IMPERSONATED,
+            }
+            cred_type = type_mapping.get(cred_type_str, GCPCredentialType.UNKNOWN)
+            
+            # Validate based on type
+            is_valid = False
+            error_msg = None
+            
+            if cred_type == GCPCredentialType.SERVICE_ACCOUNT:
+                # Service account needs client_email and private_key
+                if creds.get("client_email") and creds.get("private_key"):
+                    is_valid = True
+                else:
+                    error_msg = "Service account credentials missing client_email or private_key"
+                    
+            elif cred_type == GCPCredentialType.AUTHORIZED_USER:
+                # authorized_user needs client_id, client_secret, refresh_token
+                if creds.get("client_id") and creds.get("refresh_token"):
+                    is_valid = True
+                else:
+                    error_msg = "Authorized user credentials missing client_id or refresh_token"
+                    
+            elif cred_type == GCPCredentialType.EXTERNAL_ACCOUNT:
+                # External account (workload identity)
+                if creds.get("audience") or creds.get("credential_source"):
+                    is_valid = True
+                else:
+                    error_msg = "External account credentials incomplete"
+                    
+            elif cred_type == GCPCredentialType.UNKNOWN:
+                error_msg = f"Unknown credential type: {cred_type_str}"
+            
+            return GCPCredentialInfo(
+                type=cred_type,
+                path=path,
+                project_id=project_id,
+                account=account,
+                is_valid=is_valid,
+                error_message=error_msg,
+            )
+            
+        except json.JSONDecodeError as e:
+            return GCPCredentialInfo(
+                type=GCPCredentialType.UNKNOWN,
+                path=path,
+                project_id=None,
+                account=None,
+                is_valid=False,
+                error_message=f"Invalid JSON in credentials file: {e}",
+            )
+        except Exception as e:
+            return GCPCredentialInfo(
+                type=GCPCredentialType.UNKNOWN,
+                path=path,
+                project_id=None,
+                account=None,
+                is_valid=False,
+                error_message=f"Failed to read credentials: {e}",
+            )
+    
+    @classmethod
+    def _has_metadata_server(cls) -> bool:
+        """Check if running on GCE/GKE with metadata server access."""
+        try:
+            import socket
+            # Metadata server is always at this IP on GCE/GKE
+            socket.setdefaulttimeout(0.1)
+            socket.socket().connect(("169.254.169.254", 80))
+            return True
+        except Exception:
+            return False
+    
+    @classmethod
+    def _get_project_from_metadata(cls) -> Optional[str]:
+        """Get project ID from metadata server."""
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "http://169.254.169.254/computeMetadata/v1/project/project-id",
+                headers={"Metadata-Flavor": "Google"}
+            )
+            with urllib.request.urlopen(req, timeout=1) as resp:
+                return resp.read().decode()
+        except Exception:
+            return None
 
 
 class CloudSQLProxyManager:
@@ -984,10 +1259,11 @@ class CloudSQLProxyManager:
         """
         Start Cloud SQL proxy with health monitoring and auto-recovery.
 
-        v115.0 Enhancements:
-        - GCP credential bootstrapping before proxy start
-        - Enhanced error logging with credential status
-        - Better retry logic with credential verification
+        v218.0 CRITICAL FIX:
+        - Intelligent credential type detection (authorized_user vs service_account)
+        - authorized_user credentials (from gcloud auth) DON'T use --credentials-file
+        - service_account credentials use --credentials-file
+        - This fixes the "exit code 1" crash caused by incorrect auth method
 
         Args:
             force_restart: Kill existing processes and start fresh
@@ -998,21 +1274,32 @@ class CloudSQLProxyManager:
         """
         last_error = None
 
-        # v115.0: Bootstrap GCP credentials FIRST - proxy needs this to authenticate
-        try:
-            from intelligence.cloud_sql_connection_manager import IntelligentCredentialResolver
-            if not IntelligentCredentialResolver.ensure_gcp_credentials():
-                logger.warning(
-                    "[ProxyManager v115.0] ⚠️ GCP credentials not found. Proxy may fail to authenticate. "
-                    "Run 'gcloud auth application-default login' or set GOOGLE_APPLICATION_CREDENTIALS."
+        # v218.0: Use intelligent credential detection to determine auth strategy
+        cred_info = IntelligentCredentialDetector.detect_credentials()
+        
+        if not cred_info.is_valid:
+            logger.warning(
+                f"[ProxyManager v218.0] ⚠️ GCP credential issue: {cred_info.error_message}\n"
+                "   For developer auth: gcloud auth application-default login\n"
+                "   For service account: Set GOOGLE_APPLICATION_CREDENTIALS to key file"
+            )
+        else:
+            logger.info(
+                f"[ProxyManager v218.0] ✅ Detected {cred_info.type.value} credentials"
+                + (f" at {cred_info.path}" if cred_info.path else "")
+            )
+            if cred_info.type == GCPCredentialType.AUTHORIZED_USER:
+                logger.info(
+                    "   → Using Application Default Credentials (NOT --credentials-file)"
                 )
-            else:
-                gcp_creds_path = IntelligentCredentialResolver.get_gcp_credentials_path()
-                logger.info(f"[ProxyManager v115.0] ✅ GCP credentials ready: {gcp_creds_path}")
-        except ImportError:
-            logger.debug("[ProxyManager v115.0] IntelligentCredentialResolver not available")
-        except Exception as e:
-            logger.warning(f"[ProxyManager v115.0] GCP credential bootstrap failed: {e}")
+            elif cred_info.type == GCPCredentialType.SERVICE_ACCOUNT:
+                logger.info(
+                    "   → Using --credentials-file for service account"
+                )
+            elif cred_info.type == GCPCredentialType.METADATA_SERVER:
+                logger.info(
+                    "   → Using GCE/GKE metadata server for authentication"
+                )
 
         for attempt in range(max_retries):
             try:
@@ -1021,7 +1308,6 @@ class CloudSQLProxyManager:
                     await asyncio.sleep(2)  # Wait before retry
 
                 # Check if already running (async - doesn't block event loop)
-                # v124.0: Use is_running_async() instead of is_running()
                 if await self.is_running_async() and not force_restart:
                     logger.info("✅ Cloud SQL proxy already running")
                     return True
@@ -1041,21 +1327,25 @@ class CloudSQLProxyManager:
                     f"--port={port}",
                 ]
 
-                # v115.0: Add credentials file if available from bootstrap
-                try:
-                    from intelligence.cloud_sql_connection_manager import IntelligentCredentialResolver
-                    gcp_creds = IntelligentCredentialResolver.get_gcp_credentials_path()
-                    if gcp_creds and gcp_creds != "metadata_server" and os.path.exists(gcp_creds):
-                        cmd.append(f"--credentials-file={gcp_creds}")
-                        logger.info(f"   Using credentials: {gcp_creds}")
-                except Exception:
-                    pass
+                # v218.0: CRITICAL FIX - Add auth args based on credential TYPE
+                # authorized_user credentials MUST NOT use --credentials-file
+                # They work via GOOGLE_APPLICATION_CREDENTIALS env var (ADC)
+                if cred_info.is_valid:
+                    auth_args = cred_info.get_proxy_auth_args()
+                    cmd.extend(auth_args)
+                    if auth_args:
+                        logger.info(f"   Auth method: --credentials-file (service account)")
+                    else:
+                        logger.info(f"   Auth method: Application Default Credentials")
 
-                # Add optional auth if specified in config (legacy support)
+                # Legacy support: explicit service_account_key in config
                 if "auth_method" in cloud_sql:
                     if cloud_sql["auth_method"] == "service_account":
                         if "service_account_key" in cloud_sql:
-                            cmd.append(f"--credentials-file={cloud_sql['service_account_key']}")
+                            key_path = cloud_sql['service_account_key']
+                            # Only add if not already in command
+                            if f"--credentials-file={key_path}" not in cmd:
+                                cmd.append(f"--credentials-file={key_path}")
 
                 logger.info(f"🚀 Starting Cloud SQL proxy (attempt {attempt + 1}/{max_retries})...")
                 logger.info(f"   Binary: {self.proxy_binary}")
@@ -1064,34 +1354,20 @@ class CloudSQLProxyManager:
                 logger.info(f"   Log: {self.log_path}")
                 logger.info(f"   Command: {' '.join(cmd)}")
 
-                # v124.0: Run all blocking I/O in thread pool to not block event loop
-                # v217.0: Ensure GCP credentials are available in environment
+                # v218.0: Build environment with credential-type-aware settings
                 proxy_env = os.environ.copy()
-                gcp_creds_path = None
                 
-                # Try to find GCP credentials if not set
-                if "GOOGLE_APPLICATION_CREDENTIALS" not in proxy_env:
-                    # Search for credentials in standard locations
-                    creds_search_paths = [
-                        Path.home() / ".config" / "gcloud" / "application_default_credentials.json",
-                        Path.home() / ".gcloud" / "application_default_credentials.json",
-                        Path("/etc/google/auth/application_default_credentials.json"),
-                    ]
-                    for creds_path in creds_search_paths:
-                        if creds_path.exists():
-                            gcp_creds_path = str(creds_path)
-                            proxy_env["GOOGLE_APPLICATION_CREDENTIALS"] = gcp_creds_path
-                            logger.info(f"   GCP credentials: {gcp_creds_path}")
-                            break
-                    
-                    if not gcp_creds_path:
-                        logger.warning(
-                            "⚠️ No GCP credentials found. Proxy may fail to authenticate.\n"
-                            "   Run: gcloud auth application-default login"
-                        )
-                else:
-                    gcp_creds_path = proxy_env["GOOGLE_APPLICATION_CREDENTIALS"]
-                    logger.info(f"   GCP credentials (env): {gcp_creds_path}")
+                # Add credential-specific environment variables
+                if cred_info.is_valid:
+                    cred_env_vars = cred_info.proxy_env_vars
+                    proxy_env.update(cred_env_vars)
+                    if cred_env_vars:
+                        logger.info(f"   Environment: {', '.join(f'{k}=...' for k in cred_env_vars.keys())}")
+                
+                # Fallback: Set GOOGLE_APPLICATION_CREDENTIALS if not already set
+                if "GOOGLE_APPLICATION_CREDENTIALS" not in proxy_env and cred_info.path:
+                    proxy_env["GOOGLE_APPLICATION_CREDENTIALS"] = cred_info.path
+                    logger.info(f"   GCP credentials (fallback): {cred_info.path}")
                 
                 def _start_proxy_process_sync():
                     """Sync helper - runs in thread pool."""
@@ -1130,23 +1406,47 @@ class CloudSQLProxyManager:
                             return self.log_path.read_text() if self.log_path.exists() else "No log"
                         log_content = await asyncio.to_thread(_read_log_sync)
                         
-                        # v217.0: Enhanced error diagnostics
+                        # v218.0: Enhanced error diagnostics with credential-type awareness
                         exit_code = self.process.returncode
                         error_msg = f"Proxy process crashed (exit code: {exit_code})"
                         
-                        # Provide specific guidance based on error
-                        if "unauthorized" in log_content.lower() or "permission denied" in log_content.lower():
-                            error_msg += "\n   → Authentication failed. Run: gcloud auth application-default login"
+                        # v218.0: Credential-type-specific diagnostics
+                        if exit_code == 1 and (not log_content.strip() or len(log_content.strip()) < 50):
+                            # Exit code 1 with minimal output = authentication failure
+                            error_msg += "\n   ═══════════════════════════════════════════════════"
+                            error_msg += "\n   AUTHENTICATION FAILURE DETECTED"
+                            error_msg += "\n   ═══════════════════════════════════════════════════"
+                            
+                            if cred_info.type == GCPCredentialType.AUTHORIZED_USER:
+                                error_msg += "\n   Using: authorized_user credentials (OAuth2)"
+                                error_msg += "\n   Possible causes:"
+                                error_msg += "\n   1. OAuth2 token expired - run: gcloud auth application-default login"
+                                error_msg += "\n   2. Missing Cloud SQL Client IAM role"
+                                error_msg += "\n   3. Network issue reaching OAuth token endpoint"
+                            elif cred_info.type == GCPCredentialType.SERVICE_ACCOUNT:
+                                error_msg += "\n   Using: service_account credentials"
+                                error_msg += "\n   Possible causes:"
+                                error_msg += "\n   1. Service account key is invalid or expired"
+                                error_msg += "\n   2. Missing Cloud SQL Client IAM role for service account"
+                                error_msg += f"\n   3. Wrong project - expected: {cred_info.project_id}"
+                            elif not cred_info.is_valid:
+                                error_msg += f"\n   Credential issue: {cred_info.error_message}"
+                                error_msg += "\n   Run: gcloud auth application-default login"
+                            else:
+                                error_msg += "\n   Run: gcloud auth application-default login"
+                                
+                        # Provide specific guidance based on error content
+                        elif "unauthorized" in log_content.lower() or "permission denied" in log_content.lower():
+                            error_msg += "\n   → Authentication failed. Check IAM permissions."
                         elif "quota" in log_content.lower():
                             error_msg += "\n   → API quota exceeded. Wait or check GCP console."
                         elif "not found" in log_content.lower() and "instance" in log_content.lower():
                             error_msg += "\n   → Cloud SQL instance not found. Check connection_name in database_config.json"
-                        elif exit_code == 1 and not log_content.strip():
-                            error_msg += "\n   → Likely authentication issue. Run: gcloud auth application-default login"
                         
                         if log_content.strip():
-                            # Only show first 500 chars of log to avoid spam
-                            error_msg += f"\n   Log: {log_content[:500]}..."
+                            # Show log content (truncated)
+                            truncated_log = log_content[:500] + "..." if len(log_content) > 500 else log_content
+                            error_msg += f"\n   Log:\n{truncated_log}"
                         
                         logger.error(f"❌ {error_msg}")
                         last_error = error_msg
