@@ -64463,20 +64463,57 @@ async def handle_check_only(args: argparse.Namespace) -> int:
         docker_timeout = 10.0
         if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
             docker_timeout = get_timeouts().docker_check_timeout
+        
+        # v210.0: First check if Docker is installed
+        docker_installed = False
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "docker", "info",
-                stdout=asyncio.subprocess.DEVNULL,
+            version_proc = await asyncio.create_subprocess_exec(
+                "docker", "--version",
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(proc.wait(), timeout=docker_timeout)
-            docker_ok = proc.returncode == 0
-            print(f"{BOLD}{BLUE}║{RESET}    {check_mark(docker_ok)} Docker daemon: {'running' if docker_ok else 'not running'}")
-            if not docker_ok:
-                warnings.append("Docker daemon not running - will attempt auto-start")
+            stdout, _ = await asyncio.wait_for(version_proc.communicate(), timeout=5.0)
+            docker_installed = version_proc.returncode == 0
+            if docker_installed:
+                version_str = stdout.decode().strip() if stdout else "unknown"
+        except FileNotFoundError:
+            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker: not installed")
+            warnings.append("Docker not installed - Docker features unavailable")
+            docker_installed = False
         except Exception:
-            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker check: could not verify")
-            warnings.append("Docker check failed")
+            docker_installed = False
+        
+        if docker_installed:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker", "info",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=docker_timeout)
+                docker_ok = proc.returncode == 0
+                if docker_ok:
+                    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(True)} Docker daemon: running")
+                else:
+                    # v210.0: Check if auto-start is enabled and Docker Desktop exists
+                    auto_start = os.getenv("DOCKER_AUTO_START", "true").lower() == "true"
+                    docker_app = Path("/Applications/Docker.app")
+                    
+                    if sys.platform == "darwin" and auto_start and docker_app.exists():
+                        print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker daemon: stopped (will auto-start)")
+                        warnings.append("Docker daemon stopped - auto-starting Docker Desktop")
+                    elif sys.platform == "darwin" and docker_app.exists():
+                        print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker daemon: stopped")
+                        warnings.append("Docker daemon stopped - run 'open -a Docker' to start")
+                    else:
+                        print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker daemon: stopped")
+                        warnings.append("Docker daemon not running - continuing without Docker")
+            except asyncio.TimeoutError:
+                print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker daemon: not responding")
+                warnings.append("Docker daemon not responding - may be starting")
+            except Exception as e:
+                print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Docker check: error")
+                warnings.append(f"Docker check failed: {str(e)[:50]}")
     else:
         print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ Docker: disabled{RESET}")
 
@@ -65604,7 +65641,19 @@ async def _show_startup_dashboard() -> None:
     port_ok = checks.get("backend_port_free", True)
 
     print(f"  {status_icon(critical_ok)} Directories: {'OK' if critical_ok else 'Missing'}")
-    print(f"  {status_opt(docker_ok)} Docker: {'Running' if docker_ok else ('Stopped' if docker_ok is False else 'Disabled')}")
+    # v210.0: Improved Docker status messaging
+    if docker_ok is True:
+        docker_status = "Running"
+    elif docker_ok is False:
+        # Check if auto-start is enabled
+        auto_start = os.getenv("DOCKER_AUTO_START", "true").lower() == "true"
+        if auto_start:
+            docker_status = "Stopped (will auto-start)"
+        else:
+            docker_status = "Stopped"
+    else:
+        docker_status = "Disabled"
+    print(f"  {status_opt(docker_ok)} Docker: {docker_status}")
     print(f"  {status_opt(gcp_ok)} GCP: {'Authenticated' if gcp_ok else ('Not auth' if gcp_ok is False else 'Disabled')}")
     print(f"  {status_icon(port_ok, warn=not port_ok)} Port {checks.get('backend_port', '?')}: {'Available' if port_ok else 'In use'}")
 
