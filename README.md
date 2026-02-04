@@ -1,3 +1,146 @@
+# JARVIS (JARVIS-AI-Agent)
+
+**The Body of the AGI OS — macOS integration, computer use, action execution, and unified orchestration**
+
+JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command.
+
+---
+
+## What is JARVIS?
+
+| Role | Repository | Responsibility |
+|------|------------|----------------|
+| **Body** | **JARVIS (this repo)** | Computer use, macOS control, voice/vision, safety, unified supervisor |
+| **Mind** | [JARVIS-Prime](https://github.com/drussell23/jarvis-prime) | LLM inference, reasoning, Neural Orchestrator Core |
+| **Nerves** | [Reactor-Core](https://github.com/drussell23/JARVIS-Reactor) | Training, fine-tuning, experience collection, model deployment |
+
+**Single entry point for the whole ecosystem:**
+
+```bash
+# Start JARVIS + JARVIS-Prime + Reactor-Core (Trinity)
+python3 unified_supervisor.py
+```
+
+The **unified supervisor** (`unified_supervisor.py`) is the authoritative kernel: it discovers repos, starts components in the correct order, performs health checks, manages GCP offload (Spot VMs when memory is low), and preserves model loading progress across Early Prime → Trinity handoff (v221.0).
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- **macOS** (primary platform; Linux supported for backend-only)
+- **Python 3.9+** (3.11+ recommended)
+- **16GB+ RAM** (32GB recommended for local LLM; GCP offload available for lower RAM)
+
+### Install and run
+
+```bash
+# Clone and enter repo
+git clone https://github.com/drussell23/JARVIS-AI-Agent.git
+cd JARVIS-AI-Agent
+
+# Create venv and install
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+# Start entire ecosystem (Body + Mind + Nerves)
+python3 unified_supervisor.py
+```
+
+**What starts:**
+
+- **Loading experience** (Phase 0) — browser to loading page
+- **Preflight** — ports, Docker, GCP, memory checks
+- **Backend** (Body) — FastAPI on port 8010, WebSocket, voice/vision
+- **Trinity** — JARVIS-Prime (port 8000/8002), Reactor-Core (port 8090)
+- **Frontend** — UI on port 3000
+
+**Optional:** Use `unified_supervisor.py --status` to see component status; use `--shutdown` then run again for a clean restart.
+
+---
+
+## Architecture at a Glance
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                 UNIFIED SUPERVISOR (unified_supervisor.py)           │
+│                     Single entry point • ~50k lines                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  Zones: 0 Early Protection → 1 Foundation → 2 Utils → 3 Resources   │
+│        → 4 Intelligence → 5 Process Orchestration → 6 Kernel       │
+│        → 7 Entry Point                                               │
+└─────────────────────────────────────────────────────────────────────┘
+         │
+         ├── Backend (Body)     port 8010   • Computer use, voice, vision
+         ├── JARVIS-Prime       port 8000   • LLM, Neural Orchestrator
+         ├── Reactor-Core       port 8090   • Training, experience, models
+         ├── GCP Spot VM        (on demand) • Offload when RAM &lt; threshold
+         └── Frontend           port 3000   • Web UI
+```
+
+**Key files:**
+
+| File | Purpose |
+|------|--------|
+| `unified_supervisor.py` | Monolithic kernel: startup, Trinity, GCP, dashboard, shutdown |
+| `backend/main.py` | FastAPI backend (Body) — REST + WebSocket |
+| `backend/core/` | GCP VM manager, Trinity integrator, dynamic components, resilience |
+| `backend/supervisor/` | Cross-repo startup orchestrator, Trinity coordination |
+| `loading_server.py` | Loading-page server and progress broadcaster |
+
+---
+
+## Cross-Repo Integration (Trinity)
+
+JARVIS is the **orchestrator** for the three repos:
+
+1. **Discovery** — Resolves JARVIS-Prime and Reactor-Core paths via env or default locations.
+2. **Startup order** — Loading server → preflight → backend → Trinity (Prime + Reactor in parallel where possible).
+3. **Early Prime pre-warm** — Starts JARVIS-Prime early so LLM loading begins in parallel; Trinity then adopts the process and **preserves loading progress** (v221.0 handoff).
+4. **Health** — Polls `/health` for Prime and Reactor; uses readiness state (e.g. LOADING → READY) for dashboard and timeouts.
+5. **State** — Writes shared state under `~/.jarvis/` (e.g. `trinity/state/`, `cross_repo/`, `signals/`) for Prime and Reactor to read.
+6. **GCP offload** — When memory is low, provisions Spot VMs and updates ML registry / cloud state so Prime can use the cloud backend.
+
+**Trinity status** (example after startup):
+
+```
+body:HEAL | prime:STAR | reactorc:STAR | gcpvm:STAR | trinity:STAR
+```
+
+---
+
+## Key Components (Backend)
+
+| Area | Location | Description |
+|------|----------|-------------|
+| **Trinity** | `backend/core/trinity_integrator.py`, `backend/supervisor/cross_repo_startup_orchestrator.py` | Start Prime/Reactor, adopt early Prime, health checks |
+| **GCP** | `backend/core/gcp_vm_manager.py`, `dynamic_component_manager.py` | Spot VMs, auto offload, cost tracking |
+| **Loading progress** | `unified_supervisor.py` (LiveDashboard, `update_model_loading`), `backend/loading_server/` | Model load progress, handoff-safe (no 18%→0% regression) |
+| **Voice** | `backend/voice_unlock/`, `backend/voice/` | ECAPA speaker verification, unlock, TTS |
+| **Vision** | `backend/vision/` | Situational awareness, display topology |
+| **Intelligence** | `backend/intelligence/` | Goal inference, hybrid routing, Cloud SQL |
+
+---
+
+## Configuration
+
+- **Ports:** `JARVIS_BACKEND_PORT` (8010), `TRINITY_JPRIME_PORT` (8000), `TRINITY_REACTOR_PORT` (8090).
+- **Paths:** `JARVIS_PRIME_REPO_PATH`, `REACTOR_CORE_REPO_PATH` (or defaults under `~/Documents/repos/`).
+- **GCP:** `GCP_ENABLED`, `GCP_PROJECT_ID`, memory thresholds (`JARVIS_MIN_FREE_RAM_GB`, etc.).
+- **Trinity:** `TRINITY_ENABLED`, `HOLLOW_CLIENT_MODE` (auto when RAM &lt; 32GB).
+
+See [README_v2.md](./README_v2.md) for full configuration and troubleshooting.
+
+---
+
+## Documentation and Changelog
+
+The sections below contain the **documentation index**, **unified kernel details**, and **version-specific changelog** (v107.0 startup, v108.0 lifecycle, v116.0 Cloud SQL/ECAPA, v117.5 Trinity, v131/v132 supervisor/voice, v221.0 model loading handoff, etc.). For API references, deployment, and troubleshooting, use **[README_v2.md](./README_v2.md)**.
+
+---
+
 # 📚 JARVIS Ecosystem Documentation Guide
 
 > **Choose Your Path:** This repository has two README files serving different purposes.
