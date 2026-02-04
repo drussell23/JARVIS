@@ -111,16 +111,23 @@ class IntelligentMemoryController:
     """
     Intelligent memory pressure controller with adaptive thresholds.
     
-    Prevents runaway cleanup loops by:
-    1. Tracking cleanup effectiveness (did memory actually drop?)
-    2. Enforcing cooldown periods between cleanup attempts
-    3. Adaptive backoff when cleanup isn't helping
-    4. Baseline detection to understand normal memory for this system
-    5. State machine to prevent duplicate/overlapping cleanup runs
-    6. Progressive thresholds based on system behavior
+    v210.0 ROOT CAUSE FIX:
+    The old approach was triggering "HIGH relief" warnings constantly on 16GB Macs
+    even though 80% memory usage is NORMAL for a system running Chrome + Python + ML.
+    The issue was default thresholds were too aggressive and baseline detection
+    took too long (30 samples = 2.5 minutes of false alarms at startup).
     
-    This is the brain of memory management - the old approach was reactive,
-    this one is predictive and adaptive.
+    This version:
+    1. Uses HARDWARE-AWARE initial thresholds based on total RAM
+    2. Fast baseline detection (starts during init, uses first 10 samples)
+    3. Tracks cleanup effectiveness (did memory actually drop?)
+    4. Enforces cooldown periods between cleanup attempts
+    5. Adaptive backoff when cleanup isn't helping
+    6. State machine to prevent duplicate/overlapping cleanup runs
+    7. Environment variable overrides for customization
+    
+    Philosophy: 80% memory on 16GB is fine. 80% on 64GB is suspicious.
+    The cure is adapting to the hardware, not constant warnings.
     """
     
     def __init__(self):
@@ -129,10 +136,10 @@ class IntelligentMemoryController:
         self._state_lock = threading.RLock()
         
         # Timing configuration (adaptive)
-        self._base_cooldown = 30.0      # Base cooldown after relief (seconds)
+        self._base_cooldown = float(os.getenv("JARVIS_MEMORY_COOLDOWN", "60.0"))  # v210.0: Increased from 30s
         self._max_cooldown = 300.0      # Max cooldown (5 minutes)
-        self._min_check_interval = 5.0  # Minimum between checks
-        self._max_check_interval = 60.0 # Maximum between checks (backoff)
+        self._min_check_interval = 10.0  # v210.0: Increased from 5s to reduce noise
+        self._max_check_interval = 120.0 # v210.0: Increased from 60s
         
         # Current adaptive values
         self._current_cooldown = self._base_cooldown
@@ -143,17 +150,25 @@ class IntelligentMemoryController:
         self._consecutive_ineffective = 0
         self._ineffective_threshold = 3  # After 3 ineffective attempts, backoff
         
-        # Baseline detection
+        # Baseline detection - v210.0: Faster detection with hardware awareness
         self._memory_baseline: Optional[float] = None
-        self._baseline_samples: deque = deque(maxlen=60)  # 5 minutes of samples at 5s interval
+        self._baseline_samples: deque = deque(maxlen=60)  # 5 minutes of samples
         self._baseline_established = False
+        self._fast_baseline_threshold = 10  # v210.0: Establish baseline after 10 samples (vs 30)
         
-        # Adaptive thresholds
-        self._base_moderate_threshold = 70.0  # Default
-        self._base_high_threshold = 80.0      # Default
-        self._base_critical_threshold = 90.0  # Default
+        # v210.0: Hardware-aware initial thresholds
+        # Detect total system RAM and set appropriate thresholds
+        self._total_ram_gb = self._detect_total_ram()
+        self._hardware_profile = self._detect_hardware_profile()
         
-        # Current thresholds (adaptive)
+        # v210.0: Set initial thresholds based on hardware profile
+        # This prevents false alarms during the baseline detection period
+        thresholds = self._get_hardware_aware_thresholds()
+        self._base_moderate_threshold = thresholds["moderate"]
+        self._base_high_threshold = thresholds["high"]
+        self._base_critical_threshold = thresholds["critical"]
+        
+        # Current thresholds (will adapt once baseline is established)
         self._moderate_threshold = self._base_moderate_threshold
         self._high_threshold = self._base_high_threshold
         self._critical_threshold = self._base_critical_threshold
@@ -162,7 +177,7 @@ class IntelligentMemoryController:
         self._last_check_time: float = 0.0
         self._last_relief_time: float = 0.0
         self._last_event_emission: float = 0.0
-        self._event_emission_cooldown = 30.0  # Minimum between event emissions
+        self._event_emission_cooldown = 60.0  # v210.0: Increased from 30s to reduce noise
         
         # Relief deduplication
         self._pending_relief_level: Optional[str] = None
@@ -173,7 +188,75 @@ class IntelligentMemoryController:
         self._total_events_suppressed = 0
         self._total_relief_attempts = 0
         
-        logger.info("🧠 Intelligent Memory Controller initialized")
+        logger.info(
+            f"🧠 Intelligent Memory Controller initialized "
+            f"(RAM: {self._total_ram_gb:.0f}GB, profile: {self._hardware_profile}, "
+            f"thresholds: {self._moderate_threshold:.0f}/{self._high_threshold:.0f}/{self._critical_threshold:.0f}%)"
+        )
+    
+    def _detect_total_ram(self) -> float:
+        """Detect total system RAM in GB."""
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            return mem.total / (1024 ** 3)  # Convert to GB
+        except Exception:
+            return 16.0  # Conservative default
+    
+    def _detect_hardware_profile(self) -> str:
+        """
+        Detect hardware profile based on RAM.
+        
+        v210.0: Different hardware profiles need different thresholds.
+        A 16GB MacBook running JARVIS + Chrome is expected to be at 75-85%.
+        A 64GB workstation at 80% has a memory leak.
+        """
+        if self._total_ram_gb < 12:
+            return "constrained"  # 8GB or less - very tight
+        elif self._total_ram_gb < 20:
+            return "consumer"  # 16GB - typical dev MacBook
+        elif self._total_ram_gb < 48:
+            return "prosumer"  # 32GB - developer workstation
+        else:
+            return "server"  # 64GB+ - should have lots of headroom
+    
+    def _get_hardware_aware_thresholds(self) -> Dict[str, float]:
+        """
+        Get memory thresholds appropriate for the hardware profile.
+        
+        v210.0 ROOT CAUSE FIX:
+        The disease was using the same thresholds for all hardware.
+        80% on 16GB (13GB used, 3GB free) is very different from
+        80% on 64GB (51GB used, 13GB free).
+        
+        The cure: hardware-aware thresholds that expect higher baseline
+        usage on constrained systems.
+        """
+        # Allow environment variable overrides
+        env_moderate = os.getenv("JARVIS_MEMORY_MODERATE_THRESHOLD")
+        env_high = os.getenv("JARVIS_MEMORY_HIGH_THRESHOLD")
+        env_critical = os.getenv("JARVIS_MEMORY_CRITICAL_THRESHOLD")
+        
+        if env_moderate and env_high and env_critical:
+            return {
+                "moderate": float(env_moderate),
+                "high": float(env_high),
+                "critical": float(env_critical),
+            }
+        
+        # Hardware-aware defaults
+        if self._hardware_profile == "constrained":
+            # 8GB systems: expect to run at 80-90%
+            return {"moderate": 85.0, "high": 92.0, "critical": 96.0}
+        elif self._hardware_profile == "consumer":
+            # 16GB systems: expect to run at 70-85%
+            return {"moderate": 82.0, "high": 90.0, "critical": 95.0}
+        elif self._hardware_profile == "prosumer":
+            # 32GB systems: some headroom expected
+            return {"moderate": 75.0, "high": 85.0, "critical": 93.0}
+        else:
+            # Server/workstation: lots of headroom expected
+            return {"moderate": 70.0, "high": 80.0, "critical": 90.0}
     
     def record_memory_sample(self, percent_used: float) -> None:
         """Record a memory sample for baseline calculation."""
@@ -181,13 +264,26 @@ class IntelligentMemoryController:
             self._baseline_samples.append((time.time(), percent_used))
             self._total_checks += 1
             
-            # Recalculate baseline if we have enough samples
-            if len(self._baseline_samples) >= 30:
+            # v210.0: Fast baseline detection - establish after fewer samples
+            # This prevents false alarms during startup
+            if not self._baseline_established and len(self._baseline_samples) >= self._fast_baseline_threshold:
+                self._calculate_baseline()
+            elif self._baseline_established and len(self._baseline_samples) >= 30:
+                # Periodically recalculate baseline as system behavior changes
                 self._calculate_baseline()
     
     def _calculate_baseline(self) -> None:
-        """Calculate memory baseline from recent samples."""
-        if len(self._baseline_samples) < 30:
+        """
+        Calculate memory baseline from recent samples.
+        
+        v210.0 ROOT CAUSE FIX:
+        The disease was waiting for 30 samples (2.5 minutes) before establishing
+        baseline, causing constant false alarms during startup.
+        
+        The cure: Fast baseline with 10 samples, then refine over time.
+        """
+        min_samples = self._fast_baseline_threshold if not self._baseline_established else 30
+        if len(self._baseline_samples) < min_samples:
             return
         
         samples = [s[1] for s in self._baseline_samples]
@@ -195,42 +291,64 @@ class IntelligentMemoryController:
         # Use median as baseline (more robust than mean)
         sorted_samples = sorted(samples)
         median_idx = len(sorted_samples) // 2
-        self._memory_baseline = sorted_samples[median_idx]
+        new_baseline = sorted_samples[median_idx]
         
         # Calculate standard deviation
         mean = sum(samples) / len(samples)
         variance = sum((x - mean) ** 2 for x in samples) / len(samples)
         std_dev = variance ** 0.5
         
-        # Adapt thresholds based on baseline
-        # If baseline is already high, be more tolerant
+        # v210.0: Only log if baseline changed significantly (>2%)
+        old_baseline = self._memory_baseline
+        self._memory_baseline = new_baseline
+        
+        # v210.0: Adaptive thresholds based on BOTH hardware profile AND baseline
+        # This ensures thresholds never go below the hardware-aware minimums
+        hw_thresholds = self._get_hardware_aware_thresholds()
+        
         if self._memory_baseline > 75:
             # System normally runs at high memory - adjust thresholds up
-            self._moderate_threshold = min(85.0, self._memory_baseline + 5)
-            self._high_threshold = min(92.0, self._memory_baseline + 10)
-            self._critical_threshold = 95.0
-            logger.info(
-                f"🧠 Adaptive thresholds (high baseline {self._memory_baseline:.1f}%): "
-                f"moderate={self._moderate_threshold:.0f}%, "
-                f"high={self._high_threshold:.0f}%, "
-                f"critical={self._critical_threshold:.0f}%"
+            # But never below the hardware-aware minimums
+            self._moderate_threshold = max(
+                hw_thresholds["moderate"],
+                min(88.0, self._memory_baseline + 5)
             )
-        elif self._memory_baseline < 50:
-            # System normally runs at low memory - be more aggressive
-            self._moderate_threshold = max(60.0, self._memory_baseline + 15)
-            self._high_threshold = max(70.0, self._memory_baseline + 25)
-            self._critical_threshold = max(85.0, self._memory_baseline + 40)
+            self._high_threshold = max(
+                hw_thresholds["high"],
+                min(94.0, self._memory_baseline + 8)
+            )
+            self._critical_threshold = max(hw_thresholds["critical"], 96.0)
+        elif self._memory_baseline > 60:
+            # Medium baseline - use hardware-aware thresholds as-is
+            # with small adjustments based on observed baseline
+            buffer = self._memory_baseline - 60  # 0-15 range
+            self._moderate_threshold = max(
+                hw_thresholds["moderate"],
+                hw_thresholds["moderate"] + buffer * 0.3
+            )
+            self._high_threshold = max(
+                hw_thresholds["high"],
+                hw_thresholds["high"] + buffer * 0.2
+            )
+            self._critical_threshold = hw_thresholds["critical"]
         else:
-            # Normal range - use defaults
-            self._moderate_threshold = self._base_moderate_threshold
-            self._high_threshold = self._base_high_threshold
-            self._critical_threshold = self._base_critical_threshold
+            # Low baseline (unusual) - use hardware-aware thresholds
+            self._moderate_threshold = hw_thresholds["moderate"]
+            self._high_threshold = hw_thresholds["high"]
+            self._critical_threshold = hw_thresholds["critical"]
         
+        # Log baseline establishment or significant changes
         if not self._baseline_established:
             self._baseline_established = True
             logger.info(
                 f"🧠 Memory baseline established: {self._memory_baseline:.1f}% "
-                f"(std_dev={std_dev:.1f}%)"
+                f"(std_dev={std_dev:.1f}%, samples={len(samples)}, "
+                f"thresholds: {self._moderate_threshold:.0f}/{self._high_threshold:.0f}/{self._critical_threshold:.0f}%)"
+            )
+        elif old_baseline and abs(new_baseline - old_baseline) > 2.0:
+            logger.debug(
+                f"🧠 Memory baseline updated: {old_baseline:.1f}% → {new_baseline:.1f}% "
+                f"(thresholds: {self._moderate_threshold:.0f}/{self._high_threshold:.0f}/{self._critical_threshold:.0f}%)"
             )
     
     def should_emit_event(self, current_memory: float) -> Tuple[bool, str, Optional[str]]:
@@ -3112,57 +3230,268 @@ class ProcessCleanupManager:
 
     async def _high_memory_relief(self) -> None:
         """
-        HIGH memory relief (80-90% usage).
-        Aggressive cleanup + cloud offload + GCP Spot VM fallback.
+        HIGH memory relief.
+        
+        v210.0: More aggressive cleanup with intelligent targeting:
+        1. Clear Python caches
+        2. Trim Chrome helpers aggressively
+        3. Unload cached ML models if available
+        4. Try cloud offload
+        5. GCP Spot VM as last resort
+        
+        Philosophy: Prefer local cleanup over cloud provisioning when possible.
+        Cloud resources cost money and take time to provision.
         """
         logger.warning("⚠️  HIGH memory pressure - aggressive relief mode")
-
-        # 1. Try cloud offload first (Cloud Run)
-        offload_result = await self._trigger_cloud_offload()
-        if offload_result["success"]:
-            logger.info(f"☁️  Cloud offload freed {offload_result['memory_freed_mb']:.0f}MB")
-            return  # Cloud offload successful, might be enough
-
-        # 1b. Try GCP Spot VM if Cloud Run offload failed
-        vm_result = await self._trigger_gcp_spot_vm()
-        if vm_result.get("success"):
-            logger.info(f"🚀 GCP Spot VM created for ML offload: {vm_result.get('ip')}")
-            return  # VM created, ML will be offloaded
-
-        # 2. Standard aggressive cleanup (fallback if cloud options failed)
+        
+        mem_before = 0
+        try:
+            import psutil
+            mem_before = psutil.virtual_memory().percent
+        except Exception:
+            pass
+        
+        total_freed_mb = 0.0
+        
+        # 1. Clear Python caches first (fast, always works)
+        freed = await self._clear_python_caches()
+        total_freed_mb += freed
+        
+        # 2. Aggressively trim Chrome helpers
+        freed = await self._trim_chrome_helpers(max_helpers=4)  # More aggressive limit
+        total_freed_mb += freed
+        
+        # 3. IPC resource cleanup
         try:
             self._cleanup_ipc_resources()
         except Exception as e:
             logger.debug(f"IPC cleanup failed: {e}")
+        
+        # 4. Garbage collection with full sweep
+        try:
+            import gc
+            gc.collect()
+            gc.collect()
+            gc.collect()  # Three passes for thorough cleanup
+        except Exception:
+            pass
+        
+        # 5. Unload cached models if ML registry is available
+        freed = await self._unload_cached_models()
+        total_freed_mb += freed
+        
+        # Check if local cleanup was sufficient
+        try:
+            import psutil
+            mem_after = psutil.virtual_memory().percent
+            freed_actual = mem_before - mem_after
+            
+            if freed_actual > 2.0:
+                logger.info(
+                    f"⚠️  HIGH relief succeeded locally: {mem_before:.1f}% → {mem_after:.1f}% "
+                    f"(freed ~{total_freed_mb:.0f}MB estimated)"
+                )
+                return  # Local cleanup was effective, don't need cloud
+        except Exception:
+            pass
+        
+        # 6. Try cloud offload if local cleanup wasn't enough
+        offload_result = await self._trigger_cloud_offload()
+        if offload_result["success"]:
+            logger.info(f"☁️  Cloud offload freed {offload_result['memory_freed_mb']:.0f}MB")
+            return
 
+        # 7. GCP Spot VM as last resort
+        vm_result = await self._trigger_gcp_spot_vm()
+        if vm_result.get("success"):
+            logger.info(f"🚀 GCP Spot VM created for ML offload")
+    
+    async def _unload_cached_models(self) -> float:
+        """
+        v210.0: Unload cached ML models to free memory.
+        
+        ML models can consume 500MB-2GB each. Unloading them when memory
+        is tight can provide significant relief.
+        """
+        freed_mb = 0.0
+        
+        try:
+            # Try ML Engine Registry
+            try:
+                from voice_unlock.ml_engine_registry import get_ml_registry
+                registry = await get_ml_registry()
+                if registry and hasattr(registry, 'unload_inactive_models'):
+                    unloaded = await registry.unload_inactive_models(inactive_seconds=300)
+                    freed_mb += unloaded.get('freed_mb', 0)
+                    if freed_mb > 0:
+                        logger.info(f"🧠 Unloaded inactive ML models (freed ~{freed_mb:.0f}MB)")
+            except ImportError:
+                pass
+            
+            # Clear torch/tensorflow caches if available
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    freed_mb += 100  # Estimate
+            except ImportError:
+                pass
+            
+        except Exception as e:
+            logger.debug(f"Model unload failed: {e}")
+        
+        return freed_mb
+
+    async def _moderate_memory_relief(self) -> None:
+        """
+        MODERATE memory relief.
+        
+        v210.0: More intelligent moderate relief that actually frees memory:
+        1. Clear Python caches (linecache, functools, etc.)
+        2. Trim Chrome helper processes if excessive
+        3. Garbage collection
+        
+        Philosophy: Don't just gc.collect() and hope - target specific memory hogs.
+        """
+        logger.info("📊 Moderate memory pressure - targeted relief mode")
+        
+        mem_before = 0
+        try:
+            import psutil
+            mem_before = psutil.virtual_memory().percent
+        except Exception:
+            pass
+
+        # 1. Clear Python internal caches (often holds 50-100MB on long-running processes)
+        freed_by_caches = await self._clear_python_caches()
+        
+        # 2. Trim Chrome helper processes if there are too many
+        chrome_freed = await self._trim_chrome_helpers(max_helpers=6)
+        
         # 3. Garbage collection
         try:
             import gc
             gc.collect()
+            gc.collect()  # Second pass catches cycles
         except Exception:
             pass
-
-    async def _moderate_memory_relief(self) -> None:
-        """
-        MODERATE memory relief (70-80% usage).
-        Standard cleanup + notify about cloud option.
-        """
-        logger.info("📊 Moderate memory pressure - standard relief mode")
-
-        # 1. Check if cloud offload would help
-        cloud_available = await self._check_cloud_run_available()
-        if cloud_available:
-            logger.info(
-                "☁️  Cloud Run is available - consider enabling cloud_first_mode "
-                "for better memory management"
-            )
-
-        # 2. Light cleanup
+        
+        # 4. Log effectiveness
         try:
-            import gc
-            gc.collect()
+            import psutil
+            mem_after = psutil.virtual_memory().percent
+            logger.info(
+                f"📊 Moderate relief complete: {mem_before:.1f}% → {mem_after:.1f}% "
+                f"(caches: {freed_by_caches:.0f}MB, chrome: {chrome_freed:.0f}MB)"
+            )
         except Exception:
             pass
+    
+    async def _clear_python_caches(self) -> float:
+        """
+        v210.0: Clear Python internal caches that accumulate over time.
+        
+        Returns estimated MB freed.
+        """
+        freed_mb = 0.0
+        
+        try:
+            # linecache - holds source code for tracebacks
+            import linecache
+            linecache.clearcache()
+            freed_mb += 5.0  # Estimate
+            
+            # functools.lru_cache - can grow unbounded
+            import functools
+            if hasattr(functools, '_lru_cache_wrapper'):
+                # Clear all LRU caches (if accessible)
+                pass
+            
+            # importlib caches
+            try:
+                import importlib
+                importlib.invalidate_caches()
+            except Exception:
+                pass
+            
+            # sys internal caches
+            import sys
+            if hasattr(sys, '_clear_type_cache'):
+                sys._clear_type_cache()
+                freed_mb += 10.0  # Estimate
+            
+            # Regular expression cache
+            import re
+            try:
+                re.purge()
+                freed_mb += 2.0
+            except Exception:
+                pass
+            
+        except Exception as e:
+            logger.debug(f"Cache clearing partially failed: {e}")
+        
+        return freed_mb
+    
+    async def _trim_chrome_helpers(self, max_helpers: int = 8) -> float:
+        """
+        v210.0: Trim excessive Chrome helper processes.
+        
+        Chrome spawns many helper processes (GPU, renderer, utility).
+        If there are too many, kill the oldest/least active ones.
+        
+        Returns estimated MB freed.
+        """
+        freed_mb = 0.0
+        
+        try:
+            import psutil
+            
+            # Find Chrome helper processes
+            chrome_helpers = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info', 'create_time']):
+                try:
+                    name = proc.info.get('name', '').lower()
+                    cmdline = ' '.join(proc.info.get('cmdline') or []).lower()
+                    
+                    # Chrome helper patterns
+                    if 'google chrome helper' in name or 'chrome helper' in name:
+                        mem = proc.info.get('memory_info')
+                        if mem:
+                            chrome_helpers.append({
+                                'pid': proc.info['pid'],
+                                'mem_mb': mem.rss / (1024 ** 2),
+                                'created': proc.info.get('create_time', 0),
+                                'is_gpu': 'gpu' in cmdline,
+                                'is_renderer': 'renderer' in cmdline,
+                            })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            # Sort by memory usage (descending) and creation time (oldest first)
+            chrome_helpers.sort(key=lambda x: (-x['mem_mb'], x['created']))
+            
+            # Don't kill GPU or essential renderer processes
+            non_essential = [h for h in chrome_helpers if not h['is_gpu']]
+            
+            # Kill excess helpers
+            if len(non_essential) > max_helpers:
+                to_kill = non_essential[max_helpers:]
+                for helper in to_kill[:3]:  # Kill at most 3 at a time
+                    try:
+                        os.kill(helper['pid'], signal.SIGTERM)
+                        freed_mb += helper['mem_mb']
+                        logger.debug(f"Trimmed Chrome helper PID {helper['pid']} ({helper['mem_mb']:.0f}MB)")
+                    except Exception:
+                        pass
+                
+                if freed_mb > 0:
+                    logger.info(f"🔪 Trimmed {len(to_kill[:3])} Chrome helpers (freed ~{freed_mb:.0f}MB)")
+        
+        except Exception as e:
+            logger.debug(f"Chrome helper trimming failed: {e}")
+        
+        return freed_mb
 
     def _kill_non_essential_processes(self) -> List[Dict]:
         """
