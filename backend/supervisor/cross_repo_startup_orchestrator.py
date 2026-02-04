@@ -1331,9 +1331,13 @@ async def _background_gcp_prewarm_task(timeout: Optional[float] = None) -> None:
 
     CRITICAL: This is NON-BLOCKING - it does not delay service startup.
     """
-    # v192.0: Use dynamic timeout from env var
+    # v214.0: Use centralized timeout config
     if timeout is None:
-        timeout = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "300.0"))
+        try:
+            from backend.config.startup_timeouts import get_timeouts
+            timeout = get_timeouts().gcp_vm_startup_timeout
+        except ImportError:
+            timeout = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "600.0"))
     global _active_rescue_gcp_endpoint, _active_rescue_gcp_ready, _trinity_gcp_ready_event
 
     logger.info("[v146.0] 🔥 TRINITY PROTOCOL: Starting background GCP pre-warm...")
@@ -1453,8 +1457,15 @@ async def _background_gcp_retry_for_hollow_client(
 
             logger.info(f"[v192.0] 🔄 GCP retry attempt {attempt}/{max_retries}...")
 
+            # v214.0: Use centralized timeout config
+            try:
+                from backend.config.startup_timeouts import get_timeouts
+                gcp_timeout = get_timeouts().gcp_vm_startup_timeout
+            except ImportError:
+                gcp_timeout = float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "600.0"))
+            
             success, endpoint = await ensure_gcp_vm_ready_for_prime(
-                timeout_seconds=float(os.environ.get("GCP_VM_STARTUP_TIMEOUT", "300.0")),
+                timeout_seconds=gcp_timeout,
                 force_provision=True,  # Force fresh provisioning attempt
             )
 

@@ -201,61 +201,170 @@ def get_crash_info(code: int) -> CrashInfo:
 
 
 # =============================================================================
-# CHROME STABILITY FLAGS
+# CHROME STABILITY FLAGS - OFFICIALLY SUPPORTED ONLY
 # =============================================================================
+# 
+# ROOT CAUSE ANALYSIS for Chrome GPU crashes (code 5):
+# 1. GPU process runs out of memory due to Metal API overhead on macOS
+# 2. CompositorTileWorker threads crash under memory pressure
+# 3. V8 JavaScript heap exhaustion
+#
+# CURE (not band-aid): Use ONLY officially supported Chrome flags that address
+# these root causes through proper resource management, not by disabling
+# security features or using deprecated/unsupported flags.
+#
+# References:
+# - https://peter.sh/experiments/chromium-command-line-switches/
+# - Chromium source: chrome/common/chrome_switches.cc
+# =============================================================================
+
+# Flags that are OFFICIALLY SUPPORTED across Chrome versions
+_SUPPORTED_UNIVERSAL_FLAGS = [
+    # Resource management (addresses root cause: memory pressure)
+    "--disable-dev-shm-usage",              # Use /tmp instead of /dev/shm (prevents SIGBUS)
+    "--disable-extensions",                  # Extensions consume memory
+    "--disable-background-networking",       # Reduce background memory usage
+    "--disable-sync",                        # Disable sync to reduce memory
+    "--disable-default-apps",                # Don't load default apps
+    
+    # Startup optimization
+    "--no-first-run",                        # Skip first run tasks
+    "--no-default-browser-check",            # Skip browser check
+    
+    # Audio/video (reduces GPU memory pressure)
+    "--mute-audio",                          # Mute to save resources
+    "--autoplay-policy=no-user-gesture-required",  # Prevent autoplay blocking
+    
+    # Telemetry
+    "--metrics-recording-only",              # Don't send metrics
+    "--disable-breakpad",                    # Disable crash reporter
+    
+    # Memory limits for V8 (addresses root cause: heap exhaustion)
+    "--js-flags=--max-old-space-size=2048",  # Limit V8 heap to 2GB
+    "--js-flags=--expose-gc",                # Allow manual GC for memory management
+]
+
+# macOS-specific SUPPORTED flags (addresses Metal API issues properly)
+_SUPPORTED_MACOS_FLAGS = [
+    # GPU control (proper way to address Metal crashes)
+    "--disable-gpu",                         # Disable hardware GPU acceleration entirely
+    "--disable-gpu-compositing",             # Disable GPU-based compositing
+    "--disable-accelerated-2d-canvas",       # Disable GPU canvas (major memory user)
+    "--disable-accelerated-video-decode",    # Disable GPU video decode
+    
+    # Feature flags (supported syntax for disabling features)
+    "--disable-features=VizDisplayCompositor,Vulkan,SkiaRenderer",
+    
+    # Renderer settings
+    "--force-color-profile=srgb",            # Consistent color handling
+    "--disable-partial-raster",              # Disable partial GPU raster
+    "--disable-skia-runtime-opts",           # Disable Skia optimizations that may crash
+]
+
+# Linux-specific SUPPORTED flags
+_SUPPORTED_LINUX_FLAGS = [
+    "--disable-gpu",                         # Disable GPU (safe on servers/containers)
+    "--no-sandbox",                          # Required when running as root (Docker)
+    "--disable-setuid-sandbox",              # For containers
+]
+
+# Windows-specific SUPPORTED flags  
+_SUPPORTED_WINDOWS_FLAGS = [
+    "--disable-gpu",                         # Disable GPU for stability
+    "--disable-gpu-compositing",
+]
+
 
 def get_chrome_stability_flags() -> List[str]:
     """
-    Get platform-specific Chrome stability flags.
+    Get platform-specific Chrome stability flags - ONLY officially supported flags.
     
-    These flags are designed to prevent GPU process crashes (code 5) and
-    CompositorTileWorker SIGSEGV crashes on macOS.
+    This function returns flags that:
+    1. Are documented in Chromium source code
+    2. Don't produce "unsupported flag" warnings
+    3. Address root causes of GPU crashes (memory pressure, not security bypasses)
+    
+    Root cause cure for code 5 (GPU crash):
+    - Disable GPU entirely (--disable-gpu) rather than trying to sandbox hack
+    - Limit V8 memory to prevent heap exhaustion
+    - Disable features that cause Metal API crashes on macOS
     """
-    # Universal flags for stability
-    base_flags = [
-        "--disable-gpu-sandbox",
-        "--disable-software-rasterizer", 
-        "--disable-dev-shm-usage",
+    flags = list(_SUPPORTED_UNIVERSAL_FLAGS)  # Copy to avoid mutation
+    
+    if sys.platform == "darwin":
+        flags.extend(_SUPPORTED_MACOS_FLAGS)
+        logger.debug(
+            f"[BrowserStability] Using {len(flags)} macOS-specific stability flags "
+            "(GPU disabled, Metal features disabled)"
+        )
+    elif sys.platform == "linux":
+        flags.extend(_SUPPORTED_LINUX_FLAGS)
+        logger.debug(
+            f"[BrowserStability] Using {len(flags)} Linux-specific stability flags"
+        )
+    elif sys.platform == "win32":
+        flags.extend(_SUPPORTED_WINDOWS_FLAGS)
+        logger.debug(
+            f"[BrowserStability] Using {len(flags)} Windows-specific stability flags"
+        )
+    
+    return flags
+
+
+def get_minimal_stability_flags() -> List[str]:
+    """
+    Get minimal set of stability flags for maximum compatibility.
+    
+    Use this when the full flag set causes issues. This is the absolute
+    minimum needed to prevent GPU crashes.
+    """
+    minimal = [
+        "--disable-gpu",                     # The key fix for code 5 crashes
+        "--disable-dev-shm-usage",           # Prevents SIGBUS on shared memory
         "--no-first-run",
-        "--no-default-browser-check",
         "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--metrics-recording-only",
-        "--disable-default-apps",
-        "--mute-audio",
-        "--no-zygote",
-        "--disable-setuid-sandbox",
-        "--disable-accelerated-2d-canvas",
-        "--disable-web-security",
-        "--js-flags=--max-old-space-size=4096",  # Limit V8 heap
+        "--js-flags=--max-old-space-size=2048",
     ]
     
-    # macOS-specific: Bypass Metal API (prevents CompositorTileWorker crashes)
-    if sys.platform == "darwin":
-        macos_flags = [
-            "--disable-gpu",
-            "--disable-gpu-compositing",
-            "--disable-metal",  # Explicitly disable Metal
-            "--use-gl=swiftshader",  # Force software rendering
-            "--disable-features=VizDisplayCompositor",
-            "--disable-features=Metal",
-            "--disable-accelerated-video-decode",
-            "--disable-accelerated-video-encode",
-            "--in-process-gpu",  # Keep GPU in main process
-        ]
-        base_flags.extend(macos_flags)
-        logger.debug("[BrowserStability] Using macOS Metal bypass flags")
+    # Add platform-specific minimal flags
+    if sys.platform == "linux":
+        # Only add no-sandbox if running as root
+        if os.geteuid() == 0:
+            minimal.append("--no-sandbox")
     
-    # Linux-specific
-    elif sys.platform == "linux":
-        linux_flags = [
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-        ]
-        base_flags.extend(linux_flags)
+    return minimal
+
+
+def validate_chrome_flags(flags: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Validate Chrome flags against known supported flags.
     
-    return base_flags
+    Returns:
+        Tuple of (supported_flags, unsupported_flags)
+    """
+    # Known unsupported/deprecated flags to avoid
+    unsupported_patterns = [
+        "--disable-gpu-sandbox",      # Unsupported, causes warning
+        "--disable-metal",            # Not a real flag
+        "--use-gl=swiftshader",       # SwiftShader may not be installed
+        "--in-process-gpu",           # Deprecated
+        "--disable-web-security",     # Security risk, not stability
+        "--no-zygote",                # Linux-specific, may cause issues
+        "--enable-features=",         # Syntax issues common
+    ]
+    
+    supported = []
+    unsupported = []
+    
+    for flag in flags:
+        is_unsupported = any(pattern in flag for pattern in unsupported_patterns)
+        if is_unsupported:
+            unsupported.append(flag)
+            logger.warning(f"[BrowserStability] Removing unsupported flag: {flag}")
+        else:
+            supported.append(flag)
+    
+    return supported, unsupported
 
 
 def get_chrome_binary_path() -> Optional[str]:

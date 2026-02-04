@@ -121,6 +121,11 @@ _DEFAULT_PRIME_STARTUP_TIMEOUT = 600.0  # 10 min for model loading
 _DEFAULT_REACTOR_STARTUP_TIMEOUT = 120.0
 _DEFAULT_REACTOR_HEALTH_TIMEOUT = 10.0
 
+# v214.0: GCP VM Timeouts - centralized for consistency
+_DEFAULT_GCP_VM_STARTUP_TIMEOUT = 600.0  # 10 min base (APARS can extend this)
+_DEFAULT_GCP_VM_MODEL_LOAD_BUFFER = 300.0  # 5 min extra for model loading
+_DEFAULT_GCP_VM_APARS_HARD_CAP = 1500.0  # 25 min hard cap with APARS extensions
+
 # Lock timeouts
 _DEFAULT_STARTUP_LOCK_TIMEOUT = 30.0
 _DEFAULT_TAKEOVER_HANDOVER_TIMEOUT = 15.0
@@ -264,6 +269,25 @@ class StartupTimeouts:
     """Timeout for Reactor-Core health check."""
 
     # -------------------------------------------------------------------------
+    # GCP VM Timeouts (v214.0)
+    # -------------------------------------------------------------------------
+
+    gcp_vm_startup_timeout: float = field(default_factory=lambda: get_env_float(
+        "GCP_VM_STARTUP_TIMEOUT", _DEFAULT_GCP_VM_STARTUP_TIMEOUT, min_val=60.0
+    ))
+    """Base timeout for GCP VM startup (APARS can extend this adaptively)."""
+
+    gcp_vm_model_load_buffer: float = field(default_factory=lambda: get_env_float(
+        "GCP_MODEL_LOAD_BUFFER", _DEFAULT_GCP_VM_MODEL_LOAD_BUFFER, min_val=30.0
+    ))
+    """Extra buffer time for model loading on GCP VM."""
+
+    gcp_vm_apars_hard_cap: float = field(default_factory=lambda: get_env_float(
+        "GCP_VM_APARS_HARD_CAP", _DEFAULT_GCP_VM_APARS_HARD_CAP, min_val=300.0
+    ))
+    """Hard cap for APARS extended timeouts (prevents unbounded waits)."""
+
+    # -------------------------------------------------------------------------
     # Lock Timeouts
     # -------------------------------------------------------------------------
 
@@ -328,6 +352,7 @@ class StartupTimeouts:
         """Validate timeout relationships after initialization."""
         # Validate all timeout fields are <= max_timeout (per spec requirement)
         # Get all fields except max_timeout itself
+        # Note: gcp_vm_apars_hard_cap intentionally excluded - it can exceed max_timeout
         timeout_fields = [
             "cleanup_timeout_sigint",
             "cleanup_timeout_sigterm",
@@ -344,6 +369,8 @@ class StartupTimeouts:
             "prime_startup_timeout",
             "reactor_startup_timeout",
             "reactor_health_timeout",
+            "gcp_vm_startup_timeout",  # v214.0
+            "gcp_vm_model_load_buffer",  # v214.0
             "startup_lock_timeout",
             "takeover_handover_timeout",
             "max_lock_timeout",
@@ -497,6 +524,10 @@ class StartupTimeouts:
             "prime_startup_timeout": self.prime_startup_timeout,
             "reactor_startup_timeout": self.reactor_startup_timeout,
             "reactor_health_timeout": self.reactor_health_timeout,
+            # GCP VM (v214.0)
+            "gcp_vm_startup_timeout": self.gcp_vm_startup_timeout,
+            "gcp_vm_model_load_buffer": self.gcp_vm_model_load_buffer,
+            "gcp_vm_apars_hard_cap": self.gcp_vm_apars_hard_cap,
             # Locks
             "startup_lock_timeout": self.startup_lock_timeout,
             "takeover_handover_timeout": self.takeover_handover_timeout,
@@ -1065,6 +1096,10 @@ __all__ = [
     "_DEFAULT_PRIME_STARTUP_TIMEOUT",
     "_DEFAULT_REACTOR_STARTUP_TIMEOUT",
     "_DEFAULT_REACTOR_HEALTH_TIMEOUT",
+    # GCP VM defaults (v214.0)
+    "_DEFAULT_GCP_VM_STARTUP_TIMEOUT",
+    "_DEFAULT_GCP_VM_MODEL_LOAD_BUFFER",
+    "_DEFAULT_GCP_VM_APARS_HARD_CAP",
     "_DEFAULT_STARTUP_LOCK_TIMEOUT",
     "_DEFAULT_TAKEOVER_HANDOVER_TIMEOUT",
     "_DEFAULT_MAX_LOCK_TIMEOUT",

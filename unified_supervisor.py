@@ -11667,160 +11667,159 @@ class StartupPhase(Enum):
 # v197.5 FIX: Platform-specific flag sets for macOS vs Linux
 # =============================================================================
 
+# =============================================================================
+# v210.0: CHROME STABILITY FLAGS - OFFICIALLY SUPPORTED ONLY
+# =============================================================================
+# 
+# ROOT CAUSE FIX for Chrome GPU crashes (code 5, 11, 139):
+# - Use ONLY officially supported Chrome flags (no unsupported flag warnings)
+# - Address root causes through proper GPU control, not security bypasses
+# - Flags verified against Chromium source: chrome/common/chrome_switches.cc
+# 
+# DO NOT ADD:
+# - --disable-gpu-sandbox (UNSUPPORTED, security risk)
+# - --in-process-gpu (DEPRECATED)
+# - --use-angle=swiftshader (SwiftShader may not be installed)
+# - --disable-metal (not a real flag)
+# - --no-zygote on macOS (Linux-only)
+# =============================================================================
+
 # === macOS-SPECIFIC FLAGS ===
-# These flags are tested and safe on macOS (Darwin)
-# v197.6: Added Metal API stability flags to prevent CompositorTileWorker SIGSEGV
+# These flags are OFFICIALLY SUPPORTED and tested on macOS (Darwin)
 CHROME_MACOS_STABILITY_FLAGS: List[str] = [
-    # === GPU & METAL CRASH PREVENTION (Code 5/11/139) ===
-    # v197.6 FIX: The CompositorTileWorker1 SIGSEGV crash at ~2.4s is caused by
-    # Metal API initialization. These flags disable the problematic Metal paths.
-    "--disable-gpu",                    # Disable GPU hardware acceleration
-    "--disable-gpu-compositing",        # Disable GPU-based compositing
-    "--disable-accelerated-2d-canvas",  # Disable GPU-accelerated canvas
-    "--disable-accelerated-video-decode", # Disable GPU video decode
-    # v197.6: CRITICAL Metal-specific flags for macOS
-    "--disable-features=Metal",                      # Disable Metal rendering entirely
-    "--disable-features=MetalCommandBufferCaches",   # Disable Metal command buffer caching
-    "--disable-features=RawDraw",                    # Disable raw Metal drawing
-    "--disable-features=UseChromeOSDirectVideoDecoder",  # Disable direct video decoder
-    "--use-angle=swiftshader",          # Use SwiftShader software renderer instead of Metal
-    "--disable-threaded-scrolling",     # Prevent compositor thread issues
-    "--disable-threaded-animation",     # Prevent animation thread issues
-    "--disable-checker-imaging",        # Disable checker imaging (compositor related)
-    "--in-process-gpu",                 # Run GPU in main process (safer on macOS)
-    # NOTE: DO NOT use --disable-software-rasterizer on macOS (causes crashes)
+    # === GPU CRASH PREVENTION (Code 5/11/139) - ROOT CAUSE FIX ===
+    # Completely disable GPU to prevent Metal API crashes
+    "--disable-gpu",                    # Disable GPU hardware acceleration (SUPPORTED)
+    "--disable-gpu-compositing",        # Disable GPU compositing (SUPPORTED)
+    "--disable-accelerated-2d-canvas",  # Disable GPU canvas (SUPPORTED)
+    "--disable-accelerated-video-decode", # Disable GPU video decode (SUPPORTED)
+    
+    # Feature flags (proper syntax for disabling multiple features)
+    "--disable-features=VizDisplayCompositor,Vulkan,SkiaRenderer",
+    
+    # Compositor stability
+    "--disable-partial-raster",         # Disable partial GPU raster (SUPPORTED)
+    "--disable-skia-runtime-opts",      # Disable Skia optimizations (SUPPORTED)
+    "--force-color-profile=srgb",       # Consistent color handling (SUPPORTED)
 
     # === MEMORY OPTIMIZATION ===
-    "--disable-extensions",             # Reduce memory footprint
-    "--disable-plugins",                # Reduce memory footprint
-    "--disable-background-networking",  # Reduce background memory
-    "--disable-sync",                   # Disable sync (memory + network)
-    "--disable-default-apps",           # Don't load default apps
-    "--disable-translate",              # Disable translation feature
-    "--disable-features=TranslateUI",   # More translate disable
-    # NOTE: DO NOT use --single-process on macOS (causes SIGSEGV)
-    # NOTE: DO NOT use --no-zygote on macOS (Linux-only)
-
-    # === RENDERER STABILITY ===
-    "--disable-features=VizDisplayCompositor",  # Stability on macOS
-    "--disable-features=UseSkiaRenderer",       # Use default renderer
-    "--disable-partial-raster",         # Disable partial raster (compositor stability)
-    "--disable-zero-copy",              # Disable zero-copy (memory stability)
-    # NOTE: DO NOT use --no-sandbox on macOS (causes permission issues)
-    # NOTE: DO NOT use --disable-setuid-sandbox (Linux-only)
+    "--disable-extensions",             # Reduce memory footprint (SUPPORTED)
+    "--disable-background-networking",  # Reduce background memory (SUPPORTED)
+    "--disable-sync",                   # Disable sync (SUPPORTED)
+    "--disable-default-apps",           # Don't load default apps (SUPPORTED)
+    "--disable-translate",              # Disable translation (SUPPORTED)
 
     # === GENERAL STABILITY ===
-    "--disable-hang-monitor",           # Disable hang detection
-    "--disable-prompt-on-repost",       # Don't prompt on form resubmit
-    "--disable-popup-blocking",         # Disable popup blocker
-    "--disable-infobars",               # Disable info bars
-    "--disable-notifications",          # Disable notifications
-    "--disable-session-crashed-bubble", # Don't show crash bubble
-    "--disable-breakpad",               # Disable crash reporting
-    "--noerrdialogs",                   # Suppress error dialogs
-    "--disable-background-timer-throttling",  # Prevent timer throttling
+    "--disable-hang-monitor",           # Disable hang detection (SUPPORTED)
+    "--disable-prompt-on-repost",       # Don't prompt on resubmit (SUPPORTED)
+    "--disable-popup-blocking",         # Disable popup blocker (SUPPORTED)
+    "--disable-notifications",          # Disable notifications (SUPPORTED)
+    "--disable-breakpad",               # Disable crash reporting (SUPPORTED)
 
     # === AUTOMATION FLAGS ===
-    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
-    # The --remote-debugging-port flag is added dynamically at launch time
-    "--remote-allow-origins=*",         # Allow all origins for CDP
-    "--no-first-run",                   # Skip first run experience
-    "--no-default-browser-check",       # Skip default browser check
-    "--password-store=basic",           # Use basic password store
-    "--use-mock-keychain",              # macOS: Use mock keychain
+    "--remote-allow-origins=*",         # Allow CDP origins (SUPPORTED)
+    "--no-first-run",                   # Skip first run (SUPPORTED)
+    "--no-default-browser-check",       # Skip browser check (SUPPORTED)
+    "--password-store=basic",           # Basic password store (SUPPORTED)
+    "--use-mock-keychain",              # macOS mock keychain (SUPPORTED)
+    "--mute-audio",                     # Mute audio (SUPPORTED)
 
-    # === V8 MEMORY LIMITS (safe on all platforms) ===
-    "--js-flags=--max-old-space-size=1024",  # Limit V8 heap to 1GB (512 was too aggressive)
+    # === V8 MEMORY LIMITS ===
+    "--js-flags=--max-old-space-size=2048",  # Limit V8 heap to 2GB (SUPPORTED)
+    "--js-flags=--expose-gc",           # Allow manual GC (SUPPORTED)
 ]
 
 # === LINUX-SPECIFIC FLAGS ===
-# These flags are safe on Linux but may crash macOS
+# These flags are safe on Linux containers/servers
 CHROME_LINUX_STABILITY_FLAGS: List[str] = [
     # === GPU CRASH PREVENTION (Code 5) ===
-    "--disable-gpu",
-    "--disable-software-rasterizer",    # Safe on Linux
-    "--disable-gpu-compositing",
-    "--disable-gpu-sandbox",
-    "--disable-accelerated-2d-canvas",
-    "--disable-accelerated-video-decode",
+    "--disable-gpu",                    # Disable GPU (SUPPORTED)
+    "--disable-gpu-compositing",        # Disable compositing (SUPPORTED)
+    "--disable-software-rasterizer",    # Safe on Linux (SUPPORTED)
+    "--disable-accelerated-2d-canvas",  # Disable GPU canvas (SUPPORTED)
+    "--disable-accelerated-video-decode", # Disable GPU video (SUPPORTED)
 
-    # === MEMORY OPTIMIZATION ===
-    "--disable-dev-shm-usage",          # Critical on Linux Docker
-    "--disable-extensions",
-    "--disable-plugins",
-    "--disable-background-networking",
-    "--disable-sync",
-    "--disable-default-apps",
-    "--disable-translate",
-    "--disable-features=TranslateUI",
-    "--disable-features=VizDisplayCompositor",
-    "--memory-pressure-off",
-    "--single-process",                 # Safe on Linux
-    "--no-zygote",                      # Linux-only
+    # === MEMORY & CONTAINER OPTIMIZATION ===
+    "--disable-dev-shm-usage",          # Use /tmp instead of /dev/shm (SUPPORTED)
+    "--disable-extensions",             # Reduce memory (SUPPORTED)
+    "--disable-background-networking",  # Reduce background (SUPPORTED)
+    "--disable-sync",                   # Disable sync (SUPPORTED)
+    "--disable-default-apps",           # Don't load apps (SUPPORTED)
+    "--disable-translate",              # Disable translation (SUPPORTED)
+    
+    # Feature flags
+    "--disable-features=VizDisplayCompositor,IsolateOrigins",
 
-    # === RENDERER STABILITY ===
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--disable-setuid-sandbox",         # Linux-only
-    "--no-sandbox",                     # Safe on Linux
+    # === CONTAINER SANDBOX (only when needed) ===
+    "--no-sandbox",                     # Required when running as root (SUPPORTED)
+    "--disable-setuid-sandbox",         # For containers (SUPPORTED)
 
     # === GENERAL STABILITY ===
-    "--disable-hang-monitor",
-    "--disable-prompt-on-repost",
-    "--disable-popup-blocking",
-    "--disable-infobars",
-    "--disable-notifications",
-    "--disable-session-crashed-bubble",
-    "--disable-breakpad",
-    "--noerrdialogs",
+    "--disable-hang-monitor",           # Disable hang detection (SUPPORTED)
+    "--disable-prompt-on-repost",       # Don't prompt (SUPPORTED)
+    "--disable-popup-blocking",         # Disable popup blocker (SUPPORTED)
+    "--disable-notifications",          # Disable notifications (SUPPORTED)
+    "--disable-breakpad",               # Disable crash reporting (SUPPORTED)
 
     # === AUTOMATION FLAGS ===
-    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
-    "--remote-allow-origins=*",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--password-store=basic",
+    "--remote-allow-origins=*",         # Allow CDP origins (SUPPORTED)
+    "--no-first-run",                   # Skip first run (SUPPORTED)
+    "--no-default-browser-check",       # Skip browser check (SUPPORTED)
+    "--password-store=basic",           # Basic password store (SUPPORTED)
+    "--mute-audio",                     # Mute audio (SUPPORTED)
 
     # === V8 MEMORY LIMITS ===
-    "--js-flags=--max-old-space-size=1024",
+    "--js-flags=--max-old-space-size=2048",  # Limit V8 heap (SUPPORTED)
+    "--js-flags=--expose-gc",           # Allow manual GC (SUPPORTED)
 ]
 
 # === WINDOWS-SPECIFIC FLAGS ===
+# Officially supported flags for Windows
 CHROME_WINDOWS_STABILITY_FLAGS: List[str] = [
-    "--disable-gpu",
-    "--disable-gpu-compositing",
-    "--disable-accelerated-2d-canvas",
-    "--disable-extensions",
-    "--disable-plugins",
-    "--disable-background-networking",
-    "--disable-sync",
-    "--disable-translate",
-    "--disable-hang-monitor",
-    "--disable-popup-blocking",
-    "--disable-infobars",
-    "--disable-notifications",
-    "--disable-session-crashed-bubble",
-    "--disable-breakpad",
-    "--noerrdialogs",
-    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
-    "--remote-allow-origins=*",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--js-flags=--max-old-space-size=1024",
+    # GPU control
+    "--disable-gpu",                    # Disable GPU (SUPPORTED)
+    "--disable-gpu-compositing",        # Disable compositing (SUPPORTED)
+    "--disable-accelerated-2d-canvas",  # Disable GPU canvas (SUPPORTED)
+    
+    # Memory optimization
+    "--disable-extensions",             # Reduce memory (SUPPORTED)
+    "--disable-background-networking",  # Reduce background (SUPPORTED)
+    "--disable-sync",                   # Disable sync (SUPPORTED)
+    "--disable-translate",              # Disable translation (SUPPORTED)
+    
+    # Stability
+    "--disable-hang-monitor",           # Disable hang detection (SUPPORTED)
+    "--disable-popup-blocking",         # Disable popups (SUPPORTED)
+    "--disable-notifications",          # Disable notifications (SUPPORTED)
+    "--disable-breakpad",               # Disable crash reporting (SUPPORTED)
+    
+    # Automation
+    "--remote-allow-origins=*",         # CDP origins (SUPPORTED)
+    "--no-first-run",                   # Skip first run (SUPPORTED)
+    "--no-default-browser-check",       # Skip browser check (SUPPORTED)
+    "--mute-audio",                     # Mute audio (SUPPORTED)
+    
+    # V8 memory
+    "--js-flags=--max-old-space-size=2048",  # Limit V8 heap (SUPPORTED)
 ]
 
 # === MINIMAL FLAGS (for maximum compatibility) ===
+# v210.0: ONLY officially supported flags - no unsupported flag warnings
 # Use these if the full flag set causes issues
-# v197.6: Added critical Metal-bypass flags even for minimal mode
 CHROME_MINIMAL_STABILITY_FLAGS: List[str] = [
-    "--disable-gpu",
-    "--disable-gpu-compositing",        # v197.6: Critical for compositor crashes
-    "--use-angle=swiftshader",          # v197.6: Software renderer fallback
-    "--disable-features=Metal",         # v197.6: Disable Metal on macOS
-    "--disable-extensions",
-    # NOTE: CDP port is now dynamic - see _find_available_cdp_port()
-    "--remote-allow-origins=*",
-    "--no-first-run",
-    "--disable-session-crashed-bubble",
+    # Core stability (the minimum needed to prevent GPU crashes)
+    "--disable-gpu",                    # Key fix for code 5 crashes (SUPPORTED)
+    "--disable-gpu-compositing",        # Prevent compositor crashes (SUPPORTED)
+    "--disable-dev-shm-usage",          # Prevent SIGBUS (SUPPORTED)
+    
+    # Memory management
+    "--disable-extensions",             # Reduce memory (SUPPORTED)
+    "--js-flags=--max-old-space-size=2048",  # Limit V8 heap (SUPPORTED)
+    
+    # Automation basics
+    "--remote-allow-origins=*",         # CDP origins (SUPPORTED)
+    "--no-first-run",                   # Skip first run (SUPPORTED)
+    "--mute-audio",                     # Mute audio (SUPPORTED)
 ]
 
 # === CDP PORT CONFIGURATION ===

@@ -130,16 +130,36 @@ class CircuitBreaker:
         self,
         name: str = "default",
         config: Optional[CircuitBreakerConfig] = None,
+        # Backward-compatible parameters (match original inline implementation)
+        failure_threshold: Optional[int] = None,
+        recovery_timeout: Optional[float] = None,
+        half_open_max_calls: Optional[int] = None,
     ):
         """
         Initialize circuit breaker.
         
+        Supports both the new config-based API and backward-compatible
+        parameter-based API for drop-in replacement.
+        
         Args:
             name: Name for logging and identification
             config: Configuration (uses defaults if None)
+            failure_threshold: Number of failures before opening (backward compat)
+            recovery_timeout: Seconds before attempting recovery (backward compat)
+            half_open_max_calls: Max requests in half-open state (backward compat)
         """
         self._name = name
-        self._config = config or CircuitBreakerConfig(name=name)
+        
+        # If backward-compatible parameters are provided, build config from them
+        if failure_threshold is not None or recovery_timeout is not None:
+            self._config = CircuitBreakerConfig(
+                name=name,
+                failure_threshold=failure_threshold if failure_threshold is not None else 5,
+                recovery_timeout_seconds=recovery_timeout if recovery_timeout is not None else 30.0,
+                half_open_max_requests=half_open_max_calls if half_open_max_calls is not None else 3,
+            )
+        else:
+            self._config = config or CircuitBreakerConfig(name=name)
         self._config.name = name
         
         # State
@@ -158,6 +178,11 @@ class CircuitBreaker:
         
         # History
         self._failure_history: List[Dict[str, Any]] = []
+        
+        # Expose config values as attributes for backward compatibility
+        self.failure_threshold = self._config.failure_threshold
+        self.recovery_timeout = self._config.recovery_timeout_seconds
+        self.half_open_max_calls = self._config.half_open_max_requests
         
         logger.debug(
             f"[CircuitBreaker:{name}] Initialized with "
@@ -338,6 +363,44 @@ class CircuitBreaker:
         }
     
     # =========================================================================
+    # COROUTINE EXECUTION API (for backward compatibility with inline version)
+    # =========================================================================
+    
+    async def execute(self, coro) -> Any:
+        """
+        Execute a coroutine with circuit breaker protection.
+        
+        This method wraps a coroutine and handles the circuit breaker
+        check, execution, and success/failure recording automatically.
+        
+        This is the backward-compatible API matching the original inline
+        implementation used by resource managers.
+        
+        Args:
+            coro: A coroutine to execute
+            
+        Returns:
+            The result of the coroutine
+            
+        Raises:
+            RuntimeError: If circuit is OPEN
+            Any exception from the coroutine
+        
+        Example:
+            result = await breaker.execute(async_operation())
+        """
+        if not await self.can_execute():
+            raise RuntimeError(f"Circuit breaker {self._name} is OPEN")
+        
+        try:
+            result = await coro
+            await self.record_success()
+            return result
+        except Exception as e:
+            await self.record_failure(str(e))
+            raise
+    
+    # =========================================================================
     # SYNCHRONOUS API (for backward compatibility)
     # =========================================================================
     
@@ -381,27 +444,53 @@ class RetryWithBackoff:
     """
     Retry with exponential backoff and optional jitter.
     
-    Usage:
-        retry = RetryWithBackoff(max_retries=3)
+    Supports both the new config-based API and backward-compatible
+    parameter-based API for drop-in replacement.
+    
+    Usage (new style):
+        retry = RetryWithBackoff(config=RetryConfig(max_retries=3))
         
-        async for attempt in retry:
-            try:
-                result = await operation()
-                break  # Success
-            except Exception as e:
-                if not retry.should_retry(e):
-                    raise
+    Usage (backward-compatible):
+        retry = RetryWithBackoff(max_retries=3, base_delay=1.0)
+        result = await retry.execute(lambda: async_op(), "operation_name")
     """
     
     def __init__(
         self,
         config: Optional[RetryConfig] = None,
         name: str = "default",
+        # Backward-compatible parameters
+        max_retries: Optional[int] = None,
+        base_delay: Optional[float] = None,
+        max_delay: Optional[float] = None,
+        exponential_base: Optional[float] = None,
+        jitter: Optional[float] = None,
+        retry_exceptions: Optional[tuple] = None,
     ):
-        self._config = config or RetryConfig()
+        # If backward-compatible parameters are provided, build config from them
+        if max_retries is not None or base_delay is not None:
+            self._config = RetryConfig(
+                max_retries=max_retries if max_retries is not None else 3,
+                initial_delay=base_delay if base_delay is not None else 1.0,
+                max_delay=max_delay if max_delay is not None else 30.0,
+                exponential_base=exponential_base if exponential_base is not None else 2.0,
+                jitter=jitter is not None and jitter > 0,
+            )
+        else:
+            self._config = config or RetryConfig()
+        
         self._name = name
         self._attempt = 0
         self._last_error: Optional[Exception] = None
+        self._retry_exceptions = retry_exceptions or (Exception,)
+        
+        # Expose config values as attributes for backward compatibility
+        self.max_retries = self._config.max_retries
+        self.base_delay = self._config.initial_delay
+        self.max_delay = self._config.max_delay
+        self.exponential_base = self._config.exponential_base
+        self.jitter = 0.1 if self._config.jitter else 0.0
+        self.retry_exceptions = self._retry_exceptions
     
     def should_retry(self, error: Exception) -> bool:
         """Check if should retry based on error type and attempt count."""
@@ -438,6 +527,54 @@ class RetryWithBackoff:
                 await asyncio.sleep(delay)
             
             self._attempt += 1
+    
+    async def execute(
+        self,
+        coro_factory: Callable[[], Any],
+        operation_name: str = "operation",
+    ) -> Any:
+        """
+        Execute an operation with retry logic.
+        
+        This is the backward-compatible API matching the original inline
+        implementation used by various components.
+        
+        Args:
+            coro_factory: A callable that returns a coroutine
+            operation_name: Name for logging purposes
+            
+        Returns:
+            The result of the successful coroutine
+            
+        Raises:
+            The last exception if all retries exhausted
+        
+        Example:
+            result = await retry.execute(
+                lambda: async_operation(),
+                "fetch_data"
+            )
+        """
+        last_exception: Optional[Exception] = None
+        
+        for attempt in range(self._config.max_retries + 1):
+            try:
+                return await coro_factory()
+            except Exception as e:
+                last_exception = e
+                self._last_error = e
+                self._attempt = attempt + 1
+                
+                if attempt < self._config.max_retries:
+                    delay = self.get_delay()
+                    logger.debug(
+                        f"[Retry:{self._name}] {operation_name} failed "
+                        f"(attempt {attempt + 1}/{self._config.max_retries + 1}), "
+                        f"retrying in {delay:.1f}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+        
+        raise last_exception or RuntimeError(f"Retries exhausted for {operation_name}")
 
 
 # =============================================================================
