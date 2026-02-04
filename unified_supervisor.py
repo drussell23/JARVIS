@@ -57180,24 +57180,130 @@ class JarvisSystemKernel:
                     os.environ["JARVIS_EARLY_PRIME_PID"] = str(process.pid)
                     os.environ["JARVIS_EARLY_PRIME_PORT"] = str(prime_port)
                     
-                    # Monitor health briefly to confirm startup began
-                    await asyncio.sleep(5)  # Give it a few seconds to start
+                    # v220.3: Start background health monitor to update dashboard
+                    # This continuously polls Prime's health and updates the progress bar
+                    await asyncio.sleep(3)  # Brief wait before first health check
                     
                     health_url = f"http://localhost:{prime_port}/health"
-                    try:
+                    
+                    async def _monitor_early_prime_health():
+                        """
+                        Background monitor that polls Early Prime health endpoint
+                        and updates the dashboard with real-time progress.
+                        
+                        This runs until Prime is ready or Trinity phase takes over.
+                        """
                         import aiohttp
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(health_url, timeout=5) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    self.logger.info(f"[EarlyPrime] Prime responding: {data.get('status', 'unknown')}")
-                                else:
-                                    self.logger.debug(f"[EarlyPrime] Prime starting (HTTP {resp.status})")
-                    except Exception:
-                        self.logger.debug("[EarlyPrime] Prime not yet responding (normal during model load)")
+                        _start_time = time.time()
+                        _last_progress = 1
+                        
+                        while True:
+                            try:
+                                # Check if Trinity has taken over (env var cleared)
+                                if "JARVIS_EARLY_PRIME_PID" not in os.environ:
+                                    self.logger.debug("[EarlyPrime] Trinity took over - stopping monitor")
+                                    update_dashboard_model_loading(active=False)
+                                    break
+                                
+                                elapsed = time.time() - _start_time
+                                
+                                # Poll health endpoint
+                                try:
+                                    async with aiohttp.ClientSession() as session:
+                                        async with session.get(health_url, timeout=5) as resp:
+                                            if resp.status == 200:
+                                                data = await resp.json()
+                                                
+                                                # Extract progress from health response
+                                                status = data.get("status", "unknown")
+                                                phase = data.get("phase", "loading")
+                                                model_loaded = data.get("model_loaded", False)
+                                                ready = data.get("ready_for_inference", False)
+                                                
+                                                # Get progress from various fields
+                                                progress = data.get("startup_progress", 0)
+                                                if not progress:
+                                                    progress = data.get("model_load_progress_pct", 0)
+                                                if not progress:
+                                                    progress = data.get("loading_progress", 0)
+                                                if not progress:
+                                                    # Estimate from elapsed time (720s total)
+                                                    progress = min(95, int((elapsed / 720.0) * 100))
+                                                
+                                                # Never go backwards
+                                                progress = max(progress, _last_progress)
+                                                _last_progress = progress
+                                                
+                                                # Get model info
+                                                model_name = data.get("model") or data.get("active_model") or "LLM"
+                                                stage = data.get("loading_stage") or phase or "loading"
+                                                stage_detail = data.get("status_message") or f"Loading {model_name}"
+                                                
+                                                # Calculate ETA
+                                                if progress > 5 and elapsed > 10:
+                                                    rate = progress / elapsed
+                                                    remaining = int((100 - progress) / rate) if rate > 0 else 600
+                                                else:
+                                                    remaining = 720 - int(elapsed)
+                                                
+                                                # Update dashboard
+                                                update_dashboard_model_loading(
+                                                    active=True,
+                                                    model_name=model_name,
+                                                    progress_pct=progress,
+                                                    stage=stage,
+                                                    stage_detail=stage_detail,
+                                                    estimated_total_seconds=720,
+                                                    elapsed_seconds=int(elapsed),
+                                                    reason=f"Loading model ({progress}% complete, ~{remaining//60}m {remaining%60}s remaining)"
+                                                )
+                                                
+                                                if ready or model_loaded:
+                                                    self.logger.info(f"[EarlyPrime] Model ready! (elapsed: {elapsed:.1f}s)")
+                                                    update_dashboard_model_loading(active=False)
+                                                    break
+                                                    
+                                except aiohttp.ClientError:
+                                    # Prime not responding yet - estimate progress
+                                    progress = min(50, max(_last_progress, int((elapsed / 720.0) * 100)))
+                                    _last_progress = progress
+                                    remaining = 720 - int(elapsed)
+                                    
+                                    update_dashboard_model_loading(
+                                        active=True,
+                                        model_name="LLM",
+                                        progress_pct=progress,
+                                        stage="initializing",
+                                        stage_detail="Prime starting up...",
+                                        estimated_total_seconds=720,
+                                        elapsed_seconds=int(elapsed),
+                                        reason=f"Starting Prime ({progress}% complete, ~{remaining//60}m {remaining%60}s remaining)"
+                                    )
+                                
+                                # Poll every 3 seconds for responsive progress updates
+                                await asyncio.sleep(3.0)
+                                
+                                # Stop after 15 minutes (failsafe)
+                                if elapsed > 900:
+                                    self.logger.warning("[EarlyPrime] Monitor timeout after 15 minutes")
+                                    break
+                                    
+                            except asyncio.CancelledError:
+                                break
+                            except Exception as e:
+                                self.logger.debug(f"[EarlyPrime] Monitor error: {e}")
+                                await asyncio.sleep(5.0)
+                    
+                    # Start background monitor
+                    _monitor_task = create_safe_task(
+                        _monitor_early_prime_health(),
+                        name="early-prime-health-monitor"
+                    )
+                    self._background_tasks.append(_monitor_task)
                     
                 except Exception as e:
                     self.logger.warning(f"[EarlyPrime] Pre-warm failed (non-fatal): {e}")
+                    update_dashboard_model_loading(active=False)
                     # Clear any partial state
                     if "JARVIS_EARLY_PRIME_PID" in os.environ:
                         del os.environ["JARVIS_EARLY_PRIME_PID"]
