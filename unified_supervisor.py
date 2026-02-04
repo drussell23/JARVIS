@@ -2453,9 +2453,55 @@ class StartupLock:
             return False, None
 
     def _is_process_alive(self, pid: int) -> bool:
-        """Check if a process is alive."""
+        """
+        Check if a process is alive AND is actually a JARVIS process.
+        
+        v220.3: Enhanced stale lock detection with process validation.
+        Previously, this only checked if a PID existed. If the original JARVIS
+        process died and the PID was reused by another process, we would
+        incorrectly think JARVIS was still running.
+        
+        Now we also verify the process is actually JARVIS by checking:
+        1. Process exists (os.kill signal 0)
+        2. Process cmdline contains 'unified_supervisor' or 'jarvis' (case-insensitive)
+        """
         try:
-            os.kill(pid, 0)
+            os.kill(pid, 0)  # Check if process exists
+            
+            # v220.3: Verify it's actually a JARVIS process
+            # This prevents false positives when PID is reused
+            if platform.system() == "Darwin" or platform.system() == "Linux":
+                try:
+                    # Read process command line
+                    if platform.system() == "Darwin":
+                        # macOS: use ps command
+                        import subprocess
+                        result = subprocess.run(
+                            ["ps", "-p", str(pid), "-o", "command="],
+                            capture_output=True, text=True, timeout=2
+                        )
+                        cmdline = result.stdout.lower()
+                    else:
+                        # Linux: read /proc/{pid}/cmdline
+                        with open(f"/proc/{pid}/cmdline", "r") as f:
+                            cmdline = f.read().lower().replace("\x00", " ")
+                    
+                    # Check if it's a JARVIS-related process
+                    jarvis_markers = [
+                        "unified_supervisor",
+                        "jarvis",
+                        "kernel.lock",  # In case it's a child process
+                    ]
+                    is_jarvis = any(marker in cmdline for marker in jarvis_markers)
+                    
+                    if not is_jarvis:
+                        # PID exists but isn't JARVIS - this is a stale lock
+                        return False
+                        
+                except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
+                    # Can't verify cmdline - assume alive to be safe
+                    pass
+            
             return True
         except (OSError, ProcessLookupError):
             return False
@@ -65484,6 +65530,12 @@ Environment Variables:
         dest="no_dashboard",
         help="Skip dashboard display during startup (for scripts/CI)",
     )
+    # v220.3: Force flag for edge cases with stale locks
+    control.add_argument(
+        "--force",
+        action="store_true",
+        help="Force start: kill any existing kernel and take over the lock (use with caution)",
+    )
 
     # =========================================================================
     # OPERATING MODE
@@ -66583,22 +66635,43 @@ async def handle_cloud_monitor_logs() -> int:
 async def _fetch_lock_status_readonly() -> Dict[str, Any]:
     """
     Fetch startup lock status in READ-ONLY mode.
+    
+    v220.3: Enhanced with automatic stale lock cleanup.
 
     NEVER acquires the lock - only reads current state.
     Uses StartupLock.is_locked() and get_current_holder().
+    
+    Now also:
+    - Detects stale locks (PID dead or not JARVIS)
+    - Auto-cleans stale locks if detected
+    - Reports stale lock cleanup in result
 
     Returns:
-        Dict with keys: locked, holder_pid, holder_info, error
+        Dict with keys: locked, holder_pid, holder_info, stale_cleaned, error
     """
     result: Dict[str, Any] = {
         "locked": False,
         "holder_pid": None,
         "holder_info": None,
+        "stale_cleaned": False,
         "error": None,
     }
 
     try:
         lock = StartupLock("kernel")
+        
+        # v220.3: First check if lock file exists with raw PID
+        # This lets us detect and report stale locks
+        raw_holder_pid = None
+        if lock.lock_path.exists():
+            try:
+                content = lock.lock_path.read_text().strip()
+                data = json.loads(content)
+                raw_holder_pid = data.get("pid")
+            except (json.JSONDecodeError, OSError):
+                pass
+        
+        # Now do the proper alive check
         is_locked, holder_pid = lock.is_locked()
         result["locked"] = is_locked
         result["holder_pid"] = holder_pid
@@ -66606,6 +66679,17 @@ async def _fetch_lock_status_readonly() -> Dict[str, Any]:
         if is_locked:
             holder_info = lock.get_current_holder()
             result["holder_info"] = holder_info
+        elif raw_holder_pid and not is_locked:
+            # v220.3: Lock file exists but process is dead/not JARVIS
+            # This is a stale lock - clean it up automatically
+            try:
+                lock.lock_path.unlink()
+                result["stale_cleaned"] = True
+                result["holder_pid"] = raw_holder_pid  # Report what we cleaned
+                _unified_logger.info(f"[v220.3] Auto-cleaned stale lock from dead PID {raw_holder_pid}")
+            except OSError as e:
+                result["error"] = f"Stale lock cleanup failed: {e}"
+                
     except Exception as e:
         result["error"] = str(e)
 
@@ -67267,9 +67351,14 @@ async def _show_startup_dashboard() -> None:
     invincible_status = results[2] if isinstance(results[2], dict) else {"enabled": False}
 
     # Lock status
+    # v220.3: Enhanced lock status with stale lock cleanup reporting
     if lock_status.get("locked"):
         holder_pid = lock_status.get("holder_pid", "?")
         print(f"  {status_icon(False)} Lock: Held by PID {holder_pid} (kernel already running?)")
+    elif lock_status.get("stale_cleaned"):
+        # v220.3: Stale lock was auto-cleaned
+        old_pid = lock_status.get("holder_pid", "?")
+        print(f"  {status_icon(True)} Lock: Available (auto-cleaned stale lock from dead PID {old_pid})")
     else:
         print(f"  {status_icon(True)} Lock: Available")
 
@@ -68028,6 +68117,47 @@ async def async_main(args: argparse.Namespace) -> int:
         # Shutdown first, then continue to startup
         await handle_shutdown()
         await asyncio.sleep(2.0)  # Wait for shutdown
+
+    # v220.3: Handle --force flag for forceful takeover
+    if getattr(args, 'force', False):
+        print(f"{YELLOW}[Force Mode] Attempting forceful takeover...{RESET}")
+        
+        lock = StartupLock("kernel")
+        is_locked, holder_pid = lock.is_locked()
+        
+        if is_locked and holder_pid:
+            print(f"{YELLOW}[Force Mode] Killing existing kernel (PID {holder_pid})...{RESET}")
+            try:
+                os.kill(holder_pid, signal.SIGTERM)
+                await asyncio.sleep(1.0)
+                # Force kill if still alive
+                try:
+                    os.kill(holder_pid, 0)  # Check if still alive
+                    os.kill(holder_pid, signal.SIGKILL)
+                    await asyncio.sleep(0.5)
+                except (OSError, ProcessLookupError):
+                    pass  # Already dead
+                print(f"{GREEN}[Force Mode] Previous kernel terminated{RESET}")
+            except (OSError, ProcessLookupError):
+                print(f"{YELLOW}[Force Mode] PID {holder_pid} already dead{RESET}")
+        
+        # Clean up lock file
+        if lock.lock_path.exists():
+            lock.lock_path.unlink()
+            print(f"{GREEN}[Force Mode] Lock file cleaned{RESET}")
+        
+        # Also clean up any child processes
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["pkill", "-9", "-f", "run_server.py|loading_server.py"],
+                capture_output=True, timeout=3
+            )
+        except Exception:
+            pass
+        
+        print(f"{GREEN}[Force Mode] Ready for fresh start{RESET}")
+        await asyncio.sleep(0.5)
 
     # v201.3: Show dashboard before startup (unless --no-dashboard)
     # This gives visibility into system state before kernel starts or dry-run
