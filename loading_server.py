@@ -4,20 +4,43 @@ JARVIS Loading Server v87.0 - Trinity Ultra Edition (LEGACY)
 ============================================================
 
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  ⚠️  DEPRECATION NOTICE (v211.0)                                             ║
+║  ⚠️  DEPRECATION NOTICE (v212.0)                                             ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  This file is the LEGACY loading server. The CANONICAL version is now:       ║
 ║                                                                               ║
-║     backend/loading_server.py (v182.0+)                                       ║
+║     backend/loading_server.py (v212.0+)                                       ║
+║     backend/loading_server/          (modular package)                        ║
 ║                                                                               ║
-║  The unified_supervisor.py uses the backend version.                          ║
+║  v212.0 MODULAR PACKAGE STRUCTURE:                                            ║
+║     backend/loading_server/                                                   ║
+║       __init__.py              - Package exports with lazy imports            ║
+║       tracing.py               - W3C Distributed Tracing (50 lines)           ║
+║       persistence.py           - Event Sourcing + SQLite (~200 lines)         ║
+║       eta_prediction.py        - ML-based ETA Prediction (~350 lines)         ║
+║       lock_free.py             - CAS Atomic Updates (~50 lines)               ║
+║       container_awareness.py   - cgroup Detection (~90 lines)                 ║
+║       backpressure.py          - AIMD Backpressure (~60 lines)                ║
+║       cross_repo_health.py     - Health Aggregation (~150 lines)              ║
+║       trinity_heartbeat.py     - Heartbeat Monitoring (~80 lines)             ║
+║       self_healing.py          - Auto-Recovery (~120 lines)                   ║
+║       message_generator.py     - Context-Aware Messages (~130 lines)          ║
+║       progress_reporter.py     - HTTP Client (~200 lines)                     ║
+║                                                                               ║
+║  The unified_supervisor.py uses the backend version with v212.0 features.     ║
 ║                                                                               ║
 ║  This file is kept for:                                                       ║
 ║  - Backward compatibility with run_supervisor.py                              ║
 ║  - Test imports (tests/test_loading_server_shutdown_fix.py)                   ║
-║  - Reference for advanced features (W3C tracing, SQLite persistence)         ║
+║  - Reference for advanced features now in modular package                     ║
 ║                                                                               ║
-║  Migration: Update imports to use backend.loading_server                      ║
+║  Migration:                                                                   ║
+║    OLD: from loading_server import LoadingServer                              ║
+║    NEW: from backend.loading_server import LoadingServer                      ║
+║                                                                               ║
+║    OLD: from loading_server import W3CTraceContext                            ║
+║    NEW: from backend.loading_server import W3CTraceContext                    ║
+║                                                                               ║
+║  All v87.0 features have been extracted to the modular package.               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Serves the loading page independently from frontend/backend during restart.

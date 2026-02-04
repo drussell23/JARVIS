@@ -983,6 +983,39 @@ except ImportError:
     VoiceOrchestrator = None
 
 # =============================================================================
+# v212.0: ADVANCED LOADING SERVER INTEGRATION
+# =============================================================================
+# Enterprise-grade loading server features for enhanced startup UX:
+# - W3C Distributed Tracing (cross-service debugging)
+# - Container Awareness (K8s/Docker timeout scaling)
+# - Adaptive Backpressure (slow client handling)
+# - Cross-Repo Health Aggregation (unified Trinity health)
+# - Trinity Heartbeat Monitoring (direct file-based health)
+# - Intelligent Message Generation (context-aware UX)
+# - Progress Reporter Client (HTTP-based progress updates)
+# =============================================================================
+try:
+    from backend.loading_server import (
+        W3CTraceContext,
+        ContainerAwareness,
+        AdaptiveBackpressureController,
+        CrossRepoHealthAggregator,
+        TrinityHeartbeatReader,
+        IntelligentMessageGenerator,
+        ProgressReporter,
+    )
+    LOADING_SERVER_V212_AVAILABLE = True
+except ImportError:
+    LOADING_SERVER_V212_AVAILABLE = False
+    W3CTraceContext = None
+    ContainerAwareness = None
+    AdaptiveBackpressureController = None
+    CrossRepoHealthAggregator = None
+    TrinityHeartbeatReader = None
+    IntelligentMessageGenerator = None
+    ProgressReporter = None
+
+# =============================================================================
 # CONSTANTS
 # =============================================================================
 
@@ -54767,6 +54800,101 @@ class JarvisSystemKernel:
         # This prevents broadcast attempts before server is ready
         self._loading_server_ready: bool = False
 
+        # =====================================================================
+        # v212.0: Advanced Loading Server Integration
+        # =====================================================================
+        # Enterprise-grade features for enhanced startup UX:
+        # - W3C Distributed Tracing (cross-service debugging)
+        # - Container Awareness (K8s/Docker timeout scaling)
+        # - Adaptive Backpressure (slow client handling)
+        # - Cross-Repo Health Aggregation (unified Trinity health)
+        # - Trinity Heartbeat Monitoring (direct file-based health)
+        # - Intelligent Message Generation (context-aware UX)
+        # - Progress Reporter Client (HTTP-based progress updates)
+        # =====================================================================
+        self._trace_context: Optional["W3CTraceContext"] = None
+        self._container_awareness: Optional["ContainerAwareness"] = None
+        self._backpressure_controller: Optional["AdaptiveBackpressureController"] = None
+        self._cross_repo_health: Optional["CrossRepoHealthAggregator"] = None
+        self._trinity_heartbeat_reader: Optional["TrinityHeartbeatReader"] = None
+        self._message_generator: Optional["IntelligentMessageGenerator"] = None
+        self._progress_reporter: Optional["ProgressReporter"] = None
+        self._v212_features_available: bool = False
+
+        # Initialize v212.0 features if available
+        self._init_v212_features()
+
+    def _init_v212_features(self) -> None:
+        """
+        v212.0: Initialize advanced loading server features.
+
+        These features provide enhanced startup UX including:
+        - W3C Distributed Tracing for cross-service debugging
+        - Container Awareness for K8s/Docker timeout scaling
+        - Adaptive Backpressure for slow client handling
+        - Cross-Repo Health Aggregation for unified Trinity health
+        - Trinity Heartbeat Monitoring for direct file-based health
+        - Intelligent Message Generation for context-aware UX
+        - Progress Reporter Client for HTTP-based progress updates
+        """
+        if not LOADING_SERVER_V212_AVAILABLE:
+            self.logger.debug("[v212.0] Advanced features not available (import failed)")
+            return
+
+        try:
+            # W3C Distributed Tracing - unique trace context for this startup session
+            if W3CTraceContext is not None:
+                self._trace_context = W3CTraceContext()
+                self.logger.debug(f"[v212.0] Trace context: {self._trace_context.trace_id[:16]}...")
+
+            # Container Awareness - detect K8s/Docker and adjust timeouts
+            if ContainerAwareness is not None:
+                self._container_awareness = ContainerAwareness()
+                if self._container_awareness.is_containerized:
+                    multiplier = self._container_awareness.get_timeout_multiplier()
+                    self.logger.info(
+                        f"[v212.0] Container detected ({self._container_awareness.container_type}), "
+                        f"timeout multiplier: {multiplier:.1f}x"
+                    )
+
+            # Adaptive Backpressure Controller - for slow WebSocket clients
+            if AdaptiveBackpressureController is not None:
+                self._backpressure_controller = AdaptiveBackpressureController()
+
+            # Cross-Repo Health Aggregator - unified Trinity health view
+            if CrossRepoHealthAggregator is not None:
+                self._cross_repo_health = CrossRepoHealthAggregator(
+                    jarvis_home=self.config.jarvis_home
+                )
+
+            # Trinity Heartbeat Reader - direct file-based health monitoring
+            if TrinityHeartbeatReader is not None:
+                self._trinity_heartbeat_reader = TrinityHeartbeatReader(
+                    jarvis_home=self.config.jarvis_home
+                )
+
+            # Intelligent Message Generator - context-aware startup messages
+            if IntelligentMessageGenerator is not None:
+                self._message_generator = IntelligentMessageGenerator()
+
+            # Progress Reporter Client - HTTP-based progress updates with tracing
+            if ProgressReporter is not None:
+                self._progress_reporter = ProgressReporter(
+                    port=self.config.loading_server_port,
+                    timeout=5.0,
+                    max_retries=3,
+                )
+                # Set trace context for request propagation
+                if self._trace_context is not None:
+                    self._progress_reporter.set_trace_context(self._trace_context)
+
+            self._v212_features_available = True
+            self.logger.info("[v212.0] Advanced loading server features initialized")
+
+        except Exception as e:
+            self.logger.warning(f"[v212.0] Feature initialization failed: {e}")
+            self._v212_features_available = False
+
     @property
     def state(self) -> KernelState:
         """Current kernel state."""
@@ -60347,6 +60475,7 @@ class JarvisSystemKernel:
             self._startup_watchdog.update_phase(stage, progress)
 
         # v205.0: Get timeout from StartupTimeouts if available, default 2.0s
+        # v212.0: Apply container-aware timeout multiplier if running in K8s/Docker
         timeout = 2.0
         if STARTUP_TIMEOUTS_AVAILABLE and get_timeouts is not None:
             try:
@@ -60354,6 +60483,10 @@ class JarvisSystemKernel:
                 timeout = timeouts.broadcast_timeout
             except Exception:
                 pass
+
+        # v212.0: Apply container-aware timeout scaling
+        if self._container_awareness is not None and self._container_awareness.is_containerized:
+            timeout *= self._container_awareness.get_timeout_multiplier()
 
         # v205.0: Bounded retries - max 2 attempts, NON-FATAL
         max_retries = 2
@@ -60412,6 +60545,7 @@ class JarvisSystemKernel:
 
         v205.0: This runs in a thread via asyncio.to_thread to never block the event loop.
         v210.0: Enhanced error tracking for diagnostics.
+        v212.0: Added W3C trace context propagation for distributed tracing.
 
         Args:
             progress_data: The progress data to send
@@ -60434,11 +60568,22 @@ class JarvisSystemKernel:
 
         try:
             url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
+
+            # v212.0: Add trace context to progress data if available
+            if self._trace_context is not None:
+                progress_data["trace_id"] = self._trace_context.trace_id
+
             data = _json.dumps(progress_data).encode('utf-8')
+
+            # v212.0: Build headers with W3C trace context
+            headers = {'Content-Type': 'application/json'}
+            if self._trace_context is not None:
+                headers['traceparent'] = self._trace_context.to_traceparent()
+
             req = urllib.request.Request(
                 url,
                 data=data,
-                headers={'Content-Type': 'application/json'},
+                headers=headers,
                 method='POST'
             )
 
@@ -60696,6 +60841,210 @@ class JarvisSystemKernel:
         self.logger.info(
             f"[StateChange] {component}: {old_state} → {new_state} ({reason}) @ {timestamp}"
         )
+
+    # =========================================================================
+    # v212.0: ADVANCED LOADING SERVER FEATURES
+    # =========================================================================
+    # Enterprise-grade features for enhanced startup UX.
+    # =========================================================================
+
+    def _get_intelligent_message(
+        self,
+        stage: str,
+        progress: float,
+        component: Optional[str] = None
+    ) -> str:
+        """
+        v212.0: Generate intelligent context-aware message using IntelligentMessageGenerator.
+
+        Uses historical startup data and current context to generate
+        helpful, contextual messages during startup.
+
+        Args:
+            stage: Current startup stage
+            progress: Progress percentage (0-100)
+            component: Optional component name for component-specific messages
+
+        Returns:
+            Contextual message string
+        """
+        if self._message_generator is None:
+            # Fallback to simple message
+            name = (component or stage).replace("_", " ").title()
+            return f"{name}... ({progress:.0f}%)"
+
+        try:
+            return self._message_generator.generate_message(
+                stage=stage,
+                component=component,
+                progress=progress,
+            )
+        except Exception as e:
+            self.logger.debug(f"[v212.0] Message generation failed: {e}")
+            return f"{stage}... ({progress:.0f}%)"
+
+    async def _get_cross_repo_health(self) -> Dict[str, Any]:
+        """
+        v212.0: Get unified health status across all Trinity components.
+
+        Aggregates health from:
+        - jarvis_body (this backend)
+        - jarvis_prime (local LLM)
+        - reactor_core (training pipeline)
+
+        Returns:
+            Dict with health status for each component and overall summary
+        """
+        if self._cross_repo_health is None:
+            return {"available": False, "reason": "CrossRepoHealthAggregator not initialized"}
+
+        try:
+            return await self._cross_repo_health.get_aggregated_health()
+        except Exception as e:
+            self.logger.debug(f"[v212.0] Cross-repo health check failed: {e}")
+            return {"available": False, "error": str(e)}
+
+    async def _get_trinity_heartbeats(self) -> Dict[str, Any]:
+        """
+        v212.0: Get direct heartbeat status from Trinity component files.
+
+        Reads heartbeat files from ~/.jarvis/trinity/components/ for:
+        - jarvis_body.json
+        - jarvis_prime.json
+        - reactor_core.json
+        - coding_council.json
+        - agentic_watchdog.json
+
+        Returns:
+            Dict with heartbeat status for each component
+        """
+        if self._trinity_heartbeat_reader is None:
+            return {"available": False, "reason": "TrinityHeartbeatReader not initialized"}
+
+        try:
+            heartbeats = await self._trinity_heartbeat_reader.get_all_heartbeats()
+            summary = await self._trinity_heartbeat_reader.get_health_summary()
+            return {
+                "available": True,
+                "heartbeats": {
+                    name: {
+                        "status": hb.status if hb else "unknown",
+                        "age_seconds": round(hb.age_seconds, 1) if hb else None,
+                        "is_healthy": hb.is_healthy if hb else False,
+                    }
+                    for name, hb in heartbeats.items()
+                },
+                "summary": summary,
+            }
+        except Exception as e:
+            self.logger.debug(f"[v212.0] Trinity heartbeat read failed: {e}")
+            return {"available": False, "error": str(e)}
+
+    def _get_startup_greeting(self) -> str:
+        """
+        v212.0: Get time-of-day appropriate startup greeting.
+
+        Returns contextual greeting like:
+        - "Good morning! JARVIS is booting up..."
+        - "Working late? JARVIS is here to help."
+
+        Returns:
+            Greeting message
+        """
+        if self._message_generator is None:
+            return "JARVIS is starting up..."
+
+        try:
+            return self._message_generator.get_greeting()
+        except Exception:
+            return "JARVIS is starting up..."
+
+    def _get_completion_message(self, duration: Optional[float] = None) -> str:
+        """
+        v212.0: Get startup completion message.
+
+        Args:
+            duration: Total startup duration in seconds
+
+        Returns:
+            Completion message with optional timing
+        """
+        if self._message_generator is None:
+            if duration:
+                return f"JARVIS is ready! (Started in {duration:.1f}s)"
+            return "JARVIS is ready!"
+
+        try:
+            return self._message_generator.get_completion_message(duration)
+        except Exception:
+            if duration:
+                return f"JARVIS is ready! (Started in {duration:.1f}s)"
+            return "JARVIS is ready!"
+
+    def _track_stage_start(self, stage: str) -> None:
+        """
+        v212.0: Track when a startup stage begins for timing analysis.
+
+        Args:
+            stage: Stage name starting
+        """
+        if self._message_generator is not None:
+            try:
+                self._message_generator.track_stage_start(stage)
+            except Exception as e:
+                self.logger.debug(f"[v212.0] Stage tracking failed: {e}")
+
+    def _track_stage_end(self, stage: str) -> None:
+        """
+        v212.0: Track when a startup stage ends for timing analysis.
+
+        Records duration for future ETA predictions.
+
+        Args:
+            stage: Stage name ending
+        """
+        if self._message_generator is not None:
+            try:
+                self._message_generator.track_stage_end(stage)
+            except Exception as e:
+                self.logger.debug(f"[v212.0] Stage tracking failed: {e}")
+
+    def get_v212_diagnostics(self) -> Dict[str, Any]:
+        """
+        v212.0: Get diagnostics for advanced loading server features.
+
+        Returns:
+            Dict with feature availability and status
+        """
+        return {
+            "v212_available": self._v212_features_available,
+            "features": {
+                "trace_context": {
+                    "available": self._trace_context is not None,
+                    "trace_id": self._trace_context.trace_id[:16] + "..." if self._trace_context else None,
+                },
+                "container_awareness": {
+                    "available": self._container_awareness is not None,
+                    "is_containerized": self._container_awareness.is_containerized if self._container_awareness else False,
+                    "container_type": self._container_awareness.container_type if self._container_awareness else None,
+                },
+                "backpressure": {
+                    "available": self._backpressure_controller is not None,
+                },
+                "cross_repo_health": {
+                    "available": self._cross_repo_health is not None,
+                },
+                "trinity_heartbeat": {
+                    "available": self._trinity_heartbeat_reader is not None,
+                },
+                "message_generator": {
+                    "available": self._message_generator is not None,
+                },
+                "progress_reporter": {
+                    "available": self._progress_reporter is not None,
+                },
+            },
+        }
 
     async def run(self) -> int:
         """
