@@ -3,11 +3,14 @@
 Cloud Database Adapter for JARVIS
 Supports both local SQLite and GCP Cloud SQL (PostgreSQL)
 Seamless switching between local and cloud databases
+
+v2.0.0: Added proxy lifecycle coordination with unified supervisor
 """
 import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,6 +25,192 @@ try:
 except ImportError:
     ASYNCPG_AVAILABLE = False
     logging.warning("asyncpg not available - install with: pip install asyncpg")
+
+
+# =============================================================================
+# v2.0.0: PROXY LIFECYCLE COORDINATION
+# =============================================================================
+# This module coordinates proxy lifecycle between the unified supervisor
+# and other components that need database access. It prevents:
+# - Redundant warnings when supervisor is managing the proxy
+# - Race conditions during startup
+# - Multiple components trying to start the proxy simultaneously
+# =============================================================================
+
+class _ProxyLifecycleCoordinator:
+    """
+    Singleton coordinator for Cloud SQL proxy lifecycle management.
+    
+    This ensures only one component (preferably the unified supervisor)
+    manages the proxy, while other components can check status and wait
+    for readiness without triggering redundant warnings or startup attempts.
+    """
+    
+    _instance = None
+    _lock = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+            
+        self._initialized = True
+        self._supervisor_managing = False
+        self._proxy_ready = False
+        self._proxy_ready_event = None  # Lazy-created asyncio.Event
+        self._startup_time = time.time()
+        self._startup_grace_period = 30.0  # 30 seconds grace for supervisor to start proxy
+        self._warned_this_session = False
+        self._manager_name = None  # Who is managing the proxy
+        self._ready_timestamp = None
+        self._logger = logging.getLogger(__name__)
+    
+    def _get_or_create_event(self) -> asyncio.Event:
+        """Get or create the async event (must be called in async context)."""
+        if self._proxy_ready_event is None:
+            try:
+                self._proxy_ready_event = asyncio.Event()
+                if self._proxy_ready:
+                    self._proxy_ready_event.set()
+            except RuntimeError:
+                # No event loop running - will be created later
+                pass
+        return self._proxy_ready_event
+    
+    def register_supervisor_management(self, manager_name: str = "UnifiedSupervisor"):
+        """
+        Register that the supervisor is managing proxy lifecycle.
+        
+        This suppresses warnings from other components during startup
+        and prevents them from trying to start the proxy themselves.
+        """
+        self._supervisor_managing = True
+        self._manager_name = manager_name
+        self._logger.debug(f"[ProxyCoordinator] Proxy lifecycle managed by: {manager_name}")
+    
+    def signal_proxy_ready(self):
+        """Signal that the proxy is ready for connections."""
+        self._proxy_ready = True
+        self._ready_timestamp = time.time()
+        self._logger.debug("[ProxyCoordinator] Proxy marked as ready")
+        
+        # Signal any waiting coroutines
+        if self._proxy_ready_event is not None:
+            try:
+                self._proxy_ready_event.set()
+            except Exception:
+                pass
+    
+    def signal_proxy_failed(self):
+        """Signal that the proxy failed to start (allows fallback)."""
+        self._proxy_ready = False
+        self._supervisor_managing = False  # Allow others to try
+        self._logger.debug("[ProxyCoordinator] Proxy startup failed, releasing management lock")
+        
+        # Signal any waiting coroutines to unblock
+        if self._proxy_ready_event is not None:
+            try:
+                self._proxy_ready_event.set()  # Unblock waiters so they can fallback
+            except Exception:
+                pass
+    
+    def is_proxy_ready(self) -> bool:
+        """Check if proxy is confirmed ready."""
+        return self._proxy_ready
+    
+    def is_supervisor_managing(self) -> bool:
+        """Check if supervisor is managing the proxy lifecycle."""
+        return self._supervisor_managing
+    
+    def is_in_startup_grace_period(self) -> bool:
+        """Check if we're still in the startup grace period."""
+        return (time.time() - self._startup_time) < self._startup_grace_period
+    
+    def should_suppress_warning(self) -> bool:
+        """
+        Determine if proxy warnings should be suppressed.
+        
+        Suppresses if:
+        - Supervisor is managing the proxy (it will handle it)
+        - We're in the startup grace period (supervisor may not have started yet)
+        - We've already warned this session
+        """
+        if self._supervisor_managing:
+            return True
+        if self.is_in_startup_grace_period():
+            return True
+        if self._warned_this_session:
+            return True
+        return False
+    
+    def mark_warned(self):
+        """Mark that we've issued a warning this session (prevents spam)."""
+        self._warned_this_session = True
+    
+    async def wait_for_proxy(self, timeout: float = 30.0) -> bool:
+        """
+        Wait for proxy to become ready (or fail).
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            True if proxy is ready, False if timed out or failed
+        """
+        if self._proxy_ready:
+            return True
+        
+        event = self._get_or_create_event()
+        if event is None:
+            # No event loop, can't wait asynchronously
+            return self._proxy_ready
+        
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return self._proxy_ready
+        except asyncio.TimeoutError:
+            return False
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get current coordinator status for debugging."""
+        return {
+            "supervisor_managing": self._supervisor_managing,
+            "manager_name": self._manager_name,
+            "proxy_ready": self._proxy_ready,
+            "ready_timestamp": self._ready_timestamp,
+            "in_grace_period": self.is_in_startup_grace_period(),
+            "grace_remaining_sec": max(0, self._startup_grace_period - (time.time() - self._startup_time)),
+            "warned_this_session": self._warned_this_session,
+        }
+
+
+# Global singleton
+_proxy_coordinator = _ProxyLifecycleCoordinator()
+
+
+def get_proxy_coordinator() -> _ProxyLifecycleCoordinator:
+    """Get the proxy lifecycle coordinator singleton."""
+    return _proxy_coordinator
+
+
+def register_supervisor_proxy_management(manager_name: str = "UnifiedSupervisor"):
+    """Convenience function to register supervisor management."""
+    _proxy_coordinator.register_supervisor_management(manager_name)
+
+
+def signal_proxy_ready():
+    """Convenience function to signal proxy is ready."""
+    _proxy_coordinator.signal_proxy_ready()
+
+
+def signal_proxy_failed():
+    """Convenience function to signal proxy startup failed."""
+    _proxy_coordinator.signal_proxy_failed()
 
 # Import singleton connection manager
 try:
@@ -282,10 +471,12 @@ class CloudDatabaseAdapter:
         """
         Ensure Cloud SQL proxy is running, start it if not.
 
-        Features:
+        v2.0.0 Features:
+        - Coordinates with unified supervisor via ProxyLifecycleCoordinator
+        - Waits for supervisor to start proxy if in grace period
+        - Prevents redundant warnings and startup attempts
         - Intelligent detection with caching
-        - Only warns when Cloud SQL was explicitly requested
-        - Auto-start with exponential backoff
+        - Auto-start with exponential backoff (only if not supervisor-managed)
         - Silent fallback when proxy unavailable
 
         Returns:
@@ -293,7 +484,24 @@ class CloudDatabaseAdapter:
         """
         import asyncio
         import socket
-        import time
+
+        coordinator = get_proxy_coordinator()
+        
+        # v2.0.0: If supervisor is managing and proxy is ready, skip all checks
+        if coordinator.is_proxy_ready():
+            logger.debug(f"[ProxyCoordinator] Proxy confirmed ready by coordinator")
+            return True
+        
+        # v2.0.0: If supervisor is managing, wait for it to complete
+        if coordinator.is_supervisor_managing():
+            logger.debug("[ProxyCoordinator] Supervisor managing proxy - waiting...")
+            ready = await coordinator.wait_for_proxy(timeout=30.0)
+            if ready:
+                logger.debug("[ProxyCoordinator] Proxy ready (supervisor managed)")
+                return True
+            else:
+                logger.debug("[ProxyCoordinator] Supervisor proxy startup timed out")
+                # Fall through to manual check
 
         # Check if proxy port is already listening
         try:
@@ -304,17 +512,43 @@ class CloudDatabaseAdapter:
 
             if result == 0:
                 logger.debug(f"Cloud SQL proxy detected on port {self.config.db_port}")
+                # Signal to coordinator that proxy is available
+                if not coordinator.is_proxy_ready():
+                    coordinator.signal_proxy_ready()
                 return True
         except Exception as e:
             logger.debug(f"Port check failed: {e}")
 
+        # v2.0.0: If we're in the startup grace period, wait a bit longer
+        # The supervisor might be about to start the proxy
+        if coordinator.is_in_startup_grace_period() and not coordinator.is_supervisor_managing():
+            logger.debug("[ProxyCoordinator] In startup grace period - brief wait before proceeding")
+            await asyncio.sleep(3)  # Brief wait for supervisor to potentially take over
+            
+            # Re-check
+            if coordinator.is_supervisor_managing():
+                ready = await coordinator.wait_for_proxy(timeout=25.0)
+                if ready:
+                    return True
+
         # Proxy not running - check if we should even try to start it
-        # Only log warning if Cloud SQL was explicitly requested
-        if self.config._explicit_cloudsql_request:
+        # v2.0.0: Use coordinator to determine if we should warn
+        should_warn = (
+            self.config._explicit_cloudsql_request and 
+            not coordinator.should_suppress_warning()
+        )
+        
+        if should_warn:
             logger.warning(f"⚠️  Cloud SQL proxy not detected on port {self.config.db_port}")
             logger.info(f"🚀 Attempting to start Cloud SQL proxy...")
+            coordinator.mark_warned()  # Prevent repeated warnings
         else:
             logger.debug(f"Cloud SQL proxy not running on port {self.config.db_port}")
+
+        # v2.0.0: If supervisor is managing, don't try to start ourselves
+        if coordinator.is_supervisor_managing():
+            logger.debug("[ProxyCoordinator] Supervisor managing - not starting proxy independently")
+            return False
 
         try:
             from intelligence.cloud_sql_proxy_manager import CloudSQLProxyManager
@@ -324,11 +558,12 @@ class CloudDatabaseAdapter:
 
             if started:
                 logger.info(f"✅ Cloud SQL proxy started successfully")
+                coordinator.signal_proxy_ready()
                 # Wait a moment for proxy to be fully ready
                 await asyncio.sleep(2)
                 return True
             else:
-                if self.config._explicit_cloudsql_request:
+                if should_warn:
                     logger.error(f"❌ Failed to start Cloud SQL proxy")
                 else:
                     logger.debug(f"Cloud SQL proxy not available - will use SQLite")
@@ -336,14 +571,14 @@ class CloudDatabaseAdapter:
 
         except FileNotFoundError as e:
             # Config file or proxy binary not found - this is expected if not configured
-            if self.config._explicit_cloudsql_request:
+            if should_warn:
                 logger.error(f"❌ Cloud SQL proxy not configured: {e}")
             else:
                 logger.debug(f"Cloud SQL proxy not configured: {e}")
             return False
 
         except Exception as e:
-            if self.config._explicit_cloudsql_request:
+            if should_warn:
                 logger.error(f"❌ Error starting Cloud SQL proxy: {e}")
             else:
                 logger.debug(f"Cloud SQL proxy error: {e}")

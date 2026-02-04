@@ -56271,6 +56271,20 @@ class JarvisSystemKernel:
         """
         Internal startup implementation (wrapped by timeout in startup()).
         """
+        # =====================================================================
+        # v2.0.0: EARLY PROXY LIFECYCLE COORDINATION
+        # =====================================================================
+        # Register supervisor as proxy manager FIRST, before any component
+        # imports the database adapter. This prevents redundant warnings from
+        # components that initialize before _initialize_cloud_sql_proxy runs.
+        # =====================================================================
+        try:
+            from intelligence.cloud_database_adapter import register_supervisor_proxy_management
+            register_supervisor_proxy_management("UnifiedSupervisor")
+            self.logger.debug("[CloudSQL] Early proxy coordinator registration complete")
+        except ImportError:
+            pass  # Coordinator not available, proceed without it
+        
         # Initialize startup issue collector for organized error/warning display
         issue_collector = get_startup_issue_collector()
         issue_collector.clear()  # Fresh start
@@ -62737,11 +62751,13 @@ class JarvisSystemKernel:
         """
         Initialize and manage the Cloud SQL proxy for database connections.
 
-        Features:
+        v2.0.0 Features:
+        - Coordinates with ProxyLifecycleCoordinator to prevent redundant warnings
         - Auto-detects if proxy is already running
         - Starts proxy if needed (singleton pattern)
         - Validates connection to Cloud SQL
         - Falls back to SQLite if unavailable
+        - Signals ready/failed status to waiting components
 
         Returns:
             Dict with proxy status and connection info
@@ -62755,8 +62771,25 @@ class JarvisSystemKernel:
             "fallback_to_sqlite": False,
         }
 
+        # v2.0.0: Register that supervisor is managing proxy lifecycle
+        # This prevents other components from issuing redundant warnings
+        try:
+            from intelligence.cloud_database_adapter import (
+                register_supervisor_proxy_management,
+                signal_proxy_ready,
+                signal_proxy_failed,
+            )
+            register_supervisor_proxy_management("UnifiedSupervisor")
+            self.logger.debug("[CloudSQL] Registered as proxy lifecycle manager")
+        except ImportError:
+            # Coordinator not available, proceed without it
+            signal_proxy_ready = None
+            signal_proxy_failed = None
+
         if not self.config.cloud_sql_enabled:
             self.logger.info("[CloudSQL] Proxy disabled by configuration")
+            if signal_proxy_failed:
+                signal_proxy_failed()
             return result
 
         self.logger.info("[CloudSQL] Initializing Cloud SQL proxy...")
@@ -62767,6 +62800,8 @@ class JarvisSystemKernel:
             if not config_path.exists():
                 self.logger.warning("[CloudSQL] Config not found, falling back to SQLite")
                 result["fallback_to_sqlite"] = True
+                if signal_proxy_failed:
+                    signal_proxy_failed()
                 return result
 
             import json
@@ -62805,6 +62840,9 @@ class JarvisSystemKernel:
                     result["running"] = True
                     result["reused_existing"] = True
                     result["enabled"] = True
+                    # v2.0.0: Signal proxy is ready to waiting components
+                    if signal_proxy_ready:
+                        signal_proxy_ready()
                 else:
                     # Start proxy
                     self.logger.info("[CloudSQL] Starting proxy process...")
@@ -62814,17 +62852,27 @@ class JarvisSystemKernel:
                         self.logger.success(f"[CloudSQL] Proxy started on port {result['port']}")
                         result["running"] = True
                         result["enabled"] = True
+                        # v2.0.0: Signal proxy is ready to waiting components
+                        if signal_proxy_ready:
+                            signal_proxy_ready()
                     else:
                         self.logger.warning("[CloudSQL] Proxy failed to start, using SQLite")
                         result["fallback_to_sqlite"] = True
+                        # v2.0.0: Signal proxy failed so waiting components can fallback
+                        if signal_proxy_failed:
+                            signal_proxy_failed()
 
             except ImportError as e:
                 self.logger.warning(f"[CloudSQL] Proxy manager not available: {e}")
                 result["fallback_to_sqlite"] = True
+                if signal_proxy_failed:
+                    signal_proxy_failed()
 
         except Exception as e:
             self.logger.error(f"[CloudSQL] Initialization error: {e}")
             result["fallback_to_sqlite"] = True
+            if signal_proxy_failed:
+                signal_proxy_failed()
 
         return result
 
