@@ -51766,6 +51766,7 @@ class StartupWatchdog:
     # - backend: JARVIS_BACKEND_STARTUP_TIMEOUT (default 90s)
     #
     # Environment overrides: JARVIS_DMS_TIMEOUT_<PHASE>=<seconds>
+    # v210.0: Added 'two_tier' phase for VBIA/Watchdog initialization
     DEFAULT_PHASES: Dict[str, PhaseConfig] = {
         "clean_slate": PhaseConfig("Clean Slate", 30.0, 0, 5, "diagnostic"),
         "loading_server": PhaseConfig("Loading Server", 45.0, 5, 15, "restart"),
@@ -51774,6 +51775,8 @@ class StartupWatchdog:
         "resources": PhaseConfig("Resources", 330.0, 25, 45, "restart"),
         "backend": PhaseConfig("Backend", 120.0, 45, 55, "restart"),  # v192.0: Increased for slower starts
         "intelligence": PhaseConfig("Intelligence", 120.0, 55, 65, "diagnostic"),  # v192.0: Increased
+        # v210.0: Two-Tier Security phase (VBIA Adapter + Agentic Watchdog)
+        "two_tier": PhaseConfig("Two-Tier Security", 60.0, 55, 65, "diagnostic"),
         # v193.0: Trinity timeout increased to cover GCP VM startup (300s) + fallback (120s) + buffer (60s)
         # This prevents false DMS timeouts when GCP VM health check fails and fallback triggers
         "trinity": PhaseConfig("Trinity", 480.0, 65, 85, "restart"),

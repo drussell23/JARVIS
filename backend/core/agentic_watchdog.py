@@ -292,6 +292,38 @@ class AgenticWatchdog:
         logger.info("[Watchdog] AgenticWatchdog initialized")
 
     # =========================================================================
+    # Properties (v210.0)
+    # =========================================================================
+    
+    @property
+    def mode(self) -> AgenticMode:
+        """
+        v210.0: Current mode of the watchdog.
+        
+        Provides convenient access to the current mode without needing
+        to call get_status().
+        
+        Returns:
+            Current AgenticMode (PASSIVE, AUTONOMOUS, DOWNGRADED, KILLED)
+        """
+        return self._mode
+    
+    @property
+    def is_active(self) -> bool:
+        """v210.0: Whether the watchdog is actively monitoring a task."""
+        return self._active_task_id is not None
+    
+    @property
+    def is_autonomous(self) -> bool:
+        """v210.0: Whether the watchdog is in autonomous mode."""
+        return self._mode == AgenticMode.AUTONOMOUS
+    
+    @property
+    def kill_switch_armed(self) -> bool:
+        """v210.0: Whether the kill switch is armed."""
+        return self._kill_switch_armed
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
 
