@@ -10301,16 +10301,19 @@ class AsyncVoiceNarrator:
 
         # v220.2: CRITICAL - Acquire lock to prevent concurrent speech
         # This is a non-blocking try to prevent deadlocks during rapid calls
+        # v220.2.1: Use wait_for instead of asyncio.timeout for Python 3.9 compatibility
+        acquired = False
         try:
-            async with asyncio.timeout(0.1):  # Quick timeout for lock acquisition
-                acquired = await self._speech_lock.acquire()
+            # Try to acquire lock with short timeout (non-blocking)
+            await asyncio.wait_for(self._speech_lock.acquire(), timeout=0.1)
+            acquired = True
         except asyncio.TimeoutError:
             # Another speech is in progress - skip this one if lower priority
             if priority.value >= self._current_priority.value:
                 _unified_logger.debug(f"[Voice] Skipping (lock busy, lower priority): {text[:30]}...")
                 self._messages_skipped += 1
                 return
-            # Higher priority - wait for lock
+            # Higher priority - wait for lock (blocking)
             await self._speech_lock.acquire()
             acquired = True
         
