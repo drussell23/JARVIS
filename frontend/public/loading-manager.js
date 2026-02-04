@@ -1731,11 +1731,11 @@ class JARVISLoadingManager {
         // ═══════════════════════════════════════════════════════════════════════════
         console.log('[v210.0] Phase 2: Checking system readiness...');
         
-        // Quick check: Skip loading if system already fully ready (backend + frontend)
+        // Quick check: Skip loading if system already fully ready (backend + frontend + WebSocket)
         const fullyReady = await this.checkFullSystemReady();
         if (fullyReady) {
             console.log('[JARVIS] ✅ Full system already ready - skipping loading screen');
-            this.quickRedirectToApp();
+            await this.quickRedirectToApp();
             return;
         }
 
@@ -1749,7 +1749,7 @@ class JARVISLoadingManager {
                 const frontendReady = await this.checkFrontendReady();
                 if (frontendReady) {
                     console.log('[v210.0] ✅ Frontend also ready - redirecting');
-                    this.quickRedirectToApp();
+                    await this.quickRedirectToApp();
                     return;
                 } else {
                     console.log('[v210.0] ℹ️ Frontend not ready yet - showing completion with fallback');
@@ -1914,17 +1914,32 @@ class JARVISLoadingManager {
 
     async checkFullSystemReady() {
         /**
-         * Check if BOTH backend AND frontend are ready.
-         * Only returns true if both services are available.
-         * This prevents the loading screen from skipping when only backend is up.
+         * v211.0: Check if backend, WebSocket, AND frontend are all ready.
+         * 
+         * CRITICAL FIX: Previously only checked HTTP endpoints, causing redirect
+         * before WebSocket was stable. This resulted in "OFFLINE - SEARCHING FOR BACKEND"
+         * errors in the React frontend.
+         * 
+         * Now verifies:
+         * 1. Backend HTTP health endpoint responds
+         * 2. Backend WebSocket endpoint accepts connections (NEW!)
+         * 3. Frontend HTTP is accessible
+         * 
+         * Only returns true if ALL services are verified operational.
          */
-        const [backendReady, frontendReady] = await Promise.all([
+        const backendPort = this.config.backendPort || 8010;
+        
+        // Run all checks in parallel for speed
+        const [backendReady, wsReady, frontendReady] = await Promise.all([
             this.checkBackendHealth(),
+            this.testWebSocket(`ws://${this.config.hostname}:${backendPort}/ws`),
             this.checkFrontendReady()
         ]);
 
-        console.log(`[Health] Full system check - Backend: ${backendReady}, Frontend: ${frontendReady}`);
-        return backendReady && frontendReady;
+        console.log(`[Health] Full system check - Backend: ${backendReady}, WebSocket: ${wsReady}, Frontend: ${frontendReady}`);
+        
+        // ALL three must be ready
+        return backendReady && wsReady && frontendReady;
     }
 
     async quickBackendCheck() {
@@ -1950,17 +1965,62 @@ class JARVISLoadingManager {
         }
     }
 
-    quickRedirectToApp() {
+    async quickRedirectToApp() {
         /**
-         * Quick redirect to main app when backend is already ready.
-         * Shows brief success animation before redirect.
+         * v211.0: Quick redirect to main app with final verification.
+         * 
+         * CRITICAL FIX: Added final WebSocket verification before redirect.
+         * This prevents "OFFLINE - SEARCHING FOR BACKEND" by ensuring
+         * WebSocket connectivity is confirmed before sending user to React app.
          */
-        // Stop polling
+        // Prevent duplicate redirects
+        if (this.state.redirecting) {
+            console.log('[Redirect] Already redirecting, skipping duplicate call');
+            return;
+        }
+        
         this.state.redirecting = true;
 
+        // Update UI to show verifying state
+        if (this.elements.statusMessage) {
+            this.elements.statusMessage.textContent = 'Verifying connection...';
+        }
+        if (this.elements.progressBar) {
+            this.elements.progressBar.style.width = '98%';
+        }
+        if (this.elements.subtitle) {
+            this.elements.subtitle.textContent = 'VERIFYING';
+        }
+
+        // v211.0: Final WebSocket verification before redirect
+        const backendPort = this.config.backendPort || 8010;
+        const wsUrl = `ws://${this.config.hostname}:${backendPort}/ws`;
+        
+        console.log(`[Redirect] Final WebSocket verification at ${wsUrl}...`);
+        const wsReady = await this.testWebSocket(wsUrl);
+        
+        if (!wsReady) {
+            console.warn('[Redirect] WebSocket not ready - delaying redirect');
+            this.state.redirecting = false;
+            
+            // Show warning and retry after delay
+            if (this.elements.statusMessage) {
+                this.elements.statusMessage.textContent = 'WebSocket connecting...';
+            }
+            if (this.elements.subtitle) {
+                this.elements.subtitle.textContent = 'CONNECTING';
+            }
+            
+            // Retry after 2 seconds
+            setTimeout(() => this.quickRedirectToApp(), 2000);
+            return;
+        }
+
+        console.log('[Redirect] ✓ WebSocket verified - proceeding with redirect');
+        
         // Update UI to show ready state
         if (this.elements.statusMessage) {
-            this.elements.statusMessage.textContent = 'JARVIS is already online!';
+            this.elements.statusMessage.textContent = 'JARVIS is online!';
         }
         if (this.elements.progressBar) {
             this.elements.progressBar.style.width = '100%';
@@ -2221,7 +2281,7 @@ class JARVISLoadingManager {
             const systemReady = await this.checkFullSystemReady();
             if (systemReady) {
                 console.log('[WebSocket] ✅ System already running - redirecting');
-                this.quickRedirectToApp();
+                await this.quickRedirectToApp();
             } else {
                 console.warn('[WebSocket] System not ready - will rely on health polling fallback');
             }
@@ -2338,10 +2398,10 @@ class JARVISLoadingManager {
         // This provides faster recovery when loading server is down but system is healthy
         if (this.state.reconnectAttempts === 3) {
             console.log('[WebSocket] 3 attempts failed - checking if system already running...');
-            this.checkFullSystemReady().then(ready => {
+            this.checkFullSystemReady().then(async (ready) => {
                 if (ready && !this.state.redirecting) {
                     console.log('[WebSocket] ✅ System already running (early check) - redirecting');
-                    this.quickRedirectToApp();
+                    await this.quickRedirectToApp();
                 }
             });
         }
@@ -5866,9 +5926,9 @@ class JARVISLoadingManager {
                     case 'redirect-complete':
                         // Another tab redirected - we should too
                         console.log('[v87.0] 🔄 Another tab redirected - following');
-                        setTimeout(() => {
+                        setTimeout(async () => {
                             if (this.state.progress >= 100) {
-                                this.quickRedirectToApp();
+                                await this.quickRedirectToApp();
                             }
                         }, 500);
                         break;
