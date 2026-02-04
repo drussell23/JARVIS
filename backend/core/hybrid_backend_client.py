@@ -158,7 +158,20 @@ class HybridBackendClient:
     """
 
     def __init__(self, config_path: Optional[str] = None):
-        self.config_path = config_path or "backend/core/hybrid_config.yaml"
+        # v218.0: Robust config path resolution with guaranteed absolute paths
+        # Uses .resolve() to ensure the path is absolute regardless of:
+        # - Working directory when Python was invoked
+        # - Symlinks in the path
+        # - Relative imports
+        if config_path:
+            # User-provided path - resolve to absolute
+            self.config_path = str(Path(config_path).resolve())
+        else:
+            # Default: resolve relative to this file's directory (backend/core/)
+            # __file__ can be relative if Python was invoked with a relative path
+            this_file = Path(__file__).resolve()  # Guaranteed absolute path
+            this_dir = this_file.parent
+            self.config_path = str(this_dir / "hybrid_config.yaml")
         self.config = self._load_config()
 
         # Initialize HTTP client with connection pooling

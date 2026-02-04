@@ -1065,6 +1065,34 @@ class CloudSQLProxyManager:
                 logger.info(f"   Command: {' '.join(cmd)}")
 
                 # v124.0: Run all blocking I/O in thread pool to not block event loop
+                # v217.0: Ensure GCP credentials are available in environment
+                proxy_env = os.environ.copy()
+                gcp_creds_path = None
+                
+                # Try to find GCP credentials if not set
+                if "GOOGLE_APPLICATION_CREDENTIALS" not in proxy_env:
+                    # Search for credentials in standard locations
+                    creds_search_paths = [
+                        Path.home() / ".config" / "gcloud" / "application_default_credentials.json",
+                        Path.home() / ".gcloud" / "application_default_credentials.json",
+                        Path("/etc/google/auth/application_default_credentials.json"),
+                    ]
+                    for creds_path in creds_search_paths:
+                        if creds_path.exists():
+                            gcp_creds_path = str(creds_path)
+                            proxy_env["GOOGLE_APPLICATION_CREDENTIALS"] = gcp_creds_path
+                            logger.info(f"   GCP credentials: {gcp_creds_path}")
+                            break
+                    
+                    if not gcp_creds_path:
+                        logger.warning(
+                            "⚠️ No GCP credentials found. Proxy may fail to authenticate.\n"
+                            "   Run: gcloud auth application-default login"
+                        )
+                else:
+                    gcp_creds_path = proxy_env["GOOGLE_APPLICATION_CREDENTIALS"]
+                    logger.info(f"   GCP credentials (env): {gcp_creds_path}")
+                
                 def _start_proxy_process_sync():
                     """Sync helper - runs in thread pool."""
                     # Ensure log directory exists
@@ -1077,6 +1105,7 @@ class CloudSQLProxyManager:
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,  # Detach from parent
+                        env=proxy_env,  # v217.0: Pass environment with GCP credentials
                     )
 
                     # Write PID file
@@ -1100,7 +1129,25 @@ class CloudSQLProxyManager:
                         def _read_log_sync():
                             return self.log_path.read_text() if self.log_path.exists() else "No log"
                         log_content = await asyncio.to_thread(_read_log_sync)
-                        error_msg = f"Proxy process crashed (exit code: {self.process.returncode})\nLog:\n{log_content}"
+                        
+                        # v217.0: Enhanced error diagnostics
+                        exit_code = self.process.returncode
+                        error_msg = f"Proxy process crashed (exit code: {exit_code})"
+                        
+                        # Provide specific guidance based on error
+                        if "unauthorized" in log_content.lower() or "permission denied" in log_content.lower():
+                            error_msg += "\n   → Authentication failed. Run: gcloud auth application-default login"
+                        elif "quota" in log_content.lower():
+                            error_msg += "\n   → API quota exceeded. Wait or check GCP console."
+                        elif "not found" in log_content.lower() and "instance" in log_content.lower():
+                            error_msg += "\n   → Cloud SQL instance not found. Check connection_name in database_config.json"
+                        elif exit_code == 1 and not log_content.strip():
+                            error_msg += "\n   → Likely authentication issue. Run: gcloud auth application-default login"
+                        
+                        if log_content.strip():
+                            # Only show first 500 chars of log to avoid spam
+                            error_msg += f"\n   Log: {log_content[:500]}..."
+                        
                         logger.error(f"❌ {error_msg}")
                         last_error = error_msg
                         break
