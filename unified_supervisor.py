@@ -4183,9 +4183,11 @@ class LiveProgressDashboard:
         estimated_total_seconds: int = None,
         elapsed_seconds: int = None,
         reason: str = None,
+        handoff: bool = False,  # v221.0: Handoff mode - preserve progress during monitor transfer
     ) -> None:
         """
         v220.0: Update model loading state for detailed CLI feedback.
+        v221.0: Added handoff mode to preserve progress during Early Prime → Trinity transition.
         
         This provides users with clear visibility into what's happening during
         the 12-minute model loading process so they understand why it takes time.
@@ -4200,17 +4202,45 @@ class LiveProgressDashboard:
             estimated_total_seconds: Estimated total time for this model
             elapsed_seconds: Time spent loading so far
             reason: Explanation of why it takes time (e.g., "Loading 7B parameters into GPU memory")
+            handoff: If True, preserve progress state during monitor handoff (don't reset max_progress_seen)
         """
         with self._lock:
-            # v220.1: CRITICAL - Track persistent start time to prevent progress reset
-            if active is True and self._model_loading_state["start_time"] is None:
-                # Model loading just started - record the start time
-                self._model_loading_state["start_time"] = time.time()
-                self._model_loading_state["max_progress_seen"] = 0
+            # v221.0: CRITICAL - Proper state management for handoffs vs completion
+            # Three scenarios:
+            # 1. Starting: active=True, first time → initialize start_time, max_progress_seen=0
+            # 2. Handoff: active=False, handoff=True → preserve max_progress_seen (Early Prime → Trinity)
+            # 3. Finished: active=False, handoff=False, progress>=100 → reset for next load
+            # 4. Display off (model still loading): active=False, progress<100 → DON'T reset max_progress_seen
+            
+            if active is True:
+                if self._model_loading_state["start_time"] is None:
+                    # Model loading just started - record the start time
+                    # BUT preserve max_progress_seen if we had progress from a previous monitor
+                    self._model_loading_state["start_time"] = time.time()
+                    # Only reset max_progress_seen if it was previously 0 or finished (100%)
+                    if self._model_loading_state["max_progress_seen"] >= 100:
+                        self._model_loading_state["max_progress_seen"] = 0
             elif active is False:
-                # Model loading finished - reset tracking
-                self._model_loading_state["start_time"] = None
-                self._model_loading_state["max_progress_seen"] = 0
+                # v221.0: CRITICAL FIX - Only reset max_progress_seen when:
+                # 1. Model actually finished loading (progress >= 100), OR
+                # 2. Explicit reset is requested AND it's not a handoff
+                current_progress = self._model_loading_state.get("progress_pct", 0)
+                max_seen = self._model_loading_state.get("max_progress_seen", 0)
+                
+                if handoff:
+                    # Handoff mode: another monitor is taking over
+                    # DON'T reset anything - preserve state for seamless transition
+                    pass  # Explicitly do nothing - keep all state
+                elif current_progress >= 100 or max_seen >= 100:
+                    # Model actually finished loading - safe to reset
+                    self._model_loading_state["start_time"] = None
+                    self._model_loading_state["max_progress_seen"] = 0
+                else:
+                    # Model NOT finished but display turning off (e.g., during transition)
+                    # PRESERVE max_progress_seen so we don't regress when display comes back
+                    # Only clear start_time to stop elapsed calculation
+                    self._model_loading_state["start_time"] = None
+                    # KEEP max_progress_seen - this is the critical fix!
             
             if active is not None:
                 self._model_loading_state["active"] = active
@@ -4219,16 +4249,28 @@ class LiveProgressDashboard:
             if model_size_gb is not None:
                 self._model_loading_state["model_size_gb"] = model_size_gb
             
-            # v220.1: NEVER let progress go backwards - this prevents the 7% → 0% issue
+            # v221.0: ENHANCED progress regression prevention
+            # Never let progress go backwards - this prevents the 18% → 0% issue during handoffs
             if progress_pct is not None:
                 new_pct = min(100, max(0, progress_pct))
                 max_seen = self._model_loading_state["max_progress_seen"]
+                current_pct = self._model_loading_state["progress_pct"]
+                
                 # Only update if new progress is >= what we've seen
                 if new_pct >= max_seen:
                     self._model_loading_state["progress_pct"] = new_pct
                     self._model_loading_state["max_progress_seen"] = new_pct
-                # Otherwise keep showing max_seen (progress never goes backwards)
-                elif self._model_loading_state["progress_pct"] < max_seen:
+                elif new_pct < max_seen:
+                    # v221.0: CRITICAL - Progress would have regressed, use max_seen instead
+                    # Log when this happens for debugging handoff issues
+                    if new_pct < max_seen - 5:  # Only log significant regressions (>5%)
+                        # Use print since logger may not be available in all contexts
+                        import sys
+                        print(
+                            f"[v221.0] 🛡️ Progress regression prevented: {new_pct}% → {max_seen}% "
+                            f"(would have lost {max_seen - new_pct}% progress)",
+                            file=sys.stderr
+                        )
                     self._model_loading_state["progress_pct"] = max_seen
             
             if stage is not None:
@@ -4691,9 +4733,11 @@ def update_dashboard_model_loading(
     estimated_total_seconds: int = None,
     elapsed_seconds: int = None,
     reason: str = None,
+    handoff: bool = False,  # v221.0: Handoff mode - preserve progress during monitor transfer
 ) -> None:
     """
     v220.0: Helper to update model loading progress on the dashboard.
+    v221.0: Added handoff mode to preserve progress during Early Prime → Trinity transition.
     
     Call this from anywhere to show users what's happening during the
     12-minute model loading process. This provides transparency so
@@ -4709,6 +4753,7 @@ def update_dashboard_model_loading(
         estimated_total_seconds: Expected total load time
         elapsed_seconds: Time spent so far
         reason: User-friendly explanation (e.g., "Large model requires memory allocation")
+        handoff: If True, preserve progress state during monitor handoff (don't reset max_progress_seen)
     
     Example:
         update_dashboard_model_loading(
@@ -4722,6 +4767,9 @@ def update_dashboard_model_loading(
             elapsed_seconds=250,
             reason="Loading 7B parameters into memory (16GB model on 32GB RAM)"
         )
+        
+        # Handoff to another monitor (preserves max_progress_seen):
+        update_dashboard_model_loading(active=False, handoff=True)
     """
     if _live_dashboard:
         _live_dashboard.update_model_loading(
@@ -4734,6 +4782,7 @@ def update_dashboard_model_loading(
             estimated_total_seconds=estimated_total_seconds,
             elapsed_seconds=elapsed_seconds,
             reason=reason,
+            handoff=handoff,  # v221.0: Pass through handoff flag
         )
 
 
@@ -53445,7 +53494,10 @@ class TrinityIntegrator:
                 results["jarvis-prime"] = True  # Already started
                 prime_already_started = True
                 
-                # Clear the early prime env vars
+                # v221.0: HANDOFF - Clear the early prime env vars
+                # This signals the Early Prime monitor to stop (it will use handoff=True
+                # to preserve max_progress_seen). Trinity monitor will pick up seamlessly.
+                self.logger.info("[Trinity] 🔄 Initiating Early Prime → Trinity handoff (preserving progress)")
                 del os.environ["JARVIS_EARLY_PRIME_PID"]
                 if "JARVIS_EARLY_PRIME_PORT" in os.environ:
                     del os.environ["JARVIS_EARLY_PRIME_PORT"]
@@ -54326,6 +54378,16 @@ class TrinityIntegrator:
                     )
                     
                     if is_model_loading:
+                        # v221.0: Check if we're continuing from a preserved progress (handoff scenario)
+                        if _live_dashboard:
+                            preserved_progress = _live_dashboard._model_loading_state.get("max_progress_seen", 0)
+                            if preserved_progress > 0 and not hasattr(self, "_handoff_logged"):
+                                self.logger.info(
+                                    f"[Trinity] 🔄 Continuing from Early Prime handoff "
+                                    f"(preserved progress: {preserved_progress}%)"
+                                )
+                                self._handoff_logged = True
+                        
                         # Extract progress from health response
                         raw = result.raw_response or {}
                         
@@ -57201,8 +57263,12 @@ class JarvisSystemKernel:
                             try:
                                 # Check if Trinity has taken over (env var cleared)
                                 if "JARVIS_EARLY_PRIME_PID" not in os.environ:
-                                    self.logger.debug("[EarlyPrime] Trinity took over - stopping monitor")
-                                    update_dashboard_model_loading(active=False)
+                                    # v221.0: CRITICAL FIX - DON'T reset progress on handoff!
+                                    # Trinity will continue monitoring from where we left off.
+                                    # Just stop this monitor - Trinity will pick up seamlessly.
+                                    self.logger.debug(f"[EarlyPrime] Trinity took over - stopping monitor (preserving progress: {_last_progress}%)")
+                                    # Use handoff=True to preserve max_progress_seen
+                                    update_dashboard_model_loading(active=False, handoff=True)
                                     break
                                 
                                 elapsed = time.time() - _start_time
