@@ -56,29 +56,44 @@
 
 class JARVISLoadingManager {
     constructor() {
-        // v186.0: Priority port detection - server-injected > window.location > defaults
-        // loading_server.py injects window.JARVIS_LOADING_SERVER_PORT with the correct port
-        // This is CRITICAL when the page is served from a different origin (e.g., 8080) 
-        // than where the loading server actually runs (e.g., 3001)
+        // v210.0: Enhanced port detection with dynamic discovery
+        // ROOT CAUSE FIX: Instead of relying on potentially stale values,
+        // we now discover the actual running ports dynamically.
+        
+        // Priority 1: Server-injected ports (most reliable when page is freshly served)
         const injectedLoadingPort = window.JARVIS_LOADING_SERVER_PORT;
         const injectedFrontendPort = window.JARVIS_FRONTEND_PORT;
         const injectedBackendPort = window.JARVIS_BACKEND_PORT;
         
-        // Fallback to window.location.port only if no injection
+        // Priority 2: Window location (may be stale if page is cached)
         const currentPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
         const isUnifiedSupervisor = currentPort === 8080 || window.location.pathname.includes('unified');
 
-        // v186.0: Determine loading server port with clear priority
-        // 1. Server-injected port (most reliable - loading_server.py knows its own port)
-        // 2. window.location.port (works when page is served from same server)
-        // 3. Default 3001 (legacy fallback)
-        const loadingServerPort = injectedLoadingPort || currentPort || 3001;
+        // v210.0: Define all possible loading server ports to try
+        // This enables dynamic discovery when injected ports fail
+        this._loadingServerCandidatePorts = [
+            injectedLoadingPort,  // Server-injected (highest priority)
+            currentPort,          // Current page port
+            8080,                 // Default unified_supervisor loading port
+            8081, 8082, 8083,     // Alternate loading ports
+            3001,                 // Legacy loading port
+        ].filter(p => p && p > 0); // Remove nulls and zeros
+        
+        // Remove duplicates while preserving order
+        this._loadingServerCandidatePorts = [...new Set(this._loadingServerCandidatePorts)];
+
+        // Start with best guess, will be updated by discovery
+        const loadingServerPort = injectedLoadingPort || currentPort || 8080;
         
         if (injectedLoadingPort) {
-            console.log(`[v186.0] Using server-injected loading port: ${injectedLoadingPort}`);
+            console.log(`[v210.0] Using server-injected loading port: ${injectedLoadingPort}`);
         } else {
-            console.warn(`[v186.0] No server-injected port, using fallback: ${loadingServerPort}`);
+            console.warn(`[v210.0] No server-injected port, will try discovery: [${this._loadingServerCandidatePorts.join(', ')}]`);
         }
+        
+        // v210.0: Track port discovery state
+        this._portDiscoveryAttempted = false;
+        this._discoveredLoadingPort = null;
 
         this.config = {
             // v186.0: Use server-injected port when available
@@ -2027,6 +2042,51 @@ class JARVISLoadingManager {
         }
     }
 
+    /**
+     * v210.0: Discover which port the loading server is actually running on.
+     * Tries candidate ports in order until one responds.
+     */
+    async discoverLoadingServerPort() {
+        if (this._discoveredLoadingPort) {
+            return this._discoveredLoadingPort;
+        }
+
+        console.log(`[v210.0] 🔍 Discovering loading server port from candidates: [${this._loadingServerCandidatePorts.join(', ')}]`);
+
+        for (const port of this._loadingServerCandidatePorts) {
+            try {
+                const healthUrl = `${this.config.httpProtocol}//${this.config.hostname}:${port}/health`;
+                console.log(`[v210.0] Trying port ${port}...`);
+                
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+                
+                const response = await fetch(healthUrl, {
+                    method: 'GET',
+                    signal: controller.signal,
+                    mode: 'cors',
+                    credentials: 'omit'
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (response.ok) {
+                    console.log(`[v210.0] ✅ Loading server found on port ${port}`);
+                    this._discoveredLoadingPort = port;
+                    this.config.loadingServerPort = port;
+                    return port;
+                }
+            } catch (error) {
+                // Port not responding, try next
+                console.debug(`[v210.0] Port ${port} not responding: ${error.name}`);
+            }
+        }
+
+        // No port found - fall back to configured port
+        console.warn(`[v210.0] ⚠️ No loading server found, using configured port: ${this.config.loadingServerPort}`);
+        return this.config.loadingServerPort;
+    }
+
     async connectWebSocket() {
         if (this.state.reconnectAttempts >= this.config.reconnect.maxAttempts) {
             console.warn('[WebSocket] Max reconnection attempts reached');
@@ -2043,8 +2103,13 @@ class JARVISLoadingManager {
         }
 
         try {
-            // v186.0: Connect to loading server using canonical endpoint /ws/progress
-            // (loading_server.py accepts any WebSocket upgrade, but /ws/progress is the documented endpoint)
+            // v210.0: Discover actual loading server port if not already done
+            if (!this._portDiscoveryAttempted) {
+                this._portDiscoveryAttempted = true;
+                await this.discoverLoadingServerPort();
+            }
+
+            // v210.0: Connect to discovered/configured loading server
             const wsUrl = `${this.config.wsProtocol}//${this.config.hostname}:${this.config.loadingServerPort}/ws/progress`;
             console.log(`[WebSocket] Connecting to ${wsUrl}...`);
 
@@ -2153,6 +2218,13 @@ class JARVISLoadingManager {
                     this.quickRedirectToApp();
                 }
             });
+        }
+
+        // v210.0: Re-discover port after 5 failed attempts (loading server may have restarted on different port)
+        if (this.state.reconnectAttempts === 5 || this.state.reconnectAttempts === 10 || this.state.reconnectAttempts === 15) {
+            console.log(`[v210.0] ${this.state.reconnectAttempts} attempts failed - re-discovering loading server port...`);
+            this._portDiscoveryAttempted = false;
+            this._discoveredLoadingPort = null;
         }
 
         console.log(`[WebSocket] Reconnecting in ${delay}ms (attempt ${this.state.reconnectAttempts})...`);
