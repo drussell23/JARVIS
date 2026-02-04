@@ -64539,33 +64539,62 @@ async def handle_check_only(args: argparse.Namespace) -> int:
     else:
         print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ GCP: disabled{RESET}")
 
-    # 5. Invincible Node (if enabled)
+    # 5. Invincible Node (GCP Spot VM with Static IP)
+    # v210.0: Enhanced check with clearer messaging and graceful degradation
     print(f"{BOLD}{BLUE}║{RESET}")
-    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Invincible Node{RESET}")
+    print(f"{BOLD}{BLUE}║{RESET}  {CYAN}Invincible Node (Cloud VM){RESET}")
     if config.invincible_node_enabled:
-        # Check if static IP can be resolved
         static_ip_name = config.invincible_node_static_ip_name
-        if static_ip_name:
+        instance_name = config.invincible_node_instance_name
+        
+        # First check if GCP is authenticated (required for Invincible Node)
+        if not gcp_ok:
+            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Requires GCP authentication")
+            print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ Run: gcloud auth application-default login{RESET}")
+            warnings.append("Invincible Node requires GCP auth")
+        elif not static_ip_name:
+            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Static IP name not configured")
+            print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ Set: GCP_VM_STATIC_IP_NAME environment variable{RESET}")
+            warnings.append("Invincible Node: missing GCP_VM_STATIC_IP_NAME")
+        else:
+            # Try to resolve the static IP
             try:
+                region = os.getenv("GCP_REGION", "us-central1")
                 proc = await asyncio.create_subprocess_exec(
                     "gcloud", "compute", "addresses", "describe", static_ip_name,
-                    "--region", os.getenv("GCP_REGION", "us-central1"),
+                    "--region", region,
                     "--format=value(address)",
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-                static_ip = stdout.decode().strip() if stdout else None
-                node_ok = bool(static_ip)
-                print(f"{BOLD}{BLUE}║{RESET}    {check_mark(node_ok)} Static IP: {static_ip if node_ok else 'not found'}")
-            except Exception:
-                print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Static IP: could not verify")
-                warnings.append("Invincible Node IP check failed")
-        else:
-            print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Static IP name not configured")
-            warnings.append("Invincible Node enabled but IP name not set")
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+                
+                if proc.returncode == 0 and stdout:
+                    static_ip = stdout.decode().strip()
+                    print(f"{BOLD}{BLUE}║{RESET}    {check_mark(True)} Static IP: {static_ip}")
+                    print(f"{BOLD}{BLUE}║{RESET}    {DIM}Instance: {instance_name}{RESET}")
+                    print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ VM will be started during resource init{RESET}")
+                else:
+                    # Static IP doesn't exist yet - this is recoverable
+                    print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Static IP '{static_ip_name}' not found")
+                    print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ Will be created during startup (or create manually){RESET}")
+                    print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ gcloud compute addresses create {static_ip_name} --region={region}{RESET}")
+                    warnings.append(f"Invincible Node IP will be created")
+                    
+            except asyncio.TimeoutError:
+                print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} GCP check timed out")
+                print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ Will retry during startup{RESET}")
+                warnings.append("Invincible Node check timed out")
+            except FileNotFoundError:
+                print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} gcloud CLI not found")
+                print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ Install: brew install google-cloud-sdk{RESET}")
+                warnings.append("Invincible Node: gcloud not installed")
+            except Exception as e:
+                print(f"{BOLD}{BLUE}║{RESET}    {warn_mark()} Check error: {str(e)[:40]}")
+                print(f"{BOLD}{BLUE}║{RESET}    {DIM}→ Will attempt during startup{RESET}")
+                warnings.append("Invincible Node check failed")
     else:
-        print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ Invincible Node: disabled{RESET}")
+        print(f"{BOLD}{BLUE}║{RESET}    {DIM}○ Disabled (set JARVIS_INVINCIBLE_NODE_ENABLED=true to enable){RESET}")
 
     # 6. Trinity (if enabled)
     print(f"{BOLD}{BLUE}║{RESET}")
@@ -65657,7 +65686,7 @@ async def _show_startup_dashboard() -> None:
     print(f"  {status_opt(gcp_ok)} GCP: {'Authenticated' if gcp_ok else ('Not auth' if gcp_ok is False else 'Disabled')}")
     print(f"  {status_icon(port_ok, warn=not port_ok)} Port {checks.get('backend_port', '?')}: {'Available' if port_ok else 'In use'}")
 
-    # Invincible Node (if enabled)
+    # v210.0: Invincible Node status with better messaging
     if invincible_status.get("enabled"):
         gcp_status = invincible_status.get("gcp_status") or "UNKNOWN"
         error = invincible_status.get("error")
@@ -65665,19 +65694,25 @@ async def _show_startup_dashboard() -> None:
         ready = health.get("ready_for_inference", False)
 
         if error:
-            status_str = f"{YELLOW}Check failed{RESET}"
+            # Provide more context on what failed
+            error_str = str(error)[:30] if error else "unknown"
+            status_str = f"{YELLOW}Pending ({error_str}){RESET}"
         elif gcp_status == "RUNNING" and ready:
             status_str = f"{GREEN}Ready{RESET}"
         elif gcp_status == "RUNNING":
-            status_str = f"{YELLOW}Starting{RESET}"
+            status_str = f"{YELLOW}Starting...{RESET}"
         elif gcp_status in ("STOPPED", "TERMINATED"):
-            status_str = f"{YELLOW}{gcp_status}{RESET}"
+            status_str = f"{YELLOW}Will start{RESET}"
+        elif gcp_status == "NOT_FOUND":
+            status_str = f"{YELLOW}Will create{RESET}"
         elif gcp_status == "UNKNOWN":
-            status_str = f"{YELLOW}Unknown{RESET}"
+            status_str = f"{YELLOW}Checking...{RESET}"
         else:
-            status_str = f"{RED}{gcp_status}{RESET}"
+            status_str = f"{YELLOW}{gcp_status}{RESET}"
 
-        print(f"  {status_opt(gcp_status == 'RUNNING' and not error)} Invincible Node: {status_str}")
+        # Show warning icon only if there's an actual error, not just pending state
+        is_ok = gcp_status == "RUNNING" and ready and not error
+        print(f"  {status_opt(is_ok)} Invincible Node: {status_str}")
 
     # Warnings summary
     if warnings:
