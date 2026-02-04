@@ -60604,19 +60604,50 @@ class JarvisSystemKernel:
             env["PORT"] = str(frontend_port)
             env["BROWSER"] = "none"  # Don't auto-open browser
             env["REACT_APP_BACKEND_URL"] = f"http://localhost:{self.config.backend_port}"
+            
+            # v210.1: CI mode to reduce npm output
+            env["CI"] = "true"  # Makes npm output less verbose
 
-            # Start the frontend
-            self._frontend_process = await asyncio.create_subprocess_exec(
-                "npm", "start",
-                cwd=str(frontend_dir),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            # v210.1: Create log file for frontend output (fixes subprocess buffer deadlock)
+            # When using PIPE, the subprocess will BLOCK if its output buffer fills up.
+            # This was causing the frontend to hang indefinitely.
+            logs_dir = self.config.project_root / "backend" / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            frontend_log_path = logs_dir / f"frontend_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            
+            try:
+                self._frontend_log_file = await asyncio.to_thread(
+                    open, frontend_log_path, "w"
+                )
+                self.logger.debug(f"[Frontend] Log file: {frontend_log_path}")
+            except Exception as log_err:
+                self.logger.debug(f"[Frontend] Could not create log file: {log_err}")
+                self._frontend_log_file = None
+
+            # Start the frontend with output going to log file (prevents buffer deadlock)
+            if self._frontend_log_file:
+                self._frontend_process = await asyncio.create_subprocess_exec(
+                    "npm", "start",
+                    cwd=str(frontend_dir),
+                    env=env,
+                    stdout=self._frontend_log_file,
+                    stderr=asyncio.subprocess.STDOUT,  # Combine stderr into log
+                )
+            else:
+                # Fallback: use DEVNULL to prevent blocking (lose output but process won't hang)
+                self._frontend_process = await asyncio.create_subprocess_exec(
+                    "npm", "start",
+                    cwd=str(frontend_dir),
+                    env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+
+            self.logger.info(f"[Frontend] npm start process started (PID: {self._frontend_process.pid})")
 
             # Wait for frontend to be ready using non-blocking socket check
             deadline = time.time() + 120.0  # 2 minute timeout
-            check_interval = 3.0
+            check_interval = 2.0  # Check every 2 seconds
 
             while time.time() < deadline:
                 try:
@@ -60658,6 +60689,18 @@ class JarvisSystemKernel:
                     self.logger.warning(
                         f"[Frontend] Exited with code {self._frontend_process.returncode}"
                     )
+                    # v210.1: Log last lines of frontend output for debugging
+                    if hasattr(self, '_frontend_log_file') and self._frontend_log_file:
+                        try:
+                            await asyncio.to_thread(self._frontend_log_file.flush)
+                            log_content = await asyncio.to_thread(frontend_log_path.read_text)
+                            lines = log_content.strip().split('\n')
+                            if lines:
+                                self.logger.warning(f"[Frontend] Last log entries:")
+                                for line in lines[-10:]:
+                                    self.logger.warning(f"  {line}")
+                        except Exception:
+                            pass
                     return False
 
                 await asyncio.sleep(check_interval)
@@ -60685,6 +60728,14 @@ class JarvisSystemKernel:
                     await self._frontend_process.wait()
                 self.logger.info("[Frontend] Stopped")
             self._frontend_process = None
+        
+        # v210.1: Close frontend log file
+        if hasattr(self, '_frontend_log_file') and self._frontend_log_file:
+            try:
+                await asyncio.to_thread(self._frontend_log_file.close)
+            except Exception:
+                pass
+            self._frontend_log_file = None
 
     # =========================================================================
     # v182.0: DYNAMIC COMPONENT TRACKING
