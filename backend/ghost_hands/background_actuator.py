@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 # =============================================================================
 # v197.1: Global Crash Monitor Integration
+# v198.0: Refactored to use modular browser_stability module (not 65K-line unified_supervisor)
 # =============================================================================
 
 async def _report_crash_to_monitor(
@@ -67,25 +68,37 @@ async def _report_crash_to_monitor(
     error_message: str = "",
 ) -> None:
     """
-    Report a browser crash to the global BrowserCrashMonitor.
+    Report a browser crash to the BrowserStabilityManager.
     
-    This function is safe to call even if the monitor is not available.
+    v198.0: Now uses the modular browser_stability module instead of
+    importing from the monolithic unified_supervisor.py (65K+ lines).
+    This is the CURE for the architectural debt - clean modular imports.
     """
     try:
-        # Lazy import to avoid circular dependency
-        from unified_supervisor import get_browser_crash_monitor
-        monitor = get_browser_crash_monitor()
-        event = await monitor.record_crash(
+        # v198.0: Use modular browser_stability module
+        from backend.core.browser_stability import get_stability_manager
+        manager = get_stability_manager()
+        await manager.record_crash(
             crash_reason=crash_reason,
             crash_code=crash_code,
             source=source,
             error_message=error_message,
         )
-        # Optionally attempt recovery
-        if event.severity.value in ("high", "critical"):
-            await monitor.attempt_recovery(event)
     except ImportError:
-        logger.debug("[GHOST-HANDS] BrowserCrashMonitor not available - skipping crash report")
+        # Fallback: try legacy unified_supervisor import
+        try:
+            from unified_supervisor import get_browser_crash_monitor
+            monitor = get_browser_crash_monitor()
+            event = await monitor.record_crash(
+                crash_reason=crash_reason,
+                crash_code=crash_code,
+                source=source,
+                error_message=error_message,
+            )
+            if event.severity.value in ("high", "critical"):
+                await monitor.attempt_recovery(event)
+        except ImportError:
+            logger.debug("[GHOST-HANDS] BrowserStabilityManager not available - skipping crash report")
     except Exception as e:
         logger.debug(f"[GHOST-HANDS] Failed to report crash to monitor: {e}")
 
@@ -930,17 +943,20 @@ class PlaywrightBackend(ActuatorBackend):
         
         # =====================================================================
         # v197.4: ROOT CAUSE FIX - Restart Chrome with stability flags
+        # v198.0: Refactored to use modular browser_stability module
         # =====================================================================
         # On reconnect (typically after a crash), restart Chrome with
         # crash-prevention flags to prevent the same crash from recurring.
         # This is the CURE - we fix the underlying cause of code 5 crashes.
         # =====================================================================
         try:
-            from unified_supervisor import get_stabilized_chrome_launcher
+            # v198.0: Use modular browser_stability module (not 65K-line unified_supervisor)
+            from backend.core.browser_stability import get_stability_manager
             
-            launcher = get_stabilized_chrome_launcher()
+            manager = get_stability_manager()
+            launcher = manager.chrome_launcher
             
-            logger.info("[GHOST-HANDS] v197.4: Restarting Chrome with stability flags (crash prevention)...")
+            logger.info("[GHOST-HANDS] v198.0: Restarting Chrome with stability flags (crash prevention)...")
             
             # Restart Chrome with all stability flags (this kills existing Chrome)
             success = await launcher.restart_chrome(url=None, incognito=False)
@@ -954,7 +970,16 @@ class PlaywrightBackend(ActuatorBackend):
                 logger.warning("[GHOST-HANDS] StabilizedChromeLauncher restart failed")
                 
         except ImportError:
-            logger.debug("[GHOST-HANDS] StabilizedChromeLauncher not available")
+            # Fallback: try legacy unified_supervisor import
+            try:
+                from unified_supervisor import get_stabilized_chrome_launcher
+                launcher = get_stabilized_chrome_launcher()
+                success = await launcher.restart_chrome(url=None, incognito=False)
+                if success:
+                    self._stabilized_launcher_available = True
+                    await asyncio.sleep(2.0)
+            except ImportError:
+                logger.debug("[GHOST-HANDS] StabilizedChromeLauncher not available")
         except Exception as launcher_err:
             logger.debug(f"[GHOST-HANDS] Launcher restart failed: {launcher_err}")
         
@@ -999,11 +1024,19 @@ class PlaywrightBackend(ActuatorBackend):
                     "Preemptively restarting to prevent crash..."
                 )
                 
-                # Try to use stabilized launcher for restart
+                # v198.0: Try to use modular browser_stability for restart
                 try:
-                    from unified_supervisor import get_stabilized_chrome_launcher
-                    launcher = get_stabilized_chrome_launcher()
-                    await launcher.preemptive_restart_if_needed(self.CHROME_MEMORY_THRESHOLD_MB)
+                    from backend.core.browser_stability import get_stability_manager
+                    manager = get_stability_manager()
+                    await manager.chrome_launcher.preemptive_restart_if_needed(self.CHROME_MEMORY_THRESHOLD_MB)
+                except ImportError:
+                    # Fallback to legacy
+                    try:
+                        from unified_supervisor import get_stabilized_chrome_launcher
+                        launcher = get_stabilized_chrome_launcher()
+                        await launcher.preemptive_restart_if_needed(self.CHROME_MEMORY_THRESHOLD_MB)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 
@@ -1049,26 +1082,29 @@ class PlaywrightBackend(ActuatorBackend):
             
             # =====================================================================
             # v197.6: ROOT CAUSE FIX - Ensure Chrome is launched with stability flags
+            # v198.0: Refactored to use modular browser_stability module
             # =====================================================================
             # Before connecting via CDP, ensure Chrome is running with the right flags.
-            # v197.6 IMPROVEMENTS:
+            # v198.0 IMPROVEMENTS:
+            # - Uses modular browser_stability.py (not 65K-line unified_supervisor.py)
             # - Dynamic CDP port detection (no more hardcoded 9222)
             # - Metal API bypass flags (prevents CompositorTileWorker SIGSEGV)
             # - Proper async coordination (no lock contention)
             # =====================================================================
             cdp_port = 9222  # Default fallback
             try:
-                # Try to import the stabilized launcher from unified_supervisor
-                from unified_supervisor import (
-                    get_stabilized_chrome_launcher,
+                # v198.0: Use modular browser_stability module
+                from backend.core.browser_stability import (
+                    get_stability_manager,
                     get_active_cdp_port,
                 )
 
-                launcher = get_stabilized_chrome_launcher()
+                manager = get_stability_manager()
+                launcher = manager.chrome_launcher
 
                 # Check if Chrome is already running with stability flags
                 if not await launcher.is_chrome_running():
-                    logger.info("[GHOST-HANDS] v197.6: Launching Chrome with stability flags (Metal bypass)...")
+                    logger.info("[GHOST-HANDS] v198.0: Launching Chrome with stability flags (Metal bypass)...")
                     success = await launcher.launch_stabilized_chrome(
                         url=None,  # No URL, just start Chrome
                         incognito=False,  # Not incognito for general automation
@@ -1076,7 +1112,7 @@ class PlaywrightBackend(ActuatorBackend):
                         headless=self.config.playwright_headless,
                     )
                     if success:
-                        # v197.6: Get the dynamically assigned CDP port
+                        # v198.0: Get the dynamically assigned CDP port
                         cdp_port = launcher.get_cdp_port() or get_active_cdp_port()
                         logger.info(
                             f"[GHOST-HANDS] ✅ Chrome launched with Metal bypass, "
@@ -1088,13 +1124,33 @@ class PlaywrightBackend(ActuatorBackend):
                     else:
                         logger.warning("[GHOST-HANDS] StabilizedChromeLauncher failed - Chrome may crash")
                 else:
-                    # v197.6: Get CDP port from running instance
+                    # v198.0: Get CDP port from running instance
                     cdp_port = launcher.get_cdp_port() or get_active_cdp_port()
                     logger.info(f"[GHOST-HANDS] Chrome already running on CDP port {cdp_port}")
                     self._stabilized_launcher_available = True
 
             except ImportError:
-                logger.debug("[GHOST-HANDS] StabilizedChromeLauncher not available - using existing Chrome")
+                # Fallback: try legacy unified_supervisor import
+                try:
+                    from unified_supervisor import (
+                        get_stabilized_chrome_launcher,
+                        get_active_cdp_port as legacy_get_active_cdp_port,
+                    )
+                    launcher = get_stabilized_chrome_launcher()
+                    if not await launcher.is_chrome_running():
+                        success = await launcher.launch_stabilized_chrome(
+                            url=None, incognito=False, kill_existing=False,
+                            headless=self.config.playwright_headless,
+                        )
+                        if success:
+                            cdp_port = launcher.get_cdp_port() or legacy_get_active_cdp_port()
+                            self._stabilized_launcher_available = True
+                            await asyncio.sleep(2.0)
+                    else:
+                        cdp_port = launcher.get_cdp_port() or legacy_get_active_cdp_port()
+                        self._stabilized_launcher_available = True
+                except ImportError:
+                    logger.debug("[GHOST-HANDS] StabilizedChromeLauncher not available - using existing Chrome")
             except Exception as launcher_err:
                 logger.debug(f"[GHOST-HANDS] Launcher check failed: {launcher_err}")
 
