@@ -135,6 +135,295 @@ def _env_list(key: str, default: List[str], separator: str = ",") -> List[str]:
 
 
 # =============================================================================
+# v220.0: INFERENCE SEMANTIC CACHE
+# =============================================================================
+
+@dataclass
+class InferenceCacheEntry:
+    """A cached inference result with metadata."""
+    prompt_hash: str
+    prompt_preview: str  # First 100 chars for debugging
+    response_text: str
+    model_name: str
+    created_at: float
+    hit_count: int = 0
+    last_accessed: float = field(default_factory=time.time)
+    tokens_used: int = 0
+    latency_ms: float = 0.0
+
+
+class InferenceSemanticCache:
+    """
+    v220.0: Semantic cache for LLM inference results.
+    
+    This cache reduces redundant inference calls by caching results for
+    identical or semantically similar prompts. Benefits:
+    
+    1. Instant responses for repeated queries (no model inference needed)
+    2. Reduced GPU/CPU load on Prime
+    3. Lower latency for common operations
+    4. Works across restarts (optional persistence)
+    
+    The cache uses:
+    - LRU eviction for memory management
+    - Exact hash matching for identical prompts
+    - Optional TTL for stale result expiration
+    
+    Usage:
+        cache = InferenceSemanticCache()
+        
+        # Check cache before inference
+        cached = cache.get(prompt, system_prompt, model)
+        if cached:
+            return cached  # Instant!
+        
+        # After inference, store result
+        cache.put(prompt, system_prompt, model, result)
+    """
+    
+    def __init__(
+        self,
+        max_entries: int = None,
+        ttl_seconds: float = None,
+        enabled: bool = None,
+        persist_path: Optional[Path] = None,
+    ):
+        """
+        Initialize the inference cache.
+        
+        Args:
+            max_entries: Max cache entries (default: JARVIS_INFERENCE_CACHE_SIZE or 1000)
+            ttl_seconds: Entry TTL in seconds (default: JARVIS_INFERENCE_CACHE_TTL or 3600)
+            enabled: Enable caching (default: JARVIS_INFERENCE_CACHE_ENABLED or True)
+            persist_path: Optional path for cache persistence
+        """
+        self.max_entries = max_entries or _env_int("JARVIS_INFERENCE_CACHE_SIZE", 1000)
+        self.ttl_seconds = ttl_seconds or _env_float("JARVIS_INFERENCE_CACHE_TTL", 3600.0)
+        self.enabled = enabled if enabled is not None else _env_bool("JARVIS_INFERENCE_CACHE_ENABLED", True)
+        self.persist_path = persist_path
+        
+        # LRU cache using dict (Python 3.7+ maintains insertion order)
+        self._cache: Dict[str, InferenceCacheEntry] = {}
+        self._lock = asyncio.Lock()
+        
+        # Statistics
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "expirations": 0,
+        }
+        
+        # Load persisted cache if available
+        if self.persist_path and self.persist_path.exists():
+            self._load_cache()
+    
+    def _compute_key(self, prompt: str, system_prompt: Optional[str], model: str) -> str:
+        """Compute cache key from prompt components."""
+        key_parts = [
+            prompt.strip(),
+            system_prompt.strip() if system_prompt else "",
+            model.lower(),
+        ]
+        key_string = "|||".join(key_parts)
+        return hashlib.sha256(key_string.encode()).hexdigest()[:32]
+    
+    async def get(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: str = "default",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get cached inference result.
+        
+        Args:
+            prompt: The user prompt
+            system_prompt: Optional system prompt
+            model: Model name
+            
+        Returns:
+            Cached result dict or None if not found/expired
+        """
+        if not self.enabled:
+            return None
+        
+        key = self._compute_key(prompt, system_prompt, model)
+        
+        async with self._lock:
+            entry = self._cache.get(key)
+            
+            if entry is None:
+                self._stats["misses"] += 1
+                return None
+            
+            # Check TTL
+            if time.time() - entry.created_at > self.ttl_seconds:
+                del self._cache[key]
+                self._stats["expirations"] += 1
+                self._stats["misses"] += 1
+                return None
+            
+            # Cache hit!
+            entry.hit_count += 1
+            entry.last_accessed = time.time()
+            self._stats["hits"] += 1
+            
+            # Move to end for LRU
+            self._cache[key] = self._cache.pop(key)
+            
+            logger.debug(f"[InferenceCache] HIT for prompt: {prompt[:50]}... (hits: {entry.hit_count})")
+            
+            return {
+                "text": entry.response_text,
+                "tokens_used": entry.tokens_used,
+                "latency_ms": 0.1,  # Cached responses are instant
+                "cached": True,
+                "cache_hit_count": entry.hit_count,
+                "model_version": entry.model_name,
+            }
+    
+    async def put(
+        self,
+        prompt: str,
+        system_prompt: Optional[str],
+        model: str,
+        result: Dict[str, Any],
+    ) -> None:
+        """
+        Store inference result in cache.
+        
+        Args:
+            prompt: The user prompt
+            system_prompt: Optional system prompt
+            model: Model name
+            result: Inference result to cache
+        """
+        if not self.enabled:
+            return
+        
+        # Don't cache errors or empty results
+        text = result.get("text", "")
+        if not text or result.get("error"):
+            return
+        
+        key = self._compute_key(prompt, system_prompt, model)
+        
+        async with self._lock:
+            # Evict oldest if at capacity
+            while len(self._cache) >= self.max_entries:
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+                self._stats["evictions"] += 1
+            
+            # Store entry
+            self._cache[key] = InferenceCacheEntry(
+                prompt_hash=key,
+                prompt_preview=prompt[:100],
+                response_text=text,
+                model_name=model,
+                created_at=time.time(),
+                tokens_used=result.get("tokens_used", 0),
+                latency_ms=result.get("latency_ms", 0.0),
+            )
+            
+            logger.debug(f"[InferenceCache] Stored result for: {prompt[:50]}...")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total = self._stats["hits"] + self._stats["misses"]
+        hit_rate = self._stats["hits"] / total if total > 0 else 0.0
+        
+        return {
+            "enabled": self.enabled,
+            "entries": len(self._cache),
+            "max_entries": self.max_entries,
+            "ttl_seconds": self.ttl_seconds,
+            "hits": self._stats["hits"],
+            "misses": self._stats["misses"],
+            "hit_rate": hit_rate,
+            "evictions": self._stats["evictions"],
+            "expirations": self._stats["expirations"],
+        }
+    
+    def clear(self) -> int:
+        """Clear all cache entries. Returns number of entries cleared."""
+        count = len(self._cache)
+        self._cache.clear()
+        return count
+    
+    def _load_cache(self) -> None:
+        """Load cache from persistence file."""
+        if not self.persist_path:
+            return
+        try:
+            with open(self.persist_path, 'r') as f:
+                data = json.load(f)
+                for entry_data in data.get("entries", []):
+                    entry = InferenceCacheEntry(**entry_data)
+                    # Skip expired entries
+                    if time.time() - entry.created_at <= self.ttl_seconds:
+                        self._cache[entry.prompt_hash] = entry
+                logger.info(f"[InferenceCache] Loaded {len(self._cache)} entries from {self.persist_path}")
+        except Exception as e:
+            logger.debug(f"[InferenceCache] Could not load cache: {e}")
+    
+    def save(self) -> None:
+        """Save cache to persistence file."""
+        if not self.persist_path:
+            return
+        try:
+            data = {
+                "version": 1,
+                "saved_at": time.time(),
+                "entries": [
+                    {
+                        "prompt_hash": e.prompt_hash,
+                        "prompt_preview": e.prompt_preview,
+                        "response_text": e.response_text,
+                        "model_name": e.model_name,
+                        "created_at": e.created_at,
+                        "hit_count": e.hit_count,
+                        "last_accessed": e.last_accessed,
+                        "tokens_used": e.tokens_used,
+                        "latency_ms": e.latency_ms,
+                    }
+                    for e in self._cache.values()
+                ],
+            }
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.persist_path, 'w') as f:
+                json.dump(data, f)
+            logger.info(f"[InferenceCache] Saved {len(self._cache)} entries to {self.persist_path}")
+        except Exception as e:
+            logger.warning(f"[InferenceCache] Could not save cache: {e}")
+
+
+# Global inference cache instance
+_inference_cache: Optional[InferenceSemanticCache] = None
+_inference_cache_lock: Optional[asyncio.Lock] = None
+
+
+async def get_inference_cache() -> InferenceSemanticCache:
+    """Get or create the global inference cache."""
+    global _inference_cache, _inference_cache_lock
+    
+    if _inference_cache is not None:
+        return _inference_cache
+    
+    if _inference_cache_lock is None:
+        _inference_cache_lock = asyncio.Lock()
+    
+    async with _inference_cache_lock:
+        if _inference_cache is None:
+            persist_path = None
+            if _env_bool("JARVIS_INFERENCE_CACHE_PERSIST", True):
+                persist_path = Path.home() / ".jarvis" / "cache" / "inference_cache.json"
+            _inference_cache = InferenceSemanticCache(persist_path=persist_path)
+        return _inference_cache
+
+
+# =============================================================================
 # v84.0: INTELLIGENT SERVICE DISCOVERY
 # =============================================================================
 
@@ -655,13 +944,19 @@ class InferenceRequest:
 
 @dataclass
 class InferenceResponse:
-    """Response from LLM inference."""
+    """
+    Response from LLM inference.
+    
+    v220.0: Added 'cached' field to indicate if response came from semantic cache.
+    Cached responses have latency_ms near 0 and don't consume GPU resources.
+    """
     text: str
     tokens_used: int
     latency_ms: float
     model_version: str
-    finish_reason: str  # stop, length, error
+    finish_reason: str = "stop"  # stop, length, error
     metadata: Dict[str, Any] = field(default_factory=dict)
+    cached: bool = False  # v220.0: True if from cache
 
 
 @dataclass
@@ -1150,9 +1445,14 @@ class JARVISPrimeClient(TrinityBaseClient[Dict[str, Any]]):
         stop_sequences: Optional[List[str]] = None,
         system_prompt: Optional[str] = None,
         mode: InferenceMode = InferenceMode.STANDARD,
+        use_cache: bool = True,
     ) -> Optional[InferenceResponse]:
         """
         Run inference on JARVIS Prime.
+        
+        v220.0: Now supports semantic caching. If a cached result exists for
+        the same prompt/system_prompt/model combination, it's returned instantly
+        without calling the model. This dramatically speeds up repeated queries.
 
         Args:
             prompt: Input prompt
@@ -1162,10 +1462,29 @@ class JARVISPrimeClient(TrinityBaseClient[Dict[str, Any]]):
             stop_sequences: Stop sequences
             system_prompt: Optional system prompt
             mode: Inference mode
+            use_cache: Whether to use inference cache (default True)
 
         Returns:
             InferenceResponse or None if failed
         """
+        # v220.0: Check cache first for instant responses
+        model_name = self._discovered_service.model_name if self._discovered_service else "default"
+        
+        if use_cache and temperature is None or (temperature is not None and temperature <= 0.1):
+            # Only cache deterministic requests (low temperature)
+            cache = await get_inference_cache()
+            cached_result = await cache.get(prompt, system_prompt, model_name)
+            if cached_result:
+                logger.debug(f"[JARVISPrime] Cache HIT for prompt: {prompt[:50]}...")
+                self._total_inferences += 1
+                return InferenceResponse(
+                    text=cached_result["text"],
+                    tokens_used=cached_result.get("tokens_used", 0),
+                    latency_ms=cached_result.get("latency_ms", 0.1),
+                    model_version=cached_result.get("model_version", model_name),
+                    cached=True,
+                )
+        
         request = InferenceRequest(
             prompt=prompt,
             max_tokens=max_tokens or self._prime_config.default_max_tokens,
@@ -1188,6 +1507,11 @@ class JARVISPrimeClient(TrinityBaseClient[Dict[str, Any]]):
                 (self._avg_latency_ms * (self._total_inferences - 1) + latency)
                 / self._total_inferences
             )
+            
+            # v220.0: Store in cache for future requests
+            if use_cache:
+                cache = await get_inference_cache()
+                await cache.put(prompt, system_prompt, model_name, result)
 
             return InferenceResponse(
                 text=result.get("text", ""),

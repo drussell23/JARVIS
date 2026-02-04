@@ -4007,6 +4007,18 @@ class LiveProgressDashboard:
             "elapsed_seconds": 0,
             "status": "pending",
         }
+        # v220.0: Model loading state for detailed user feedback
+        self._model_loading_state = {
+            "active": False,
+            "model_name": "",
+            "model_size_gb": 0.0,
+            "progress_pct": 0,
+            "stage": "idle",  # idle, downloading, loading_weights, initializing, warming_up, ready
+            "stage_detail": "",
+            "estimated_total_seconds": 720,  # Default 12 minutes for large models
+            "elapsed_seconds": 0,
+            "reason": "",  # Why it takes so long
+        }
         # v197.2: Use dynamic ports from environment (matching TrinityIntegrator)
         # This fixes the port mismatch where dashboard showed 8001 but component used 8000
         self._components = {
@@ -4076,6 +4088,119 @@ class LiveProgressDashboard:
             if status is not None:
                 self._gcp_state["status"] = status
                 self._components["gcp-vm"]["status"] = status
+
+    def update_model_loading(
+        self,
+        active: bool = None,
+        model_name: str = None,
+        model_size_gb: float = None,
+        progress_pct: int = None,
+        stage: str = None,
+        stage_detail: str = None,
+        estimated_total_seconds: int = None,
+        elapsed_seconds: int = None,
+        reason: str = None,
+    ) -> None:
+        """
+        v220.0: Update model loading state for detailed CLI feedback.
+        
+        This provides users with clear visibility into what's happening during
+        the 12-minute model loading process so they understand why it takes time.
+        
+        Args:
+            active: Whether model loading is in progress
+            model_name: Name of the model being loaded (e.g., "Mistral-7B", "LLAVA")
+            model_size_gb: Size of the model in GB
+            progress_pct: Loading progress percentage (0-100)
+            stage: Current stage (downloading, loading_weights, initializing, warming_up, ready)
+            stage_detail: Detailed stage info (e.g., "Loading layer 24/32")
+            estimated_total_seconds: Estimated total time for this model
+            elapsed_seconds: Time spent loading so far
+            reason: Explanation of why it takes time (e.g., "Loading 7B parameters into GPU memory")
+        """
+        with self._lock:
+            if active is not None:
+                self._model_loading_state["active"] = active
+            if model_name is not None:
+                self._model_loading_state["model_name"] = model_name
+            if model_size_gb is not None:
+                self._model_loading_state["model_size_gb"] = model_size_gb
+            if progress_pct is not None:
+                self._model_loading_state["progress_pct"] = min(100, max(0, progress_pct))
+            if stage is not None:
+                self._model_loading_state["stage"] = stage
+            if stage_detail is not None:
+                self._model_loading_state["stage_detail"] = stage_detail
+            if estimated_total_seconds is not None:
+                self._model_loading_state["estimated_total_seconds"] = estimated_total_seconds
+            if elapsed_seconds is not None:
+                self._model_loading_state["elapsed_seconds"] = elapsed_seconds
+            if reason is not None:
+                self._model_loading_state["reason"] = reason
+
+    def _get_model_loading_display(self) -> List[str]:
+        """
+        v220.0: Generate model loading display lines for the dashboard.
+        
+        Shows detailed info about what's happening during model loading
+        so users understand why startup takes 12 minutes.
+        """
+        lines = []
+        state = self._model_loading_state
+        
+        if not state["active"]:
+            return lines
+        
+        # Stage descriptions for user understanding
+        stage_descriptions = {
+            "idle": "Preparing...",
+            "downloading": "Downloading model weights from cache/network",
+            "loading_weights": "Loading neural network weights into memory",
+            "initializing": "Initializing model architecture and parameters",
+            "warming_up": "Warming up model with test inference",
+            "ready": "Model ready for inference",
+        }
+        
+        model_name = state["model_name"] or "LLM"
+        progress = state["progress_pct"]
+        stage = state["stage"]
+        elapsed = state["elapsed_seconds"]
+        estimated = state["estimated_total_seconds"]
+        
+        # Progress bar
+        bar_width = 20
+        filled = int(bar_width * progress / 100)
+        bar = self.PROGRESS_FULL * filled + self.PROGRESS_EMPTY * (bar_width - filled)
+        
+        # ETA calculation
+        if progress > 5 and elapsed > 0:
+            rate = progress / elapsed  # percent per second
+            remaining = (100 - progress) / rate if rate > 0 else estimated
+            eta_str = f"{remaining:.0f}s remaining"
+        elif estimated > 0:
+            eta_str = f"~{estimated // 60}m estimated"
+        else:
+            eta_str = ""
+        
+        # Main loading line
+        lines.append(f"  {self.BOLD}🧠 MODEL LOADING:{self.RESET}")
+        lines.append(f"      {model_name}: {bar} {progress}%  {eta_str}")
+        
+        # Stage info
+        stage_desc = stage_descriptions.get(stage, stage)
+        if state["stage_detail"]:
+            stage_desc = state["stage_detail"]
+        lines.append(f"      Stage: {self.CYAN}{stage_desc}{self.RESET}")
+        
+        # Size info if available
+        if state["model_size_gb"] > 0:
+            lines.append(f"      Size: {state['model_size_gb']:.1f} GB")
+        
+        # Reason/explanation (helps users understand)
+        if state["reason"]:
+            lines.append(f"      {self.DIM}{state['reason']}{self.RESET}")
+        
+        return lines
     
     def update_component(
         self,
@@ -4250,6 +4375,11 @@ class LiveProgressDashboard:
         progress_bar = self._make_progress_bar(gcp["progress"], width=20)
         lines.append(f"  GCP: {progress_bar} {gcp['progress']:.0f}% - {gcp['checkpoint']}")
         
+        # v220.0: Model Loading Progress (shows what's happening during 12-minute wait)
+        model_loading_lines = self._get_model_loading_display()
+        if model_loading_lines:
+            lines.extend(model_loading_lines)
+        
         # Memory
         mem = self._memory
         mem_color = self.GREEN if mem["percent"] < 70 else (self.YELLOW if mem["percent"] < 85 else self.STATUS_COLORS["error"])
@@ -4305,6 +4435,42 @@ class LiveProgressDashboard:
             port_str = f":{port}" if port else ""
             lines.append(f"║      {name:<15} {status_color}[{status.upper():^10}]{self.RESET} {port_str:<6} {pid_str}")
         lines.append(f"║")
+        
+        # v220.0: Model Loading Section (detailed progress during 12-minute wait)
+        model_state = self._model_loading_state
+        if model_state["active"]:
+            lines.append(f"║  {self.BOLD}🧠 MODEL LOADING:{self.RESET}")
+            model_name = model_state["model_name"] or "LLM"
+            progress = model_state["progress_pct"]
+            bar = self._make_progress_bar(progress, width=20)
+            elapsed = model_state["elapsed_seconds"]
+            estimated = model_state["estimated_total_seconds"]
+            
+            # ETA calculation
+            if progress > 5 and elapsed > 0:
+                rate = progress / elapsed
+                remaining = (100 - progress) / rate if rate > 0 else estimated
+                eta_str = f"~{remaining:.0f}s remaining"
+            else:
+                eta_str = f"~{estimated // 60}m total"
+            
+            lines.append(f"║      {model_name}: {bar} {progress}%  {eta_str}")
+            
+            stage_map = {
+                "downloading": "Downloading weights",
+                "loading_weights": "Loading into memory",
+                "initializing": "Initializing model",
+                "warming_up": "Warming up inference",
+            }
+            stage_desc = stage_map.get(model_state["stage"], model_state["stage"])
+            if model_state["stage_detail"]:
+                stage_desc = model_state["stage_detail"]
+            lines.append(f"║      Stage: {self.CYAN}{stage_desc}{self.RESET}")
+            
+            if model_state["reason"]:
+                reason = model_state["reason"][:55]
+                lines.append(f"║      {self.DIM}{reason}{self.RESET}")
+            lines.append(f"║")
         
         # Recent logs section (v197.3)
         if self._log_buffer and self._max_log_lines > 0:
@@ -4379,6 +4545,62 @@ def update_dashboard_gcp_progress(
             progress=progress,
             eta_seconds=eta_seconds,
             **kwargs
+        )
+
+
+def update_dashboard_model_loading(
+    active: bool = None,
+    model_name: str = None,
+    model_size_gb: float = None,
+    progress_pct: int = None,
+    stage: str = None,
+    stage_detail: str = None,
+    estimated_total_seconds: int = None,
+    elapsed_seconds: int = None,
+    reason: str = None,
+) -> None:
+    """
+    v220.0: Helper to update model loading progress on the dashboard.
+    
+    Call this from anywhere to show users what's happening during the
+    12-minute model loading process. This provides transparency so
+    users know why startup takes time.
+    
+    Args:
+        active: Whether model loading is in progress (False to hide)
+        model_name: Name of the model (e.g., "Mistral-7B", "LLAVA-1.5")
+        model_size_gb: Model size in GB
+        progress_pct: Loading progress 0-100
+        stage: Current stage (downloading, loading_weights, initializing, warming_up)
+        stage_detail: Detailed stage info (e.g., "Loading layer 24/32")
+        estimated_total_seconds: Expected total load time
+        elapsed_seconds: Time spent so far
+        reason: User-friendly explanation (e.g., "Large model requires memory allocation")
+    
+    Example:
+        update_dashboard_model_loading(
+            active=True,
+            model_name="Mistral-7B-Instruct",
+            model_size_gb=14.5,
+            progress_pct=35,
+            stage="loading_weights",
+            stage_detail="Loading layer 12/32",
+            estimated_total_seconds=720,
+            elapsed_seconds=250,
+            reason="Loading 7B parameters into memory (16GB model on 32GB RAM)"
+        )
+    """
+    if _live_dashboard:
+        _live_dashboard.update_model_loading(
+            active=active,
+            model_name=model_name,
+            model_size_gb=model_size_gb,
+            progress_pct=progress_pct,
+            stage=stage,
+            stage_detail=stage_detail,
+            estimated_total_seconds=estimated_total_seconds,
+            elapsed_seconds=elapsed_seconds,
+            reason=reason,
         )
 
 
@@ -53846,6 +54068,24 @@ class TrinityIntegrator:
                     )
                     last_state = result.state
                     last_phase = result.phase
+                    
+                    # v220.0: Update model loading dashboard for Prime when in LOADING state
+                    if result.component_type == ComponentType.PRIME:
+                        if result.state == ComponentReadinessState.LOADING:
+                            # Show model loading progress in dashboard
+                            update_dashboard_model_loading(
+                                active=True,
+                                model_name=result.raw_response.get("active_model", "LLM") if result.raw_response else "LLM",
+                                progress_pct=int(result.raw_response.get("startup_progress", 0)) if result.raw_response else int(elapsed / 7.2),  # ~720s total
+                                stage="loading_weights",
+                                stage_detail=result.phase or "Loading model into memory",
+                                estimated_total_seconds=720,  # 12 minutes typical
+                                elapsed_seconds=int(elapsed),
+                                reason="Loading large language model parameters into memory (this is normal for ML models)"
+                            )
+                        elif result.state == ComponentReadinessState.READY:
+                            # Clear model loading display
+                            update_dashboard_model_loading(active=False)
 
                 # Check if ready
                 if result.is_ready:
