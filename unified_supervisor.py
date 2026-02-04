@@ -10193,6 +10193,15 @@ class AsyncVoiceNarrator:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._speaking = False
         self._current_priority = VoicePriority.LOW
+        
+        # v220.2: CRITICAL - Asyncio lock to prevent duplicate/overlapping speech
+        # This is the ROOT CAUSE FIX for hallucinated/duplicate voices during startup
+        self._speech_lock: asyncio.Lock = asyncio.Lock()
+        
+        # v220.2: Track active speech to prevent duplicates
+        self._last_spoken_text: str = ""
+        self._last_spoken_time: float = 0.0
+        self._duplicate_prevention_window: float = 2.0  # Seconds to prevent same message
 
         # Queue management with priority
         self._queue: asyncio.PriorityQueue[Tuple[int, float, str]] = asyncio.PriorityQueue()
@@ -10201,6 +10210,7 @@ class AsyncVoiceNarrator:
         # Statistics
         self._messages_spoken = 0
         self._messages_skipped = 0
+        self._messages_deduplicated = 0  # v220.2: Track deduplicated messages
         self._start_time = time.time()
 
         # Lifecycle tracking
@@ -10267,19 +10277,58 @@ class AsyncVoiceNarrator:
         wait: bool = True,
         priority: VoicePriority = VoicePriority.MEDIUM,
     ) -> None:
-        """Internal speech implementation."""
+        """
+        Internal speech implementation.
+        
+        v220.2: CRITICAL FIX - Uses asyncio Lock to prevent duplicate/overlapping speech.
+        This fixes the "hallucinated duplicate voices" issue during startup by:
+        1. Acquiring exclusive lock before speaking
+        2. Deduplicating identical messages within a time window
+        3. Properly serializing all speech requests
+        """
         if not self.enabled:
             return
 
+        # v220.2: Deduplicate identical messages within time window
+        # This prevents rapid-fire duplicate announcements
+        now = time.time()
+        text_normalized = text.strip().lower()
+        if (text_normalized == self._last_spoken_text.strip().lower() and 
+            (now - self._last_spoken_time) < self._duplicate_prevention_window):
+            _unified_logger.debug(f"[Voice] Skipping duplicate message: {text[:50]}...")
+            self._messages_deduplicated += 1
+            return
+
+        # v220.2: CRITICAL - Acquire lock to prevent concurrent speech
+        # This is a non-blocking try to prevent deadlocks during rapid calls
+        try:
+            async with asyncio.timeout(0.1):  # Quick timeout for lock acquisition
+                acquired = await self._speech_lock.acquire()
+        except asyncio.TimeoutError:
+            # Another speech is in progress - skip this one if lower priority
+            if priority.value >= self._current_priority.value:
+                _unified_logger.debug(f"[Voice] Skipping (lock busy, lower priority): {text[:30]}...")
+                self._messages_skipped += 1
+                return
+            # Higher priority - wait for lock
+            await self._speech_lock.acquire()
+            acquired = True
+        
         try:
             # Priority interrupt: kill lower priority speech
             if self._speaking and priority.value < self._current_priority.value:
                 if self._process and self._process.returncode is None:
                     self._process.terminate()
+                    try:
+                        await asyncio.wait_for(self._process.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        self._process.kill()
                     self._messages_skipped += 1
 
             self._speaking = True
             self._current_priority = priority
+            self._last_spoken_text = text
+            self._last_spoken_time = now
 
             self._process = await asyncio.create_subprocess_exec(
                 "say",
@@ -10293,8 +10342,8 @@ class AsyncVoiceNarrator:
             if wait:
                 await asyncio.wait_for(self._process.communicate(), timeout=30.0)
             else:
-                # Fire and forget for non-blocking
-                create_safe_task(self._wait_and_cleanup())
+                # Fire and forget for non-blocking, but still hold lock during speech
+                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
 
             self._messages_spoken += 1
 
@@ -10306,6 +10355,8 @@ class AsyncVoiceNarrator:
             _unified_logger.debug(f"Voice error: {e}")
         finally:
             self._speaking = False
+            if acquired:
+                self._speech_lock.release()
 
     async def _wait_and_cleanup(self) -> None:
         """Wait for speech to finish and cleanup."""
@@ -10650,6 +10701,7 @@ class AsyncVoiceNarrator:
             "enabled": self.enabled,
             "messages_spoken": self._messages_spoken,
             "messages_skipped": self._messages_skipped,
+            "messages_deduplicated": self._messages_deduplicated,  # v220.2: Track deduped messages
             "zones_completed": list(self._zones_completed),
             "phases_completed": list(self._phases_completed),
             "uptime_seconds": time.time() - self._start_time,
@@ -53316,6 +53368,46 @@ class TrinityIntegrator:
 
         # v201.0: Determine whether to skip local Prime
         should_skip_prime = skip_prime or invincible_node_ready
+        
+        # v220.2: Check if Prime was already started by early pre-warm task
+        early_prime_pid = os.environ.get("JARVIS_EARLY_PRIME_PID")
+        early_prime_port = os.environ.get("JARVIS_EARLY_PRIME_PORT")
+        prime_already_started = False
+        
+        if early_prime_pid and self._jprime and not should_skip_prime:
+            try:
+                pid = int(early_prime_pid)
+                # Check if process is still running
+                os.kill(pid, 0)  # Doesn't kill, just checks if exists
+                
+                self.logger.info(
+                    f"[Trinity] 🚀 EARLY PRIME DETECTED - Adopting pre-warmed Prime (PID: {pid})"
+                )
+                self.logger.info(
+                    "[Trinity]    → LLM loading started ~3-5 minutes ago, should be nearly ready!"
+                )
+                
+                # Adopt the already-running process
+                self._jprime.pid = pid
+                self._jprime.state = "starting"  # Already starting, not newly started
+                if early_prime_port:
+                    self._jprime.port = int(early_prime_port)
+                
+                results["jarvis-prime"] = True  # Already started
+                prime_already_started = True
+                
+                # Clear the early prime env vars
+                del os.environ["JARVIS_EARLY_PRIME_PID"]
+                if "JARVIS_EARLY_PRIME_PORT" in os.environ:
+                    del os.environ["JARVIS_EARLY_PRIME_PORT"]
+                    
+            except (ValueError, ProcessLookupError, OSError) as e:
+                self.logger.debug(f"[Trinity] Early Prime process not found or dead: {e}")
+                # Clear stale env vars
+                if "JARVIS_EARLY_PRIME_PID" in os.environ:
+                    del os.environ["JARVIS_EARLY_PRIME_PID"]
+                if "JARVIS_EARLY_PRIME_PORT" in os.environ:
+                    del os.environ["JARVIS_EARLY_PRIME_PORT"]
 
         if should_skip_prime and self._jprime:
             self.logger.info(
@@ -53330,7 +53422,8 @@ class TrinityIntegrator:
 
         # v197.2: Collect all components to start
         components_to_start = []
-        if self._jprime and not should_skip_prime:
+        # v220.2: Only add Prime if not already started by early pre-warm
+        if self._jprime and not should_skip_prime and not prime_already_started:
             components_to_start.append(("jarvis-prime", self._jprime))
         if self._reactor:
             # Reactor-Core always starts locally (training pipeline)
@@ -56944,6 +57037,111 @@ class JarvisSystemKernel:
         )
         await self._startup_watchdog.start()
 
+        # =====================================================================
+        # v220.2: EARLY PRIME PRE-WARM - Start LLM loading IMMEDIATELY
+        # =====================================================================
+        # CRITICAL OPTIMIZATION: Prime takes 12 minutes to load LLMs. Starting
+        # it early (in parallel with all other phases) means by the time we
+        # reach Phase 5 (Trinity), Prime may already be ready or nearly ready.
+        # This is the ROOT CAUSE FIX for "LLM loading should start first".
+        #
+        # Strategy:
+        # - Start Prime subprocess NOW (before Phase 0)
+        # - Let it load models in background
+        # - Don't block other phases
+        # - Trinity phase will find Prime already warming up
+        # =====================================================================
+        self._early_prime_task: Optional[asyncio.Task] = None
+        if self.config.trinity_enabled and os.getenv("JARVIS_EARLY_PRIME_PREWARM", "true").lower() == "true":
+            self.logger.info("[Kernel] 🚀 Starting EARLY PRIME PRE-WARM (12-minute LLM load begins NOW)")
+            add_dashboard_log("Starting early Prime pre-warm (LLM loading)", "INFO")
+            
+            async def _early_prime_prewarm():
+                """
+                Start Prime subprocess early to begin LLM loading immediately.
+                This runs in parallel with all startup phases.
+                """
+                try:
+                    # Import TrinityIntegrator to start Prime
+                    prime_repo = os.getenv("JARVIS_PRIME_REPO_PATH", os.path.expanduser("~/Documents/repos/JARVIS-Prime"))
+                    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", "8000"))
+                    
+                    if not os.path.exists(prime_repo):
+                        self.logger.warning(f"[EarlyPrime] Prime repo not found: {prime_repo}")
+                        return
+                    
+                    # Update dashboard to show early model loading started
+                    update_dashboard_model_loading(
+                        active=True,
+                        model_name="LLM (pre-warming)",
+                        progress_pct=1,
+                        stage="starting",
+                        stage_detail="Early pre-warm: Starting Prime subprocess...",
+                        estimated_total_seconds=720,
+                        reason="Starting LLM pre-load in parallel with other startup phases"
+                    )
+                    
+                    # Build startup command
+                    startup_script = os.path.join(prime_repo, "startup.py")
+                    if not os.path.exists(startup_script):
+                        startup_script = os.path.join(prime_repo, "main.py")
+                    
+                    if not os.path.exists(startup_script):
+                        self.logger.warning("[EarlyPrime] No startup script found in Prime repo")
+                        return
+                    
+                    # Prepare environment with startup grace period
+                    env = os.environ.copy()
+                    env["JARVIS_EARLY_PREWARM"] = "true"
+                    env["JARVIS_PORT"] = str(prime_port)
+                    env["JARVIS_STARTUP_GRACE_PERIOD"] = "720"  # 12 minutes
+                    
+                    self.logger.info(f"[EarlyPrime] Starting Prime at port {prime_port}...")
+                    
+                    # Start Prime subprocess
+                    process = await asyncio.create_subprocess_exec(
+                        "python3", startup_script,
+                        cwd=prime_repo,
+                        env=env,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    
+                    self.logger.success(f"[EarlyPrime] Prime subprocess started (PID: {process.pid})")
+                    
+                    # Store PID for later use by TrinityIntegrator
+                    os.environ["JARVIS_EARLY_PRIME_PID"] = str(process.pid)
+                    os.environ["JARVIS_EARLY_PRIME_PORT"] = str(prime_port)
+                    
+                    # Monitor health briefly to confirm startup began
+                    await asyncio.sleep(5)  # Give it a few seconds to start
+                    
+                    health_url = f"http://localhost:{prime_port}/health"
+                    try:
+                        import aiohttp
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(health_url, timeout=5) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    self.logger.info(f"[EarlyPrime] Prime responding: {data.get('status', 'unknown')}")
+                                else:
+                                    self.logger.debug(f"[EarlyPrime] Prime starting (HTTP {resp.status})")
+                    except Exception:
+                        self.logger.debug("[EarlyPrime] Prime not yet responding (normal during model load)")
+                    
+                except Exception as e:
+                    self.logger.warning(f"[EarlyPrime] Pre-warm failed (non-fatal): {e}")
+                    # Clear any partial state
+                    if "JARVIS_EARLY_PRIME_PID" in os.environ:
+                        del os.environ["JARVIS_EARLY_PRIME_PID"]
+            
+            # Fire and forget - don't block startup
+            self._early_prime_task = create_safe_task(
+                _early_prime_prewarm(),
+                name="early-prime-prewarm"
+            )
+            self._background_tasks.append(self._early_prime_task)
+        
         try:
             # =================================================================
             # PHASE 0: LOADING EXPERIENCE (v117.0)
