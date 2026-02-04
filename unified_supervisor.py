@@ -58086,7 +58086,21 @@ class JarvisSystemKernel:
             return False
 
     async def _wait_for_backend_health(self, timeout: float = 60.0) -> bool:
-        """Wait for backend to respond to health checks using non-blocking async."""
+        """
+        Wait for backend to respond to health checks using non-blocking async.
+        
+        v215.0: Enhanced to verify WebSocket readiness in addition to HTTP health.
+        
+        This fixes the "Not connected to JARVIS" error that occurs when:
+        1. Backend HTTP endpoints become ready
+        2. Supervisor marks backend as "complete"
+        3. Frontend attempts WebSocket connection
+        4. WebSocket endpoints aren't fully initialized yet
+        5. Connection fails → "❌ Not connected to JARVIS"
+        
+        The fix verifies /health/ready includes websocket_ready: true before
+        signaling that the backend is ready for frontend connections.
+        """
         if not AIOHTTP_AVAILABLE:
             # Simple socket check using async_check_port
             start_time = time.time()
@@ -58119,21 +58133,89 @@ class JarvisSystemKernel:
                 await asyncio.sleep(1.0)
             return False
 
-        # HTTP health check
+        # =========================================================================
+        # v215.0: Two-Phase Health Check (HTTP + WebSocket Readiness)
+        # =========================================================================
+        # Phase 1: Wait for basic HTTP health endpoint
+        # Phase 2: Verify WebSocket endpoints are ready via /health/ready
+        # This ensures frontend WebSocket connections succeed after backend is marked ready
+        # =========================================================================
+        
         health_url = f"http://localhost:{self.config.backend_port}/health"
+        readiness_url = f"http://localhost:{self.config.backend_port}/health/ready"
         start_time = time.time()
-
+        http_ready = False
+        
+        # Phase 1: Wait for basic HTTP health
+        self.logger.debug("[Kernel] Phase 1: Waiting for HTTP health endpoint...")
         while (time.time() - start_time) < timeout:
             try:
                 async with aiohttp.ClientSession() as session:  # type: ignore[union-attr]
                     async with session.get(health_url, timeout=5.0) as response:
                         if response.status == 200:
-                            return True
+                            http_ready = True
+                            self.logger.debug("[Kernel] ✓ HTTP health endpoint ready")
+                            break
             except Exception:
                 pass
             await asyncio.sleep(1.0)
-
-        return False
+        
+        if not http_ready:
+            self.logger.warning("[Kernel] HTTP health check failed - backend not ready")
+            return False
+        
+        # Phase 2: Wait for WebSocket readiness (remaining timeout)
+        # This ensures /ws endpoint is fully initialized before frontend connects
+        remaining_timeout = timeout - (time.time() - start_time)
+        ws_timeout = min(remaining_timeout, 30.0)  # Cap WebSocket wait at 30s
+        ws_start_time = time.time()
+        
+        self.logger.debug("[Kernel] Phase 2: Verifying WebSocket readiness...")
+        while (time.time() - ws_start_time) < ws_timeout:
+            try:
+                async with aiohttp.ClientSession() as session:  # type: ignore[union-attr]
+                    async with session.get(readiness_url, timeout=5.0) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            
+                            # Check if WebSocket is ready
+                            websocket_ready = data.get("details", {}).get("websocket_ready", False)
+                            status = data.get("status", "unknown")
+                            ready = data.get("ready", False)
+                            
+                            # Log readiness status for debugging
+                            self.logger.debug(
+                                f"[Kernel] Readiness check: status={status}, "
+                                f"ready={ready}, websocket_ready={websocket_ready}"
+                            )
+                            
+                            # Accept if WebSocket is ready OR if system is fully ready
+                            # (some configurations may not have websocket_ready explicitly)
+                            if websocket_ready or (ready and status in ("ready", "operational", "interactive", "websocket_ready")):
+                                self.logger.info(
+                                    f"[Kernel] ✓ Backend fully ready "
+                                    f"(status={status}, websocket={websocket_ready})"
+                                )
+                                return True
+                            
+                            # Not ready yet - WebSocket still initializing
+                            if status in ("warming_up", "initializing"):
+                                self.logger.debug(
+                                    f"[Kernel] WebSocket initializing... (status={status})"
+                                )
+                                
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Readiness check error: {e}")
+            
+            await asyncio.sleep(0.5)  # Check more frequently for WebSocket
+        
+        # Timeout waiting for WebSocket - still return True if HTTP was ready
+        # This provides graceful degradation - voice may not work but other features will
+        self.logger.warning(
+            "[Kernel] ⚠ WebSocket readiness timeout - backend ready but WebSocket may be delayed. "
+            "Voice commands may fail initially."
+        )
+        return True  # Allow startup to continue with degraded WebSocket
 
     async def _phase_intelligence(self) -> bool:
         """
