@@ -1,16 +1,18 @@
 """
 RobustFileLock - POSIX Cross-Process File Locking using fcntl.flock().
 
+v214.0: REENTRANT SUPPORT - Same async task can re-acquire locks it holds.
+
 Guarantees:
 - ATOMIC: Lock acquisition is atomic at the kernel level
 - EPHEMERAL: Lock automatically released on process death
 - NON-BLOCKING EVENT LOOP: All blocking I/O runs in executor
 - CROSS-PROCESS: Works across all processes on same machine
+- REENTRANT (v214.0): Same async task can re-acquire same lock safely
 
 Limitations:
 - POSIX-ONLY: Does not work on Windows
 - LOCAL FILESYSTEM: LOCK_DIR must be on a local filesystem (not NFS)
-- NOT REENTRANT: Same process must not acquire same lock twice
 - NO FORK: Do not fork while holding the lock
 """
 
@@ -25,7 +27,7 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional, Set, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +51,12 @@ LOCK_POLL_INTERVAL_S = float(os.environ.get("LOCK_POLL_INTERVAL_S", "0.05"))
 LOCK_STALE_WARNING_S = float(os.environ.get("LOCK_STALE_WARNING_S", "30.0"))
 
 # =============================================================================
-# Process-local reentrancy guard
+# v214.0: Task-aware reentrant lock tracking
 # =============================================================================
 
-_held_locks: Set[str] = set()
+# Maps lock_name -> (task_id, reentrance_count, fd)
+# This allows the same async task to re-acquire a lock it already holds
+_held_locks: Dict[str, Tuple[int, int, Optional[int]]] = {}
 _held_locks_lock: Optional[asyncio.Lock] = None
 
 
@@ -64,10 +68,26 @@ def _get_held_locks_lock() -> asyncio.Lock:
     return _held_locks_lock
 
 
+def _get_task_id() -> int:
+    """Get unique ID for current async task (or thread if no task)."""
+    try:
+        task = asyncio.current_task()
+        return id(task) if task else id(asyncio.get_running_loop())
+    except RuntimeError:
+        # No running event loop - use thread ID
+        import threading
+        return threading.current_thread().ident or 0
+
+
 class RobustFileLock:
     """
     OS-level file lock using fcntl.flock().
     All blocking I/O runs in executor to avoid blocking the event loop.
+    
+    v214.0: Now supports reentrancy within the same async task.
+    If the same task tries to acquire a lock it already holds, the lock
+    count is incremented and the existing fd is reused. Release decrements
+    the count and only truly releases when count reaches 0.
     """
 
     def __init__(self, lock_name: str, source: str = "jarvis"):
@@ -88,27 +108,44 @@ class RobustFileLock:
 
         self._fd: Optional[int] = None
         self._acquired = False
+        self._is_reentrant_acquire = False  # v214.0: Track if this was a reentrant acquire
 
     async def acquire(self, timeout_s: Optional[float] = None) -> bool:
         """
         Acquire the lock with timeout.
 
-        Returns:
-            True if acquired, False if timeout or error.
+        v214.0: Supports reentrance - if the same async task already holds
+        this lock, the count is incremented and we return True immediately.
 
-        Raises:
-            RuntimeError: If same process already holds this lock (reentrancy)
+        Returns:
+            True if acquired (or reentrantly held), False if timeout or error.
         """
         timeout_s = timeout_s or LOCK_ACQUIRE_TIMEOUT_S
+        task_id = _get_task_id()
 
-        # Reentrancy check
+        # v214.0: Check for reentrant acquisition by same task
         held_lock = _get_held_locks_lock()
         async with held_lock:
             if self._lock_name in _held_locks:
-                raise RuntimeError(
-                    f"Lock '{self._lock_name}' already held by this process. "
-                    f"RobustFileLock is NOT reentrant."
-                )
+                holder_task_id, count, existing_fd = _held_locks[self._lock_name]
+                if holder_task_id == task_id:
+                    # Same task - this is a reentrant acquire
+                    _held_locks[self._lock_name] = (task_id, count + 1, existing_fd)
+                    self._acquired = True
+                    self._is_reentrant_acquire = True
+                    self._fd = existing_fd  # Reuse existing fd
+                    logger.debug(
+                        f"[Lock v214.0] Reentrant acquire: {self._lock_name} "
+                        f"(count now {count + 1})"
+                    )
+                    return True
+                else:
+                    # Different task holds the lock - this shouldn't happen with
+                    # proper async code, but if it does, we wait for it
+                    logger.debug(
+                        f"[Lock v214.0] Lock {self._lock_name} held by different task "
+                        f"(holder={holder_task_id}, us={task_id}), waiting..."
+                    )
 
         deadline = time.monotonic() + timeout_s
         loop = asyncio.get_running_loop()
@@ -137,10 +174,11 @@ class RobustFileLock:
 
                 if acquired:
                     self._acquired = True
+                    self._is_reentrant_acquire = False
 
-                    # Register in held locks
+                    # Register in held locks with task ID and count
                     async with held_lock:
-                        _held_locks.add(self._lock_name)
+                        _held_locks[self._lock_name] = (task_id, 1, self._fd)
 
                     # Write metadata
                     await loop.run_in_executor(None, self._write_metadata_sync)
@@ -162,8 +200,38 @@ class RobustFileLock:
         return False
 
     async def release(self) -> None:
-        """Release the lock. Safe to call multiple times."""
-        if self._fd is not None and self._acquired:
+        """
+        Release the lock. Safe to call multiple times.
+        
+        v214.0: If this was a reentrant acquire, decrements the count.
+        Only truly releases when count reaches 0.
+        """
+        if not self._acquired:
+            return
+            
+        task_id = _get_task_id()
+        held_lock = _get_held_locks_lock()
+        
+        async with held_lock:
+            if self._lock_name in _held_locks:
+                holder_task_id, count, existing_fd = _held_locks[self._lock_name]
+                
+                if holder_task_id == task_id:
+                    if count > 1:
+                        # Decrement count, don't actually release
+                        _held_locks[self._lock_name] = (task_id, count - 1, existing_fd)
+                        self._acquired = False
+                        logger.debug(
+                            f"[Lock v214.0] Reentrant release: {self._lock_name} "
+                            f"(count now {count - 1})"
+                        )
+                        return
+                    else:
+                        # count == 1, actually release
+                        del _held_locks[self._lock_name]
+        
+        # Actually release the lock
+        if self._fd is not None and not self._is_reentrant_acquire:
             loop = asyncio.get_running_loop()
             try:
                 await loop.run_in_executor(None, self._release_sync)
@@ -171,14 +239,9 @@ class RobustFileLock:
             except OSError as e:
                 logger.warning(f"[Lock] Error releasing {self._lock_name}: {e}")
             finally:
-                self._acquired = False
-
-                # Remove from held locks
-                held_lock = _get_held_locks_lock()
-                async with held_lock:
-                    _held_locks.discard(self._lock_name)
-
                 await self._close_fd_async()
+        
+        self._acquired = False
 
     # =========================================================================
     # Sync methods (run in executor)

@@ -1838,19 +1838,30 @@ async def ensure_gcp_vm_ready_for_prime(
         # v147.0: start_spot_vm now returns IP on success
         vm_ip = result_or_error  # This is the IP address when success=True
         
-        # v213.0: Track VM name for diagnosis - get it immediately after provisioning
-        # This fixes the "Could not find VM for IP" error by tracking the name upfront
+        # v214.0: Track VM name for diagnosis - use get_most_recent_vm() which doesn't
+        # require is_healthy=True (unlike get_active_vm). This fixes the "Could not find VM"
+        # error because the VM exists but hasn't passed health checks yet.
         provisioned_vm_name: Optional[str] = None
         try:
-            active_vm = await vm_manager.get_active_vm()
-            if active_vm:
-                provisioned_vm_name = active_vm.name
+            # v214.0: Use get_most_recent_vm instead of get_active_vm
+            # get_active_vm requires is_healthy=True, but immediately after creation
+            # the VM hasn't passed health checks yet
+            recent_vm = await vm_manager.get_most_recent_vm()
+            if recent_vm:
+                provisioned_vm_name = recent_vm.name
+                logger.info(f"[v214.0] Tracked VM name for diagnosis: {provisioned_vm_name}")
                 # v213.0: Also verify/update the IP if it was initially None
-                if not vm_ip and active_vm.ip_address:
-                    vm_ip = active_vm.ip_address
-                    logger.info(f"[v213.0] Updated VM IP from manager: {vm_ip}")
+                if not vm_ip and recent_vm.ip_address:
+                    vm_ip = recent_vm.ip_address
+                    logger.info(f"[v214.0] Updated VM IP from manager: {vm_ip}")
+            else:
+                # Fallback: query managed_vms directly
+                async with vm_manager._vm_lock:
+                    if vm_manager.managed_vms:
+                        provisioned_vm_name = next(iter(vm_manager.managed_vms.keys()))
+                        logger.info(f"[v214.0] Fallback VM name from managed_vms: {provisioned_vm_name}")
         except Exception as vm_track_err:
-            logger.debug(f"[v213.0] Could not track VM name (non-fatal): {vm_track_err}")
+            logger.debug(f"[v214.0] Could not track VM name (non-fatal): {vm_track_err}")
         
         logger.info(f"[v213.0] 🔧 VM provisioned: name={provisioned_vm_name}, IP={vm_ip}, waiting for service...")
 
@@ -1936,42 +1947,84 @@ async def ensure_gcp_vm_ready_for_prime(
         # Timeout reached - v155.0: Run diagnostics before failing
         logger.warning(f"[v155.0] ⏳ GCP VM health check timeout - running diagnostics...")
 
-        # v213.0: Enhanced VM diagnostics with multi-strategy lookup
-        # Use the VM name we tracked at provision time, or search by IP, or by any active VM
-        vm_name = provisioned_vm_name  # v213.0: Use tracked name from provision
+        # v214.0: Enhanced VM diagnostics with multi-strategy lookup
+        # Priority: tracked name -> IP lookup -> GCP API query -> any managed VM
+        vm_name = provisioned_vm_name  # v214.0: Use tracked name from provision
         diagnosis = None
         try:
-            # If we didn't track the name, try to find it by IP or get any active VM
-            if not vm_name:
+            # Strategy 1: Use tracked name (already set above)
+            if vm_name:
+                logger.debug(f"[v214.0] Using tracked VM name for diagnosis: {vm_name}")
+            
+            # Strategy 2: Find by IP in local tracking
+            if not vm_name and vm_ip:
                 async with vm_manager._vm_lock:
-                    # Strategy 1: Find by IP
                     for name, vm in vm_manager.managed_vms.items():
                         if vm.ip_address == vm_ip:
                             vm_name = name
+                            logger.info(f"[v214.0] Found VM by IP match: {vm_name}")
                             break
+            
+            # Strategy 3: Query GCP API directly (if local tracking failed)
+            if not vm_name and vm_ip:
+                try:
+                    import asyncio
+                    from google.cloud import compute_v1
                     
-                    # Strategy 2: Find by most recent running VM (if IP lookup failed)
-                    if not vm_name:
-                        for name, vm in vm_manager.managed_vms.items():
-                            if vm.state.value == "running":
-                                vm_name = name
-                                logger.info(f"[v213.0] Found running VM by state: {vm_name}")
+                    # List all instances and find by IP
+                    instances_client = compute_v1.InstancesClient()
+                    request = compute_v1.ListInstancesRequest(
+                        project=vm_manager.config.project_id,
+                        zone=vm_manager.config.zone,
+                        filter=f'status=RUNNING'
+                    )
+                    instances = await asyncio.to_thread(instances_client.list, request=request)
+                    
+                    for instance in instances:
+                        for ni in instance.network_interfaces:
+                            if ni.access_configs:
+                                for ac in ni.access_configs:
+                                    if ac.nat_i_p == vm_ip:
+                                        vm_name = instance.name
+                                        logger.info(f"[v214.0] Found VM by GCP API query: {vm_name}")
+                                        break
+                            if vm_name:
                                 break
+                        if vm_name:
+                            break
+                except Exception as gcp_query_err:
+                    logger.debug(f"[v214.0] GCP API query failed (non-fatal): {gcp_query_err}")
+            
+            # Strategy 4: Find any running VM in local tracking
+            if not vm_name:
+                async with vm_manager._vm_lock:
+                    for name, vm in vm_manager.managed_vms.items():
+                        if vm.state.value == "running":
+                            vm_name = name
+                            logger.info(f"[v214.0] Found running VM by state: {vm_name}")
+                            break
+            
+            # Strategy 5: Use any tracked VM as last resort
+            if not vm_name:
+                async with vm_manager._vm_lock:
+                    if vm_manager.managed_vms:
+                        vm_name = next(iter(vm_manager.managed_vms.keys()))
+                        logger.info(f"[v214.0] Using any tracked VM as fallback: {vm_name}")
             
             # Now run diagnosis with whatever VM name we found
             if vm_name and hasattr(vm_manager, 'diagnose_vm_startup_failure'):
                 diagnosis = await vm_manager.diagnose_vm_startup_failure(vm_name, vm_ip)
-                logger.info(f"[v213.0] Diagnosis complete for VM '{vm_name}': {diagnosis.get('detected_issues', [])}")
+                logger.info(f"[v214.0] Diagnosis complete for VM '{vm_name}': {diagnosis.get('detected_issues', [])}")
             else:
-                # v213.0: Enhanced warning with debug info
+                # v214.0: Enhanced warning with debug info
                 tracked_vms = list(vm_manager.managed_vms.keys()) if vm_manager.managed_vms else []
                 logger.warning(
-                    f"[v213.0] Could not find VM for diagnosis. "
+                    f"[v214.0] Could not find VM for diagnosis. "
                     f"IP={vm_ip}, tracked_name={provisioned_vm_name}, "
                     f"managed_vms={tracked_vms}, has_diagnose={hasattr(vm_manager, 'diagnose_vm_startup_failure')}"
                 )
         except Exception as diag_err:
-            logger.warning(f"[v213.0] Diagnosis error (non-fatal): {diag_err}")
+            logger.warning(f"[v214.0] Diagnosis error (non-fatal): {diag_err}")
 
         timeout_error = TimeoutError(
             f"GCP VM not ready after {timeout_seconds}s timeout. "

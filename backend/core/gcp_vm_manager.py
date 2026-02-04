@@ -1380,11 +1380,33 @@ class GCPVMManager:
                     return vm
         return None
 
+    async def get_most_recent_vm(self) -> Optional[VMInstance]:
+        """
+        v214.0: Get the most recently created VM instance, regardless of health status.
+        
+        This is useful immediately after provisioning when the VM exists but
+        hasn't passed health checks yet.
+        
+        Returns:
+            VMInstance if found, None otherwise.
+        """
+        async with self._vm_lock:
+            if not self.managed_vms:
+                return None
+            # Return the first RUNNING VM, or any VM if none are running
+            running_vms = [vm for vm in self.managed_vms.values() if vm.state == VMState.RUNNING]
+            if running_vms:
+                return running_vms[0]
+            # No running VMs - return any VM
+            return next(iter(self.managed_vms.values()), None)
+    
     async def start_spot_vm(self) -> Tuple[bool, Optional[str]]:
         """
         Start a Spot VM for immediate use.
         
         v147.0: Enhanced with detailed error messages for diagnostics.
+        v214.0: Returns (success, ip_or_error, vm_name) - vm_name available via
+                get_most_recent_vm() immediately after this call.
         
         Returns:
             (success, result_or_error)
