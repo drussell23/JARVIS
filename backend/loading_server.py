@@ -1,10 +1,30 @@
 #!/usr/bin/env python3
 """
-JARVIS Loading Server v182.0 - Enterprise-Grade Startup Orchestration Hub
+JARVIS Loading Server v212.0 - Enterprise-Grade Startup Orchestration Hub
 ==========================================================================
 
 The ultimate loading server that serves as the central nervous system for
 JARVIS startup coordination across all Trinity components.
+
+v212.0 ENHANCEMENTS (Unified Feature Integration):
+- W3C Distributed Tracing for cross-service debugging
+- Event Sourcing with JSONL logs for replay capability
+- SQLite Progress Persistence for browser refresh resume
+- Enhanced ML-based ETA Prediction with historical learning
+- Lock-Free Progress Updates with CAS atomic operations
+- Container Awareness for K8s/Docker timeout scaling
+- Adaptive Backpressure (AIMD) for slow client handling
+- Cross-Repo Health Aggregation with circuit breakers
+- Intelligent Context-Aware Message Generation
+- Self-Healing Restart Manager with exponential backoff
+- Trinity Heartbeat File Monitoring
+- Parent Death Watcher (v211.0) - Prevents orphaned processes
+
+v186.0 FIXES:
+- Port injection for correct loading server communication
+- Endpoint aliases (/api/startup-progress -> /api/progress)
+- Sequence tracking for missed update recovery
+- Resume endpoint for WebSocket reconnection
 
 Architecture:
     ┌─────────────────────────────────────────────────────────────────────────┐
@@ -67,7 +87,7 @@ API Endpoints:
     GET  /sse/progress                - SSE fallback stream
 
 Author: JARVIS Trinity System
-Version: 182.0.0
+Version: 212.0.0
 """
 
 from __future__ import annotations
@@ -105,9 +125,35 @@ logging.basicConfig(
     level=getattr(logging, os.getenv("LOADING_SERVER_LOG_LEVEL", "INFO")),
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
 )
-logger = logging.getLogger("LoadingServer.v182")
+logger = logging.getLogger("LoadingServer.v212")
 
 T = TypeVar('T')
+
+
+# =============================================================================
+# v212.0: INTEGRATED MODULE IMPORTS
+# =============================================================================
+# Import advanced features from the loading_server package
+
+try:
+    from backend.loading_server import (
+        W3CTraceContext,
+        EventSourcingLog,
+        ProgressPersistence,
+        PredictiveETACalculator,
+        LockFreeProgressUpdate,
+        ContainerAwareness,
+        AdaptiveBackpressureController,
+        CrossRepoHealthAggregator,
+        IntelligentMessageGenerator,
+        SelfHealingRestartManager,
+        TrinityHeartbeatReader,
+    )
+    ADVANCED_FEATURES_AVAILABLE = True
+    logger.info("[v212.0] Advanced loading server modules loaded")
+except ImportError as e:
+    ADVANCED_FEATURES_AVAILABLE = False
+    logger.debug(f"[v212.0] Advanced features not available: {e}")
 
 
 # =============================================================================
@@ -869,7 +915,21 @@ class TrinityHealthAggregator:
 
 class LoadingServer:
     """
-    v125.0: Enterprise-grade loading server with full Trinity integration.
+    v212.0: Enterprise-grade loading server with full Trinity integration.
+
+    Features:
+    - W3C Distributed Tracing for cross-service correlation
+    - Event Sourcing with JSONL logs for replay/debugging
+    - SQLite Progress Persistence for browser refresh resume
+    - Enhanced ML-based ETA Prediction
+    - Lock-Free Progress Updates
+    - Container-Aware Timeout Scaling
+    - Adaptive Backpressure (AIMD) for WebSocket
+    - Cross-Repo Health Aggregation
+    - Intelligent Message Generation
+    - Self-Healing with Auto-Recovery
+    - Trinity Heartbeat Monitoring
+    - Parent Death Watcher (v211.0)
     """
 
     def __init__(self, config: Optional[LoadingServerConfig] = None):
@@ -911,9 +971,95 @@ class LoadingServer:
         self._trinity_summary: Optional[Dict[str, Any]] = None
         self._trinity_ready: bool = False
 
+        # =================================================================
+        # v212.0: Advanced Feature Integration
+        # =================================================================
+        self._session_id = str(uuid.uuid4())
+        self._trace_context: Optional[Any] = None
+        self._event_log: Optional[Any] = None
+        self._persistence: Optional[Any] = None
+        self._enhanced_eta: Optional[Any] = None
+        self._lock_free_progress: Optional[Any] = None
+        self._container_awareness: Optional[Any] = None
+        self._backpressure: Optional[Any] = None
+        self._cross_repo_health: Optional[Any] = None
+        self._message_generator: Optional[Any] = None
+        self._self_healing: Optional[Any] = None
+        self._heartbeat_reader: Optional[Any] = None
+
+        if ADVANCED_FEATURES_AVAILABLE:
+            self._init_advanced_features()
+
         # Integration with unified hub (if available)
         self._hub = None
         self._try_connect_hub()
+
+    def _init_advanced_features(self) -> None:
+        """Initialize v212.0 advanced features."""
+        try:
+            # W3C Distributed Tracing
+            self._trace_context = W3CTraceContext()
+            logger.info(f"[v212.0] Trace context: {self._trace_context.to_traceparent()}")
+
+            # Event Sourcing Log
+            self._event_log = EventSourcingLog()
+
+            # Progress Persistence (SQLite)
+            self._persistence = ProgressPersistence()
+
+            # Enhanced ETA Prediction
+            self._enhanced_eta = PredictiveETACalculator()
+            self._enhanced_eta.start_session(self._session_id)
+
+            # Lock-Free Progress Updates
+            self._lock_free_progress = LockFreeProgressUpdate()
+
+            # Container Awareness
+            self._container_awareness = ContainerAwareness()
+            if self._container_awareness.is_containerized():
+                timeout_mult = self._container_awareness.get_timeout_multiplier()
+                logger.info(f"[v212.0] Container detected, timeout multiplier: {timeout_mult}x")
+
+            # Adaptive Backpressure
+            self._backpressure = AdaptiveBackpressureController()
+
+            # Cross-Repo Health (use existing aggregator enhanced)
+            self._cross_repo_health = CrossRepoHealthAggregator(self.config)
+
+            # Message Generator
+            self._message_generator = IntelligentMessageGenerator()
+
+            # Self-Healing Manager
+            self._self_healing = SelfHealingRestartManager()
+
+            # Trinity Heartbeat Reader
+            self._heartbeat_reader = TrinityHeartbeatReader()
+
+            # Log initialization event
+            if self._event_log:
+                self._event_log.append_event(
+                    "server_init",
+                    {
+                        "session_id": self._session_id,
+                        "version": "212.0.0",
+                        "features": {
+                            "tracing": True,
+                            "persistence": True,
+                            "enhanced_eta": True,
+                            "lock_free": True,
+                            "container_aware": self._container_awareness.is_containerized() if self._container_awareness else False,
+                            "backpressure": True,
+                            "message_generator": True,
+                            "heartbeat_reader": True,
+                        },
+                    },
+                    trace_id=self._trace_context.trace_id if self._trace_context else None,
+                )
+
+            logger.info("[v212.0] All advanced features initialized")
+
+        except Exception as e:
+            logger.warning(f"[v212.0] Error initializing advanced features: {e}")
 
     def _try_connect_hub(self):
         """Try to connect to the UnifiedStartupProgressHub."""
@@ -936,8 +1082,27 @@ class LoadingServer:
         asyncio.create_task(self._broadcast_progress())
 
     async def _broadcast_progress(self):
-        """Broadcast current progress to all WebSocket clients."""
-        eta_data = self._eta_engine.get_predicted_eta()
+        """
+        Broadcast current progress to all WebSocket clients.
+
+        v212.0: Added backpressure control and enhanced ETA data.
+        """
+        # v212.0: Check backpressure before sending
+        if self._backpressure and not self._backpressure.should_send():
+            return  # Skip this broadcast due to backpressure
+
+        # Get ETA from enhanced engine if available, otherwise use legacy
+        if self._enhanced_eta:
+            eta_data = self._enhanced_eta.get_predicted_eta()
+        else:
+            eta_data = self._eta_engine.get_predicted_eta()
+
+        # v212.0: Get sequence number for missed update detection
+        sequence = self._sequence_number
+        if self._lock_free_progress:
+            _, lock_free_seq = self._lock_free_progress.get_progress()
+            sequence = max(sequence, lock_free_seq)
+
         message = json.dumps({
             "type": "progress",
             "data": {
@@ -949,9 +1114,18 @@ class LoadingServer:
                 "components": self._components,
                 "trinity": self._trinity_summary,  # v185.0: Trinity component summary
                 "trinity_ready": self._trinity_ready,  # v185.0: Trinity ready flag
+                "sequence": sequence,  # v186.0/v212.0: Sequence for detecting missed updates
+                "session_id": self._session_id,  # v212.0: Session correlation
+                "trace_id": self._trace_context.trace_id if self._trace_context else None,
                 "timestamp": datetime.now().isoformat()
             }
         })
+
+        # v212.0: Report queue depth for backpressure control
+        if self._backpressure:
+            queue_depth = self._ws_manager.connection_count
+            self._backpressure.report_congestion(queue_depth)
+
         await self._ws_manager.broadcast(message)
 
     def get_supervisor_state(self) -> Dict[str, Any]:
@@ -1084,7 +1258,36 @@ class LoadingServer:
         elif path == "/api/trinity/status" and method == "GET":
             return self._json_response({"trinity": self._trinity_status})
 
+        # =================================================================
+        # v212.0: New Advanced API Endpoints
+        # =================================================================
+        elif path == "/api/analytics/startup":
+            # Historical startup analytics
+            return self._json_response(self._get_startup_analytics())
+
+        elif path == "/api/health/cross-repo":
+            # Enhanced cross-repo health with circuit breakers
+            if self._cross_repo_health:
+                health = await self._cross_repo_health.get_unified_health()
+                return self._json_response(health)
+            return self._json_response({"error": "Cross-repo health not available"}, status=503)
+
+        elif path == "/api/trinity/heartbeats":
+            # Direct heartbeat file status
+            return self._json_response(await self._get_trinity_heartbeats())
+
+        elif path == "/api/session/info":
+            # Current session information
+            return self._json_response(self._get_session_info())
+
         elif path == "/api/shutdown" and method == "POST":
+            # v212.0: Log shutdown event
+            if self._event_log:
+                self._event_log.append_event(
+                    "shutdown_requested",
+                    {"progress": self._progress, "phase": self._phase},
+                    trace_id=self._trace_context.trace_id if self._trace_context else None,
+                )
             self._shutdown_requested = True
             return self._json_response({"status": "shutdown_initiated"})
 
@@ -1218,13 +1421,15 @@ class LoadingServer:
         return {
             "supervisor": state,
             "loading_server": {
-                "version": "183.0.0",
+                "version": "212.0.0",
                 "startup_time": self._startup_time,
                 "uptime_seconds": time.time() - self._startup_time,
                 "progress": self._progress,
                 "phase": self._phase,
                 "message": self._message,
                 "websocket_clients": self._ws_manager.connection_count,
+                "session_id": self._session_id,
+                "advanced_features": ADVANCED_FEATURES_AVAILABLE,
             },
             "eta": self._eta_engine.get_predicted_eta(),
             "components": self._dependency_graph.get_progress(),
@@ -1255,11 +1460,119 @@ class LoadingServer:
             "timestamp": now,
         }
 
+    # =========================================================================
+    # v212.0: Advanced Feature Helper Methods
+    # =========================================================================
+
+    def _get_startup_analytics(self) -> Dict[str, Any]:
+        """
+        v212.0: Get historical startup analytics.
+
+        Returns statistics about previous startups for optimization insights.
+        """
+        analytics = {
+            "current_session": {
+                "session_id": self._session_id,
+                "started_at": self._startup_time,
+                "elapsed_seconds": time.time() - self._startup_time,
+                "progress": self._progress,
+            },
+        }
+
+        # Add enhanced ETA analytics if available
+        if self._enhanced_eta:
+            try:
+                analytics["eta_engine"] = self._enhanced_eta.get_startup_analytics()
+            except Exception:
+                pass
+
+        # Add persistence analytics if available
+        if self._persistence:
+            try:
+                analytics["persistence"] = self._persistence.get_analytics()
+            except Exception:
+                pass
+
+        return analytics
+
+    async def _get_trinity_heartbeats(self) -> Dict[str, Any]:
+        """
+        v212.0: Get direct heartbeat file status for Trinity components.
+
+        Provides unfiltered view of heartbeat files for debugging.
+        """
+        if not self._heartbeat_reader:
+            return {
+                "available": False,
+                "reason": "Heartbeat reader not initialized",
+            }
+
+        try:
+            summary = await self._heartbeat_reader.get_health_summary()
+            return {
+                "available": True,
+                **summary,
+            }
+        except Exception as e:
+            return {
+                "available": False,
+                "error": str(e),
+            }
+
+    def _get_session_info(self) -> Dict[str, Any]:
+        """
+        v212.0: Get current session information.
+
+        Returns details about the current loading session for debugging.
+        """
+        info = {
+            "session_id": self._session_id,
+            "started_at": datetime.fromtimestamp(self._startup_time).isoformat(),
+            "uptime_seconds": round(time.time() - self._startup_time, 2),
+            "version": "212.0.0",
+            "progress": self._progress,
+            "phase": self._phase,
+            "advanced_features": ADVANCED_FEATURES_AVAILABLE,
+        }
+
+        # Add trace context if available
+        if self._trace_context:
+            info["trace"] = {
+                "trace_id": self._trace_context.trace_id,
+                "traceparent": self._trace_context.to_traceparent(),
+            }
+
+        # Add container info if available
+        if self._container_awareness:
+            try:
+                info["container"] = self._container_awareness.get_resource_summary()
+            except Exception:
+                pass
+
+        # Add backpressure stats if available
+        if self._backpressure:
+            try:
+                info["backpressure"] = self._backpressure.get_stats()
+            except Exception:
+                pass
+
+        # Add lock-free progress state
+        if self._lock_free_progress:
+            try:
+                info["lock_free"] = self._lock_free_progress.get_full_state()
+            except Exception:
+                pass
+
+        return info
+
     async def _handle_progress_update(self, body: Optional[bytes]) -> str:
         """Handle progress update from supervisor.
 
         v127.0: Fixed component handling - now properly extracts 'components' from
         metadata for display on the loading page.
+
+        v212.0: Added event sourcing, persistence, lock-free updates, and
+        intelligent message generation.
 
         Expected format from unified_supervisor:
         {
@@ -1281,9 +1594,28 @@ class LoadingServer:
 
         try:
             data = json.loads(body.decode())
-            self._progress = data.get("progress", self._progress)
+            new_progress = data.get("progress", self._progress)
+
+            # v212.0: Use lock-free progress update for monotonicity
+            if self._lock_free_progress:
+                success, current = self._lock_free_progress.update_progress(new_progress)
+                if success:
+                    self._progress = current
+            else:
+                self._progress = max(self._progress, new_progress)
+
             self._phase = data.get("stage", data.get("phase", self._phase))
             self._message = data.get("message", self._message)
+
+            # v212.0: Generate intelligent message if none provided
+            if not data.get("message") and self._message_generator:
+                try:
+                    self._message = self._message_generator.generate_message(
+                        stage=self._phase,
+                        progress=self._progress,
+                    )
+                except Exception:
+                    pass  # Keep existing message on failure
 
             # v127.0: Properly handle metadata with nested components
             if "metadata" in data:
@@ -1302,6 +1634,14 @@ class LoadingServer:
                     self._trinity_ready = metadata["trinity_ready"]
 
             self._eta_engine.update_progress(self._progress)
+
+            # v212.0: Update enhanced ETA engine
+            if self._enhanced_eta:
+                try:
+                    self._enhanced_eta.update_progress(self._progress)
+                except Exception:
+                    pass
+
             # v183.0: Track supervisor activity
             self._last_supervisor_update = time.time()
             
@@ -1314,11 +1654,42 @@ class LoadingServer:
                 "message": self._message,
                 "timestamp": time.time(),
             })
+
+            # v212.0: Log event for replay/debugging
+            if self._event_log:
+                try:
+                    self._event_log.append_event(
+                        "progress_update",
+                        {
+                            "progress": self._progress,
+                            "stage": self._phase,
+                            "message": self._message,
+                            "components": list(self._components.keys()) if self._components else [],
+                        },
+                        trace_id=self._trace_context.trace_id if self._trace_context else None,
+                    )
+                except Exception:
+                    pass
+
+            # v212.0: Persist progress for browser refresh resume
+            if self._persistence:
+                try:
+                    self._persistence.save_progress(
+                        session_id=self._session_id,
+                        progress=self._progress,
+                        stage=self._phase,
+                        message=self._message,
+                        trace_id=self._trace_context.trace_id if self._trace_context else None,
+                        completed=(self._progress >= 100),
+                    )
+                except Exception:
+                    pass
             
             await self._broadcast_progress()
 
             return self._json_response({"status": "updated", "sequence": self._sequence_number})
         except Exception as e:
+            logger.debug(f"[v212.0] Progress update error: {e}")
             return self._json_response({"error": str(e)}, status=400)
 
     async def _handle_component_register(self, body: Optional[bytes]) -> str:
@@ -1882,10 +2253,34 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
 
     async def start(self):
         """Start the loading server."""
-        logger.info(f"[v125.0] Starting loading server on {self.config.host}:{self.config.port}")
+        logger.info(f"[v212.0] Starting loading server on {self.config.host}:{self.config.port}")
+
+        # =================================================================
+        # v211.0: PARENT DEATH WATCHER - Prevent orphaned processes
+        # =================================================================
+        # When the supervisor (kernel) crashes, this process should exit too.
+        # Without this, the loading server becomes an orphan that persists
+        # across restarts, causing "Cleaned N orphaned processes" warnings.
+        # =================================================================
+        self._parent_watcher = None
+        try:
+            from backend.utils.parent_death_watcher import start_parent_watcher
+            self._parent_watcher = await start_parent_watcher()
+            if self._parent_watcher:
+                logger.info("[v211.0] Parent death watcher started - will auto-exit if supervisor dies")
+            else:
+                logger.debug("[v211.0] Running standalone - no parent watcher needed")
+        except ImportError:
+            logger.debug("Parent death watcher not available")
+        except Exception as e:
+            logger.debug(f"Could not start parent death watcher: {e}")
 
         # Initialize ETA tracking
         self._eta_engine.start_tracking()
+
+        # v212.0: Initialize enhanced ETA if available
+        if self._enhanced_eta:
+            self._enhanced_eta.start_session(self._session_id)
 
         # Start background tasks
         self._background_tasks = [
@@ -1909,8 +2304,19 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
 
     async def stop(self):
         """Stop the loading server gracefully."""
-        logger.info("[v125.0] Shutting down loading server...")
+        logger.info("[v212.0] Shutting down loading server...")
         self._shutdown_requested = True
+
+        # =================================================================
+        # v211.0: PARENT DEATH WATCHER - Stop monitoring during graceful shutdown
+        # =================================================================
+        if hasattr(self, '_parent_watcher') and self._parent_watcher:
+            try:
+                from backend.utils.parent_death_watcher import stop_parent_watcher
+                await stop_parent_watcher()
+                logger.info("[v211.0] Parent death watcher stopped")
+            except Exception as e:
+                logger.debug(f"Parent death watcher cleanup: {e}")
 
         # Cancel background tasks
         for task in self._background_tasks:
@@ -1921,12 +2327,29 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
         # Save ETA history
         self._eta_engine.finish_tracking()
 
+        # v212.0: Save enhanced ETA history if available
+        if self._enhanced_eta:
+            self._enhanced_eta.finish_session()
+
+        # v212.0: Log shutdown event
+        if self._event_log:
+            self._event_log.append_event(
+                "server_shutdown",
+                {
+                    "session_id": self._session_id,
+                    "progress": self._progress,
+                    "phase": self._phase,
+                    "uptime_seconds": time.time() - self._startup_time,
+                },
+                trace_id=self._trace_context.trace_id if self._trace_context else None,
+            )
+
         # Close server
         if self._server:
             self._server.close()
             await self._server.wait_closed()
 
-        logger.info("[v125.0] Loading server stopped")
+        logger.info("[v212.0] Loading server stopped")
 
 
 # =============================================================================
@@ -1955,14 +2378,14 @@ async def run_server():
 
 def main():
     """Main entry point."""
-    logger.info("[v125.0] JARVIS Loading Server starting...")
+    logger.info("[v212.0] JARVIS Loading Server starting...")
 
     try:
         asyncio.run(run_server())
     except KeyboardInterrupt:
-        logger.info("[v125.0] Interrupted by user")
+        logger.info("[v212.0] Interrupted by user")
     except Exception as e:
-        logger.error(f"[v125.0] Fatal error: {e}")
+        logger.error(f"[v212.0] Fatal error: {e}")
         traceback.print_exc()
         sys.exit(1)
 
