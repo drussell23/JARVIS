@@ -55455,36 +55455,72 @@ class JarvisSystemKernel:
         self.logger.info("╰─────────────────────────────────────────────────────────────────────╯")
         self.logger.info("")
 
-    def _print_completion_banner(self, startup_duration: float) -> None:
+    def _print_completion_banner(
+        self,
+        startup_duration: float,
+        is_fully_ready: bool = True,
+        readiness_message: str = "",
+        blocking_components: Optional[List[str]] = None,
+        degraded_components: Optional[List[str]] = None,
+    ) -> None:
         """
-        v186.0: Print startup completion banner with Rich CLI support.
+        v213.0: Print startup completion banner with ACCURATE readiness tier.
         
         Uses Rich library for enhanced visuals if available, otherwise
-        falls back to plain text.
+        falls back to plain text. Now correctly displays the actual
+        readiness tier based on component health.
         
         Args:
             startup_duration: Startup time in seconds
+            is_fully_ready: True if FULLY_READY tier, False if INTERACTIVE (degraded)
+            readiness_message: Human-readable readiness description
+            blocking_components: List of critical components blocking readiness
+            degraded_components: List of optional components in degraded state
         """
         backend_port = self.config.backend_port
         frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+        blocking_components = blocking_components or []
+        degraded_components = degraded_components or []
+        
+        # v213.0: Determine tier display based on actual readiness
+        if is_fully_ready:
+            tier_text_rich = "[bold green]🟢 FULLY READY TIER REACHED[/bold green]"
+            tier_color = "green"
+            tier_text_plain = "🟢 FULLY READY TIER REACHED"
+            status_text = "🎯 JARVIS is ready!"
+        else:
+            tier_text_rich = "[bold yellow]🟡 INTERACTIVE TIER (DEGRADED)[/bold yellow]"
+            tier_color = "yellow"
+            tier_text_plain = "🟡 INTERACTIVE TIER (DEGRADED)"
+            status_text = "⚠️  JARVIS is running in DEGRADED mode"
         
         if RICH_AVAILABLE and _rich_console:
             # =========================================================================
-            # RICH CLI COMPLETION BANNER (v186.0)
+            # RICH CLI COMPLETION BANNER (v213.0)
             # =========================================================================
             try:
                 _rich_console.print()
                 
-                # Ready tier panel
+                # Ready tier panel - now shows ACTUAL tier
                 _rich_console.print(Panel(
-                    "[bold green]🟢 FULLY READY TIER REACHED[/bold green]",
-                    border_style="green",
+                    tier_text_rich,
+                    border_style=tier_color,
                     padding=(0, 2),
                 ))
                 
-                # Access points table
+                # v213.0: Show blocking/degraded components if not fully ready
+                if not is_fully_ready:
+                    if blocking_components:
+                        _rich_console.print(f"[red]Critical components not ready: {', '.join(blocking_components)}[/red]")
+                    if degraded_components:
+                        _rich_console.print(f"[yellow]Degraded components: {', '.join(degraded_components)}[/yellow]")
+                    if readiness_message:
+                        _rich_console.print(f"[dim]{readiness_message}[/dim]")
+                    _rich_console.print()
+                
+                # Access points table - v213.0: Uses dynamic status text
                 access_table = Table(
-                    title="[bold cyan]🎯 JARVIS is ready![/bold cyan]",
+                    title=f"[bold cyan]{status_text}[/bold cyan]",
                     box=box.ROUNDED,  # type: ignore[arg-type]
                     border_style="cyan",
                     show_header=True,
@@ -55522,15 +55558,30 @@ class JarvisSystemKernel:
                 self.logger.debug(f"[Kernel] Rich completion banner failed, using fallback: {rich_err}")
         
         # =========================================================================
-        # FALLBACK PLAIN TEXT COMPLETION BANNER
+        # FALLBACK PLAIN TEXT COMPLETION BANNER (v213.0: Respects actual tier)
         # =========================================================================
         self.logger.info("")
         self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
-        self.logger.info("║                   🟢 FULLY READY TIER REACHED                       ║")
+        # v213.0: Display actual tier, not always FULLY_READY
+        if is_fully_ready:
+            self.logger.info("║                   🟢 FULLY READY TIER REACHED                       ║")
+        else:
+            self.logger.info("║                🟡 INTERACTIVE TIER (DEGRADED)                       ║")
         self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
+        
+        # v213.0: Show blocking/degraded components if not fully ready
+        if not is_fully_ready:
+            self.logger.info("")
+            if blocking_components:
+                self.logger.warning(f"  Critical components not ready: {', '.join(blocking_components)}")
+            if degraded_components:
+                self.logger.warning(f"  Degraded components: {', '.join(degraded_components)}")
+            if readiness_message:
+                self.logger.info(f"  {readiness_message}")
+        
         self.logger.info("")
         self.logger.info("════════════════════════════════════════════════════════════════════════")
-        self.logger.info("🎯 JARVIS is ready!")
+        self.logger.info(status_text)
         self.logger.info("════════════════════════════════════════════════════════════════════════")
         self.logger.info("")
         self.logger.info("Access Points:")
@@ -56314,9 +56365,16 @@ class JarvisSystemKernel:
                 pass
 
             # =====================================================================
-            # v186.0: ENTERPRISE COMPLETION BANNER (with Rich CLI support)
+            # v213.0: ENTERPRISE COMPLETION BANNER (with ACCURATE readiness tier)
+            # Now passes actual readiness state to display correct tier
             # =====================================================================
-            self._print_completion_banner(startup_duration)
+            self._print_completion_banner(
+                startup_duration=startup_duration,
+                is_fully_ready=readiness_is_fully_ready,
+                readiness_message=readiness_message,
+                blocking_components=blocking_components,
+                degraded_components=degraded_components,
+            )
 
             # v186.0: Stop the startup watchdog - we made it!
             if self._startup_watchdog:
@@ -59984,16 +60042,29 @@ class JarvisSystemKernel:
 
         # v197.1: Update LiveProgressDashboard with component status
         # v208.0: Use DASHBOARD_STATUS_MAP from readiness_config for consistent mapping
+        # v213.0: Map internal component names to dashboard component names
         # CRITICAL FIX: "skipped" -> "skipped" (NOT "stopped")
         try:
             dashboard = get_live_dashboard()
             if dashboard.enabled:
+                # v213.0: Map internal names to dashboard names
+                # Dashboard uses hyphenated names, internal uses underscores
+                # "backend" -> "jarvis-body" for the main JARVIS service
+                dashboard_name_map = {
+                    "backend": "jarvis-body",
+                    "jarvis_body": "jarvis-body",
+                    "jarvis_prime": "jarvis-prime",
+                    "reactor_core": "reactor-core",
+                    "gcp_vm": "gcp-vm",
+                }
+                dash_name = dashboard_name_map.get(component, component)
+                
                 # Handle internal state aliases, then use unified mapping
                 # Internal states: "running" -> "starting", "complete" -> "healthy"
                 status_alias = {"running": "starting", "complete": "healthy"}
                 normalized_status = status_alias.get(status, status)
                 dash_status = DASHBOARD_STATUS_MAP.get(normalized_status, normalized_status)
-                dashboard.update_component(component, dash_status, message[:60] if message else "")
+                dashboard.update_component(dash_name, dash_status, message[:60] if message else "")
         except Exception:
             pass  # Dashboard updates are non-critical
 
