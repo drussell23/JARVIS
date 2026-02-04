@@ -1349,6 +1349,13 @@ DEFAULT_HOT_RELOAD_INTERVAL = 10.0
 DEFAULT_HOT_RELOAD_GRACE_PERIOD = 120.0
 DEFAULT_IDLE_TIMEOUT = 300
 
+# v222.0: Progress-aware Trinity deadline configuration
+# These enable dynamic timeout extension based on observed model loading progress
+TRINITY_PROGRESS_POLL_INTERVAL = 15.0  # Seconds between progress checks
+TRINITY_PROGRESS_EXTENSION_BUFFER = 120.0  # Seconds to add when progress observed
+TRINITY_MAX_EXTENDED_TIMEOUT = 1200.0  # 20 minutes absolute hard cap
+TRINITY_PROGRESS_STALL_THRESHOLD = 90.0  # Seconds without progress before considering stalled
+
 
 def _calculate_effective_startup_timeout(
     config_timeout: float,
@@ -54904,6 +54911,119 @@ class TrinityIntegrator:
             self.logger.error(f"[Trinity] Error stopping {name}: {e}")
             return False
 
+    async def tiered_stop(self, timeout: float = 30.0) -> None:
+        """
+        v222.0: Idempotent, bounded, never-raises cleanup for Trinity components.
+        
+        Implements a tiered shutdown strategy:
+        1. SIGTERM - Give processes 60% of timeout for graceful shutdown
+        2. SIGKILL - If still running, force kill with 30% of timeout
+        3. Abandon - If still running, log and move on (never hang)
+        
+        This method is called:
+        - During normal supervisor shutdown
+        - On Trinity startup timeout/error for cleanup
+        - On emergency shutdown
+        
+        CRITICAL: This method MUST NOT raise exceptions or hang. It must
+        complete within the given timeout to prevent supervisor hangs.
+        
+        Args:
+            timeout: Maximum total time for cleanup (default 30s)
+        """
+        try:
+            self._shutdown_event.set()
+            
+            # Budget allocation: 60% TERM, 30% KILL, 10% abandon margin
+            term_timeout = timeout * 0.6
+            kill_timeout = timeout * 0.3
+            
+            self.logger.info(f"[Trinity] 🛑 tiered_stop starting (timeout={timeout:.1f}s)")
+            
+            # Stop health monitor first (non-blocking)
+            if self._health_monitor_task:
+                self._health_monitor_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._health_monitor_task),
+                        timeout=2.0
+                    )
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass  # Health monitor cleanup is best-effort
+            
+            # Gather components that need stopping
+            components_to_stop = [
+                (comp, comp.name) for comp in [self._jprime, self._reactor]
+                if comp and comp.process and comp.process.returncode is None
+            ]
+            
+            if not components_to_stop:
+                self.logger.info("[Trinity] tiered_stop: No active processes to stop")
+                return
+            
+            self.logger.info(f"[Trinity] tiered_stop: Stopping {len(components_to_stop)} component(s)")
+            
+            # TIER 1: SIGTERM (graceful shutdown)
+            for component, name in components_to_stop:
+                try:
+                    self.logger.debug(f"[Trinity] SIGTERM → {name} (PID {component.pid})")
+                    component.process.terminate()
+                except Exception as e:
+                    self.logger.debug(f"[Trinity] SIGTERM failed for {name}: {e}")
+            
+            # Wait for graceful shutdown
+            start_time = asyncio.get_event_loop().time()
+            while components_to_stop and (asyncio.get_event_loop().time() - start_time) < term_timeout:
+                await asyncio.sleep(0.5)
+                # Remove components that have exited
+                components_to_stop = [
+                    (comp, name) for comp, name in components_to_stop
+                    if comp.process and comp.process.returncode is None
+                ]
+            
+            if not components_to_stop:
+                self.logger.info("[Trinity] tiered_stop: All components stopped gracefully")
+                return
+            
+            # TIER 2: SIGKILL (force kill remaining)
+            self.logger.warning(f"[Trinity] tiered_stop: {len(components_to_stop)} component(s) didn't stop gracefully, sending SIGKILL")
+            
+            for component, name in components_to_stop:
+                try:
+                    self.logger.debug(f"[Trinity] SIGKILL → {name} (PID {component.pid})")
+                    component.process.kill()
+                except Exception as e:
+                    self.logger.debug(f"[Trinity] SIGKILL failed for {name}: {e}")
+            
+            # Wait for forced termination
+            start_time = asyncio.get_event_loop().time()
+            while components_to_stop and (asyncio.get_event_loop().time() - start_time) < kill_timeout:
+                await asyncio.sleep(0.3)
+                components_to_stop = [
+                    (comp, name) for comp, name in components_to_stop
+                    if comp.process and comp.process.returncode is None
+                ]
+            
+            if not components_to_stop:
+                self.logger.info("[Trinity] tiered_stop: All components killed successfully")
+                return
+            
+            # TIER 3: ABANDON (log and move on - never hang)
+            remaining_names = [name for _, name in components_to_stop]
+            self.logger.error(
+                f"[Trinity] tiered_stop: Abandoning {len(components_to_stop)} process(es) "
+                f"that wouldn't die: {remaining_names}"
+            )
+            
+            # Clean up component state even if process didn't die
+            for component, name in components_to_stop:
+                component.state = "abandoned"
+                # Don't null the process - it may still be running
+                
+        except Exception as e:
+            # tiered_stop MUST NOT raise - log and continue
+            self.logger.error(f"[Trinity] tiered_stop unexpected error (suppressed): {e}")
+
     async def start_component(self, name: str) -> bool:
         """
         v201.0: Start a specific Trinity component.
@@ -57812,13 +57932,17 @@ class JarvisSystemKernel:
             # Step 5: Store for use by _phase_trinity() to ensure consistency
             self._effective_trinity_timeout = effective_trinity_timeout
 
-            # Step 6: Set DMS operational timeout (add extra buffer for phase setup/teardown)
-            dms_trinity_timeout = effective_trinity_timeout + 60.0  # Extra 60s buffer for DMS
+            # Step 6: Set DMS operational timeout
+            # v222.0: DMS timeout must account for progress-aware deadline extensions
+            # The progress-aware wrapper can extend up to TRINITY_MAX_EXTENDED_TIMEOUT,
+            # so DMS must allow at least that much time plus buffer
+            max_possible_extended = min(TRINITY_MAX_EXTENDED_TIMEOUT, effective_trinity_timeout * 2)
+            dms_trinity_timeout = max_possible_extended + 120.0  # Extra buffer for DMS
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase("trinity", 65, operational_timeout=dms_trinity_timeout)
-                self.logger.debug(
-                    f"[Trinity] DMS timeout set to {dms_trinity_timeout:.0f}s "
-                    f"(component timeout + 60s buffer)"
+                self.logger.info(
+                    f"[Trinity] v222.0 DMS timeout set to {dms_trinity_timeout:.0f}s "
+                    f"(max extended={max_possible_extended:.0f}s + 120s buffer)"
                 )
             if self.config.trinity_enabled:
                 if self._narrator:
@@ -60126,6 +60250,245 @@ class JarvisSystemKernel:
             }
         )
 
+    async def _await_trinity_with_progress_awareness(
+        self,
+        start_coro,
+        base_timeout: float,
+        integrator_name: str = "Trinity",
+    ) -> Tuple[Dict[str, bool], bool, Optional[str]]:
+        """
+        v222.0: Progress-aware wrapper for Trinity component startup.
+        
+        ROOT CAUSE FIX: The previous implementation used a fixed `asyncio.wait_for`
+        with a 600s timeout. This would cancel the startup even when Prime was at
+        95% completion with only 39 seconds remaining. The supervisor had no way
+        to observe progress and extend the deadline.
+        
+        This method implements ADAPTIVE PROGRESS-AWARE DEADLINES:
+        1. Start the component startup coroutine in a background task
+        2. Poll model loading progress periodically (every 15s)
+        3. While progress is being made (not stalled), extend the deadline
+        4. Enforce a hard cap to prevent infinite waits
+        5. Return accurate status: success, timeout, or error (NOT "skipped")
+        
+        This is the SINGLE SOURCE OF TRUTH for Trinity component startup timing.
+        Both ProcessOrchestrator and legacy paths use this same logic.
+        
+        Args:
+            start_coro: The coroutine to await (e.g., trinity_integrator.start_components())
+            base_timeout: Initial timeout in seconds (e.g., 600s)
+            integrator_name: Name for logging (e.g., "Trinity", "ProcessOrchestrator")
+            
+        Returns:
+            Tuple of:
+            - results: Dict[str, bool] mapping component names to success
+            - timed_out: True if timeout occurred (even with progress)
+            - timeout_context: String describing why timeout occurred, or None if success
+        """
+        global _live_dashboard
+        
+        # Configuration
+        poll_interval = TRINITY_PROGRESS_POLL_INTERVAL
+        extension_buffer = TRINITY_PROGRESS_EXTENSION_BUFFER
+        max_timeout = min(TRINITY_MAX_EXTENDED_TIMEOUT, base_timeout * 2)  # At most 2x base
+        stall_threshold = TRINITY_PROGRESS_STALL_THRESHOLD
+        
+        # State tracking
+        start_time = asyncio.get_event_loop().time()
+        current_deadline = start_time + base_timeout
+        last_progress_pct = 0.0
+        last_progress_time = start_time
+        extensions_granted = 0
+        max_extensions = 5  # Prevent infinite extension
+        
+        self.logger.info(
+            f"[{integrator_name}] v222.0 Progress-aware startup: "
+            f"base={base_timeout:.0f}s, max={max_timeout:.0f}s, poll={poll_interval:.0f}s"
+        )
+        
+        # Start the component startup as a task
+        startup_task = create_safe_task(start_coro, name=f"{integrator_name.lower()}-startup")
+        
+        try:
+            while True:
+                now = asyncio.get_event_loop().time()
+                remaining = current_deadline - now
+                elapsed = now - start_time
+                
+                # Check if hard cap reached
+                if (now - start_time) >= max_timeout:
+                    self.logger.error(
+                        f"[{integrator_name}] Hard timeout cap reached ({max_timeout:.0f}s) "
+                        f"after {extensions_granted} deadline extensions"
+                    )
+                    startup_task.cancel()
+                    try:
+                        await startup_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    
+                    # Get final progress for context
+                    final_progress = 0.0
+                    if _live_dashboard:
+                        final_progress = _live_dashboard._model_loading_state.get("progress_pct", 0)
+                    
+                    return (
+                        {},
+                        True,
+                        f"Hard timeout ({max_timeout:.0f}s) reached. Prime was at {final_progress:.1f}%"
+                    )
+                
+                # Wait for task completion or next poll
+                wait_time = min(remaining, poll_interval)
+                if wait_time <= 0:
+                    wait_time = poll_interval  # Ensure we always wait something
+                
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.shield(startup_task),
+                        timeout=wait_time
+                    )
+                    # Task completed successfully
+                    self.logger.success(
+                        f"[{integrator_name}] Component startup completed after {elapsed:.1f}s "
+                        f"(extensions: {extensions_granted})"
+                    )
+                    return results, False, None
+                    
+                except asyncio.TimeoutError:
+                    # Poll timeout - check progress and potentially extend
+                    pass
+                except asyncio.CancelledError:
+                    # Task was cancelled externally
+                    self.logger.warning(f"[{integrator_name}] Startup task cancelled externally")
+                    return {}, True, "Task cancelled externally"
+                except Exception as e:
+                    # Task raised an exception
+                    self.logger.error(f"[{integrator_name}] Startup task error: {e}")
+                    return {}, False, f"Error: {e}"
+                
+                # Check model loading progress
+                current_progress = 0.0
+                model_loading_active = False
+                eta_seconds = None
+                
+                if _live_dashboard:
+                    state = _live_dashboard._model_loading_state
+                    current_progress = state.get("progress_pct", 0)
+                    model_loading_active = state.get("active", False)
+                    estimated_total = state.get("estimated_total_seconds", 0)
+                    elapsed_model = state.get("elapsed_seconds", 0)
+                    if estimated_total > 0 and elapsed_model > 0:
+                        eta_seconds = max(0, estimated_total - elapsed_model)
+                
+                now = asyncio.get_event_loop().time()
+                elapsed = now - start_time
+                remaining = current_deadline - now
+                
+                # Log progress status
+                progress_delta = current_progress - last_progress_pct
+                self.logger.info(
+                    f"[{integrator_name}] Progress check: {current_progress:.1f}% "
+                    f"(+{progress_delta:.1f}%), elapsed={elapsed:.0f}s, remaining={remaining:.0f}s"
+                    + (f", ETA={eta_seconds:.0f}s" if eta_seconds else "")
+                )
+                
+                # Decide whether to extend deadline
+                should_extend = False
+                extension_reason = ""
+                
+                if remaining <= poll_interval:
+                    # Deadline is about to expire - consider extension
+                    
+                    if model_loading_active and current_progress > 0:
+                        # Model is actively loading with progress
+                        
+                        if progress_delta > 0:
+                            # Progress is being made - extend
+                            should_extend = True
+                            extension_reason = f"Progress observed: +{progress_delta:.1f}%"
+                            last_progress_pct = current_progress
+                            last_progress_time = now
+                            
+                        elif (now - last_progress_time) < stall_threshold:
+                            # No progress but not stalled yet - extend
+                            should_extend = True
+                            extension_reason = f"Not yet stalled ({now - last_progress_time:.0f}s < {stall_threshold:.0f}s)"
+                            
+                        elif eta_seconds is not None and eta_seconds < extension_buffer:
+                            # ETA suggests completion is imminent - extend
+                            should_extend = True
+                            extension_reason = f"ETA imminent: {eta_seconds:.0f}s remaining"
+                            
+                        elif current_progress >= 90:
+                            # Very close to done - give it more time
+                            should_extend = True
+                            extension_reason = f"Near completion: {current_progress:.1f}%"
+                        
+                    elif model_loading_active and current_progress == 0 and extensions_granted == 0:
+                        # Model loading started but no progress yet - grant one extension
+                        should_extend = True
+                        extension_reason = "Model loading started, awaiting first progress"
+                
+                if should_extend and extensions_granted < max_extensions:
+                    # Calculate extension amount
+                    extension_amount = extension_buffer
+                    if eta_seconds is not None and eta_seconds > 0:
+                        # Use ETA + buffer if available
+                        extension_amount = min(eta_seconds + 60, extension_buffer)
+                    
+                    # Ensure we don't exceed hard cap
+                    max_extension = max_timeout - (now - start_time)
+                    extension_amount = min(extension_amount, max_extension)
+                    
+                    if extension_amount > 10:  # Only extend if meaningful
+                        current_deadline = now + extension_amount
+                        extensions_granted += 1
+                        self.logger.warning(
+                            f"[{integrator_name}] 🔄 DEADLINE EXTENDED by {extension_amount:.0f}s "
+                            f"(reason: {extension_reason}, extension #{extensions_granted})"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"[{integrator_name}] Extension too small ({extension_amount:.0f}s), "
+                            f"proceeding to timeout"
+                        )
+                        
+                elif remaining <= 0:
+                    # Deadline expired with no extension
+                    self.logger.error(
+                        f"[{integrator_name}] Deadline expired after {elapsed:.0f}s. "
+                        f"Progress: {current_progress:.1f}%, Active: {model_loading_active}"
+                    )
+                    
+                    startup_task.cancel()
+                    try:
+                        await startup_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    
+                    # Build timeout context
+                    context_parts = [f"Timeout after {elapsed:.0f}s"]
+                    if model_loading_active:
+                        context_parts.append(f"Prime at {current_progress:.1f}%")
+                        if (now - last_progress_time) >= stall_threshold:
+                            context_parts.append(f"stalled for {now - last_progress_time:.0f}s")
+                    else:
+                        context_parts.append("model not actively loading")
+                    
+                    return {}, True, ". ".join(context_parts)
+                    
+        except Exception as e:
+            # Unexpected error in the wrapper itself
+            self.logger.error(f"[{integrator_name}] Progress-aware wrapper error: {e}")
+            if not startup_task.done():
+                startup_task.cancel()
+                try:
+                    await startup_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            return {}, False, f"Wrapper error: {e}"
+
     async def _phase_trinity(self) -> bool:
         """
         Phase 5: Initialize Trinity cross-repo integration.
@@ -60139,6 +60502,7 @@ class JarvisSystemKernel:
 
         v186.0: Added real-time progress callbacks during health waits.
         v188.0: Added background heartbeat to prevent DMS stall during long operations.
+        v222.0: Progress-aware Trinity deadline - extends timeout when model loading shows progress.
 
         Starts:
         - J-Prime (local LLM inference or Hollow Client routing to GCP)
@@ -60248,6 +60612,8 @@ class JarvisSystemKernel:
                 # Initialize results and trinity_integrator outside context for cleanup
                 results = {}
                 trinity_integrator = None
+                # v222.0: Track timeout for proper status (error vs skipped)
+                _trinity_startup_timed_out = False
 
                 if CROSS_REPO_ORCHESTRATOR_AVAILABLE and ProcessOrchestrator is not None:
                     try:
@@ -60378,22 +60744,38 @@ class JarvisSystemKernel:
                                 if invincible_ready:
                                     self.logger.info("[Trinity] ☁️ Invincible Node ready - using Hollow Client for Prime")
 
-                                # Start Trinity components (TrinityIntegrator is the sole spawner)
-                                results = await asyncio.wait_for(
-                                    trinity_integrator.start_components(
+                                # v222.0: Use progress-aware wrapper instead of fixed timeout
+                                # This enables dynamic deadline extension when Prime model loading shows progress
+                                results, _trinity_timed_out, _timeout_context = await self._await_trinity_with_progress_awareness(
+                                    start_coro=trinity_integrator.start_components(
                                         invincible_node_ready=invincible_ready,
                                     ),
-                                    timeout=trinity_timeout
+                                    base_timeout=trinity_timeout,
+                                    integrator_name="Trinity/ProcessOrchestrator",
                                 )
+                                
+                                if _trinity_timed_out:
+                                    _trinity_startup_error = True
+                                    _trinity_startup_timed_out = True  # v222.0: Track for result handling
+                                    self.logger.error(f"[Trinity] Component startup timeout: {_timeout_context}")
+                                    # v222.0: Mark as TIMEOUT, not skipped - we attempted startup
+                                    self._update_component_status(
+                                        "jarvis_prime", "error", 
+                                        f"Startup timeout: {_timeout_context or 'timed out'}"
+                                    )
 
                             except TimeoutError:
                                 _trinity_startup_error = True
+                                _trinity_startup_timed_out = True  # v222.0: Track for result handling
                                 self.logger.error(f"[Trinity] Trinity phase timeout after {trinity_budget}s")
                                 self.logger.warning("[Trinity] Consider increasing JARVIS_TRINITY_BUDGET if startup needs more time")
-                            except asyncio.TimeoutError:
+                                # v222.0: Mark as error, not skipped
+                                self._update_component_status("jarvis_prime", "error", "Phase budget exceeded")
+                            except Exception as e:
                                 _trinity_startup_error = True
-                                self.logger.warning(f"[Trinity] Component start timed out after {trinity_timeout}s")
-                                self.logger.warning("[Trinity] Consider increasing JARVIS_TRINITY_TIMEOUT if GCP/models need more time")
+                                _trinity_startup_timed_out = True  # v222.0: Treat exceptions as timeout for status
+                                self.logger.error(f"[Trinity] Unexpected error during startup: {e}")
+                                self._update_component_status("jarvis_prime", "error", f"Error: {e}")
                             finally:
                                 # v200.0/v206.0: Cleanup - stop integrator ONLY on error/timeout
                                 # On success, Trinity keeps running; tiered_stop() is called during shutdown
@@ -60518,21 +60900,33 @@ class JarvisSystemKernel:
                     if invincible_ready:
                         self.logger.info("[Trinity] ☁️ Invincible Node ready - using Hollow Client for Prime")
 
-                    try:
-                        results = await asyncio.wait_for(
-                            self._trinity.start_components(
-                                invincible_node_ready=invincible_ready,
-                            ),
-                            timeout=trinity_timeout
+                    # v222.0: Use progress-aware wrapper instead of fixed timeout
+                    # This enables dynamic deadline extension when Prime model loading shows progress
+                    _legacy_timed_out = False
+                    _legacy_timeout_context = None
+                    results, _legacy_timed_out, _legacy_timeout_context = await self._await_trinity_with_progress_awareness(
+                        start_coro=self._trinity.start_components(
+                            invincible_node_ready=invincible_ready,
+                        ),
+                        base_timeout=trinity_timeout,
+                        integrator_name="Trinity/Legacy",
+                    )
+                    
+                    if _legacy_timed_out:
+                        _trinity_startup_timed_out = True  # v222.0: Track for result handling
+                        self.logger.error(f"[Trinity] Component startup timeout: {_legacy_timeout_context}")
+                        # v222.0: Mark as TIMEOUT error, not skipped - we attempted startup
+                        self._update_component_status(
+                            "jarvis_prime", "error",
+                            f"Startup timeout: {_legacy_timeout_context or 'timed out'}"
                         )
-                    except asyncio.TimeoutError:
-                        self.logger.warning(f"[Trinity] Component start timed out after {trinity_timeout}s")
-                        self.logger.warning("[Trinity] Consider increasing JARVIS_TRINITY_TIMEOUT if GCP/models need more time")
-                        results = {}
 
                 # Log start results
                 started_count = sum(1 for v in results.values() if v)
                 total_count = len(results) if results else 0
+                
+                # v222.0: _trinity_startup_timed_out is already set by either path above
+                # No need to compute it again
 
                 if started_count > 0:
                     self.logger.success(f"[Trinity] 🚀 {started_count}/{total_count} component(s) started")
@@ -60564,11 +60958,16 @@ class JarvisSystemKernel:
                         self._background_tasks.append(watchdog_task)
                         self.logger.info("[Trinity] 🐕 Auto-restart watchdog active")
 
-                elif total_count == 0:
+                elif total_count == 0 and not _trinity_startup_timed_out:
+                    # v222.0: Only mark as "skipped" if Trinity was NOT attempted
+                    # If we timed out, status was already set to "error" above
                     self.logger.info("[Trinity] No Trinity components configured - running JARVIS standalone")
                     # v182.0: Mark as skipped when no components configured
                     self._update_component_status("jarvis_prime", "skipped", "Not configured")
                     self._update_component_status("reactor_core", "skipped", "Not configured")
+                elif total_count == 0 and _trinity_startup_timed_out:
+                    # v222.0: Timeout occurred, already logged and status set to error
+                    self.logger.warning("[Trinity] Component startup timed out (status already set to error)")
                 else:
                     self.logger.warning(f"[Trinity] ⚠️ 0/{total_count} components started")
 
