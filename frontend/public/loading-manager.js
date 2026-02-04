@@ -1743,7 +1743,7 @@ class JARVISLoadingManager {
         if (!loadingServerFound) {
             const backendHealthy = await this.checkBackendHealth();
             if (backendHealthy) {
-                console.log('[v210.0] ✅ Backend healthy, no loading server - startup likely complete');
+                console.log('[v210.0] ✅ Backend healthy, no loading server - startup is COMPLETE');
                 
                 // Check if frontend is ready
                 const frontendReady = await this.checkFrontendReady();
@@ -1752,10 +1752,22 @@ class JARVISLoadingManager {
                     this.quickRedirectToApp();
                     return;
                 } else {
-                    console.log('[v210.0] ℹ️ Frontend not ready yet - showing backend fallback option');
-                    // Continue initialization but show backend fallback immediately
+                    console.log('[v210.0] ℹ️ Frontend not ready yet - showing completion with fallback');
+                    
+                    // v210.0: CRITICAL FIX - Set progress to 100% since startup is complete
+                    // The loading server being down means startup finished
+                    this.state.progress = 95;
+                    this.state.targetProgress = 100;
+                    this.state.stage = 'complete';
+                    this.state.message = 'JARVIS backend is ready! Waiting for frontend...';
+                    
+                    // Show backend fallback immediately
                     this._showBackendFallbackEarly = true;
                 }
+            } else {
+                console.log('[v210.0] ℹ️ No loading server and backend not healthy - waiting for startup...');
+                // Neither is ready - keep polling until something responds
+                this._retryLoadingServerDiscovery = true;
             }
         }
 
@@ -1765,6 +1777,17 @@ class JARVISLoadingManager {
         console.log('[v210.0] Phase 3: Initializing UI...');
         this.createParticles();
         this.createDetailedStatusPanel();
+        
+        // v210.0: Update progress bar immediately with current state
+        // This ensures progress is shown even if set before UI initialization
+        this.updateProgressBar();
+        if (this.state.message) {
+            if (this.elements.statusMessage) {
+                this.elements.statusMessage.textContent = this.state.message;
+            }
+        }
+        
+        // Start smooth progress animation
         this.startSmoothProgress();
 
         // Make details panel visible immediately and add initial log
@@ -1777,6 +1800,10 @@ class JARVISLoadingManager {
             this.addLogEntry('System', `Connecting to loading server on port ${loadingServerPort}...`, 'info');
         } else {
             this.addLogEntry('System', 'Loading server not found - monitoring backend directly...', 'warning');
+            // v210.0: If backend is healthy, add log entry
+            if (this._showBackendFallbackEarly) {
+                this.addLogEntry('System', 'Backend is ready! Waiting for frontend...', 'success');
+            }
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
@@ -2035,10 +2062,13 @@ class JARVISLoadingManager {
                 }
 
                 // ═══════════════════════════════════════════════════════════════════════════
-                // FALLBACK: Standard health polling
+                // v210.0: FALLBACK: Standard health polling
+                // Enhanced to update progress when loading server is not running
                 // ═══════════════════════════════════════════════════════════════════════════
                 const timeSinceLoadingUpdate = Date.now() - this.state.lastUpdate;
-                if (timeSinceLoadingUpdate < 10000 && this.state.progress < 95) {
+                const loadingServerActive = timeSinceLoadingUpdate < 10000 && this._discoveredLoadingPort !== null;
+                
+                if (loadingServerActive && this.state.progress < 95) {
                     // Loading server is active and we're not stuck, let it handle completion
                     consecutiveHealthyChecks = 0;
                     return;
@@ -2050,11 +2080,31 @@ class JARVISLoadingManager {
                     consecutiveHealthyChecks++;
                     console.log(`[Health Polling] Backend healthy (${consecutiveHealthyChecks}/${requiredConsecutiveChecks})`);
 
+                    // v210.0: Update progress based on backend health when no loading server
+                    if (!loadingServerActive && this.state.progress < 95) {
+                        // Simulate progress based on consecutive healthy checks
+                        // Each check represents ~10-15% progress towards completion
+                        const estimatedProgress = Math.min(95, 70 + (consecutiveHealthyChecks * 8));
+                        if (estimatedProgress > this.state.progress) {
+                            console.log(`[v210.0] Backend healthy - updating progress: ${this.state.progress}% → ${estimatedProgress}%`);
+                            this.state.targetProgress = estimatedProgress;
+                            this.state.message = `Backend ready (verifying: ${consecutiveHealthyChecks}/${requiredConsecutiveChecks})...`;
+                            this.updateProgressBar();
+                        }
+                    }
+
                     if (consecutiveHealthyChecks >= requiredConsecutiveChecks) {
                         const frontendReady = await this.checkFrontendReady();
 
                         if (!frontendReady) {
                             console.log('[Health Polling] Backend ready but frontend not yet available, waiting...');
+                            // v210.0: Set progress to 95% and show it's waiting for frontend
+                            if (this.state.progress < 95) {
+                                this.state.targetProgress = 95;
+                                this.state.message = 'Backend ready, waiting for frontend...';
+                                this.updateProgressBar();
+                            }
+                            this.showBackendFallbackButton();
                             return;
                         }
 
@@ -2073,6 +2123,19 @@ class JARVISLoadingManager {
                     }
                 } else {
                     consecutiveHealthyChecks = 0;
+                    
+                    // v210.0: Try to re-discover loading server if backend isn't healthy yet
+                    if (this._retryLoadingServerDiscovery && !this._discoveredLoadingPort) {
+                        console.log('[v210.0] Retrying loading server discovery...');
+                        this._portDiscoveryAttempted = false;
+                        const port = await this.discoverLoadingServerPort();
+                        if (this._discoveredLoadingPort) {
+                            console.log(`[v210.0] ✅ Loading server found on retry: ${port}`);
+                            // Connect to the discovered loading server
+                            await this.connectWebSocket();
+                            this.startPolling();
+                        }
+                    }
                 }
             } catch (error) {
                 consecutiveHealthyChecks = 0;
