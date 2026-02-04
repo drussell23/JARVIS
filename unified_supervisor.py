@@ -58425,52 +58425,121 @@ class JarvisSystemKernel:
                                 except Exception as e:
                                     self.logger.debug(f"[TwoTier/Runner] TTS error: {e}")
                         
-                        # Get or create with auto-initialization
-                        self._agentic_runner = await get_or_create_agentic_runner(
-                            config=None,  # Use defaults
-                            tts_callback=runner_tts if self.config.voice_enabled else None,
-                            watchdog=self._agentic_watchdog,
-                            timeout=30.0,
-                        )
-                        
-                        if self._agentic_runner:
-                            self.logger.success("[TwoTier] ✓ AgenticTaskRunner auto-created")
-                        else:
-                            self.logger.warning("[TwoTier] ⚠ AgenticTaskRunner creation failed")
+                        # v1.0.1: Try direct creation first for better error diagnostics
+                        try:
+                            from core.agentic_task_runner import create_agentic_runner
+                            
+                            self._agentic_runner = await asyncio.wait_for(
+                                create_agentic_runner(
+                                    config=None,
+                                    tts_callback=runner_tts if self.config.voice_enabled else None,
+                                    watchdog=self._agentic_watchdog,
+                                ),
+                                timeout=30.0,
+                            )
+                            
+                            if self._agentic_runner:
+                                # Register as global instance
+                                set_agentic_runner(self._agentic_runner)
+                                self.logger.success("[TwoTier] ✓ AgenticTaskRunner auto-created")
+                            else:
+                                self.logger.warning("[TwoTier] ⚠ AgenticTaskRunner creation returned None")
+                                
+                        except asyncio.TimeoutError:
+                            self.logger.warning("[TwoTier] ⚠ AgenticTaskRunner creation timed out (30s)")
+                        except ImportError as ie:
+                            self.logger.warning(f"[TwoTier] ⚠ AgenticTaskRunner import failed: {ie}")
+                        except Exception as create_err:
+                            # v1.0.1: Log full traceback for debugging
+                            import traceback
+                            self.logger.warning(f"[TwoTier] ⚠ AgenticTaskRunner creation failed: {create_err}")
+                            self.logger.debug(f"[TwoTier] Full traceback:\n{traceback.format_exc()}")
 
                     # Now attempt to wire
                     if self._tiered_router and self._agentic_runner:
                         # Create execute_tier2 wrapper that routes to AgenticTaskRunner
                         # v1.0.0: Capture runner in closure to avoid race conditions
+                        # v1.0.1: Handle partially-initialized runners gracefully
                         runner_ref = self._agentic_runner
                         
-                        async def execute_tier2_via_runner(
+                        # Check if runner has execution capabilities
+                        has_execution = (
+                            getattr(runner_ref, '_computer_use_tool', None) is not None or
+                            getattr(runner_ref, '_computer_use_connector', None) is not None
+                        )
+                        
+                        if has_execution:
+                            async def execute_tier2_via_runner(
+                                command: str,
+                                context: Optional[Dict[str, Any]] = None,
+                            ) -> Dict[str, Any]:
+                                """Execute Tier 2 (agentic) commands via AgenticTaskRunner."""
+                                try:
+                                    result = await runner_ref.run(
+                                        goal=command,
+                                        mode=RunnerMode.AUTONOMOUS,
+                                        context=context,
+                                        narrate=True,
+                                    )
+                                    return {
+                                        "success": result.success if result else False,
+                                        "result": result.result if result else None,
+                                        "task_id": result.task_id if result else None,
+                                        "actions_count": result.actions_count if result else 0,
+                                        "duration_ms": result.duration_ms if result else 0,
+                                    }
+                                except Exception as e:
+                                    self.logger.error(f"[TwoTier] execute_tier2 error: {e}")
+                                    return {"success": False, "error": str(e)}
+
+                            # Wire the router's execute_tier2 to our wrapper
+                            self._tiered_router.execute_tier2 = execute_tier2_via_runner
+                            self._two_tier_status["runner_wired"] = True
+                            self._two_tier_status["execution_capable"] = True
+                            self.logger.success("[TwoTier] ✓ execute_tier2 → AgenticTaskRunner wired (full execution)")
+                        else:
+                            # v1.0.1: Create a fallback handler that reports the limitation
+                            async def execute_tier2_limited(
+                                command: str,
+                                context: Optional[Dict[str, Any]] = None,
+                            ) -> Dict[str, Any]:
+                                """Execute Tier 2 - limited mode (no execution capabilities)."""
+                                self.logger.warning(
+                                    f"[TwoTier] Tier 2 command received but execution unavailable: {command[:50]}..."
+                                )
+                                return {
+                                    "success": False,
+                                    "error": "Tier 2 execution not available - computer use tools not initialized",
+                                    "command": command,
+                                    "suggestion": "Check autonomy.computer_use_tool and autonomy.claude_computer_use_connector",
+                                }
+                            
+                            self._tiered_router.execute_tier2 = execute_tier2_limited
+                            self._two_tier_status["runner_wired"] = True
+                            self._two_tier_status["execution_capable"] = False
+                            self.logger.warning(
+                                "[TwoTier] ⚠ execute_tier2 wired (LIMITED - no execution capabilities)"
+                            )
+                    elif self._tiered_router and not self._agentic_runner:
+                        # v1.0.1: Wire router with a placeholder that explains the situation
+                        async def execute_tier2_unavailable(
                             command: str,
                             context: Optional[Dict[str, Any]] = None,
                         ) -> Dict[str, Any]:
-                            """Execute Tier 2 (agentic) commands via AgenticTaskRunner."""
-                            try:
-                                result = await runner_ref.run(
-                                    goal=command,
-                                    mode=RunnerMode.AUTONOMOUS,
-                                    context=context,
-                                    narrate=True,
-                                )
-                                return {
-                                    "success": result.success if result else False,
-                                    "result": result.result if result else None,
-                                    "task_id": result.task_id if result else None,
-                                    "actions_count": result.actions_count if result else 0,
-                                    "duration_ms": result.duration_ms if result else 0,
-                                }
-                            except Exception as e:
-                                self.logger.error(f"[TwoTier] execute_tier2 error: {e}")
-                                return {"success": False, "error": str(e)}
-
-                        # Wire the router's execute_tier2 to our wrapper
-                        self._tiered_router.execute_tier2 = execute_tier2_via_runner
+                            """Execute Tier 2 - runner unavailable."""
+                            self.logger.warning(
+                                f"[TwoTier] Tier 2 command blocked (runner unavailable): {command[:50]}..."
+                            )
+                            return {
+                                "success": False,
+                                "error": "AgenticTaskRunner not available",
+                                "command": command,
+                            }
+                        
+                        self._tiered_router.execute_tier2 = execute_tier2_unavailable
                         self._two_tier_status["runner_wired"] = True
-                        self.logger.success("[TwoTier] ✓ execute_tier2 → AgenticTaskRunner wired")
+                        self._two_tier_status["execution_capable"] = False
+                        self.logger.warning("[TwoTier] ⚠ execute_tier2 wired (UNAVAILABLE - no runner)")
                     else:
                         # v1.0.0: More detailed diagnostic logging
                         missing = []

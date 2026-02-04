@@ -5500,11 +5500,63 @@ async def create_agentic_runner(
     tts_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     watchdog: Optional[Any] = None,
 ) -> AgenticTaskRunner:
-    """Create and initialize an agentic runner."""
+    """
+    Create and initialize an agentic runner.
+    
+    v1.0.0: Enhanced with better error handling and graceful degradation.
+    If initialization fails but the runner was created, returns the runner
+    anyway to allow partial functionality.
+    
+    Raises:
+        RuntimeError: If runner creation itself fails (not just initialization)
+    """
     runner = AgenticTaskRunner(
         config=config,
         tts_callback=tts_callback,
         watchdog=watchdog,
     )
-    await runner.initialize()
+    
+    # v1.0.0: Try initialization but don't fail if it returns False
+    # The runner can still be useful for some operations even without
+    # all execution capabilities
+    try:
+        init_success = await runner.initialize()
+        
+        if not init_success:
+            # Log what's missing
+            logger.warning("[AgenticRunner] Initialization returned False - checking capabilities...")
+            
+            # Check specific capabilities
+            has_computer_use = runner._computer_use_tool is not None
+            has_connector = runner._computer_use_connector is not None
+            
+            if not has_computer_use and not has_connector:
+                logger.warning(
+                    "[AgenticRunner] ⚠ No execution capability available. "
+                    "This is usually due to missing dependencies or import errors. "
+                    "Check: autonomy.computer_use_tool, autonomy.claude_computer_use_connector"
+                )
+                
+                # v1.0.0: Check if the modules can be imported
+                try:
+                    from autonomy.computer_use_tool import ComputerUseTool
+                    logger.info("[AgenticRunner]   ✓ computer_use_tool module importable")
+                except ImportError as e:
+                    logger.warning(f"[AgenticRunner]   ✗ computer_use_tool import failed: {e}")
+                
+                try:
+                    from autonomy.claude_computer_use_connector import ClaudeComputerUseConnector
+                    logger.info("[AgenticRunner]   ✓ claude_computer_use_connector module importable")
+                except ImportError as e:
+                    logger.warning(f"[AgenticRunner]   ✗ claude_computer_use_connector import failed: {e}")
+            
+            # Return the runner anyway - it may have partial functionality
+            logger.info("[AgenticRunner] Returning partially initialized runner")
+        
+    except Exception as init_error:
+        logger.error(f"[AgenticRunner] Initialization exception: {init_error}")
+        import traceback
+        logger.debug(f"[AgenticRunner] Traceback:\n{traceback.format_exc()}")
+        # Still return the runner - it was created, just not fully initialized
+    
     return runner
