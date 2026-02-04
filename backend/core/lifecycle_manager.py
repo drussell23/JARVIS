@@ -176,11 +176,17 @@ class LifecycleManager:
 
         # Run async shutdown
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             if loop.is_running():
                 asyncio.create_task(self.shutdown())
             else:
                 asyncio.run(self.shutdown())
+        except RuntimeError:
+            # No running loop — use asyncio.run() as fallback
+            try:
+                asyncio.run(self.shutdown())
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"❌ Error during signal shutdown: {e}")
 

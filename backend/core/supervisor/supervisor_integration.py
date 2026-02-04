@@ -132,45 +132,68 @@ async def trigger_update(
             )
         await asyncio.sleep(0.3)  # Let TTS finish
     
-    # Exit with update code
-    os._exit(EXIT_CODE_UPDATE)
+    # v223.0: Run lifecycle cleanup before exit to prevent DB connection leaks.
+    # os._exit() bypasses atexit handlers and finally blocks, so we run
+    # LifecycleManager.shutdown() explicitly first.
+    await _graceful_exit(EXIT_CODE_UPDATE)
+
+
+async def _graceful_exit(code: int) -> None:
+    """
+    Run cleanup handlers before signaling supervisor via exit code.
+
+    v223.0: Root cause fix for database connection leaks during
+    supervisor-triggered operations. Previously os._exit() was called
+    directly, bypassing all Python cleanup (atexit, finally, __del__).
+    Now LifecycleManager.shutdown() runs first to close DB connections
+    and flush buffers. We still use os._exit() at the end because the
+    supervisor relies on exit codes for control flow signaling.
+    """
+    try:
+        from backend.core.lifecycle_manager import get_lifecycle_manager
+        lm = get_lifecycle_manager()
+        await lm.shutdown()
+        logger.info(f"[SupervisorIntegration] Lifecycle cleanup complete, exiting with code {code}")
+    except Exception as e:
+        logger.debug(f"[SupervisorIntegration] Lifecycle cleanup failed (best-effort): {e}")
+    os._exit(code)
 
 
 async def trigger_rollback(speak: bool = True) -> None:
     """
     Trigger a rollback to the previous version.
-    
+
     The supervisor will catch exit code 101 and perform:
     1. git reset --hard HEAD@{1}
     2. pip install from snapshot
     3. Restart JARVIS
     """
     logger.info("🔄 Rollback triggered - signaling supervisor")
-    
+
     if speak:
         await speak_tts(
             "Understood. Rolling back to the previous stable version. "
             "Standby for system restart."
         )
         await asyncio.sleep(0.3)
-    
-    os._exit(EXIT_CODE_ROLLBACK)
+
+    await _graceful_exit(EXIT_CODE_ROLLBACK)
 
 
 async def trigger_restart(speak: bool = True) -> None:
     """
     Trigger a restart without update.
-    
+
     The supervisor will catch exit code 102 and simply
     restart JARVIS without any git operations.
     """
     logger.info("🔄 Restart triggered - signaling supervisor")
-    
+
     if speak:
         await speak_tts("Restarting core systems. Back in a moment.")
         await asyncio.sleep(0.3)
-    
-    os._exit(EXIT_CODE_RESTART)
+
+    await _graceful_exit(EXIT_CODE_RESTART)
 
 
 async def check_for_updates() -> dict[str, Any]:

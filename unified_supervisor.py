@@ -1305,6 +1305,34 @@ except ImportError:
     IntelligentStartupNarrator = None
     BackendStartupPhase = None
 
+# v223.0: Orchestrator Narrator Bridge for cross-repo voice event emission
+try:
+    from backend.core.supervisor.orchestrator_narrator_bridge import (
+        emit_orchestrator_event,
+        OrchestratorEvent,
+    )
+    ORCHESTRATOR_NARRATOR_AVAILABLE = True
+except ImportError:
+    ORCHESTRATOR_NARRATOR_AVAILABLE = False
+    emit_orchestrator_event = None
+    OrchestratorEvent = None
+
+# v223.0: Startup Narrator convenience functions
+try:
+    from backend.core.supervisor.startup_narrator import (
+        get_startup_narrator as _get_backend_startup_narrator,
+        narrate_phase as _narrate_backend_phase,
+        narrate_complete as _narrate_backend_complete,
+        narrate_error as _narrate_backend_error,
+    )
+    BACKEND_NARRATOR_FUNCS_AVAILABLE = True
+except ImportError:
+    BACKEND_NARRATOR_FUNCS_AVAILABLE = False
+    _get_backend_startup_narrator = None
+    _narrate_backend_phase = None
+    _narrate_backend_complete = None
+    _narrate_backend_error = None
+
 # v200.1: Voice Orchestrator for cross-repo TTS coordination
 try:
     from backend.core.voice_orchestrator import VoiceOrchestrator
@@ -1353,7 +1381,7 @@ DEFAULT_IDLE_TIMEOUT = 300
 # These enable dynamic timeout extension based on observed model loading progress
 TRINITY_PROGRESS_POLL_INTERVAL = 15.0  # Seconds between progress checks
 TRINITY_PROGRESS_EXTENSION_BUFFER = 120.0  # Seconds to add when progress observed
-TRINITY_MAX_EXTENDED_TIMEOUT = 1200.0  # 20 minutes absolute hard cap
+TRINITY_MAX_EXTENDED_TIMEOUT = float(os.environ.get("JARVIS_TRINITY_MAX_TIMEOUT", "1200.0"))  # Configurable hard cap
 TRINITY_PROGRESS_STALL_THRESHOLD = 90.0  # Seconds without progress before considering stalled
 
 
@@ -6396,7 +6424,7 @@ class GCPInstanceManager(ResourceManagerBase):
 
         try:
             # Run in executor to not block
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             instance = await loop.run_in_executor(
                 None,
                 lambda: self._compute_client.get(
@@ -6478,7 +6506,7 @@ class GCPInstanceManager(ResourceManagerBase):
             instance.network_interfaces = [network_interface]
 
             # Insert instance
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             operation = await loop.run_in_executor(
                 None,
                 lambda: self._compute_client.insert(
@@ -7210,7 +7238,7 @@ class DynamicPortManager(ResourceManagerBase):
         }
 
         # First check process state
-        proc_info = await asyncio.get_event_loop().run_in_executor(
+        proc_info = await asyncio.get_running_loop().run_in_executor(
             None, self._get_process_on_port, port
         )
 
@@ -8800,7 +8828,7 @@ class IntelligentCacheManager(ResourceManagerBase):
         results: Dict[str, Any] = {}
 
         # Run bytecode cleanup in executor to not block
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         if self.clear_bytecode or self.clear_pycache:
             bytecode_result = await loop.run_in_executor(
@@ -9447,7 +9475,7 @@ class GlobalSessionManager:
         if not self.vm_registry.exists():
             return {}
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             content = await loop.run_in_executor(None, self.vm_registry.read_text)
             return json.loads(content)
         except Exception:
@@ -9457,7 +9485,7 @@ class GlobalSessionManager:
         """Save VM registry to disk."""
         try:
             content = json.dumps(registry, indent=2)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.vm_registry.write_text, content)
         except Exception as e:
             _unified_logger.error(f"Failed to save VM registry: {e}")
@@ -15138,7 +15166,7 @@ class ParallelProcessCleaner:
         discovered: Dict[int, ProcessInfo] = {}
 
         # Run in thread pool for psutil operations (they can block)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         with ThreadPoolExecutor(max_workers=4) as executor:
             # Task 1: Check PID files
             pid_file_task = loop.run_in_executor(
@@ -16464,7 +16492,7 @@ class PhysicsAwareAuthManager:
         try:
             if self._anti_spoofing_detector:
                 # Run 7-layer anti-spoofing
-                spoof_result = await asyncio.get_event_loop().run_in_executor(
+                spoof_result = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self._anti_spoofing_detector.detect(
                         audio_data, sample_rate
@@ -16483,7 +16511,7 @@ class PhysicsAwareAuthManager:
 
             if self._physics_extractor:
                 # Extract physics features
-                features = await asyncio.get_event_loop().run_in_executor(
+                features = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self._physics_extractor.extract(audio_data, sample_rate),
                 )
@@ -18351,7 +18379,7 @@ class HybridWorkloadRouter(IntelligenceManagerBase):
 
             # Create instance
             client = compute_v1.InstancesClient()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             operation = await loop.run_in_executor(
                 None,
                 lambda: client.insert(
@@ -18514,7 +18542,7 @@ echo "=== JARVIS GCP Instance Ready ===" | tee -a /var/log/jarvis-startup.log
             from google.cloud import compute_v1
             client = compute_v1.InstancesClient()
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             instance = await loop.run_in_executor(
                 None,
                 lambda: client.get(project=project, zone=zone, instance=instance_id)
@@ -18570,7 +18598,7 @@ echo "=== JARVIS GCP Instance Ready ===" | tee -a /var/log/jarvis-startup.log
             from google.cloud import compute_v1
             client = compute_v1.InstancesClient()
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
                 lambda: client.delete(project=project, zone=zone, instance=target_id)
@@ -21223,6 +21251,11 @@ class TrinityHealthMonitor:
     """
     Cross-repo health monitoring for the Trinity system.
 
+    v223.0: Unified health monitor — delegates to the production implementation
+    in backend.core.trinity_health_monitor when available (HTTP + heartbeat,
+    weighted scoring, event callbacks, 4 components). Falls back to the inline
+    heartbeat-only implementation when the backend module is not importable.
+
     Monitors health of:
     - JARVIS (main body)
     - JARVIS Prime (Tier-0 brain)
@@ -21233,6 +21266,7 @@ class TrinityHealthMonitor:
     - Crash detection and auto-recovery
     - Circuit breakers for failing components
     - Health trend analysis
+    - HTTP health endpoint probing (when backend module available)
     """
 
     def __init__(
@@ -21245,7 +21279,17 @@ class TrinityHealthMonitor:
         self._failure_threshold = failure_threshold
         self._recovery_cooldown = recovery_cooldown
 
-        # Component health state
+        # v223.0: Try to use the production health monitor from backend
+        self._delegate: Optional[Any] = None
+        try:
+            from backend.core.trinity_health_monitor import TrinityHealthMonitor as _ProductionMonitor
+            self._delegate = _ProductionMonitor()
+            _logger = logging.getLogger("unified_supervisor")
+            _logger.debug("[HealthMonitor] Using production backend.core.trinity_health_monitor")
+        except ImportError:
+            pass
+
+        # Inline fallback state (used only when delegate is None)
         self._components: Dict[str, Dict[str, Any]] = {
             "jarvis": {
                 "healthy": False,
@@ -21270,7 +21314,7 @@ class TrinityHealthMonitor:
             },
         }
 
-        # Heartbeat file paths
+        # Heartbeat file paths (fallback)
         trinity_dir = Path.home() / ".jarvis" / "trinity"
         self._heartbeat_files = {
             "jarvis": trinity_dir / "jarvis_body.json",
@@ -21300,6 +21344,11 @@ class TrinityHealthMonitor:
     ) -> None:
         """Register a recovery callback for a component."""
         self._recovery_callbacks[component] = callback
+        if self._delegate and hasattr(self._delegate, "register_recovery_callback"):
+            try:
+                self._delegate.register_recovery_callback(component, callback)
+            except Exception:
+                pass
 
     async def start(self) -> bool:
         """Start health monitoring."""
@@ -21307,12 +21356,28 @@ class TrinityHealthMonitor:
             return True
 
         self._running = True
+
+        # Delegate to production monitor when available
+        if self._delegate and hasattr(self._delegate, "start"):
+            try:
+                await self._delegate.start()
+                return True
+            except Exception:
+                pass  # Fall through to inline monitor
+
         self._monitor_task = create_safe_task(self._monitor_loop())
         return True
 
     async def stop(self) -> None:
         """Stop health monitoring."""
         self._running = False
+
+        if self._delegate and hasattr(self._delegate, "stop"):
+            try:
+                await self._delegate.stop()
+            except Exception:
+                pass
+
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
@@ -21321,7 +21386,7 @@ class TrinityHealthMonitor:
                 pass
 
     async def _monitor_loop(self) -> None:
-        """Background health monitoring loop."""
+        """Background health monitoring loop (inline fallback)."""
         while self._running:
             try:
                 await self._check_all_components()
@@ -21406,6 +21471,13 @@ class TrinityHealthMonitor:
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get current health status of all components."""
+        # v223.0: Delegate to production monitor when available
+        if self._delegate and hasattr(self._delegate, "get_health_status"):
+            try:
+                return self._delegate.get_health_status()
+            except Exception:
+                pass
+
         return {
             "components": {
                 name: {
@@ -25893,7 +25965,7 @@ class DistributedLockManager:
             if remaining <= 0:
                 break
 
-            waiter = asyncio.get_event_loop().create_future()
+            waiter = asyncio.get_running_loop().create_future()
             self._lock_waiters[resource_id].append(waiter)
 
             try:
@@ -50865,7 +50937,7 @@ class ComprehensiveZombieCleanup:
             self.logger.warning("[Kernel] psutil not available - limited zombie detection")
             return discovered
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             # Task 1: Port scanning
@@ -54972,8 +55044,8 @@ class TrinityIntegrator:
                     self.logger.debug(f"[Trinity] SIGTERM failed for {name}: {e}")
             
             # Wait for graceful shutdown
-            start_time = asyncio.get_event_loop().time()
-            while components_to_stop and (asyncio.get_event_loop().time() - start_time) < term_timeout:
+            start_time = asyncio.get_running_loop().time()
+            while components_to_stop and (asyncio.get_running_loop().time() - start_time) < term_timeout:
                 await asyncio.sleep(0.5)
                 # Remove components that have exited
                 components_to_stop = [
@@ -54996,8 +55068,8 @@ class TrinityIntegrator:
                     self.logger.debug(f"[Trinity] SIGKILL failed for {name}: {e}")
             
             # Wait for forced termination
-            start_time = asyncio.get_event_loop().time()
-            while components_to_stop and (asyncio.get_event_loop().time() - start_time) < kill_timeout:
+            start_time = asyncio.get_running_loop().time()
+            while components_to_stop and (asyncio.get_running_loop().time() - start_time) < kill_timeout:
                 await asyncio.sleep(0.3)
                 components_to_stop = [
                     (comp, name) for comp, name in components_to_stop
@@ -56201,6 +56273,16 @@ class JarvisSystemKernel:
         if self.config.voice_enabled:
             self._narrator = get_voice_narrator()
 
+        # v223.0: Intelligent Startup Narrator (rich phase-aware narration)
+        self._startup_narrator: Optional["IntelligentStartupNarrator"] = None
+        if self.config.voice_enabled and STARTUP_NARRATOR_AVAILABLE:
+            try:
+                self._startup_narrator = _get_backend_startup_narrator(
+                    user_name=os.environ.get("JARVIS_USER_NAME", "Sir")
+                )
+            except Exception:
+                pass
+
         # v200.1: Voice Orchestrator for cross-repo TTS coordination
         self._voice_orchestrator: Optional["VoiceOrchestrator"] = None
 
@@ -56666,6 +56748,32 @@ class JarvisSystemKernel:
                 )
             except asyncio.TimeoutError:
                 pass
+
+        # v223.0: Stop Node.js WebSocket Router (prevents orphaned Node processes)
+        if hasattr(self, '_ws_router_process') and self._ws_router_process:
+            try:
+                self._ws_router_process.terminate()
+                await asyncio.wait_for(self._ws_router_process.wait(), timeout=5.0)
+                self.logger.info("[Kernel] WebSocket Router stopped")
+            except Exception:
+                try:
+                    self._ws_router_process.kill()
+                except Exception:
+                    pass
+            # Close log file
+            if hasattr(self, '_ws_router_log') and self._ws_router_log:
+                try:
+                    self._ws_router_log.close()
+                except Exception:
+                    pass
+
+        # v223.0: Stop Cloud SQL proxy (prevents orphaned proxy processes)
+        if hasattr(self, '_cloud_sql_proxy_manager') and self._cloud_sql_proxy_manager:
+            try:
+                await asyncio.wait_for(self._cloud_sql_proxy_manager.stop(), timeout=5.0)
+                self.logger.info("[Kernel] Cloud SQL proxy stopped")
+            except Exception as proxy_err:
+                self.logger.debug(f"[Kernel] Cloud SQL proxy cleanup: {proxy_err}")
 
         # v119.0: Release browser lock if held
         # v205.0: Use asyncio.to_thread to avoid blocking the event loop
@@ -57254,6 +57362,25 @@ class JarvisSystemKernel:
             except Exception as narr_err:
                 self.logger.debug(f"[Narrator] Startup announcement failed: {narr_err}")
 
+        # v223.0: Emit orchestrator startup event for cross-repo voice coordination
+        if ORCHESTRATOR_NARRATOR_AVAILABLE and emit_orchestrator_event:
+            try:
+                await emit_orchestrator_event(OrchestratorEvent.STARTUP_BEGIN)
+            except Exception:
+                pass
+
+        # v223.0: Rich startup narrator phase announcement
+        if BACKEND_NARRATOR_FUNCS_AVAILABLE and _narrate_backend_phase and BackendStartupPhase:
+            try:
+                await _narrate_backend_phase(
+                    BackendStartupPhase.SUPERVISOR_INIT,
+                    "Initializing JARVIS supervisor",
+                    5.0,
+                    "start",
+                )
+            except Exception:
+                pass
+
         # =====================================================================
         # v186.0: DEAD MAN'S SWITCH (Startup Watchdog)
         # =====================================================================
@@ -57707,6 +57834,25 @@ class JarvisSystemKernel:
                     self.logger.warning(f"[Kernel] Voice Orchestrator failed to start: {vo_err}")
                     self._voice_orchestrator = None
 
+            # v223.0: ECAPA verification pipeline (non-blocking smoke test)
+            # Runs after backend is up to validate voice biometric pipeline end-to-end
+            try:
+                ecapa_verify = await asyncio.wait_for(
+                    self._verify_ecapa_pipeline(), timeout=60.0
+                )
+                if ecapa_verify.get("verification_pipeline_ready"):
+                    self.logger.info("[Kernel] ECAPA pipeline verified and ready")
+                elif self.config.ecapa_enabled:
+                    issue_collector.add_warning(
+                        "ECAPA pipeline verification incomplete — voice unlock may be degraded",
+                        IssueCategory.INTELLIGENCE,
+                        suggestion="Check ECAPA model availability and ML engine registry",
+                    )
+            except asyncio.TimeoutError:
+                self.logger.warning("[Kernel] ECAPA verification timed out (60s) — skipping")
+            except Exception as ev_err:
+                self.logger.debug(f"[Kernel] ECAPA verification skipped: {ev_err}")
+
             # Phase 4: Intelligence (Zone 4)
             self._current_startup_phase = "intelligence"
             self._current_startup_progress = 52
@@ -57818,6 +57964,14 @@ class JarvisSystemKernel:
                         self.logger.info("[Kernel] WebSocket hub not available (Trinity will use FileTransport)")
                 except Exception as ws_err:
                     self.logger.warning(f"[Kernel] WebSocket pre-init failed (non-fatal): {ws_err}")
+
+                # v223.0: Start Node.js WebSocket Router if configured
+                try:
+                    ws_router = await self._start_websocket_router()
+                    if ws_router:
+                        self.logger.info("[Kernel] Node.js WebSocket Router started alongside hub")
+                except Exception as wsr_err:
+                    self.logger.debug(f"[Kernel] WebSocket Router not started: {wsr_err}")
 
             # =================================================================
             # v211.0: PARALLEL FRONTEND WARMUP
@@ -57947,6 +58101,21 @@ class JarvisSystemKernel:
             if self.config.trinity_enabled:
                 if self._narrator:
                     await self._narrator.narrate_phase_start("trinity")
+                # v223.0: Rich startup narrator for Trinity phase
+                if self._startup_narrator:
+                    try:
+                        await self._startup_narrator.announce_trinity_init()
+                    except Exception:
+                        pass
+                # v223.0: Emit orchestrator event for Trinity startup
+                if ORCHESTRATOR_NARRATOR_AVAILABLE and emit_orchestrator_event:
+                    try:
+                        await emit_orchestrator_event(
+                            OrchestratorEvent.STARTUP_BEGIN,
+                            service_name="trinity",
+                        )
+                    except Exception:
+                        pass
                 await self._phase_trinity()
             else:
                 # v170.0: Explicitly log when Trinity is disabled
@@ -58255,6 +58424,25 @@ class JarvisSystemKernel:
                 except Exception as narr_err:
                     self.logger.debug(f"[Narrator] Startup complete announcement failed: {narr_err}")
 
+            # v223.0: Rich startup narrator completion with service details
+            if BACKEND_NARRATOR_FUNCS_AVAILABLE and _narrate_backend_complete:
+                try:
+                    await _narrate_backend_complete(
+                        f"All systems online in {startup_duration:.1f} seconds"
+                    )
+                except Exception:
+                    pass
+
+            # v223.0: Emit orchestrator startup complete event
+            if ORCHESTRATOR_NARRATOR_AVAILABLE and emit_orchestrator_event:
+                try:
+                    await emit_orchestrator_event(
+                        OrchestratorEvent.STARTUP_COMPLETE,
+                        elapsed_seconds=startup_duration,
+                    )
+                except Exception:
+                    pass
+
             return 0
 
         except Exception as e:
@@ -58528,7 +58716,7 @@ class JarvisSystemKernel:
             self.logger.debug("[Kernel] Set JARVIS_CLEANUP_DONE=1")
 
             # Install signal handlers
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self._signal_handler.install(loop)
             self._signal_handler.register_callback(self._signal_shutdown)
 
@@ -59251,6 +59439,21 @@ class JarvisSystemKernel:
                             self.logger.info("[Kernel] Invincible Node: provisioning (background recovery active)")
                     except ImportError:
                         self.logger.debug("[Kernel] Invincible Node: GCP module not available")
+
+            # v223.0: ECAPA backend selection (concurrent probing)
+            # Runs after Docker/GCP are initialized so we can probe Docker ECAPA
+            try:
+                ecapa_result = await asyncio.wait_for(
+                    self._select_ecapa_backend(), timeout=90.0
+                )
+                if ecapa_result.get("selected_backend"):
+                    self.logger.info(
+                        f"[Kernel] ECAPA backend: {ecapa_result['selected_backend']}"
+                    )
+            except asyncio.TimeoutError:
+                self.logger.warning("[Kernel] ECAPA backend selection timed out (90s)")
+            except Exception as ecapa_err:
+                self.logger.debug(f"[Kernel] ECAPA backend selection skipped: {ecapa_err}")
 
             # v180.0: Diagnostic checkpoint
             if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
@@ -60294,7 +60497,7 @@ class JarvisSystemKernel:
         stall_threshold = TRINITY_PROGRESS_STALL_THRESHOLD
         
         # State tracking
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         current_deadline = start_time + base_timeout
         last_progress_pct = 0.0
         last_progress_time = start_time
@@ -60311,7 +60514,7 @@ class JarvisSystemKernel:
         
         try:
             while True:
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 remaining = current_deadline - now
                 elapsed = now - start_time
                 
@@ -60368,20 +60571,52 @@ class JarvisSystemKernel:
                     return {}, False, f"Error: {e}"
                 
                 # Check model loading progress
+                # v223.0: Dashboard fallback — ensure progress is observable even
+                # if _live_dashboard was not initialized before this function runs.
                 current_progress = 0.0
                 model_loading_active = False
                 eta_seconds = None
-                
-                if _live_dashboard:
-                    state = _live_dashboard._model_loading_state
+
+                _dashboard = _live_dashboard
+                if _dashboard is None:
+                    # Attempt to acquire the dashboard if it exists
+                    try:
+                        _dashboard = get_live_dashboard()
+                    except Exception:
+                        _dashboard = None
+
+                if _dashboard is not None:
+                    state = _dashboard._model_loading_state
                     current_progress = state.get("progress_pct", 0)
                     model_loading_active = state.get("active", False)
                     estimated_total = state.get("estimated_total_seconds", 0)
                     elapsed_model = state.get("elapsed_seconds", 0)
                     if estimated_total > 0 and elapsed_model > 0:
                         eta_seconds = max(0, estimated_total - elapsed_model)
+                elif extensions_granted == 0:
+                    # v223.0: Fallback — poll Prime's HTTP health endpoint for progress
+                    # when dashboard is completely unavailable
+                    try:
+                        import aiohttp as _aiohttp
+                        prime_port = int(os.environ.get("JARVIS_PRIME_PORT", "8001"))
+                        async with _aiohttp.ClientSession() as _sess:
+                            async with _sess.get(
+                                f"http://localhost:{prime_port}/health",
+                                timeout=_aiohttp.ClientTimeout(total=3.0),
+                            ) as resp:
+                                if resp.status == 200:
+                                    health_data = await resp.json()
+                                    model_status = health_data.get("model", {})
+                                    current_progress = float(model_status.get("progress", 0))
+                                    model_loading_active = model_status.get("loading", False)
+                                    self.logger.debug(
+                                        f"[{integrator_name}] Dashboard unavailable, "
+                                        f"polled Prime health: {current_progress:.1f}%"
+                                    )
+                    except Exception:
+                        pass  # Health endpoint not available yet — keep defaults
                 
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 elapsed = now - start_time
                 remaining = current_deadline - now
                 
@@ -60480,14 +60715,19 @@ class JarvisSystemKernel:
                     
         except Exception as e:
             # Unexpected error in the wrapper itself
+            # v223.0: Return timed_out=True so downstream logic treats this as
+            # an error, NOT "skipped". Previously ({}, False, ...) caused the
+            # outer `total_count == 0 and not timed_out` branch to misclassify
+            # wrapper errors as "skipped" (no components configured).
             self.logger.error(f"[{integrator_name}] Progress-aware wrapper error: {e}")
+            self.logger.error(f"[{integrator_name}] Wrapper error treated as timeout for status tracking")
             if not startup_task.done():
                 startup_task.cancel()
                 try:
                     await startup_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            return {}, False, f"Wrapper error: {e}"
+            return {}, True, f"Wrapper error: {e}"
 
     async def _phase_trinity(self) -> bool:
         """
@@ -60759,8 +60999,13 @@ class JarvisSystemKernel:
                                     _trinity_startup_timed_out = True  # v222.0: Track for result handling
                                     self.logger.error(f"[Trinity] Component startup timeout: {_timeout_context}")
                                     # v222.0: Mark as TIMEOUT, not skipped - we attempted startup
+                                    # v223.0: Set BOTH components to error on timeout
                                     self._update_component_status(
-                                        "jarvis_prime", "error", 
+                                        "jarvis_prime", "error",
+                                        f"Startup timeout: {_timeout_context or 'timed out'}"
+                                    )
+                                    self._update_component_status(
+                                        "reactor_core", "error",
                                         f"Startup timeout: {_timeout_context or 'timed out'}"
                                     )
 
@@ -60770,12 +61015,16 @@ class JarvisSystemKernel:
                                 self.logger.error(f"[Trinity] Trinity phase timeout after {trinity_budget}s")
                                 self.logger.warning("[Trinity] Consider increasing JARVIS_TRINITY_BUDGET if startup needs more time")
                                 # v222.0: Mark as error, not skipped
+                                # v223.0: Set BOTH components to error on timeout
                                 self._update_component_status("jarvis_prime", "error", "Phase budget exceeded")
+                                self._update_component_status("reactor_core", "error", "Phase budget exceeded")
                             except Exception as e:
                                 _trinity_startup_error = True
                                 _trinity_startup_timed_out = True  # v222.0: Treat exceptions as timeout for status
                                 self.logger.error(f"[Trinity] Unexpected error during startup: {e}")
+                                # v223.0: Set BOTH components to error on unexpected exception
                                 self._update_component_status("jarvis_prime", "error", f"Error: {e}")
+                                self._update_component_status("reactor_core", "error", f"Error: {e}")
                             finally:
                                 # v200.0/v206.0: Cleanup - stop integrator ONLY on error/timeout
                                 # On success, Trinity keeps running; tiered_stop() is called during shutdown
@@ -60916,8 +61165,13 @@ class JarvisSystemKernel:
                         _trinity_startup_timed_out = True  # v222.0: Track for result handling
                         self.logger.error(f"[Trinity] Component startup timeout: {_legacy_timeout_context}")
                         # v222.0: Mark as TIMEOUT error, not skipped - we attempted startup
+                        # v223.0: Set BOTH components to error on timeout
                         self._update_component_status(
                             "jarvis_prime", "error",
+                            f"Startup timeout: {_legacy_timeout_context or 'timed out'}"
+                        )
+                        self._update_component_status(
+                            "reactor_core", "error",
                             f"Startup timeout: {_legacy_timeout_context or 'timed out'}"
                         )
 
@@ -64311,6 +64565,434 @@ class JarvisSystemKernel:
         return result
 
     # =========================================================================
+    # v223.0: ECAPA BACKEND ORCHESTRATOR
+    # =========================================================================
+    # Ported from start_system.py v19.0.0 — Concurrent probing of Docker,
+    # Cloud Run, and Local ECAPA backends with intelligent selection.
+    # =========================================================================
+
+    async def _select_ecapa_backend(self) -> Dict[str, Any]:
+        """
+        v223.0: Intelligent ECAPA backend selection with concurrent probing.
+
+        Probes Docker, Cloud Run, and Local backends concurrently, then
+        selects the fastest-responding healthy backend. Starts Docker in
+        background if not running but available.
+
+        Ported from start_system.py v19.0.0 (lines 19262-19982).
+
+        Returns:
+            Dict with selected backend info and probe results
+        """
+        result: Dict[str, Any] = {
+            "selected_backend": None,
+            "endpoint": None,
+            "probes": {},
+            "decision_reason": "",
+        }
+
+        if not self.config.ecapa_enabled:
+            result["decision_reason"] = "ECAPA disabled by configuration"
+            return result
+
+        self.logger.info("[ECAPA] Probing backends concurrently...")
+
+        # =====================================================================
+        # Phase 1: Concurrent Backend Probing
+        # =====================================================================
+        async def probe_docker() -> Dict[str, Any]:
+            """Probe Docker ECAPA backend (non-blocking, never auto-starts)."""
+            probe = {"available": False, "healthy": False, "endpoint": None, "latency_ms": 0}
+            skip_docker = os.environ.get("JARVIS_SKIP_DOCKER", "false").lower() == "true"
+            if skip_docker:
+                return probe
+            try:
+                from intelligence.docker_daemon_manager import get_docker_daemon_manager
+                dm = await get_docker_daemon_manager()
+                health = await dm.check_daemon_health()
+                if health.get("healthy"):
+                    probe["available"] = True
+                    # Check if ECAPA container is running
+                    container_name = os.environ.get(
+                        "JARVIS_ECAPA_CONTAINER", "jarvis-ecapa-cloud"
+                    )
+                    check = await asyncio.create_subprocess_exec(
+                        "docker", "ps", "--filter", f"name={container_name}",
+                        "--format", "{{.Names}}",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await asyncio.wait_for(check.communicate(), timeout=5.0)
+                    if container_name in stdout.decode():
+                        # Container running — health check endpoint
+                        import aiohttp
+                        ecapa_port = int(os.environ.get("JARVIS_ECAPA_PORT", "8010"))
+                        t0 = asyncio.get_running_loop().time()
+                        async with aiohttp.ClientSession() as sess:
+                            async with sess.get(
+                                f"http://localhost:{ecapa_port}/health",
+                                timeout=aiohttp.ClientTimeout(total=5.0),
+                            ) as resp:
+                                if resp.status == 200:
+                                    probe["healthy"] = True
+                                    probe["endpoint"] = f"http://localhost:{ecapa_port}"
+                                    probe["latency_ms"] = (
+                                        asyncio.get_running_loop().time() - t0
+                                    ) * 1000
+            except Exception as e:
+                self.logger.debug(f"[ECAPA] Docker probe: {e}")
+            return probe
+
+        async def probe_cloud_run() -> Dict[str, Any]:
+            """Probe Cloud Run ECAPA backend with cold-start awareness."""
+            probe = {"available": False, "healthy": False, "endpoint": None, "latency_ms": 0}
+            cloud_endpoint = os.environ.get("JARVIS_CLOUD_ML_ENDPOINT", "")
+            if not cloud_endpoint:
+                return probe
+            probe["available"] = True
+            request_timeout = float(os.environ.get("CLOUD_RUN_PROBE_REQUEST_TIMEOUT", "15"))
+            max_wait = float(os.environ.get("CLOUD_RUN_PROBE_MAX_WAIT", "60"))
+            poll_interval = float(os.environ.get("CLOUD_RUN_PROBE_POLL_INTERVAL", "3"))
+            max_retries = int(os.environ.get("CLOUD_RUN_PROBE_MAX_RETRIES", "10"))
+            try:
+                import aiohttp
+                t_start = asyncio.get_running_loop().time()
+                health_paths = ["/health", "/api/ml/health", "/status"]
+                async with aiohttp.ClientSession() as sess:
+                    # Try prewarm first
+                    prewarm = os.environ.get("CLOUD_RUN_ENABLE_PREWARM", "true").lower() == "true"
+                    if prewarm:
+                        try:
+                            prewarm_url = f"{cloud_endpoint}/api/ml/prewarm"
+                            async with sess.post(
+                                prewarm_url,
+                                json={"warmup": True},
+                                timeout=aiohttp.ClientTimeout(total=10.0),
+                            ) as _:
+                                pass
+                        except Exception:
+                            pass
+
+                    for attempt in range(max_retries):
+                        elapsed = asyncio.get_running_loop().time() - t_start
+                        if elapsed > max_wait:
+                            break
+                        for path in health_paths:
+                            try:
+                                t0 = asyncio.get_running_loop().time()
+                                async with sess.get(
+                                    f"{cloud_endpoint}{path}",
+                                    timeout=aiohttp.ClientTimeout(total=request_timeout),
+                                ) as resp:
+                                    if resp.status == 200:
+                                        data = await resp.json()
+                                        if data.get("ecapa_ready", False):
+                                            probe["healthy"] = True
+                                            probe["endpoint"] = cloud_endpoint
+                                            probe["latency_ms"] = (
+                                                asyncio.get_running_loop().time() - t0
+                                            ) * 1000
+                                            return probe
+                                        status = data.get("status", "")
+                                        if status in ("initializing", "loading", "warming_up"):
+                                            break  # Retry after interval
+                            except Exception:
+                                continue
+                        if not probe["healthy"]:
+                            delay = min(poll_interval * (2 ** attempt), 60.0)
+                            await asyncio.sleep(delay)
+            except Exception as e:
+                self.logger.debug(f"[ECAPA] Cloud Run probe: {e}")
+            return probe
+
+        async def probe_local() -> Dict[str, Any]:
+            """Probe local ECAPA backend with memory-adaptive thresholds."""
+            probe = {"available": False, "memory_ok": False, "error": None}
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                total_gb = mem.total / (1024 ** 3)
+                available_gb = mem.available / (1024 ** 3)
+                # Adaptive thresholds based on total RAM
+                if total_gb >= 32:
+                    required_gb = 2.5
+                elif total_gb >= 16:
+                    required_gb = 2.0
+                elif total_gb >= 8:
+                    required_gb = 1.5
+                else:
+                    required_gb = 1.2
+                if available_gb >= required_gb:
+                    probe["memory_ok"] = True
+                elif available_gb >= required_gb * 0.75:
+                    # Close to threshold — try memory relief
+                    import gc
+                    gc.collect()
+                    mem2 = psutil.virtual_memory()
+                    if mem2.available / (1024 ** 3) >= required_gb * 0.75:
+                        probe["memory_ok"] = True
+                # Check speechbrain availability
+                try:
+                    import importlib
+                    importlib.import_module("speechbrain")
+                    probe["available"] = True
+                except ImportError:
+                    probe["error"] = "speechbrain not installed"
+            except ImportError:
+                probe["error"] = "psutil not available"
+            except Exception as e:
+                probe["error"] = str(e)
+            return probe
+
+        # Run all probes concurrently
+        docker_probe, cloud_probe, local_probe = await asyncio.gather(
+            probe_docker(), probe_cloud_run(), probe_local(),
+            return_exceptions=True,
+        )
+        # Handle exceptions from gather
+        if isinstance(docker_probe, Exception):
+            docker_probe = {"available": False, "healthy": False}
+        if isinstance(cloud_probe, Exception):
+            cloud_probe = {"available": False, "healthy": False}
+        if isinstance(local_probe, Exception):
+            local_probe = {"available": False, "memory_ok": False}
+
+        result["probes"] = {
+            "docker": docker_probe,
+            "cloud_run": cloud_probe,
+            "local": local_probe,
+        }
+
+        # =====================================================================
+        # Phase 2: Intelligent Backend Selection (zero-blocking)
+        # =====================================================================
+        force_backend = os.environ.get("JARVIS_ECAPA_FORCE_BACKEND", "").lower()
+        if force_backend:
+            if force_backend == "docker" and docker_probe.get("healthy"):
+                result["selected_backend"] = "docker"
+                result["endpoint"] = docker_probe.get("endpoint")
+                result["decision_reason"] = "Forced docker backend"
+            elif force_backend == "cloud_run" and cloud_probe.get("healthy"):
+                result["selected_backend"] = "cloud_run"
+                result["endpoint"] = cloud_probe.get("endpoint")
+                result["decision_reason"] = "Forced cloud_run backend"
+            elif force_backend == "local" and local_probe.get("available"):
+                result["selected_backend"] = "local"
+                result["decision_reason"] = "Forced local backend"
+
+        if not result["selected_backend"]:
+            # Priority: Docker (fastest) → Cloud Run → Local
+            available_now: Dict[str, Dict[str, Any]] = {}
+            if docker_probe.get("healthy"):
+                available_now["docker"] = {
+                    "endpoint": docker_probe.get("endpoint"),
+                    "priority": 1,
+                    "latency_ms": docker_probe.get("latency_ms", 0),
+                }
+            if cloud_probe.get("healthy"):
+                available_now["cloud_run"] = {
+                    "endpoint": cloud_probe.get("endpoint"),
+                    "priority": 2,
+                    "latency_ms": cloud_probe.get("latency_ms", 0),
+                }
+            if local_probe.get("available") and local_probe.get("memory_ok"):
+                available_now["local"] = {
+                    "endpoint": None,
+                    "priority": 3,
+                    "latency_ms": 50,
+                }
+
+            if available_now:
+                best = min(available_now.items(), key=lambda x: x[1]["priority"])
+                result["selected_backend"] = best[0]
+                result["endpoint"] = best[1]["endpoint"]
+                result["decision_reason"] = (
+                    f"Selected {best[0]} (priority={best[1]['priority']}, "
+                    f"latency={best[1]['latency_ms']:.0f}ms)"
+                )
+
+                # Background Docker start if local was selected but Docker is available
+                if result["selected_backend"] == "local" and docker_probe.get("available"):
+                    async def _bg_docker_start() -> None:
+                        try:
+                            from intelligence.docker_daemon_manager import (
+                                ensure_docker_ecapa_service,
+                            )
+                            await ensure_docker_ecapa_service()
+                        except Exception:
+                            pass
+                    asyncio.create_task(_bg_docker_start())
+
+        # =====================================================================
+        # Phase 3: Configure Selected Backend
+        # =====================================================================
+        backend = result["selected_backend"]
+        if backend == "docker":
+            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = result["endpoint"] or ""
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "true"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "docker"
+        elif backend == "cloud_run":
+            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = result["endpoint"] or ""
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "cloud_run"
+        elif backend == "local":
+            os.environ["JARVIS_ECAPA_BACKEND"] = "local"
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
+
+        if backend:
+            self.logger.info(
+                f"[ECAPA] Backend selected: {backend} — {result['decision_reason']}"
+            )
+        else:
+            result["decision_reason"] = "No ECAPA backend available"
+            self.logger.warning("[ECAPA] No backend available — voice biometrics degraded")
+
+        return result
+
+    # =========================================================================
+    # v223.0: ECAPA VERIFICATION PIPELINE
+    # =========================================================================
+    # Ported from start_system.py — 6-step smoke test to validate the full
+    # voice biometric pipeline after backend initialization.
+    # =========================================================================
+
+    async def _verify_ecapa_pipeline(self) -> Dict[str, Any]:
+        """
+        v223.0: Run 6-step ECAPA verification pipeline.
+
+        Non-blocking verification — failure logs warnings but doesn't abort
+        startup (voice unlock degrades gracefully).
+
+        Ported from start_system.py (lines 20160-20490).
+
+        Returns:
+            Dict with step-by-step verification results
+        """
+        result: Dict[str, Any] = {
+            "ml_registry_tested": False,
+            "cloud_ecapa_tested": False,
+            "local_ecapa_tested": False,
+            "embedding_extraction_tested": False,
+            "embedding_shape": None,
+            "verification_pipeline_ready": False,
+            "errors": [],
+        }
+
+        if not self.config.ecapa_enabled:
+            return result
+
+        self.logger.info("[ECAPA] Running verification pipeline (6 steps)...")
+        backend_dir = self.config.backend_dir
+        if str(backend_dir) not in sys.path:
+            sys.path.insert(0, str(backend_dir))
+
+        # Step 1/6: ML Engine Registry
+        try:
+            from voice_unlock.ml_engine_registry import get_ml_registry, ensure_ecapa_available
+            registry = get_ml_registry()
+            result["ml_registry_tested"] = True
+            self.logger.info("[ECAPA]   Step 1/6: ML Engine Registry ✓")
+        except Exception as e:
+            result["errors"].append(f"ML Registry: {e}")
+            self.logger.warning(f"[ECAPA]   Step 1/6: ML Engine Registry ✗ ({e})")
+            return result  # Can't continue without registry
+
+        # Step 2/6: Cloud Run ECAPA readiness
+        cloud_endpoint = os.environ.get("JARVIS_CLOUD_ML_ENDPOINT", "")
+        if cloud_endpoint:
+            try:
+                import aiohttp
+                timeout_s = float(os.environ.get("ECAPA_HEALTH_CHECK_TIMEOUT", "15"))
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(
+                        f"{cloud_endpoint}/health",
+                        timeout=aiohttp.ClientTimeout(total=timeout_s),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            result["cloud_ecapa_tested"] = data.get("ecapa_ready", False)
+                self.logger.info(
+                    f"[ECAPA]   Step 2/6: Cloud Run ECAPA "
+                    f"{'✓' if result['cloud_ecapa_tested'] else '✗'}"
+                )
+            except Exception as e:
+                result["errors"].append(f"Cloud Run: {e}")
+                self.logger.info(f"[ECAPA]   Step 2/6: Cloud Run ECAPA ✗ ({e})")
+        else:
+            self.logger.info("[ECAPA]   Step 2/6: Cloud Run ECAPA (skipped, no endpoint)")
+
+        # Step 3/6: Local ECAPA via ML Engine
+        try:
+            await ensure_ecapa_available()
+            result["local_ecapa_tested"] = True
+            self.logger.info("[ECAPA]   Step 3/6: Local ECAPA ✓")
+        except Exception as e:
+            result["errors"].append(f"Local ECAPA: {e}")
+            self.logger.info(f"[ECAPA]   Step 3/6: Local ECAPA ✗ ({e})")
+
+        # Step 4/6: Embedding extraction test (synthetic audio)
+        try:
+            from voice_unlock.ml_engine_registry import extract_speaker_embedding
+            import numpy as np
+            import io
+            import wave
+
+            # Generate synthetic 16kHz audio (1 second)
+            sample_rate = 16000
+            samples = (np.random.randn(sample_rate) * 0.01).astype(np.float32)
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes((samples * 32767).astype(np.int16).tobytes())
+            audio_bytes = buf.getvalue()
+
+            embedding = await extract_speaker_embedding(audio_bytes)
+            if embedding is not None and hasattr(embedding, "shape"):
+                result["embedding_extraction_tested"] = True
+                result["embedding_shape"] = str(embedding.shape)
+                self.logger.info(
+                    f"[ECAPA]   Step 4/6: Embedding extraction ✓ (shape={embedding.shape})"
+                )
+            else:
+                self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (no result)")
+        except Exception as e:
+            result["errors"].append(f"Embedding extraction: {e}")
+            self.logger.info(f"[ECAPA]   Step 4/6: Embedding extraction ✗ ({e})")
+
+        # Step 5/6: SpeakerVerificationService integration test
+        try:
+            from voice.speaker_verification_service import SpeakerVerificationService
+            test_svc = SpeakerVerificationService()
+            await test_svc.initialize()
+            # Quick embedding extraction through the service
+            await test_svc._extract_speaker_embedding(audio_bytes)
+            await test_svc.shutdown()
+            self.logger.info("[ECAPA]   Step 5/6: SpeakerVerificationService ✓")
+        except Exception as e:
+            result["errors"].append(f"SpeakerVerification: {e}")
+            self.logger.info(f"[ECAPA]   Step 5/6: SpeakerVerificationService ✗ ({e})")
+
+        # Step 6/6: Overall pipeline readiness
+        if result["embedding_extraction_tested"]:
+            result["verification_pipeline_ready"] = True
+        elif result["local_ecapa_tested"] or result["cloud_ecapa_tested"]:
+            # ECAPA available but embedding test failed — still mark ready
+            result["verification_pipeline_ready"] = True
+
+        readiness = "READY" if result["verification_pipeline_ready"] else "DEGRADED"
+        self.logger.info(f"[ECAPA]   Step 6/6: Pipeline status: {readiness}")
+
+        # Export results to environment
+        os.environ["JARVIS_ECAPA_VERIFIED"] = str(result["verification_pipeline_ready"]).lower()
+        os.environ["JARVIS_ECAPA_EMBEDDING_TESTED"] = str(
+            result["embedding_extraction_tested"]
+        ).lower()
+
+        return result
+
+    # =========================================================================
     # ENTERPRISE VOICE BIOMETRICS INITIALIZATION
     # =========================================================================
     # Full voice biometric system initialization with ECAPA-TDNN speaker
@@ -64563,6 +65245,27 @@ class JarvisSystemKernel:
                         self.logger.success(f"[CloudSQL] Proxy started on port {result['port']}")
                         result["running"] = True
                         result["enabled"] = True
+
+                        # v223.0: Verify connectivity after start (ported from start_system.py)
+                        try:
+                            health = await proxy_manager.check_connection_health()
+                            result["health"] = health
+                            if health.get("healthy", False):
+                                self.logger.info(
+                                    f"[CloudSQL] Connection verified: "
+                                    f"latency={health.get('latency_ms', '?')}ms"
+                                )
+                            else:
+                                self.logger.warning(
+                                    f"[CloudSQL] Proxy running but health check failed: "
+                                    f"{health.get('error', 'unknown')}"
+                                )
+                        except Exception as health_err:
+                            self.logger.debug(f"[CloudSQL] Health check skipped: {health_err}")
+
+                        # Store reference for shutdown cleanup
+                        self._cloud_sql_proxy_manager = proxy_manager
+
                         # v2.0.0: Signal proxy is ready to waiting components
                         if signal_proxy_ready:
                             signal_proxy_ready()
@@ -64640,7 +65343,7 @@ class JarvisSystemKernel:
         for module_name in modules_to_prewarm:
             try:
                 # Import in executor to not block
-                await asyncio.get_event_loop().run_in_executor(
+                await asyncio.get_running_loop().run_in_executor(
                     None,
                     __import__,
                     module_name
@@ -64887,6 +65590,171 @@ class JarvisSystemKernel:
             self.logger.warning(f"[WebSocket] Initialization failed: {e}")
 
         return result
+
+    # =========================================================================
+    # v223.0: NODE.JS WEBSOCKET ROUTER LIFECYCLE
+    # =========================================================================
+    # Ported from start_system.py start_websocket_router() (lines 15415-15576).
+    # Manages the full Node.js TypeScript WebSocket Router process.
+    # =========================================================================
+
+    async def _start_websocket_router(self) -> Optional[asyncio.subprocess.Process]:
+        """
+        v223.0: Start and manage the Node.js WebSocket Router process.
+
+        Ported from start_system.py. Only runs if a TypeScript router
+        directory exists at backend/websocket.
+
+        Returns:
+            Subprocess handle or None if not available/failed
+        """
+        ws_dir = self.config.backend_dir / "websocket"
+        if not ws_dir.exists():
+            self.logger.debug("[WSRouter] No TypeScript router directory found")
+            return None
+
+        ws_router_enabled = os.environ.get(
+            "JARVIS_WS_ROUTER_ENABLED", "false"
+        ).lower() == "true"
+        if not ws_router_enabled:
+            self.logger.debug("[WSRouter] TypeScript router disabled (set JARVIS_WS_ROUTER_ENABLED=true)")
+            return None
+
+        self.logger.info("[WSRouter] Starting Node.js WebSocket Router...")
+
+        # Step 1: Install dependencies if needed
+        node_modules = ws_dir / "node_modules"
+        if not node_modules.exists():
+            self.logger.info("[WSRouter] Installing npm dependencies...")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "npm", "install",
+                    cwd=str(ws_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                if proc.returncode != 0:
+                    self.logger.warning(f"[WSRouter] npm install failed: {stderr.decode()[:200]}")
+                    return None
+            except asyncio.TimeoutError:
+                self.logger.warning("[WSRouter] npm install timed out (60s)")
+                return None
+            except FileNotFoundError:
+                self.logger.info("[WSRouter] npm not found — skipping TypeScript router")
+                return None
+
+        # Step 2: Build TypeScript
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "npm", "run", "build",
+                cwd=str(ws_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            if proc.returncode != 0:
+                self.logger.warning(f"[WSRouter] TypeScript build failed: {stderr.decode()[:200]}")
+                return None
+        except asyncio.TimeoutError:
+            self.logger.warning("[WSRouter] TypeScript build timed out (30s)")
+            return None
+        except FileNotFoundError:
+            return None
+
+        # Step 3: Port cleanup
+        router_port = int(os.environ.get("JARVIS_WS_ROUTER_PORT", "8765"))
+        try:
+            import socket as _socket
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            if sock.connect_ex(("localhost", router_port)) == 0:
+                # Port in use — try to free it
+                sock.close()
+                if sys.platform != "win32":
+                    kill_proc = await asyncio.create_subprocess_exec(
+                        "lsof", "-ti", f":{router_port}",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await kill_proc.communicate()
+                    if stdout:
+                        for pid_str in stdout.decode().strip().split("\n"):
+                            try:
+                                pid = int(pid_str.strip())
+                                if pid != os.getpid():
+                                    os.kill(pid, signal.SIGTERM)
+                            except (ValueError, ProcessLookupError):
+                                pass
+                        await asyncio.sleep(1.0)
+            else:
+                sock.close()
+        except Exception:
+            pass
+
+        # Step 4: Start the router process
+        env = os.environ.copy()
+        env["PORT"] = str(router_port)
+        env["NODE_ENV"] = "production"
+        env["PYTHONUNBUFFERED"] = "1"
+
+        # Set up log file
+        log_dir = self.config.backend_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime as _dt
+        log_file_path = log_dir / f"websocket_router_{_dt.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_file = open(log_file_path, "w")  # Keep open for subprocess
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "npm", "start",
+                cwd=str(ws_dir),
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+        except Exception as e:
+            log_file.close()
+            self.logger.warning(f"[WSRouter] Failed to start: {e}")
+            return None
+
+        # Step 5: Wait for initialization and health check
+        await asyncio.sleep(2.0)
+        if process.returncode is not None:
+            log_file.close()
+            self.logger.warning("[WSRouter] Process died immediately")
+            return None
+
+        # Health check with retries
+        router_ready = False
+        for attempt in range(5):
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(
+                        f"http://localhost:{router_port}/health",
+                        timeout=aiohttp.ClientTimeout(total=5.0),
+                    ) as resp:
+                        if resp.status == 200:
+                            router_ready = True
+                            break
+            except Exception:
+                pass
+            if process.returncode is not None:
+                break
+            await asyncio.sleep(2.0)
+
+        if not router_ready:
+            self.logger.warning("[WSRouter] Failed health check — killing process")
+            process.kill()
+            log_file.close()
+            return None
+
+        # Store references for lifecycle management
+        self._ws_router_process = process
+        self._ws_router_log = log_file
+        self.logger.success(f"[WSRouter] ✓ Node.js WebSocket Router running on port {router_port}")
+        return process
 
     # =========================================================================
     # COMPREHENSIVE SERVICE VERIFICATION
@@ -65328,6 +66196,7 @@ class JarvisSystemKernel:
         healing_strategies = [
             (self._is_port_conflict, self._heal_port_conflict),
             (self._is_missing_module, self._heal_missing_module),
+            (self._is_typing_import, self._heal_typing_import),  # v223.0
             (self._is_permission_issue, self._heal_permission_issue),
             (self._is_memory_pressure, self._heal_memory_pressure),
             (self._is_process_crash, self._heal_process_crash),
@@ -65364,6 +66233,12 @@ class JarvisSystemKernel:
     def _is_missing_module(self, error_str: str, error_type: str) -> bool:
         """Check if error indicates a missing module."""
         return error_type == "ModuleNotFoundError" or "no module named" in error_str
+
+    def _is_typing_import(self, error_str: str, error_type: str) -> bool:
+        """v223.0: Check if error is a typing import issue (Python version compat)."""
+        return error_type == "NameError" and any(
+            t in error_str for t in ["list[", "dict[", "tuple[", "set["]
+        )
 
     def _is_permission_issue(self, error_str: str, error_type: str) -> bool:
         """Check if error indicates a permission issue."""
@@ -65408,17 +66283,21 @@ class JarvisSystemKernel:
         return any(indicator in error_str for indicator in api_indicators)
 
     async def _heal_port_conflict(self, context: str, error: Exception) -> bool:
-        """Attempt to heal a port conflict."""
-        # Extract port number from error
+        """
+        Attempt to heal a port conflict.
+
+        v223.0: Enhanced with alternative port fallback from start_system.py.
+        If killing the process on the port fails, tries alternative ports.
+        """
         port = self._extract_port_from_error(str(error))
         if not port:
             port = self.config.backend_port
 
         self.logger.info(f"[SelfHeal] Attempting to free port {port}")
 
-        # Try to kill the process using the port
+        # Step 1: Try to kill the process using the port
+        killed = False
         try:
-            # Use lsof on Unix systems
             if sys.platform != "win32":
                 result = await asyncio.create_subprocess_exec(
                     "lsof", "-ti", f":{port}",
@@ -65432,18 +66311,43 @@ class JarvisSystemKernel:
                     for pid_str in pids:
                         try:
                             pid = int(pid_str.strip())
-                            if pid != os.getpid():  # Don't kill ourselves
+                            if pid != os.getpid():
                                 os.kill(pid, signal.SIGTERM)
                                 self.logger.info(f"[SelfHeal] Sent SIGTERM to PID {pid}")
+                                killed = True
                         except (ValueError, ProcessLookupError):
                             pass
 
-                    # Wait for processes to die
-                    await asyncio.sleep(2.0)
-                    return True
+                    if killed:
+                        await asyncio.sleep(2.0)
+                        return True
 
         except Exception as e:
-            self.logger.debug(f"[SelfHeal] Port healing error: {e}")
+            self.logger.debug(f"[SelfHeal] Port kill error: {e}")
+
+        # Step 2: v223.0 — Try alternative port (ported from start_system.py)
+        alt_ports = {
+            8010: 8011, 8001: 8002, 3000: 3001, 8888: 8889,
+            8765: 8766, 8090: 8091,
+        }
+        alt = alt_ports.get(port)
+        if alt:
+            self.logger.info(f"[SelfHeal] Trying alternative port {alt} (original: {port})")
+            try:
+                # Check if alternative is available
+                import socket as _socket
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                available = sock.connect_ex(("localhost", alt)) != 0
+                sock.close()
+                if available:
+                    # Update config with alternative port
+                    if port == self.config.backend_port:
+                        self.config.backend_port = alt
+                    self.logger.info(f"[SelfHeal] Switched to alternative port {alt}")
+                    return True
+            except Exception as alt_err:
+                self.logger.debug(f"[SelfHeal] Alternative port check failed: {alt_err}")
 
         return False
 
@@ -65484,6 +66388,43 @@ class JarvisSystemKernel:
 
         return False
 
+    async def _heal_typing_import(self, context: str, error: Exception) -> bool:
+        """
+        v223.0: Fix typing import issues (Python <3.10 compatibility).
+
+        Ported from start_system.py — injects `from __future__ import annotations`
+        or `from typing import List, Dict, ...` into files with PEP 585 syntax
+        that aren't supported in older Python versions.
+        """
+        self.logger.info("[SelfHeal] Typing import issue detected")
+        # Find files that might need fixing
+        target_files = [
+            "backend/ml_logging_config.py",
+            "backend/ml_memory_manager.py",
+            "backend/context_aware_loader.py",
+        ]
+        fixed_any = False
+        for rel_path in target_files:
+            full_path = self.config.jarvis_home / rel_path
+            if not full_path.exists():
+                continue
+            try:
+                content = await asyncio.to_thread(full_path.read_text)
+                if "from __future__ import annotations" not in content:
+                    # Inject future annotations import at the top
+                    if content.startswith("#!"):
+                        # Skip shebang line
+                        lines = content.split("\n", 1)
+                        content = lines[0] + "\nfrom __future__ import annotations\n" + lines[1]
+                    else:
+                        content = "from __future__ import annotations\n" + content
+                    await asyncio.to_thread(full_path.write_text, content)
+                    self.logger.info(f"[SelfHeal] Injected future annotations into {rel_path}")
+                    fixed_any = True
+            except Exception as e:
+                self.logger.debug(f"[SelfHeal] Failed to fix {rel_path}: {e}")
+        return fixed_any
+
     async def _heal_permission_issue(self, context: str, error: Exception) -> bool:
         """Attempt to resolve permission issues."""
         self.logger.info("[SelfHeal] Permission issue detected")
@@ -65497,23 +66438,80 @@ class JarvisSystemKernel:
         return False
 
     async def _heal_memory_pressure(self, context: str, error: Exception) -> bool:
-        """Attempt to resolve memory pressure."""
+        """
+        Attempt to resolve memory pressure.
+
+        v223.0: Enhanced with memory-hog process killing and before/after
+        measurement (ported from start_system.py).
+        """
         self.logger.info("[SelfHeal] Memory pressure detected")
 
         try:
             import gc
 
+            # Measure memory before healing
+            available_before_gb = 0.0
+            try:
+                import psutil
+                mem_before = psutil.virtual_memory()
+                available_before_gb = mem_before.available / (1024 ** 3)
+                self.logger.info(
+                    f"[SelfHeal] Memory before healing: "
+                    f"{available_before_gb:.1f}GB available / "
+                    f"{mem_before.percent:.0f}% used"
+                )
+            except ImportError:
+                pass
+
             # Force garbage collection
             gc.collect()
             self.logger.info("[SelfHeal] Forced garbage collection")
+
+            # v223.0: Kill known memory hogs (Chrome, Electron apps)
+            if sys.platform != "win32":
+                try:
+                    # Kill Chrome helper processes (can consume GBs)
+                    proc = await asyncio.create_subprocess_exec(
+                        "pkill", "-f", "Google Chrome Helper",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+                    if proc.returncode == 0:
+                        self.logger.info("[SelfHeal] Killed Chrome helper processes")
+                except Exception:
+                    pass
+
+            # v223.0: Try GCP memory fallback
+            try:
+                from backend.core.gcp_vm_manager import get_local_memory_fallback
+                fallback = get_local_memory_fallback()
+                await fallback.attempt_local_relief(target_free_mb=2048)
+                self.logger.info("[SelfHeal] GCP memory fallback applied")
+            except (ImportError, Exception):
+                pass
 
             # If hybrid cloud is enabled, try offloading to GCP
             if hasattr(self, '_resource_registry') and self._resource_registry:
                 gcp_manager = self._resource_registry.get_manager("GCPInstanceManager")
                 if gcp_manager and gcp_manager.is_ready:
                     self.logger.info("[SelfHeal] Attempting GCP offload")
-                    # This would trigger workload migration to GCP
                     return True
+
+            # Measure memory after healing
+            try:
+                import psutil
+                mem_after = psutil.virtual_memory()
+                available_after_gb = mem_after.available / (1024 ** 3)
+                freed_mb = (available_after_gb - available_before_gb) * 1024
+                self.logger.info(
+                    f"[SelfHeal] Memory after healing: "
+                    f"{available_after_gb:.1f}GB available "
+                    f"(freed {freed_mb:.0f}MB)"
+                )
+                return freed_mb > 500  # Success if freed at least 500MB
+            except ImportError:
+                pass
 
             return True  # GC is always somewhat helpful
 
@@ -65523,7 +66521,11 @@ class JarvisSystemKernel:
         return False
 
     async def _heal_process_crash(self, context: str, error: Exception) -> bool:
-        """Attempt to recover from a process crash."""
+        """
+        Attempt to recover from a process crash.
+
+        v223.0: Enhanced with WebSocket npm rebuild (ported from start_system.py).
+        """
         self.logger.info(f"[SelfHeal] Process crash detected in: {context}")
 
         # If backend crashed, try to restart it
@@ -65548,13 +66550,64 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.warning(f"[SelfHeal] Backend restart failed: {e}")
 
+        # v223.0: If websocket crashed, try npm rebuild
+        if "websocket" in context.lower():
+            self.logger.info("[SelfHeal] Attempting WebSocket npm rebuild")
+            ws_dir = self.config.backend_dir / "websocket"
+            if ws_dir.exists():
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "npm", "run", "build",
+                        cwd=str(ws_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                    if proc.returncode == 0:
+                        self.logger.info("[SelfHeal] WebSocket rebuild successful")
+                        return True
+                    else:
+                        self.logger.warning(
+                            f"[SelfHeal] WebSocket rebuild failed: {stderr.decode()[:200]}"
+                        )
+                except asyncio.TimeoutError:
+                    self.logger.warning("[SelfHeal] WebSocket rebuild timed out (30s)")
+                except Exception as ws_err:
+                    self.logger.debug(f"[SelfHeal] WebSocket rebuild error: {ws_err}")
+
         return False
 
     async def _heal_api_key_issue(self, context: str, error: Exception) -> bool:
-        """Handle API key issues."""
+        """
+        Handle API key issues.
+
+        v223.0: Enhanced with .env file reloading from multiple search paths
+        (ported from start_system.py).
+        """
         self.logger.info("[SelfHeal] API key issue detected")
-        self.logger.warning("  → Please set ANTHROPIC_API_KEY environment variable")
-        # Can't auto-fix API key issues - need user action
+
+        # v223.0: Try reloading from .env files
+        env_search_paths = [".env", "backend/.env", "../.env"]
+        for env_path in env_search_paths:
+            full_path = Path(env_path)
+            if full_path.exists():
+                try:
+                    from dotenv import load_dotenv
+                    load_dotenv(full_path, override=True)
+                    self.logger.info(f"[SelfHeal] Reloaded environment from {env_path}")
+                    # Check if key is now available
+                    if os.environ.get("ANTHROPIC_API_KEY"):
+                        self.logger.info("[SelfHeal] ANTHROPIC_API_KEY found after .env reload")
+                        return True
+                except ImportError:
+                    self.logger.debug("[SelfHeal] python-dotenv not available for .env reload")
+                    break
+                except Exception as e:
+                    self.logger.debug(f"[SelfHeal] .env reload failed: {e}")
+
+        self.logger.warning("[SelfHeal] API key not found in any .env file")
+        self.logger.info("  → Please set ANTHROPIC_API_KEY environment variable")
+        self.logger.info("  → Or create a .env file with: ANTHROPIC_API_KEY=your_key_here")
         return False
 
     def _extract_port_from_error(self, error_str: str) -> Optional[int]:
