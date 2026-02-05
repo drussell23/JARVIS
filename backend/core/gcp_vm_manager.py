@@ -98,6 +98,14 @@ except ImportError:
     except ImportError:
         pass
 
+# v224.0: aiohttp availability for golden image health polling
+AIOHTTP_AVAILABLE = False
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    pass
+
 from backend.core.async_safety import LazyAsyncLock
 
 # Log severity bridge for criticality-aware logging
@@ -1359,7 +1367,7 @@ wait
                 labels={
                     "created-by": "jarvis",
                     "type": "golden-image-builder",
-                    "model-name": self.config.golden_image_model.replace("/", "-"),
+                    "model-name": self.config.golden_image_model.replace("/", "-").replace(".", "-").lower(),
                 },
             )
             
@@ -1487,7 +1495,7 @@ wait
                 labels={
                     "created-by": "jarvis",
                     "type": "golden-image",
-                    "model-name": self.config.golden_image_model.replace("/", "-"),
+                    "model-name": self.config.golden_image_model.replace("/", "-").replace(".", "-").lower(),
                     "model-version": "latest",
                     "jarvis-version": os.getenv("JARVIS_VERSION", "unknown"),
                     "source-vm": builder_vm_name,
