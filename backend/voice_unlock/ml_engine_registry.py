@@ -3406,9 +3406,104 @@ async def extract_speaker_embedding(
     return None
 
 
+def _coerce_audio_to_float32(audio_data) -> Optional["np.ndarray"]:
+    """Convert any supported audio format to float32 numpy array in [-1, 1].
+
+    v226.1: Unified audio format detection for the local ECAPA extraction
+    pipeline.  Handles every format that callers actually pass:
+
+    1. **int16 PCM bytes** — from ``normalize_audio_data()`` in
+       unified_voice_cache_manager and from raw WebSocket/mic capture.
+       Detected when byte-length is even and is NOT a valid WAV header.
+    2. **float32 bytes** — from callers that pre-convert to float32.
+       Detected by byte-length being a multiple of 4 AND the resulting
+       values being in a plausible audio range.
+    3. **WAV container bytes** — from unified_supervisor voice enrollment.
+       Detected by the ``RIFF`` magic header.
+    4. **numpy arrays** — from parallel_vbi_orchestrator / vbi_debug_tracer.
+       Detected by ``isinstance(audio_data, np.ndarray)``.
+    5. **torch tensors** — from internal pipeline.
+       Detected by ``hasattr(audio_data, 'numpy')``.
+
+    Returns None for unrecognizable input rather than producing garbage.
+    """
+    import numpy as np
+
+    # --- numpy array ---
+    if isinstance(audio_data, np.ndarray):
+        if audio_data.dtype == np.int16:
+            return audio_data.astype(np.float32) / 32768.0
+        return audio_data.astype(np.float32)
+
+    # --- torch tensor ---
+    if hasattr(audio_data, 'detach') and hasattr(audio_data, 'cpu'):
+        try:
+            np_arr = audio_data.detach().cpu().numpy().copy()
+            return _coerce_audio_to_float32(np_arr)
+        except Exception:
+            return None
+
+    # --- bytes ---
+    if isinstance(audio_data, (bytes, bytearray)):
+        raw = bytes(audio_data)
+
+        if len(raw) < 4:
+            return None
+
+        # WAV container: decode via soundfile or wave stdlib
+        if raw[:4] == b'RIFF':
+            try:
+                import io
+                import wave
+                with wave.open(io.BytesIO(raw), 'rb') as wf:
+                    frames = wf.readframes(wf.getnframes())
+                    sw = wf.getsampwidth()
+                if sw == 2:
+                    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                elif sw == 4:
+                    return np.frombuffer(frames, dtype=np.float32)
+                else:
+                    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            except Exception:
+                pass  # fall through to raw PCM heuristics
+
+        # Heuristic: try float32 first, validate range
+        if len(raw) % 4 == 0:
+            candidate = np.frombuffer(raw, dtype=np.float32)
+            if len(candidate) > 0:
+                if not np.any(np.isnan(candidate)) and not np.any(np.isinf(candidate)):
+                    absmax = np.abs(candidate).max()
+                    # Plausible float32 audio lives in roughly [-10, 10].
+                    # int16-reinterpreted-as-float32 produces values like 1e30+
+                    if absmax < 100.0:
+                        return candidate
+
+        # Default: treat as int16 PCM (the most common raw format)
+        if len(raw) % 2 == 0:
+            return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # Odd-length bytes: pad and treat as int16
+        padded = raw + b'\x00'
+        return np.frombuffer(padded, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # --- base64 string ---
+    if isinstance(audio_data, str):
+        try:
+            import base64
+            decoded = base64.b64decode(audio_data)
+            return _coerce_audio_to_float32(decoded)
+        except Exception:
+            return None
+
+    logger.warning(
+        f"[AudioCoerce] Unsupported audio type: {type(audio_data).__name__}"
+    )
+    return None
+
+
 async def _extract_local_embedding(
     registry: MLEngineRegistry,
-    audio_data: bytes
+    audio_data
 ) -> Optional[Any]:
     """
     Extract embedding using local ECAPA-TDNN engine.
@@ -3440,9 +3535,26 @@ async def _extract_local_embedding(
                 if engine_ref is None:
                     raise RuntimeError("Engine reference became None during extraction")
 
-                # Audio should be float32, 16kHz, mono
-                audio_array = np.frombuffer(audio_data, dtype=np.float32)
-                audio_tensor = torch.tensor(audio_array).unsqueeze(0)
+                # v226.1: Robust audio format detection.
+                #
+                # Root cause fix: callers pass audio in multiple formats —
+                # int16 PCM bytes (from normalize_audio_data), numpy arrays
+                # (from parallel_vbi_orchestrator), WAV container bytes
+                # (from unified_supervisor), or float32 bytes.
+                #
+                # Previously assumed float32 bytes unconditionally, causing
+                # NaN when int16 bytes were reinterpreted as float32
+                # (IEEE 754 NaN bit patterns from negative int16 values).
+                audio_array = _coerce_audio_to_float32(audio_data)
+
+                if audio_array is None or len(audio_array) == 0:
+                    raise RuntimeError(
+                        "Audio conversion failed — could not interpret "
+                        f"input as valid audio (type={type(audio_data).__name__}, "
+                        f"len={len(audio_data) if hasattr(audio_data, '__len__') else '?'})"
+                    )
+
+                audio_tensor = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0)
 
                 with torch.no_grad():
                     embedding = engine_ref.encode_batch(audio_tensor)
