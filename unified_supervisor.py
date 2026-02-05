@@ -5009,15 +5009,30 @@ def get_live_dashboard(enabled: bool = True) -> LiveProgressDashboard:
     return _live_dashboard
 
 
+# v226.2: Timestamp of last real (APARS-sourced) GCP progress update.
+# Used by _background_node_monitor to avoid overwriting real data with
+# synthetic time-based progress estimates.
+_last_real_gcp_progress_update: float = 0.0
+
+
 def update_dashboard_gcp_progress(
     phase: int = None,
     phase_name: str = None,
     checkpoint: str = None,
     progress: float = None,
     eta_seconds: int = None,
+    source: str = "unknown",
     **kwargs
 ) -> None:
-    """Helper to update GCP progress on the dashboard (if available)."""
+    """Helper to update GCP progress on the dashboard (if available).
+
+    v226.2: Added ``source`` parameter. When source="apars", records the
+    timestamp so that the synthetic progress generator in
+    _background_node_monitor can defer to real data.
+    """
+    global _last_real_gcp_progress_update
+    if source == "apars":
+        _last_real_gcp_progress_update = time.time()
     if _live_dashboard:
         _live_dashboard.update_gcp_progress(
             phase=phase,
@@ -60078,19 +60093,35 @@ class JarvisSystemKernel:
                             _last_pct = 40
                             
                             # Create a progress updater that runs while waiting
+                            # v226.2: This synthetic progress generator now defers to
+                            # real APARS data. When the APARS health check loop in
+                            # _wait_for_gcp_vm_ready feeds real progress data to the
+                            # dashboard, we skip our synthetic update to avoid
+                            # overwriting accurate phase/progress info with a naive
+                            # time-based estimate. Falls back to synthetic only when
+                            # no real data has arrived in the last 15s.
                             async def _update_gcp_progress_periodically():
                                 nonlocal _last_pct
                                 while True:
                                     await asyncio.sleep(5.0)  # Update every 5 seconds
+
+                                    # v226.2: Defer to real APARS data if it arrived recently
+                                    if _last_real_gcp_progress_update > 0:
+                                        age = time.time() - _last_real_gcp_progress_update
+                                        if age < 15.0:
+                                            # Real APARS data is flowing — skip synthetic update
+                                            continue
+
                                     elapsed = time.time() - _bg_start
-                                    # Progress from 40% to 95% over background_timeout
+                                    # Fallback synthetic: 40% → 95% over background_timeout
                                     new_pct = min(95, 40 + int((elapsed / background_timeout) * 55))
                                     if new_pct > _last_pct:
                                         _last_pct = new_pct
                                         update_dashboard_gcp_progress(
                                             phase=4, phase_name="Waking",
                                             checkpoint=f"VM starting ({int(elapsed)}s elapsed)",
-                                            progress=new_pct
+                                            progress=new_pct,
+                                            source="synthetic",
                                         )
                             
                             progress_task = create_safe_task(_update_gcp_progress_periodically())

@@ -2567,6 +2567,8 @@ class AdaptiveProgressAwareWaiter:
             self._last_log_time = now
         
         # v197.1: Update live dashboard (if available)
+        # v226.2: Pass source="apars" so dashboard knows this is real data
+        # and the synthetic progress generator in _background_node_monitor defers.
         try:
             from unified_supervisor import update_dashboard_gcp_progress
             update_dashboard_gcp_progress(
@@ -2577,6 +2579,7 @@ class AdaptiveProgressAwareWaiter:
                 eta_seconds=snapshot.eta_seconds,
                 elapsed_seconds=int(elapsed),
                 status="starting" if snapshot.total_progress < 100 else "healthy",
+                source="apars",
             )
         except ImportError:
             pass  # Dashboard not available
@@ -3269,15 +3272,51 @@ async def _wait_for_gcp_vm_ready(
 
         elif result.state in (HealthState.UNREACHABLE, HealthState.TIMEOUT):
             # VM not responding yet - might still be booting
+            #
+            # v226.2: Feed APARS a boot-phase progress signal so it can track
+            # forward progress and extend deadlines during VM boot.
+            #
+            # ROOT CAUSE: Previously, UNREACHABLE/TIMEOUT states NEVER called
+            # record_progress(), starving APARS of data entirely. With an empty
+            # progress_history, should_continue() reported progress=unknown,
+            # granted 0 extensions, and hit the deadline every time — even
+            # though the VM was actively booting.
+            #
+            # The fix: synthesize a "Phase 0: vm_booting" snapshot that reflects
+            # OS boot + network initialization. This gives APARS enough signal
+            # to extend the deadline while the VM gets its health endpoint up.
+            # Once the VM starts responding (HealthState.STARTING), real APARS
+            # data from the ultra-stub takes over.
+            if apars_waiter:
+                # Synthetic boot progress: 0→4% over first 150s, then hold
+                # Reflects OS boot → cloud-init → network ready → Phase 0 start
+                boot_progress = min(4.0, elapsed / 37.5)  # ~1% per 37.5s
+                boot_phase_pct = min(90.0, (elapsed / 150.0) * 90.0)
+                # ETA: expect first health response in ~150s for cold boot
+                # (OS boot ~30s, cloud-init ~60s, Phase 0 ultra-stub ~10s, network ~30s)
+                boot_eta = max(30, int(180 - elapsed))
+
+                boot_snapshot = APARSProgressSnapshot(
+                    timestamp=time.time(),
+                    phase_number=0,
+                    phase_name="vm_booting",
+                    phase_progress=boot_phase_pct,
+                    total_progress=boot_progress,
+                    checkpoint=f"waiting_for_vm_{result.state.value}",
+                    eta_seconds=boot_eta,
+                    elapsed_seconds=int(elapsed),
+                )
+                apars_waiter.record_progress(boot_snapshot)
+
             if time.time() - last_log_time > 30.0 or last_state != result.state:
                 logger.debug(
-                    f"[v189.0] ⏳ GCP VM not responding yet "
+                    f"[v226.2] ⏳ GCP VM not responding yet "
                     f"({elapsed:.0f}s elapsed, {result.error_message})"
                 )
                 last_log_time = time.time()
                 if progress_callback:
-                    base_timeout = apars_waiter.base_timeout if apars_waiter else timeout_seconds
-                    progress_callback("Waiting for VM to boot...", int((elapsed / base_timeout) * 25))
+                    boot_pct = min(25, int((elapsed / 150.0) * 25))
+                    progress_callback(f"VM booting ({result.state.value})...", boot_pct)
 
         else:
             # UNHEALTHY or other error state

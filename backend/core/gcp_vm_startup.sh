@@ -482,6 +482,14 @@ echo "════════════════════════�
 # v197.0: Report Phase 2 start
 update_progress 2 0 16 "full_setup_starting"
 
+# v226.2: Export shell variables so the child bash process inherits them.
+# The nohup bash -c '...' block runs in a new bash process that does NOT
+# inherit non-exported variables from the parent shell. Previously,
+# JARVIS_PORT was only assigned (line 59) but never exported, causing all
+# ${JARVIS_PORT} references inside Phases 2-6 to expand to empty string.
+# This broke Phase 5 server handoff and Phase 6 health verification.
+export JARVIS_PORT JARVIS_COMPONENTS JARVIS_REPO_URL
+
 # Run full setup in background so startup script can exit
 nohup bash -c '
 LOG_FILE="/var/log/jarvis-full-setup.log"
@@ -951,8 +959,11 @@ sleep 2
 update_progress 5 50 87 "starting_real_server"
 
 # Start real inference server
+# v226.2: JARVIS_PORT is inherited from the exported parent environment.
+# Removed the quoted prefix that broke the enclosing bash -c block
+# quoting structure (inner quotes ended the outer quoted region).
 cd /opt/jarvis-prime
-JARVIS_PORT='${JARVIS_PORT}' nohup python3 server.py > /var/log/jarvis-inference.log 2>&1 &
+JARVIS_PORT=${JARVIS_PORT} nohup python3 server.py > /var/log/jarvis-inference.log 2>&1 &
 REAL_PID=$!
 echo "   Real inference server started (PID: $REAL_PID)"
 
