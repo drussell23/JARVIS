@@ -16893,7 +16893,21 @@ _manager = None
 
 # Global flag to prevent duplicate browser tabs during startup
 # This is checked by both the restart flow and the manager's open_browser_smart
-_browser_opened_this_startup = False
+# v225.1: Also check environment variable for cross-process coordination with unified_supervisor.py
+_browser_opened_this_startup = os.environ.get("JARVIS_BROWSER_OPENED", "").lower() == "true"
+
+
+def _mark_browser_opened():
+    """Mark browser as opened both locally and in environment for cross-process coordination."""
+    global _browser_opened_this_startup
+    _browser_opened_this_startup = True
+    os.environ["JARVIS_BROWSER_OPENED"] = "true"
+
+
+def _is_browser_opened() -> bool:
+    """Check if browser was already opened (local flag OR environment variable)."""
+    global _browser_opened_this_startup
+    return _browser_opened_this_startup or os.environ.get("JARVIS_BROWSER_OPENED", "").lower() == "true"
 
 # Global lock for browser operations - prevents race conditions between concurrent calls
 # This is a module-level lock that ALL browser operations must acquire

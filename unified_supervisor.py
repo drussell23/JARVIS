@@ -13752,8 +13752,23 @@ def get_stabilized_chrome_launcher() -> StabilizedChromeLauncher:
 # =============================================================================
 
 # Global browser state management
-_browser_opened_this_startup: bool = False
+# v225.1: Use BOTH module-local flag AND environment variable for cross-process coordination
+# The environment variable JARVIS_BROWSER_OPENED ensures multiple processes don't open duplicate windows
+_browser_opened_this_startup: bool = os.environ.get("JARVIS_BROWSER_OPENED", "").lower() == "true"
 _browser_lock: Optional[asyncio.Lock] = None
+
+
+def _mark_browser_opened():
+    """Mark browser as opened both locally and in environment for cross-process coordination."""
+    global _browser_opened_this_startup
+    _browser_opened_this_startup = True
+    os.environ["JARVIS_BROWSER_OPENED"] = "true"
+
+
+def _is_browser_opened() -> bool:
+    """Check if browser was already opened (local flag OR environment variable)."""
+    global _browser_opened_this_startup
+    return _browser_opened_this_startup or os.environ.get("JARVIS_BROWSER_OPENED", "").lower() == "true"
 
 
 def _get_browser_lock() -> asyncio.Lock:
@@ -13863,6 +13878,10 @@ class IntelligentChromeIncognitoManager:
             }
 
             try:
+                # v225.1: Check cross-process browser state first
+                if _is_browser_opened() and not force_new:
+                    self._logger.info("🔒 Browser already opened (cross-process check) - finding window to redirect")
+                
                 # Quick check for existing incognito windows first
                 if not force_new:
                     quick_window = await self._quick_find_any_incognito_window()
@@ -13870,7 +13889,7 @@ class IntelligentChromeIncognitoManager:
                         self._logger.info(f"🔄 Found existing incognito window {quick_window} - reusing")
                         success = await self._redirect_incognito_window(quick_window, url)
                         if success:
-                            _browser_opened_this_startup = True
+                            _mark_browser_opened()  # v225.1: Cross-process safe
                             await self._ensure_fullscreen()
                             return {
                                 'success': True,
@@ -13881,7 +13900,7 @@ class IntelligentChromeIncognitoManager:
                             }
 
                 # Check if browser already opened this startup
-                if _browser_opened_this_startup and not force_new:
+                if _is_browser_opened() and not force_new:
                     scan_result = await self._scan_all_chrome_windows()
                     all_incognito = scan_result.get('all_incognito_windows', [])
                     if all_incognito:
@@ -13906,7 +13925,7 @@ class IntelligentChromeIncognitoManager:
 
                     if not scan_result['chrome_running']:
                         # Chrome not running - launch fresh
-                        _browser_opened_this_startup = True
+                        _mark_browser_opened()  # v225.1: Cross-process safe
                         success = await self._launch_fresh_incognito(url)
                         result['success'] = success
                         result['action'] = 'created'
@@ -13925,17 +13944,17 @@ class IntelligentChromeIncognitoManager:
                     if force_new and all_incognito:
                         closed = await self._close_incognito_windows(all_incognito)
                         result['duplicates_closed'] = closed
-                        _browser_opened_this_startup = True
+                        _mark_browser_opened()  # v225.1: Cross-process safe
                         success = await self._launch_fresh_incognito(url)
                         result['success'] = success
                         result['action'] = 'created'
                     elif not all_incognito:
-                        _browser_opened_this_startup = True
+                        _mark_browser_opened()  # v225.1: Cross-process safe
                         success = await self._launch_fresh_incognito(url)
                         result['success'] = success
                         result['action'] = 'created'
                     elif len(all_incognito) == 1:
-                        _browser_opened_this_startup = True
+                        _mark_browser_opened()  # v225.1: Cross-process safe
                         success = await self._redirect_incognito_window(all_incognito[0], url)
                         if success:
                             await self._ensure_fullscreen()
@@ -13947,7 +13966,7 @@ class IntelligentChromeIncognitoManager:
                         to_close = all_incognito[1:]
                         closed = await self._close_incognito_windows(to_close)
                         result['duplicates_closed'] = closed
-                        _browser_opened_this_startup = True
+                        _mark_browser_opened()  # v225.1: Cross-process safe
                         success = await self._redirect_incognito_window(to_keep, url)
                         if success:
                             await self._ensure_fullscreen()
