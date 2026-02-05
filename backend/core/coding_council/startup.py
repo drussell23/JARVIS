@@ -46,9 +46,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
+import socket as _socket
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .orchestrator import UnifiedCodingCouncil
@@ -110,6 +112,54 @@ def _get_startup_timeout() -> float:
     return float(os.getenv("CODING_COUNCIL_STARTUP_TIMEOUT", "30.0"))
 
 
+def _calculate_dynamic_startup_timeout() -> float:
+    """
+    Calculate startup timeout dynamically based on enabled components.
+
+    Instead of a static 60s that doesn't account for workload,
+    this sums per-component time budgets and applies a safety buffer.
+
+    Priority: env override > non-default config > calculated value.
+    """
+    # Environment override takes absolute priority
+    env_override = os.getenv("CODING_COUNCIL_STARTUP_TIMEOUT")
+    if env_override:
+        return float(env_override)
+
+    # Non-default config value = intentional override
+    config = _get_config()
+    if config and config.timeouts.startup != 60.0:
+        return config.timeouts.startup
+
+    # Dynamic calculation based on enabled components
+    base = 30.0  # Core council + orchestrator init
+
+    ide_enabled = _is_ide_bridge_enabled()
+    jprime_enabled = os.getenv("JARVIS_PRIME_ENABLED", "true").lower() == "true"
+    voice_enabled = os.getenv("CODING_COUNCIL_VOICE_ANNOUNCE", "true").lower() == "true"
+    ai_available = _can_use_ai()
+
+    if ide_enabled:
+        base += 15.0  # Trinity sync, LSP server, WebSocket, IDE bridge
+    if jprime_enabled:
+        base += 45.0  # J-Prime model loading is the heaviest component
+    if voice_enabled:
+        base += 5.0   # Voice announcer initialization
+    if ai_available:
+        base += 10.0  # Anthropic engine API validation
+
+    # 1.5x safety buffer for system variability (disk I/O, GC, contention)
+    timeout = base * 1.5
+
+    logger.debug(
+        f"[CodingCouncilStartup] Dynamic timeout: {timeout:.0f}s "
+        f"(base={base:.0f}s, IDE={ide_enabled}, JPrime={jprime_enabled}, "
+        f"Voice={voice_enabled}, AI={ai_available})"
+    )
+
+    return timeout
+
+
 def _can_use_ai() -> bool:
     """Check if AI functionality is available."""
     config = _get_config()
@@ -153,6 +203,217 @@ JPRIME_ENABLED = os.getenv("JARVIS_PRIME_ENABLED", "true").lower() == "true"
 IDE_BRIDGE_ENABLED = os.getenv("IDE_BRIDGE_ENABLED", "true").lower() == "true"
 LSP_SERVER_PORT = int(os.getenv("LSP_SERVER_PORT", "9257"))
 IDE_WEBSOCKET_PORT = int(os.getenv("IDE_WEBSOCKET_PORT", "9258"))
+
+
+# =============================================================================
+# v226.2: Dynamic Port Resolution — Stale Reclamation + Collision Avoidance
+# =============================================================================
+
+def _get_reserved_ports() -> Set[int]:
+    """Get ports reserved by JARVIS components to avoid cross-service collisions.
+
+    Reads from environment variables so that any runtime overrides are respected.
+    """
+    reserved: Set[int] = set()
+    for env_var, default in [
+        ("LSP_SERVER_PORT", "9257"),
+        ("IDE_WEBSOCKET_PORT", "9258"),
+        ("JARVIS_PORT", "8010"),
+        ("JARVIS_PRIME_PORT", "8000"),
+        ("REACTOR_CORE_PORT", "8090"),
+    ]:
+        try:
+            reserved.add(int(os.getenv(env_var, default)))
+        except ValueError:
+            reserved.add(int(default))
+    reserved.add(8080)  # Loading server
+    return reserved
+
+
+def _is_port_available_sync(port: int, host: str = "127.0.0.1") -> bool:
+    """Check if a port is available for binding (synchronous socket probe)."""
+    try:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.settimeout(1)
+        sock.bind((host, port))
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
+def _find_free_port(
+    preferred: int,
+    reserved: Set[int],
+    max_range: int = 20,
+    host: str = "127.0.0.1",
+) -> Optional[int]:
+    """Find the next available port starting from preferred+1, skipping reserved ports.
+
+    Scans preferred+1 through preferred+max_range, returning the first
+    port that is both available and not reserved by another JARVIS component.
+    """
+    for offset in range(1, max_range + 1):
+        candidate = preferred + offset
+        if candidate in reserved:
+            continue
+        if _is_port_available_sync(candidate, host):
+            return candidate
+    return None
+
+
+async def _get_port_owner_pid(port: int) -> Optional[int]:
+    """Get the PID of the process occupying a port (async, via lsof)."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "lsof", "-t", "-i", f":{port}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+        if stdout:
+            pids = stdout.decode().strip().split("\n")
+            if pids and pids[0]:
+                return int(pids[0])
+        return None
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+        return None
+    except (ValueError, Exception):
+        return None
+
+
+async def _is_jarvis_process(pid: int) -> bool:
+    """Check if a PID belongs to a JARVIS-related process (safe to terminate)."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ps", "-p", str(pid), "-o", "command=",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+        if stdout:
+            cmd = stdout.decode().strip().lower()
+            jarvis_indicators = [
+                "jarvis", "coding_council", "lsp_server",
+                "unified_supervisor", "run_supervisor",
+            ]
+            return any(indicator in cmd for indicator in jarvis_indicators)
+        return False
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+        return False
+    except Exception:
+        return False
+
+
+async def _reclaim_stale_port(port: int) -> bool:
+    """Try to reclaim a port held by a stale JARVIS process.
+
+    Only terminates processes identifiable as JARVIS components.
+    Returns True if the port was successfully reclaimed.
+    """
+    pid = await _get_port_owner_pid(port)
+    if pid is None:
+        return False
+
+    if not await _is_jarvis_process(pid):
+        logger.info(
+            f"[CodingCouncilStartup] Port {port} held by non-JARVIS process "
+            f"(PID {pid}), will find alternative port"
+        )
+        return False
+
+    logger.info(
+        f"[CodingCouncilStartup] Reclaiming port {port} from stale JARVIS "
+        f"process (PID {pid})"
+    )
+    try:
+        os.kill(pid, signal.SIGTERM)
+        # Wait up to 3s for graceful exit
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            if _is_port_available_sync(port):
+                logger.info(
+                    f"[CodingCouncilStartup] Successfully reclaimed port {port}"
+                )
+                return True
+        # Force kill if still running
+        try:
+            os.kill(pid, signal.SIGKILL)
+            await asyncio.sleep(0.5)
+        except ProcessLookupError:
+            pass
+        return _is_port_available_sync(port)
+    except ProcessLookupError:
+        # Process already exited
+        await asyncio.sleep(0.2)
+        return _is_port_available_sync(port)
+    except PermissionError:
+        logger.warning(
+            f"[CodingCouncilStartup] No permission to terminate PID {pid} "
+            f"on port {port}"
+        )
+        return False
+
+
+async def _resolve_port(preferred: int, name: str) -> Optional[int]:
+    """Resolve the best available port for a service.
+
+    v226.2: Dynamic port resolution strategy:
+    1. Try the preferred port (from env var or default)
+    2. If in use by a stale JARVIS process, reclaim it
+    3. If still unavailable, find the next free port (skipping reserved ports)
+
+    Args:
+        preferred: The preferred port number to try first.
+        name: Human-readable service name for logging.
+
+    Returns:
+        Resolved port number, or None if no port could be found.
+    """
+    reserved = _get_reserved_ports()
+    # Don't block the service from using its own preferred port
+    reserved.discard(preferred)
+
+    # Strategy 1: Try preferred port directly
+    if _is_port_available_sync(preferred):
+        return preferred
+
+    logger.info(
+        f"[CodingCouncilStartup] Preferred {name} port {preferred} is in use, "
+        f"attempting recovery..."
+    )
+
+    # Strategy 2: Reclaim from stale JARVIS process
+    if await _reclaim_stale_port(preferred):
+        return preferred
+
+    # Strategy 3: Find next free port, avoiding reserved ones
+    free_port = _find_free_port(preferred, reserved)
+    if free_port is not None:
+        logger.info(
+            f"[CodingCouncilStartup] Resolved {name} to dynamic port {free_port}"
+        )
+        return free_port
+
+    logger.error(
+        f"[CodingCouncilStartup] Could not find any available port for {name} "
+        f"(tried {preferred} and {preferred + 1}..{preferred + 20})"
+    )
+    return None
 
 
 # =============================================================================
@@ -273,7 +534,11 @@ async def _run_advanced_recovery(report, log) -> None:
 
 async def _recover_port_conflict(check, log) -> bool:
     """
-    Attempt to recover from port conflicts by using alternative ports.
+    v226.2: Recover from port conflicts using dynamic resolution.
+
+    Uses stale JARVIS process reclamation and dynamic free-port discovery
+    instead of the naive port+1 fallback that could collide with reserved
+    ports (e.g. IDE_WEBSOCKET_PORT on 9258).
     """
     global _recovery_log, LSP_SERVER_PORT, IDE_WEBSOCKET_PORT
 
@@ -284,28 +549,32 @@ async def _recover_port_conflict(check, log) -> bool:
         return False
 
     original_port = int(match.group(1))
-    alternative_port = original_port + 1
+    is_lsp = "lsp" in check.name.lower()
+    service_name = "LSP Server" if is_lsp else "WebSocket"
 
-    # Check if alternative port is available
-    from .diagnostics import PortChecker
-    if PortChecker.is_port_available(alternative_port):
-        # Update the appropriate global variable
-        if "lsp" in check.name.lower():
-            os.environ["LSP_SERVER_PORT"] = str(alternative_port)
-            log.info(f"    ⚡ Using alternative LSP port: {alternative_port}")
-        elif "websocket" in check.name.lower():
-            os.environ["IDE_WEBSOCKET_PORT"] = str(alternative_port)
-            log.info(f"    ⚡ Using alternative WebSocket port: {alternative_port}")
+    # Use the full resolution strategy: reclaim stale → find free
+    resolved = await _resolve_port(original_port, service_name)
+    if resolved is None:
+        return False
 
-        _recovery_log.append({
-            "action": f"Switched to alternative port {alternative_port}",
-            "original_port": original_port,
-            "timestamp": time.time(),
-            "success": True,
-        })
-        return True
+    # Update the appropriate global variable and env var
+    if is_lsp:
+        LSP_SERVER_PORT = resolved
+        os.environ["LSP_SERVER_PORT"] = str(resolved)
+        log.info(f"    ⚡ Resolved LSP port: {resolved}")
+    else:
+        IDE_WEBSOCKET_PORT = resolved
+        os.environ["IDE_WEBSOCKET_PORT"] = str(resolved)
+        log.info(f"    ⚡ Resolved WebSocket port: {resolved}")
 
-    return False
+    _recovery_log.append({
+        "action": f"Resolved {service_name} to port {resolved}",
+        "original_port": original_port,
+        "resolved_port": resolved,
+        "timestamp": time.time(),
+        "success": True,
+    })
+    return True
 
 
 async def _recover_directory(check, log) -> bool:
@@ -454,20 +723,49 @@ async def initialize_coding_council_startup(
             except Exception as e:
                 log.debug(f"[v79.1] Startup coordinator integration skipped: {e}")
 
-        # Initialize with timeout (use dynamic config)
-        startup_timeout = _get_startup_timeout()
+        # Initialize with dynamic timeout based on enabled components
+        startup_timeout = _calculate_dynamic_startup_timeout()
+        log.info(
+            f"[CodingCouncilStartup] Dynamic timeout: {startup_timeout:.0f}s "
+            f"(IDE={_is_ide_bridge_enabled()}, JPrime={JPRIME_ENABLED}, AI={_can_use_ai()})"
+        )
+
+        # Use asyncio.shield so the task continues in background on timeout
+        # (instead of restarting from scratch which wastes all partial progress)
+        init_task = asyncio.create_task(_initialize_council_full())
         try:
             _council = await asyncio.wait_for(
-                _initialize_council_full(),
+                asyncio.shield(init_task),
                 timeout=startup_timeout
             )
         except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
             log.warning(
-                f"[CodingCouncilStartup] Initialization timed out after "
-                f"{startup_timeout}s, continuing in background"
+                f"[CodingCouncilStartup] Initialization timed out after {elapsed:.1f}s "
+                f"(limit: {startup_timeout:.0f}s) — partial progress preserved, "
+                f"continuing in background"
             )
-            # Start in background instead
-            asyncio.create_task(_initialize_council_full())
+
+            # The shielded task is still running — attach completion callback
+            def _on_init_done(fut: asyncio.Future) -> None:
+                global _council, _initialized, _startup_time
+                try:
+                    result = fut.result()
+                    if result is not None:
+                        _council = result
+                        _initialized = True
+                        _startup_time = time.time()
+                        total = time.time() - start_time
+                        logger.info(
+                            f"[CodingCouncilStartup] Background init completed "
+                            f"({total:.1f}s total)"
+                        )
+                except Exception as exc:
+                    logger.error(
+                        f"[CodingCouncilStartup] Background init failed: {exc}"
+                    )
+
+            init_task.add_done_callback(_on_init_done)
             return False
 
         _startup_time = time.time()
@@ -509,16 +807,9 @@ async def initialize_coding_council_startup(
         return False
 
 
-async def _initialize_council_full() -> "UnifiedCodingCouncil":
-    """Internal: Full council initialization with Trinity, Anthropic engine, and IDE bridge."""
-    global _anthropic_engine, _ide_bridge, _trinity_sync, _lsp_server
-
-    from . import initialize_coding_council_full
-
-    # Initialize council
-    council = await initialize_coding_council_full()
-
-    # Initialize Anthropic engine (primary engine for Aider/MetaGPT style operations)
+async def _init_anthropic_engine() -> None:
+    """Initialize Anthropic engine (parallel-safe wrapper)."""
+    global _anthropic_engine
     try:
         from .adapters.anthropic_engine import get_anthropic_engine
         _anthropic_engine = await get_anthropic_engine()
@@ -528,18 +819,71 @@ async def _initialize_council_full() -> "UnifiedCodingCouncil":
         logger.warning(f"[CodingCouncilStartup] Anthropic engine not available: {e}")
         _anthropic_engine = None
 
-    # Initialize IDE Bridge and Trinity Sync
+
+async def _init_ide_if_enabled() -> None:
+    """Initialize IDE components if enabled (parallel-safe wrapper)."""
     if IDE_BRIDGE_ENABLED:
         await _initialize_ide_components()
+    else:
+        logger.debug("[CodingCouncilStartup] IDE bridge disabled, skipping")
 
-    # v78.0: Initialize Advanced Process Management Components
-    await _initialize_v78_components()
 
-    # v79.0: Initialize Voice Announcer for evolution feedback
-    await _initialize_v79_components()
+async def _init_jprime_if_enabled() -> None:
+    """Initialize J-Prime if enabled (parallel-safe wrapper)."""
+    if JPRIME_ENABLED:
+        await _initialize_v85_jprime_components()
+    else:
+        logger.debug("[CodingCouncilStartup] J-Prime disabled, skipping")
 
-    # v85.0: Initialize J-Prime Local LLM Engine
-    await _initialize_v85_jprime_components()
+
+async def _initialize_council_full() -> "UnifiedCodingCouncil":
+    """
+    Full council initialization: phased + parallel.
+
+    Phase 1 (sequential): Core council + Trinity integration.
+        Must complete first — creates the singleton that Phase 2 components may reference.
+
+    Phase 2 (parallel): Anthropic, IDE, v78.0, v79.0, J-Prime.
+        All independent of each other — run simultaneously via asyncio.gather.
+    """
+    global _anthropic_engine, _ide_bridge, _trinity_sync, _lsp_server
+
+    # ── Phase 1: Core Council (sequential, required) ─────────────────
+    phase1_start = time.time()
+    from . import initialize_coding_council_full
+    council = await initialize_coding_council_full()
+    phase1_elapsed = time.time() - phase1_start
+    logger.info(
+        f"[CodingCouncilStartup] Phase 1 complete: Core council ready ({phase1_elapsed:.1f}s)"
+    )
+
+    # ── Phase 2: Optional components (parallel) ──────────────────────
+    phase2_start = time.time()
+    component_names = ["Anthropic", "IDE", "v78.0", "v79.0", "J-Prime"]
+    results = await asyncio.gather(
+        _init_anthropic_engine(),
+        _init_ide_if_enabled(),
+        _initialize_v78_components(),
+        _initialize_v79_components(),
+        _init_jprime_if_enabled(),
+        return_exceptions=True,
+    )
+
+    # Log Phase 2 results
+    phase2_elapsed = time.time() - phase2_start
+    failures = []
+    for name, result in zip(component_names, results):
+        if isinstance(result, Exception):
+            failures.append(name)
+            logger.warning(f"[CodingCouncilStartup] {name} parallel init failed: {result}")
+
+    succeeded = len(component_names) - len(failures)
+    logger.info(
+        f"[CodingCouncilStartup] Phase 2 complete: {succeeded}/{len(component_names)} "
+        f"components ready ({phase2_elapsed:.1f}s parallel)"
+    )
+    if failures:
+        logger.warning(f"[CodingCouncilStartup] Failed components: {', '.join(failures)}")
 
     return council
 
@@ -839,7 +1183,7 @@ async def _initialize_ide_components() -> None:
         _lsp_server = LSPServer()
         # Start LSP server in background task
         asyncio.create_task(_start_lsp_server())
-        logger.info(f"[CodingCouncilStartup] LSP Server starting on port {LSP_SERVER_PORT}")
+        logger.info(f"[CodingCouncilStartup] LSP Server initializing (preferred port: {LSP_SERVER_PORT})")
     except Exception as e:
         logger.warning(f"[CodingCouncilStartup] LSP Server not available: {e}")
         _lsp_server = None
@@ -907,29 +1251,44 @@ async def _connect_trinity_to_orchestrator() -> None:
 
 
 async def _start_lsp_server() -> None:
-    """Start LSP server in background with port conflict detection."""
-    global _lsp_server
+    """v226.2: Start LSP server with dynamic port resolution and stale process cleanup.
+
+    Instead of blindly binding to the configured port and failing with a
+    "try port+1" message, this:
+    1. Checks if the preferred port is available
+    2. Reclaims stale JARVIS LSP processes if found on that port
+    3. Finds a free port dynamically if needed (avoiding reserved ports)
+    4. Updates the module-level global and env var so health/status endpoints
+       report the actual port
+    """
+    global _lsp_server, LSP_SERVER_PORT
 
     if _lsp_server is None:
         return
 
+    # Re-read preferred port (may have been updated by preflight recovery)
+    preferred = int(os.getenv("LSP_SERVER_PORT", "9257"))
+
+    # Resolve to an available port
+    resolved = await _resolve_port(preferred, "LSP Server")
+    if resolved is None:
+        logger.error(
+            "[CodingCouncilStartup] LSP Server: no available port found, skipping"
+        )
+        return
+
     try:
-        await _lsp_server.start_tcp(host="127.0.0.1", port=LSP_SERVER_PORT)
+        await _lsp_server.start_tcp(host="127.0.0.1", port=resolved)
+        LSP_SERVER_PORT = resolved
+        os.environ["LSP_SERVER_PORT"] = str(resolved)
+        logger.info(
+            f"[CodingCouncilStartup] LSP Server started on port {resolved}"
+            + (f" (fallback from {preferred})" if resolved != preferred else "")
+        )
     except OSError as e:
-        if "Address already in use" in str(e) or "address already in use" in str(e).lower():
-            logger.error(
-                f"[CodingCouncilStartup] LSP Server port {LSP_SERVER_PORT} is already in use. "
-                f"Try: export LSP_SERVER_PORT={LSP_SERVER_PORT + 1}"
-            )
-            # Try alternative port
-            try:
-                alt_port = LSP_SERVER_PORT + 1
-                await _lsp_server.start_tcp(host="127.0.0.1", port=alt_port)
-                logger.info(f"[CodingCouncilStartup] LSP Server started on alternative port {alt_port}")
-            except Exception:
-                logger.error("[CodingCouncilStartup] LSP Server failed to start on alternative port")
-        else:
-            logger.error(f"[CodingCouncilStartup] LSP Server failed: {e}")
+        logger.error(
+            f"[CodingCouncilStartup] LSP Server failed on resolved port {resolved}: {e}"
+        )
     except Exception as e:
         logger.error(f"[CodingCouncilStartup] LSP Server failed: {e}")
 
