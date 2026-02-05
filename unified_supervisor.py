@@ -62236,6 +62236,40 @@ class JarvisSystemKernel:
                     else stall_threshold
                 )
 
+                # v229.0: Completion detection — if progress is 100% and component
+                # is no longer actively initializing, the startup is DONE but the
+                # asyncio coroutine may still be doing internal cleanup. Handle this
+                # explicitly instead of falling through to the deadline expiry path.
+                if current_progress >= 100.0 and not model_loading_active:
+                    if startup_task.done():
+                        # Task already finished — collect results immediately
+                        try:
+                            results = startup_task.result()
+                            self.logger.success(
+                                f"[{integrator_name}] Component startup completed "
+                                f"(100% progress detected, task done) after {elapsed:.1f}s"
+                            )
+                            return results, False, None
+                        except Exception as e:
+                            self.logger.error(
+                                f"[{integrator_name}] Task completed with error: {e}"
+                            )
+                            return {}, True, f"Task completed with error: {e}"
+                    elif remaining <= poll_interval:
+                        # Task not done yet but progress=100% — grant grace period
+                        # for coroutine cleanup (post-health-check bookkeeping, etc.)
+                        grace_seconds = 60.0
+                        grace_deadline = now + grace_seconds
+                        if grace_deadline <= start_time + max_timeout:
+                            current_deadline = grace_deadline
+                            extensions_granted += 1
+                            self.logger.info(
+                                f"[{integrator_name}] Progress 100% + inactive — "
+                                f"granting {grace_seconds:.0f}s grace for coroutine cleanup "
+                                f"(extension #{extensions_granted})"
+                            )
+                            continue  # Go back to wait_for loop
+
                 # Decide whether to extend deadline
                 should_extend = False
                 extension_reason = ""
@@ -62670,7 +62704,10 @@ class JarvisSystemKernel:
                                     _trinity_startup_error = True
                                     _trinity_startup_timed_out = True  # v222.0: Track for result handling
                                     self.logger.error(f"[Trinity] Component startup timeout: {_timeout_context}")
-                                    # v228.0: Per-component error tracking — check each independently
+                                    # v229.0: Per-component error tracking with live health probing
+                                    # When deadline expires, results may be empty {} because the
+                                    # coroutine was cancelled before returning. Probe live health
+                                    # to detect components that are actually running.
                                     for comp_key, comp_status_key in [("jarvis-prime", "jarvis_prime"), ("reactor-core", "reactor_core")]:
                                         comp_result = results.get(comp_key) if results else None
                                         if comp_result is True:
@@ -62678,13 +62715,29 @@ class JarvisSystemKernel:
                                                 comp_status_key, "complete",
                                                 f"{comp_key} started successfully (peer timed out)"
                                             )
-                                            self.logger.info(f"[Trinity]   \u2713 {comp_key}: COMPLETE (started before timeout)")
+                                            self.logger.info(f"[Trinity]   \u2713 {comp_key}: COMPLETE (from results)")
+                                        elif comp_result is None:
+                                            # v229.0: No result — deadline expired before task returned.
+                                            # Probe actual health before marking error.
+                                            actual_port = self._get_component_port(comp_status_key)
+                                            if await self._quick_health_probe(actual_port):
+                                                self._update_component_status(
+                                                    comp_status_key, "complete",
+                                                    f"{comp_key} healthy on port {actual_port} (deadline expired before task returned)"
+                                                )
+                                                self.logger.info(f"[Trinity]   \u2713 {comp_key}: COMPLETE (live probe port {actual_port})")
+                                            else:
+                                                self._update_component_status(
+                                                    comp_status_key, "error",
+                                                    f"Startup timeout: {_timeout_context or 'timed out'}"
+                                                )
+                                                self.logger.error(f"[Trinity]   \u2717 {comp_key}: ERROR (timeout, probe failed)")
                                         else:
                                             self._update_component_status(
                                                 comp_status_key, "error",
-                                                f"Startup timeout: {_timeout_context or 'timed out'}"
+                                                f"Startup failed: {_timeout_context or 'timed out'}"
                                             )
-                                            self.logger.error(f"[Trinity]   \u2717 {comp_key}: ERROR (timeout)")
+                                            self.logger.error(f"[Trinity]   \u2717 {comp_key}: ERROR (startup failed)")
 
                             except TimeoutError:
                                 _trinity_startup_error = True
@@ -62852,7 +62905,7 @@ class JarvisSystemKernel:
                     if _legacy_timed_out:
                         _trinity_startup_timed_out = True  # v222.0: Track for result handling
                         self.logger.error(f"[Trinity] Component startup timeout: {_legacy_timeout_context}")
-                        # v228.0: Per-component error tracking — check each independently
+                        # v229.0: Per-component error tracking with live health probing
                         for comp_key, comp_status_key in [("jarvis-prime", "jarvis_prime"), ("reactor-core", "reactor_core")]:
                             comp_result = results.get(comp_key) if results else None
                             if comp_result is True:
@@ -62860,13 +62913,28 @@ class JarvisSystemKernel:
                                     comp_status_key, "complete",
                                     f"{comp_key} started successfully (peer timed out)"
                                 )
-                                self.logger.info(f"[Trinity]   \u2713 {comp_key}: COMPLETE (started before timeout)")
+                                self.logger.info(f"[Trinity]   \u2713 {comp_key}: COMPLETE (from results)")
+                            elif comp_result is None:
+                                # v229.0: No result — probe actual health
+                                actual_port = self._get_component_port(comp_status_key)
+                                if await self._quick_health_probe(actual_port):
+                                    self._update_component_status(
+                                        comp_status_key, "complete",
+                                        f"{comp_key} healthy on port {actual_port} (deadline expired before task returned)"
+                                    )
+                                    self.logger.info(f"[Trinity]   \u2713 {comp_key}: COMPLETE (live probe port {actual_port})")
+                                else:
+                                    self._update_component_status(
+                                        comp_status_key, "error",
+                                        f"Startup timeout: {_legacy_timeout_context or 'timed out'}"
+                                    )
+                                    self.logger.error(f"[Trinity]   \u2717 {comp_key}: ERROR (timeout, probe failed)")
                             else:
                                 self._update_component_status(
                                     comp_status_key, "error",
-                                    f"Startup timeout: {_legacy_timeout_context or 'timed out'}"
+                                    f"Startup failed: {_legacy_timeout_context or 'timed out'}"
                                 )
-                                self.logger.error(f"[Trinity]   \u2717 {comp_key}: ERROR (timeout)")
+                                self.logger.error(f"[Trinity]   \u2717 {comp_key}: ERROR (startup failed)")
 
                 # Log start results
                 started_count = sum(1 for v in results.values() if v)
