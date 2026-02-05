@@ -57889,6 +57889,11 @@ class JarvisSystemKernel:
         # for the progress getter closure defined below.
         _startup_entry_time = time.time()
 
+        # v227.0: Store timing info on self so inner phases (Trinity) can calculate
+        # remaining budget dynamically instead of using fixed timeouts.
+        self._startup_entry_time_ref = _startup_entry_time
+        self._startup_max_timeout = startup_max_timeout
+
         # v227.0: Honest progress state getter — no micro-increment masking.
         #
         # HISTORY:
@@ -61833,13 +61838,22 @@ class JarvisSystemKernel:
             - Prevents heartbeat from setting lower progress than manual updates
             - Logs estimated time remaining based on timeout
             """
-            heartbeat_increment = 66  # Internal counter for heartbeat increments
+            heartbeat_start = time.time()
+            # v227.0: Time-proportional heartbeat progress instead of fixed +1/5s.
+            # The old approach reached 79% in 65s then plateaued for 500+ seconds,
+            # creating a dead zone the ProgressController could interpret as a stall.
+            # New approach: advance 66%→79% proportionally over the Trinity budget,
+            # ensuring smooth visible progress throughout the entire phase.
+            _heartbeat_budget = getattr(self, '_startup_max_timeout', 1200.0) * 0.4
             while not heartbeat_stop.is_set():
                 try:
                     await asyncio.sleep(5.0)
                     if self._startup_watchdog and not heartbeat_stop.is_set():
-                        # Increment our internal counter
-                        heartbeat_increment = min(heartbeat_increment + 1, 79)
+                        # Time-proportional: 66→79% over ~40% of the budget
+                        elapsed_in_phase = time.time() - heartbeat_start
+                        ratio = min(1.0, elapsed_in_phase / max(1.0, _heartbeat_budget))
+                        heartbeat_increment = 66 + int(ratio * 13)  # 13% range (66→79)
+                        heartbeat_increment = min(heartbeat_increment, 79)
 
                         # Use maximum of current progress and our increment
                         # This ensures manual updates (e.g., progress=70) are not overwritten
@@ -61848,8 +61862,17 @@ class JarvisSystemKernel:
                         trinity_heartbeat_progress["current"] = new_progress
 
                         self._startup_watchdog.update_phase("trinity", new_progress)
+
+                        # v227.0: Sync heartbeat progress to _current_progress so the
+                        # ProgressController sees accurate values via get_progress_state().
+                        # Previously only the watchdog was updated, leaving the controller
+                        # with stale phase progress (e.g., 65% while actual is 73-79%).
+                        current = getattr(self, '_current_progress', 0) or 0
+                        if new_progress > current:
+                            self._current_progress = new_progress
+
                         self.logger.debug(
-                            f"[Trinity] 💓 DMS heartbeat: progress={new_progress} "
+                            f"[Trinity] DMS heartbeat: progress={new_progress} "
                             f"(heartbeat_incr={heartbeat_increment})"
                         )
                 except asyncio.CancelledError:
@@ -61895,23 +61918,49 @@ class JarvisSystemKernel:
 
                 # =====================================================================
                 # v206.0: PILLAR 2 - TIMEOUT CALCULUS with StartupTimeoutCalculator
+                # v227.0: DYNAMIC BUDGET — use remaining time from ProgressController
                 # =====================================================================
-                # Use centralized config for calculated timeouts instead of hardcoding.
-                # StartupTimeoutCalculator provides trinity_budget based on feature flags.
+                # The outer ProgressController manages the overall startup hard cap
+                # with progress-aware extensions. This inner trinity_budget must be
+                # a SAFETY NET subordinate to the controller, NOT an independent timer.
+                #
+                # Previous bug: Fixed 600s trinity_budget killed Trinity even when
+                # the ProgressController would have extended (model loading at 73%).
+                # Fix: Calculate remaining budget from the overall hard cap.
                 # =====================================================================
                 if STARTUP_TIMEOUTS_AVAILABLE and get_startup_config is not None:
                     _startup_config = get_startup_config()
                     _timeout_calculator = _startup_config.create_timeout_calculator()
-                    trinity_budget = _timeout_calculator.trinity_budget
+                    _configured_trinity_budget = _timeout_calculator.trinity_budget
                     _cleanup_timeout = _startup_config.budgets.CLEANUP
-                    self.logger.info(f"[Trinity] Using calculated timeouts: trinity_budget={trinity_budget:.1f}s, cleanup={_cleanup_timeout:.1f}s")
-                    # v206.0: Log startup config for debugging (PILLAR 6)
                     _startup_config.log_config()
                 else:
-                    # Fallback to environment variable if config not available
-                    trinity_budget = float(os.environ.get("JARVIS_TRINITY_BUDGET", "600.0"))
+                    _configured_trinity_budget = float(
+                        os.environ.get("JARVIS_TRINITY_BUDGET", "600.0")
+                    )
                     _cleanup_timeout = 30.0
-                    self.logger.warning("[Trinity] StartupConfig not available, using fallback timeouts")
+                    self.logger.warning(
+                        "[Trinity] StartupConfig not available, using fallback timeouts"
+                    )
+
+                # v227.0: Dynamic budget = remaining time from overall hard cap
+                # This prevents the inner timer from killing Trinity before the
+                # ProgressController (which has progress awareness) would.
+                _entry_ref = getattr(self, '_startup_entry_time_ref', time.time())
+                _max_timeout = getattr(self, '_startup_max_timeout', 1200.0)
+                _elapsed_so_far = time.time() - _entry_ref
+                _remaining_budget = max(0, _max_timeout - _elapsed_so_far)
+
+                # Use the larger of: configured budget OR remaining budget.
+                # This ensures Trinity gets at least its configured time, but also
+                # benefits from the additive timeout when GCP consumed less time.
+                trinity_budget = max(_configured_trinity_budget, _remaining_budget)
+                self.logger.info(
+                    f"[Trinity] Budget: {trinity_budget:.0f}s "
+                    f"(configured={_configured_trinity_budget:.0f}s, "
+                    f"remaining_from_cap={_remaining_budget:.0f}s, "
+                    f"elapsed_so_far={_elapsed_so_far:.0f}s)"
+                )
 
                 # Initialize results and trinity_integrator outside context for cleanup
                 results = {}
