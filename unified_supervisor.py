@@ -1411,14 +1411,18 @@ def _calculate_effective_startup_timeout(
     config_timeout: float,
     trinity_enabled: bool = False,
     gcp_enabled: bool = False,
-) -> float:
+) -> Dict[str, float]:
     """
-    v181.0: Calculate effective startup timeout based on enabled features.
+    v227.0: Calculate effective startup timeout based on enabled features.
 
-    The timeout must account for:
-    - GCP Spot VM provisioning (can take 2-5 minutes)
-    - Large model loading (can take 3-10 minutes)
-    - Trinity cross-repo coordination
+    ADDITIVE MODEL: When multiple slow subsystems are enabled (GCP + Trinity),
+    their timeout budgets stack because they execute sequentially:
+    GCP VM must boot BEFORE Trinity can coordinate cross-repo components.
+
+    v181.0 original used elif (exclusive), meaning GCP (900s) and Trinity (600s)
+    never stacked. This caused hard-cap timeouts at 1200s with 73.8% progress
+    because GCP consumed ~600s of the 900s base, leaving only 300s for Trinity
+    (which needs 600s for model loading alone).
 
     Args:
         config_timeout: User-configured timeout from JARVIS_STARTUP_TIMEOUT
@@ -1426,18 +1430,36 @@ def _calculate_effective_startup_timeout(
         gcp_enabled: Whether GCP cloud provisioning is enabled
 
     Returns:
-        Effective timeout that accounts for all enabled features
+        Dict with 'base_timeout' and 'max_timeout' calculated dynamically.
+        Caller uses both to configure the ProgressAwareStartupController.
     """
     effective = config_timeout
+    components = []
 
     if gcp_enabled:
-        # GCP provisioning needs the most time
+        # GCP provisioning: VM boot + health check (2-10 min)
         effective = max(effective, DEFAULT_GCP_STARTUP_TIMEOUT)
-    elif trinity_enabled:
-        # Trinity cross-repo needs substantial time
-        effective = max(effective, DEFAULT_TRINITY_TIMEOUT)
+        components.append("gcp")
 
-    return effective
+    if trinity_enabled:
+        # Trinity runs AFTER GCP VM is up — add its budget on top
+        effective += DEFAULT_TRINITY_TIMEOUT
+        components.append("trinity")
+
+    # Dynamic hard cap: proportional to base, with env override
+    env_max = os.environ.get("JARVIS_STARTUP_MAX_TIMEOUT")
+    if env_max:
+        max_timeout = float(env_max)
+    else:
+        # 1.5x base gives headroom for retries and slow model loads
+        # Minimum 1200s to preserve existing behavior for simple setups
+        max_timeout = max(TRINITY_MAX_EXTENDED_TIMEOUT, effective * 1.5)
+
+    return {
+        "base_timeout": effective,
+        "max_timeout": max_timeout,
+        "components": components,
+    }
 
 
 # =============================================================================
@@ -1482,16 +1504,21 @@ class ProgressAwareStartupController:
         # State tracking
         self._last_progress_pct: float = 0.0
         self._last_progress_time: float = 0.0
+        self._last_activity_time: float = 0.0  # v227.0: tracks subsystem activity
         self._current_deadline: float = 0.0
         self._extensions_granted: int = 0
         self._start_time: float = 0.0
-    
-    def _get_progress_state(self, get_state_func: Callable[[], Dict]) -> Tuple[float, float, bool]:
+
+    def _get_progress_state(self, get_state_func: Callable[[], Dict]) -> Tuple[float, float, bool, bool]:
         """
-        Extract progress information from the kernel's model loading state.
-        
+        v227.0: Extract progress information from the kernel's composite state.
+
         Returns:
-            Tuple of (progress_pct, eta_seconds, is_active)
+            Tuple of (progress_pct, eta_seconds, is_active, has_active_subsystem)
+
+            has_active_subsystem: True when a long-running subsystem (model loading,
+            component startup) is actively working. Used to distinguish "phase hold"
+            (progress unchanged but work ongoing) from "phase stall" (genuinely stuck).
         """
         try:
             state = get_state_func()
@@ -1499,20 +1526,20 @@ class ProgressAwareStartupController:
             eta_seconds = state.get("estimated_total_seconds", 0.0)
             elapsed = state.get("elapsed_seconds", 0)
             is_active = state.get("active", False)
-            
+            has_active_subsystem = state.get("has_active_subsystem", False)
+
             # Calculate remaining time from eta if available
             if eta_seconds > 0 and elapsed > 0 and progress_pct > 0:
-                # Estimate remaining based on progress rate
                 if progress_pct < 100:
                     remaining = (eta_seconds - elapsed) if eta_seconds > elapsed else (100 - progress_pct) / max(progress_pct / elapsed, 0.001)
                 else:
                     remaining = 0
             else:
                 remaining = 0
-            
-            return progress_pct, remaining, is_active
+
+            return progress_pct, remaining, is_active, has_active_subsystem
         except Exception:
-            return 0.0, 0.0, False
+            return 0.0, 0.0, False, False
     
     async def run_with_progress_aware_timeout(
         self,
@@ -1541,143 +1568,185 @@ class ProgressAwareStartupController:
         self._start_time = time.time()
         self._current_deadline = self._start_time + self.base_timeout
         self._last_progress_time = self._start_time
+        self._last_activity_time = self._start_time
         self._last_progress_pct = 0.0
         self._extensions_granted = 0
-        
+
         # Create the startup task
         task = asyncio.create_task(coro)
-        
+
         self.logger.info(
             f"[ProgressController] Starting with base timeout: {self.base_timeout:.0f}s, "
             f"max timeout: {self.max_timeout:.0f}s"
         )
-        
+
         try:
             while True:
                 now = time.time()
                 elapsed = now - self._start_time
                 remaining = self._current_deadline - now
-                
+
                 # Check if task completed
                 if task.done():
                     return task.result()
-                
+
                 # Check progress state
-                progress_pct, eta_remaining, is_active = self._get_progress_state(get_progress_func)
-                
-                # RULE 1: Detect progress advancement
+                progress_pct, eta_remaining, is_active, has_active_subsystem = (
+                    self._get_progress_state(get_progress_func)
+                )
+
+                # RULE 1: Detect REAL progress advancement (phase changes)
                 if progress_pct > self._last_progress_pct:
                     self._last_progress_time = now
+                    self._last_activity_time = now
                     progress_delta = progress_pct - self._last_progress_pct
                     self._last_progress_pct = progress_pct
-                    
-                    self.logger.debug(
-                        f"[ProgressController] Progress: {progress_pct:.1f}% (+{progress_delta:.1f}%), "
-                        f"elapsed: {elapsed:.0f}s"
+
+                    self.logger.info(
+                        f"[ProgressController] Progress: {progress_pct:.1f}% "
+                        f"(+{progress_delta:.1f}%), elapsed: {elapsed:.0f}s"
                     )
-                
-                # RULE 2: Extend deadline if progress is being made and ETA suggests we need more time
+
+                # v227.0: Active subsystem resets activity timer but NOT progress timer.
+                # This lets us distinguish "phase hold" (work ongoing, extend deadline)
+                # from "phase stall" (nothing happening, trigger timeout).
+                if has_active_subsystem:
+                    self._last_activity_time = now
+
+                # RULE 2: Extend deadline if progress/activity warrants it
                 time_since_progress = now - self._last_progress_time
+                time_since_activity = now - self._last_activity_time
                 time_until_deadline = self._current_deadline - now
-                
+
                 should_extend = False
                 extension_reason = ""
-                
-                # Check if we need an extension
+
                 if is_active and progress_pct > 0 and progress_pct < 100:
-                    # Model is actively loading
-                    
                     # Case A: ETA exceeds remaining deadline
                     if eta_remaining > 0 and eta_remaining > time_until_deadline:
                         should_extend = True
-                        extension_reason = f"ETA ({eta_remaining:.0f}s) > deadline ({time_until_deadline:.0f}s)"
-                    
-                    # Case B: Progress is being made but deadline is imminent
-                    elif time_until_deadline < self.extension_buffer and time_since_progress < self.stall_threshold:
+                        extension_reason = (
+                            f"ETA ({eta_remaining:.0f}s) > deadline ({time_until_deadline:.0f}s)"
+                        )
+
+                    # Case B: Active subsystem with imminent deadline
+                    elif has_active_subsystem and time_until_deadline < self.extension_buffer:
                         should_extend = True
-                        extension_reason = f"Progress active, deadline imminent ({time_until_deadline:.0f}s)"
-                    
-                    # Case C: Near completion (>90%) with recent progress
-                    elif progress_pct >= 90 and time_since_progress < 60:
+                        extension_reason = (
+                            f"Active subsystem, deadline imminent ({time_until_deadline:.0f}s)"
+                        )
+
+                    # Case C: Recent real progress with imminent deadline
+                    elif (
+                        time_until_deadline < self.extension_buffer
+                        and time_since_progress < self.stall_threshold
+                    ):
+                        should_extend = True
+                        extension_reason = (
+                            f"Recent progress ({time_since_progress:.0f}s ago), "
+                            f"deadline imminent ({time_until_deadline:.0f}s)"
+                        )
+
+                    # Case D: Near completion (>90%) with recent activity
+                    elif progress_pct >= 90 and time_since_activity < 60:
                         if time_until_deadline < 120:
                             should_extend = True
-                            extension_reason = f"Near completion ({progress_pct:.0f}%), deadline imminent"
-                
+                            extension_reason = (
+                                f"Near completion ({progress_pct:.0f}%), deadline imminent"
+                            )
+
                 # Apply extension if warranted and within hard cap
                 if should_extend:
                     new_deadline = now + self.extension_buffer
-                    
+
                     # Check hard cap
                     hard_cap_deadline = self._start_time + self.max_timeout
                     if new_deadline > hard_cap_deadline:
                         new_deadline = hard_cap_deadline
                         if new_deadline <= now:
-                            # Hard cap reached
                             self.logger.warning(
                                 f"[ProgressController] HARD CAP reached ({self.max_timeout:.0f}s). "
                                 f"Progress: {progress_pct:.1f}%"
                             )
                             task.cancel()
                             raise asyncio.TimeoutError(
-                                f"Startup hard cap reached ({self.max_timeout:.0f}s) at {progress_pct:.1f}% progress"
+                                f"Startup hard cap reached ({self.max_timeout:.0f}s) "
+                                f"at {progress_pct:.1f}% progress"
                             )
-                    
+
                     if new_deadline > self._current_deadline:
                         self._extensions_granted += 1
                         old_deadline = self._current_deadline
                         self._current_deadline = new_deadline
                         self.logger.info(
-                            f"[ProgressController] ⏱️ Deadline extended: {old_deadline - self._start_time:.0f}s → "
-                            f"{new_deadline - self._start_time:.0f}s (reason: {extension_reason}, "
-                            f"progress: {progress_pct:.1f}%, extensions: {self._extensions_granted})"
+                            f"[ProgressController] Deadline extended: "
+                            f"{old_deadline - self._start_time:.0f}s -> "
+                            f"{new_deadline - self._start_time:.0f}s "
+                            f"(reason: {extension_reason}, progress: {progress_pct:.1f}%, "
+                            f"extensions: {self._extensions_granted})"
                         )
-                
-                # RULE 3: Check for stall (no progress for threshold period)
+
+                # RULE 3: Stall detection — v227.0 two-tier check
+                # Tier 1: No real phase progress for stall_threshold — WARN
+                # Tier 2: No phase progress AND no active subsystem — KILL
+                #
+                # This prevents false stalls during long phases where progress_pct
+                # is flat but a subsystem (model loading, component startup) is
+                # actively working. Only kills when BOTH are inactive.
                 if time_since_progress > self.stall_threshold and is_active and progress_pct > 0:
-                    self.logger.warning(
-                        f"[ProgressController] ⚠️ Progress stalled for {time_since_progress:.0f}s "
-                        f"at {progress_pct:.1f}%"
-                    )
-                    # v225.2: Don't trigger stall when model loading has a valid ETA remaining.
-                    # progress_pct may appear stalled due to max_progress_seen clamping or
-                    # discrete phase boundaries while the model IS actively loading. A positive
-                    # eta_remaining means loading is ongoing, not truly stalled. The hard cap
-                    # (Rule 4 + max_timeout) provides the ultimate safety net.
-                    if progress_pct < 95 and eta_remaining <= 0:
-                        task.cancel()
-                        raise asyncio.TimeoutError(
-                            f"Startup stalled at {progress_pct:.1f}% for {time_since_progress:.0f}s"
+                    if has_active_subsystem or eta_remaining > 0:
+                        # Phase hold: progress flat but subsystem working — just log
+                        if time_since_progress > self.stall_threshold * 2:
+                            # Extended hold: warn but don't kill
+                            self.logger.info(
+                                f"[ProgressController] Phase hold at {progress_pct:.1f}% "
+                                f"for {time_since_progress:.0f}s "
+                                f"(subsystem active, ETA: {eta_remaining:.0f}s)"
+                            )
+                    elif time_since_activity > self.stall_threshold:
+                        # TRUE stall: no progress AND no subsystem activity
+                        self.logger.warning(
+                            f"[ProgressController] TRUE STALL at {progress_pct:.1f}% — "
+                            f"no progress for {time_since_progress:.0f}s, "
+                            f"no activity for {time_since_activity:.0f}s"
                         )
-                
-                # RULE 4: Check if deadline exceeded (and no extension applied this cycle)
+                        if progress_pct < 95:
+                            task.cancel()
+                            raise asyncio.TimeoutError(
+                                f"Startup stalled at {progress_pct:.1f}% "
+                                f"(no progress: {time_since_progress:.0f}s, "
+                                f"no activity: {time_since_activity:.0f}s)"
+                            )
+
+                # RULE 4: Deadline exceeded
                 if now >= self._current_deadline:
                     if is_active and progress_pct >= 90:
-                        # Give a final grace period for near-completion
                         self.logger.info(
-                            f"[ProgressController] Granting final grace period at {progress_pct:.1f}%"
+                            f"[ProgressController] Granting final grace period "
+                            f"at {progress_pct:.1f}%"
                         )
-                        self._current_deadline = now + 120  # 2 minute grace
+                        self._current_deadline = now + 120
                         self._extensions_granted += 1
                     else:
                         self.logger.error(
-                            f"[ProgressController] TIMEOUT after {elapsed:.0f}s at {progress_pct:.1f}% progress "
-                            f"(extensions granted: {self._extensions_granted})"
+                            f"[ProgressController] TIMEOUT after {elapsed:.0f}s "
+                            f"at {progress_pct:.1f}% progress "
+                            f"(extensions: {self._extensions_granted})"
                         )
                         task.cancel()
                         raise asyncio.TimeoutError(
-                            f"Startup timeout after {elapsed:.0f}s at {progress_pct:.1f}% progress"
+                            f"Startup timeout after {elapsed:.0f}s "
+                            f"at {progress_pct:.1f}% progress"
                         )
-                
+
                 # Wait for next poll or task completion
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(task),
                         timeout=min(self.poll_interval, max(0.1, remaining))
                     )
-                    # Task completed
                     return task.result()
                 except asyncio.TimeoutError:
-                    # Poll interval elapsed, continue monitoring
                     continue
                     
         except asyncio.CancelledError:
@@ -57787,25 +57856,28 @@ class JarvisSystemKernel:
             str(DEFAULT_STARTUP_TIMEOUT)
         ))
 
-        # Apply dynamic timeout calculation based on enabled features
-        startup_timeout = _calculate_effective_startup_timeout(
+        # v227.0: Additive timeout calculation — GCP + Trinity budgets stack
+        timeout_spec = _calculate_effective_startup_timeout(
             config_timeout=base_timeout,
             trinity_enabled=self.config.trinity_enabled,
             gcp_enabled=self.config.gcp_enabled,
         )
+        startup_timeout = timeout_spec["base_timeout"]
+        startup_max_timeout = timeout_spec["max_timeout"]
+        startup_components = timeout_spec["components"]
 
         if startup_timeout != base_timeout:
             self.logger.info(
                 f"[Kernel] Startup timeout adjusted: {base_timeout}s → {startup_timeout}s "
-                f"(Trinity: {self.config.trinity_enabled}, GCP: {self.config.gcp_enabled})"
+                f"(Trinity: {self.config.trinity_enabled}, GCP: {self.config.gcp_enabled}, "
+                f"components: {startup_components}, hard cap: {startup_max_timeout}s)"
             )
 
         # v225.0: Use progress-aware startup controller instead of rigid timeout
-        # This solves the "Prime skipped at 95%" issue by extending deadlines
-        # when active progress is being made (e.g., LLM loading at 95% with 46s ETA)
+        # v227.0: max_timeout is now dynamically calculated from enabled components
         progress_controller = ProgressAwareStartupController(
             base_timeout=startup_timeout,
-            max_timeout=float(os.environ.get("JARVIS_STARTUP_MAX_TIMEOUT", str(TRINITY_MAX_EXTENDED_TIMEOUT))),
+            max_timeout=startup_max_timeout,
             poll_interval=TRINITY_PROGRESS_POLL_INTERVAL,
             extension_buffer=TRINITY_PROGRESS_EXTENSION_BUFFER,
             stall_threshold=TRINITY_PROGRESS_STALL_THRESHOLD,
@@ -57817,27 +57889,28 @@ class JarvisSystemKernel:
         # for the progress getter closure defined below.
         _startup_entry_time = time.time()
 
-        # v225.1: Composite progress state getter that bridges two tracking systems.
-        # v225.2: Use phase progress as the authoritative base to prevent regression
-        #         when switching between model loading and phase progress sources.
-        #         Add elapsed-based micro-increment for continuous forward movement.
+        # v227.0: Honest progress state getter — no micro-increment masking.
         #
-        # BUG FIX (v225.1): The original closure referenced self._model_loading_state,
-        # which lives on LiveProgressDashboard, NOT JarvisSystemKernel. Silent
-        # AttributeError caused permanent 0% progress.
+        # HISTORY:
+        # v225.1: Fixed self._model_loading_state → dashboard._model_loading_state
+        # v225.2: Added micro-increment to prevent false stall detection
+        # v227.0: REMOVED micro-increment because it masks REAL stalls too.
         #
-        # BUG FIX (v225.2): Returning raw model_state caused progress to regress
-        # (e.g., 68% phase → 22% model loading due to max_progress_seen clamping),
-        # triggering false stall detection. Now always uses phase progress as the
-        # base and overlays model loading ETA for intelligent deadline extension.
+        # The micro-increment (overall_elapsed * 0.0001) made progress_pct increase
+        # continuously, which defeated stall detection entirely. The controller saw
+        # "progress" every 15s poll and never triggered stall rules, even when the
+        # system was genuinely stuck. The hard cap (1200s) was the only safety net.
         #
-        # Phase progress advances discretely at phase boundaries (5→15→30→50→68→80→100).
-        # Between boundaries (e.g., during Trinity ~10 min), progress_pct doesn't change,
-        # which the stall detector (90s threshold) interprets as a stall. A tiny fractional
-        # increment based on elapsed time creates continuous forward movement, preventing
-        # false stall detection while keeping progress values essentially correct.
+        # Instead, we now report HONEST phase progress and a separate
+        # "has_active_subsystem" flag. The controller uses this flag to distinguish:
+        #   - Phase hold: progress unchanged but subsystem active → not a stall
+        #   - Phase stall: progress unchanged AND no subsystem active → real stall
+        #
+        # Phase progress advances discretely: 5→15→30→50→68→80→100
+        # Between boundaries (e.g., 68% during 10-min Trinity), the subsystem flag
+        # tells the controller that work is ongoing.
         def get_progress_state() -> Dict:
-            # Model loading state (for ETA overlay and extension decisions)
+            # Model loading state (for ETA and active subsystem detection)
             model_active = False
             model_eta = 0
             model_elapsed = 0
@@ -57852,31 +57925,37 @@ class JarvisSystemKernel:
             except Exception:
                 pass
 
-            # Phase progress: monotonically increasing through startup phases
+            # v227.0: Trinity coordination detection — components actively starting
+            # During Trinity phase, progress stays at 68-79% for up to 10 minutes
+            # while Prime loads its model and Reactor connects. Without this flag,
+            # the controller would see a stall at 73% and kill the startup.
+            trinity_coordinating = False
+            try:
+                kernel_state = getattr(self, '_state', None)
+                if kernel_state == KernelState.STARTING_TRINITY:
+                    # Check if any Trinity component is still incomplete
+                    trinity_ready = getattr(self, '_trinity_ready', {})
+                    if not all(trinity_ready.values()):
+                        trinity_coordinating = True
+            except Exception:
+                pass
+
+            # Phase progress: honest value, no micro-increment
             phase_progress = float(getattr(self, '_current_progress', 0) or 0)
             started = self._started_at or _startup_entry_time
             overall_elapsed = max(0, time.time() - started) if started else 0
 
-            # Micro-increment: ensures the controller sees continuous forward movement
-            # even during long phases where progress_pct doesn't change. The increment
-            # is < 1% total over the entire startup, so it doesn't distort the value.
-            if model_active and model_elapsed > 0:
-                phase_progress += model_elapsed * 0.001
-            elif overall_elapsed > 0:
-                phase_progress += overall_elapsed * 0.0001
+            # Composite active subsystem: model loading OR Trinity coordination
+            subsystem_active = model_active or trinity_coordinating
 
             return {
-                "active": (0 < phase_progress < 100) or model_active,
+                "active": (0 < phase_progress < 100) or subsystem_active,
                 "progress_pct": phase_progress,
                 "elapsed_seconds": model_elapsed if model_active else int(overall_elapsed),
                 "estimated_total_seconds": model_eta if model_active else 0,
                 "stage": getattr(self, '_current_startup_phase', 'startup'),
-                "stage_detail": "",
-                "model_name": "",
-                "model_size_gb": 0.0,
-                "reason": "",
+                "has_active_subsystem": subsystem_active,
                 "start_time": started,
-                "max_progress_seen": int(phase_progress),
             }
         
         self.logger.info(
@@ -61465,48 +61544,104 @@ class JarvisSystemKernel:
                 # Check model loading progress
                 # v223.0: Dashboard fallback — ensure progress is observable even
                 # if _live_dashboard was not initialized before this function runs.
+                # v224.0: Phase-aware progress with v2 protocol support.
                 current_progress = 0.0
                 model_loading_active = False
                 eta_seconds = None
+                current_phase_name = None  # v224.0: Track current init phase for stall thresholds
 
-                _dashboard = _live_dashboard
-                if _dashboard is None:
-                    # Attempt to acquire the dashboard if it exists
+                # v224.0: Always poll Prime's HTTP health endpoint first for v2
+                # protocol data. This provides real milestone-based progress across
+                # all 9 initialization phases. The dashboard only tracks model loading
+                # (Step 8) and reports fake time-based progress during Steps 1-7.
+                # BUGFIX: v223.0 read health_data.get("model", {}).get("progress", 0)
+                # which doesn't exist in Prime's response. Prime returns
+                # model_load_progress_pct at top level, and v224.0+ returns
+                # init_progress with protocol_version 2.
+                _got_v2_data = False
+                try:
+                    import aiohttp as _aiohttp
+                    # v224.0: Resolve Prime's actual port from multiple sources.
+                    # Priority: 1) cross-repo state file, 2) TRINITY_JPRIME_PORT env,
+                    # 3) JARVIS_PRIME_PORT env, 4) default 8000
+                    prime_port = None
                     try:
-                        _dashboard = get_live_dashboard()
+                        import json as _json
+                        _state_path = os.path.expanduser("~/.jarvis/cross_repo/jarvis_prime_state.json")
+                        if os.path.exists(_state_path):
+                            with open(_state_path) as _f:
+                                _state = _json.load(_f)
+                                _sp = _state.get("port")
+                                if _sp and isinstance(_sp, int):
+                                    prime_port = _sp
                     except Exception:
-                        _dashboard = None
+                        pass
+                    if prime_port is None:
+                        prime_port = int(os.environ.get(
+                            "TRINITY_JPRIME_PORT",
+                            os.environ.get("JARVIS_PRIME_PORT", "8000")
+                        ))
+                    async with _aiohttp.ClientSession() as _sess:
+                        async with _sess.get(
+                            f"http://localhost:{prime_port}/health",
+                            timeout=_aiohttp.ClientTimeout(total=3.0),
+                        ) as resp:
+                            if resp.status == 200:
+                                health_data = await resp.json()
 
-                if _dashboard is not None:
-                    state = _dashboard._model_loading_state
-                    current_progress = state.get("progress_pct", 0)
-                    model_loading_active = state.get("active", False)
-                    estimated_total = state.get("estimated_total_seconds", 0)
-                    elapsed_model = state.get("elapsed_seconds", 0)
-                    if estimated_total > 0 and elapsed_model > 0:
-                        eta_seconds = max(0, estimated_total - elapsed_model)
-                elif extensions_granted == 0:
-                    # v223.0: Fallback — poll Prime's HTTP health endpoint for progress
-                    # when dashboard is completely unavailable
-                    try:
-                        import aiohttp as _aiohttp
-                        prime_port = int(os.environ.get("JARVIS_PRIME_PORT", "8001"))
-                        async with _aiohttp.ClientSession() as _sess:
-                            async with _sess.get(
-                                f"http://localhost:{prime_port}/health",
-                                timeout=_aiohttp.ClientTimeout(total=3.0),
-                            ) as resp:
-                                if resp.status == 200:
-                                    health_data = await resp.json()
-                                    model_status = health_data.get("model", {})
-                                    current_progress = float(model_status.get("progress", 0))
-                                    model_loading_active = model_status.get("loading", False)
-                                    self.logger.debug(
-                                        f"[{integrator_name}] Dashboard unavailable, "
-                                        f"polled Prime health: {current_progress:.1f}%"
+                                # v224.0: Try v2 protocol first (phase-based progress)
+                                init_progress = health_data.get("init_progress")
+                                if init_progress and init_progress.get("protocol_version", 0) >= 2:
+                                    current_progress = float(init_progress.get("overall_pct", 0))
+                                    cp = init_progress.get("current_phase") or {}
+                                    current_phase_name = cp.get("name")
+                                    # Any in-progress phase means active work
+                                    model_loading_active = cp.get("status") == "in_progress"
+                                    # Calculate ETA from remaining phases
+                                    completed = init_progress.get("completed_phases", 0)
+                                    total = init_progress.get("total_phases", 9)
+                                    if completed > 0 and total > completed:
+                                        avg_phase_time = elapsed / max(completed, 1)
+                                        eta_seconds = avg_phase_time * (total - completed)
+                                    _got_v2_data = True
+                                    self.logger.info(
+                                        f"[{integrator_name}] v2 progress: {current_progress:.1f}% "
+                                        f"phase={current_phase_name} ({completed}/{total})"
                                     )
-                    except Exception:
-                        pass  # Health endpoint not available yet — keep defaults
+                                else:
+                                    # v1 fallback: read actual Prime response fields
+                                    # BUGFIX: was reading non-existent "model.progress" path
+                                    current_progress = float(health_data.get("model_load_progress_pct", 0))
+                                    model_loading_active = health_data.get("model_loading_in_progress", False)
+                                    # Also check if Prime is actively initializing (status=starting)
+                                    if not model_loading_active and health_data.get("status") == "starting":
+                                        model_loading_active = True
+                                    self.logger.info(
+                                        f"[{integrator_name}] v1 progress: {current_progress:.1f}% "
+                                        f"active={model_loading_active}"
+                                    )
+                except Exception:
+                    pass  # Health endpoint not available yet
+
+                # Fallback: use dashboard model-loading data only when HTTP poll failed
+                if not _got_v2_data and current_progress == 0.0:
+                    _dashboard = _live_dashboard
+                    if _dashboard is None:
+                        try:
+                            _dashboard = get_live_dashboard()
+                        except Exception:
+                            _dashboard = None
+                    if _dashboard is not None:
+                        state = _dashboard._model_loading_state
+                        _dash_progress = state.get("progress_pct", 0)
+                        _dash_active = state.get("active", False)
+                        if _dash_progress > 0 and _dash_active:
+                            current_progress = _dash_progress
+                            model_loading_active = _dash_active
+                            estimated_total = state.get("estimated_total_seconds", 0)
+                            elapsed_model = state.get("elapsed_seconds", 0)
+                            if estimated_total > 0 and elapsed_model > 0:
+                                eta_seconds = max(0, estimated_total - elapsed_model)
                 
                 now = asyncio.get_running_loop().time()
                 elapsed = now - start_time
@@ -61514,48 +61649,83 @@ class JarvisSystemKernel:
                 
                 # Log progress status
                 progress_delta = current_progress - last_progress_pct
+                phase_label = f", phase={current_phase_name}" if current_phase_name else ""
                 self.logger.info(
                     f"[{integrator_name}] Progress check: {current_progress:.1f}% "
                     f"(+{progress_delta:.1f}%), elapsed={elapsed:.0f}s, remaining={remaining:.0f}s"
                     + (f", ETA={eta_seconds:.0f}s" if eta_seconds else "")
+                    + phase_label
                 )
-                
+
+                # v224.0: Phase-aware stall thresholds — different phases have
+                # legitimately different durations. Read from env vars with defaults.
+                _phase_stall_thresholds = {
+                    "importing_ml_libraries": float(os.environ.get("JARVIS_STALL_THRESH_IMPORT", "60")),
+                    "initializing_bridge": float(os.environ.get("JARVIS_STALL_THRESH_BRIDGE", "30")),
+                    "initializing_trinity": float(os.environ.get("JARVIS_STALL_THRESH_TRINITY", "60")),
+                    "initializing_agi_hub": float(os.environ.get("JARVIS_STALL_THRESH_AGI", "180")),
+                    "initializing_neural_orchestrator": float(os.environ.get("JARVIS_STALL_THRESH_NEURAL", "60")),
+                    "resolving_model": float(os.environ.get("JARVIS_STALL_THRESH_RESOLVE", "60")),
+                    "configuring_hardware": float(os.environ.get("JARVIS_STALL_THRESH_HARDWARE", "30")),
+                    "loading_model": float(os.environ.get("JARVIS_STALL_THRESH_MODEL", "120")),
+                    "marking_ready": float(os.environ.get("JARVIS_STALL_THRESH_READY", "15")),
+                }
+                _default_phase_stall = float(os.environ.get("JARVIS_STALL_THRESH_DEFAULT", "90"))
+                effective_stall_threshold = (
+                    _phase_stall_thresholds.get(current_phase_name, _default_phase_stall)
+                    if current_phase_name
+                    else stall_threshold
+                )
+
                 # Decide whether to extend deadline
                 should_extend = False
                 extension_reason = ""
-                
+
                 if remaining <= poll_interval:
                     # Deadline is about to expire - consider extension
-                    
-                    if model_loading_active and current_progress > 0:
-                        # Model is actively loading with progress
-                        
+
+                    # v224.0: Phase completion is a strong progress signal
+                    # (each step is ~11% of total, so delta >= 10 means a step completed)
+                    if progress_delta >= 10:
+                        should_extend = True
+                        extension_reason = f"Phase completed: {current_phase_name or 'unknown'} (+{progress_delta:.0f}%)"
+                        last_progress_pct = current_progress
+                        last_progress_time = now
+
+                    elif model_loading_active and current_progress > 0:
+                        # Active initialization with progress
+
                         if progress_delta > 0:
                             # Progress is being made - extend
                             should_extend = True
                             extension_reason = f"Progress observed: +{progress_delta:.1f}%"
                             last_progress_pct = current_progress
                             last_progress_time = now
-                            
-                        elif (now - last_progress_time) < stall_threshold:
+
+                        elif (now - last_progress_time) < effective_stall_threshold:
                             # No progress but not stalled yet - extend
                             should_extend = True
-                            extension_reason = f"Not yet stalled ({now - last_progress_time:.0f}s < {stall_threshold:.0f}s)"
-                            
+                            extension_reason = (
+                                f"Not yet stalled ({now - last_progress_time:.0f}s < "
+                                f"{effective_stall_threshold:.0f}s"
+                                + (f", phase={current_phase_name}" if current_phase_name else "")
+                                + ")"
+                            )
+
                         elif eta_seconds is not None and eta_seconds < extension_buffer:
                             # ETA suggests completion is imminent - extend
                             should_extend = True
                             extension_reason = f"ETA imminent: {eta_seconds:.0f}s remaining"
-                            
+
                         elif current_progress >= 90:
                             # Very close to done - give it more time
                             should_extend = True
                             extension_reason = f"Near completion: {current_progress:.1f}%"
-                        
+
                     elif model_loading_active and current_progress == 0 and extensions_granted == 0:
-                        # Model loading started but no progress yet - grant one extension
+                        # Initialization started but no progress yet - grant one extension
                         should_extend = True
-                        extension_reason = "Model loading started, awaiting first progress"
+                        extension_reason = "Initialization started, awaiting first progress"
                 
                 if should_extend and extensions_granted < max_extensions:
                     # Calculate extension amount
@@ -61598,10 +61768,12 @@ class JarvisSystemKernel:
                     context_parts = [f"Timeout after {elapsed:.0f}s"]
                     if model_loading_active:
                         context_parts.append(f"Prime at {current_progress:.1f}%")
-                        if (now - last_progress_time) >= stall_threshold:
+                        if current_phase_name:
+                            context_parts.append(f"phase={current_phase_name}")
+                        if (now - last_progress_time) >= effective_stall_threshold:
                             context_parts.append(f"stalled for {now - last_progress_time:.0f}s")
                     else:
-                        context_parts.append("model not actively loading")
+                        context_parts.append("not actively initializing")
                     
                     return {}, True, ". ".join(context_parts)
                     
