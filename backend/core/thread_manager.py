@@ -1579,12 +1579,33 @@ def shutdown_third_party_threads(timeout: float = 5.0) -> Dict[str, Any]:
                 logger.debug(f"CUDA cleanup: {cuda_e}")
 
         # Clear MPS (Apple Silicon) if available
+        # v225.0: Enhanced MPS cleanup to prevent "commit an already committed command buffer" crash
+        # This crash occurs when Metal command buffers are double-committed during shutdown.
+        # The fix involves multiple synchronization passes and a brief wait to let any
+        # in-flight operations complete before we release memory.
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             try:
+                # Pass 1: Synchronize to wait for queued operations
                 if hasattr(torch.mps, 'synchronize'):
-                    torch.mps.synchronize()  # Wait for MPS operations
+                    torch.mps.synchronize()
+                
+                # Pass 2: Brief wait for any background Metal operations
+                # This is critical - some operations may be scheduled but not yet in the queue
+                time.sleep(0.1)  # 100ms for any async Metal operations to complete
+                
+                # Pass 3: Second synchronize to catch any operations that started during wait
+                if hasattr(torch.mps, 'synchronize'):
+                    torch.mps.synchronize()
+                
+                # Pass 4: Now safe to empty cache
                 if hasattr(torch.mps, 'empty_cache'):
-                    torch.mps.empty_cache()  # Release cached memory
+                    torch.mps.empty_cache()
+                
+                # Pass 5: Final synchronize after cache clear
+                if hasattr(torch.mps, 'synchronize'):
+                    torch.mps.synchronize()
+                
+                logger.debug("MPS cleanup completed with multi-pass synchronization")
             except Exception as mps_e:
                 logger.debug(f"MPS cleanup: {mps_e}")
 

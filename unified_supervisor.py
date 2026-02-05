@@ -1439,6 +1439,251 @@ def _calculate_effective_startup_timeout(
 
     return effective
 
+
+# =============================================================================
+# v225.0: PROGRESS-AWARE STARTUP CONTROLLER
+# =============================================================================
+# This solves the root cause of "Prime skipped at 95%" by making the startup
+# timeout intelligent and progress-aware instead of rigid.
+#
+# RULES:
+# 1. BASE TIMEOUT: Start with calculated timeout (e.g., 900s for GCP)
+# 2. PROGRESS EXTENSION: If progress is being made (LLM loading), extend deadline
+# 3. ETA AWARENESS: If ETA < remaining time, ensure we wait at least ETA + buffer
+# 4. STALL DETECTION: Only timeout when no progress for STALL_THRESHOLD
+# 5. HARD CAP: Never exceed MAX_EXTENDED_TIMEOUT (safety limit)
+# =============================================================================
+
+class ProgressAwareStartupController:
+    """
+    v225.0: Enterprise-grade progress-aware startup controller.
+    
+    Replaces rigid asyncio.wait_for with intelligent timeout management that
+    extends deadlines based on observed progress. This prevents the scenario
+    where startup times out at 900s while LLM is at 95% with only 46s remaining.
+    """
+    
+    def __init__(
+        self,
+        base_timeout: float,
+        max_timeout: float = TRINITY_MAX_EXTENDED_TIMEOUT,
+        poll_interval: float = TRINITY_PROGRESS_POLL_INTERVAL,
+        extension_buffer: float = TRINITY_PROGRESS_EXTENSION_BUFFER,
+        stall_threshold: float = TRINITY_PROGRESS_STALL_THRESHOLD,
+        logger: Optional[logging.Logger] = None,
+    ):
+        self.base_timeout = base_timeout
+        self.max_timeout = max_timeout
+        self.poll_interval = poll_interval
+        self.extension_buffer = extension_buffer
+        self.stall_threshold = stall_threshold
+        self.logger = logger or logging.getLogger(__name__)
+        
+        # State tracking
+        self._last_progress_pct: float = 0.0
+        self._last_progress_time: float = 0.0
+        self._current_deadline: float = 0.0
+        self._extensions_granted: int = 0
+        self._start_time: float = 0.0
+    
+    def _get_progress_state(self, get_state_func: Callable[[], Dict]) -> Tuple[float, float, bool]:
+        """
+        Extract progress information from the kernel's model loading state.
+        
+        Returns:
+            Tuple of (progress_pct, eta_seconds, is_active)
+        """
+        try:
+            state = get_state_func()
+            progress_pct = state.get("progress_pct", 0.0)
+            eta_seconds = state.get("estimated_total_seconds", 0.0)
+            elapsed = state.get("elapsed_seconds", 0)
+            is_active = state.get("active", False)
+            
+            # Calculate remaining time from eta if available
+            if eta_seconds > 0 and elapsed > 0 and progress_pct > 0:
+                # Estimate remaining based on progress rate
+                if progress_pct < 100:
+                    remaining = (eta_seconds - elapsed) if eta_seconds > elapsed else (100 - progress_pct) / max(progress_pct / elapsed, 0.001)
+                else:
+                    remaining = 0
+            else:
+                remaining = 0
+            
+            return progress_pct, remaining, is_active
+        except Exception:
+            return 0.0, 0.0, False
+    
+    async def run_with_progress_aware_timeout(
+        self,
+        coro: Awaitable,
+        get_progress_func: Callable[[], Dict],
+    ) -> Any:
+        """
+        v225.0: Run a coroutine with progress-aware timeout management.
+        
+        This is the core of the fix. Instead of a rigid timeout, we:
+        1. Start the coroutine as a task
+        2. Periodically check progress
+        3. Extend deadline when progress is being made
+        4. Only timeout when progress stalls OR hard cap is reached
+        
+        Args:
+            coro: The coroutine to run (e.g., _startup_impl())
+            get_progress_func: Function that returns current progress state dict
+            
+        Returns:
+            Result of the coroutine
+            
+        Raises:
+            asyncio.TimeoutError: If startup stalls or exceeds hard cap
+        """
+        self._start_time = time.time()
+        self._current_deadline = self._start_time + self.base_timeout
+        self._last_progress_time = self._start_time
+        self._last_progress_pct = 0.0
+        self._extensions_granted = 0
+        
+        # Create the startup task
+        task = asyncio.create_task(coro)
+        
+        self.logger.info(
+            f"[ProgressController] Starting with base timeout: {self.base_timeout:.0f}s, "
+            f"max timeout: {self.max_timeout:.0f}s"
+        )
+        
+        try:
+            while True:
+                now = time.time()
+                elapsed = now - self._start_time
+                remaining = self._current_deadline - now
+                
+                # Check if task completed
+                if task.done():
+                    return task.result()
+                
+                # Check progress state
+                progress_pct, eta_remaining, is_active = self._get_progress_state(get_progress_func)
+                
+                # RULE 1: Detect progress advancement
+                if progress_pct > self._last_progress_pct:
+                    self._last_progress_time = now
+                    progress_delta = progress_pct - self._last_progress_pct
+                    self._last_progress_pct = progress_pct
+                    
+                    self.logger.debug(
+                        f"[ProgressController] Progress: {progress_pct:.1f}% (+{progress_delta:.1f}%), "
+                        f"elapsed: {elapsed:.0f}s"
+                    )
+                
+                # RULE 2: Extend deadline if progress is being made and ETA suggests we need more time
+                time_since_progress = now - self._last_progress_time
+                time_until_deadline = self._current_deadline - now
+                
+                should_extend = False
+                extension_reason = ""
+                
+                # Check if we need an extension
+                if is_active and progress_pct > 0 and progress_pct < 100:
+                    # Model is actively loading
+                    
+                    # Case A: ETA exceeds remaining deadline
+                    if eta_remaining > 0 and eta_remaining > time_until_deadline:
+                        should_extend = True
+                        extension_reason = f"ETA ({eta_remaining:.0f}s) > deadline ({time_until_deadline:.0f}s)"
+                    
+                    # Case B: Progress is being made but deadline is imminent
+                    elif time_until_deadline < self.extension_buffer and time_since_progress < self.stall_threshold:
+                        should_extend = True
+                        extension_reason = f"Progress active, deadline imminent ({time_until_deadline:.0f}s)"
+                    
+                    # Case C: Near completion (>90%) with recent progress
+                    elif progress_pct >= 90 and time_since_progress < 60:
+                        if time_until_deadline < 120:
+                            should_extend = True
+                            extension_reason = f"Near completion ({progress_pct:.0f}%), deadline imminent"
+                
+                # Apply extension if warranted and within hard cap
+                if should_extend:
+                    new_deadline = now + self.extension_buffer
+                    
+                    # Check hard cap
+                    hard_cap_deadline = self._start_time + self.max_timeout
+                    if new_deadline > hard_cap_deadline:
+                        new_deadline = hard_cap_deadline
+                        if new_deadline <= now:
+                            # Hard cap reached
+                            self.logger.warning(
+                                f"[ProgressController] HARD CAP reached ({self.max_timeout:.0f}s). "
+                                f"Progress: {progress_pct:.1f}%"
+                            )
+                            task.cancel()
+                            raise asyncio.TimeoutError(
+                                f"Startup hard cap reached ({self.max_timeout:.0f}s) at {progress_pct:.1f}% progress"
+                            )
+                    
+                    if new_deadline > self._current_deadline:
+                        self._extensions_granted += 1
+                        old_deadline = self._current_deadline
+                        self._current_deadline = new_deadline
+                        self.logger.info(
+                            f"[ProgressController] ⏱️ Deadline extended: {old_deadline - self._start_time:.0f}s → "
+                            f"{new_deadline - self._start_time:.0f}s (reason: {extension_reason}, "
+                            f"progress: {progress_pct:.1f}%, extensions: {self._extensions_granted})"
+                        )
+                
+                # RULE 3: Check for stall (no progress for threshold period)
+                if time_since_progress > self.stall_threshold and is_active and progress_pct > 0:
+                    self.logger.warning(
+                        f"[ProgressController] ⚠️ Progress stalled for {time_since_progress:.0f}s "
+                        f"at {progress_pct:.1f}%"
+                    )
+                    # Don't timeout immediately on stall if we're very close to completion
+                    if progress_pct < 95:
+                        task.cancel()
+                        raise asyncio.TimeoutError(
+                            f"Startup stalled at {progress_pct:.1f}% for {time_since_progress:.0f}s"
+                        )
+                
+                # RULE 4: Check if deadline exceeded (and no extension applied this cycle)
+                if now >= self._current_deadline:
+                    if is_active and progress_pct >= 90:
+                        # Give a final grace period for near-completion
+                        self.logger.info(
+                            f"[ProgressController] Granting final grace period at {progress_pct:.1f}%"
+                        )
+                        self._current_deadline = now + 120  # 2 minute grace
+                        self._extensions_granted += 1
+                    else:
+                        self.logger.error(
+                            f"[ProgressController] TIMEOUT after {elapsed:.0f}s at {progress_pct:.1f}% progress "
+                            f"(extensions granted: {self._extensions_granted})"
+                        )
+                        task.cancel()
+                        raise asyncio.TimeoutError(
+                            f"Startup timeout after {elapsed:.0f}s at {progress_pct:.1f}% progress"
+                        )
+                
+                # Wait for next poll or task completion
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=min(self.poll_interval, max(0.1, remaining))
+                    )
+                    # Task completed
+                    return task.result()
+                except asyncio.TimeoutError:
+                    # Poll interval elapsed, continue monitoring
+                    continue
+                    
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        except Exception as e:
+            if not task.done():
+                task.cancel()
+            raise
+
 # Memory defaults
 DEFAULT_MEMORY_TARGET_PERCENT = 30.0
 DEFAULT_MAX_MEMORY_GB = 4.8
@@ -57517,24 +57762,47 @@ class JarvisSystemKernel:
                 f"(Trinity: {self.config.trinity_enabled}, GCP: {self.config.gcp_enabled})"
             )
 
+        # v225.0: Use progress-aware startup controller instead of rigid timeout
+        # This solves the "Prime skipped at 95%" issue by extending deadlines
+        # when active progress is being made (e.g., LLM loading at 95% with 46s ETA)
+        progress_controller = ProgressAwareStartupController(
+            base_timeout=startup_timeout,
+            max_timeout=float(os.environ.get("JARVIS_STARTUP_MAX_TIMEOUT", str(TRINITY_MAX_EXTENDED_TIMEOUT))),
+            poll_interval=TRINITY_PROGRESS_POLL_INTERVAL,
+            extension_buffer=TRINITY_PROGRESS_EXTENSION_BUFFER,
+            stall_threshold=TRINITY_PROGRESS_STALL_THRESHOLD,
+            logger=self.logger,
+        )
+        
+        # Create a progress state getter that the controller can poll
+        def get_progress_state() -> Dict:
+            """Get current model loading state for progress monitoring."""
+            return self._model_loading_state.copy()
+        
+        self.logger.info(
+            f"[Kernel] Starting with PROGRESS-AWARE timeout "
+            f"(base: {startup_timeout}s, max: {progress_controller.max_timeout}s, "
+            f"stall threshold: {progress_controller.stall_threshold}s)"
+        )
+
         try:
-            return await asyncio.wait_for(
+            return await progress_controller.run_with_progress_aware_timeout(
                 self._startup_impl(),
-                timeout=startup_timeout
+                get_progress_state,
             )
-        except asyncio.TimeoutError:
-            self.logger.error(f"[Kernel] STARTUP TIMEOUT after {startup_timeout}s")
-            self.logger.error("[Kernel] This may indicate a hung component or resource lock.")
+        except asyncio.TimeoutError as e:
+            self.logger.error(f"[Kernel] STARTUP TIMEOUT: {e}")
+            self.logger.error("[Kernel] This may indicate a hung component or stalled progress.")
             self.logger.error("[Kernel] Try: python unified_supervisor.py --restart --force")
             if self.config.trinity_enabled:
-                self.logger.error("[Kernel] Trinity is enabled - consider increasing JARVIS_STARTUP_TIMEOUT")
+                self.logger.error("[Kernel] Trinity is enabled - check Prime/Reactor health")
             if self.config.gcp_enabled:
-                self.logger.error("[Kernel] GCP is enabled - VM provisioning may need more time")
+                self.logger.error("[Kernel] GCP is enabled - check VM provisioning status")
 
             # Log diagnostic checkpoint for forensics
             if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
                 try:
-                    log_shutdown_trigger("TIMEOUT", f"Startup exceeded {startup_timeout}s")
+                    log_shutdown_trigger("TIMEOUT", f"Startup exceeded timeout: {e}")
                 except Exception:
                     pass
 
