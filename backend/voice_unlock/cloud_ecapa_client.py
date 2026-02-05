@@ -2544,11 +2544,33 @@ class CloudECAPAClient:
                         if result.get("success") and result.get("embedding"):
                             embedding = np.array(result["embedding"], dtype=np.float32)
 
+                            # v226.0: Validate embedding integrity at the source.
+                            # The cloud endpoint may return NaN (server-side L2
+                            # normalization on a zero-vector from silent audio) or
+                            # zero vectors (model error). Catching here prevents
+                            # NaN from propagating into caches, profiles, and
+                            # downstream similarity computations.
+                            if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
+                                logger.warning(
+                                    f"⚠️ [CloudECAPA] Embedding from {endpoint} "
+                                    f"contains NaN/Inf — rejecting"
+                                )
+                                raise RuntimeError("Cloud embedding contains NaN/Inf values")
+
+                            emb_norm = np.linalg.norm(embedding)
+                            if emb_norm < 1e-8:
+                                logger.warning(
+                                    f"⚠️ [CloudECAPA] Embedding from {endpoint} "
+                                    f"is near-zero (norm={emb_norm:.2e}) — rejecting"
+                                )
+                                raise RuntimeError("Cloud embedding is near-zero vector")
+
                             # Record successful extraction time
                             elapsed_ms = (time.time() - request_start_time) * 1000
                             logger.info(
                                 f"✅ [CloudECAPA] Extracted embedding from {endpoint}: "
-                                f"shape {embedding.shape}, {elapsed_ms:.0f}ms"
+                                f"shape {embedding.shape}, norm={emb_norm:.4f}, "
+                                f"{elapsed_ms:.0f}ms"
                             )
 
                             # Update cold start tracking

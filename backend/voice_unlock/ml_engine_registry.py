@@ -3453,6 +3453,24 @@ async def _extract_local_embedding(
             # CRITICAL FIX: Run blocking PyTorch in thread pool to avoid blocking event loop
             embedding = await asyncio.to_thread(_extract_sync)
 
+            # v226.0: Validate local embedding before returning.
+            # Silent/corrupt audio can produce zero-vector or NaN embeddings
+            # from ECAPA-TDNN. Reject early so callers see None (= failed)
+            # instead of getting a poisoned embedding into caches/profiles.
+            if embedding is not None:
+                if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
+                    logger.warning(
+                        "⚠️ [LocalECAPA] Embedding contains NaN/Inf — rejecting"
+                    )
+                    return None
+                emb_norm = np.linalg.norm(embedding)
+                if emb_norm < 1e-8:
+                    logger.warning(
+                        f"⚠️ [LocalECAPA] Embedding near-zero "
+                        f"(norm={emb_norm:.2e}) — rejecting"
+                    )
+                    return None
+
             logger.debug(f"Local embedding extracted via ML Registry: shape {embedding.shape}")
             return embedding
     except RuntimeError as e:

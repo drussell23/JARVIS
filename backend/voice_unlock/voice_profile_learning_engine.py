@@ -42,6 +42,30 @@ from backend.core.async_safety import LazyAsyncLock
 logger = logging.getLogger(__name__)
 
 
+def _safe_normalize(embedding: np.ndarray, epsilon: float = 1e-10) -> Optional[np.ndarray]:
+    """
+    v226.0: L2-normalize an embedding with zero-norm and NaN protection.
+
+    Raw `embedding / np.linalg.norm(embedding)` is the #1 source of NaN in
+    the voice pipeline: silent audio → zero vector → division by zero → NaN
+    → propagates into reference embeddings, temporal profiles, sample buffers,
+    and ultimately into the stored voiceprint (permanent corruption).
+
+    Returns None if the embedding is degenerate (zero-norm, NaN, Inf),
+    signaling to the caller that the sample should be discarded.
+    """
+    if embedding is None:
+        return None
+    if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
+        logger.warning("[SafeNorm] Embedding contains NaN/Inf — discarding")
+        return None
+    norm = np.linalg.norm(embedding)
+    if norm < epsilon:
+        logger.warning(f"[SafeNorm] Embedding norm near-zero ({norm:.2e}) — discarding")
+        return None
+    return embedding / norm
+
+
 # =============================================================================
 # CONFIGURATION - Dynamically loaded, no hardcoding
 # =============================================================================
@@ -505,9 +529,12 @@ class VoiceProfileLearningEngine:
         if self._reference_embedding is None:
             return False
 
-        # Calculate cosine distance
-        ref_norm = self._reference_embedding / np.linalg.norm(self._reference_embedding)
-        emb_norm = embedding / np.linalg.norm(embedding)
+        # v226.0: Safe normalization to prevent NaN from zero-norm vectors
+        ref_norm = _safe_normalize(self._reference_embedding)
+        emb_norm = _safe_normalize(embedding)
+        if ref_norm is None or emb_norm is None:
+            # Degenerate embedding — treat as outlier to discard it
+            return True
         similarity = np.dot(ref_norm, emb_norm)
 
         # If similarity is very low, it's likely an outlier
@@ -531,9 +558,10 @@ class VoiceProfileLearningEngine:
         )
 
         # Normalize to unit sphere (important for cosine similarity)
-        self._reference_embedding = (
-            self._reference_embedding / np.linalg.norm(self._reference_embedding)
-        )
+        # v226.0: Safe normalization prevents NaN from zero-norm EMA results
+        normalized = _safe_normalize(self._reference_embedding)
+        if normalized is not None:
+            self._reference_embedding = normalized
 
     async def _update_temporal_profile(self, sample: VoiceSample):
         """Update time-of-day specific profile."""
@@ -546,11 +574,10 @@ class VoiceProfileLearningEngine:
                 (1 - alpha) * self._temporal_embeddings[bucket] +
                 alpha * sample.embedding
             )
-            # Normalize
-            self._temporal_embeddings[bucket] = (
-                self._temporal_embeddings[bucket] /
-                np.linalg.norm(self._temporal_embeddings[bucket])
-            )
+            # v226.0: Safe normalization prevents NaN from zero-norm temporal EMA
+            normalized = _safe_normalize(self._temporal_embeddings[bucket])
+            if normalized is not None:
+                self._temporal_embeddings[bucket] = normalized
         else:
             self._temporal_embeddings[bucket] = sample.embedding.copy()
 
@@ -885,14 +912,26 @@ class VoiceProfileLearningEngine:
         confidences = np.array([s.confidence for s in self._sample_buffer])
 
         # Calculate similarity to mean embedding
+        # v226.0: Safe normalization prevents NaN from zero-norm mean/samples
         mean_embedding = np.mean(embeddings, axis=0)
-        mean_embedding = mean_embedding / np.linalg.norm(mean_embedding)
+        mean_normalized = _safe_normalize(mean_embedding)
+        if mean_normalized is None:
+            return {
+                'optimized': False,
+                'reason': 'Mean embedding is degenerate (zero-norm or NaN)',
+                'would_remove': 0,
+                'would_remain': original_count
+            }
+        mean_embedding = mean_normalized
 
         similarities = []
         for emb in embeddings:
-            emb_norm = emb / np.linalg.norm(emb)
-            sim = np.dot(mean_embedding, emb_norm)
-            similarities.append(sim)
+            emb_norm = _safe_normalize(emb)
+            if emb_norm is None:
+                similarities.append(0.0)  # Degenerate → treated as worst similarity
+            else:
+                sim = np.dot(mean_embedding, emb_norm)
+                similarities.append(sim)
         similarities = np.array(similarities)
 
         # IQR-based outlier detection
@@ -930,7 +969,16 @@ class VoiceProfileLearningEngine:
         weights = weights / weights.sum()
 
         optimized_embedding = np.average(opt_embeddings, axis=0, weights=weights)
-        optimized_embedding = optimized_embedding / np.linalg.norm(optimized_embedding)
+        # v226.0: Safe normalization prevents NaN from zero-norm weighted average
+        opt_normalized = _safe_normalize(optimized_embedding)
+        if opt_normalized is None:
+            return {
+                'optimized': False,
+                'reason': 'Optimized embedding is degenerate (zero-norm or NaN)',
+                'would_remove': 0,
+                'would_remain': original_count
+            }
+        optimized_embedding = opt_normalized
 
         # Step 4: Update state
         old_embedding = self._reference_embedding
