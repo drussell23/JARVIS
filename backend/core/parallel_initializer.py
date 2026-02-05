@@ -1833,6 +1833,17 @@ class ParallelInitializer:
 
             for attempt in range(max_retries):
                 try:
+                    # v226.1: Create fresh instance per attempt to avoid partial-state
+                    # reuse. A timed-out initialize() may leave SQLite connections open,
+                    # partial schema, or half-initialized ChromaDB. Retrying on the same
+                    # instance leaks resources and risks inconsistent state.
+                    if attempt > 0:
+                        try:
+                            await learning_db.close()
+                        except BaseException:
+                            pass
+                        learning_db = JARVISLearningDatabase()
+
                     # Initialize with timeout per attempt
                     await asyncio.wait_for(learning_db.initialize(), timeout=20.0)
                     self.app.state.learning_db = learning_db

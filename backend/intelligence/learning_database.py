@@ -8557,17 +8557,23 @@ async def get_learning_database(config: Optional[Dict] = None) -> JARVISLearning
             )
             try:
                 await _db_instance.close()
-            except Exception:
-                pass
+            except BaseException:
+                pass  # Best-effort cleanup; we're discarding this instance regardless
             _db_instance = None
 
         # Create and initialize fresh instance
         _db_instance = JARVISLearningDatabase(config=config)
         try:
             await _db_instance.initialize()
-        except Exception:
-            # Reset so the next call retries with a fresh instance
-            # instead of returning this broken one forever.
+        except BaseException:
+            # v226.1: Must catch BaseException, not just Exception.
+            # In Python 3.9, asyncio.CancelledError is a BaseException subclass.
+            # If a caller wraps get_learning_database() in asyncio.wait_for()
+            # and the timeout fires during initialize(), CancelledError bypasses
+            # `except Exception:`, leaving _db_instance set but _initialized=False
+            # — permanently poisoning the singleton. BaseException catches all
+            # failure modes (CancelledError, KeyboardInterrupt, SystemExit).
+            # We always re-raise, so this is safe cleanup-before-propagation.
             _db_instance = None
             raise
 

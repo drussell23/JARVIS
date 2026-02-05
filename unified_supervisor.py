@@ -657,6 +657,7 @@ except ImportError:
 
 # v186.0: rich - enhanced CLI experience
 # v228.0: Extended Rich imports for full UX overhaul
+# v228.1: Vibrant palette expansion + emoji mappings for enterprise CLI
 try:
     from rich.console import Console, Group as RichGroup
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
@@ -669,33 +670,76 @@ try:
     from rich.align import Align as RichAlign
     from rich.columns import Columns as RichColumns
     from rich.theme import Theme as RichTheme
+    from rich.spinner import Spinner as RichSpinner
+    from rich.padding import Padding as RichPadding
     from rich import box
     RICH_AVAILABLE = True
 
-    # ── JARVIS Rich Theme (v228.0) ─────────────────────────────────
-    # Centralized color palette for consistent CLI experience across
-    # all display components: banners, logs, dashboards, phase headers.
+    # ── JARVIS Rich Theme (v228.1) ─────────────────────────────────
+    # Enterprise-grade color palette with vibrant section-specific
+    # styles, gradient effects, and status-aware theming.
     JARVIS_THEME_STYLES = {
-        "jarvis.title":       "bold bright_cyan",
-        "jarvis.subtitle":    "dim cyan",
-        "jarvis.success":     "bold green",
-        "jarvis.error":       "bold red",
-        "jarvis.warning":     "bold yellow",
-        "jarvis.info":        "bold blue",
-        "jarvis.phase":       "bold magenta",
-        "jarvis.progress":    "bold bright_green",
-        "jarvis.dim":         "dim white",
-        "jarvis.highlight":   "bold bright_white",
-        "jarvis.zone":        "cyan",
-        "jarvis.component":   "bright_white",
-        "jarvis.metric":      "bright_yellow",
-        "jarvis.border":      "bright_cyan",
-        "jarvis.timestamp":   "dim bright_black",
-        "jarvis.pid":         "dim cyan",
-        "jarvis.label":       "bold white",
-        "jarvis.value":       "bright_white",
-        "jarvis.active":      "bold bright_green",
-        "jarvis.inactive":    "dim red",
+        # ── Core Identity ──
+        "jarvis.title":         "bold bright_cyan",
+        "jarvis.subtitle":      "dim cyan",
+        "jarvis.logo":          "bold bright_cyan",
+        "jarvis.version":       "bold bright_white on dark_blue",
+        # ── Status Indicators ──
+        "jarvis.success":       "bold green",
+        "jarvis.error":         "bold red",
+        "jarvis.warning":       "bold yellow",
+        "jarvis.info":          "bold blue",
+        "jarvis.critical":      "bold bright_white on red",
+        "jarvis.degraded":      "bold bright_yellow",
+        # ── Structure ──
+        "jarvis.phase":         "bold magenta",
+        "jarvis.phase.num":     "bold bright_magenta",
+        "jarvis.progress":      "bold bright_green",
+        "jarvis.progress.bar":  "bright_green",
+        "jarvis.progress.bg":   "dim white",
+        "jarvis.dim":           "dim white",
+        "jarvis.highlight":     "bold bright_white",
+        "jarvis.separator":     "dim bright_black",
+        # ── Components & Zones ──
+        "jarvis.zone":          "bold cyan",
+        "jarvis.zone.num":      "bold bright_cyan",
+        "jarvis.zone.name":     "bold bright_white",
+        "jarvis.zone.desc":     "dim bright_white",
+        "jarvis.component":     "bright_white",
+        "jarvis.component.ok":  "bold bright_green",
+        "jarvis.component.err": "bold bright_red",
+        # ── Data & Metrics ──
+        "jarvis.metric":        "bright_yellow",
+        "jarvis.metric.good":   "bold bright_green",
+        "jarvis.metric.warn":   "bold bright_yellow",
+        "jarvis.metric.bad":    "bold bright_red",
+        "jarvis.border":        "bright_cyan",
+        "jarvis.border.gold":   "bold bright_yellow",
+        "jarvis.border.success": "bold bright_green",
+        "jarvis.timestamp":     "dim bright_black",
+        "jarvis.pid":           "dim cyan",
+        "jarvis.label":         "bold white",
+        "jarvis.value":         "bright_white",
+        "jarvis.active":        "bold bright_green",
+        "jarvis.inactive":      "dim red",
+        # ── Section Specific ──
+        "jarvis.section.boot":       "bold bright_blue",
+        "jarvis.section.config":     "bold bright_white",
+        "jarvis.section.docker":     "bold bright_cyan",
+        "jarvis.section.gcp":        "bold bright_yellow",
+        "jarvis.section.backend":    "bold bright_green",
+        "jarvis.section.trinity":    "bold bright_magenta",
+        "jarvis.section.intelligence": "bold bright_cyan",
+        "jarvis.section.voice":      "bold bright_white",
+        "jarvis.section.health":     "bold bright_green",
+        "jarvis.section.shutdown":   "bold bright_red",
+        # ── Feature Tags ──
+        "jarvis.tag.healing":   "bold green",
+        "jarvis.tag.zerotouch": "bold yellow",
+        "jarvis.tag.crossrepo": "bold blue",
+        "jarvis.tag.trinity":   "bold magenta",
+        "jarvis.tag.gcp":       "bold bright_yellow",
+        "jarvis.tag.voice":     "bold bright_white",
     }
     JARVIS_RICH_THEME = RichTheme(JARVIS_THEME_STYLES)
     _rich_console = Console(theme=JARVIS_RICH_THEME, highlight=False)
@@ -714,10 +758,93 @@ except ImportError:
     RichColumns = None
     RichTheme = None
     RichGroup = None
+    RichSpinner = None
+    RichPadding = None
     box = None
     _rich_console = None
     JARVIS_THEME_STYLES = {}
     JARVIS_RICH_THEME = None
+
+# ── v228.1: Centralized Emoji Mappings ─────────────────────────────
+# Enterprise-grade emoji indicators for all CLI components.
+# Used by logger, banners, dashboard, health report, phase headers.
+
+# Log level emoji indicators
+_LEVEL_EMOJI = {
+    "DEBUG":    "⚙️ ",
+    "INFO":     "🔵",
+    "WARNING":  "⚠️ ",
+    "ERROR":    "🔴",
+    "CRITICAL": "💀",
+    "SUCCESS":  "✅",
+    "PHASE":    "🟣",
+}
+
+# Log section emoji indicators
+_SECTION_EMOJI = {
+    "BOOT":         "🚀",
+    "CONFIG":       "⚙️ ",
+    "DOCKER":       "🐳",
+    "GCP":          "☁️ ",
+    "BACKEND":      "🖥️ ",
+    "TRINITY":      "🔱",
+    "INTELLIGENCE": "🧠",
+    "VOICE":        "🎙️",
+    "HEALTH":       "💚",
+    "SHUTDOWN":     "🔌",
+    "RESOURCES":    "📦",
+    "PORTS":        "🔌",
+    "STORAGE":      "💾",
+    "PROCESS":      "⚡",
+    "DEV":          "🛠️ ",
+}
+
+# Zone architecture emoji indicators
+_ZONE_EMOJI = {
+    "0": "🛡️ ",
+    "1": "🏗️ ",
+    "2": "🔧",
+    "3": "☁️ ",
+    "4": "🧠",
+    "5": "🎯",
+    "6": "⚡",
+    "7": "🚀",
+}
+
+# Component status emoji indicators
+_STATUS_EMOJI = {
+    "pending":     "⏳",
+    "starting":    "🔄",
+    "healthy":     "✅",
+    "degraded":    "⚠️ ",
+    "error":       "❌",
+    "stopped":     "⏹️ ",
+    "skipped":     "⏭️ ",
+    "unavailable": "🚫",
+}
+
+# Issue category emoji indicators
+_CATEGORY_EMOJI = {
+    "General":        "📋",
+    "GCP":            "☁️ ",
+    "Trinity":        "🔱",
+    "Database":       "🗄️ ",
+    "Docker":         "🐳",
+    "Voice":          "🎙️",
+    "Intelligence":   "🧠",
+    "Network":        "🌐",
+    "Filesystem":     "📂",
+    "Import":         "📦",
+    "Config":         "⚙️ ",
+}
+
+# Issue severity emoji indicators
+_SEVERITY_EMOJI = {
+    "info":     "ℹ️ ",
+    "warning":  "⚠️ ",
+    "error":    "❌",
+    "critical": "🚨",
+}
 
 # =============================================================================
 # BACKEND HELPER IMPORTS (v180.0 - Advanced Gap Fixes)
@@ -2665,35 +2792,42 @@ class UnifiedLogger:
         return SectionContext(self, section, title)
 
     def _render_section_header(self, section: LogSection, title: str) -> None:
-        """Render section header. v228.0: Uses Rich Rule when available."""
+        """Render section header. v228.1: Emoji-coded sections with vibrant Rich styling."""
         elapsed = self._elapsed_ms()
+        section_emoji = _SECTION_EMOJI.get(section.value, "📌")
+        # Section-specific Rich style key (falls back to jarvis.phase)
+        section_style = f"jarvis.section.{section.value.lower()}"
+        if section_style not in JARVIS_THEME_STYLES:
+            section_style = "jarvis.phase"
 
         with self._log_lock:
             if RICH_AVAILABLE and _rich_console:
                 label = (
-                    f"[jarvis.phase]{section.value}[/jarvis.phase]"
-                    f" [jarvis.dim]|[/jarvis.dim] "
+                    f"{section_emoji} [{section_style}]{section.value}[/{section_style}]"
+                    f" [jarvis.separator]│[/jarvis.separator] "
                     f"[jarvis.highlight]{title}[/jarvis.highlight]"
-                    f"  [jarvis.timestamp]+{elapsed:.0f}ms[/jarvis.timestamp]"
+                    f"  [jarvis.timestamp]⏱ +{elapsed:.0f}ms[/jarvis.timestamp]"
                 )
                 _rich_console.print()
-                _rich_console.print(RichRule(label, style="jarvis.border"))
+                _rich_console.print(RichRule(label, style="jarvis.border", characters="━"))
             else:
                 width = 70
                 reset = "\033[0m" if self._colors_enabled else ""
                 blue = "\033[94m" if self._colors_enabled else ""
                 print(f"\n{blue}{'═' * width}{reset}")
-                print(f"{blue}║{reset} {section.value:12} │ {title:<43} │ +{elapsed:>6.0f}ms {blue}║{reset}")
+                print(f"{blue}║{reset} {section_emoji} {section.value:12} │ {title:<40} │ +{elapsed:>6.0f}ms {blue}║{reset}")
                 print(f"{blue}{'═' * width}{reset}")
 
     def _render_section_footer(self, section: LogSection, duration_ms: float) -> None:
-        """Render section footer. v228.0: Uses Rich Rule when available."""
+        """Render section footer. v228.1: Emoji-coded with completion indicator."""
+        section_emoji = _SECTION_EMOJI.get(section.value, "📌")
         with self._log_lock:
             if RICH_AVAILABLE and _rich_console:
                 _rich_console.print(
                     RichRule(
-                        f"[jarvis.dim]{section.value} completed in {duration_ms:.1f}ms[/jarvis.dim]",
+                        f"[jarvis.dim]✅ {section_emoji} {section.value} completed in {duration_ms:.1f}ms[/jarvis.dim]",
                         style="dim",
+                        characters="─",
                     )
                 )
                 _rich_console.print()
@@ -2702,7 +2836,7 @@ class UnifiedLogger:
                 reset = "\033[0m" if self._colors_enabled else ""
                 blue = "\033[94m" if self._colors_enabled else ""
                 print(f"{blue}{'─' * width}{reset}")
-                print(f"  └── {section.value} completed in {duration_ms:.1f}ms\n")
+                print(f"  └── ✅ {section_emoji} {section.value} completed in {duration_ms:.1f}ms\n")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # PERFORMANCE TRACKING
@@ -2752,19 +2886,19 @@ class UnifiedLogger:
     # STANDARD LOGGING METHODS
     # ═══════════════════════════════════════════════════════════════════════════
 
-    # v228.0: Map LogLevel to JARVIS Rich theme styles
+    # v228.1: Map LogLevel to JARVIS Rich theme styles
     _LEVEL_THEME_MAP = {
-        "DEBUG": "jarvis.dim",
-        "INFO": "jarvis.info",
-        "WARNING": "jarvis.warning",
-        "ERROR": "jarvis.error",
-        "CRITICAL": "jarvis.error",
-        "SUCCESS": "jarvis.success",
-        "PHASE": "jarvis.phase",
+        "DEBUG":    "jarvis.dim",
+        "INFO":     "jarvis.info",
+        "WARNING":  "jarvis.warning",
+        "ERROR":    "jarvis.error",
+        "CRITICAL": "jarvis.critical",
+        "SUCCESS":  "jarvis.success",
+        "PHASE":    "jarvis.phase",
     }
 
     def _log(self, level: LogLevel, message: str, **kwargs) -> None:
-        """Core logging method. v228.0: Rich-styled output when available."""
+        """Core logging method. v228.1: Emoji-coded levels with vibrant Rich styling."""
         elapsed = self._elapsed_ms()
         indent = "  " * self._indent_level
 
@@ -2773,22 +2907,24 @@ class UnifiedLogger:
         elif RICH_AVAILABLE and _rich_console and self._colors_enabled:
             level_name = level.value[0]
             style = self._LEVEL_THEME_MAP.get(level_name, "jarvis.dim")
+            emoji = _LEVEL_EMOJI.get(level_name, "  ")
             level_str = f"[{level_name:8}]"
             time_str = f"+{elapsed:>7.0f}ms"
             with self._log_lock:
                 _rich_console.print(
-                    f"[{style}]{level_str}[/{style}]"
+                    f"[{style}]{emoji} {level_str}[/{style}]"
                     f" [jarvis.timestamp]{time_str}[/jarvis.timestamp]"
-                    f" [jarvis.dim]\u2502[/jarvis.dim] {indent}{message}"
+                    f" [jarvis.separator]│[/jarvis.separator] {indent}{message}"
                 )
         else:
             reset = "\033[0m" if self._colors_enabled else ""
             color = level.value[1] if self._colors_enabled else ""
+            emoji = _LEVEL_EMOJI.get(level.value[0], "  ")
             level_str = f"[{level.value[0]:8}]"
             time_str = f"+{elapsed:>7.0f}ms"
 
             with self._log_lock:
-                print(f"{color}{level_str}{reset} {time_str} │ {indent}{message}")
+                print(f"{color}{emoji} {level_str}{reset} {time_str} │ {indent}{message}")
                 sys.stdout.flush()
 
     def _log_json(self, level: LogLevel, message: str, elapsed: float, **kwargs) -> None:
@@ -3876,7 +4012,7 @@ else:
 # TERMINAL UI HELPERS
 # =============================================================================
 class TerminalUI:
-    """Terminal UI utilities for visual feedback. v228.0: Rich-enhanced."""
+    """Terminal UI utilities for visual feedback. v228.1: Emoji-rich, vibrant Rich styling."""
 
     # ANSI color codes (fallback)
     RESET = "\033[0m"
@@ -3902,20 +4038,25 @@ class TerminalUI:
 
     @classmethod
     def print_banner(cls, title: str, subtitle: str = "") -> None:
-        """Print a banner with title. v228.0: Rich Panel when available."""
+        """Print a banner with title. v228.1: Vibrant Rich Panel with emoji flair."""
         if RICH_AVAILABLE and _rich_console:
-            content = f"[jarvis.title]{title}[/jarvis.title]"
+            content = f"[jarvis.title]⚡ {title}[/jarvis.title]"
             if subtitle:
-                content += f"\n[jarvis.subtitle]{subtitle}[/jarvis.subtitle]"
+                content += f"\n[jarvis.subtitle]   {subtitle}[/jarvis.subtitle]"
             _rich_console.print()
-            _rich_console.print(Panel(content, border_style="jarvis.border", box=box.DOUBLE, padding=(0, 2)))
+            _rich_console.print(Panel(
+                content,
+                border_style="jarvis.border",
+                box=box.DOUBLE,
+                padding=(1, 3),
+            ))
             _rich_console.print()
             return
 
         width = 70
         print()
         print(cls._color("╔" + "═" * (width - 2) + "╗", cls.CYAN))
-        print(cls._color("║", cls.CYAN) + f" {title:^{width - 4}} " + cls._color("║", cls.CYAN))
+        print(cls._color("║", cls.CYAN) + f" ⚡ {title:^{width - 6}} " + cls._color("║", cls.CYAN))
         if subtitle:
             print(cls._color("║", cls.CYAN) + f" {subtitle:^{width - 4}} " + cls._color("║", cls.CYAN))
         print(cls._color("╚" + "═" * (width - 2) + "╝", cls.CYAN))
@@ -3923,50 +4064,54 @@ class TerminalUI:
 
     @classmethod
     def print_success(cls, message: str) -> None:
-        """Print success message. v228.0: Rich-styled."""
+        """Print success message. v228.1: Rich-styled with emoji."""
         if RICH_AVAILABLE and _rich_console:
-            _rich_console.print(f"  [jarvis.success]\u2713 {message}[/jarvis.success]")
+            _rich_console.print(f"  [jarvis.success]✅ {message}[/jarvis.success]")
             return
-        print(cls._color(f"✓ {message}", cls.GREEN))
+        print(cls._color(f"✅ {message}", cls.GREEN))
 
     @classmethod
     def print_error(cls, message: str) -> None:
-        """Print error message. v228.0: Rich-styled."""
+        """Print error message. v228.1: Rich-styled with emoji."""
         if RICH_AVAILABLE and _rich_console:
-            _rich_console.print(f"  [jarvis.error]\u2717 {message}[/jarvis.error]")
+            _rich_console.print(f"  [jarvis.error]❌ {message}[/jarvis.error]")
             return
-        print(cls._color(f"✗ {message}", cls.RED))
+        print(cls._color(f"❌ {message}", cls.RED))
 
     @classmethod
     def print_warning(cls, message: str) -> None:
-        """Print warning message. v228.0: Rich-styled."""
+        """Print warning message. v228.1: Rich-styled with emoji."""
         if RICH_AVAILABLE and _rich_console:
-            _rich_console.print(f"  [jarvis.warning]\u26a0 {message}[/jarvis.warning]")
+            _rich_console.print(f"  [jarvis.warning]⚠️  {message}[/jarvis.warning]")
             return
-        print(cls._color(f"⚠ {message}", cls.YELLOW))
+        print(cls._color(f"⚠️  {message}", cls.YELLOW))
 
     @classmethod
     def print_info(cls, message: str) -> None:
-        """Print info message. v228.0: Rich-styled."""
+        """Print info message. v228.1: Rich-styled with emoji."""
         if RICH_AVAILABLE and _rich_console:
-            _rich_console.print(f"  [jarvis.info]\u2139 {message}[/jarvis.info]")
+            _rich_console.print(f"  [jarvis.info]🔵 {message}[/jarvis.info]")
             return
-        print(cls._color(f"ℹ {message}", cls.BLUE))
+        print(cls._color(f"🔵 {message}", cls.BLUE))
 
     @classmethod
     def print_section(cls, title: str) -> None:
-        """Print a section separator. v228.0: Rich Rule when available."""
+        """Print a section separator. v228.1: Rich Rule with emoji flair."""
         if RICH_AVAILABLE and _rich_console:
-            _rich_console.print(RichRule(f"[jarvis.highlight]{title}[/jarvis.highlight]", style="jarvis.border"))
+            _rich_console.print(RichRule(
+                f"[jarvis.highlight]📌 {title}[/jarvis.highlight]",
+                style="jarvis.border",
+                characters="━",
+            ))
             return
         width = 70
-        print(cls._color("─" * width, cls.CYAN))
-        print(cls._color(f"  {title}", cls.BOLD + cls.CYAN))
-        print(cls._color("─" * width, cls.CYAN))
+        print(cls._color("━" * width, cls.CYAN))
+        print(cls._color(f"  📌 {title}", cls.BOLD + cls.CYAN))
+        print(cls._color("━" * width, cls.CYAN))
 
     @classmethod
     def print_progress(cls, current: int, total: int, label: str = "") -> None:
-        """Print a progress bar."""
+        """Print a progress bar. v228.1: Rich-styled when available."""
         if total == 0:
             pct = 100
         else:
@@ -3974,11 +4119,26 @@ class TerminalUI:
 
         bar_width = 30
         filled = int(bar_width * current / total) if total > 0 else bar_width
-        bar = "█" * filled + "░" * (bar_width - filled)
 
-        line = f"\r  [{bar}] {pct:3d}% {label}"
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        if RICH_AVAILABLE and _rich_console:
+            bar = "━" * filled + "╌" * (bar_width - filled)
+            pct_style = "jarvis.metric.good" if pct >= 80 else ("jarvis.metric.warn" if pct >= 50 else "jarvis.metric")
+            from io import StringIO
+            buf = StringIO()
+            temp_console = Console(file=buf, theme=JARVIS_RICH_THEME, highlight=False, no_color=False)
+            temp_console.print(
+                f"  [jarvis.progress.bar]{bar}[/jarvis.progress.bar]"
+                f" [{pct_style}]{pct:3d}%[/{pct_style}]"
+                f" [jarvis.dim]{label}[/jarvis.dim]",
+                end="",
+            )
+            sys.stdout.write(f"\r\033[K{buf.getvalue()}")
+            sys.stdout.flush()
+        else:
+            bar = "█" * filled + "░" * (bar_width - filled)
+            line = f"\r  [{bar}] {pct:3d}% {label}"
+            sys.stdout.write(line)
+            sys.stdout.flush()
 
         if current >= total:
             print()  # New line when complete
@@ -4954,36 +5114,39 @@ class LiveProgressDashboard:
     
     def _render_compact(self, final: bool = False) -> None:
         """
-        v228.0: Compact single-line status bar. Rich-styled when available.
+        v228.1: Compact single-line status bar with emoji indicators.
         """
         elapsed = time.time() - self._start_time
         healthy = sum(1 for c in self._components.values() if c.get("status") == "healthy")
         starting = sum(1 for c in self._components.values() if c.get("status") == "starting")
+        errored = sum(1 for c in self._components.values() if c.get("status") == "error")
         total = len(self._components)
         gcp = self._gcp_state
         mem = self._memory
         model_state = self._model_loading_state
 
         if RICH_AVAILABLE and _rich_console:
-            # Build Rich-styled compact line (still uses carriage return for overwrite)
+            # Build Rich-styled compact line with emoji indicators
             parts = [
-                f"[jarvis.title]JARVIS[/jarvis.title]",
-                f"[jarvis.timestamp]{elapsed:>5.0f}s[/jarvis.timestamp]",
-                f"[jarvis.label]GCP:[/jarvis.label][jarvis.metric]{gcp['progress']:.0f}%[/jarvis.metric]",
+                f"[jarvis.title]⚡ JARVIS[/jarvis.title]",
+                f"[jarvis.timestamp]⏱ {elapsed:>5.0f}s[/jarvis.timestamp]",
+                f"[jarvis.label]☁️  GCP:[/jarvis.label][jarvis.metric]{gcp['progress']:.0f}%[/jarvis.metric]",
             ]
             if model_state.get("active", False):
                 m_pct = model_state.get("progress_pct", 0)
                 m_name = (model_state.get("model_name") or "LLM")[:8]
-                parts.append(f"[jarvis.label]{m_name}:[/jarvis.label][jarvis.metric]{m_pct}%[/jarvis.metric]")
+                parts.append(f"[jarvis.label]🧠 {m_name}:[/jarvis.label][jarvis.metric]{m_pct}%[/jarvis.metric]")
             else:
                 parts.append(
-                    f"[jarvis.success]{healthy}[/jarvis.success]"
+                    f"[jarvis.success]✅{healthy}[/jarvis.success]"
                     f"[jarvis.dim]/[/jarvis.dim]"
-                    f"[jarvis.info]{starting}[/jarvis.info]"
-                    f"[jarvis.dim]/{total}[/jarvis.dim]"
+                    f"[jarvis.info]🔄{starting}[/jarvis.info]"
+                    f"[jarvis.dim]/[/jarvis.dim]"
+                    + (f"[jarvis.error]❌{errored}[/jarvis.error][jarvis.dim]/[/jarvis.dim]" if errored else "")
+                    + f"[jarvis.dim]{total}[/jarvis.dim]"
                 )
-            mem_style = "jarvis.success" if mem["percent"] < 70 else ("jarvis.warning" if mem["percent"] < 85 else "jarvis.error")
-            parts.append(f"[jarvis.label]Mem:[/jarvis.label][{mem_style}]{mem['percent']:.0f}%[/{mem_style}]")
+            mem_style = "jarvis.metric.good" if mem["percent"] < 70 else ("jarvis.metric.warn" if mem["percent"] < 85 else "jarvis.metric.bad")
+            parts.append(f"[jarvis.label]💾 Mem:[/jarvis.label][{mem_style}]{mem['percent']:.0f}%[/{mem_style}]")
 
             # Render to string for carriage-return overwrite
             from io import StringIO
@@ -5074,20 +5237,21 @@ class LiveProgressDashboard:
         sys.stdout.flush()
 
     def _render_passthrough_rich(self, elapsed: float, final: bool = False) -> None:
-        """v228.0: Rich-rendered passthrough status block."""
+        """v228.1: Rich-rendered passthrough status block with emoji indicators."""
         gcp = self._gcp_state
         mem = self._memory
         model_state = self._model_loading_state
 
         _rich_console.print()
         _rich_console.print(RichRule(
-            f"[jarvis.title]JARVIS STATUS[/jarvis.title]"
-            f" [jarvis.dim]@[/jarvis.dim] "
-            f"[jarvis.timestamp]{elapsed:.0f}s[/jarvis.timestamp]",
-            style="jarvis.dim",
+            f"[jarvis.title]⚡ JARVIS STATUS[/jarvis.title]"
+            f" [jarvis.separator]│[/jarvis.separator] "
+            f"[jarvis.timestamp]⏱ {elapsed:.0f}s[/jarvis.timestamp]",
+            style="jarvis.border",
+            characters="━",
         ))
 
-        # Component status line
+        # Component status line with emoji indicators
         _status_styles = {
             "pending": "dim", "starting": "bright_cyan",
             "healthy": "bold green", "degraded": "bold yellow",
@@ -5098,19 +5262,21 @@ class LiveProgressDashboard:
         for name, comp in self._components.items():
             status = comp.get("status", "pending")
             style = _status_styles.get(status, "dim")
+            emoji = _STATUS_EMOJI.get(status, "⏳")
             short = name.replace("jarvis-", "").replace("-", "")[:8]
             code = STATUS_DISPLAY_MAP.get(status, status[:4].upper())
-            comp_parts.append(f"[jarvis.component]{short}[/jarvis.component]:[{style}]{code}[/{style}]")
-        _rich_console.print("  " + " [jarvis.dim]|[/jarvis.dim] ".join(comp_parts))
+            comp_parts.append(f"{emoji}[jarvis.component]{short}[/jarvis.component]:[{style}]{code}[/{style}]")
+        _rich_console.print("  " + " [jarvis.separator]│[/jarvis.separator] ".join(comp_parts))
 
-        # GCP progress
+        # GCP progress with gradient bar
         gcp_pct = gcp["progress"]
         gcp_bar_filled = int(20 * gcp_pct / 100)
-        gcp_bar = "\u2588" * gcp_bar_filled + "\u2591" * (20 - gcp_bar_filled)
+        gcp_bar = "━" * gcp_bar_filled + "╌" * (20 - gcp_bar_filled)
+        gcp_pct_style = "jarvis.metric.good" if gcp_pct >= 80 else ("jarvis.metric.warn" if gcp_pct >= 40 else "jarvis.metric")
         _rich_console.print(
-            f"  [jarvis.label]GCP[/jarvis.label]  "
-            f"[jarvis.progress]{gcp_bar}[/jarvis.progress] "
-            f"[jarvis.metric]{gcp_pct:.0f}%[/jarvis.metric] "
+            f"  [jarvis.label]☁️  GCP[/jarvis.label]  "
+            f"[jarvis.progress.bar]{gcp_bar}[/jarvis.progress.bar] "
+            f"[{gcp_pct_style}]{gcp_pct:.0f}%[/{gcp_pct_style}] "
             f"[jarvis.dim]{gcp['checkpoint']}[/jarvis.dim]"
         )
 
@@ -5119,18 +5285,19 @@ class LiveProgressDashboard:
             m_pct = model_state.get("progress_pct", 0)
             m_name = (model_state.get("model_name") or "LLM")[:15]
             m_bar_filled = int(20 * m_pct / 100)
-            m_bar = "\u2588" * m_bar_filled + "\u2591" * (20 - m_bar_filled)
+            m_bar = "━" * m_bar_filled + "╌" * (20 - m_bar_filled)
+            m_pct_style = "jarvis.metric.good" if m_pct >= 80 else ("jarvis.metric.warn" if m_pct >= 40 else "jarvis.metric")
             _rich_console.print(
-                f"  [jarvis.label]Model[/jarvis.label] {m_name}  "
-                f"[jarvis.progress]{m_bar}[/jarvis.progress] "
-                f"[jarvis.metric]{m_pct}%[/jarvis.metric]"
+                f"  [jarvis.label]🧠 Model[/jarvis.label] {m_name}  "
+                f"[jarvis.progress.bar]{m_bar}[/jarvis.progress.bar] "
+                f"[{m_pct_style}]{m_pct}%[/{m_pct_style}]"
             )
 
-        # Memory
+        # Memory with gradient coloring
         mem_pct = mem["percent"]
-        mem_style = "jarvis.success" if mem_pct < 70 else ("jarvis.warning" if mem_pct < 85 else "jarvis.error")
+        mem_style = "jarvis.metric.good" if mem_pct < 70 else ("jarvis.metric.warn" if mem_pct < 85 else "jarvis.metric.bad")
         _rich_console.print(
-            f"  [jarvis.label]Memory[/jarvis.label] "
+            f"  [jarvis.label]💾 Memory[/jarvis.label] "
             f"[{mem_style}]{mem_pct:.0f}%[/{mem_style}] "
             f"[jarvis.dim]({mem['used_gb']:.1f}/{mem['total_gb']:.1f} GB)[/jarvis.dim]"
         )
@@ -5138,12 +5305,12 @@ class LiveProgressDashboard:
         # Recent logs
         if self._log_buffer:
             import re
-            _rich_console.print(f"  [jarvis.dim]\u2500 Recent Activity \u2500[/jarvis.dim]")
+            _rich_console.print(f"  [jarvis.dim]📋 Recent Activity[/jarvis.dim]")
             for log_line in self._log_buffer[-self._max_log_lines:]:
                 clean = re.sub(r'\033\[[0-9;]*m', '', log_line)
-                _rich_console.print(f"  [jarvis.dim]{clean[:70]}[/jarvis.dim]")
+                _rich_console.print(f"  [jarvis.dim]  {clean[:68]}[/jarvis.dim]")
 
-        _rich_console.print(RichRule(style="jarvis.dim"))
+        _rich_console.print(RichRule(style="jarvis.dim", characters="─"))
         _rich_console.print()
     
     def _render_overlay(self, final: bool = False) -> None:
@@ -5221,12 +5388,12 @@ class LiveProgressDashboard:
             self._last_render = output
 
     def _render_overlay_rich(self, elapsed: float, final: bool = False) -> None:
-        """v228.0: Rich-rendered overlay using Table and Panel."""
+        """v228.1: Rich-rendered overlay with emoji indicators and vibrant styling."""
         gcp = self._gcp_state
         model_state = self._model_loading_state
         mem = self._memory
 
-        # Status table for components
+        # Status table for components with emoji indicators
         comp_table = Table(
             show_header=True,
             header_style="jarvis.label",
@@ -5235,6 +5402,7 @@ class LiveProgressDashboard:
             pad_edge=False,
             expand=True,
         )
+        comp_table.add_column("", width=2)  # emoji column
         comp_table.add_column("Component", style="jarvis.component", ratio=3)
         comp_table.add_column("Status", justify="center", ratio=2)
         comp_table.add_column("Port", style="jarvis.dim", justify="right", ratio=1)
@@ -5251,31 +5419,33 @@ class LiveProgressDashboard:
         for name, comp in self._components.items():
             status = comp.get("status", "pending")
             style = _status_styles.get(status, "dim")
+            emoji = _STATUS_EMOJI.get(status, "⏳")
             port = str(comp.get("port", "")) if comp.get("port") else ""
             pid = str(comp.get("pid", "")) if comp.get("pid") else ""
-            comp_table.add_row(name, f"[{style}]{status.upper()}[/{style}]", port, pid)
+            comp_table.add_row(emoji, name, f"[{style}]{status.upper()}[/{style}]", port, pid)
 
-        # GCP progress bar via Rich Text
+        # GCP progress bar with gradient styling
         gcp_pct = gcp["progress"]
         gcp_bar_filled = int(25 * gcp_pct / 100)
-        gcp_bar = "\u2588" * gcp_bar_filled + "\u2591" * (25 - gcp_bar_filled)
-        eta_str = f"{gcp['eta_seconds']}s" if gcp["eta_seconds"] > 0 else "ready"
+        gcp_bar = "━" * gcp_bar_filled + "╌" * (25 - gcp_bar_filled)
+        eta_str = f"{gcp['eta_seconds']}s" if gcp["eta_seconds"] > 0 else "✅ ready"
+        gcp_pct_style = "jarvis.metric.good" if gcp_pct >= 80 else ("jarvis.metric.warn" if gcp_pct >= 40 else "jarvis.metric")
         gcp_line = (
-            f"[jarvis.label]GCP VM[/jarvis.label] "
+            f"[jarvis.label]☁️  GCP VM[/jarvis.label] "
             f"[jarvis.dim]Phase {gcp['phase']}:[/jarvis.dim] {gcp['phase_name']}  "
-            f"[jarvis.progress]{gcp_bar}[/jarvis.progress] "
-            f"[jarvis.metric]{gcp_pct:.0f}%[/jarvis.metric]  "
+            f"[jarvis.progress.bar]{gcp_bar}[/jarvis.progress.bar] "
+            f"[{gcp_pct_style}]{gcp_pct:.0f}%[/{gcp_pct_style}]  "
             f"[jarvis.dim]ETA: {eta_str}[/jarvis.dim]  "
             f"[jarvis.dim]{gcp['checkpoint']}[/jarvis.dim]"
         )
 
-        # Model loading line
+        # Model loading line with gradient bar
         model_line = None
         if model_state.get("active", False):
             m_pct = model_state.get("progress_pct", 0)
             m_name = (model_state.get("model_name") or "LLM")[:15]
             m_bar_filled = int(20 * m_pct / 100)
-            m_bar = "\u2588" * m_bar_filled + "\u2591" * (20 - m_bar_filled)
+            m_bar = "━" * m_bar_filled + "╌" * (20 - m_bar_filled)
             m_elapsed = model_state.get("elapsed_seconds", 0)
             m_estimated = model_state.get("estimated_total_seconds", 0)
             if m_pct > 5 and m_elapsed > 0:
@@ -5287,20 +5457,21 @@ class LiveProgressDashboard:
             else:
                 m_eta = ""
             stage_desc = model_state.get("stage_detail") or model_state.get("stage", "")
+            m_pct_style = "jarvis.metric.good" if m_pct >= 80 else ("jarvis.metric.warn" if m_pct >= 40 else "jarvis.metric")
             model_line = (
-                f"[jarvis.label]Model[/jarvis.label] {m_name}  "
-                f"[jarvis.progress]{m_bar}[/jarvis.progress] "
-                f"[jarvis.metric]{m_pct}%[/jarvis.metric]  "
+                f"[jarvis.label]🧠 Model[/jarvis.label] {m_name}  "
+                f"[jarvis.progress.bar]{m_bar}[/jarvis.progress.bar] "
+                f"[{m_pct_style}]{m_pct}%[/{m_pct_style}]  "
                 f"[jarvis.dim]{m_eta}  {stage_desc}[/jarvis.dim]"
             )
 
-        # Memory line
+        # Memory line with gradient coloring
         mem_pct = mem["percent"]
-        mem_style = "jarvis.success" if mem_pct < 70 else ("jarvis.warning" if mem_pct < 85 else "jarvis.error")
+        mem_style = "jarvis.metric.good" if mem_pct < 70 else ("jarvis.metric.warn" if mem_pct < 85 else "jarvis.metric.bad")
         mem_bar_filled = int(15 * mem_pct / 100)
-        mem_bar = "\u2588" * mem_bar_filled + "\u2591" * (15 - mem_bar_filled)
+        mem_bar = "━" * mem_bar_filled + "╌" * (15 - mem_bar_filled)
         mem_line = (
-            f"[jarvis.label]Memory[/jarvis.label]  "
+            f"[jarvis.label]💾 Memory[/jarvis.label]  "
             f"[{mem_style}]{mem_bar} {mem_pct:.0f}%[/{mem_style}]  "
             f"[jarvis.dim]({mem['used_gb']:.1f}/{mem['total_gb']:.1f} GB)[/jarvis.dim]"
         )
@@ -5308,11 +5479,10 @@ class LiveProgressDashboard:
         # Recent logs
         log_lines = []
         if self._log_buffer:
+            import re
             for log_line in self._log_buffer[-min(4, self._max_log_lines):]:
-                # Strip ANSI codes for Rich display since we already have Rich markup
-                import re
                 clean = re.sub(r'\033\[[0-9;]*m', '', log_line)
-                log_lines.append(f"  [jarvis.dim]{clean[:70]}[/jarvis.dim]")
+                log_lines.append(f"  [jarvis.dim]{clean[:68]}[/jarvis.dim]")
 
         # Compose panel content
         parts = [gcp_line, ""]
@@ -5324,13 +5494,13 @@ class LiveProgressDashboard:
         parts.append(mem_line)
         if log_lines:
             parts.append("")
-            parts.append("[jarvis.label]Recent Activity[/jarvis.label]")
+            parts.append("[jarvis.label]📋 Recent Activity[/jarvis.label]")
             parts.extend(log_lines)
 
         panel = Panel(
             RichGroup(*parts),
-            title=f"[jarvis.title]JARVIS SYSTEM STATUS[/jarvis.title]",
-            subtitle=f"[jarvis.timestamp]{elapsed:.1f}s elapsed[/jarvis.timestamp]",
+            title=f"[jarvis.title]⚡ JARVIS SYSTEM STATUS[/jarvis.title]",
+            subtitle=f"[jarvis.timestamp]⏱ {elapsed:.1f}s elapsed[/jarvis.timestamp]",
             border_style="jarvis.border",
             box=box.ROUNDED,
             padding=(0, 1),
@@ -5886,26 +6056,26 @@ class StartupIssueCollector:
         WHITE = "\033[37m"; BG_RED = "\033[41m"; BG_GREEN = "\033[42m"
 
         if critical_count > 0:
-            health_status = f"{BG_RED}{WHITE}{BOLD} CRITICAL {RESET}"; border_color = RED
+            health_status = f"{BG_RED}{WHITE}{BOLD} 🚨 CRITICAL {RESET}"; border_color = RED
         elif error_count > 0:
-            health_status = f"{RED}{BOLD} DEGRADED {RESET}"; border_color = RED
+            health_status = f"{RED}{BOLD} ❌ DEGRADED {RESET}"; border_color = RED
         elif warning_count > 0:
-            health_status = f"{YELLOW}{BOLD} WARNINGS {RESET}"; border_color = YELLOW
+            health_status = f"{YELLOW}{BOLD} ⚠️  WARNINGS {RESET}"; border_color = YELLOW
         else:
-            health_status = f"{BG_GREEN}{WHITE}{BOLD} HEALTHY {RESET}"; border_color = GREEN
+            health_status = f"{BG_GREEN}{WHITE}{BOLD} ✅ HEALTHY {RESET}"; border_color = GREEN
 
         print()
-        print(f"{border_color}{'═' * 78}{RESET}")
-        print(f"  JARVIS STARTUP HEALTH REPORT  {health_status}  ({elapsed:.2f}s)")
-        print(f"{border_color}{'═' * 78}{RESET}")
+        print(f"{border_color}{'━' * 78}{RESET}")
+        print(f"  🏥 JARVIS STARTUP HEALTH REPORT  {health_status}  (⏱ {elapsed:.2f}s)")
+        print(f"{border_color}{'━' * 78}{RESET}")
 
         # Summary counts
-        if critical_count: print(f"  {MAGENTA}Critical: {critical_count}{RESET}")
-        if error_count: print(f"  {RED}Errors:   {error_count}{RESET}")
-        if warning_count: print(f"  {YELLOW}Warnings: {warning_count}{RESET}")
-        if show_all and info_count: print(f"  {CYAN}Info:     {info_count}{RESET}")
+        if critical_count: print(f"  {MAGENTA}🚨 Critical: {critical_count}{RESET}")
+        if error_count: print(f"  {RED}❌ Errors:   {error_count}{RESET}")
+        if warning_count: print(f"  {YELLOW}⚠️  Warnings: {warning_count}{RESET}")
+        if show_all and info_count: print(f"  {CYAN}ℹ️  Info:     {info_count}{RESET}")
         if not (critical_count or error_count or warning_count):
-            print(f"  {GREEN}All systems operational{RESET}")
+            print(f"  {GREEN}✅ All systems operational{RESET}")
 
         # Issues by category
         if display_issues:
@@ -5916,22 +6086,23 @@ class StartupIssueCollector:
             for cat in sorted(issues_by_cat, key=lambda c: min(
                 list(IssueSeverity).index(i.severity) for i in issues_by_cat[c])):
                 issues = issues_by_cat[cat]
-                print(f"\n  {BOLD}{cat.value} ({len(issues)}){RESET}")
+                cat_emoji = _CATEGORY_EMOJI.get(cat.value, "📋")
+                print(f"\n  {BOLD}{cat_emoji} {cat.value} ({len(issues)}){RESET}")
                 for issue in issues[:5]:
-                    sev_icon = issue.severity.value[2]
+                    sev_emoji = _SEVERITY_EMOJI.get(issue.severity.value[0], "📌")
                     sev_color = issue.severity.value[1]
-                    msg = issue.message[:60] + "..." if len(issue.message) > 60 else issue.message
-                    print(f"    {sev_color}{sev_icon}{RESET} {msg}")
+                    msg = issue.message[:58] + "..." if len(issue.message) > 58 else issue.message
+                    print(f"    {sev_color}{sev_emoji}{RESET} {msg}")
                     if issue.suggestion:
-                        print(f"      {DIM}-> {issue.suggestion[:55]}{RESET}")
+                        print(f"      {DIM}💡 {issue.suggestion[:55]}{RESET}")
                 if len(issues) > 5:
                     print(f"    {DIM}... and {len(issues) - 5} more{RESET}")
 
         tracebacks = [i for i in display_issues if i.traceback]
         if tracebacks:
-            print(f"\n  {DIM}Tracebacks available: {len(tracebacks)} (run with --debug){RESET}")
+            print(f"\n  {DIM}🔍 Tracebacks available: {len(tracebacks)} (run with --debug){RESET}")
 
-        print(f"{border_color}{'═' * 78}{RESET}")
+        print(f"{border_color}{'━' * 78}{RESET}")
         print()
 
     def _print_health_report_rich(
@@ -5944,62 +6115,65 @@ class StartupIssueCollector:
         elapsed: float,
         show_all: bool,
     ) -> None:
-        """v228.0: Rich-rendered health report with Panel, Tree, and themed styles."""
-        # Overall status
+        """v228.1: Rich-rendered health report with emoji-coded categories and vibrant styling."""
+        # Overall status with emoji
         if critical_count > 0:
-            status_text = "[bold bright_magenta]CRITICAL[/bold bright_magenta]"
+            status_text = "[jarvis.critical]🚨 CRITICAL[/jarvis.critical]"
             border_style = "bright_magenta"
         elif error_count > 0:
-            status_text = "[jarvis.error]DEGRADED[/jarvis.error]"
+            status_text = "[jarvis.error]❌ DEGRADED[/jarvis.error]"
             border_style = "red"
         elif warning_count > 0:
-            status_text = "[jarvis.warning]WARNINGS[/jarvis.warning]"
+            status_text = "[jarvis.warning]⚠️  WARNINGS[/jarvis.warning]"
             border_style = "yellow"
         else:
-            status_text = "[jarvis.success]HEALTHY[/jarvis.success]"
+            status_text = "[jarvis.success]✅ HEALTHY[/jarvis.success]"
             border_style = "green"
 
-        # Summary counts
+        # Summary counts with emoji
         summary_parts = []
         if critical_count:
-            summary_parts.append(f"[bold bright_magenta]{critical_count} critical[/bold bright_magenta]")
+            summary_parts.append(f"[jarvis.critical]🚨 {critical_count} critical[/jarvis.critical]")
         if error_count:
-            summary_parts.append(f"[jarvis.error]{error_count} errors[/jarvis.error]")
+            summary_parts.append(f"[jarvis.error]❌ {error_count} errors[/jarvis.error]")
         if warning_count:
-            summary_parts.append(f"[jarvis.warning]{warning_count} warnings[/jarvis.warning]")
+            summary_parts.append(f"[jarvis.warning]⚠️  {warning_count} warnings[/jarvis.warning]")
         if show_all and info_count:
-            summary_parts.append(f"[jarvis.info]{info_count} info[/jarvis.info]")
+            summary_parts.append(f"[jarvis.info]ℹ️  {info_count} info[/jarvis.info]")
         if not summary_parts:
-            summary_parts.append("[jarvis.success]All systems operational[/jarvis.success]")
+            summary_parts.append("[jarvis.success]✅ All systems operational[/jarvis.success]")
 
-        summary_line = " [jarvis.dim]\u2022[/jarvis.dim] ".join(summary_parts)
-        header = f"{status_text}  [jarvis.dim]|[/jarvis.dim]  {summary_line}  [jarvis.dim]|[/jarvis.dim]  [jarvis.timestamp]{elapsed:.2f}s[/jarvis.timestamp]"
+        summary_line = " [jarvis.separator]│[/jarvis.separator] ".join(summary_parts)
+        header = f"{status_text}  [jarvis.separator]│[/jarvis.separator]  {summary_line}  [jarvis.separator]│[/jarvis.separator]  [jarvis.timestamp]⏱ {elapsed:.2f}s[/jarvis.timestamp]"
 
-        # Build issues tree
+        # Build issues tree with category emojis
         if display_issues:
             issues_by_cat: Dict[IssueCategory, list] = {}
             for issue in display_issues:
                 issues_by_cat.setdefault(issue.category, []).append(issue)
 
             issue_tree = RichTree(
-                "[jarvis.label]Issues by Category[/jarvis.label]",
-                guide_style="jarvis.dim",
+                "📊 [jarvis.label]Issues by Category[/jarvis.label]",
+                guide_style="jarvis.border",
             )
             for cat in sorted(issues_by_cat, key=lambda c: min(
                 list(IssueSeverity).index(i.severity) for i in issues_by_cat[c])):
                 issues = issues_by_cat[cat]
                 most_severe = min(issues, key=lambda i: list(IssueSeverity).index(i.severity))
                 style = self._SEVERITY_RICH_STYLE.get(most_severe.severity.value[0], "jarvis.dim")
+                cat_emoji = _CATEGORY_EMOJI.get(cat.value, "📋")
+                sev_emoji = _SEVERITY_EMOJI.get(most_severe.severity.value[0], "📌")
                 cat_branch = issue_tree.add(
-                    f"[{style}]{most_severe.severity.value[2]} {cat.value}[/{style}]"
+                    f"{cat_emoji} [{style}]{sev_emoji} {cat.value}[/{style}]"
                     f" [jarvis.dim]({len(issues)})[/jarvis.dim]"
                 )
                 for issue in issues[:5]:
                     sev_style = self._SEVERITY_RICH_STYLE.get(issue.severity.value[0], "jarvis.dim")
-                    msg = issue.message[:65] + "..." if len(issue.message) > 65 else issue.message
-                    node = cat_branch.add(f"[{sev_style}]{issue.severity.value[2]}[/{sev_style}] {msg}")
+                    sev_emoji_i = _SEVERITY_EMOJI.get(issue.severity.value[0], "📌")
+                    msg = issue.message[:63] + "..." if len(issue.message) > 63 else issue.message
+                    node = cat_branch.add(f"[{sev_style}]{sev_emoji_i}[/{sev_style}] {msg}")
                     if issue.suggestion:
-                        node.add(f"[jarvis.dim]\u2192 {issue.suggestion[:60]}[/jarvis.dim]")
+                        node.add(f"[jarvis.dim]💡 {issue.suggestion[:58]}[/jarvis.dim]")
                 if len(issues) > 5:
                     cat_branch.add(f"[jarvis.dim]... and {len(issues) - 5} more[/jarvis.dim]")
 
@@ -6010,7 +6184,7 @@ class StartupIssueCollector:
         _rich_console.print()
         _rich_console.print(Panel(
             content,
-            title="[jarvis.highlight]JARVIS Health Report[/jarvis.highlight]",
+            title="[jarvis.highlight]🏥 JARVIS Health Report[/jarvis.highlight]",
             border_style=border_style,
             box=box.ROUNDED,
             padding=(1, 2),
@@ -6019,7 +6193,7 @@ class StartupIssueCollector:
         # Tracebacks note
         tracebacks = [i for i in display_issues if i.traceback]
         if tracebacks:
-            _rich_console.print(f"  [jarvis.dim]Tracebacks available: {len(tracebacks)} (run with --debug)[/jarvis.dim]")
+            _rich_console.print(f"  [jarvis.dim]🔍 Tracebacks available: {len(tracebacks)} (run with --debug)[/jarvis.dim]")
         _rich_console.print()
 
     def print_tracebacks(self) -> None:
@@ -58299,7 +58473,7 @@ class JarvisSystemKernel:
             self._state = KernelState.FAILED
             return 1
 
-    # v228.0: ASCII art logo (compact, no FIGlet dependency)
+    # v228.1: ASCII art logo (compact, no FIGlet dependency)
     _JARVIS_ASCII_LOGO = (
         "     ██╗ █████╗ ██████╗ ██╗   ██╗██╗███████╗\n"
         "     ██║██╔══██╗██╔══██╗██║   ██║██║██╔════╝\n"
@@ -58309,7 +58483,7 @@ class JarvisSystemKernel:
         " ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝"
     )
 
-    # v228.0: Zone architecture data for DRY banner rendering
+    # v228.1: Zone architecture data for DRY banner rendering
     _ZONE_DATA = [
         ("0", "Early Protection", "Signal guards, venv activation"),
         ("1", "Foundation", "Imports, SystemKernelConfig"),
@@ -58323,39 +58497,53 @@ class JarvisSystemKernel:
 
     def _print_startup_banner(self) -> None:
         """
-        v228.0: Print enterprise startup banner with Rich CLI support.
+        v228.1: Print enterprise startup banner with vibrant Rich CLI.
 
-        Uses Rich library for enhanced visuals with ASCII art logo,
-        themed Panel with DOUBLE border, and Tree for zone architecture.
+        Features emoji-coded zone architecture, dramatic ASCII art,
+        color-coded feature badges, and professional panel styling.
         Falls back to plain text if Rich is unavailable.
         """
         if RICH_AVAILABLE and _rich_console:
             try:
-                # ASCII art logo with theme colors
-                logo_text = RichText(self._JARVIS_ASCII_LOGO, style="jarvis.title")
+                # ASCII art logo with vibrant styling
+                logo_text = RichText(self._JARVIS_ASCII_LOGO, style="jarvis.logo")
 
-                # Version and feature info
+                # Version badge
                 version_line = RichText()
+                version_line.append("⚡ ", style="bold bright_yellow")
                 version_line.append("Unified System Kernel v1.0.0", style="jarvis.highlight")
-                version_line.append("  |  ", style="jarvis.dim")
-                version_line.append("Enterprise Edition (v228.0)", style="jarvis.subtitle")
+                version_line.append("  │  ", style="jarvis.separator")
+                version_line.append("Enterprise Edition (v228.1)", style="jarvis.subtitle")
+                version_line.append(" ⚡", style="bold bright_yellow")
 
-                # Feature tags
+                # Feature badges with distinct emojis and colors
                 features = RichText()
-                features.append("Self-Healing", style="bold green")
-                features.append(" \u2022 ", style="jarvis.dim")
-                features.append("Zero-Touch", style="bold yellow")
-                features.append(" \u2022 ", style="jarvis.dim")
-                features.append("Cross-Repo", style="bold blue")
-                features.append(" \u2022 ", style="jarvis.dim")
-                features.append("Trinity-Ready", style="bold magenta")
+                features.append("🔄 Self-Healing", style="jarvis.tag.healing")
+                features.append("  •  ", style="jarvis.dim")
+                features.append("🤖 Zero-Touch", style="jarvis.tag.zerotouch")
+                features.append("  •  ", style="jarvis.dim")
+                features.append("🔗 Cross-Repo", style="jarvis.tag.crossrepo")
+                features.append("  •  ", style="jarvis.dim")
+                features.append("🔱 Trinity-Ready", style="jarvis.tag.trinity")
+
+                # Capability tags row
+                capabilities = RichText()
+                capabilities.append("☁️  GCP", style="jarvis.tag.gcp")
+                capabilities.append("  •  ", style="jarvis.dim")
+                capabilities.append("🎙️ Voice", style="jarvis.tag.voice")
+                capabilities.append("  •  ", style="jarvis.dim")
+                capabilities.append("🧠 Intelligence", style="jarvis.section.intelligence")
+                capabilities.append("  •  ", style="jarvis.dim")
+                capabilities.append("🐳 Docker", style="jarvis.section.docker")
 
                 # Compose into panel
                 banner_content = RichGroup(
                     RichAlign.center(logo_text),
                     RichText(),  # spacer
                     RichAlign.center(version_line),
+                    RichText(),  # spacer
                     RichAlign.center(features),
+                    RichAlign.center(capabilities),
                 )
 
                 _rich_console.print()
@@ -58363,21 +58551,22 @@ class JarvisSystemKernel:
                     banner_content,
                     border_style="jarvis.border",
                     box=box.DOUBLE,
-                    padding=(1, 2),
+                    padding=(1, 3),
                 ))
 
-                # Zone architecture as Tree
+                # Zone architecture as Tree with emojis
                 zone_tree = RichTree(
-                    "[jarvis.highlight]Zone Architecture[/jarvis.highlight]",
+                    "🏛️  [jarvis.highlight]Zone Architecture Overview[/jarvis.highlight]",
                     guide_style="jarvis.border",
                 )
                 for num, name, desc in self._ZONE_DATA:
+                    zone_emoji = _ZONE_EMOJI.get(num, "📦")
                     zone_tree.add(
-                        f"[jarvis.zone]Zone {num}[/jarvis.zone]"
-                        f" [jarvis.dim]\u2502[/jarvis.dim] "
-                        f"[jarvis.label]{name}[/jarvis.label]"
-                        f" [jarvis.dim]\u2014[/jarvis.dim] "
-                        f"[jarvis.component]{desc}[/jarvis.component]"
+                        f"{zone_emoji} [jarvis.zone.num]Zone {num}[/jarvis.zone.num]"
+                        f" [jarvis.separator]│[/jarvis.separator] "
+                        f"[jarvis.zone.name]{name}[/jarvis.zone.name]"
+                        f" [jarvis.separator]—[/jarvis.separator] "
+                        f"[jarvis.zone.desc]{desc}[/jarvis.zone.desc]"
                     )
 
                 _rich_console.print(zone_tree)
@@ -58392,14 +58581,15 @@ class JarvisSystemKernel:
         # =========================================================================
         self.logger.info("")
         self.logger.info("╔═════════════════════════════════════════════════════════════════════╗")
-        self.logger.info("║          ⚡ JARVIS UNIFIED SYSTEM KERNEL v1.0.0 ⚡                  ║")
-        self.logger.info("║                   Enterprise Edition (v228.0)                       ║")
+        self.logger.info("║        ⚡ JARVIS UNIFIED SYSTEM KERNEL v1.0.0 ⚡                    ║")
+        self.logger.info("║                 Enterprise Edition (v228.1)                         ║")
         self.logger.info("╠═════════════════════════════════════════════════════════════════════╣")
-        self.logger.info("║  Self-Healing • Zero-Touch • Cross-Repo • Trinity-Ready            ║")
+        self.logger.info("║  🔄 Self-Healing • 🤖 Zero-Touch • 🔗 Cross-Repo • 🔱 Trinity     ║")
         self.logger.info("╚═════════════════════════════════════════════════════════════════════╝")
         self.logger.info("")
         for num, name, desc in self._ZONE_DATA:
-            self.logger.info(f"  Zone {num}: {name:<18} | {desc}")
+            zone_emoji = _ZONE_EMOJI.get(num, "📦")
+            self.logger.info(f"  {zone_emoji} Zone {num}: {name:<18} │ {desc}")
         self.logger.info("")
 
     def _print_completion_banner(
@@ -58443,49 +58633,65 @@ class JarvisSystemKernel:
         
         if RICH_AVAILABLE and _rich_console:
             # =========================================================================
-            # RICH CLI COMPLETION BANNER (v228.0)
+            # RICH CLI COMPLETION BANNER (v228.1)
             # =========================================================================
             try:
                 _rich_console.print()
 
-                # Ready tier panel
-                _rich_console.print(Panel(
-                    tier_text_rich,
-                    border_style=tier_color,
-                    box=box.ROUNDED,
-                    padding=(0, 2),
-                ))
+                # Ready tier panel with celebratory styling
+                if is_fully_ready:
+                    tier_content = RichGroup(
+                        RichAlign.center(RichText("🎉", style="bold")),
+                        RichAlign.center(RichText("FULLY READY TIER REACHED", style="bold bright_green")),
+                        RichAlign.center(RichText("All systems operational", style="dim bright_green")),
+                    )
+                    _rich_console.print(Panel(
+                        tier_content,
+                        border_style="jarvis.border.success",
+                        box=box.DOUBLE,
+                        padding=(1, 3),
+                    ))
+                else:
+                    tier_content = RichGroup(
+                        RichAlign.center(RichText("⚠️  INTERACTIVE TIER (DEGRADED)", style="bold bright_yellow")),
+                    )
+                    _rich_console.print(Panel(
+                        tier_content,
+                        border_style="jarvis.border.gold",
+                        box=box.ROUNDED,
+                        padding=(0, 3),
+                    ))
 
                 # Show blocking/degraded components if not fully ready
                 if not is_fully_ready:
                     if blocking_components:
-                        _rich_console.print(f"  [jarvis.error]Critical: {', '.join(blocking_components)}[/jarvis.error]")
+                        _rich_console.print(f"  [jarvis.error]❌ Critical: {', '.join(blocking_components)}[/jarvis.error]")
                     if degraded_components:
-                        _rich_console.print(f"  [jarvis.warning]Degraded: {', '.join(degraded_components)}[/jarvis.warning]")
+                        _rich_console.print(f"  [jarvis.warning]⚠️  Degraded: {', '.join(degraded_components)}[/jarvis.warning]")
                     if readiness_message:
-                        _rich_console.print(f"  [jarvis.dim]{readiness_message}[/jarvis.dim]")
+                        _rich_console.print(f"  [jarvis.dim]💡 {readiness_message}[/jarvis.dim]")
                     _rich_console.print()
 
-                # Access points tree
+                # Access points tree with emoji-coded categories
                 access_tree = RichTree(
                     f"[jarvis.title]{status_text}[/jarvis.title]",
                     guide_style="jarvis.border",
                 )
 
                 # Web endpoints
-                web_branch = access_tree.add("[jarvis.label]Web Endpoints[/jarvis.label]")
-                web_branch.add(f"[jarvis.component]Frontend[/jarvis.component]    [jarvis.dim]\u2192[/jarvis.dim] [link=http://localhost:{frontend_port}]http://localhost:{frontend_port}/[/link]")
-                web_branch.add(f"[jarvis.component]API Docs[/jarvis.component]    [jarvis.dim]\u2192[/jarvis.dim] [link=http://localhost:{backend_port}/docs]http://localhost:{backend_port}/docs[/link]")
-                web_branch.add(f"[jarvis.component]Health[/jarvis.component]      [jarvis.dim]\u2192[/jarvis.dim] [link=http://localhost:{backend_port}/health]http://localhost:{backend_port}/health[/link]")
+                web_branch = access_tree.add("🌐 [jarvis.label]Web Endpoints[/jarvis.label]")
+                web_branch.add(f"[jarvis.component]🖥️  Frontend[/jarvis.component]    [jarvis.separator]→[/jarvis.separator] [link=http://localhost:{frontend_port}]http://localhost:{frontend_port}/[/link]")
+                web_branch.add(f"[jarvis.component]📖 API Docs[/jarvis.component]    [jarvis.separator]→[/jarvis.separator] [link=http://localhost:{backend_port}/docs]http://localhost:{backend_port}/docs[/link]")
+                web_branch.add(f"[jarvis.component]💚 Health[/jarvis.component]      [jarvis.separator]→[/jarvis.separator] [link=http://localhost:{backend_port}/health]http://localhost:{backend_port}/health[/link]")
 
                 # Voice commands
-                voice_branch = access_tree.add("[jarvis.label]Voice Commands[/jarvis.label]")
-                voice_branch.add("[jarvis.metric]'Hey JARVIS'[/jarvis.metric] [jarvis.dim]\u2014 Activate[/jarvis.dim]")
-                voice_branch.add("[jarvis.metric]'What can you do?'[/jarvis.metric] [jarvis.dim]\u2014 Capabilities[/jarvis.dim]")
-                voice_branch.add("[jarvis.metric]'Can you see my screen?'[/jarvis.metric] [jarvis.dim]\u2014 Vision test[/jarvis.dim]")
+                voice_branch = access_tree.add("🎙️ [jarvis.label]Voice Commands[/jarvis.label]")
+                voice_branch.add("[jarvis.metric]'Hey JARVIS'[/jarvis.metric] [jarvis.dim]— Activate[/jarvis.dim]")
+                voice_branch.add("[jarvis.metric]'What can you do?'[/jarvis.metric] [jarvis.dim]— Capabilities[/jarvis.dim]")
+                voice_branch.add("[jarvis.metric]'Can you see my screen?'[/jarvis.metric] [jarvis.dim]— Vision test[/jarvis.dim]")
 
                 # IPC commands
-                ipc_branch = access_tree.add("[jarvis.label]IPC Commands[/jarvis.label]")
+                ipc_branch = access_tree.add("⚡ [jarvis.label]IPC Commands[/jarvis.label]")
                 ipc_branch.add("[jarvis.dim]python unified_supervisor.py --status[/jarvis.dim]")
                 ipc_branch.add("[jarvis.dim]python unified_supervisor.py --shutdown[/jarvis.dim]")
                 ipc_branch.add("[jarvis.dim]python unified_supervisor.py --restart[/jarvis.dim]")
@@ -58493,12 +58699,18 @@ class JarvisSystemKernel:
                 _rich_console.print(access_tree)
                 _rich_console.print()
 
-                # Timing footer
+                # Timing footer with achievement badge
                 timing_text = RichText()
+                timing_text.append("⏱️  Startup: ", style="jarvis.dim")
+                timing_text.append(f"{startup_duration:.2f}s", style="jarvis.metric")
+                if startup_duration < 30:
+                    timing_text.append("  🏆 Speed Achievement!", style="bold bright_green")
+                elif startup_duration < 60:
+                    timing_text.append("  ⚡ Fast Boot", style="bold bright_yellow")
+                timing_text.append("  │  ", style="jarvis.separator")
                 timing_text.append("Press ", style="jarvis.dim")
                 timing_text.append("Ctrl+C", style="jarvis.highlight")
-                timing_text.append(f" to stop  \u2502  Startup: ", style="jarvis.dim")
-                timing_text.append(f"{startup_duration:.2f}s", style="jarvis.metric")
+                timing_text.append(" to stop", style="jarvis.dim")
                 _rich_console.print(timing_text)
                 _rich_console.print()
 
