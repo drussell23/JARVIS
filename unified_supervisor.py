@@ -61609,6 +61609,8 @@ class JarvisSystemKernel:
                                         avg_phase_time = elapsed / max(completed, 1)
                                         eta_seconds = avg_phase_time * (total - completed)
                                     _got_v2_data = True
+                                    # v225.0: Store init_progress for loading server broadcast
+                                    self._prime_init_progress = init_progress
                                     self.logger.info(
                                         f"[{integrator_name}] v2 progress: {current_progress:.1f}% "
                                         f"phase={current_phase_name} ({completed}/{total})"
@@ -64465,6 +64467,11 @@ class JarvisSystemKernel:
             "trinity": self._get_trinity_summary(),
             "trinity_ready": self._is_trinity_ready(),
         }
+
+        # v225.0: Include Prime v2 init_progress data if available
+        _ip = getattr(self, '_prime_init_progress', None)
+        if _ip:
+            metadata["init_progress"] = _ip
 
         return await self._broadcast_startup_progress(
             stage=stage,

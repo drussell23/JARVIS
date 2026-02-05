@@ -1005,6 +1005,9 @@ class LoadingServer:
         self._trinity_summary: Optional[Dict[str, Any]] = None
         self._trinity_ready: bool = False
 
+        # v225.0: Prime v2 init_progress protocol data
+        self._prime_init_progress: Optional[Dict[str, Any]] = None
+
         # =================================================================
         # v212.0: Advanced Feature Integration
         # =================================================================
@@ -1149,6 +1152,7 @@ class LoadingServer:
                 "components": self._components,
                 "trinity": self._trinity_summary,  # v185.0: Trinity component summary
                 "trinity_ready": self._trinity_ready,  # v185.0: Trinity ready flag
+                "init_progress": self._prime_init_progress,  # v225.0: Prime v2 phase data
                 "sequence": sequence,  # v186.0/v212.0: Sequence for detecting missed updates
                 "session_id": self._session_id,  # v212.0: Session correlation
                 "trace_id": self._trace_context.trace_id if self._trace_context else None,
@@ -1391,6 +1395,7 @@ class LoadingServer:
             "components": self._components,
             "trinity": self._trinity_summary,  # v185.0: Trinity component summary
             "trinity_ready": self._trinity_ready,  # v185.0: Trinity ready flag
+            "init_progress": self._prime_init_progress,  # v225.0: Prime v2 phase data
             "dependency_graph": self._dependency_graph.get_progress(),
             "sequence": self._sequence_number,  # v186.0: Sequence for tracking
             "timestamp": datetime.now().isoformat(),
@@ -1667,6 +1672,10 @@ class LoadingServer:
                     self._trinity_summary = metadata["trinity"]
                 if "trinity_ready" in metadata:
                     self._trinity_ready = metadata["trinity_ready"]
+
+                # v225.0: Persist Prime v2 init_progress protocol data
+                if "init_progress" in metadata:
+                    self._prime_init_progress = metadata["init_progress"]
 
             self._eta_engine.update_progress(self._progress)
 

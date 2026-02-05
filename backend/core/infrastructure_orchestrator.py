@@ -1332,9 +1332,22 @@ class GCPReconciler:
             if proc.returncode == 0:
                 logger.info(f"[GCPReconciler] Deleted orphaned VM: {vm_name}")
                 return True
-            else:
-                logger.warning(f"[GCPReconciler] Failed to delete VM {vm_name}: {stderr.decode()}")
-                return False
+
+            stderr_text = stderr.decode() if stderr else ""
+            # v227.0: Idempotent delete — "not found" means the VM is already
+            # gone, which is the desired end state. Treat as success to avoid
+            # spurious warnings during cleanup of VMs that were already deleted
+            # by another process or never fully created.
+            if "was not found" in stderr_text or "does not exist" in stderr_text:
+                logger.info(
+                    f"[GCPReconciler] VM {vm_name} already gone (not found)"
+                )
+                return True
+
+            logger.warning(
+                f"[GCPReconciler] Failed to delete VM {vm_name}: {stderr_text}"
+            )
+            return False
 
         except Exception as e:
             logger.error(f"[GCPReconciler] VM deletion error: {e}")
@@ -1361,9 +1374,18 @@ class GCPReconciler:
             if proc.returncode == 0:
                 logger.info(f"[GCPReconciler] Deleted orphaned Cloud Run: {service_name}")
                 return True
-            else:
-                logger.warning(f"[GCPReconciler] Failed to delete Cloud Run {service_name}: {stderr.decode()}")
-                return False
+
+            stderr_text = stderr.decode() if stderr else ""
+            if "was not found" in stderr_text or "does not exist" in stderr_text:
+                logger.info(
+                    f"[GCPReconciler] Cloud Run {service_name} already gone (not found)"
+                )
+                return True
+
+            logger.warning(
+                f"[GCPReconciler] Failed to delete Cloud Run {service_name}: {stderr_text}"
+            )
+            return False
 
         except Exception as e:
             logger.error(f"[GCPReconciler] Cloud Run deletion error: {e}")
