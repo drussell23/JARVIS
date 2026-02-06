@@ -53765,7 +53765,161 @@ class StartupWatchdog:
         self._escalation_cooldown = float(
             os.environ.get("JARVIS_DMS_ESCALATION_COOLDOWN", "60")
         )
-        
+
+        # v232.2: Progress-aware watchdog — don't kill processes that are advancing
+        self._progress_history: List[Tuple[float, int]] = []  # (timestamp, progress)
+        self._progress_advancing_window = float(
+            os.environ.get("JARVIS_DMS_PROGRESS_WINDOW", "120")
+        )  # Consider progress "advancing" if it changed within this window
+
+        # v232.2: Execution mode awareness — dynamic constraint calculation
+        self._execution_mode: str = "local_prime"  # "gcp_golden", "gcp_standard", "local_prime"
+        self._is_fallback_mode: bool = False
+        self._fallback_reason: Optional[str] = None
+        self._ram_gb: float = 16.0  # Will be detected at runtime
+        try:
+            import psutil as _psutil_dms
+            self._ram_gb = _psutil_dms.virtual_memory().total / (1024 ** 3)
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------
+    # v232.2: Progress-Aware Decision Logic
+    # -----------------------------------------------------------------
+
+    def _is_progress_advancing(self) -> bool:
+        """
+        v232.2: Check if progress has advanced within the tracking window.
+
+        Returns True if progress changed at all in the last N seconds,
+        meaning the process is alive and working — just slow.
+        """
+        if len(self._progress_history) < 2:
+            return False
+        now = time.time()
+        cutoff = now - self._progress_advancing_window
+        # Get progress values within the window
+        recent = [(t, p) for t, p in self._progress_history if t >= cutoff]
+        if len(recent) < 2:
+            return False
+        # Check if progress value actually changed (not just heartbeats)
+        min_progress = min(p for _, p in recent)
+        max_progress = max(p for _, p in recent)
+        return max_progress > min_progress
+
+    def _get_progress_rate(self) -> float:
+        """
+        v232.2: Calculate progress rate (% per second) over the tracking window.
+
+        Returns 0.0 if insufficient data or no progress.
+        """
+        if len(self._progress_history) < 2:
+            return 0.0
+        now = time.time()
+        cutoff = now - self._progress_advancing_window
+        recent = [(t, p) for t, p in self._progress_history if t >= cutoff]
+        if len(recent) < 2:
+            return 0.0
+        oldest_t, oldest_p = recent[0]
+        newest_t, newest_p = recent[-1]
+        dt = newest_t - oldest_t
+        if dt <= 0:
+            return 0.0
+        return (newest_p - oldest_p) / dt
+
+    # -----------------------------------------------------------------
+    # v232.2: Dynamic Constraint Calculator
+    # -----------------------------------------------------------------
+
+    def _calculate_dynamic_timeout(self, phase_key: str) -> float:
+        """
+        v232.2: Calculate phase timeout dynamically based on execution context.
+
+        Considers: base timeout, execution mode, RAM, fallback status,
+        and proximity to completion.
+        """
+        phase_config = self._phase_configs.get(phase_key)
+        if not phase_config:
+            return 120.0
+
+        base = phase_config.timeout_seconds
+
+        # Factor 1: Execution mode multiplier
+        mode_multipliers = {
+            "gcp_golden": 1.0,
+            "gcp_standard": 2.0,
+            "local_prime": 3.0,
+        }
+        mode_mult = mode_multipliers.get(self._execution_mode, 2.0)
+
+        # Factor 2: RAM-based scaling (more RAM = faster loading)
+        if self._ram_gb >= 64:
+            ram_mult = 0.5
+        elif self._ram_gb >= 32:
+            ram_mult = 0.8
+        elif self._ram_gb >= 16:
+            ram_mult = 1.0
+        else:
+            ram_mult = 1.5
+
+        # Factor 3: Fallback mode buffer
+        fallback_mult = 1.3 if self._is_fallback_mode else 1.0
+
+        # Factor 4: Near-completion extension (if >= 70%, be more patient)
+        progress_mult = 1.0
+        if self._last_progress >= 80:
+            progress_mult = 1.5
+        elif self._last_progress >= 70:
+            progress_mult = 1.2
+
+        dynamic_timeout = base * mode_mult * ram_mult * fallback_mult * progress_mult
+
+        # Hard ceiling: never exceed 30 minutes for any phase
+        return min(dynamic_timeout, 1800.0)
+
+    # -----------------------------------------------------------------
+    # v232.2: Mode Change Notification
+    # -----------------------------------------------------------------
+
+    def notify_mode_change(
+        self,
+        execution_mode: str,
+        is_fallback: bool = False,
+        fallback_reason: Optional[str] = None,
+    ) -> None:
+        """
+        v232.2: Notify DMS of execution mode change.
+
+        Called when GCP fails and fallback activates, or when execution
+        path changes. DMS recalculates all constraints.
+        """
+        old_mode = self._execution_mode
+        self._execution_mode = execution_mode
+        self._is_fallback_mode = is_fallback
+        self._fallback_reason = fallback_reason
+
+        if old_mode != execution_mode:
+            self._logger.info(
+                f"[DMS] v232.2: Execution mode changed: {old_mode} → {execution_mode}"
+                + (f" (fallback: {fallback_reason})" if fallback_reason else "")
+            )
+            # Recalculate all phase timeouts
+            for phase_key in self._phase_configs:
+                new_timeout = self._calculate_dynamic_timeout(phase_key)
+                old_config = self._phase_configs[phase_key]
+                if new_timeout != old_config.timeout_seconds:
+                    self._phase_configs[phase_key] = PhaseConfig(
+                        old_config.name,
+                        new_timeout,
+                        old_config.progress_start,
+                        old_config.progress_end,
+                        old_config.recovery_action,
+                    )
+            self._logger.info(
+                f"[DMS] v232.2: Phase timeouts recalculated for {execution_mode} mode "
+                f"(RAM: {self._ram_gb:.0f}GB, fallback: {is_fallback})"
+            )
+
     def _detect_hollow_client_mode(self) -> bool:
         """
         v192.0: Detect if Prime will run in hollow client mode.
@@ -53908,6 +54062,14 @@ class StartupWatchdog:
         # Track progress value changes separately
         if progress != self._last_progress:
             self._last_progress = progress
+
+        # v232.2: Track progress history for rate/advancement detection
+        self._progress_history.append((now, progress))
+        # Prune old entries beyond 2x the window
+        _cutoff = now - (self._progress_advancing_window * 2)
+        self._progress_history = [
+            (t, p) for t, p in self._progress_history if t >= _cutoff
+        ]
     
     def get_status(self) -> Dict[str, Any]:
         """Get current watchdog status for diagnostics."""
@@ -53948,15 +54110,36 @@ class StartupWatchdog:
                     phase_timeout = 120.0
                     recovery_action = "warn"
                 else:
-                    phase_timeout = phase_config.timeout_seconds
+                    # v232.2: Use dynamic timeout instead of static config
+                    phase_timeout = self._calculate_dynamic_timeout(self._current_phase)
                     recovery_action = phase_config.recovery_action
-                
+
                 # Check for phase timeout
                 phase_elapsed = now - self._phase_start_time
                 if phase_elapsed > phase_timeout:
+                    # v232.2: PROGRESS-AWARE DECISION — don't kill advancing processes
+                    if self._is_progress_advancing():
+                        _rate = self._get_progress_rate()
+                        # Progress is moving — extend timeout dynamically
+                        _remaining_pct = 100 - self._last_progress
+                        _eta = _remaining_pct / _rate if _rate > 0 else 600
+                        _extended = phase_elapsed + min(_eta * 1.5, 600)
+                        if phase_elapsed < _extended:
+                            # Log only once per minute to avoid spam
+                            _last_action = self._last_timeout_action_time.get(
+                                self._current_phase, 0
+                            )
+                            if (now - _last_action) >= 60:
+                                self._last_timeout_action_time[self._current_phase] = now
+                                self._logger.info(
+                                    f"[DMS] v232.2: Phase '{self._current_phase}' past timeout "
+                                    f"({phase_elapsed:.0f}s > {phase_timeout:.0f}s) but progress "
+                                    f"advancing ({self._last_progress}%, rate={_rate:.2f}%/s, "
+                                    f"ETA={_eta:.0f}s) — holding off"
+                                )
+                            continue
+
                     # v232.1: Enforce cooldown between escalation steps.
-                    # Without this, every 5s check re-triggers escalation
-                    # (warn→diagnostic→restart→rollback in 20 seconds).
                     _last_action = self._last_timeout_action_time.get(self._current_phase, 0)
                     if (now - _last_action) >= self._escalation_cooldown:
                         self._last_timeout_action_time[self._current_phase] = now
@@ -59253,6 +59436,16 @@ class JarvisSystemKernel:
         )
         await self._startup_watchdog.start()
 
+        # v232.2: Set initial execution mode for DMS dynamic constraints
+        _golden_active = os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true"
+        _gcp_enabled = getattr(self.config, 'invincible_node_enabled', False)
+        if _golden_active and _gcp_enabled:
+            self._startup_watchdog.notify_mode_change("gcp_golden")
+        elif _gcp_enabled:
+            self._startup_watchdog.notify_mode_change("gcp_standard")
+        else:
+            self._startup_watchdog.notify_mode_change("local_prime")
+
         # =====================================================================
         # v220.2: EARLY PRIME PRE-WARM - Start LLM loading IMMEDIATELY
         # =====================================================================
@@ -63622,6 +63815,14 @@ class JarvisSystemKernel:
                                                 )
                                             except Exception:
                                                 pass
+
+                                            # v232.2: Notify DMS of mode change — recalculate all timeouts
+                                            if self._startup_watchdog:
+                                                self._startup_watchdog.notify_mode_change(
+                                                    "local_prime",
+                                                    is_fallback=True,
+                                                    fallback_reason=f"GCP stalled {_gw_stall_count}x, recovery exhausted",
+                                                )
                                             break
 
                                         # Adaptive deadline extension when deadline is near
@@ -63673,7 +63874,15 @@ class JarvisSystemKernel:
                                                 f"[Trinity]    Wait stats: {_gw_extensions} extensions granted, "
                                                 f"peak progress: {_gw_last_progress:.0f}%"
                                             )
-                                
+
+                                        # v232.2: Notify DMS of fallback to local mode
+                                        if self._startup_watchdog:
+                                            self._startup_watchdog.notify_mode_change(
+                                                "local_prime",
+                                                is_fallback=True,
+                                                fallback_reason="GCP golden image VM not ready in time",
+                                            )
+
                                 # v219.0: If ready and URL not yet propagated, do it now
                                 if invincible_ready and invincible_ip:
                                     hollow_active = os.environ.get("JARVIS_HOLLOW_CLIENT_ACTIVE", "") == "true"
