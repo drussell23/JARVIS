@@ -59736,61 +59736,95 @@ class JarvisSystemKernel:
                 pass
             
             # v230.0: PARALLEL HEDGING — ROOT CAUSE FIX for golden image timeout cascade
+            # v233.3: Cloud-only detection — don't hedge if local Prime isn't viable.
+            #   On 16GB Mac, local LLM loading is not practical (takes 12+ min, uses
+            #   81% RAM). Setting hedge=True shortens golden wait from 240s to 90s,
+            #   which is insufficient for VM create (~60s) + boot (~30s) + model (~60s).
             #
-            # PREVIOUS BEHAVIOR (v229): When golden image was expected, local pre-warm
-            # was completely skipped. If GCP VM failed to boot in 180s, local Prime had
-            # to start from SCRATCH with zero head start, adding 180s+ penalty. The model
-            # reached 95% at the 720s mark and got killed — needing only ~40 more seconds.
-            #
-            # NEW BEHAVIOR (v230): Always start local Prime as a PARALLEL HEDGE alongside
-            # GCP. This creates a "race" pattern:
-            #   - If GCP VM wins → cloud takeover kills local Prime (already handled at ~line 60943)
-            #   - If local Prime wins → immediate inference, GCP continues in background
-            #   - If both fail → at least we maximized our chances
-            #
-            # The 5-7 minute head start from early pre-warm means local Prime will almost
-            # certainly finish before the Trinity phase even starts, eliminating the timeout
-            # cascade entirely.
-            #
-            # Cases where we STILL skip local pre-warm:
-            #   - Explicit GCP inference endpoint configured (user chose cloud-only)
-            #   - Explicit hollow client mode set (user chose cloud routing)
-            # Cases where we now HEDGE instead of skipping:
-            #   - Golden image mode (GCP might fail to boot)
-            #   - Low RAM + GCP available (local is slow but still viable as backup)
+            # Hedge strategy (v230.0) remains valid on 32GB+ machines where local
+            # Prime CAN load in parallel as a genuine fallback.
+            _cloud_only_mode = (
+                os.getenv("JARVIS_CLOUD_ONLY", "false").lower() == "true"
+                or os.getenv("JARVIS_SKIP_LOCAL_PREWARM", "false").lower() == "true"
+                or os.getenv("JARVIS_EARLY_PRIME_PREWARM", "true").lower() == "false"
+            )
 
             if _use_golden_image and (_has_static_ip or _gcp_enabled):
-                # v230.0: DON'T skip — start local as parallel hedge
-                _skip_local_prewarm = False
-                self._local_prime_is_hedge_for_cloud = True
-                self._early_prime_skipped_for_cloud = False
-                self.logger.info(
-                    "[Kernel] 🛡️ PARALLEL HEDGE: Starting local Prime pre-warm alongside GCP golden image"
-                )
-                self.logger.info(
-                    "[Kernel]    Strategy: First-to-ready wins. If GCP boots fast → local killed. "
-                    "If GCP slow → local provides inference."
-                )
-                self.logger.info(
-                    f"[Kernel]    GCP: golden image ({_has_static_ip=}), Local: pre-warm begins NOW"
-                )
-                add_dashboard_log(
-                    "Parallel hedge: local LLM + GCP golden image racing", "INFO"
-                )
+                if _cloud_only_mode or (_low_ram and _total_ram_gb <= 16):
+                    # v233.3: Cloud-only — skip local Prime, don't set hedge
+                    _skip_local_prewarm = True
+                    _skip_reason = (
+                        f"cloud_only_golden_image (RAM: {_total_ram_gb:.0f}GB, "
+                        f"cloud_only={_cloud_only_mode})"
+                    )
+                    self._local_prime_is_hedge_for_cloud = False
+                    self._early_prime_skipped_for_cloud = True
+                    self.logger.info(
+                        f"[Kernel] CLOUD-ONLY: Golden image without local hedge "
+                        f"(RAM: {_total_ram_gb:.0f}GB, cloud_only={_cloud_only_mode})"
+                    )
+                    self.logger.info(
+                        "[Kernel]    Golden image gets full 240s+ wait (no hedge shortcut)"
+                    )
+                    add_dashboard_log(
+                        "Cloud-only: golden image (no local LLM hedge)", "INFO"
+                    )
+                else:
+                    # v230.0: Local Prime IS viable — start as parallel hedge
+                    _skip_local_prewarm = False
+                    self._local_prime_is_hedge_for_cloud = True
+                    self._early_prime_skipped_for_cloud = False
+                    self.logger.info(
+                        "[Kernel] PARALLEL HEDGE: Starting local Prime pre-warm "
+                        "alongside GCP golden image"
+                    )
+                    self.logger.info(
+                        "[Kernel]    Strategy: First-to-ready wins. If GCP boots fast "
+                        "→ local killed. If GCP slow → local provides inference."
+                    )
+                    self.logger.info(
+                        f"[Kernel]    GCP: golden image ({_has_static_ip=}), "
+                        f"Local: pre-warm begins NOW"
+                    )
+                    add_dashboard_log(
+                        "Parallel hedge: local LLM + GCP golden image racing", "INFO"
+                    )
             elif _low_ram and _gcp_enabled and not _hollow_client:
-                # v230.0: Low RAM with GCP — hedge instead of skip
-                _skip_local_prewarm = False
-                self._local_prime_is_hedge_for_cloud = True
-                self._early_prime_skipped_for_cloud = False
-                self.logger.info(
-                    f"[Kernel] 🛡️ PARALLEL HEDGE: Low RAM ({_total_ram_gb:.0f}GB) with GCP available"
-                )
-                self.logger.info(
-                    "[Kernel]    Local loading is slow but viable. Starting as backup for GCP."
-                )
-                add_dashboard_log(
-                    f"Parallel hedge: local LLM (slow, {_total_ram_gb:.0f}GB) + GCP racing", "INFO"
-                )
+                if _cloud_only_mode or _total_ram_gb <= 16:
+                    # v233.3: Low RAM + cloud-only → skip local hedge
+                    _skip_local_prewarm = True
+                    _skip_reason = (
+                        f"cloud_only_low_ram ({_total_ram_gb:.0f}GB, "
+                        f"cloud_only={_cloud_only_mode})"
+                    )
+                    self._local_prime_is_hedge_for_cloud = False
+                    self._early_prime_skipped_for_cloud = True
+                    self.logger.info(
+                        f"[Kernel] CLOUD-ONLY: Low RAM ({_total_ram_gb:.0f}GB) — "
+                        f"skipping local hedge, cloud inference only"
+                    )
+                    add_dashboard_log(
+                        f"Cloud-only: low RAM ({_total_ram_gb:.0f}GB), no local hedge",
+                        "INFO",
+                    )
+                else:
+                    # v230.0: Local is slow but viable on >16GB — hedge
+                    _skip_local_prewarm = False
+                    self._local_prime_is_hedge_for_cloud = True
+                    self._early_prime_skipped_for_cloud = False
+                    self.logger.info(
+                        f"[Kernel] PARALLEL HEDGE: Low RAM ({_total_ram_gb:.0f}GB) "
+                        f"with GCP available"
+                    )
+                    self.logger.info(
+                        "[Kernel]    Local loading is slow but viable. "
+                        "Starting as backup for GCP."
+                    )
+                    add_dashboard_log(
+                        f"Parallel hedge: local LLM (slow, {_total_ram_gb:.0f}GB) "
+                        f"+ GCP racing",
+                        "INFO",
+                    )
             elif _hollow_client and _gcp_enabled:
                 # Explicit hollow client mode — respect user's choice
                 _skip_local_prewarm = True
@@ -63874,13 +63908,15 @@ class JarvisSystemKernel:
                                 _local_is_hedge = getattr(self, '_local_prime_is_hedge_for_cloud', False)
                                 
                                 if not invincible_ready and _golden_image_active and self.config.invincible_node_enabled:
-                                    # v230.0: Dynamic base wait — shorter when local hedge is running
+                                    # v233.3: Dynamic base wait — 90s when hedge, 240s when cloud-only
+                                    # Cloud-only needs: VM create ~60s + boot ~30s + model ~60s + buffer
                                     _gw_base_wait = float(os.environ.get(
                                         "JARVIS_GOLDEN_WAIT_BASE",
-                                        "90" if _local_is_hedge else "180"
+                                        "90" if _local_is_hedge else "240"
                                     ))
                                     _gw_max_wait = float(os.environ.get(
-                                        "JARVIS_GOLDEN_WAIT_MAX", "300"
+                                        "JARVIS_GOLDEN_WAIT_MAX",
+                                        "300" if _local_is_hedge else "600"
                                     ))
                                     _gw_poll_interval = 5.0
                                     _gw_stall_threshold = float(os.environ.get(
@@ -64301,11 +64337,25 @@ class JarvisSystemKernel:
 
                                         # Adaptive deadline extension when deadline is near
                                         _gw_remaining = _gw_effective_wait - _wait_elapsed
+                                        # v233.3: Allow extensions when VM is creating but APARS
+                                        # hasn't started yet (e.g. pre-rebake port mismatch).
+                                        # Stall detection (v233.2) will still fire independently.
+                                        _gw_vm_creating = (
+                                            _gw_checkpoint
+                                            and "starting" in _gw_checkpoint.lower()
+                                        )
+                                        _gw_time_check = (
+                                            _gw_time_since_progress < _gw_stall_threshold
+                                            or (
+                                                _gw_vm_creating
+                                                and _gw_progress_source in ("none", "synthetic")
+                                            )
+                                        )
                                         if (
                                             _gw_remaining < 15
                                             and _gw_extensions < _gw_max_extensions
                                             and _gw_current_progress > _gw_last_progress * 0.8
-                                            and _gw_time_since_progress < _gw_stall_threshold
+                                            and _gw_time_check
                                         ):
                                             # VM is making progress — extend wait
                                             _gw_extension = min(
@@ -64327,22 +64377,25 @@ class JarvisSystemKernel:
                                             f"[Trinity] ⚠️ Golden image VM not ready after "
                                             f"{_total_waited:.0f}s."
                                         )
-                                        # Log final GCP state for diagnostics
+                                        # v233.3: Enhanced diagnostic log for post-mortem analysis
                                         try:
                                             _gcp_final = dashboard._gcp_state
                                             self.logger.warning(
-                                                f"[Trinity]    GCP state: phase={_gcp_final.get('phase_name')}, "
-                                                f"progress={_gcp_final.get('progress'):.0f}%, "
+                                                f"[Trinity]    GCP state: "
+                                                f"progress={_gcp_final.get('progress', 0):.0f}%, "
+                                                f"source={_gcp_final.get('source', 'unknown')}, "
                                                 f"checkpoint={_gcp_final.get('checkpoint')}, "
                                                 f"deploy_mode={_gcp_final.get('deployment_mode')}"
                                             )
                                         except Exception:
                                             pass
-                                        if _gw_extensions > 0:
-                                            self.logger.info(
-                                                f"[Trinity]    Wait stats: {_gw_extensions} extensions granted, "
-                                                f"peak progress: {_gw_last_progress:.0f}%"
-                                            )
+                                        self.logger.warning(
+                                            f"[Trinity]    Wait stats: "
+                                            f"extensions={_gw_extensions}/{_gw_max_extensions}, "
+                                            f"stalls={_gw_stall_count}, "
+                                            f"peak_apars={_gw_last_progress:.0f}%, "
+                                            f"hedge={_local_is_hedge}"
+                                        )
 
                                         # ── v233.0: Three-tier fallback — try standard GCP before local ──
                                         _try_standard_timeout = os.environ.get(

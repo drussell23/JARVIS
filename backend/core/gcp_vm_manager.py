@@ -1371,7 +1371,8 @@ rm -rf "$CLONE_DIR"
 CLONE_SUCCESS=false
 for attempt in 1 2 3; do
     log "   Clone attempt $attempt/3..."
-    if git clone --depth 1 "$REPO_URL" "$CLONE_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+    # v233.3: Timeout to prevent indefinite hang
+    if timeout 120 git clone --depth 1 "$REPO_URL" "$CLONE_DIR" 2>&1 | tee -a "$LOG_FILE"; then
         CLONE_SUCCESS=true
         break
     fi
@@ -6628,12 +6629,16 @@ else
         http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-repo-url \\
         2>/dev/null || echo "${JARVIS_PRIME_REPO_URL:-}")
     if [ -n "$REPO_URL" ]; then
-        log "   Cloning from: $REPO_URL"
-        git clone --depth 1 "$REPO_URL" /tmp/jprime-rescue 2>&1 | tee -a "$LOG_FILE" && \\
+        log "   Cloning from: $REPO_URL (timeout 120s)"
+        # v233.3: Add timeout to prevent indefinite hang on DNS/network issues
+        if timeout 120 git clone --depth 1 "$REPO_URL" /tmp/jprime-rescue 2>&1 | tee -a "$LOG_FILE"; then
             cp -a /tmp/jprime-rescue/* "$JARVIS_DIR/" 2>/dev/null && \\
-            rm -rf /tmp/jprime-rescue && \\
-            log "✅ Code rescued via git clone" || \\
-            log "❌ Failed to clone code"
+                rm -rf /tmp/jprime-rescue && \\
+                log "✅ Code rescued via git clone"
+        else
+            log "❌ Git clone failed or timed out after 120s"
+            rm -rf /tmp/jprime-rescue 2>/dev/null
+        fi
     else
         VALIDATION_OK=false
         log "❌ No repo URL available — cannot rescue code"
@@ -6643,7 +6648,8 @@ fi
 # Check model cache
 MODEL_CACHE="${JARVIS_MODEL_CACHE:-$JARVIS_DIR/models}"
 if [ -d "$MODEL_CACHE" ] && [ "$(ls -A "$MODEL_CACHE" 2>/dev/null)" ]; then
-    MODEL_SIZE=$(du -sm "$MODEL_CACHE" 2>/dev/null | cut -f1 || echo "0")
+    # v233.3: Add timeout to prevent hang on network mounts
+    MODEL_SIZE=$(timeout 10 du -sm "$MODEL_CACHE" 2>/dev/null | cut -f1 || echo "0")
     log "✅ Model cache: ${MODEL_SIZE}MB"
     update_apars 5 50 70 "model_cache_verified" true false
 else
