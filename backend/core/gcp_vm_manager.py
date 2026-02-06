@@ -4682,8 +4682,10 @@ class GCPVMManager:
                 error (Optional[str]): Error description if something failed
                 status_message (str): Human-readable summary
         """
+        # v232.1: Default 450s (was 300s) — GCP golden image VM creation + boot + health
+        # can legitimately take 4-5 minutes. Configurable via env var.
         recovery_timeout = recovery_timeout or float(
-            os.environ.get("JARVIS_GCP_RECOVERY_TIMEOUT", "300")
+            os.environ.get("JARVIS_GCP_RECOVERY_TIMEOUT", "450")
         )
 
         result: Dict[str, Any] = {

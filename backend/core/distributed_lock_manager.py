@@ -565,6 +565,12 @@ class DistributedLockManager:
         self._redis_client: Optional[AsyncRedisLockClient] = None
         self._redis_available = False
 
+        # v3.2: Redis availability caching — prevents log spam and wasted connect attempts
+        self._redis_last_check_time: float = 0.0
+        self._redis_retry_interval: float = float(
+            os.environ.get("JARVIS_REDIS_RETRY_INTERVAL", "300")
+        )
+
         # v3.0: Fencing token counter (monotonically increasing)
         self._fencing_token_counter = 0
         self._fencing_lock = asyncio.Lock()
@@ -1730,13 +1736,26 @@ class DistributedLockManager:
 
         # AUTO mode: Try Redis first, fall back to file
         if self.config.backend == LockBackend.AUTO:
+            # v3.2: Skip Redis check if we recently found it unavailable
+            now = time.time()
+            if (
+                self._redis_last_check_time > 0
+                and (now - self._redis_last_check_time) < self._redis_retry_interval
+            ):
+                return LockBackend.FILE
+
             self._redis_client = get_redis_client()
             if await self._redis_client.connect():
                 self._redis_available = True
-                logger.info("[v3.0] Using Redis backend (distributed mode)")
+                self._redis_last_check_time = 0.0  # Reset on success
+                logger.info("[v3.2] Using Redis backend (distributed mode)")
                 return LockBackend.REDIS
             else:
-                logger.info("[v3.0] Redis unavailable, using file backend (local mode)")
+                self._redis_last_check_time = now
+                logger.info(
+                    f"[v3.2] Redis unavailable, using file backend "
+                    f"(will retry in {self._redis_retry_interval:.0f}s)"
+                )
                 return LockBackend.FILE
 
         return LockBackend.FILE

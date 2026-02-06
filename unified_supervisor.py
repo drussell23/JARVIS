@@ -53660,7 +53660,10 @@ class StartupWatchdog:
         "preflight": PhaseConfig("Preflight", 60.0, 15, 25, "diagnostic"),
         # v192.0: Resources timeout synced with JARVIS_RESOURCE_TIMEOUT (default 300s + 30s buffer)
         "resources": PhaseConfig("Resources", 330.0, 25, 45, "restart"),
-        "backend": PhaseConfig("Backend", 120.0, 45, 55, "restart"),  # v192.0: Increased for slower starts
+        # v232.1: Backend recovery changed from "restart" to "diagnostic".
+        # Restarting mid-model-load is destructive — kills Prime at 87%.
+        # Timeout increased from 120→360s (JARVIS_BACKEND_STARTUP_TIMEOUT default 300 + 60s buffer).
+        "backend": PhaseConfig("Backend", 360.0, 45, 55, "diagnostic"),
         "intelligence": PhaseConfig("Intelligence", 120.0, 55, 65, "diagnostic"),  # v192.0: Increased
         # v210.0: Two-Tier Security phase (VBIA Adapter + Agentic Watchdog)
         "two_tier": PhaseConfig("Two-Tier Security", 60.0, 55, 65, "diagnostic"),
@@ -53753,6 +53756,15 @@ class StartupWatchdog:
         self._warnings_issued: Dict[str, int] = {}
         self._diagnostics_dumped: Dict[str, int] = {}
         self._restarts_attempted: Dict[str, int] = {}
+
+        # v232.1: Post-timeout cooldown — prevents rapid-fire escalation.
+        # Without this, every 5s check after timeout triggers another escalation
+        # (warn→diagnostic→restart→rollback in 20 seconds). Cooldown ensures
+        # minimum spacing between escalation steps.
+        self._last_timeout_action_time: Dict[str, float] = {}
+        self._escalation_cooldown = float(
+            os.environ.get("JARVIS_DMS_ESCALATION_COOLDOWN", "60")
+        )
         
     def _detect_hollow_client_mode(self) -> bool:
         """
@@ -53884,6 +53896,8 @@ class StartupWatchdog:
         if phase_key != self._current_phase:
             self._current_phase = phase_key
             self._phase_start_time = now
+            # v232.1: Reset escalation cooldown for new phase
+            self._last_timeout_action_time.pop(phase_key, None)
             self._logger.debug(f"[DMS] Phase entered: {phase_key}")
 
         # v188.0: ALWAYS update progress time as heartbeat
@@ -53940,12 +53954,18 @@ class StartupWatchdog:
                 # Check for phase timeout
                 phase_elapsed = now - self._phase_start_time
                 if phase_elapsed > phase_timeout:
-                    await self._handle_timeout(
-                        self._current_phase,
-                        phase_elapsed,
-                        phase_timeout,
-                        recovery_action
-                    )
+                    # v232.1: Enforce cooldown between escalation steps.
+                    # Without this, every 5s check re-triggers escalation
+                    # (warn→diagnostic→restart→rollback in 20 seconds).
+                    _last_action = self._last_timeout_action_time.get(self._current_phase, 0)
+                    if (now - _last_action) >= self._escalation_cooldown:
+                        self._last_timeout_action_time[self._current_phase] = now
+                        await self._handle_timeout(
+                            self._current_phase,
+                            phase_elapsed,
+                            phase_timeout,
+                            recovery_action
+                        )
                     continue
                 
                 # Check for stall (no progress change)
@@ -59734,7 +59754,9 @@ class JarvisSystemKernel:
             issue_collector.set_current_phase("Phase 3: Backend")
             issue_collector.set_current_zone("Zone 6")
             # v192.0: Register backend operational timeout with DMS
-            backend_timeout = float(os.environ.get("JARVIS_BACKEND_STARTUP_TIMEOUT", "90.0"))
+            # v232.1: Increased from 90→300s. Backend includes Prime model loading
+            # which takes 300-600s on 16GB Mac with memory pressure.
+            backend_timeout = float(os.environ.get("JARVIS_BACKEND_STARTUP_TIMEOUT", "300.0"))
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase("backend", 30, operational_timeout=backend_timeout)
             if self._narrator:
@@ -63414,10 +63436,15 @@ class JarvisSystemKernel:
                                     _gw_max_extensions = 4
 
                                     # v3.1: Stall recovery tracking
+                                    # v232.1: Increased default from 2→3 to allow 2 actual recovery
+                                    # attempts before final blacklist (stall N with remaining=0)
                                     _gw_max_stall_retries = int(os.environ.get(
-                                        "JARVIS_GCP_MAX_STALL_RETRIES", "2"
+                                        "JARVIS_GCP_MAX_STALL_RETRIES", "3"
                                     ))
                                     _gw_stall_count = 0
+                                    _gw_cooldown_secs = float(os.environ.get(
+                                        "JARVIS_GCP_STALL_COOLDOWN", "60"
+                                    ))
 
                                     _gw_effective_wait = _gw_base_wait
                                     _gw_extensions = 0
@@ -63553,7 +63580,30 @@ class JarvisSystemKernel:
                                             if _gw_recovery_succeeded:
                                                 continue  # Re-enter wait loop for new VM
 
-                                            # No retries left or recovery failed — give up on GCP
+                                            # v232.1: Don't permanently blacklist if retries remain.
+                                            # Cooldown, then allow stall detection to trigger next attempt.
+                                            if _gw_retries_remaining > 0:
+                                                self.logger.info(
+                                                    f"[Trinity] ⏳ Recovery attempt {_gw_stall_count}/{_gw_max_stall_retries} "
+                                                    f"failed. Cooling down {_gw_cooldown_secs:.0f}s before retry "
+                                                    f"({_gw_retries_remaining} attempts left)..."
+                                                )
+                                                await asyncio.sleep(_gw_cooldown_secs)
+                                                # Reset progress tracking — set non-zero so stall detector can re-fire
+                                                _gw_last_progress_time = time.time()
+                                                _gw_last_progress = 0.1
+                                                # Extend wait to accommodate retry cycle
+                                                _wait_elapsed = time.time() - _golden_wait_start
+                                                _gw_effective_wait = max(
+                                                    _gw_effective_wait,
+                                                    _wait_elapsed + _gw_stall_threshold + 180,
+                                                )
+                                                _gw_effective_wait = min(
+                                                    _gw_effective_wait, _gw_max_wait + 600
+                                                )
+                                                continue  # Re-enter wait loop for next stall-triggered retry
+
+                                            # All retries exhausted — give up on GCP
                                             self.logger.warning(
                                                 f"[Trinity] GCP marked unavailable after {_gw_stall_count} stalls. "
                                                 f"Falling back to local Prime."
