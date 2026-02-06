@@ -4704,6 +4704,8 @@ class LiveProgressDashboard:
             "status": "pending",
             # v229.0: Deployment mode transparency
             "deployment_mode": "",  # "golden-image", "standard", or ""
+            # v233.2: Progress source — "apars", "synthetic", or "none"
+            "source": "none",
         }
         # v220.0: Model loading state for detailed user feedback
         self._model_loading_state = {
@@ -4777,15 +4779,17 @@ class LiveProgressDashboard:
         eta_seconds: int = None,
         elapsed_seconds: int = None,
         status: str = None,
+        source: str = None,  # v233.2: "apars", "synthetic", or "none"
         **kwargs,
     ) -> None:
         """
         Update GCP VM progress state.
-        
+
         v220.1: Enhanced to track start time persistently and prevent progress
         from ever going backwards, fixing the 0% stuck issue.
-        
+
         v229.0: Added deployment_mode for transparency (golden-image vs standard).
+        v233.2: Added source parameter for stall detection accuracy.
         """
         with self._lock:
             # v220.1: Track start time on first non-zero update
@@ -4804,11 +4808,21 @@ class LiveProgressDashboard:
             if checkpoint is not None:
                 self._gcp_state["checkpoint"] = checkpoint
             
-            # v220.1: NEVER let progress go backwards
+            # v233.2: Source-aware monotonic progress guard.
+            # APARS (real VM data) is authoritative — always accept, even if
+            # lower than synthetic. This fixes the bug where synthetic at 40%
+            # permanently blocked real APARS data at 3.9%.
             if progress is not None:
                 new_progress = float(progress)
+                source_val = source or self._gcp_state.get("source", "none")
                 max_seen = self._gcp_loading_state["max_progress_seen"]
-                if new_progress >= max_seen:
+
+                if source_val == "apars":
+                    # Ground truth — always accept and reset max
+                    self._gcp_state["progress"] = new_progress
+                    self._gcp_loading_state["max_progress_seen"] = new_progress
+                elif new_progress >= max_seen:
+                    # Non-APARS (synthetic) — normal monotonic behavior
                     self._gcp_state["progress"] = new_progress
                     self._gcp_loading_state["max_progress_seen"] = new_progress
                 elif self._gcp_state["progress"] < max_seen:
@@ -4831,6 +4845,10 @@ class LiveProgressDashboard:
             # v229.0: Deployment mode transparency
             if "deployment_mode" in kwargs:
                 self._gcp_state["deployment_mode"] = kwargs["deployment_mode"]
+
+            # v233.2: Track progress source for stall detection accuracy
+            if source is not None:
+                self._gcp_state["source"] = source
 
     def update_model_loading(
         self,
@@ -5608,6 +5626,7 @@ def update_dashboard_gcp_progress(
             checkpoint=checkpoint,
             progress=progress,
             eta_seconds=eta_seconds,
+            source=source,  # v233.2: Forward source for stall detection
             **kwargs
         )
 
@@ -61685,10 +61704,18 @@ class JarvisSystemKernel:
                                 while True:
                                     await asyncio.sleep(5.0)  # Update every 5 seconds
 
-                                    # v226.2: Defer to real APARS data if it arrived recently
+                                    # v233.2: Compute deployment mode early — needed for deferral window
+                                    _is_golden = os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true"
+
+                                    # v233.2: Configurable deferral window — 60s for golden image
+                                    # because Phase 0 boot (VM + metadata + Python) takes 30-60s.
+                                    _syn_deferral_default = "60" if _is_golden else "15"
+                                    _syn_deferral_s = float(os.environ.get(
+                                        "JARVIS_SYNTHETIC_DEFERRAL_SECONDS", _syn_deferral_default
+                                    ))
                                     if _last_real_gcp_progress_update > 0:
                                         age = time.time() - _last_real_gcp_progress_update
-                                        if age < 15.0:
+                                        if age < _syn_deferral_s:
                                             # Real APARS data is flowing — skip synthetic update
                                             continue
 
@@ -61696,13 +61723,26 @@ class JarvisSystemKernel:
                                     # v229.0: Synthetic progress rate depends on deployment mode
                                     # Golden image: 40% → 95% over 90s (fast boot)
                                     # Standard: 40% → 95% over background_timeout (~600s)
-                                    _is_golden = os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true"
                                     _effective_timeout = 90.0 if _is_golden else background_timeout
-                                    new_pct = min(95, 40 + int((elapsed / _effective_timeout) * 55))
+
+                                    # v233.2: Cap synthetic below APARS value to prevent
+                                    # synthetic from re-overwriting real data after deferral
+                                    _syn_apars_cap = 95
+                                    if _last_real_gcp_progress_update > 0:
+                                        try:
+                                            _syn_apars_last = float(_live_dashboard._gcp_state.get("progress", 0))
+                                            _syn_source = _live_dashboard._gcp_state.get("source", "none")
+                                            if _syn_source == "apars" and _syn_apars_last > 0:
+                                                _syn_apars_cap = int(_syn_apars_last)
+                                        except Exception:
+                                            pass
+
+                                    _syn_raw = min(95, 40 + int((elapsed / _effective_timeout) * 55))
+                                    new_pct = min(_syn_raw, _syn_apars_cap) if _syn_apars_cap < _syn_raw else _syn_raw
                                     if new_pct > _last_pct:
                                         _last_pct = new_pct
                                         # v229.0: More descriptive checkpoint based on deploy mode
-                                        _syn_mode = "golden-image" if os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true" else "standard"
+                                        _syn_mode = "golden-image" if _is_golden else "standard"
                                         if _syn_mode == "golden-image":
                                             _syn_msg = f"Golden image VM booting ({int(elapsed)}s)"
                                         else:
@@ -63896,17 +63936,19 @@ class JarvisSystemKernel:
                                         
                                         _wait_elapsed = time.time() - _golden_wait_start
 
-                                        # v230.0: Track GCP progress for adaptive extension
+                                        # v233.2: Read progress WITH source for accurate stall detection
                                         _gw_current_progress = 0.0
                                         _gw_checkpoint = ""
+                                        _gw_progress_source = "none"
                                         try:
                                             _gcp = dashboard._gcp_state
                                             _gw_checkpoint = _gcp.get("checkpoint", "")
                                             _gw_current_progress = float(_gcp.get("progress", 0))
+                                            _gw_progress_source = _gcp.get("source", "none")
                                             _status_msg = (
-                                                f"GCP: {_gw_current_progress:.0f}% - {_gw_checkpoint}"
+                                                f"GCP: {_gw_current_progress:.0f}% ({_gw_progress_source}) - {_gw_checkpoint}"
                                                 if _gw_checkpoint
-                                                else f"GCP: {_gw_current_progress:.0f}%"
+                                                else f"GCP: {_gw_current_progress:.0f}% ({_gw_progress_source})"
                                             )
                                             if _status_msg != _last_gcp_status:
                                                 dashboard.add_log(
@@ -63915,26 +63957,74 @@ class JarvisSystemKernel:
                                                     "DEBUG"
                                                 )
                                                 _last_gcp_status = _status_msg
-                                            else:
-                                                dashboard.add_log(
-                                                    f"Waiting for golden image VM... "
-                                                    f"({_wait_elapsed:.0f}s/{_gw_effective_wait:.0f}s)",
-                                                    "DEBUG"
-                                                )
                                         except Exception:
                                             pass
 
-                                        # Track progress changes
-                                        if _gw_current_progress > _gw_last_progress:
+                                        # v233.2: Only APARS (real) progress resets stall timer.
+                                        # Synthetic progress continuously increases and would
+                                        # reset the timer every 5s, defeating stall detection.
+                                        if _gw_progress_source == "apars" and _gw_current_progress > _gw_last_progress:
                                             _gw_last_progress = _gw_current_progress
                                             _gw_last_progress_time = time.time()
 
-                                        # v3.1: Stall detection with recovery — terminate stuck VM, optionally retry
+                                        # v233.2: Phase 0 fast-fail + no-APARS detection
+                                        _gw_effective_stall_threshold = _gw_stall_threshold
+                                        _gw_phase0_timeout = float(os.environ.get(
+                                            "JARVIS_GCP_PHASE0_TIMEOUT", "120"
+                                        ))
+
+                                        # Detect: NO APARS data at all after timeout
+                                        # (port mismatch, health endpoint crash, etc.)
+                                        _gw_no_apars_at_all = (
+                                            _gw_progress_source in ("none", "synthetic")
+                                            and _gw_last_progress == 0
+                                            and _wait_elapsed > _gw_phase0_timeout
+                                        )
+                                        if _gw_no_apars_at_all:
+                                            _gw_effective_stall_threshold = min(
+                                                _gw_stall_threshold,
+                                                float(os.environ.get(
+                                                    "JARVIS_GCP_PHASE0_STALL_THRESHOLD", "30"
+                                                ))
+                                            )
+                                            self.logger.warning(
+                                                f"[Trinity] ⚠️ No APARS data received after "
+                                                f"{_wait_elapsed:.0f}s — possible port mismatch "
+                                                f"or health endpoint failure. Stall threshold "
+                                                f"reduced to {_gw_effective_stall_threshold:.0f}s"
+                                            )
+                                        elif (
+                                            _gw_progress_source == "apars"
+                                            and _gw_current_progress < 5
+                                            and _wait_elapsed > _gw_phase0_timeout
+                                        ):
+                                            # Phase 0 stuck — APARS data but <5%
+                                            _gw_effective_stall_threshold = min(
+                                                _gw_stall_threshold,
+                                                float(os.environ.get(
+                                                    "JARVIS_GCP_PHASE0_STALL_THRESHOLD", "30"
+                                                ))
+                                            )
+                                            if _gw_effective_stall_threshold < _gw_stall_threshold:
+                                                self.logger.info(
+                                                    f"[Trinity] Phase 0 fast-fail: threshold → "
+                                                    f"{_gw_effective_stall_threshold:.0f}s "
+                                                    f"(VM at {_gw_current_progress:.1f}% "
+                                                    f"after {_wait_elapsed:.0f}s)"
+                                                )
+
+                                        # v233.2: Stall detection — decoupled from hedge, source-aware
                                         _gw_time_since_progress = time.time() - _gw_last_progress_time
+                                        _gw_allow_stall_detection = (
+                                            _local_is_hedge
+                                            or os.environ.get(
+                                                "JARVIS_GCP_STALL_DETECT_ALWAYS", "true"
+                                            ).lower() == "true"
+                                        )
                                         if (
-                                            _gw_time_since_progress > _gw_stall_threshold
-                                            and _gw_last_progress > 0
-                                            and _local_is_hedge
+                                            _gw_time_since_progress > _gw_effective_stall_threshold
+                                            and (_gw_last_progress > 0 or _gw_no_apars_at_all)
+                                            and _gw_allow_stall_detection
                                         ):
                                             _gw_stall_count += 1
                                             _gw_retries_remaining = _gw_max_stall_retries - _gw_stall_count
@@ -64027,7 +64117,9 @@ class JarvisSystemKernel:
                                             ).lower() == "true"
                                             _standard_attempted = False
 
-                                            if _try_standard and _local_is_hedge:
+                                            # v233.2: Removed _local_is_hedge gate — standard GCP
+                                            # fallback must work in cloud-only mode too.
+                                            if _try_standard:
                                                 # Check if local Prime is >70% — if so, skip standard (local finishes first)
                                                 _local_prog = 0.0
                                                 try:
@@ -64130,16 +64222,37 @@ class JarvisSystemKernel:
                                                 # Standard fallback succeeded — break out of wait loop
                                                 break
 
-                                            # Final fallback: local Prime
+                                            # v233.2: Final fallback — trigger Claude API if available
                                             self.logger.warning(
                                                 f"[Trinity] GCP marked unavailable after {_gw_stall_count} stalls"
-                                                f"{' + standard fallback failed' if _standard_attempted else ''}. "
-                                                f"Falling back to local Prime."
+                                                f"{' + standard fallback failed' if _standard_attempted else ''}."
                                             )
+                                            try:
+                                                from backend.supervisor.cross_repo_startup_orchestrator import (
+                                                    write_claude_api_fallback_signal
+                                                )
+                                                write_claude_api_fallback_signal(
+                                                    reason=(
+                                                        f"Golden image stalled {_gw_stall_count}x "
+                                                        f"at {_gw_current_progress:.0f}%"
+                                                        f"{', standard fallback also failed' if _standard_attempted else ''}"
+                                                    ),
+                                                    gcp_attempts=_gw_stall_count,
+                                                )
+                                                self.logger.warning(
+                                                    f"[Trinity] 📢 Claude API fallback signal written "
+                                                    f"after {_gw_stall_count} golden image failures"
+                                                )
+                                            except Exception as _fallback_err:
+                                                self.logger.error(
+                                                    f"[Trinity] Failed to write Claude API fallback "
+                                                    f"signal: {_fallback_err}"
+                                                )
+
                                             # v231.0: Clear GCP dashboard state so UI reflects reality
                                             try:
                                                 update_dashboard_gcp_progress(
-                                                    checkpoint="Recovery failed — using local Prime",
+                                                    checkpoint="Recovery failed — Claude API fallback",
                                                     status="stopped",
                                                     progress=0,
                                                     deployment_mode="",

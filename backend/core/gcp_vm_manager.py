@@ -6461,7 +6461,16 @@ update_apars() {
 EOFPROGRESS
 }
 
-# ─── Phase 0: Instant APARS health endpoint (<2 seconds) ───
+# ─── Phase 0: Read port from GCP metadata FIRST (before health endpoint) ───
+# v233.2: CRITICAL FIX — Previously the APARS health endpoint started before
+# the port was read from metadata, causing it to listen on the wrong port.
+# The supervisor would then poll the metadata port and get no response.
+JARVIS_PORT=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \\
+    http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-port \\
+    2>/dev/null || echo "8000")
+export JARVIS_PORT
+log "Port resolved from metadata: $JARVIS_PORT"
+
 update_apars 0 50 2 "golden_image_booting"
 
 python3 << 'EOFHEALTH' &
@@ -6489,7 +6498,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                 "model_loaded": state.get("model_loaded", False),
                 "ready_for_inference": ready,
                 "apars": {
-                    "version": "229.0",
+                    "version": "233.2",
                     "phase_number": state.get("phase", 0),
                     "phase_name": state.get("checkpoint", "starting"),
                     "phase_progress": state.get("phase_progress", 0),
@@ -6503,7 +6512,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                     "skipped_phases": [2, 3]
                 },
                 "uptime_seconds": elapsed,
-                "version": "v229.0-golden"
+                "version": "v233.2-golden"
             }
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -6535,16 +6544,44 @@ EOFHEALTH
 HEALTH_PID=$!
 sleep 1
 
-log "═══════════════════════════════════════════════════════════════════════════════"
-log "GOLDEN IMAGE STARTUP v229.0 - Pre-baked environment"
-log "═══════════════════════════════════════════════════════════════════════════════"
+# v233.2: Verify health endpoint started successfully
+if ! kill -0 $HEALTH_PID 2>/dev/null; then
+    log "ERROR: Health endpoint failed to start on port $JARVIS_PORT — retrying..."
+    python3 << 'EOFHEALTH2' &
+import http.server, json, os, time
+PROGRESS_FILE = "/tmp/jarvis_progress.json"
+start_time = time.time()
+class APARSHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/health", "/health/"):
+            try:
+                with open(PROGRESS_FILE, "r") as f:
+                    state = json.load(f)
+            except:
+                state = {"phase": 0, "total_progress": 5, "checkpoint": "golden_booting"}
+            elapsed = int(time.time() - start_time)
+            ready = state.get("ready_for_inference", False)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "starting", "apars": {"total_progress": state.get("total_progress", 5), "elapsed_seconds": elapsed}, "ready_for_inference": ready}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, format, *args):
+        pass
+port = int(os.environ.get("JARVIS_PORT", "8000"))
+server = http.server.HTTPServer(("0.0.0.0", port), APARSHandler)
+server.serve_forever()
+EOFHEALTH2
+    HEALTH_PID=$!
+    sleep 1
+fi
 
-# ─── Read port from GCP metadata ───
-JARVIS_PORT=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \\
-    http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-port \\
-    2>/dev/null || echo "8000")
-export JARVIS_PORT
-log "Port: $JARVIS_PORT"
+log "═══════════════════════════════════════════════════════════════════════════════"
+log "GOLDEN IMAGE STARTUP v233.2 - Pre-baked environment"
+log "═══════════════════════════════════════════════════════════════════════════════"
+log "APARS health endpoint on port $JARVIS_PORT (PID: $HEALTH_PID)"
 
 # ─── Source pre-baked environment ───
 update_apars 1 0 10 "loading_environment"
