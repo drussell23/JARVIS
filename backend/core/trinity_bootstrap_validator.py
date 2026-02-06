@@ -1149,7 +1149,7 @@ class CrossRepoValidator(BaseValidator):
                 message=f"JARVIS Prime repository not found: {path}",
                 component="jarvis_prime",
                 fix_suggestion="Clone jarvis-prime repository or update JARVIS_PRIME_PATH",
-                fix_command=f"git clone https://github.com/your-org/jarvis-prime.git '{path}'",
+                fix_command=f"git clone https://github.com/drussell23/jarvis-prime.git '{path}'",
             )
             return
 

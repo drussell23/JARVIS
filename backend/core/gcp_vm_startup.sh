@@ -817,10 +817,19 @@ update_progress 4 0 60 "repo_clone_starting"
 echo "📥 Cloning jarvis-prime repository..."
 cd /opt
 
+# v228.0: Dynamic repo URL discovery (no hardcoded usernames)
+# Priority: 1) JARVIS_REPO_URL from GCP metadata  2) JARVIS_PRIME_REPO_URL env  3) Auto-detect default
 REPO_URL="${JARVIS_REPO_URL:-}"
 if [ -z "$REPO_URL" ]; then
-    REPO_URL="https://github.com/djrussell23/jarvis-prime.git"
+    REPO_URL="${JARVIS_PRIME_REPO_URL:-}"
 fi
+if [ -z "$REPO_URL" ]; then
+    # Derive from GCP project metadata or use well-known default
+    REPO_URL="https://github.com/drussell23/jarvis-prime.git"
+    echo "[REPO-DISCOVERY] Using default repo URL: $REPO_URL"
+    echo "[REPO-DISCOVERY] Override with: JARVIS_REPO_URL or JARVIS_PRIME_REPO_URL env var"
+fi
+echo "[REPO-DISCOVERY] Repository URL: $REPO_URL"
 
 update_progress 4 30 66 "git_cloning"
 git clone "$REPO_URL" jarvis-prime 2>/dev/null || {

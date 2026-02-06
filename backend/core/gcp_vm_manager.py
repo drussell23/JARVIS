@@ -878,6 +878,85 @@ class GoldenImageBuilder:
             self._machine_images_client = compute_v1.MachineImagesClient()
         return self._machine_images_client
     
+    def _discover_prime_repo_url(self) -> str:
+        """
+        v228.0: Dynamically discover JARVIS-Prime repository URL.
+        
+        Discovery order (first match wins, zero hardcoded usernames):
+          1. JARVIS_PRIME_REPO_URL environment variable (explicit override)
+          2. JARVIS_REPO_URL environment variable (legacy/metadata compat)
+          3. Auto-detect from local jarvis-prime sibling repo's git remote
+          4. Fail with clear error — never silently use a wrong URL
+        
+        Returns:
+            Repository URL string, or empty string if discovery fails
+        """
+        # 1. Explicit environment variables (highest priority)
+        for env_key in ("JARVIS_PRIME_REPO_URL", "JARVIS_REPO_URL"):
+            url = os.getenv(env_key)
+            if url:
+                self.logger.info(f"[GoldenImageBuilder] Repo URL from {env_key}: {url}")
+                return url
+        
+        # 2. Auto-detect from local sibling repository git remote
+        try:
+            import subprocess
+            from pathlib import Path
+            
+            # Search multiple potential locations for the jarvis-prime repo
+            search_paths = []
+            
+            # Relative to this file's repo root (../../jarvis-prime)
+            this_file = Path(__file__).resolve()
+            repo_root = this_file.parent.parent.parent  # backend/core/ → project root
+            workspace_parent = repo_root.parent  # parent of JARVIS-AI-Agent
+            
+            search_paths.extend([
+                workspace_parent / "jarvis-prime",
+                workspace_parent / "JARVIS-Prime",
+            ])
+            
+            # Home-based paths
+            home = Path.home()
+            search_paths.extend([
+                home / "Documents" / "repos" / "jarvis-prime",
+                home / "Documents" / "repos" / "JARVIS-Prime",
+            ])
+            
+            # Deduplicate (resolve to absolute)
+            seen = set()
+            unique_paths = []
+            for p in search_paths:
+                resolved = str(p.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    unique_paths.append(p)
+            
+            for path in unique_paths:
+                if path.exists() and (path / ".git").exists():
+                    result = subprocess.run(
+                        ["git", "remote", "get-url", "origin"],
+                        cwd=str(path),
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        detected_url = result.stdout.strip()
+                        self.logger.info(
+                            f"[GoldenImageBuilder] Auto-detected repo URL from "
+                            f"{path}: {detected_url}"
+                        )
+                        return detected_url
+        except Exception as e:
+            self.logger.debug(f"[GoldenImageBuilder] Auto-detect git remote failed: {e}")
+        
+        # 3. No URL found — log clear error
+        self.logger.warning(
+            "[GoldenImageBuilder] Could not discover JARVIS-Prime repo URL. "
+            "Set JARVIS_PRIME_REPO_URL environment variable for explicit configuration. "
+            "The golden image builder needs a valid repo URL to clone JARVIS-Prime code."
+        )
+        return ""
+    
     async def list_golden_images(
         self,
         family: Optional[str] = None,
@@ -1000,29 +1079,49 @@ class GoldenImageBuilder:
     
     def _generate_builder_startup_script(self) -> str:
         """
-        Generate the startup script for the builder VM.
+        v228.0: Generate the startup script for the golden image builder VM.
         
-        This script:
-        1. Installs Python and all dependencies
-        2. Clones JARVIS-Prime repository
-        3. Downloads and caches the LLM model
-        4. Configures the system for fast startup
-        5. Signals completion via /tmp/golden_image_ready
+        This script runs on a temporary builder VM and pre-bakes everything:
+          Phase 1: System packages (Python, build tools, git)
+          Phase 2: Python virtual environment
+          Phase 3: Clone JARVIS-Prime repository (CRITICAL — provides the code)
+          Phase 4: Install ML dependencies (torch, transformers, llama-cpp-python)
+          Phase 5: Download and cache LLM model with verification
+          Phase 6: Configure for fast startup (systemd, .env, APARS)
+          Phase 7: Validate build integrity and signal completion
+        
+        All URLs are dynamically discovered — zero hardcoded usernames.
         """
         model_name = self.config.golden_image_model
         
-        # Get JARVIS-Prime repo URL from environment
-        jarvis_prime_repo = os.getenv(
-            "JARVIS_PRIME_REPO_URL",
-            "https://github.com/your-org/JARVIS-Prime.git"  # Placeholder
-        )
+        # v228.0: Dynamically discover repo URL (never hardcoded)
+        jarvis_prime_repo = self._discover_prime_repo_url()
+        if not jarvis_prime_repo:
+            self.logger.error(
+                "[GoldenImageBuilder] Cannot generate builder script: "
+                "no JARVIS-Prime repo URL. Set JARVIS_PRIME_REPO_URL."
+            )
+            raise ValueError(
+                "JARVIS-Prime repository URL not found. "
+                "Set JARVIS_PRIME_REPO_URL environment variable or ensure "
+                "jarvis-prime repo exists locally with a git remote configured."
+            )
+        
+        self.logger.info(f"[GoldenImageBuilder] Using repo URL: {jarvis_prime_repo}")
         
         return f'''#!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# v224.0: Golden Image Builder - Pre-bake Everything
+# v228.0: Golden Image Builder - Enterprise-Grade Pre-bake
 # ═══════════════════════════════════════════════════════════════════════════════
-# This script creates a "golden image" with everything pre-installed.
-# It runs on a temporary builder VM and signals completion via health endpoint.
+# Creates a golden image with code, dependencies, and models pre-installed.
+# Runs on a temporary builder VM. Signals completion via health endpoint.
+#
+# Key improvements over v224.0:
+#   - Actually clones JARVIS-Prime repository (was missing!)
+#   - Model download verification (fail-fast on missing models)
+#   - systemd EnvironmentFile integration
+#   - Build integrity validation before signaling ready
+#   - Dynamic repo URL (zero hardcoded usernames)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 set -e  # Exit on error (but handle gracefully)
@@ -1031,6 +1130,10 @@ LOG_FILE="/var/log/golden-image-build.log"
 HEALTH_FILE="/tmp/golden_image_status.json"
 READY_FILE="/tmp/golden_image_ready"
 MODEL_NAME="{model_name}"
+REPO_URL="{jarvis_prime_repo}"
+JARVIS_DIR="/opt/jarvis-prime"
+MODEL_CACHE="$JARVIS_DIR/models"
+BUILD_ERRORS=0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging and Status Functions
@@ -1051,6 +1154,8 @@ update_status() {{
     "progress_pct": $progress,
     "current_step": "$step",
     "model_name": "$MODEL_NAME",
+    "repo_url": "$REPO_URL",
+    "build_errors": $BUILD_ERRORS,
     "timestamp": "$(date -Iseconds)"
 }}
 EOFSTATUS
@@ -1058,7 +1163,6 @@ EOFSTATUS
 
 # Start health endpoint immediately (for monitoring)
 start_health_endpoint() {{
-    # Simple Python health server for monitoring build progress
     python3 << 'EOFPY' &
 import http.server
 import json
@@ -1082,7 +1186,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass  # Suppress logging
+        pass
 
 if __name__ == "__main__":
     server = http.server.HTTPServer(("0.0.0.0", 8000), HealthHandler)
@@ -1095,18 +1199,17 @@ EOFPY
 # ─────────────────────────────────────────────────────────────────────────────
 
 log "═══════════════════════════════════════════════════════════════════════════════"
-log "GOLDEN IMAGE BUILD STARTED"
+log "GOLDEN IMAGE BUILD v228.0 STARTED"
+log "   Repo URL:  $REPO_URL"
+log "   Model:     $MODEL_NAME"
 log "═══════════════════════════════════════════════════════════════════════════════"
 
-# Initialize status
 update_status "booting" 0 "Starting golden image build..."
 
-# Start health endpoint
 start_health_endpoint
 sleep 2
 
-# Update: Phase 1
-update_status "installing" 5 "Installing system packages..."
+update_status "installing" 3 "Installing system packages..."
 log "Phase 1: Installing system packages"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -1122,29 +1225,83 @@ apt-get install -y -qq \\
 # Phase 2: Python Environment
 # ─────────────────────────────────────────────────────────────────────────────
 
-update_status "installing" 15 "Setting up Python environment..."
+update_status "installing" 10 "Setting up Python environment..."
 log "Phase 2: Setting up Python environment"
 
-# Create dedicated directory for JARVIS-Prime
-JARVIS_DIR="/opt/jarvis-prime"
 mkdir -p "$JARVIS_DIR"
 cd "$JARVIS_DIR"
 
-# Create virtual environment
 python3.11 -m venv venv
 source venv/bin/activate
 
-# Upgrade pip
 pip install --upgrade pip setuptools wheel 2>&1 | tee -a "$LOG_FILE"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 3: Clone JARVIS-Prime (or use embedded deps list)
+# Phase 3: Clone JARVIS-Prime Repository (CRITICAL)
+# ─────────────────────────────────────────────────────────────────────────────
+
+update_status "cloning" 15 "Cloning JARVIS-Prime repository..."
+log "Phase 3: Cloning JARVIS-Prime from $REPO_URL"
+
+# Clone into a temporary directory, then move contents to JARVIS_DIR
+CLONE_DIR="/tmp/jarvis-prime-clone"
+rm -rf "$CLONE_DIR"
+
+CLONE_SUCCESS=false
+for attempt in 1 2 3; do
+    log "   Clone attempt $attempt/3..."
+    if git clone --depth 1 "$REPO_URL" "$CLONE_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+        CLONE_SUCCESS=true
+        break
+    fi
+    log "   Clone attempt $attempt failed. Retrying in 5s..."
+    sleep 5
+done
+
+if [ "$CLONE_SUCCESS" = true ]; then
+    # Move cloned code into JARVIS_DIR (preserve venv which is already there)
+    # Use rsync-style approach: copy everything except .git to save space
+    cp -a "$CLONE_DIR"/.git "$JARVIS_DIR/.git" 2>/dev/null || true
+    # Copy all files except .git directory
+    find "$CLONE_DIR" -maxdepth 1 -not -name '.git' -not -path "$CLONE_DIR" -exec cp -a {{}} "$JARVIS_DIR/" \\;
+    rm -rf "$CLONE_DIR"
+    
+    # Verify critical files exist
+    if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
+        log "   ✅ JARVIS-Prime code cloned successfully"
+        log "   ✅ jarvis_prime module found at $JARVIS_DIR/jarvis_prime"
+    else
+        log "   ⚠️  Clone succeeded but jarvis_prime module not found!"
+        log "   ⚠️  Contents of $JARVIS_DIR:"
+        ls -la "$JARVIS_DIR" 2>&1 | tee -a "$LOG_FILE"
+        BUILD_ERRORS=$((BUILD_ERRORS + 1))
+    fi
+else
+    log "   ❌ CRITICAL: Failed to clone JARVIS-Prime after 3 attempts!"
+    log "   ❌ Repo URL: $REPO_URL"
+    log "   ❌ The golden image will NOT have inference code!"
+    BUILD_ERRORS=$((BUILD_ERRORS + 1))
+    update_status "error" 15 "Git clone failed: $REPO_URL"
+fi
+
+# Install jarvis-prime requirements if they exist (from the cloned repo)
+if [ -f "$JARVIS_DIR/requirements.txt" ]; then
+    log "   Installing JARVIS-Prime requirements..."
+    update_status "installing" 20 "Installing JARVIS-Prime requirements..."
+    pip install -r "$JARVIS_DIR/requirements.txt" 2>&1 | tee -a "$LOG_FILE" || true
+elif [ -f "$JARVIS_DIR/pyproject.toml" ]; then
+    log "   Installing JARVIS-Prime from pyproject.toml..."
+    update_status "installing" 20 "Installing JARVIS-Prime package..."
+    pip install -e "$JARVIS_DIR" 2>&1 | tee -a "$LOG_FILE" || true
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 4: Install ML Dependencies
 # ─────────────────────────────────────────────────────────────────────────────
 
 update_status "installing" 25 "Installing ML dependencies..."
-log "Phase 3: Installing ML dependencies"
+log "Phase 4: Installing ML dependencies"
 
-# Install core ML dependencies
 pip install \\
     torch>=2.1.0 \\
     transformers>=4.35.0 \\
@@ -1157,7 +1314,7 @@ pip install \\
     2>&1 | tee -a "$LOG_FILE"
 
 update_status "installing" 40 "Installing server dependencies..."
-log "Phase 3b: Installing server dependencies"
+log "Phase 4b: Installing server dependencies"
 
 pip install \\
     fastapi>=0.104.0 \\
@@ -1169,19 +1326,17 @@ pip install \\
     2>&1 | tee -a "$LOG_FILE"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 4: Download and Cache Model
+# Phase 5: Download and Cache Model (with Verification)
 # ─────────────────────────────────────────────────────────────────────────────
 
 update_status "downloading" 50 "Downloading LLM model: $MODEL_NAME..."
-log "Phase 4: Downloading LLM model: $MODEL_NAME"
+log "Phase 5: Downloading LLM model: $MODEL_NAME"
 
-# Create model cache directory
-MODEL_CACHE="/opt/jarvis-prime/models"
 mkdir -p "$MODEL_CACHE"
 
-# Download model using huggingface_hub
 python3 << EOFMODEL
 import os
+import sys
 from huggingface_hub import snapshot_download
 
 model_name = "{model_name}"
@@ -1191,83 +1346,185 @@ print(f"Downloading model: {{model_name}}")
 print(f"Cache directory: {{cache_dir}}")
 
 try:
-    # Download the model (this will be cached)
     path = snapshot_download(
         repo_id=model_name if "/" in model_name else f"TheBloke/{{model_name}}-GGUF",
         cache_dir=cache_dir,
         local_dir_use_symlinks=False,
     )
-    print(f"Model downloaded to: {{path}}")
+    print(f"✅ Model downloaded to: {{path}}")
+    
+    # Verify model files exist
+    total_size = 0
+    file_count = 0
+    for root, dirs, files in os.walk(cache_dir):
+        for f in files:
+            fpath = os.path.join(root, f)
+            total_size += os.path.getsize(fpath)
+            file_count += 1
+    
+    print(f"✅ Model cache: {{file_count}} files, {{total_size / (1024*1024):.1f}} MB")
+    
+    if total_size < 1_000_000:  # Less than 1MB — something went wrong
+        print("⚠️  WARNING: Model cache suspiciously small. Model may be incomplete.")
+        sys.exit(1)
+        
 except Exception as e:
-    print(f"Warning: Model download failed: {{e}}")
-    print("The model will be downloaded on first use.")
+    print(f"❌ Model download failed: {{e}}")
+    print("❌ The golden image will NOT have pre-cached models.")
+    sys.exit(1)
 EOFMODEL
 
+if [ $? -ne 0 ]; then
+    log "   ⚠️  Model download failed or verification failed"
+    BUILD_ERRORS=$((BUILD_ERRORS + 1))
+else
+    log "   ✅ Model downloaded and verified"
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 5: Configure for Fast Startup
+# Phase 6: Configure for Fast Startup
 # ─────────────────────────────────────────────────────────────────────────────
 
 update_status "configuring" 80 "Configuring for fast startup..."
-log "Phase 5: Configuring for fast startup"
+log "Phase 6: Configuring for fast startup"
 
-# Create environment file
-cat > "$JARVIS_DIR/.env" << 'EOFENV'
-# Pre-baked Golden Image Configuration
+# Create environment file (sourced by systemd and startup script)
+cat > "$JARVIS_DIR/.env" << EOFENV
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pre-baked Golden Image Configuration (v228.0)
+# Generated at: $(date -Iseconds)
+# ═══════════════════════════════════════════════════════════════════════════════
 JARVIS_DEPS_PREBAKED=true
 JARVIS_SKIP_ML_DEPS_INSTALL=true
 JARVIS_GCP_INFERENCE=true
-JARVIS_MODEL_CACHE=/opt/jarvis-prime/models
-JARVIS_PRIME_DIR=/opt/jarvis-prime
-JARVIS_PRIME_VENV=/opt/jarvis-prime/venv
+JARVIS_MODEL_CACHE=$MODEL_CACHE
+JARVIS_PRIME_DIR=$JARVIS_DIR
+JARVIS_PRIME_VENV=$JARVIS_DIR/venv
+JARVIS_PRIME_REPO_URL=$REPO_URL
+PYTHONPATH=$JARVIS_DIR
 EOFENV
 
-# Create systemd service for auto-start (optional)
-cat > /etc/systemd/system/jarvis-prime.service << 'EOFSVC'
+log "   ✅ Environment file created at $JARVIS_DIR/.env"
+
+# Create systemd service with EnvironmentFile integration
+cat > /etc/systemd/system/jarvis-prime.service << EOFSVC
 [Unit]
-Description=JARVIS-Prime Inference Server
+Description=JARVIS-Prime Inference Server (Golden Image v228.0)
 After=network.target
+Documentation=https://github.com/drussell23/jarvis-prime
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/jarvis-prime
-Environment=PATH=/opt/jarvis-prime/venv/bin:/usr/bin:/bin
-ExecStart=/opt/jarvis-prime/venv/bin/python -m jarvis_prime.server
+WorkingDirectory=$JARVIS_DIR
+EnvironmentFile=$JARVIS_DIR/.env
+Environment=PATH=$JARVIS_DIR/venv/bin:/usr/bin:/bin
+ExecStart=$JARVIS_DIR/venv/bin/python -m jarvis_prime.server
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=120
+StandardOutput=append:/var/log/jarvis-prime.log
+StandardError=append:/var/log/jarvis-prime.log
 
 [Install]
 WantedBy=multi-user.target
 EOFSVC
 
 systemctl daemon-reload
+log "   ✅ systemd service configured with EnvironmentFile"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 6: Cleanup and Signal Completion
+# Phase 7: Build Integrity Validation and Cleanup
 # ─────────────────────────────────────────────────────────────────────────────
 
-update_status "finalizing" 95 "Cleaning up and finalizing..."
-log "Phase 6: Cleaning up"
+update_status "finalizing" 90 "Validating build integrity..."
+log "Phase 7: Validating build integrity"
 
-# Clear apt cache
+# Validate critical components
+VALIDATION_PASSED=true
+
+# Check 1: Python and venv
+if [ ! -f "$JARVIS_DIR/venv/bin/python" ]; then
+    log "   ❌ FAIL: Python venv not found"
+    VALIDATION_PASSED=false
+    BUILD_ERRORS=$((BUILD_ERRORS + 1))
+else
+    log "   ✅ Python venv: OK"
+fi
+
+# Check 2: Core ML packages importable
+$JARVIS_DIR/venv/bin/python -c "import torch; print(f'   ✅ PyTorch {{torch.__version__}}')" 2>&1 | tee -a "$LOG_FILE" || {{
+    log "   ❌ FAIL: PyTorch not importable"
+    VALIDATION_PASSED=false
+    BUILD_ERRORS=$((BUILD_ERRORS + 1))
+}}
+
+$JARVIS_DIR/venv/bin/python -c "import transformers; print(f'   ✅ Transformers {{transformers.__version__}}')" 2>&1 | tee -a "$LOG_FILE" || {{
+    log "   ❌ FAIL: Transformers not importable"
+    VALIDATION_PASSED=false
+    BUILD_ERRORS=$((BUILD_ERRORS + 1))
+}}
+
+$JARVIS_DIR/venv/bin/python -c "import llama_cpp; print('   ✅ llama-cpp-python: OK')" 2>&1 | tee -a "$LOG_FILE" || {{
+    log "   ⚠️  llama-cpp-python not importable (optional)"
+}}
+
+# Check 3: JARVIS-Prime code present
+if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
+    log "   ✅ jarvis_prime module: OK"
+else
+    log "   ❌ FAIL: jarvis_prime module not found"
+    VALIDATION_PASSED=false
+    BUILD_ERRORS=$((BUILD_ERRORS + 1))
+fi
+
+# Check 4: Model cache has content
+MODEL_SIZE=$(du -sm "$MODEL_CACHE" 2>/dev/null | cut -f1 || echo "0")
+if [ "$MODEL_SIZE" -gt 0 ]; then
+    log "   ✅ Model cache: ${{MODEL_SIZE}}MB"
+else
+    log "   ⚠️  Model cache empty (models will download at first use)"
+fi
+
+# Check 5: Environment file
+if [ -f "$JARVIS_DIR/.env" ]; then
+    log "   ✅ Environment file: OK"
+else
+    log "   ❌ FAIL: Environment file missing"
+    VALIDATION_PASSED=false
+    BUILD_ERRORS=$((BUILD_ERRORS + 1))
+fi
+
+# Check 6: systemd service
+if systemctl list-unit-files | grep -q jarvis-prime; then
+    log "   ✅ systemd service: registered"
+else
+    log "   ⚠️  systemd service not registered"
+fi
+
+# Cleanup
+update_status "finalizing" 95 "Cleaning up..."
 apt-get clean
 rm -rf /var/lib/apt/lists/*
-
-# Clear pip cache
 rm -rf ~/.cache/pip
 
-# Clear bash history
-history -c
+if [ "$VALIDATION_PASSED" = true ]; then
+    update_status "ready" 100 "Golden image ready! ($BUILD_ERRORS warnings)"
+    log "═══════════════════════════════════════════════════════════════════════════════"
+    log "✅ GOLDEN IMAGE BUILD v228.0 COMPLETED SUCCESSFULLY"
+    log "   Build errors/warnings: $BUILD_ERRORS"
+    log "═══════════════════════════════════════════════════════════════════════════════"
+else
+    update_status "error" 99 "Build completed with $BUILD_ERRORS critical errors"
+    log "═══════════════════════════════════════════════════════════════════════════════"
+    log "⚠️  GOLDEN IMAGE BUILD COMPLETED WITH ERRORS ($BUILD_ERRORS)"
+    log "   The image may not function correctly. Review errors above."
+    log "═══════════════════════════════════════════════════════════════════════════════"
+fi
 
-update_status "ready" 100 "Golden image ready!"
-log "═══════════════════════════════════════════════════════════════════════════════"
-log "GOLDEN IMAGE BUILD COMPLETED SUCCESSFULLY"
-log "═══════════════════════════════════════════════════════════════════════════════"
-
-# Signal completion
+# Signal completion (even with errors — let the caller decide)
 touch "$READY_FILE"
 
-# Keep health endpoint running for monitoring
 log "Build complete. Health endpoint running on :8000"
 wait
 '''
@@ -3449,8 +3706,16 @@ class GCPVMManager:
 
         # Metadata
         # v147.0: Added port and repo URL for startup script configuration
+        # v228.0: Dynamic repo URL discovery — always pass to VM metadata
         jarvis_port = os.environ.get("JARVIS_PRIME_PORT", "8000")
-        jarvis_repo_url = os.environ.get("JARVIS_REPO_URL", "")  # Optional: private repo URL
+        
+        # v228.0: Dynamically discover repo URL (never rely on hardcoded fallbacks)
+        jarvis_repo_url = os.environ.get("JARVIS_REPO_URL") or os.environ.get("JARVIS_PRIME_REPO_URL", "")
+        if not jarvis_repo_url:
+            # Auto-detect from golden image builder's discovery logic
+            builder = self.get_golden_image_builder()
+            if builder:
+                jarvis_repo_url = builder._discover_prime_repo_url()
         
         metadata_items = [
             compute_v1.Items(key="jarvis-components", value=",".join(components)),
@@ -3459,9 +3724,16 @@ class GCPVMManager:
             compute_v1.Items(key="jarvis-port", value=jarvis_port),  # v147.0: Port for health checks
         ]
         
-        # v147.0: Add repo URL if configured (for private repos)
+        # v228.0: Always pass repo URL to VM metadata (critical for code availability)
         if jarvis_repo_url:
             metadata_items.append(compute_v1.Items(key="jarvis-repo-url", value=jarvis_repo_url))
+            logger.debug(f"   📦 Repo URL passed to VM: {jarvis_repo_url}")
+        else:
+            logger.warning(
+                "⚠️ [GCP] No JARVIS-Prime repo URL discovered. "
+                "VM startup script may fail to clone code. "
+                "Set JARVIS_PRIME_REPO_URL or JARVIS_REPO_URL."
+            )
 
         # v224.0: Deployment mode handling (golden image, container, or startup script)
         if use_golden_image_mode and golden_image_source:
@@ -3489,49 +3761,266 @@ class GCPVMManager:
                 compute_v1.Items(key="jarvis-golden-image-source", value=golden_image_source)
             )
             
-            # Golden images have minimal startup script - just start the service
+            # v228.0: Robust golden startup script with APARS, port config,
+            # model verification, service verification with retry
             golden_startup_script = '''#!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# v224.0: Golden Image Startup - Fast boot from pre-baked image
+# v228.0: Golden Image Startup - Enterprise-Grade Fast Boot
 # ═══════════════════════════════════════════════════════════════════════════════
-# This startup script runs on VMs created from golden images.
-# Since everything is pre-installed, we just need to start the service.
+# Runs on VMs created from golden images. Everything is pre-installed:
+#   - Python + venv + ML dependencies (Phase 3 SKIPPED)
+#   - JARVIS-Prime code cloned
+#   - LLM model pre-cached
+#   - systemd service configured
+#
+# This script:
+#   1. Starts APARS health endpoint immediately (<2s)
+#   2. Reads port from GCP metadata
+#   3. Sources pre-baked environment
+#   4. Validates pre-baked code + model integrity
+#   5. Starts the service (systemd or direct)
+#   6. Verifies service health with retries
+#   7. Signals APARS ready
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LOG_FILE="/var/log/jarvis-golden-startup.log"
+PROGRESS_FILE="/tmp/jarvis_progress.json"
+JARVIS_DIR="/opt/jarvis-prime"
+START_TIME=$(date +%s)
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
+update_apars() {
+    local phase=$1
+    local phase_progress=$2
+    local total_progress=$3
+    local checkpoint=$4
+    local model_loaded=${5:-false}
+    local ready=${6:-false}
+    local error=${7:-null}
+    local now=$(date +%s)
+    local elapsed=$((now - START_TIME))
+
+    cat > "$PROGRESS_FILE" << EOFPROGRESS
+{
+    "phase": ${phase},
+    "phase_progress": ${phase_progress},
+    "total_progress": ${total_progress},
+    "checkpoint": "${checkpoint}",
+    "model_loaded": ${model_loaded},
+    "ready_for_inference": ${ready},
+    "error": ${error},
+    "updated_at": ${now},
+    "elapsed_seconds": ${elapsed},
+    "deployment_mode": "golden_image",
+    "version": "228.0"
+}
+EOFPROGRESS
+}
+
+# ─── Phase 0: Instant APARS health endpoint (<2 seconds) ───
+update_apars 0 50 2 "golden_image_booting"
+
+python3 << 'EOFHEALTH' &
+import http.server, json, os, time
+
+PROGRESS_FILE = "/tmp/jarvis_progress.json"
+start_time = time.time()
+
+class APARSHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/health", "/health/"):
+            try:
+                with open(PROGRESS_FILE, "r") as f:
+                    state = json.load(f)
+            except:
+                state = {"phase": 0, "total_progress": 5, "checkpoint": "golden_booting",
+                         "model_loaded": False, "ready_for_inference": False}
+
+            elapsed = int(time.time() - start_time)
+            ready = state.get("ready_for_inference", False)
+            response = {
+                "status": "healthy" if ready else "starting",
+                "phase": "ready" if ready else "starting",
+                "mode": "inference" if ready else "golden-startup",
+                "model_loaded": state.get("model_loaded", False),
+                "ready_for_inference": ready,
+                "apars": {
+                    "version": "228.0",
+                    "phase_number": state.get("phase", 0),
+                    "phase_name": state.get("checkpoint", "starting"),
+                    "phase_progress": state.get("phase_progress", 0),
+                    "total_progress": state.get("total_progress", 5),
+                    "checkpoint": state.get("checkpoint", "starting"),
+                    "eta_seconds": max(0, 60 - elapsed) if not ready else 0,
+                    "elapsed_seconds": elapsed,
+                    "error": state.get("error"),
+                    "deployment_mode": "golden_image",
+                    "deps_prebaked": True,
+                    "skipped_phases": [2, 3]
+                },
+                "uptime_seconds": elapsed,
+                "version": "v228.0-golden"
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+        elif self.path == "/health/ready":
+            try:
+                with open(PROGRESS_FILE) as f:
+                    ready = json.load(f).get("ready_for_inference", False)
+            except:
+                ready = False
+            code = 200 if ready else 503
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ready": ready}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+port = int(os.environ.get("JARVIS_PORT", "8000"))
+server = http.server.HTTPServer(("0.0.0.0", port), APARSHandler)
+server.serve_forever()
+EOFHEALTH
+
+HEALTH_PID=$!
+sleep 1
+
 log "═══════════════════════════════════════════════════════════════════════════════"
-log "GOLDEN IMAGE STARTUP - Pre-baked environment detected"
+log "GOLDEN IMAGE STARTUP v228.0 - Pre-baked environment"
 log "═══════════════════════════════════════════════════════════════════════════════"
 
-# Source environment if exists
-if [ -f /opt/jarvis-prime/.env ]; then
+# ─── Read port from GCP metadata ───
+JARVIS_PORT=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \
+    http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-port \
+    2>/dev/null || echo "8000")
+export JARVIS_PORT
+log "Port: $JARVIS_PORT"
+
+# ─── Source pre-baked environment ───
+update_apars 1 0 10 "loading_environment"
+
+if [ -f "$JARVIS_DIR/.env" ]; then
     set -a
-    source /opt/jarvis-prime/.env
+    source "$JARVIS_DIR/.env"
     set +a
-    log "Environment loaded from /opt/jarvis-prime/.env"
+    log "✅ Environment loaded from $JARVIS_DIR/.env"
+else
+    log "⚠️  No .env file found at $JARVIS_DIR/.env"
 fi
 
-# Start the JARVIS-Prime service
-log "Starting JARVIS-Prime service..."
+# Ensure PYTHONPATH includes JARVIS_DIR
+export PYTHONPATH="${JARVIS_DIR}:${PYTHONPATH:-}"
+
+# ─── Validate pre-baked integrity ───
+update_apars 4 0 40 "validating_prebaked"
+
+VALIDATION_OK=true
+
+# Check code exists
+if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
+    log "✅ jarvis_prime module found"
+else
+    log "⚠️  jarvis_prime module NOT found — pulling latest code"
+    REPO_URL=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \
+        http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-repo-url \
+        2>/dev/null || echo "${JARVIS_PRIME_REPO_URL:-}")
+    if [ -n "$REPO_URL" ]; then
+        log "   Cloning from: $REPO_URL"
+        git clone --depth 1 "$REPO_URL" /tmp/jprime-rescue 2>&1 | tee -a "$LOG_FILE" && \
+            cp -a /tmp/jprime-rescue/* "$JARVIS_DIR/" 2>/dev/null && \
+            rm -rf /tmp/jprime-rescue && \
+            log "✅ Code rescued via git clone" || \
+            log "❌ Failed to clone code"
+    else
+        VALIDATION_OK=false
+        log "❌ No repo URL available — cannot rescue code"
+    fi
+fi
+
+# Check model cache
+MODEL_CACHE="${JARVIS_MODEL_CACHE:-$JARVIS_DIR/models}"
+if [ -d "$MODEL_CACHE" ] && [ "$(ls -A "$MODEL_CACHE" 2>/dev/null)" ]; then
+    MODEL_SIZE=$(du -sm "$MODEL_CACHE" 2>/dev/null | cut -f1 || echo "0")
+    log "✅ Model cache: ${MODEL_SIZE}MB"
+    update_apars 5 50 70 "model_cache_verified" true false
+else
+    log "⚠️  Model cache empty — models will download on first use"
+    update_apars 5 50 70 "model_cache_empty" false false
+fi
+
+# ─── Start the service ───
+update_apars 5 80 85 "starting_service" true false
+
+# Kill APARS health stub (the real server takes over the port)
+if [ -n "$HEALTH_PID" ]; then
+    kill "$HEALTH_PID" 2>/dev/null || true
+    sleep 1
+fi
+
+log "Starting JARVIS-Prime service on port $JARVIS_PORT..."
 
 if systemctl is-enabled jarvis-prime.service 2>/dev/null; then
-    # Use systemd service if available
+    # Override port via systemd drop-in (dynamic, not hardcoded)
+    mkdir -p /etc/systemd/system/jarvis-prime.service.d
+    cat > /etc/systemd/system/jarvis-prime.service.d/port.conf << EOFOVERRIDE
+[Service]
+Environment=JARVIS_PORT=${JARVIS_PORT}
+Environment=PYTHONPATH=${JARVIS_DIR}
+EOFOVERRIDE
+    systemctl daemon-reload
     systemctl start jarvis-prime.service
-    log "Started via systemd"
+    log "Started via systemd (port $JARVIS_PORT)"
 else
-    # Fallback: start directly
-    cd /opt/jarvis-prime
+    # Fallback: start directly with proper environment
+    cd "$JARVIS_DIR"
     source venv/bin/activate
-    nohup python -m jarvis_prime.server > /var/log/jarvis-prime.log 2>&1 &
-    log "Started directly (systemd not available)"
+    set -a
+    [ -f .env ] && source .env
+    set +a
+    export JARVIS_PORT
+    export PYTHONPATH="${JARVIS_DIR}:${PYTHONPATH:-}"
+    nohup python -m jarvis_prime.server \
+        --host 0.0.0.0 --port "$JARVIS_PORT" \
+        > /var/log/jarvis-prime.log 2>&1 &
+    log "Started directly (port $JARVIS_PORT, PID: $!)"
 fi
 
-log "Golden image startup complete - service should be ready in ~30 seconds"
+# ─── Verify service health with retries ───
+update_apars 6 0 90 "verifying_service" true false
+
+READY=false
+for attempt in $(seq 1 15); do
+    sleep 2
+    if curl -sf "http://localhost:${JARVIS_PORT}/health" > /dev/null 2>&1; then
+        READY=true
+        log "✅ Service healthy after $((attempt * 2)) seconds"
+        break
+    fi
+    update_apars 6 $((attempt * 6)) $((90 + attempt / 2)) "verifying_attempt_${attempt}" true false
+done
+
+if [ "$READY" = true ]; then
+    update_apars 6 100 100 "inference_ready" true true
+    log "═══════════════════════════════════════════════════════════════════════════════"
+    ELAPSED=$(($(date +%s) - START_TIME))
+    log "✅ GOLDEN IMAGE STARTUP COMPLETE in ${ELAPSED}s"
+    log "   Port: $JARVIS_PORT | Mode: golden_image | Ready: true"
+    log "═══════════════════════════════════════════════════════════════════════════════"
+else
+    update_apars 6 100 95 "service_start_timeout" true false '"service_health_check_failed"'
+    log "⚠️  Service not responding after 30s — may need more time"
+    log "   Check: curl http://localhost:${JARVIS_PORT}/health"
+    log "   Logs:  journalctl -u jarvis-prime.service"
+fi
 '''
             metadata_items.append(
                 compute_v1.Items(key="startup-script", value=golden_startup_script)

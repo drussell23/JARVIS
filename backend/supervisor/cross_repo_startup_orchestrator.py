@@ -14815,7 +14815,7 @@ cd /opt
 if [ -d "jarvis-prime" ]; then
     cd jarvis-prime && git pull
 else
-    git clone https://github.com/your-org/jarvis-prime.git
+    git clone "${JARVIS_PRIME_REPO_URL:-https://github.com/drussell23/jarvis-prime.git}"
     cd jarvis-prime
 fi
 
