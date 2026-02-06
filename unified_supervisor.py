@@ -60883,8 +60883,12 @@ class JarvisSystemKernel:
                                             continue
 
                                     elapsed = time.time() - _bg_start
-                                    # Fallback synthetic: 40% → 95% over background_timeout
-                                    new_pct = min(95, 40 + int((elapsed / background_timeout) * 55))
+                                    # v229.0: Synthetic progress rate depends on deployment mode
+                                    # Golden image: 40% → 95% over 90s (fast boot)
+                                    # Standard: 40% → 95% over background_timeout (~600s)
+                                    _is_golden = os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true"
+                                    _effective_timeout = 90.0 if _is_golden else background_timeout
+                                    new_pct = min(95, 40 + int((elapsed / _effective_timeout) * 55))
                                     if new_pct > _last_pct:
                                         _last_pct = new_pct
                                         # v229.0: More descriptive checkpoint based on deploy mode
@@ -62868,6 +62872,54 @@ class JarvisSystemKernel:
                                 # This fixes race where node becomes ready after initial check but before Trinity
                                 invincible_ready = getattr(self, '_invincible_node_ready', False)
                                 invincible_ip = getattr(self, '_invincible_node_ip', None)
+                                
+                                # v229.0: GOLDEN IMAGE WAIT — If golden image is enabled and VM is
+                                # actively starting (not yet ready), wait up to 90s for it instead of
+                                # falling back to local Prime. Golden image VMs boot in ~30-60s, so
+                                # waiting is dramatically faster than local LLM loading (~12min).
+                                # This eliminates the timing race between VM boot and Trinity start.
+                                _golden_image_active = os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true"
+                                _early_prime_was_skipped = getattr(self, '_early_prime_skipped_for_cloud', False)
+                                
+                                if not invincible_ready and _golden_image_active and self.config.invincible_node_enabled:
+                                    _max_golden_wait = 120  # Max seconds to wait for golden image VM
+                                    _poll_interval = 3      # Check every 3 seconds
+                                    self.logger.info(
+                                        f"[Trinity] ☁️ Golden image VM not ready yet — "
+                                        f"waiting up to {_max_golden_wait}s (faster than local LLM ~12min)"
+                                    )
+                                    
+                                    _golden_wait_start = time.time()
+                                    while time.time() - _golden_wait_start < _max_golden_wait:
+                                        await asyncio.sleep(_poll_interval)
+                                        invincible_ready = getattr(self, '_invincible_node_ready', False)
+                                        invincible_ip = getattr(self, '_invincible_node_ip', None)
+                                        
+                                        if invincible_ready:
+                                            _wait_elapsed = time.time() - _golden_wait_start
+                                            self.logger.info(
+                                                f"[Trinity] ☁️ Golden image VM became ready after "
+                                                f"{_wait_elapsed:.0f}s wait!"
+                                            )
+                                            break
+                                        
+                                        # Update dashboard with wait progress
+                                        _wait_elapsed = time.time() - _golden_wait_start
+                                        _wait_pct = min(95, int((_wait_elapsed / _max_golden_wait) * 100))
+                                        try:
+                                            dashboard.add_log(
+                                                f"Waiting for golden image VM... ({_wait_elapsed:.0f}s/{_max_golden_wait}s)",
+                                                "DEBUG"
+                                            )
+                                        except Exception:
+                                            pass
+                                    
+                                    if not invincible_ready:
+                                        _total_waited = time.time() - _golden_wait_start
+                                        self.logger.warning(
+                                            f"[Trinity] ⚠️ Golden image VM not ready after {_total_waited:.0f}s. "
+                                            f"Falling back to local Prime."
+                                        )
                                 
                                 # v219.0: If ready and URL not yet propagated, do it now
                                 if invincible_ready and invincible_ip:
