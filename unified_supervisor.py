@@ -55604,9 +55604,63 @@ class TrinityIntegrator:
         last_state: Optional[ReadinessState] = None
         last_phase: Optional[str] = None
 
+        # v230.0: PROGRESS-AWARE TIMEOUT EXTENSION for ML model loading
+        # ROOT CAUSE FIX: Previous implementation used a fixed timeout (e.g., 720s) that
+        # would kill Prime at 95% model loading because there was no awareness of progress.
+        # The outer _await_trinity_with_progress_awareness wrapper had adaptive deadlines
+        # but they didn't propagate to this inner health check — the inner timeout expired
+        # independently and returned False, making the outer extensions useless.
+        #
+        # Now _wait_for_health itself is progress-aware:
+        # 1. Tracks model loading progress between iterations
+        # 2. When timeout is near AND progress is being made → extends deadline
+        # 3. Uses hardware-aware max cap (RAM-based)
+        # 4. Only applies to heavy-loading components (Prime), not fast ones (Reactor)
+        _pa_is_heavy_component = "prime" in component.name.lower()
+        _pa_effective_deadline = timeout  # Seconds from start_time; can be extended
+
+        if _pa_is_heavy_component:
+            # Dynamic max timeout based on available RAM
+            # Lower RAM = slower model loading = need more time
+            _pa_ram_multiplier = 2.0  # Default: allow 2x original timeout
+            try:
+                import psutil as _pa_psutil
+                _pa_total_ram_gb = _pa_psutil.virtual_memory().total / (1024 ** 3)
+                if _pa_total_ram_gb < 16:
+                    _pa_ram_multiplier = 3.0  # Very low RAM: 3x
+                elif _pa_total_ram_gb < 32:
+                    _pa_ram_multiplier = 2.5  # Low RAM (16-32GB): 2.5x
+                elif _pa_total_ram_gb < 64:
+                    _pa_ram_multiplier = 2.0  # Medium RAM (32-64GB): 2x
+                else:
+                    _pa_ram_multiplier = 1.5  # High RAM (64GB+): 1.5x
+                self.logger.debug(
+                    f"[Trinity] {component.name}: RAM={_pa_total_ram_gb:.0f}GB → "
+                    f"timeout multiplier={_pa_ram_multiplier}x"
+                )
+            except Exception:
+                pass
+
+            _pa_max_deadline = timeout * _pa_ram_multiplier
+            _pa_max_extensions = int(os.environ.get("JARVIS_HEALTH_MAX_EXTENSIONS", "8"))
+            _pa_extension_buffer = float(os.environ.get("JARVIS_HEALTH_EXTENSION_BUFFER", "120.0"))
+            _pa_stall_threshold = float(os.environ.get("JARVIS_HEALTH_STALL_THRESHOLD", "120.0"))
+            _pa_near_completion_pct = float(os.environ.get("JARVIS_HEALTH_NEAR_COMPLETE_PCT", "85.0"))
+        else:
+            _pa_max_deadline = timeout
+            _pa_max_extensions = 0
+            _pa_extension_buffer = 0.0
+            _pa_stall_threshold = 60.0
+            _pa_near_completion_pct = 95.0
+
+        _pa_extensions_granted = 0
+        _pa_last_progress = 0.0
+        _pa_last_progress_time = start_time
+        _pa_peak_progress = 0.0  # Monotonic high-water mark
+
         # Create a reusable session for efficiency
         async with aiohttp.ClientSession() as session:  # type: ignore
-            while (time.time() - start_time) < timeout:
+            while (time.time() - start_time) < _pa_effective_deadline:
                 attempt += 1
                 elapsed = time.time() - start_time
 
@@ -55728,8 +55782,10 @@ class TrinityIntegrator:
                         elif loading_progress > 0:
                             progress_pct = int(loading_progress)
                         else:
-                            # Fallback: estimate based on elapsed time (~720s total)
-                            progress_pct = min(95, int((elapsed / 720.0) * 100))
+                            # Fallback: estimate based on elapsed time
+                            # v230.0: Use effective deadline instead of hardcoded 720s
+                            _est_total = _pa_effective_deadline if _pa_effective_deadline > 0 else timeout
+                            progress_pct = min(95, int((elapsed / _est_total) * 100))
                         
                         # Get model name and stage from response
                         model_name = raw.get("active_model") or raw.get("model") or raw.get("model_name") or "LLM"
@@ -55737,12 +55793,14 @@ class TrinityIntegrator:
                         stage_detail = raw.get("loading_detail") or raw.get("status_message") or f"Loading {model_name} into memory"
                         
                         # Calculate ETA
+                        # v230.0: Use effective deadline for estimates, not hardcoded value
+                        _est_total_for_eta = _pa_effective_deadline if _pa_effective_deadline > 0 else timeout
                         if progress_pct > 5 and elapsed > 10:
                             # Based on actual progress rate
                             rate = progress_pct / elapsed
                             remaining_seconds = int((100 - progress_pct) / rate) if rate > 0 else 600
                         else:
-                            remaining_seconds = 720 - int(elapsed)
+                            remaining_seconds = max(0, int(_est_total_for_eta - elapsed))
                         
                         # Update dashboard with real-time progress
                         update_dashboard_model_loading(
@@ -55752,7 +55810,7 @@ class TrinityIntegrator:
                             progress_pct=progress_pct,
                             stage=loading_stage,
                             stage_detail=stage_detail,
-                            estimated_total_seconds=720,
+                            estimated_total_seconds=int(_est_total_for_eta),
                             elapsed_seconds=int(elapsed),
                             reason=f"Loading ~7B parameters into memory ({progress_pct}% complete, ~{remaining_seconds//60}m {remaining_seconds%60}s remaining)"
                         )
@@ -55827,14 +55885,109 @@ class TrinityIntegrator:
                     )
                     last_callback_time = time.time()
 
+                # v230.0: Progress-aware timeout extension for heavy components
+                # This is the ROOT CAUSE FIX for the 95%-timeout-kill failure.
+                # When model loading shows active progress and the deadline is near,
+                # extend the deadline to let it finish instead of killing at 95%.
+                if _pa_is_heavy_component and _pa_extensions_granted < _pa_max_extensions:
+                    _pa_remaining = _pa_effective_deadline - (time.time() - start_time)
+                    _pa_current_progress = 0.0
+
+                    # Extract progress from health response (multiple sources)
+                    if result.raw_response:
+                        _pa_current_progress = max(
+                            float(result.raw_response.get("model_load_progress_pct", 0)),
+                            float(result.raw_response.get("startup_progress", 0)),
+                            float(result.raw_response.get("loading_progress", 0)),
+                        )
+                        # Also check v2 init_progress for overall completion
+                        _pa_init_progress = result.raw_response.get("init_progress")
+                        if _pa_init_progress and isinstance(_pa_init_progress, dict):
+                            _pa_overall = float(_pa_init_progress.get("overall_pct", 0))
+                            _pa_current_progress = max(_pa_current_progress, _pa_overall)
+
+                    # Track monotonic progress (never regress)
+                    _pa_peak_progress = max(_pa_peak_progress, _pa_current_progress)
+
+                    # Track progress deltas
+                    if _pa_current_progress > _pa_last_progress:
+                        _pa_last_progress_time = time.time()
+                        _pa_last_progress = _pa_current_progress
+
+                    # Extension decision: only when deadline is near
+                    if _pa_remaining < 60:
+                        _pa_time_since_last = time.time() - _pa_last_progress_time
+                        _pa_should_extend = False
+                        _pa_reason = ""
+
+                        # Case 1: Near completion (>85%) — very likely to finish soon
+                        if _pa_peak_progress >= _pa_near_completion_pct:
+                            _pa_should_extend = True
+                            # Calculate ETA from progress rate
+                            _pa_elapsed_total = time.time() - start_time
+                            if _pa_peak_progress > 10 and _pa_elapsed_total > 30:
+                                _pa_rate = _pa_peak_progress / _pa_elapsed_total
+                                _pa_eta = (100 - _pa_peak_progress) / _pa_rate if _pa_rate > 0 else 300
+                                _pa_reason = (
+                                    f"near completion ({_pa_peak_progress:.0f}%, "
+                                    f"ETA ~{_pa_eta:.0f}s)"
+                                )
+                            else:
+                                _pa_reason = f"near completion ({_pa_peak_progress:.0f}%)"
+
+                        # Case 2: Active progress (not stalled)
+                        elif _pa_current_progress > 0 and _pa_time_since_last < _pa_stall_threshold:
+                            _pa_should_extend = True
+                            _pa_reason = (
+                                f"active progress ({_pa_peak_progress:.0f}%, "
+                                f"last delta {_pa_time_since_last:.0f}s ago)"
+                            )
+
+                        # Case 3: Model loading state is active even without numeric progress
+                        elif result.state == ComponentReadinessState.LOADING:
+                            if _pa_time_since_last < _pa_stall_threshold * 1.5:
+                                _pa_should_extend = True
+                                _pa_reason = (
+                                    f"LOADING state active "
+                                    f"(phase={result.phase}, stall window not exceeded)"
+                                )
+
+                        if _pa_should_extend:
+                            # Calculate extension: use ETA if available, otherwise buffer
+                            _pa_max_remaining = _pa_max_deadline - (time.time() - start_time)
+                            if _pa_max_remaining <= 10:
+                                # Hard cap reached — no more extensions
+                                self.logger.warning(
+                                    f"[Trinity] {component.name}: Hard cap reached "
+                                    f"({_pa_max_deadline:.0f}s), no more extensions. "
+                                    f"Progress: {_pa_peak_progress:.0f}%"
+                                )
+                            else:
+                                _pa_extension = min(_pa_extension_buffer, _pa_max_remaining)
+                                _pa_effective_deadline = (time.time() - start_time) + _pa_extension
+                                _pa_extensions_granted += 1
+                                self.logger.warning(
+                                    f"[Trinity] 🔄 {component.name} health wait EXTENDED by "
+                                    f"{_pa_extension:.0f}s (reason: {_pa_reason}, "
+                                    f"extension #{_pa_extensions_granted}/{_pa_max_extensions}, "
+                                    f"new effective timeout: {_pa_effective_deadline:.0f}s)"
+                                )
+
                 # Dynamic polling interval based on state and estimated wait
                 poll_interval = self._calculate_poll_interval(result)
                 await asyncio.sleep(poll_interval)
 
         # Timeout - gather diagnostic information
         elapsed = time.time() - start_time
+        _pa_timeout_label = f"{timeout}s"
+        if _pa_extensions_granted > 0:
+            _pa_timeout_label = (
+                f"{_pa_effective_deadline:.0f}s "
+                f"(base: {timeout:.0f}s + {_pa_extensions_granted} extensions)"
+            )
         self.logger.warning(
-            f"[Trinity] ⏱️  {component.name} did not become ready within {timeout}s"
+            f"[Trinity] ⏱️  {component.name} did not become ready within {_pa_timeout_label}. "
+            f"Peak progress: {_pa_peak_progress:.0f}%"
         )
 
         # Final check to get diagnostic info
@@ -55850,10 +56003,16 @@ class TrinityIntegrator:
                 attempt, elapsed
             )
 
-        # v197.1: Update dashboard with timeout error
+        # v230.0: Enhanced timeout error with progress context
+        _pa_timeout_msg = f"Timeout ({_pa_effective_deadline:.0f}s"
+        if _pa_extensions_granted > 0:
+            _pa_timeout_msg += f", {_pa_extensions_granted} extensions"
+        if _pa_peak_progress > 0:
+            _pa_timeout_msg += f", peak: {_pa_peak_progress:.0f}%"
+        _pa_timeout_msg += ")"
         update_dashboard_component_status(
             component.name, "error",
-            f"Timeout ({timeout:.0f}s)"
+            _pa_timeout_msg
         )
 
         return False
@@ -58945,6 +59104,7 @@ class JarvisSystemKernel:
         # =====================================================================
         self._early_prime_task: Optional[asyncio.Task] = None
         self._early_prime_skipped_for_cloud: bool = False  # v229.0: Track skip reason
+        self._local_prime_is_hedge_for_cloud: bool = False  # v230.0: Local is racing GCP
         
         # v229.0: Determine if cloud inference should replace local pre-warm
         _skip_local_prewarm = False
@@ -58974,29 +59134,81 @@ class JarvisSystemKernel:
             except Exception:
                 pass
             
+            # v230.0: PARALLEL HEDGING — ROOT CAUSE FIX for golden image timeout cascade
+            #
+            # PREVIOUS BEHAVIOR (v229): When golden image was expected, local pre-warm
+            # was completely skipped. If GCP VM failed to boot in 180s, local Prime had
+            # to start from SCRATCH with zero head start, adding 180s+ penalty. The model
+            # reached 95% at the 720s mark and got killed — needing only ~40 more seconds.
+            #
+            # NEW BEHAVIOR (v230): Always start local Prime as a PARALLEL HEDGE alongside
+            # GCP. This creates a "race" pattern:
+            #   - If GCP VM wins → cloud takeover kills local Prime (already handled at ~line 60943)
+            #   - If local Prime wins → immediate inference, GCP continues in background
+            #   - If both fail → at least we maximized our chances
+            #
+            # The 5-7 minute head start from early pre-warm means local Prime will almost
+            # certainly finish before the Trinity phase even starts, eliminating the timeout
+            # cascade entirely.
+            #
+            # Cases where we STILL skip local pre-warm:
+            #   - Explicit GCP inference endpoint configured (user chose cloud-only)
+            #   - Explicit hollow client mode set (user chose cloud routing)
+            # Cases where we now HEDGE instead of skipping:
+            #   - Golden image mode (GCP might fail to boot)
+            #   - Low RAM + GCP available (local is slow but still viable as backup)
+
             if _use_golden_image and (_has_static_ip or _gcp_enabled):
-                _skip_local_prewarm = True
-                _skip_reason = f"golden_image_enabled (GCP static IP: {_has_static_ip})"
+                # v230.0: DON'T skip — start local as parallel hedge
+                _skip_local_prewarm = False
+                self._local_prime_is_hedge_for_cloud = True
+                self._early_prime_skipped_for_cloud = False
+                self.logger.info(
+                    "[Kernel] 🛡️ PARALLEL HEDGE: Starting local Prime pre-warm alongside GCP golden image"
+                )
+                self.logger.info(
+                    "[Kernel]    Strategy: First-to-ready wins. If GCP boots fast → local killed. "
+                    "If GCP slow → local provides inference."
+                )
+                self.logger.info(
+                    f"[Kernel]    GCP: golden image ({_has_static_ip=}), Local: pre-warm begins NOW"
+                )
+                add_dashboard_log(
+                    "Parallel hedge: local LLM + GCP golden image racing", "INFO"
+                )
+            elif _low_ram and _gcp_enabled and not _hollow_client:
+                # v230.0: Low RAM with GCP — hedge instead of skip
+                _skip_local_prewarm = False
+                self._local_prime_is_hedge_for_cloud = True
+                self._early_prime_skipped_for_cloud = False
+                self.logger.info(
+                    f"[Kernel] 🛡️ PARALLEL HEDGE: Low RAM ({_total_ram_gb:.0f}GB) with GCP available"
+                )
+                self.logger.info(
+                    "[Kernel]    Local loading is slow but viable. Starting as backup for GCP."
+                )
+                add_dashboard_log(
+                    f"Parallel hedge: local LLM (slow, {_total_ram_gb:.0f}GB) + GCP racing", "INFO"
+                )
             elif _hollow_client and _gcp_enabled:
+                # Explicit hollow client mode — respect user's choice
                 _skip_local_prewarm = True
-                _skip_reason = f"hollow_client_mode (RAM: {_total_ram_gb:.0f}GB < 32GB)"
+                _skip_reason = f"hollow_client_mode (RAM: {_total_ram_gb:.0f}GB, explicit config)"
             elif _use_gcp_inference or _gcp_prime_endpoint:
+                # Explicit GCP inference endpoint — respect user's choice
                 _skip_local_prewarm = True
                 _skip_reason = f"gcp_inference_configured (endpoint: {bool(_gcp_prime_endpoint)})"
-            elif _low_ram and _gcp_enabled:
-                _skip_local_prewarm = True
-                _skip_reason = f"low_ram_gcp_available (RAM: {_total_ram_gb:.0f}GB, GCP: enabled)"
-            
+
             if _skip_local_prewarm:
                 self.logger.info(
-                    f"[Kernel] ☁️ SKIPPING local LLM pre-warm → Cloud inference via golden image"
+                    f"[Kernel] ☁️ SKIPPING local LLM pre-warm → Cloud inference only"
                 )
                 self.logger.info(f"[Kernel]    Reason: {_skip_reason}")
                 self.logger.info(
                     "[Kernel]    GCP Invincible Node will provide inference (~30-60s with golden image)"
                 )
                 self._early_prime_skipped_for_cloud = True
-                add_dashboard_log("Cloud inference mode: skipping local LLM loading", "INFO")
+                add_dashboard_log("Cloud-only inference mode: skipping local LLM loading", "INFO")
         
         if self.config.trinity_enabled and os.getenv("JARVIS_EARLY_PRIME_PREWARM", "true").lower() == "true" and not _skip_local_prewarm:
             self.logger.info("[Kernel] 🚀 Starting EARLY PRIME PRE-WARM (12-minute LLM load begins NOW)")
@@ -62434,10 +62646,16 @@ class JarvisSystemKernel:
                     else stall_threshold
                 )
 
-                # v229.0: Completion detection — if progress is 100% and component
-                # is no longer actively initializing, the startup is DONE but the
-                # asyncio coroutine may still be doing internal cleanup. Handle this
-                # explicitly instead of falling through to the deadline expiry path.
+                # v230.0: COMPLETION DETECTION — ROOT CAUSE FIX
+                # Previous v229 logic assumed init_progress=100% + not_active meant "done".
+                # But init_progress can report 100% (all 9 phases entered) while the inner
+                # _wait_for_health is still waiting for model_loaded=True / ready_for_inference=True.
+                # The v2 protocol's "marking_ready" phase (9/9) fires when entered, not completed.
+                #
+                # v230.0 adds ACTUAL HEALTH VERIFICATION before treating 100% as complete.
+                # If init phases report 100% but the component isn't actually healthy yet,
+                # treat it as "near completion" and use normal extension logic instead of
+                # the limited grace-period path.
                 if current_progress >= 100.0 and not model_loading_active:
                     if startup_task.done():
                         # Task already finished — collect results immediately
@@ -62453,16 +62671,54 @@ class JarvisSystemKernel:
                                 f"[{integrator_name}] Task completed with error: {e}"
                             )
                             return {}, True, f"Task completed with error: {e}"
-                    elif remaining <= poll_interval:
-                        # Task not done yet but progress=100% — grant grace period
-                        # for coroutine cleanup (post-health-check bookkeeping, etc.)
+
+                    # v230.0: Verify actual health before granting grace
+                    # The inner _wait_for_health checks model_loaded + ready_for_inference.
+                    # If those aren't True yet, the inner check is still running and needs
+                    # more time — use normal extension logic (more generous than grace period).
+                    _actual_health_ready = False
+                    try:
+                        import aiohttp as _cd_aiohttp
+                        _cd_port = int(os.environ.get(
+                            "TRINITY_JPRIME_PORT",
+                            os.environ.get("JARVIS_PRIME_PORT", "8000")
+                        ))
+                        async with _cd_aiohttp.ClientSession() as _cd_sess:
+                            async with _cd_sess.get(
+                                f"http://localhost:{_cd_port}/health",
+                                timeout=_cd_aiohttp.ClientTimeout(total=3.0),
+                            ) as _cd_resp:
+                                if _cd_resp.status == 200:
+                                    _cd_data = await _cd_resp.json()
+                                    _actual_health_ready = (
+                                        _cd_data.get("ready_for_inference", False) is True
+                                        and _cd_data.get("status") in ("healthy", "ready")
+                                    )
+                                    if not _actual_health_ready:
+                                        # v230.0: Init reports 100% but health isn't there yet
+                                        # Override model_loading_active so we fall through to
+                                        # the normal extension logic below (which is more
+                                        # generous than the old 60s grace period)
+                                        model_loading_active = True
+                                        _cd_model_pct = _cd_data.get("model_load_progress_pct", 0)
+                                        self.logger.info(
+                                            f"[{integrator_name}] v230.0: Init 100% but health not ready "
+                                            f"(model={_cd_model_pct}%, status={_cd_data.get('status')}, "
+                                            f"ready_for_inference={_cd_data.get('ready_for_inference')}). "
+                                            f"Using normal extension logic instead of grace period."
+                                        )
+                    except Exception:
+                        pass
+
+                    if not model_loading_active and remaining <= poll_interval:
+                        # Truly complete + inactive — grant grace period for cleanup
                         grace_seconds = 60.0
                         grace_deadline = now + grace_seconds
                         if grace_deadline <= start_time + max_timeout:
                             current_deadline = grace_deadline
                             extensions_granted += 1
                             self.logger.info(
-                                f"[{integrator_name}] Progress 100% + inactive — "
+                                f"[{integrator_name}] Progress 100% + verified inactive — "
                                 f"granting {grace_seconds:.0f}s grace for coroutine cleanup "
                                 f"(extension #{extensions_granted})"
                             )
@@ -62878,34 +63134,62 @@ class JarvisSystemKernel:
                                 invincible_ready = getattr(self, '_invincible_node_ready', False)
                                 invincible_ip = getattr(self, '_invincible_node_ip', None)
                                 
-                                # v229.0: GOLDEN IMAGE WAIT — If golden image is enabled and VM is
-                                # actively starting (not yet ready), wait up to 90s for it instead of
-                                # falling back to local Prime. Golden image VMs boot in ~30-60s, so
-                                # waiting is dramatically faster than local LLM loading (~12min).
-                                # This eliminates the timing race between VM boot and Trinity start.
+                                # v230.0: PROGRESS-AWARE GOLDEN IMAGE WAIT
+                                # ROOT CAUSE FIX: Previous v229 used a hardcoded 180s timer with
+                                # zero progress awareness. This caused two problems:
+                                #   1. If VM was making progress but slow, it got killed at 53%
+                                #   2. If VM was stalled, we wasted the full 180s before detecting it
+                                #
+                                # v230.0 applies the same adaptive deadline philosophy used by
+                                # _await_trinity_with_progress_awareness:
+                                #   - Track GCP VM progress (APARS data + dashboard state)
+                                #   - If progress is increasing → extend deadline
+                                #   - If stalled for >60s → stop waiting early (local is loading in parallel)
+                                #   - If local pre-warm is running (v230 hedge), wait is less critical
+                                #     but still valuable for faster inference
                                 _golden_image_active = os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true"
                                 _early_prime_was_skipped = getattr(self, '_early_prime_skipped_for_cloud', False)
+                                _local_is_hedge = getattr(self, '_local_prime_is_hedge_for_cloud', False)
                                 
                                 if not invincible_ready and _golden_image_active and self.config.invincible_node_enabled:
-                                    _max_golden_wait = 180  # Max seconds to wait for golden image VM
-                                    _poll_interval = 5      # Check every 5 seconds
-                                    self.logger.info(
-                                        f"[Trinity] ☁️ Golden image VM not ready yet — "
-                                        f"waiting up to {_max_golden_wait}s (faster than local LLM ~12min)"
-                                    )
-                                    
-                                    # v229.1: Explain WHY we're waiting
-                                    # VM was just created from golden image. Creation takes ~60s,
-                                    # boot takes ~30s, startup script takes ~10s. Total: ~100s.
-                                    # We need to give it enough time.
+                                    # v230.0: Dynamic base wait — shorter when local hedge is running
+                                    _gw_base_wait = float(os.environ.get(
+                                        "JARVIS_GOLDEN_WAIT_BASE",
+                                        "90" if _local_is_hedge else "180"
+                                    ))
+                                    _gw_max_wait = float(os.environ.get(
+                                        "JARVIS_GOLDEN_WAIT_MAX", "300"
+                                    ))
+                                    _gw_poll_interval = 5.0
+                                    _gw_stall_threshold = float(os.environ.get(
+                                        "JARVIS_GOLDEN_STALL_THRESHOLD", "60"
+                                    ))
+                                    _gw_max_extensions = 4
+
+                                    _gw_effective_wait = _gw_base_wait
+                                    _gw_extensions = 0
+                                    _gw_last_progress = 0.0
+                                    _gw_last_progress_time = time.time()
+
+                                    if _local_is_hedge:
+                                        self.logger.info(
+                                            f"[Trinity] ☁️ Golden image VM not ready — waiting up to "
+                                            f"{_gw_base_wait:.0f}s (local Prime loading in parallel as hedge)"
+                                        )
+                                    else:
+                                        self.logger.info(
+                                            f"[Trinity] ☁️ Golden image VM not ready yet — "
+                                            f"waiting up to {_gw_base_wait:.0f}s (progress-aware, max {_gw_max_wait:.0f}s)"
+                                        )
                                     self.logger.info(
                                         "[Trinity]    Timeline: VM create ~60s + boot ~30s + startup ~10s = ~100s total"
                                     )
                                     
                                     _golden_wait_start = time.time()
                                     _last_gcp_status = ""
-                                    while time.time() - _golden_wait_start < _max_golden_wait:
-                                        await asyncio.sleep(_poll_interval)
+
+                                    while time.time() - _golden_wait_start < _gw_effective_wait:
+                                        await asyncio.sleep(_gw_poll_interval)
                                         invincible_ready = getattr(self, '_invincible_node_ready', False)
                                         invincible_ip = getattr(self, '_invincible_node_ip', None)
                                         
@@ -62917,34 +63201,89 @@ class JarvisSystemKernel:
                                             )
                                             break
                                         
-                                        # v229.1: Show GCP progress detail so user knows what's happening
                                         _wait_elapsed = time.time() - _golden_wait_start
+
+                                        # v230.0: Track GCP progress for adaptive extension
+                                        _gw_current_progress = 0.0
+                                        _gw_checkpoint = ""
                                         try:
                                             _gcp = dashboard._gcp_state
-                                            _gcp_checkpoint = _gcp.get("checkpoint", "")
-                                            _gcp_pct = _gcp.get("progress", 0)
-                                            _status_msg = f"GCP: {_gcp_pct:.0f}% - {_gcp_checkpoint}" if _gcp_checkpoint else f"GCP: {_gcp_pct:.0f}%"
+                                            _gw_checkpoint = _gcp.get("checkpoint", "")
+                                            _gw_current_progress = float(_gcp.get("progress", 0))
+                                            _status_msg = (
+                                                f"GCP: {_gw_current_progress:.0f}% - {_gw_checkpoint}"
+                                                if _gw_checkpoint
+                                                else f"GCP: {_gw_current_progress:.0f}%"
+                                            )
                                             if _status_msg != _last_gcp_status:
                                                 dashboard.add_log(
-                                                    f"Waiting for golden image VM ({_wait_elapsed:.0f}s/{_max_golden_wait}s) — {_status_msg}",
+                                                    f"Waiting for golden image VM "
+                                                    f"({_wait_elapsed:.0f}s/{_gw_effective_wait:.0f}s) — {_status_msg}",
                                                     "DEBUG"
                                                 )
                                                 _last_gcp_status = _status_msg
                                             else:
                                                 dashboard.add_log(
-                                                    f"Waiting for golden image VM... ({_wait_elapsed:.0f}s/{_max_golden_wait}s)",
+                                                    f"Waiting for golden image VM... "
+                                                    f"({_wait_elapsed:.0f}s/{_gw_effective_wait:.0f}s)",
                                                     "DEBUG"
                                                 )
                                         except Exception:
                                             pass
+
+                                        # Track progress changes
+                                        if _gw_current_progress > _gw_last_progress:
+                                            _gw_last_progress = _gw_current_progress
+                                            _gw_last_progress_time = time.time()
+
+                                        # Stall detection: if no progress for threshold → stop waiting early
+                                        _gw_time_since_progress = time.time() - _gw_last_progress_time
+                                        if (
+                                            _gw_time_since_progress > _gw_stall_threshold
+                                            and _gw_last_progress > 0
+                                            and _local_is_hedge
+                                        ):
+                                            self.logger.warning(
+                                                f"[Trinity] ⚠️ GCP VM stalled for {_gw_time_since_progress:.0f}s "
+                                                f"at {_gw_last_progress:.0f}% — stopping wait early "
+                                                f"(local Prime loading in parallel)"
+                                            )
+                                            break
+
+                                        # Adaptive deadline extension when deadline is near
+                                        _gw_remaining = _gw_effective_wait - _wait_elapsed
+                                        if (
+                                            _gw_remaining < 15
+                                            and _gw_extensions < _gw_max_extensions
+                                            and _gw_current_progress > _gw_last_progress * 0.8
+                                            and _gw_time_since_progress < _gw_stall_threshold
+                                        ):
+                                            # VM is making progress — extend wait
+                                            _gw_extension = min(
+                                                60.0,
+                                                _gw_max_wait - _wait_elapsed
+                                            )
+                                            if _gw_extension > 10:
+                                                _gw_effective_wait += _gw_extension
+                                                _gw_extensions += 1
+                                                self.logger.info(
+                                                    f"[Trinity] 🔄 Golden wait EXTENDED by {_gw_extension:.0f}s "
+                                                    f"(VM at {_gw_current_progress:.0f}%, making progress, "
+                                                    f"extension #{_gw_extensions}/{_gw_max_extensions})"
+                                                )
                                     
                                     if not invincible_ready:
                                         _total_waited = time.time() - _golden_wait_start
-                                        self.logger.warning(
-                                            f"[Trinity] ⚠️ Golden image VM not ready after {_total_waited:.0f}s. "
-                                            f"Falling back to local Prime."
+                                        _gw_fallback_msg = (
+                                            "Continuing with local Prime (already loading in parallel)"
+                                            if _local_is_hedge
+                                            else "Falling back to local Prime."
                                         )
-                                        # v229.1: Log GCP VM status for diagnostics
+                                        self.logger.warning(
+                                            f"[Trinity] ⚠️ Golden image VM not ready after "
+                                            f"{_total_waited:.0f}s. {_gw_fallback_msg}"
+                                        )
+                                        # Log final GCP state for diagnostics
                                         try:
                                             _gcp_final = dashboard._gcp_state
                                             self.logger.warning(
@@ -62955,6 +63294,11 @@ class JarvisSystemKernel:
                                             )
                                         except Exception:
                                             pass
+                                        if _gw_extensions > 0:
+                                            self.logger.info(
+                                                f"[Trinity]    Wait stats: {_gw_extensions} extensions granted, "
+                                                f"peak progress: {_gw_last_progress:.0f}%"
+                                            )
                                 
                                 # v219.0: If ready and URL not yet propagated, do it now
                                 if invincible_ready and invincible_ip:
