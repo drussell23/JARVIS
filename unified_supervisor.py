@@ -53793,6 +53793,11 @@ class StartupWatchdog:
 
         Returns True if progress changed at all in the last N seconds,
         meaning the process is alive and working — just slow.
+
+        Memory pressure guard: If RAM > threshold AND progress rate is
+        pathologically slow (< min_rate), returns False. Prevents indefinite
+        hold-off during swap thrashing where progress technically advances
+        but at an unsustainable rate.
         """
         if len(self._progress_history) < 2:
             return False
@@ -53805,7 +53810,31 @@ class StartupWatchdog:
         # Check if progress value actually changed (not just heartbeats)
         min_progress = min(p for _, p in recent)
         max_progress = max(p for _, p in recent)
-        return max_progress > min_progress
+        if max_progress <= min_progress:
+            return False
+
+        # v232.2: Memory pressure circuit breaker
+        rate = self._get_progress_rate()
+        _ram_pct_threshold = float(
+            os.environ.get("JARVIS_DMS_RAM_PRESSURE_PCT", "90")
+        )
+        _min_rate_threshold = float(
+            os.environ.get("JARVIS_DMS_MIN_PROGRESS_RATE", "0.05")
+        )
+        try:
+            import psutil as _psutil_check
+            ram_pct = _psutil_check.virtual_memory().percent
+            if ram_pct > _ram_pct_threshold and rate < _min_rate_threshold:
+                self._logger.warning(
+                    f"[DMS] v232.2: Memory pressure guard — RAM at {ram_pct:.0f}% "
+                    f"(>{_ram_pct_threshold:.0f}%) with progress rate {rate:.4f}%/s "
+                    f"(<{_min_rate_threshold}%/s) — treating as stalled"
+                )
+                return False
+        except Exception:
+            pass
+
+        return True
 
     def _get_progress_rate(self) -> float:
         """
@@ -54059,12 +54088,43 @@ class StartupWatchdog:
         # (e.g., Trinity health waits reporting progress=66 repeatedly)
         self._last_progress_time = now
 
+        # v232.2: Progress sanity checks — validate data is plausible
+        _sanitized_progress = progress
+        if progress < 0:
+            self._logger.warning(
+                f"[DMS] v232.2: Negative progress ({progress}%) rejected — clamping to 0"
+            )
+            _sanitized_progress = 0
+        elif progress > 100:
+            _sanitized_progress = 100
+
+        # Detect implausible jumps (>30% in <10s) — likely a reporter bug
+        if (
+            self._last_progress > 0
+            and phase_key == self._current_phase
+            and self._progress_history
+        ):
+            _last_t, _last_p = self._progress_history[-1]
+            _dt = now - _last_t
+            _dp = _sanitized_progress - _last_p
+            if _dp > 30 and _dt < 10:
+                self._logger.warning(
+                    f"[DMS] v232.2: Suspicious progress jump: {_last_p}% → "
+                    f"{_sanitized_progress}% in {_dt:.1f}s — possible reporter bug"
+                )
+                # Still accept it — log the anomaly but don't reject valid catch-up
+            elif _dp < -20 and phase_key == self._current_phase:
+                self._logger.warning(
+                    f"[DMS] v232.2: Progress regression: {_last_p}% → "
+                    f"{_sanitized_progress}% — possible reporter corruption"
+                )
+
         # Track progress value changes separately
-        if progress != self._last_progress:
-            self._last_progress = progress
+        if _sanitized_progress != self._last_progress:
+            self._last_progress = _sanitized_progress
 
         # v232.2: Track progress history for rate/advancement detection
-        self._progress_history.append((now, progress))
+        self._progress_history.append((now, _sanitized_progress))
         # Prune old entries beyond 2x the window
         _cutoff = now - (self._progress_advancing_window * 2)
         self._progress_history = [
