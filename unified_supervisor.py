@@ -4702,6 +4702,8 @@ class LiveProgressDashboard:
             "eta_seconds": 0,
             "elapsed_seconds": 0,
             "status": "pending",
+            # v229.0: Deployment mode transparency
+            "deployment_mode": "",  # "golden-image", "standard", or ""
         }
         # v220.0: Model loading state for detailed user feedback
         self._model_loading_state = {
@@ -4774,12 +4776,15 @@ class LiveProgressDashboard:
         eta_seconds: int = None,
         elapsed_seconds: int = None,
         status: str = None,
+        **kwargs,
     ) -> None:
         """
         Update GCP VM progress state.
         
         v220.1: Enhanced to track start time persistently and prevent progress
         from ever going backwards, fixing the 0% stuck issue.
+        
+        v229.0: Added deployment_mode for transparency (golden-image vs standard).
         """
         with self._lock:
             # v220.1: Track start time on first non-zero update
@@ -4821,6 +4826,10 @@ class LiveProgressDashboard:
             if status is not None:
                 self._gcp_state["status"] = status
                 self._components["gcp-vm"]["status"] = status
+            
+            # v229.0: Deployment mode transparency
+            if "deployment_mode" in kwargs:
+                self._gcp_state["deployment_mode"] = kwargs["deployment_mode"]
 
     def update_model_loading(
         self,
@@ -5214,7 +5223,10 @@ class LiveProgressDashboard:
 
         gcp = self._gcp_state
         progress_bar = self._make_progress_bar(gcp["progress"], width=20)
-        lines.append(f"  GCP: {progress_bar} {gcp['progress']:.0f}% - {gcp['checkpoint']}")
+        # v229.0: Include deployment mode in ANSI display
+        gcp_mode = gcp.get("deployment_mode", "")
+        gcp_mode_tag = f" [{gcp_mode}]" if gcp_mode else ""
+        lines.append(f"  GCP{gcp_mode_tag}: {progress_bar} {gcp['progress']:.0f}% - {gcp['checkpoint']}")
 
         model_loading_lines = self._get_model_loading_display()
         if model_loading_lines:
@@ -5268,16 +5280,26 @@ class LiveProgressDashboard:
             comp_parts.append(f"{emoji}[jarvis.component]{short}[/jarvis.component]:[{style}]{code}[/{style}]")
         _rich_console.print("  " + " [jarvis.separator]│[/jarvis.separator] ".join(comp_parts))
 
-        # GCP progress with gradient bar
+        # GCP progress with gradient bar and deployment mode transparency (v229.0)
         gcp_pct = gcp["progress"]
         gcp_bar_filled = int(20 * gcp_pct / 100)
         gcp_bar = "━" * gcp_bar_filled + "╌" * (20 - gcp_bar_filled)
         gcp_pct_style = "jarvis.metric.good" if gcp_pct >= 80 else ("jarvis.metric.warn" if gcp_pct >= 40 else "jarvis.metric")
+        # v229.0: Show deployment mode badge for transparency
+        gcp_deploy_mode = gcp.get("deployment_mode", "")
+        gcp_mode_badge = ""
+        if gcp_deploy_mode == "golden-image":
+            gcp_mode_badge = " [jarvis.metric.good]🌟golden[/jarvis.metric.good]"
+        elif gcp_deploy_mode == "standard":
+            gcp_mode_badge = " [jarvis.metric.warn]📜standard[/jarvis.metric.warn]"
+        # v229.0: Show ETA if available
+        gcp_eta = gcp.get("eta_seconds", 0)
+        gcp_eta_str = f" ETA:{gcp_eta}s" if gcp_eta > 0 and gcp_pct < 100 else ""
         _rich_console.print(
-            f"  [jarvis.label]☁️  GCP[/jarvis.label]  "
+            f"  [jarvis.label]☁️  GCP[/jarvis.label]{gcp_mode_badge}  "
             f"[jarvis.progress.bar]{gcp_bar}[/jarvis.progress.bar] "
             f"[{gcp_pct_style}]{gcp_pct:.0f}%[/{gcp_pct_style}] "
-            f"[jarvis.dim]{gcp['checkpoint']}[/jarvis.dim]"
+            f"[jarvis.dim]{gcp['checkpoint']}{gcp_eta_str}[/jarvis.dim]"
         )
 
         # Model loading
@@ -60550,12 +60572,15 @@ class JarvisSystemKernel:
                 self.logger.info("[Kernel] Starting Invincible Node wake-up in parallel...")
                 
                 # v220.1: Update dashboard with GCP starting status
+                # v229.0: Include deployment mode for user transparency
+                _gcp_deploy_mode = "golden-image" if os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true" else "standard"
                 update_dashboard_gcp_progress(
                     phase=1, 
                     phase_name="Initiating", 
-                    checkpoint="Starting GCP VM wake-up",
+                    checkpoint=f"Starting GCP VM ({_gcp_deploy_mode})",
                     progress=5,
-                    status="starting"
+                    status="starting",
+                    deployment_mode=_gcp_deploy_mode,
                 )
 
                 async def _wake_invincible_node() -> Tuple[bool, Optional[str], str]:
@@ -60591,14 +60616,23 @@ class JarvisSystemKernel:
                             )
                             
                             # v220.1: Create progress callback for real-time dashboard updates
+                            # v229.0: Pass source="apars" so synthetic progress defers to real data
                             def _gcp_progress_callback(pct: int, phase: str, detail: str) -> None:
-                                """Callback from GCP VM manager to update dashboard."""
+                                """Callback from GCP VM manager to update dashboard with real APARS data."""
                                 # Map progress: GCP reports 0-100, we map 20-100 (20% is starting)
                                 dashboard_pct = 20 + int(pct * 0.8)  # 20% base + 80% from polling
+                                # v229.0: Detect deployment mode from detail string
+                                _mode = ""
+                                if "golden" in detail.lower():
+                                    _mode = "golden-image"
+                                elif pct > 0:
+                                    _mode = "standard"  # Real progress means VM is running
                                 update_dashboard_gcp_progress(
                                     phase=4, phase_name=phase.title()[:15],
                                     checkpoint=detail[:50],
-                                    progress=dashboard_pct
+                                    progress=dashboard_pct,
+                                    source="apars",  # v229.0: Critical — marks as real data
+                                    deployment_mode=_mode if _mode else None,
                                 )
                             
                             success, ip, status = await manager.ensure_static_vm_ready(
@@ -60795,10 +60829,14 @@ class JarvisSystemKernel:
                     self._invincible_node_ready = False
                     
                     # v220.1: Update dashboard - continuing in background
+                    # v229.0: Show deployment mode so user knows what's happening
+                    _bg_deploy_mode = "golden-image" if os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true" else "standard"
+                    _bg_msg = f"VM starting ({_bg_deploy_mode})" if _bg_deploy_mode == "golden-image" else "VM starting (standard install ~10min)"
                     update_dashboard_gcp_progress(
                         phase=4, phase_name="Background",
-                        checkpoint="Monitoring in background",
-                        progress=40
+                        checkpoint=_bg_msg,
+                        progress=40,
+                        deployment_mode=_bg_deploy_mode,
                     )
                     
                     # v211.0: Create background monitor task that doesn't block startup
@@ -60849,9 +60887,15 @@ class JarvisSystemKernel:
                                     new_pct = min(95, 40 + int((elapsed / background_timeout) * 55))
                                     if new_pct > _last_pct:
                                         _last_pct = new_pct
+                                        # v229.0: More descriptive checkpoint based on deploy mode
+                                        _syn_mode = "golden-image" if os.getenv("JARVIS_GCP_USE_GOLDEN_IMAGE", "false").lower() == "true" else "standard"
+                                        if _syn_mode == "golden-image":
+                                            _syn_msg = f"Golden image VM booting ({int(elapsed)}s)"
+                                        else:
+                                            _syn_msg = f"Standard VM installing ({int(elapsed)}s, ~10min total)"
                                         update_dashboard_gcp_progress(
                                             phase=4, phase_name="Waking",
-                                            checkpoint=f"VM starting ({int(elapsed)}s elapsed)",
+                                            checkpoint=_syn_msg,
                                             progress=new_pct,
                                             source="synthetic",
                                         )
