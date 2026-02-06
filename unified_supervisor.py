@@ -64265,10 +64265,35 @@ class JarvisSystemKernel:
                                             except Exception:
                                                 pass
 
+                                            # v233.2: Terminate any orphaned VMs before final fallback
+                                            try:
+                                                from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                                                _cleanup_mgr = await get_gcp_vm_manager_safe()
+                                                if _cleanup_mgr:
+                                                    _cleanup_vm = getattr(
+                                                        self.config, 'invincible_node_instance_name',
+                                                        os.environ.get("GCP_VM_INSTANCE_NAME", "jarvis-prime-node")
+                                                    )
+                                                    await _cleanup_mgr.terminate_vm(
+                                                        vm_name=_cleanup_vm,
+                                                        reason="Cleanup after all fallbacks exhausted",
+                                                    )
+                                                    self.logger.info(
+                                                        f"[Trinity] Orphaned VM '{_cleanup_vm}' terminated"
+                                                    )
+                                            except Exception as _cleanup_err:
+                                                self.logger.debug(
+                                                    f"[Trinity] VM cleanup (best-effort): {_cleanup_err}"
+                                                )
+
                                             # v232.2: Notify DMS of mode change — recalculate all timeouts
                                             if self._startup_watchdog:
+                                                _dms_stall_mode = (
+                                                    "local_prime" if _local_is_hedge
+                                                    else "claude_api_fallback"
+                                                )
                                                 self._startup_watchdog.notify_mode_change(
-                                                    "local_prime",
+                                                    _dms_stall_mode,
                                                     is_fallback=True,
                                                     fallback_reason=f"GCP stalled {_gw_stall_count}x, recovery exhausted",
                                                 )
