@@ -1063,6 +1063,16 @@ const JarvisVoice = () => {
       handleWebSocketMessage(data);
     });
 
+    // Subscribe to WebSocket reconnection events (from background retry)
+    const unsubscribeWsReconnect = connectionService.on('wsReconnected', () => {
+      console.log('[JarvisVoice] ✅ WebSocket reconnected — syncing wsRef');
+      const ws = connectionService.getWebSocket();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        wsRef.current = ws;
+        setError(null);
+      }
+    });
+
     // Get initial state
     const initialState = connectionService.getState();
     setJarvisStatus(connectionStateToJarvisStatus(initialState));
@@ -1076,10 +1086,30 @@ const JarvisVoice = () => {
       }
     }
 
+    // v233.2: Periodic WebSocket ref sync — catches cases where the ws connects
+    // slightly after the stateChange event fires, or reconnects in the background.
+    // Runs every 5 seconds, lightweight (no network calls, just ref check).
+    const wsSyncInterval = setInterval(() => {
+      const ws = connectionService.getWebSocket();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          console.log('[JarvisVoice] 🔄 wsRef synced from connection service (periodic)');
+          wsRef.current = ws;
+          setError(null);
+        }
+      } else if (wsRef.current && wsRef.current.readyState !== WebSocket.OPEN) {
+        // wsRef is stale (pointing to a closed socket) — clear it
+        console.log('[JarvisVoice] 🔄 wsRef cleared (stale closed socket)');
+        wsRef.current = null;
+      }
+    }, 5000);
+
     return () => {
       unsubscribeState();
       unsubscribeMode();
       unsubscribeMessage();
+      unsubscribeWsReconnect();
+      clearInterval(wsSyncInterval);
     };
   }, []);
 
@@ -4558,8 +4588,19 @@ const JarvisVoice = () => {
       console.debug('[Self-Voice v8] Speech state check unavailable');
     }
     
+    // v233.2: Dynamically get the freshest WebSocket from connection service
+    // This fixes stale wsRef.current issues where the ref points to a closed socket
+    const connectionService = jarvisConnectionServiceRef.current;
+    let activeWs = wsRef.current;
+    if ((!activeWs || activeWs.readyState !== WebSocket.OPEN) && connectionService) {
+      activeWs = connectionService.getWebSocket();
+      if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+        wsRef.current = activeWs; // Sync the ref
+      }
+    }
+
     // Send via WebSocket with audio_data for voice biometrics
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    if (activeWs && activeWs.readyState === WebSocket.OPEN) {
       const message = {
         type: 'command',
         text: command,
@@ -4582,7 +4623,7 @@ const JarvisVoice = () => {
       }
 
       try {
-        wsRef.current.send(JSON.stringify(message));
+        activeWs.send(JSON.stringify(message));
         setResponse('⚙️ Processing...');
         
         // Set a timeout to detect if backend doesn't respond (zombie WebSocket detection)
@@ -4593,17 +4634,17 @@ const JarvisVoice = () => {
             if (wsRef.current) {
               wsRef.current.close(); // Force close to trigger reconnect
             }
-            // Fallback to REST API
+            // Fallback to REST API (now with intelligent routing)
             sendTextCommand(command);
           }
         }, 10000);
       } catch (sendError) {
         console.error('[WS] Failed to send command via WebSocket:', sendError);
-        // Fallback to REST API
+        // Fallback to REST API (now with intelligent routing)
         sendTextCommand(command);
       }
     } else {
-      // Fallback to REST API if WebSocket not connected
+      // WebSocket not available — use sendTextCommand which now has REST fallback
       sendTextCommand(command);
     }
 
@@ -4613,53 +4654,129 @@ const JarvisVoice = () => {
   };
 
   // Handle text command submission
-  const handleTextCommandSubmit = (e) => {
+  // v233.2 ROOT CAUSE FIX: Uses JarvisConnectionService.sendCommand() with
+  // automatic WebSocket → REST API → queue fallback chain.
+  // NEVER directly checks wsRef.current — the connection service handles routing.
+  const handleTextCommandSubmit = async (e) => {
     e.preventDefault();
 
     if (!textCommand.trim()) return;
 
-    console.log('[TEXT-CMD] Submitting typed command:', textCommand);
+    const command = textCommand.trim();
+    console.log('[TEXT-CMD] Submitting typed command:', command);
 
     // Set transcript to show what was typed
-    setTranscript(textCommand);
+    setTranscript(command);
+    setResponse('⚙️ Processing...');
+    setIsProcessing(true);
 
-    // Send via WebSocket
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    // Clear the input immediately for UX
+    setTextCommand('');
+
+    // Use the connection service — it handles WebSocket/REST/queue routing automatically
+    const connectionService = jarvisConnectionServiceRef.current;
+
+    if (connectionService) {
       try {
-        wsRef.current.send(JSON.stringify({
-          type: 'command',
-          text: textCommand,
+        const result = await connectionService.sendCommand(command, {
           mode: autonomousMode ? 'autonomous' : 'manual',
-          metadata: {
-            source: 'text_input',
-            timestamp: Date.now()
-          }
-        }));
-        setResponse('⚙️ Processing...');
-        setIsProcessing(true);
-        
-        // Set a timeout to detect zombie WebSocket (no response after 10s)
-        setTimeout(() => {
-          if (isProcessing) {
-            console.warn('[WS] No response after 10s for text command - reconnecting...');
-            if (wsRef.current) {
-              wsRef.current.close(); // Force reconnect
-            }
-            setResponse('❌ Connection lost - please try again');
+          metadata: { source: 'text_input', timestamp: Date.now() },
+          timeout: 30000
+        });
+
+        if (result.success) {
+          console.log(`[TEXT-CMD] ✅ Command sent via ${result.route}`);
+          
+          if (result.route === 'rest' && result.response) {
+            // REST API returns the response directly — display it
+            setResponse(result.response);
             setIsProcessing(false);
           }
-        }, 10000);
-      } catch (sendError) {
-        console.error('[WS] Failed to send text command:', sendError);
-        setResponse('❌ Failed to send command');
-        setIsProcessing(false);
+          // WebSocket route: response arrives via the 'message' event handler
+          // Set a zombie detection timeout for WebSocket
+          if (result.route === 'websocket') {
+            setTimeout(() => {
+              // Only fire if still processing (response handler hasn't cleared it)
+              setIsProcessing(prev => {
+                if (prev) {
+                  console.warn('[TEXT-CMD] No WebSocket response after 15s — trying REST fallback...');
+                  // Try REST fallback for this specific command
+                  connectionService._sendViaREST(command, {}).then(restResult => {
+                    if (restResult.success && restResult.response) {
+                      setResponse(restResult.response);
+                    } else {
+                      setResponse('⚠️ Response delayed — JARVIS is still processing');
+                    }
+                  }).catch(() => {
+                    setResponse('⚠️ Response delayed — JARVIS is still processing');
+                  }).finally(() => {
+                    setIsProcessing(false);
+                  });
+                }
+                return prev; // Don't change state here
+              });
+            }, 15000);
+          }
+        } else if (result.route === 'queued') {
+          setResponse('📤 Command queued — reconnecting to JARVIS...');
+          setIsProcessing(false);
+          // Trigger reconnection
+          connectionService.reconnect();
+        } else {
+          // Both WebSocket and REST failed — try direct REST as last resort
+          console.warn('[TEXT-CMD] Connection service failed, attempting direct REST...');
+          await sendCommandViaDirectREST(command);
+        }
+      } catch (error) {
+        console.error('[TEXT-CMD] sendCommand error:', error);
+        // Last resort: try direct REST API call
+        await sendCommandViaDirectREST(command);
       }
     } else {
-      setResponse('❌ Not connected to JARVIS');
+      // Connection service not initialized — try direct REST
+      console.warn('[TEXT-CMD] No connection service, attempting direct REST...');
+      await sendCommandViaDirectREST(command);
     }
+  };
 
-    // Clear the input
-    setTextCommand('');
+  /**
+   * Last-resort direct REST API call when connection service is unavailable.
+   * Uses the backend's /api/command endpoint directly.
+   */
+  const sendCommandViaDirectREST = async (command) => {
+    try {
+      // Try to get the API URL from multiple sources
+      const apiUrl = API_URL || configService.getApiUrl() || 'http://localhost:8010';
+      const url = `${apiUrl}/api/command`;
+      
+      console.log(`[TEXT-CMD] Direct REST fallback: ${url}`);
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          command: command,
+          text: command,
+          mode: autonomousMode ? 'autonomous' : 'manual' 
+        }),
+        signal: AbortSignal.timeout(30000)
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const responseText = data.response || data.result || data.text || 'Command processed.';
+        console.log('[TEXT-CMD] ✅ Direct REST succeeded');
+        setResponse(responseText);
+      } else {
+        console.error(`[TEXT-CMD] REST returned ${response.status}`);
+        setResponse('⚠️ JARVIS is starting up — please try again in a moment');
+      }
+    } catch (error) {
+      console.error('[TEXT-CMD] Direct REST failed:', error);
+      setResponse('⚠️ Cannot reach JARVIS backend — check that the system is running');
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const activateJarvis = async () => {
@@ -5291,6 +5408,11 @@ const JarvisVoice = () => {
     };
   };
 
+  /**
+   * Send a text command with automatic WebSocket → REST → direct REST fallback.
+   * v233.2 ROOT CAUSE FIX: Never shows "Not connected" without trying alternatives.
+   * Uses JarvisConnectionService.sendCommand() for intelligent routing.
+   */
   const sendTextCommand = async (text) => {
     if (!text.trim()) return;
 
@@ -5305,21 +5427,33 @@ const JarvisVoice = () => {
     setIsProcessing(true);
     setResponse('');  // Clear previous response
 
-    // Use WebSocket if connected
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      console.log('[TEXT COMMAND] Sending via WebSocket');
-      wsRef.current.send(JSON.stringify({
-        type: 'command',
-        text: text,
-        mode: autonomousMode ? 'autonomous' : 'manual'
-      }));
-      // Response will come through WebSocket message handler
-    } else {
-      // WebSocket not connected
-      console.log('[TEXT COMMAND] WebSocket not connected');
-      setError('Not connected to JARVIS. Please refresh the page.');
-      setIsProcessing(false);
+    // Use connection service with full fallback chain
+    const connectionService = jarvisConnectionServiceRef.current;
+    
+    if (connectionService) {
+      try {
+        const result = await connectionService.sendCommand(text, {
+          mode: autonomousMode ? 'autonomous' : 'manual',
+          metadata: { source: 'voice_fallback', timestamp: Date.now() }
+        });
+
+        if (result.success) {
+          console.log(`[TEXT COMMAND] ✅ Sent via ${result.route}`);
+          if (result.route === 'rest' && result.response) {
+            // REST returns response directly
+            setResponse(result.response);
+            setIsProcessing(false);
+          }
+          // WebSocket: response comes through message handler
+          return;
+        }
+      } catch (error) {
+        console.warn('[TEXT COMMAND] Connection service failed:', error.message);
+      }
     }
+
+    // Direct REST fallback if connection service unavailable
+    await sendCommandViaDirectREST(text);
   };
 
   const playAudioResponse_UNUSED = async (text) => {

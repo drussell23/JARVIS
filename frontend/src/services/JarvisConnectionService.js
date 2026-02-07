@@ -416,20 +416,33 @@ class JarvisConnectionService {
       
       this.backendMode = health.mode || 'full';
       
-      // Initialize WebSocket
-      await this._initializeWebSocket();
+      // Initialize WebSocket — track whether it actually connected
+      const wsConnected = await this._initializeWebSocket();
       
       // Start health monitoring
       this._startHealthMonitoring();
       
-      // Update state
-      this._setState(ConnectionState.ONLINE);
-      this.consecutiveFailures = 0;
+      // Mark REST as available (health check passed, /api/command is reachable)
+      this._restAvailable = true;
+      
+      if (wsConnected) {
+        // Full connectivity: WebSocket + REST
+        this._setState(ConnectionState.ONLINE);
+        this.consecutiveFailures = 0;
+        console.log(`[JarvisConnection] ✅ Connected (${this.backendMode} mode, WebSocket + REST)`);
+      } else {
+        // Degraded connectivity: REST only, WebSocket failed
+        // Still set ONLINE because we CAN send commands via REST API
+        console.warn('[JarvisConnection] ⚠️ WebSocket failed but backend is healthy — using REST fallback');
+        this._setState(ConnectionState.ONLINE);
+        this.consecutiveFailures = 0;
+        
+        // Schedule background WebSocket retry (don't block the user)
+        this._scheduleWebSocketRetry();
+      }
       
       // Save verified state for fast-path on subsequent loads
       this._saveVerifiedState();
-      
-      console.log(`[JarvisConnection] ✅ Connected (${this.backendMode} mode)`);
       
     } catch (error) {
       console.error('[JarvisConnection] Connection failed:', error.message);
@@ -437,6 +450,42 @@ class JarvisConnectionService {
       this._setState(ConnectionState.ERROR);
       this._scheduleReconnect();
     }
+  }
+
+  /**
+   * Retry WebSocket connection in the background without blocking command sending.
+   * REST API remains available while we try to establish WebSocket.
+   */
+  _scheduleWebSocketRetry() {
+    const maxRetries = 5;
+    let attempt = 0;
+    
+    const retry = async () => {
+      attempt++;
+      if (attempt > maxRetries) {
+        console.log('[JarvisConnection] WebSocket retry exhausted — continuing with REST-only mode');
+        return;
+      }
+      
+      console.log(`[JarvisConnection] WebSocket retry ${attempt}/${maxRetries}...`);
+      try {
+        const wsConnected = await this._initializeWebSocket();
+        if (wsConnected) {
+          console.log('[JarvisConnection] ✅ WebSocket reconnected successfully');
+          this._emit('wsReconnected', {});
+          return; // Success — stop retrying
+        }
+      } catch (e) {
+        console.debug('[JarvisConnection] WebSocket retry failed:', e.message);
+      }
+      
+      // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+      const delay = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
+      setTimeout(retry, delay);
+    };
+    
+    // Start first retry after 2 seconds
+    setTimeout(retry, 2000);
   }
 
   async _quickHealthCheck(url) {
@@ -475,6 +524,10 @@ class JarvisConnectionService {
   // WEBSOCKET MANAGEMENT
   // ==========================================================================
 
+  /**
+   * Initialize WebSocket connection.
+   * @returns {Promise<boolean>} true if WebSocket connected successfully, false if it failed
+   */
   async _initializeWebSocket() {
     // Create client if needed
     if (!this.wsClient) {
@@ -519,12 +572,18 @@ class JarvisConnectionService {
       ];
     }
     
-    // Connect to main WebSocket
+    // Connect to main WebSocket — return success/failure explicitly
     try {
-      await this.wsClient.connect(`${this.wsUrl}/ws`);
+      const ws = await this.wsClient.connect(`${this.wsUrl}/ws`);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        console.log('[JarvisConnection] ✅ WebSocket connected');
+        return true;
+      }
+      console.warn('[JarvisConnection] WebSocket created but not OPEN');
+      return false;
     } catch (error) {
       console.warn('[JarvisConnection] WebSocket connection failed:', error.message);
-      // Don't throw - HTTP health check passed, WS might still work later
+      return false;
     }
   }
 
@@ -698,12 +757,24 @@ class JarvisConnectionService {
     return ws && ws.readyState === WebSocket.OPEN;
   }
 
+  /**
+   * Send a command to JARVIS with intelligent routing.
+   * 
+   * Routing priority:
+   *   1. WebSocket (real-time, bidirectional) — preferred
+   *   2. REST API (/api/command) — fallback when WebSocket unavailable
+   *   3. Queue for retry — when both are down
+   * 
+   * @param {string} command - The command text
+   * @param {object} options - Options: mode, metadata, audioData, timeout, onProgress
+   * @returns {Promise<{success: boolean, response?: string, route: string}>}
+   */
   async sendCommand(command, options = {}) {
     const message = {
       type: 'command',
       text: command,
       mode: options.mode || 'manual',
-      metadata: options.metadata || {},
+      metadata: { source: 'text_input', timestamp: Date.now(), ...options.metadata },
       timestamp: Date.now()
     };
     
@@ -712,18 +783,114 @@ class JarvisConnectionService {
       message.sample_rate = options.audioData.sampleRate;
       message.mime_type = options.audioData.mimeType;
     }
-    
-    if (options.reliable !== false) {
-      return this.wsClient?.sendReliable(message, 'jarvis', options.timeout || 10000);
+
+    // Strategy 1: Try WebSocket (preferred — real-time bidirectional)
+    const ws = this.getWebSocket();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        if (options.reliable !== false && this.wsClient) {
+          await this.wsClient.sendReliable(message, 'jarvis', options.timeout || 10000);
+        } else {
+          ws.send(JSON.stringify(message));
+        }
+        console.log('[JarvisConnection] ✅ Command sent via WebSocket');
+        return { success: true, route: 'websocket' };
+      } catch (wsError) {
+        console.warn('[JarvisConnection] WebSocket send failed:', wsError.message, '— falling back to REST');
+      }
     }
-    return this.wsClient?.send(message, 'jarvis');
+
+    // Strategy 2: Try REST API (/api/command) — synchronous fallback
+    if (this.backendUrl && this._restAvailable !== false) {
+      try {
+        const result = await this._sendViaREST(command, options);
+        return result;
+      } catch (restError) {
+        console.warn('[JarvisConnection] REST send failed:', restError.message);
+      }
+    }
+
+    // Strategy 3: Queue for later if both paths are down
+    if (this.wsClient && this.wsClient.offlineQueue) {
+      this.wsClient.offlineQueue.push({ ...message, _queuedAt: Date.now() });
+      console.log('[JarvisConnection] Command queued for retry when connection is restored');
+      return { success: false, route: 'queued', error: 'No connection available — command queued for retry' };
+    }
+
+    return { success: false, route: 'none', error: 'No connection to JARVIS backend' };
+  }
+
+  /**
+   * Send a command via REST API (/api/command).
+   * This is the fallback when WebSocket is unavailable.
+   * Works because HTTP health check passed — the backend IS reachable.
+   */
+  async _sendViaREST(command, options = {}) {
+    const url = `${this.backendUrl}/api/command`;
+    console.log(`[JarvisConnection] Sending command via REST: ${url}`);
+    
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          command: command,
+          text: command,
+          mode: options.mode || 'manual',
+          metadata: { source: 'rest_fallback', timestamp: Date.now(), ...options.metadata }
+        })
+      }, options.timeout || 30000);
+
+      if (!response.ok) {
+        throw new Error(`REST API returned ${response.status}`);
+      }
+
+      const data = await response.json();
+      console.log('[JarvisConnection] ✅ Command sent via REST API');
+      
+      // Emit the response as a message event so the UI handles it the same way
+      this._emit('message', {
+        data: {
+          type: 'response',
+          text: data.response || data.result || data.text || 'Command processed.',
+          status: data.success !== false ? 'success' : 'error',
+          command_type: data.command_type || 'command',
+          speak: data.speak !== false,
+          routing: { routed_to: 'rest_fallback' }
+        }
+      });
+
+      return { 
+        success: true, 
+        route: 'rest', 
+        response: data.response || data.result || data.text || 'Command processed.' 
+      };
+    } catch (error) {
+      this._restAvailable = false;
+      // Re-enable REST check after 10 seconds (it might have been a transient failure)
+      setTimeout(() => { this._restAvailable = true; }, 10000);
+      throw error;
+    }
   }
 
   async send(message, options = {}) {
-    if (options.reliable) {
-      return this.wsClient?.sendReliable(message, options.capability, options.timeout || 5000);
+    // Try WebSocket first
+    if (this.wsClient) {
+      const ws = this.getWebSocket();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (options.reliable) {
+          return this.wsClient.sendReliable(message, options.capability, options.timeout || 5000);
+        }
+        return this.wsClient.send(message, options.capability);
+      }
     }
-    return this.wsClient?.send(message, options.capability);
+    
+    // Fall back to REST for command-type messages
+    if (message.type === 'command' && message.text && this.backendUrl) {
+      return this._sendViaREST(message.text, options);
+    }
+    
+    throw new Error('No connection available');
   }
 
   subscribe(messageType, handler) {

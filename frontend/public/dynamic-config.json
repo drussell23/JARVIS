@@ -1,7 +1,7 @@
 {
   "backend": {
-    "url": "http://localhost:8000",
-    "wsUrl": "ws://localhost:8000",
+    "url": "http://localhost:8010",
+    "wsUrl": "ws://localhost:8010",
     "endpoints": {
       "health": "/health",
       "ml_audio_config": "/audio/ml/config",

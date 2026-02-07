@@ -89,12 +89,89 @@ def _get_env_bool(key: str, default: bool) -> bool:
     return val in ("true", "1", "yes", "on")
 
 
+def _resolve_prime_host() -> str:
+    """
+    Resolve JARVIS Prime host with intelligent priority order.
+
+    v233.2 ROOT CAUSE FIX: The supervisor sets multiple env vars when GCP VM is ready:
+      - JARVIS_PRIME_URL (full URL like http://34.45.154.209:8000)
+      - JARVIS_INVINCIBLE_NODE_IP (just the IP)
+      - JARVIS_PRIME_HOST (explicit host override)
+
+    Priority order (highest wins):
+      1. JARVIS_PRIME_URL (parse host from full URL — set by _propagate_invincible_node_url)
+      2. JARVIS_INVINCIBLE_NODE_IP (set by supervisor when GCP VM is ready)
+      3. JARVIS_PRIME_HOST (explicit override)
+      4. "localhost" (fallback)
+    """
+    # Priority 1: Parse host from JARVIS_PRIME_URL (set by supervisor)
+    prime_url = os.getenv("JARVIS_PRIME_URL", "")
+    if prime_url:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(prime_url)
+            if parsed.hostname:
+                return parsed.hostname
+        except Exception:
+            pass
+
+    # Priority 2: Invincible Node IP (set by supervisor for GCP VMs)
+    invincible_ip = os.getenv("JARVIS_INVINCIBLE_NODE_IP", "")
+    if invincible_ip:
+        return invincible_ip
+
+    # Priority 3: Explicit host override
+    return os.getenv("JARVIS_PRIME_HOST", "localhost")
+
+
+def _resolve_prime_port() -> int:
+    """
+    Resolve JARVIS Prime port with intelligent priority order.
+
+    v233.2 ROOT CAUSE FIX: Same as _resolve_prime_host — ensures port
+    from GCP VM propagation is picked up without requiring explicit JARVIS_PRIME_PORT.
+
+    Priority order:
+      1. JARVIS_PRIME_URL (parse port from full URL)
+      2. JARVIS_INVINCIBLE_NODE_PORT (set by supervisor)
+      3. JARVIS_PRIME_PORT (explicit override)
+      4. 8000 (fallback)
+    """
+    # Priority 1: Parse port from JARVIS_PRIME_URL
+    prime_url = os.getenv("JARVIS_PRIME_URL", "")
+    if prime_url:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(prime_url)
+            if parsed.port:
+                return parsed.port
+        except Exception:
+            pass
+
+    # Priority 2: Invincible Node port
+    invincible_port = os.getenv("JARVIS_INVINCIBLE_NODE_PORT", "")
+    if invincible_port:
+        try:
+            return int(invincible_port)
+        except ValueError:
+            pass
+
+    # Priority 3: Explicit port override
+    return _get_env_int("JARVIS_PRIME_PORT", 8000)
+
+
 @dataclass
 class PrimeClientConfig:
-    """Configuration for Prime client."""
-    # Connection settings
-    prime_host: str = field(default_factory=lambda: os.getenv("JARVIS_PRIME_HOST", "localhost"))
-    prime_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_PORT", 8000))
+    """
+    Configuration for Prime client.
+
+    v233.2: Uses intelligent env var resolution that respects the supervisor's
+    GCP VM propagation (JARVIS_PRIME_URL, JARVIS_INVINCIBLE_NODE_IP/PORT)
+    in addition to the explicit JARVIS_PRIME_HOST/PORT overrides.
+    """
+    # Connection settings — resolved dynamically from multiple env var sources
+    prime_host: str = field(default_factory=_resolve_prime_host)
+    prime_port: int = field(default_factory=_resolve_prime_port)
     prime_api_version: str = field(default_factory=lambda: os.getenv("JARVIS_PRIME_API_VERSION", "v1"))
 
     # Connection pool settings
@@ -123,6 +200,25 @@ class PrimeClientConfig:
     # Fallback settings
     enable_cloud_fallback: bool = field(default_factory=lambda: _get_env_bool("PRIME_ENABLE_CLOUD_FALLBACK", True))
     prefer_local: bool = field(default_factory=lambda: _get_env_bool("PRIME_PREFER_LOCAL", True))
+
+    def __post_init__(self):
+        """Log resolved configuration for debugging."""
+        is_gcp = self.prime_host != "localhost" and self.prime_host != "127.0.0.1"
+        if is_gcp:
+            logger.info(
+                f"[PrimeClientConfig] Resolved to GCP VM: {self.prime_host}:{self.prime_port} "
+                f"(source: {self._identify_source()})"
+            )
+
+    def _identify_source(self) -> str:
+        """Identify which env var was used to resolve the endpoint."""
+        if os.getenv("JARVIS_PRIME_URL"):
+            return "JARVIS_PRIME_URL"
+        if os.getenv("JARVIS_INVINCIBLE_NODE_IP"):
+            return "JARVIS_INVINCIBLE_NODE_IP/PORT"
+        if os.getenv("JARVIS_PRIME_HOST"):
+            return "JARVIS_PRIME_HOST/PORT"
+        return "default (localhost)"
 
     @property
     def base_url(self) -> str:
