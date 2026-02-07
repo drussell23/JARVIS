@@ -3514,6 +3514,7 @@ class JARVISVoiceAPI:
                                 {
                                     "type": "processing",
                                     "message": "Analyzing your screen...",
+                                    "speak": True,  # Explicit opt-in: vision takes 2-8s, user needs feedback
                                     "command_type": "vision",
                                     "timestamp": datetime.now().isoformat(),
                                 }
@@ -3712,9 +3713,10 @@ class JARVISVoiceAPI:
                         )
                         continue
 
-                    # Send acknowledgment immediately
+                    # Send acknowledgment immediately (speak: False — opt-in contract,
+                    # prevents browser TTS from reading "Processing..." as "full stop")
                     await websocket.send_json(
-                        {"type": "processing", "timestamp": datetime.now().isoformat()}
+                        {"type": "processing", "speak": False, "timestamp": datetime.now().isoformat()}
                     )
 
                     # Process with JARVIS - FAST

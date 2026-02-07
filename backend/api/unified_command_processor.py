@@ -1619,9 +1619,32 @@ class UnifiedCommandProcessor:
 
         # NORMAL PATH: For all non-SCREEN_LOCK and non-SYSTEM commands
         else:
-            # Ensure resolvers are initialized (lazy init on first use)
-            # ONLY for non-SCREEN_LOCK commands that may need VBI/ECAPA
-            if not self._resolvers_initialized:
+            # =================================================================
+            # FAST QUERY PATH v3.2: Skip resolver init for simple queries
+            # =================================================================
+            # _classify_command() returned (command_type, confidence) at line 1193.
+            # High-confidence QUERY commands (>= 0.7) can skip resolvers because
+            # handle_query() → PrimeRouter → Cloud Claude doesn't use VBI, ECAPA,
+            # ContextGraph, OCR, Yabai, or any resolver output.
+            #
+            # Low-confidence queries (0.5 = default fallback for unrecognized input)
+            # might be misclassified system/vision commands — those still get full
+            # resolver init to maximize correct routing.
+            # =================================================================
+            _fast_query_eligible = (
+                command_type == CommandType.QUERY
+                and confidence >= 0.7
+            )
+
+            if _fast_query_eligible and not self._resolvers_initialized:
+                self._fast_query_eligible = True  # Signal downstream to skip screen context
+                logger.info(
+                    f"[UNIFIED] ⚡ FAST QUERY PATH: Skipping resolver init "
+                    f"(type={command_type.value}, confidence={confidence:.2f}, "
+                    f"text='{command_text[:50]}')"
+                )
+            elif not self._resolvers_initialized:
+                self._fast_query_eligible = False
                 logger.info("[UNIFIED] 📦 Non-lock command - initializing resolvers (VBI, ECAPA, etc.)")
                 try:
                     # Increased timeout to 30s for 6-tier parallel initialization
@@ -1634,6 +1657,8 @@ class UnifiedCommandProcessor:
                 except Exception as e:
                     logger.error(f"[UNIFIED] ❌ Resolver initialization failed: {e}")
                     self._resolvers_initialized = False
+            else:
+                self._fast_query_eligible = False
 
         # NEW: Use speaker-aware command handler with CAI/SAI if audio provided
         # OPTIMIZATION: Skip heavy VBI for screen lock commands to avoid "Processing..." hang
@@ -4473,9 +4498,16 @@ class UnifiedCommandProcessor:
 
                     logger.info(f"[UNIFIED] 🧠 Processing query via PrimeRouter: '{command_text[:50]}...'")
 
-                    # Build context for query
+                    # Build context for query.
+                    # Skip screen context on fast query path — simple queries don't need it,
+                    # and _get_screen_context may depend on uninitialized resolvers.
+                    _fast_query = getattr(self, '_fast_query_eligible', False)
                     query_context = {
-                        "screen_context": await self._get_screen_context() if hasattr(self, '_get_screen_context') else {},
+                        "screen_context": (
+                            await self._get_screen_context()
+                            if not _fast_query and hasattr(self, '_get_screen_context')
+                            else {}
+                        ),
                         "history": self.context_history if hasattr(self, 'context_history') else [],
                     }
 

@@ -193,6 +193,7 @@ class EnhancedContextIntelligenceHandler:
                 await websocket.send_json({
                     "type": "processing",
                     "message": "Processing your command...",
+                    "speak": False,  # Opt-in contract: generic acks are not spoken
                     "timestamp": datetime.now().isoformat()
                 })
                 

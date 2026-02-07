@@ -753,7 +753,10 @@ const JarvisVoice = () => {
   const commandQueueRef = useRef([]);
   const proxyEndpointRef = useRef(null);
 
-  // 🆕 ROBUST COMMAND QUEUE SYSTEM - Never lose commands during WebSocket issues
+  // Request ID for deduplicating WS + REST race responses
+  const activeRequestIdRef = useRef(null);
+
+  // ROBUST COMMAND QUEUE SYSTEM - Never lose commands during WebSocket issues
   const pendingCommandsRef = useRef([]);  // Commands waiting for WebSocket
   const commandQueueProcessingRef = useRef(false);  // Prevent concurrent processing
   const maxQueuedCommands = 10;  // Prevent memory buildup
@@ -873,6 +876,9 @@ const JarvisVoice = () => {
           try {
             recognitionRef.current.start();
             console.log('🔇 [Self-Voice v2] Recognition RESUMED');
+            // Reset abort counter after successful resume to prevent backoff creep
+            // across multiple speak/pause/resume cycles
+            speechRecoveryStateRef.current.consecutiveAborts = 0;
           } catch (e) {
             console.log('🔇 [Self-Voice v2] Recognition restart failed:', e.message);
             // It might already be running, that's ok
@@ -2209,14 +2215,26 @@ const JarvisVoice = () => {
         setResponse(processingMessage);
         setIsProcessing(true);
 
-        // Optionally speak the acknowledgment
-        if (data.speak !== false && processingMessage) {
+        // Speak contract: opt-IN. Only speak processing acks that explicitly
+        // request it with speak: true (e.g., vision "Analyzing your screen...").
+        // Default is silent — prevents "full stop" TTS artifacts from generic acks.
+        if (data.speak === true) {
           speakResponse(processingMessage, false);
         }
         break;
 
       case 'response':
         console.log('WebSocket response received:', data);
+
+        // Dedup: Only process if this response matches the active request.
+        // Prevents double-display and double-speech from WS+REST race.
+        const incomingRequestId = data.requestId || data.metadata?.requestId;
+        if (incomingRequestId && activeRequestIdRef.current !== incomingRequestId) {
+          console.debug(`[WS] Ignoring stale response (got ${incomingRequestId}, active ${activeRequestIdRef.current})`);
+          return;
+        }
+        // Clear active request — any subsequent response for this ID is stale
+        activeRequestIdRef.current = null;
 
         // Check if this is an error response we should ignore
         const errorText = (data.text || data.response || '').toLowerCase();
@@ -3709,9 +3727,21 @@ const JarvisVoice = () => {
       };
 
       recognitionRef.current.onerror = async (event) => {
-        // Handle "no-speech" errors quietly - they're expected
-        if (event.error !== 'no-speech') {
+        // Handle expected errors quietly:
+        // - 'no-speech': Normal during silence
+        // - 'aborted' during self-voice suppression: Intentional pause for JARVIS speech
+        //   Grace window (cooldownMs + 500) covers aborts firing after flag cleared
+        //   but before recognition.start() completes in resumeRecognitionAfterSpeech()
+        const suppression = selfVoiceSuppressionRef.current;
+        const isSelfVoiceAbort = event.error === 'aborted' && (
+          suppression.recognitionPausedForSpeech ||
+          (Date.now() - (suppression.speakingEndTime || 0)) < (suppression.cooldownMs + 500)
+        );
+
+        if (event.error !== 'no-speech' && !isSelfVoiceAbort) {
           console.error('Speech recognition error:', event.error, event);
+        } else if (isSelfVoiceAbort) {
+          console.debug('[Self-Voice] Expected abort during speech suppression/resume');
         }
 
         // =====================================================================
@@ -3925,11 +3955,23 @@ const JarvisVoice = () => {
 
             case 'aborted':
               // ================================================================
-              // 🆕 INTELLIGENT ABORT HANDLING - Uses smart backoff system
+              // INTELLIGENT ABORT HANDLING - Uses smart backoff system
               // ================================================================
               {
                 const recovery = speechRecoveryStateRef.current;
                 const abortNow = Date.now();
+                const abortSuppression = selfVoiceSuppressionRef.current;
+
+                // Self-voice suppression aborts (including post-resume grace window)
+                // are INTENTIONAL — don't count toward backoff.
+                // resumeRecognitionAfterSpeech() will handle restarting recognition.
+                const isSelfVoiceAbort = abortSuppression.recognitionPausedForSpeech ||
+                  (abortNow - (abortSuppression.speakingEndTime || 0)) < (abortSuppression.cooldownMs + 500);
+
+                if (isSelfVoiceAbort) {
+                  console.debug('[ABORT] Self-voice suppression abort - not counting toward backoff');
+                  break;
+                }
 
                 // Reset if enough time has passed since last abort
                 if (abortNow - recovery.lastAbortTime > 5000) {
@@ -4493,6 +4535,10 @@ const JarvisVoice = () => {
 
     setTranscript(command);
 
+    // Assign unique request ID for WS/REST response deduplication
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    activeRequestIdRef.current = requestId;
+
     // Track command start time for adaptive learning
     const commandStartTime = Date.now();
 
@@ -4604,9 +4650,11 @@ const JarvisVoice = () => {
       const message = {
         type: 'command',
         text: command,
+        requestId,  // Track for WS/REST response deduplication
         mode: autonomousMode ? 'autonomous' : 'manual',
         metadata: {
           ...confidenceInfo,
+          requestId,  // Also in metadata for REST path dedup
           startTime: commandStartTime,
         }
       };
@@ -4625,16 +4673,15 @@ const JarvisVoice = () => {
       try {
         activeWs.send(JSON.stringify(message));
         setResponse('⚙️ Processing...');
-        
-        // Set a timeout to detect if backend doesn't respond (zombie WebSocket detection)
+
+        // Zombie detection: Use ref-based check (not setState updater) to avoid
+        // React batching/StrictMode issues. Don't close WS — race with REST instead.
+        // The first response to arrive clears activeRequestIdRef; the second is dropped.
+        const zombieRequestId = requestId;
         setTimeout(() => {
-          // If still showing Processing after 10 seconds, WebSocket might be dead
-          if (response === '⚙️ Processing...' || isProcessing) {
-            console.warn('[WS] No response after 10s - WebSocket might be dead, forcing reconnect...');
-            if (wsRef.current) {
-              wsRef.current.close(); // Force close to trigger reconnect
-            }
-            // Fallback to REST API (now with intelligent routing)
+          // Only fire if this request is still the active one (hasn't been superseded)
+          if (activeRequestIdRef.current === zombieRequestId) {
+            console.warn('[WS] No response after 10s - trying parallel REST fallback (WS still open)');
             sendTextCommand(command);
           }
         }, 10000);
@@ -5440,9 +5487,14 @@ const JarvisVoice = () => {
         if (result.success) {
           console.log(`[TEXT COMMAND] ✅ Sent via ${result.route}`);
           if (result.route === 'rest' && result.response) {
-            // REST returns response directly
-            setResponse(result.response);
-            setIsProcessing(false);
+            // Dedup: Only update if WS hasn't already handled this request
+            if (activeRequestIdRef.current === null) {
+              console.debug('[REST] Response arrived but WS already handled it — ignoring');
+            } else {
+              activeRequestIdRef.current = null;
+              setResponse(result.response);
+              setIsProcessing(false);
+            }
           }
           // WebSocket: response comes through message handler
           return;
@@ -5871,7 +5923,28 @@ const JarvisVoice = () => {
         // Cancel any ongoing speech first
         window.speechSynthesis.cancel();
 
-        const utterance = new SpeechSynthesisUtterance(text);
+        // Sanitize text for browser TTS to prevent literal punctuation reading
+        // (e.g., "..." read as "full stop" by British English Daniel voice)
+        const sanitizeForSpeech = (rawText) => {
+          let cleaned = rawText;
+          cleaned = cleaned.replace(/\.{2,}/g, ' ');        // "..." → " "
+          cleaned = cleaned.replace(/\.\s*$/g, '');          // trailing "." → ""
+          // Unicode Extended_Pictographic for comprehensive emoji stripping
+          // (covers ZWJ sequences, flags, supplemental symbols, future additions)
+          try {
+            cleaned = cleaned.replace(/\p{Extended_Pictographic}/gu, '');
+            cleaned = cleaned.replace(/\u200D/g, '');        // Zero-width joiners
+            cleaned = cleaned.replace(/[\uFE00-\uFE0F]/g, ''); // Variation selectors
+          } catch (_e) {
+            // Fallback for browsers without Unicode property escapes
+            cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}]/gu, '');
+          }
+          cleaned = cleaned.replace(/[*_~`#]/g, '');         // markdown
+          cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
+          return cleaned;
+        };
+
+        const utterance = new SpeechSynthesisUtterance(sanitizeForSpeech(text));
         utterance.rate = 0.7;   // Even slower rate for smooth, non-rushed speech
         utterance.pitch = 0.95; // Slightly lower pitch for more authoritative tone
         utterance.volume = 0.9; // Slightly lower volume for more natural sound
