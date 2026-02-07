@@ -125,7 +125,7 @@ T = TypeVar('T')
 # v235.0: Startup script version tag — bumped on every significant script change.
 # Embedded in VM metadata at creation. Running VMs with a stale version are
 # automatically recycled (deleted + recreated) to pick up the latest script.
-_STARTUP_SCRIPT_VERSION = "235.0"
+_STARTUP_SCRIPT_VERSION = "235.1"
 
 
 # ============================================================================
@@ -6631,7 +6631,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                 "model_loaded": state.get("model_loaded", False),
                 "ready_for_inference": ready,
                 "apars": {
-                    "version": "235.0",
+                    "version": "235.1",
                     "phase_number": state.get("phase", 0),
                     "phase_name": state.get("checkpoint", "starting"),
                     "phase_progress": state.get("phase_progress", 0),
