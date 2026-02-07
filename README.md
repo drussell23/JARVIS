@@ -112,9 +112,9 @@ body:HEAL | prime:STAR | reactorc:STAR | gcpvm:STAR | trinity:STAR
 
 ---
 
-## GCP Golden Image — Cloud Inference Architecture (v224.0+, v235.4)
+## GCP Golden Image — Cloud Inference Architecture (v224.0+, v235.4, v236.0)
 
-JARVIS uses a **pre-baked GCP VM image** (golden image) to deliver cloud-based LLM inference with ~30-60 second cold starts instead of 10-15 minutes. As of v233.2, this is the **only** inference pathway — local LLM loading on 16GB Mac is off-limits due to memory pressure and swap thrashing. The fallback chain is: GCP Golden Image → GCP Standard VM → Claude API (emergency). As of v235.4, the frontend→backend→GCP command routing is fully resilient with automatic WebSocket→REST→queue failover.
+JARVIS uses a **pre-baked GCP VM image** (golden image) to deliver cloud-based LLM inference with ~30-60 second cold starts instead of 10-15 minutes. As of v233.2, this is the **only** inference pathway — local LLM loading on 16GB Mac is off-limits due to memory pressure and swap thrashing. The fallback chain is: GCP Golden Image → GCP Standard VM → Claude API (emergency). As of v235.4, the frontend→backend→GCP command routing is fully resilient with automatic WebSocket→REST→queue failover. As of v236.0, the system prompt, max_tokens, and temperature are dynamically adapted per query complexity — simple queries get terse, deterministic responses while complex queries get thorough analysis.
 
 ### Three-Tier Inference Architecture (v234.0)
 
@@ -809,6 +809,261 @@ After deploying v235.4, the complete system was verified:
 5. **Static config files are landmines.** `dynamic-config.json` with a hardcoded port 8000 silently misdirected traffic. Config files that don't match runtime reality cause the worst kind of bugs — everything looks correct but nothing works.
 
 6. **Golden images must include both server and client fixes.** The v235.4 golden image baked in model auto-detection, health format compatibility, routing cases, and timeout adjustments — ensuring the VM works correctly from the moment it boots.
+
+### Adaptive Prompt System — Fixing Verbose LLM Responses (v236.0)
+
+#### The Problem: "Of course, the sum of five and five is ten."
+
+After v235.4 established the full frontend→backend→GCP inference pipeline, a new issue emerged: JARVIS gave **absurdly verbose responses to simple questions**. Asking "what is 5+5?" returned:
+
+> *"Of course, the sum of five and five is ten. I'd be happy to help with any other mathematical queries you might have."*
+
+Instead of just: **10**
+
+The same problem appeared across all simple queries — factual questions, yes/no questions, definitions — everything came back wrapped in conversational filler, polite sign-offs, and unnecessary elaboration.
+
+#### Root Cause Analysis: Static Prompt + Unused Classification
+
+Two root causes interacted:
+
+**RC1: A static system prompt was used for ALL queries regardless of complexity**
+
+A single `JARVIS_SYSTEM_PROMPT` was hardcoded in `query_handler.py` and applied to every query — from "5+5" to "design a microservice architecture":
+
+```python
+# BEFORE (v235.4): Same prompt, same max_tokens, same temperature for everything
+JARVIS_SYSTEM_PROMPT = """You are JARVIS, an advanced AI assistant created by Derek Russell.
+You are helpful, intelligent, and speak with a sophisticated yet approachable tone.
+When responding:
+- Be concise but thorough
+- Use natural, conversational language
+- Address the user respectfully"""
+```
+
+The instruction "be concise **but thorough**" caused Mistral-7B to interpret "thorough" as "be verbose." The identity prefix "You are JARVIS, an advanced AI assistant" further encouraged the 7B model to generate conversational, assistant-like filler instead of direct answers. Additionally, `max_tokens=4096` and `temperature=0.7` were applied to every request — giving the model maximum room and maximum randomness even for questions with one-word answers.
+
+**RC2: Query complexity classification existed but was never used**
+
+The `QueryComplexityManager` in `backend/context_intelligence/handlers/query_complexity_manager.py` already classified every query into 5 levels (SIMPLE → EXPERT) at line 1712 of `unified_command_processor.py`. But the result (`classified_query`) was **never passed to `handle_query()`** — the classification work was computed and thrown away:
+
+```python
+# BEFORE (v235.4): classified_query computed but never used for prompting
+classified_query = await self.query_complexity_manager.process_query(command_text, context=context)
+# ... 2,768 lines later ...
+result = await handle_query(command_text, query_context)  # No classified_query passed!
+```
+
+**RC3 (Compounding): The existing classifier was space-only**
+
+The `QueryComplexityClassifier` only recognized space-based patterns ("what's in space 3?", "compare space 1 and 2"). For general NL queries like "what is 5+5?" or "explain quantum physics", none of the space patterns matched, so the classifier defaulted to `SIMPLE` — which happened to be correct for "5+5" but for the wrong reasons (nothing matched, not because it recognized math). More importantly, "explain how neural networks learn" also fell through to `SIMPLE`, which was wrong.
+
+**RC4: The `expert_reasoning` pattern was too broad**
+
+The existing expert pattern `re.compile(r"explain\s+(?:why|how)")` matched bare "explain how X" queries — routing them to EXPERT (4096 tokens, temp 0.7) when they should have been COMPLEX (2048 tokens, temp 0.5). A simple "explain how TCP/IP works" is not expert-level multi-step reasoning.
+
+**RC5: Streaming and fallback paths had identical issues**
+
+Both `handle_query_stream()` and `_fallback_to_cloud()` also used the static `JARVIS_SYSTEM_PROMPT` with `max_tokens=4096`. Every code path through the system produced verbose output.
+
+#### The v236.0 Fix: Adaptive Prompt System (5 Files Modified)
+
+**Fix 1: `AdaptivePromptBuilder` replaces static prompt** (`query_handler.py`)
+
+A new `AdaptivePromptBuilder` class dynamically selects the system prompt, max_tokens, and temperature based on the query's complexity level:
+
+```
+┌────────────┬────────────┬──────┬─────────────────────────────────────────────────┐
+│ Complexity │ max_tokens │ temp │ System Prompt Strategy                          │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ SIMPLE     │ 64         │ 0.0  │ NO identity prefix. Few-shot examples.          │
+│            │            │      │ "Reply with ONLY the direct answer."            │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ MODERATE   │ 512        │ 0.3  │ Identity + "2-3 sentences. No filler."          │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ COMPLEX    │ 2048       │ 0.5  │ Identity + "Structured. Thorough where useful." │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ ADVANCED   │ 4096       │ 0.7  │ Identity + "Detailed analysis with structure."  │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ EXPERT     │ 4096       │ 0.7  │ Identity + "Comprehensive. Edge cases."         │
+└────────────┴────────────┴──────┴─────────────────────────────────────────────────┘
+```
+
+**Key design decision: SIMPLE queries omit the JARVIS identity prefix.** The "You are JARVIS, an advanced AI assistant" identity conflicts with "reply with ONLY the number" on 7B models. The model's instruction-following capacity is limited — when it sees both "be an AI assistant" (which implies conversational behavior) and "output only the number" (which implies terse behavior), the identity wins because it's the stronger training signal. Removing the identity for SIMPLE queries eliminates this conflict. MODERATE and above retain the identity because longer responses benefit from the JARVIS personality.
+
+**Few-shot examples ground the model:**
+
+```
+Examples:
+Q: 5+5
+A: 10
+Q: Capital of France?
+A: Paris
+Q: Define gravity
+A: The force that attracts objects with mass toward each other.
+```
+
+Few-shot examples are far more effective than abstract instructions for 7B models — they learn by pattern matching, not by interpreting meta-instructions about output format.
+
+**Temperature 0.0 for SIMPLE ensures deterministic output.** At temperature 0.0, the model always picks the highest-probability token. For "5+5", this reliably produces "10" without sampling variation.
+
+**Fix 2: Wired `classified_query` across method boundary** (`unified_command_processor.py`)
+
+The `classified_query` is computed in `process_command()` (line ~1715) but consumed in `_execute_command_internal()` (line ~4485) — a different method. Instead of attempting to pass it through ~2,768 lines of the same function, the fix stores it on `self`:
+
+```python
+# In process_command() — line 1731
+self._classified_query = classified_query
+
+# In _execute_command_internal() — line 4485
+_classified_query = getattr(self, '_classified_query', None)
+result = await handle_query(command_text, query_context, classified_query=_classified_query)
+```
+
+`getattr(..., None)` ensures graceful degradation if `process_command()` didn't run the classifier (e.g., the classifier threw an exception, or the command type changed mid-flight).
+
+**Fix 3: General NL query classification** (`query_complexity_manager.py`)
+
+Replaced the unconditional `return QueryComplexity.SIMPLE` default with a priority-ordered general NL classifier:
+
+```
+EXPERT indicators (checked first — highest priority):
+  "design a system/architecture/solution"
+  "implement from scratch"
+  "refactor/debug code/system"
+
+COMPLEX indicators (checked second):
+  "explain how/why/what"
+  "write a/an/me"
+  "compare X and Y"
+  "what are the pros/cons/differences"
+  "step by step", "in detail"
+
+SIMPLE indicators (checked last — only if no complex/expert matched):
+  Math expressions: digits + operator + digits (5+5, 10*3, 2^8)
+  Short factual: "what is X", "what's X", "define X" (≤8 words)
+  Short yes/no: "is/are/can X?" (≤8 words)
+
+Length-based fallback:
+  ≤6 words → SIMPLE
+  >6 words → MODERATE
+```
+
+The priority ordering prevents compound queries like "what is 5+5 and explain the concept" from being classified as SIMPLE just because the math regex fires — the COMPLEX "explain" indicator fires first.
+
+**Fix 4: Narrowed `expert_reasoning` pattern** (`query_complexity_manager.py`)
+
+Changed the overly broad "explain how/why" pattern to require multi-step causality indicators:
+
+```python
+# BEFORE: Matched all "explain how X" → EXPERT
+re.compile(r"explain\s+(?:why|how)", re.I)
+
+# AFTER: Only matches causal analysis → EXPERT
+# "explain how X works" now falls through to COMPLEX (correct)
+re.compile(r"explain\s+(?:why|how)\s+.*\b(?:interacts?|affects?|causes?|leads?\s+to|relates?)\b", re.I)
+```
+
+**Fix 5: Fixed streaming kwargs extraction** (`prime_client.py`)
+
+`generate_stream()` previously dumped all kwargs into `metadata`, which meant `max_tokens` and `temperature` from `AdaptivePromptBuilder` ended up in a metadata dict that llama-cpp-python silently ignores:
+
+```python
+# BEFORE: max_tokens/temperature lost in metadata
+request = PrimeRequest(..., stream=True, metadata=kwargs)
+
+# AFTER: Extracted into proper PrimeRequest fields
+request = PrimeRequest(
+    ...,
+    stream=True,
+    max_tokens=kwargs.pop("max_tokens", 4096),
+    temperature=kwargs.pop("temperature", 0.7),
+    metadata=kwargs,
+)
+```
+
+**Fix 6: Fallback path regression prevention** (`query_handler.py`)
+
+`_fallback_to_cloud()` has no access to `classified_query` (it's a module-level function). The fix uses `is_fallback=True` which defaults to ADVANCED (4096 tokens, temp 0.7) — matching the pre-v236.0 behavior exactly:
+
+```python
+# Fallback: generous defaults to avoid truncating complex queries
+params = AdaptivePromptBuilder.build(classified_query=None, is_fallback=True)
+# → ADVANCED: 4096 tokens, 0.7 temp (same as pre-v236.0)
+```
+
+This ensures that if a complex query hits the fallback path (e.g., Prime is down), it gets the same token budget as before — no regression.
+
+#### Files Modified (v236.0)
+
+| # | File | Change |
+|---|------|--------|
+| 1 | `backend/api/query_handler.py` | Replaced static `JARVIS_SYSTEM_PROMPT` with `AdaptivePromptBuilder` class. Updated `handle_query()`, `_fallback_to_cloud()`, and `handle_query_stream()` signatures and routing. |
+| 2 | `backend/api/unified_command_processor.py` | Stored `classified_query` on `self` in `process_command()` (line 1731), read via `getattr` in `_execute_command_internal()` (line 4485) to bridge the cross-method scope gap. |
+| 3 | `backend/context_intelligence/handlers/query_complexity_manager.py` | Narrowed `expert_reasoning` "explain" pattern to require causality indicators. Added general NL classification with EXPERT→COMPLEX→SIMPLE priority ordering, math regex, short-factual detection, and length-based fallback. |
+| 4 | `backend/core/prime_router.py` | Added temperature propagation to cloud streaming path. Added adaptive parameter logging. |
+| 5 | `backend/core/prime_client.py` | Fixed `generate_stream()` to extract `max_tokens`/`temperature` from kwargs into `PrimeRequest` fields instead of dumping them into ignored metadata. |
+
+#### Verified Results (v236.0)
+
+```
+┌───────────────────────────────────┬────────────┬────────────┬──────┬────────────────────┐
+│ Query                             │ Complexity │ max_tokens │ temp │ Response           │
+├───────────────────────────────────┼────────────┼────────────┼──────┼────────────────────┤
+│ "what is 5+5?"                    │ SIMPLE     │ 64         │ 0.0  │ 10                 │
+├───────────────────────────────────┼────────────┼────────────┼──────┼────────────────────┤
+│ "what's 5+5?"                     │ SIMPLE     │ 64         │ 0.0  │ 10                 │
+├───────────────────────────────────┼────────────┼────────────┼──────┼────────────────────┤
+│ "define photosynthesis"           │ SIMPLE     │ 64         │ 0.0  │ One sentence       │
+├───────────────────────────────────┼────────────┼────────────┼──────┼────────────────────┤
+│ "capital of France?"              │ SIMPLE     │ 64         │ 0.0  │ Paris              │
+├───────────────────────────────────┼────────────┼────────────┼──────┼────────────────────┤
+│ "explain how neural networks      │ COMPLEX    │ 2048       │ 0.5  │ Structured         │
+│  learn"                           │            │            │      │ multi-paragraph    │
+└───────────────────────────────────┴────────────┴────────────┴──────┴────────────────────┘
+```
+
+#### Why a 7B Model Needs More Than Just a Prompt (And the Path Forward)
+
+The adaptive prompt system is the **immediate fix** — it dramatically reduces verbosity by tuning system prompt, max_tokens, and temperature per query. But 7B-parameter models have fundamentally weaker instruction-following than frontier models (GPT-4, Claude). When there's tension between the model's conversational training distribution and a prompt instruction like "output ONLY the number," the training distribution sometimes wins.
+
+The v236.0 approach mitigates this through three techniques:
+1. **Omitting the identity prefix** for SIMPLE queries (removes the "be conversational" signal)
+2. **Few-shot examples** (7B models follow patterns better than abstract instructions)
+3. **Temperature 0.0** (eliminates sampling randomness for deterministic output)
+
+The **permanent solution** is the Reactor-Core training loop that's already wired into the architecture:
+
+```
+JARVIS (Body)                    JARVIS Prime (Mind)              Reactor-Core (Nerves)
+─────────────                    ───────────────────              ─────────────────────
+User: "5+5?"                 →   Mistral-7B responds "10"    →   TelemetryEmitter collects
+                                                                   (query, response, complexity,
+                                                                    latency, success)
+                                                                          │
+                                 Hot-swap fine-tuned model   ←   DPO/RLHF training on
+                                 (zero downtime)                  preference pairs:
+                                                                  chosen: "10"
+                                                                  rejected: "Of course, the
+                                                                  sum of five and..."
+```
+
+The `TelemetryEmitter` (already called at line 2096 of `unified_command_processor.py`) captures every interaction and ships it to Reactor-Core. The `TrainingDataPipeline` in JARVIS Prime creates DPO preference pairs. Reactor-Core trains on them. The result: a fine-tuned model that **inherently knows** when to say "10" and when to write a detailed analysis — not because of a prompt instruction it might ignore, but because the behavior is encoded in its weights. That's the path from "7B model fighting a prompt" to "7B model specialized for JARVIS."
+
+#### Lessons Learned (v236.0)
+
+1. **"Be concise but thorough" is contradictory for 7B models.** The word "thorough" overrides "concise" in the model's interpretation. System prompts for small models must be unambiguous — "ONLY the number" works; "concise but thorough" does not.
+
+2. **Identity prompts conflict with terse output instructions.** "You are JARVIS, an advanced AI assistant" + "reply with ONLY the number" creates a conflict that 7B models resolve in favor of the identity (be conversational). The solution is to omit the identity when terse output is required.
+
+3. **Few-shot examples beat abstract instructions.** Showing the model `Q: 5+5\nA: 10` is far more effective than telling it "for math, return just the result." Small models learn by pattern, not by interpreting meta-instructions.
+
+4. **Classification must match prompting granularity.** Having 5 complexity levels is useless if the prompt doesn't vary. Conversely, adaptive prompts are useless without accurate classification. Both systems must evolve together.
+
+5. **Existing code doing work whose result is thrown away is an architectural red flag.** The complexity classifier was running on every query, consuming CPU time, but its output was never wired into the prompt pipeline. If code computes a result, something should use it.
+
+6. **Method scope gaps require explicit bridging.** `classified_query` was computed in `process_command()` and needed in `_execute_command_internal()` — 2,768 lines apart in a different method. Storing on `self` with `getattr` fallback is simple but intentional; relying on "it's in scope somewhere above" is fragile.
+
+7. **Fallback paths must not regress.** When the adaptive system defaults to MODERATE (512 tokens) for unknown complexity, complex queries hitting the fallback get truncated. The `is_fallback=True` flag explicitly preserves current behavior (4096 tokens) for fallback paths — a critical guard against silent regression.
 
 ---
 
