@@ -357,7 +357,7 @@ class ModelManager:
                 # Create model with optimized settings
                 model = LlamaCpp(
                     model_path=str(model_path),
-                    n_gpu_layers=1,  # Use Metal GPU
+                    n_gpu_layers=int(os.getenv("JARVIS_N_GPU_LAYERS", "-1")),  # v234.0: Full Metal GPU offload
                     n_ctx=model_info.context_size,
                     n_batch=256 if tier == ModelTier.TINY else 512,
                     temperature=0.7,

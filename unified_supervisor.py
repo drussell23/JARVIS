@@ -58209,6 +58209,7 @@ class JarvisSystemKernel:
         self._invincible_node_ready: bool = False
         self._invincible_node_ip: Optional[str] = None
         self._early_invincible_task: Optional[asyncio.Task] = None  # v233.4: Early GCP pre-warm
+        self._model_serving = None  # v234.0: UnifiedModelServing instance
 
         # v207.0: Startup Resilience Coordinator
         # Provides non-blocking health checks and background auto-recovery for:
@@ -58352,6 +58353,8 @@ class JarvisSystemKernel:
         # Also set cloud-specific URLs for components that use them
         os.environ["GCP_PRIME_ENDPOINT"] = prime_url
         os.environ["JARVIS_PRIME_CLOUD_RUN_URL"] = prime_url
+        # v234.0: Also set for UnifiedModelServing's PrimeAPIClient
+        os.environ["JARVIS_PRIME_API_URL"] = prime_url
         
         # Set a flag indicating hollow client is active (for dynamic behavior)
         os.environ["JARVIS_HOLLOW_CLIENT_ACTIVE"] = "true"
@@ -58366,6 +58369,14 @@ class JarvisSystemKernel:
         # v232.0: Notify PrimeRouter singleton of GCP endpoint promotion
         try:
             asyncio.ensure_future(self._notify_prime_router_of_gcp(node_ip, port))
+        except Exception:
+            pass
+
+        # v234.0: Notify UnifiedModelServing of GCP endpoint
+        try:
+            asyncio.ensure_future(
+                self._notify_model_serving_of_gcp(node_ip, port)
+            )
         except Exception:
             pass
 
@@ -58397,6 +58408,51 @@ class JarvisSystemKernel:
         except (ImportError, Exception) as e:
             self.logger.debug(f"[InvincibleNode] PrimeRouter demotion notification: {e}")
 
+    async def _notify_model_serving_of_gcp(self, host: str, port: int) -> None:
+        """v234.0: Notify UnifiedModelServing that GCP VM is ready."""
+        try:
+            from backend.intelligence.unified_model_serving import (
+                notify_gcp_endpoint_ready,
+            )
+            url = f"http://{host}:{port}"
+            success = await notify_gcp_endpoint_ready(url)
+            if success:
+                self.logger.info(
+                    f"[InvincibleNode] v234.0: UnifiedModelServing "
+                    f"notified of GCP: {url}"
+                )
+            else:
+                self.logger.warning(
+                    f"[InvincibleNode] v234.0: UnifiedModelServing "
+                    f"GCP notification failed"
+                )
+        except ImportError:
+            self.logger.debug(
+                "[InvincibleNode] UnifiedModelServing not available"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] UnifiedModelServing notification failed: {e}"
+            )
+
+    async def _notify_model_serving_demote(self) -> None:
+        """v234.0: Notify UnifiedModelServing to demote from GCP."""
+        try:
+            from backend.intelligence.unified_model_serving import (
+                notify_gcp_endpoint_unhealthy,
+            )
+            await notify_gcp_endpoint_unhealthy()
+            self.logger.info(
+                "[InvincibleNode] v234.0: UnifiedModelServing "
+                "demoted from GCP"
+            )
+        except ImportError:
+            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] UnifiedModelServing demotion failed: {e}"
+            )
+
     def _clear_invincible_node_url(self, reason: str = "unhealthy") -> None:
         """
         v219.0: Clear Invincible Node URL when the node becomes unhealthy.
@@ -58424,6 +58480,12 @@ class JarvisSystemKernel:
         # v232.0: Notify PrimeRouter to demote back to local
         try:
             asyncio.ensure_future(self._notify_prime_router_demote())
+        except Exception:
+            pass
+
+        # v234.0: Notify UnifiedModelServing to demote from GCP
+        try:
+            asyncio.ensure_future(self._notify_model_serving_demote())
         except Exception:
             pass
 
@@ -62592,6 +62654,53 @@ class JarvisSystemKernel:
 
                 if self._readiness_manager:
                     self._readiness_manager.mark_component_ready("intelligence", ready_count > 0)
+
+                # v234.0: Initialize UnifiedModelServing (3-tier inference routing)
+                try:
+                    from backend.intelligence.unified_model_serving import (
+                        get_model_serving,
+                        PrimeLocalClient,
+                        PRIME_DEFAULT_MODEL,
+                        ModelProvider,
+                    )
+                    self._model_serving = await asyncio.wait_for(
+                        get_model_serving(), timeout=30.0,
+                    )
+                    _ms_providers = list(self._model_serving._clients.keys())
+                    self.logger.info(
+                        f"[Kernel] v234.0: UnifiedModelServing ready "
+                        f"({len(_ms_providers)} providers: "
+                        f"{[p.value for p in _ms_providers]})"
+                    )
+                    if self._readiness_manager:
+                        self._readiness_manager.mark_component_ready(
+                            "model_serving", True
+                        )
+                    # v234.0: Log warning if Tier 2 has no GGUF model
+                    _local = self._model_serving._clients.get(
+                        ModelProvider.PRIME_LOCAL
+                    )
+                    if _local and isinstance(_local, PrimeLocalClient):
+                        _found = _local._discover_model(PRIME_DEFAULT_MODEL)
+                        if _found is None:
+                            self.logger.warning(
+                                "[Kernel] v234.0: Tier 2 local inference "
+                                "unavailable — no GGUF model found. "
+                                "Set JARVIS_PRIME_AUTO_DOWNLOAD=true or "
+                                "place a model in ~/models/"
+                            )
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "[Kernel] v234.0: UnifiedModelServing init timed out "
+                        "(30s) — inference routing unavailable"
+                    )
+                    self._model_serving = None
+                except Exception as e:
+                    self.logger.warning(
+                        f"[Kernel] v234.0: UnifiedModelServing init failed "
+                        f"(non-fatal): {e}"
+                    )
+                    self._model_serving = None
 
                 if ready_count > 0:
                     self._update_component_status("intelligence", "complete", f"Intelligence ready: {ready_count}/{len(results)} initialized")

@@ -54,6 +54,7 @@ jsonschema-specifications==2025.9.1
 kubernetes==34.1.0
 lazy_loader==0.4
 librosa==0.11.0
+llama-cpp-python>=0.3.0
 llvmlite==0.43.0
 markdown-it-py==3.0.0
 MarkupSafe==3.0.3

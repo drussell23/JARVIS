@@ -287,6 +287,11 @@ class PrimeLocalClient(ModelClient):
         self._lock = asyncio.Lock()
         self._loaded = False
         self._discovery_attempted = False
+        # v234.0: Single-worker executor to serialize LLM inference (prevents OOM)
+        import concurrent.futures
+        self._inference_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="llm-inference"
+        )
 
     def _discover_model(self, model_name: str) -> Optional[Path]:
         """
@@ -446,18 +451,52 @@ class PrimeLocalClient(ModelClient):
 
         async with self._lock:
             try:
+                # v234.0: Check available RAM before loading
+                _model_size_gb = model_path.stat().st_size / (1024 ** 3)
+                try:
+                    from backend.core.memory_quantizer import (
+                        get_memory_quantizer,
+                    )
+                    _mq = await get_memory_quantizer()
+                    _metrics = _mq.get_current_metrics()
+                    _avail = _metrics.system_memory_available_gb
+                    # Need model size + 1GB headroom
+                    if _model_size_gb + 1.0 > _avail:
+                        self.logger.warning(
+                            f"[v234.0] Insufficient RAM for {model_path.name}: "
+                            f"need {_model_size_gb + 1.0:.1f}GB, "
+                            f"available {_avail:.1f}GB"
+                        )
+                        return False
+                    self.logger.info(
+                        f"[v234.0] RAM check passed: {_avail:.1f}GB available, "
+                        f"model needs {_model_size_gb:.1f}GB"
+                    )
+                except Exception as e:
+                    self.logger.debug(f"[v234.0] RAM check skipped: {e}")
+
                 # Try to import llama-cpp-python
                 from llama_cpp import Llama
+
+                # v234.0: Detect Apple Silicon for Metal GPU offload
+                _n_gpu = int(os.getenv("JARVIS_N_GPU_LAYERS", "-1"))
+                import platform
+                if platform.machine() != "arm64":
+                    _n_gpu = 0  # No Metal on Intel
 
                 self._model = Llama(
                     model_path=str(model_path),
                     n_ctx=PRIME_CONTEXT_LENGTH,
                     n_threads=os.cpu_count() or 4,
+                    n_gpu_layers=_n_gpu,
                     verbose=False,
                 )
                 self._model_path = model_path
                 self._loaded = True
-                self.logger.info(f"Loaded Prime model: {model_path.name}")
+                self.logger.info(
+                    f"Loaded Prime model: {model_path.name} "
+                    f"(GPU layers: {_n_gpu}, size: {_model_size_gb:.1f}GB)"
+                )
                 return True
 
             except ImportError:
@@ -490,10 +529,10 @@ class PrimeLocalClient(ModelClient):
             # Build prompt from messages
             prompt = self._build_prompt(request.messages, request.system_prompt)
 
-            # Run inference in thread pool to avoid blocking
+            # v234.0: Run inference in single-worker executor (prevents concurrent OOM)
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
-                None,
+                self._inference_executor,
                 lambda: self._model(
                     prompt,
                     max_tokens=request.max_tokens,
@@ -1201,16 +1240,17 @@ class ModelRouter:
     def __init__(self):
         self.logger = logging.getLogger("ModelRouter")
 
-        # Task to preferred provider mapping - J-Prime is PRIMARY for all task types
-        # Cloud APIs (Claude) serve as fallbacks for resilience
-        # v100.2: Dynamic preferences loaded from config, with J-Prime as default primary
+        # v234.0: Task preferences with 3-tier fallback: PRIME_API → PRIME_LOCAL → CLAUDE
+        # PRIME_API = GCP golden image VM or local J-Prime server (Tier 1)
+        # PRIME_LOCAL = Local GGUF via llama-cpp-python (Tier 2)
+        # CLAUDE = Anthropic API fallback (Tier 3)
         self._task_preferences: Dict[TaskType, List[ModelProvider]] = {
-            TaskType.CHAT: [ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN, ModelProvider.CLAUDE],
-            TaskType.REASONING: [ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN, ModelProvider.CLAUDE],  # J-Prime primary
-            TaskType.VISION: [ModelProvider.PRIME_CLOUD_RUN, ModelProvider.PRIME_LOCAL, ModelProvider.CLAUDE],  # J-Prime primary (Cloud Run has vision)
-            TaskType.CODE: [ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN, ModelProvider.CLAUDE],
-            TaskType.TOOL_USE: [ModelProvider.CLAUDE, ModelProvider.PRIME_LOCAL],  # Claude primary (Prime tool use experimental)
-            TaskType.EMBEDDING: [ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN],
+            TaskType.CHAT: [ModelProvider.PRIME_API, ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN, ModelProvider.CLAUDE],
+            TaskType.REASONING: [ModelProvider.PRIME_API, ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN, ModelProvider.CLAUDE],
+            TaskType.VISION: [ModelProvider.PRIME_API, ModelProvider.PRIME_CLOUD_RUN, ModelProvider.PRIME_LOCAL, ModelProvider.CLAUDE],
+            TaskType.CODE: [ModelProvider.PRIME_API, ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN, ModelProvider.CLAUDE],
+            TaskType.TOOL_USE: [ModelProvider.CLAUDE, ModelProvider.PRIME_API, ModelProvider.PRIME_LOCAL],
+            TaskType.EMBEDDING: [ModelProvider.PRIME_API, ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN],
         }
 
         # v100.2: Performance-based preference weighting (adaptive routing)
@@ -1472,21 +1512,17 @@ class UnifiedModelServing:
                     "set JARVIS_PRIME_API_ENABLED=false to skip"
                 )
 
-        # Prime Local as fallback when J-Prime API unavailable
-        if PRIME_LOCAL_ENABLED and not prime_available:
-            self.logger.info("  🔄 Trying Prime Local fallback...")
+        # v234.0: PRIME_LOCAL as Tier 2 — register even if PRIME_API available
+        # Model loads lazily on first generate() call to conserve RAM
+        if PRIME_LOCAL_ENABLED:
+            self.logger.info("  🔄 Registering Prime Local (Tier 2, lazy-load)...")
             client = PrimeLocalClient()
-            if await client.health_check() or await client.load_model():
-                self._clients[ModelProvider.PRIME_LOCAL] = client
-                self.logger.info("  ✓ Prime Local client ready (direct GGUF)")
+            self._clients[ModelProvider.PRIME_LOCAL] = client
+            self.logger.info(
+                "  ✓ Prime Local client registered (model loads on demand)"
+            )
+            if not prime_available:
                 prime_available = True
-            else:
-                # v100.5: Provide helpful guidance instead of just warning
-                self.logger.info("  ⚠️ Prime Local client not available")
-                self.logger.info(
-                    "     → Prime Local requires a GGUF model. "
-                    "Set JARVIS_PRIME_AUTO_DOWNLOAD=true or place a model in ~/models/"
-                )
 
         if PRIME_CLOUD_RUN_ENABLED and PRIME_CLOUD_RUN_URL:
             client = PrimeCloudRunClient()
@@ -2010,3 +2046,97 @@ async def get_unified_model_serving() -> UnifiedModelServing:
     Alias for get_model_serving() for Trinity Loop integration compatibility.
     """
     return await get_model_serving()
+
+
+# =============================================================================
+# v234.0: GCP Endpoint Hot-Swap (called by unified_supervisor.py)
+# =============================================================================
+
+async def notify_gcp_endpoint_ready(url: str) -> bool:
+    """
+    v234.0: Notify UnifiedModelServing that GCP endpoint is ready.
+
+    Called by unified_supervisor._propagate_invincible_node_url() when the
+    golden image VM becomes healthy. Validates the endpoint, then updates
+    the PrimeAPIClient to route to the GCP endpoint.
+
+    Args:
+        url: Full URL of the GCP endpoint (e.g., "http://34.56.78.90:8000")
+
+    Returns:
+        True if endpoint was updated successfully
+    """
+    global _model_serving, PRIME_API_URL
+    if _model_serving is None:
+        return False
+
+    url = url.rstrip("/")
+    logger = logging.getLogger("UnifiedModelServing")
+
+    # v234.0: Update module-level constant so any NEW PrimeAPIClient
+    # instances created after this point use the GCP URL, not localhost
+    PRIME_API_URL = url
+
+    client = _model_serving._clients.get(ModelProvider.PRIME_API)
+    if client and isinstance(client, PrimeAPIClient):
+        # v234.0: Validate new endpoint BEFORE closing old session
+        test_client = PrimeAPIClient(base_url=url)
+        if not await test_client.wait_for_ready():
+            logger.warning(
+                f"[v234.0] GCP endpoint failed validation ({url}), "
+                f"keeping current endpoint ({client.base_url})"
+            )
+            await test_client._close_session()
+            return False
+        await test_client._close_session()
+
+        old_url = client.base_url
+        client.base_url = url
+        client._ready = False  # Force re-validation on next request
+        await client._close_session()  # Close old connection pool
+        # Reset circuit breaker to give GCP a clean slate
+        _model_serving._circuit_breaker.record_success(
+            ModelProvider.PRIME_API.value
+        )
+        logger.info(f"[v234.0] GCP endpoint hot-swapped: {old_url} → {url}")
+        return True
+    else:
+        # No PrimeAPIClient yet — create one pointing at GCP
+        new_client = PrimeAPIClient(base_url=url)
+        if await new_client.wait_for_ready():
+            _model_serving._clients[ModelProvider.PRIME_API] = new_client
+            _model_serving._circuit_breaker.record_success(
+                ModelProvider.PRIME_API.value
+            )
+            logger.info(f"[v234.0] GCP endpoint activated: {url}")
+            return True
+        else:
+            logger.warning(f"[v234.0] GCP endpoint not ready: {url}")
+            await new_client._close_session()
+            return False
+
+
+async def notify_gcp_endpoint_unhealthy() -> None:
+    """
+    v234.0: GCP endpoint is unhealthy — trip circuit breaker to force fallback.
+
+    Called by unified_supervisor._clear_invincible_node_url() when the golden
+    image VM becomes unreachable. Trips the PRIME_API circuit breaker so
+    requests automatically fall through to PRIME_LOCAL (Tier 2) or CLAUDE (Tier 3).
+    """
+    global _model_serving
+    if _model_serving is None:
+        return
+
+    logger = logging.getLogger("UnifiedModelServing")
+
+    # Trip circuit breaker (need failure_threshold failures to open)
+    for _ in range(CIRCUIT_BREAKER_FAILURE_THRESHOLD):
+        _model_serving._circuit_breaker.record_failure(
+            ModelProvider.PRIME_API.value
+        )
+
+    logger.warning(
+        "[v234.0] GCP endpoint marked unhealthy — "
+        "PRIME_API circuit breaker opened, falling through to Tier 2/3"
+    )

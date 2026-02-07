@@ -76,7 +76,8 @@ python3 unified_supervisor.py
          ├── Backend (Body)     port 8010   • Computer use, voice, vision
          ├── JARVIS-Prime       port 8000   • LLM, Neural Orchestrator
          ├── Reactor-Core       port 8090   • Training, experience, models
-         ├── GCP Spot VM        (on demand) • Offload when RAM &lt; threshold
+         ├── GCP Golden Image   (on demand) • Invincible Node, 3-tier inference
+         ├── GCP Spot VM        (fallback)  • Offload when RAM &lt; threshold
          └── Frontend           port 3000   • Web UI
 ```
 
@@ -101,7 +102,7 @@ JARVIS is the **orchestrator** for the three repos:
 3. **Early Prime pre-warm** — Starts JARVIS-Prime early so LLM loading begins in parallel; Trinity then adopts the process and **preserves loading progress** (v221.0 handoff).
 4. **Health** — Polls `/health` for Prime and Reactor; uses readiness state (e.g. LOADING → READY) for dashboard and timeouts.
 5. **State** — Writes shared state under `~/.jarvis/` (e.g. `trinity/state/`, `cross_repo/`, `signals/`) for Prime and Reactor to read.
-6. **GCP offload** — When memory is low, provisions Spot VMs and updates ML registry / cloud state so Prime can use the cloud backend.
+6. **GCP offload** — When memory is low, provisions a golden image VM (Invincible Node with static IP and pre-baked models) for cloud inference, with Spot VM fallback. See [§ GCP Golden Image](#gcp-golden-image--cloud-inference-architecture-v2240).
 
 **Trinity status** (example after startup):
 
@@ -111,12 +112,209 @@ body:HEAL | prime:STAR | reactorc:STAR | gcpvm:STAR | trinity:STAR
 
 ---
 
+## GCP Golden Image — Cloud Inference Architecture (v224.0+)
+
+JARVIS uses a **pre-baked GCP VM image** (golden image) to deliver cloud-based LLM inference with ~30-60 second cold starts instead of 10-15 minutes. This is the primary inference pathway for systems with limited local RAM (16GB), with automatic fallback to local quantized models and Claude API.
+
+### Three-Tier Inference Architecture (v234.0)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      INFERENCE ROUTING                                   │
+│              unified_model_serving.py (ModelRouter)                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Tier 1: PRIME_API ─────────────────────────────────────────────────────│
+│  │  GCP Golden Image VM (Invincible Node)                                │
+│  │  • Static IP: jarvis-prime-ip                                         │
+│  │  • Instance: jarvis-prime-node                                        │
+│  │  • Pre-baked: Python 3.11, ML deps, GGUF models, JARVIS-Prime code   │
+│  │  • Boot time: ~30-60s (golden image) vs 10-15 min (standard)          │
+│  │  • APARS health polling with 6-phase progress tracking                │
+│  │                                                                       │
+│  │  ↓ Circuit breaker trips after 3 failures                             │
+│  │                                                                       │
+│  Tier 2: PRIME_LOCAL ───────────────────────────────────────────────────│
+│  │  Local GGUF Inference (Apple Silicon / Metal GPU)                     │
+│  │  • llama-cpp-python with n_gpu_layers=-1 (full Metal offload)         │
+│  │  • RAM-aware: checks MemoryQuantizer before loading                   │
+│  │  • Models: Mistral-7B Q4_K_M (~4.5GB), Llama-3-8B Q4_K_M (~5.5GB)   │
+│  │  • Lazy-loaded: model only enters RAM when Tier 1 fails               │
+│  │                                                                       │
+│  │  ↓ Circuit breaker trips after 3 failures                             │
+│  │                                                                       │
+│  Tier 3: CLAUDE ────────────────────────────────────────────────────────│
+│     Anthropic API (always-available fallback)                             │
+│     • 99.9% SLA, cost per token                                          │
+│     • Automatic when both GCP and local are unavailable                  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### What's Pre-Baked in the Golden Image
+
+The golden image is a custom GCP machine image with everything pre-installed and ready to serve:
+
+| Component | Details |
+|-----------|---------|
+| **Python** | 3.11 with virtual environment |
+| **ML dependencies** | PyTorch, Transformers, llama-cpp-python, SentenceTransformers |
+| **JARVIS-Prime** | Full codebase with all dependencies |
+| **Model files** | 7B+ parameter models already downloaded (default: Mistral-7B-Instruct-v0.2) |
+| **System config** | .env, PYTHONPATH, systemd service — configured and tested |
+
+### Golden Image Startup Flow (APARS Protocol)
+
+When `python3 unified_supervisor.py` runs, the golden image VM boots through a 6-phase **Adaptive Progress-Aware Readiness System (APARS)**:
+
+```
+Phase 0 (0-10%)    boot              VM instance starts, OS initializes
+Phase 1 (10-20%)   stub_server       APARS health stub starts on port 8000
+Phase 2 (20-30%)   env_setup         Load .env, set PYTHONPATH
+Phase 3 (30-40%)   deps_check        Validate pre-baked ML dependencies
+Phase 4 (40-70%)   code_validation   Verify JARVIS-Prime code + model cache integrity
+  ├── 40% validating_prebaked         Start validation
+  ├── 45% code_validated              Code found (happy path)
+  │   └── 43% code_rescue_starting   OR: git clone rescue (timeout 120s)
+  │       ├── 48% code_rescue_failed  Clone failed
+  │       └── 50% code_rescue_complete Clone succeeded
+  ├── 55% checking_model_cache        Start model cache check
+  └── 65% model_size_calculated       Cache size computed
+Phase 5 (70-95%)   model_loading     Load model into inference server
+Phase 6 (95-100%)  inference_ready   Server verified, ready_for_inference=true
+```
+
+The supervisor polls the VM's `/health` endpoint every 5 seconds, reading real-time APARS progress. The **AdaptiveProgressAwareWaiter** dynamically extends deadlines while progress is being made, and triggers stall detection if progress stalls for 60+ seconds.
+
+### Invincible Node Architecture
+
+The golden image runs as an **Invincible Node** — a persistent GCP VM with a static IP address that survives preemption:
+
+| Property | Value |
+|----------|-------|
+| **Instance name** | `jarvis-prime-node` (configurable via `GCP_VM_INSTANCE_NAME`) |
+| **Static IP** | `jarvis-prime-ip` (configurable via `GCP_VM_STATIC_IP_NAME`) |
+| **Termination action** | `STOP` (not DELETE) — VM pauses instead of being destroyed |
+| **Restart time** | ~30s from STOPPED state vs ~60s cold boot vs 10-15 min standard |
+| **Health endpoint** | `http://<static-ip>:8000/health` (APARS-compatible JSON) |
+| **Inference endpoint** | `http://<static-ip>:8000/v1/chat/completions` (OpenAI-compatible) |
+
+**State machine:**
+
+```
+NOT_FOUND ──create──→ STAGING ──boot──→ RUNNING ──preempt──→ STOPPED
+                                            │                    │
+                                            │                    └──start──→ RUNNING (~30s)
+                                            │
+                                            └──healthy──→ READY (ready_for_inference=true)
+```
+
+### Early GCP Pre-Warm (v233.4)
+
+The VM provisioning starts **before Phase 0** of the supervisor startup, gaining 60-90 seconds of parallel boot time:
+
+```
+t=0s    Supervisor starts
+t=5s    Early Prime decision tree
+t=6s    ★ EARLY GCP PRE-WARM: Invincible node provisioning begins
+t=10s   Phase 0: Loading experience (browser opens)
+t=30s   Phase 1: Preflight checks
+t=60s   Phase 2: Resources — detects early task, REUSES it (no duplicate VM)
+t=150s  VM likely ready (has been booting for ~145s)
+t=200s  Phase 5: Trinity — VM is ready, Hollow Client mode activates
+```
+
+**Deduplication:** Phase 2 checks for the early boot task before creating a new one. If the early task is still running, Phase 2 reuses it. If it already succeeded, Phase 2 skips VM provisioning entirely.
+
+**Cancellation safety:** If Phase 2 resources time out, the early boot task is NOT cancelled — it continues independently as a background task for Phase 5 to pick up.
+
+### GCP Endpoint Hot-Swap (v234.0)
+
+When the golden image VM becomes ready (or goes down), the `UnifiedModelServing` router is notified in real-time:
+
+- **Promotion:** `_propagate_invincible_node_url()` → sets env vars + hot-swaps `PrimeAPIClient.base_url` → resets circuit breaker → Tier 1 routes to GCP
+- **Demotion:** `_clear_invincible_node_url()` → trips PRIME_API circuit breaker → requests automatically fall through to Tier 2 (local) or Tier 3 (Claude)
+
+### Golden Image Lineage Verification (v229.0)
+
+Before restarting a stopped VM, the supervisor checks if the VM was created from the current golden image:
+
+- If the VM matches the golden image → **fast restart** (~30s)
+- If the VM is from an older image → **delete + recreate** from latest golden image
+- Model mismatch detection prevents stale model versions from being served
+
+### Creating and Managing Golden Images
+
+```bash
+# Create a new golden image (provisions a builder VM, installs everything, snapshots)
+python3 unified_supervisor.py --create-golden-image
+
+# List all available golden images
+python3 unified_supervisor.py --list-golden-images
+
+# Check golden image availability and staleness
+python3 unified_supervisor.py --check-golden-image
+
+# Clean up old golden images (keep 3 most recent)
+python3 unified_supervisor.py --cleanup-golden-images 3
+```
+
+### Configuration (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JARVIS_GCP_USE_GOLDEN_IMAGE` | `false` | Enable golden image deployment |
+| `JARVIS_GCP_GOLDEN_IMAGE_NAME` | (auto-detect) | Override specific image name |
+| `JARVIS_GCP_GOLDEN_IMAGE_FAMILY` | `jarvis-prime-golden` | Image family for auto-detection |
+| `JARVIS_GCP_GOLDEN_IMAGE_MODEL` | `mistral-7b-instruct-v0.2` | Model pre-loaded in image |
+| `JARVIS_GCP_GOLDEN_IMAGE_MAX_AGE_DAYS` | `30` | Days before rebuild is recommended |
+| `JARVIS_GCP_GOLDEN_IMAGE_AUTO_REBUILD` | `false` | Auto-rebuild when stale |
+| `JARVIS_GCP_GOLDEN_IMAGE_FALLBACK` | `true` | Fall back to standard script if image unavailable |
+| `JARVIS_GCP_GOLDEN_BUILDER_MACHINE_TYPE` | `e2-highmem-8` | VM type for building images |
+| `GCP_VM_INSTANCE_NAME` | `jarvis-prime-node` | Invincible Node instance name |
+| `GCP_VM_STATIC_IP_NAME` | `jarvis-prime-ip` | Static IP resource name |
+| `GCP_VM_STARTUP_TIMEOUT` | `300` | Max seconds to wait for VM health |
+| `GCP_STATIC_VM_HEALTH_POLL_INTERVAL` | `5.0` | Seconds between health polls |
+| `JARVIS_N_GPU_LAYERS` | `-1` | GPU layers for local Metal offload (-1 = all) |
+| `JARVIS_PRIME_LOCAL_ENABLED` | `true` | Enable Tier 2 local GGUF fallback |
+| `CLAUDE_FALLBACK_ENABLED` | `true` | Enable Tier 3 Claude API fallback |
+
+### Relevant Files
+
+| File | Purpose |
+|------|---------|
+| `backend/core/gcp_vm_manager.py` | GCP VM lifecycle, golden image builder, APARS health polling, Invincible Node |
+| `backend/supervisor/cross_repo_startup_orchestrator.py` | Cross-repo startup lock, hardware assessment, Spot VM guard |
+| `backend/intelligence/unified_model_serving.py` | 3-tier inference router (PRIME_API → PRIME_LOCAL → CLAUDE) |
+| `backend/intelligence/local_llm_inference.py` | Local LLM engine with circuit breaker and batching |
+| `backend/core/model_manager.py` | GGUF model discovery, llama-cpp-python loading |
+| `backend/core/memory_quantizer.py` | RAM-aware memory tier management |
+| `backend/core/gcp_hybrid_prime_router.py` | Local/GCP routing with memory pressure monitoring |
+| `docker/gcp_inference_stub.py` | Fast APARS stub server for golden image boot |
+| `docker/Dockerfile.gcp-inference` | Container-based GCP inference (fallback path) |
+| `unified_supervisor.py` | Kernel: early GCP pre-warm, Phase 2 dedup, Phase 5 Trinity wait |
+
+### Diagnostic & Stall Recovery (v233.0)
+
+When the golden image stalls during boot, the system performs automated diagnostics:
+
+| Failure Type | Detection | Recovery |
+|--------------|-----------|----------|
+| **Corrupted model cache** | Serial console analysis | Delete + recreate VM from latest image |
+| **Service never started** | APARS stuck at Phase 4+ | Restart service via SSH or recreate |
+| **Dependency drift** | Import errors in console | Rebuild golden image |
+| **Network timeout** | Health endpoint unreachable | Retry with exponential backoff |
+| **Out of memory** | OOM messages in console | Scale up machine type |
+| **Boot timeout** | No progress for 120s+ | Fall back to standard startup script |
+
+---
+
 ## Key Components (Backend)
 
 | Area | Location | Description |
 |------|----------|-------------|
 | **Trinity** | `backend/core/trinity_integrator.py`, `backend/supervisor/cross_repo_startup_orchestrator.py` | Start Prime/Reactor, adopt early Prime, health checks |
-| **GCP** | `backend/core/gcp_vm_manager.py`, `dynamic_component_manager.py` | Spot VMs, auto offload, cost tracking |
+| **GCP** | `backend/core/gcp_vm_manager.py`, `dynamic_component_manager.py` | Golden image VMs, Spot VMs, auto offload, cost tracking |
 | **Loading progress** | `unified_supervisor.py` (LiveDashboard, `update_model_loading`), `backend/loading_server/` | Model load progress, handoff-safe (no 18%→0% regression) |
 | **Voice** | `backend/voice_unlock/`, `backend/voice/` | ECAPA speaker verification, unlock, TTS |
 | **Vision** | `backend/vision/` | Situational awareness, display topology |
@@ -159,6 +357,7 @@ The sections below contain the **documentation index**, **unified kernel details
 - **Troubleshooting issues?** → See [README_v2.md § Troubleshooting](./README_v2.md#troubleshooting)
 - **Understanding how repos work together?** → Continue reading below
 - **🆕 Startup architecture & v107.0 improvements?** → See [STARTUP_ARCHITECTURE_V2.md](./docs/STARTUP_ARCHITECTURE_V2.md)
+- **🆕 GCP Golden Image, 3-tier inference, or APARS protocol?** → See [§ GCP Golden Image](#gcp-golden-image--cloud-inference-architecture-v2240) above
 - **🆕 One-command supervisor, Cloud SQL, asyncpg TLS, Trinity, OOM prevention, or Cloud ECAPA?** → See [§ v131.0 & v131.1](#v1310--v1311-one-command-supervisor-shutdown--start-january-2026), [§ v116.0 Cloud SQL](#v1160-cloud-sql-credential--retry-fixes-january-2026), [§ TLS-Safe Connections](#asyncpg-tls-invalidstateerror-fix-tls-safe-connection-factories-january-2026), [§ Cloud SQL Retry Storm](#cloud-sql-connection-retry-storm-fixes-january-2026), [§ GCP OOM Prevention](#gcp-oom-prevention-bridge-january-2026), [§ v117.5 Trinity](#v1175-trinity-startup-orchestration-persistent-state--distributed-lock-january-2026), [§ v132.0/v132.1](#v1320-parallel-trinity-initialization-january-2026), [§ v116.0 Cloud ECAPA](#v1160-cloud-ecapa-endpoint-priority-fix-january-2026) below
 - **🆕 Unified Supervisor Kernel (50k lines)?** → See [§ Unified Supervisor Kernel](#-unified-supervisor-kernel-50746-lines---monolithic-system-brain-january-2026) below
 
