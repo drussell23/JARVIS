@@ -514,7 +514,7 @@ class PrimeLocalClient(ModelClient):
         _use_mmap = os.getenv(
             "JARVIS_USE_MMAP", "true"
         ).lower() in ("true", "1", "yes")
-        _mmap_factor = 0.6 if _use_mmap else 1.0
+        _mmap_factor = 0.65 if _use_mmap else 1.0  # v235.1: 0.6→0.65 (less aggressive)
 
         download_candidate = None
 
@@ -648,17 +648,27 @@ class PrimeLocalClient(ModelClient):
                     _model_size_gb * 0.5 if _use_mmap
                     else _model_size_gb
                 )
-                if available_gb is not None:
-                    if _effective_size_gb + 1.0 > available_gb:
+
+                # v235.1: Dynamic headroom based on memory pressure tier (Fix C1)
+                _headroom_gb = 1.0  # default
+                _tier = None
+                try:
+                    from backend.core.memory_quantizer import MemoryTier
+                    _tier = _metrics.tier if '_metrics' in dir() and _metrics else None
+                    if _tier in (MemoryTier.ABUNDANT, MemoryTier.OPTIMAL):
+                        _headroom_gb = 0.75
+                    elif _tier == MemoryTier.ELEVATED:
+                        _headroom_gb = 1.0
+                    elif _tier == MemoryTier.CONSTRAINED:
+                        _headroom_gb = 1.5
+                    elif _tier in (MemoryTier.CRITICAL, MemoryTier.EMERGENCY):
                         self.logger.warning(
-                            f"[v234.3] Insufficient RAM for "
-                            f"{model_path.name}: need "
-                            f"{_effective_size_gb + 1.0:.1f}GB "
-                            f"(mmap={'on' if _use_mmap else 'off'}, "
-                            f"file={_model_size_gb:.1f}GB), "
-                            f"available {available_gb:.1f}GB"
+                            f"[v235.1] Memory tier {_tier.value} — refusing to load model "
+                            f"(available: {available_gb:.1f}GB)"
                         )
                         return False
+                except (ImportError, NameError):
+                    pass
 
                 # Step 4: Load via llama-cpp-python
                 from llama_cpp import Llama
@@ -681,6 +691,46 @@ class PrimeLocalClient(ModelClient):
                         f"(low RAM: {available_gb:.1f}GB)"
                     )
 
+                # v235.1: Include KV cache in RAM estimation (Fix C3)
+                # KV cache ~64MB per 1024 tokens for 7B-class models
+                _model_size_mb = selected_entry.get("size_mb", 4000) if selected_entry else 4000
+                _size_scale = min(2.0, _model_size_mb / 4000)
+                _kv_cache_gb = (_ctx / 1024) * 0.064 * _size_scale
+
+                if available_gb is not None:
+                    _total_needed = _effective_size_gb + _kv_cache_gb + _headroom_gb
+                    if _total_needed > available_gb:
+                        self.logger.warning(
+                            f"[v235.1] Insufficient RAM including KV cache: "
+                            f"model={_effective_size_gb:.2f}GB + kv={_kv_cache_gb:.2f}GB "
+                            f"+ headroom={_headroom_gb:.1f}GB = {_total_needed:.2f}GB, "
+                            f"available={available_gb:.1f}GB, ctx={_ctx} "
+                            f"(tier: {_tier.value if _tier else 'unknown'})"
+                        )
+                        # Try reducing context before giving up
+                        if _ctx > 2048:
+                            _reduced_ctx = 2048
+                            _reduced_kv = (_reduced_ctx / 1024) * 0.064 * _size_scale
+                            _reduced_total = _effective_size_gb + _reduced_kv + _headroom_gb
+                            if _reduced_total <= available_gb:
+                                self.logger.info(
+                                    f"[v235.1] Reducing context {_ctx}->{_reduced_ctx} to fit: "
+                                    f"{_reduced_total:.2f}GB needed, {available_gb:.1f}GB available"
+                                )
+                                _ctx = _reduced_ctx
+                                _kv_cache_gb = _reduced_kv
+                            else:
+                                return False
+                        else:
+                            return False
+                    else:
+                        self.logger.info(
+                            f"[v235.1] RAM budget: model={_effective_size_gb:.2f}GB "
+                            f"+ kv={_kv_cache_gb:.2f}GB + headroom={_headroom_gb:.1f}GB "
+                            f"= {_total_needed:.2f}GB / {available_gb:.1f}GB available "
+                            f"(tier: {_tier.value if _tier else 'unknown'})"
+                        )
+
                 self._model = Llama(
                     model_path=str(model_path),
                     n_ctx=_ctx,
@@ -689,6 +739,31 @@ class PrimeLocalClient(ModelClient):
                     use_mmap=_use_mmap,
                     verbose=False,
                 )
+
+                # v235.1: Post-load memory validation (Fix C2)
+                try:
+                    import psutil
+                    _post_mem = psutil.virtual_memory()
+                    _post_available = _post_mem.available / (1024 ** 3)
+                    _ram_delta = (available_gb - _post_available) if available_gb else 0
+                    self.logger.info(
+                        f"[v235.1] Post-load RAM: available={_post_available:.1f}GB "
+                        f"(delta={_ram_delta:.2f}GB, predicted={_effective_size_gb:.2f}GB)"
+                    )
+                    if available_gb and _ram_delta > _effective_size_gb * 1.5:
+                        self.logger.warning(
+                            f"[v235.1] Model used {_ram_delta:.2f}GB vs predicted "
+                            f"{_effective_size_gb:.2f}GB — 50%+ over budget. "
+                            f"Consider lower quantization."
+                        )
+                    if _post_available < 1.0:
+                        self.logger.warning(
+                            f"[v235.1] CRITICAL: Only {_post_available:.1f}GB RAM remaining "
+                            f"after model load. System may become unstable."
+                        )
+                except Exception:
+                    pass
+
                 self._model_path = model_path
                 self._loaded = True
                 _name = (
@@ -1796,6 +1871,95 @@ class UnifiedModelServing:
 
         self.logger.info(f"UnifiedModelServing ready ({len(self._clients)} providers)")
 
+        # v235.1: Start memory pressure monitor (Fix C4)
+        self._memory_monitor_task: Optional[asyncio.Task] = None
+        if ModelProvider.PRIME_LOCAL in self._clients:
+            self._memory_monitor_task = asyncio.create_task(
+                self._start_memory_monitor()
+            )
+            self.logger.info("[v235.1] Memory pressure monitor started")
+
+    async def _start_memory_monitor(self) -> None:
+        """v235.1: Background monitor that unloads local model under memory pressure (Fix C4)."""
+        _critical_since: Optional[float] = None
+        _unload_threshold_seconds = 30.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(15)  # Check every 15s
+
+                # Check if a local model is loaded (via PrimeLocalClient)
+                _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+                if not _local or not getattr(_local, '_model', None):
+                    _critical_since = None
+                    continue
+
+                try:
+                    from backend.core.memory_quantizer import (
+                        get_memory_quantizer, MemoryTier,
+                    )
+                    _mq = await get_memory_quantizer()
+                    _mem_metrics = _mq.get_current_metrics()
+                    _mem_tier = _mem_metrics.tier
+                except Exception:
+                    continue
+
+                if _mem_tier in (MemoryTier.CRITICAL, MemoryTier.EMERGENCY):
+                    if _critical_since is None:
+                        _critical_since = time.time()
+                        self.logger.warning(
+                            f"[v235.1] Memory pressure {_mem_tier.value} detected "
+                            f"with local model loaded "
+                            f"(available: {_mem_metrics.system_memory_available_gb:.1f}GB). "
+                            f"Monitoring for {_unload_threshold_seconds:.0f}s..."
+                        )
+                    elif time.time() - _critical_since > _unload_threshold_seconds:
+                        self.logger.warning(
+                            f"[v235.1] Memory pressure {_mem_tier.value} sustained for "
+                            f">{_unload_threshold_seconds:.0f}s — unloading local model "
+                            f"to reclaim RAM "
+                            f"(available: {_mem_metrics.system_memory_available_gb:.1f}GB)"
+                        )
+                        await self._unload_local_model()
+                        _critical_since = None
+                else:
+                    if _critical_since is not None:
+                        self.logger.info(
+                            f"[v235.1] Memory pressure resolved ({_mem_tier.value}), "
+                            f"model retained"
+                        )
+                    _critical_since = None
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug(f"[v235.1] Memory monitor error: {e}")
+                await asyncio.sleep(30)
+
+    async def _unload_local_model(self) -> None:
+        """v235.1: Safely unload the local GGUF model to reclaim RAM."""
+        _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+        if _local and getattr(_local, '_model', None) is not None:
+            try:
+                _model_path = getattr(_local._model, 'model_path', 'unknown')
+                del _local._model
+                _local._model = None
+                _local._loaded = False
+                import gc
+                gc.collect()
+                # Trip PRIME_LOCAL circuit breaker so routing skips to CLAUDE
+                for _ in range(CIRCUIT_BREAKER_FAILURE_THRESHOLD):
+                    self._circuit_breaker.record_failure(
+                        ModelProvider.PRIME_LOCAL.value
+                    )
+                self.logger.info(
+                    f"[v235.1] Local model unloaded ({_model_path}). "
+                    f"PRIME_LOCAL circuit breaker tripped — "
+                    f"inference falls through to CLAUDE tier."
+                )
+            except Exception as e:
+                self.logger.warning(f"[v235.1] Model unload error: {e}")
+
     async def stop(self) -> None:
         """Stop the model serving layer.
 
@@ -1804,6 +1968,11 @@ class UnifiedModelServing:
         Also unloads any loaded GGUF models to free GPU/system memory.
         """
         self._running = False
+
+        # v235.1: Stop memory pressure monitor
+        if hasattr(self, '_memory_monitor_task') and self._memory_monitor_task:
+            self._memory_monitor_task.cancel()
+            self._memory_monitor_task = None
 
         # v234.1: Clean up PrimeLocalClient resources
         local_client = self._clients.get(ModelProvider.PRIME_LOCAL)

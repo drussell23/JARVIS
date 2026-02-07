@@ -8034,6 +8034,15 @@ class ProcessOrchestrator:
                 )
                 return
 
+            # v235.1: Skip Spot VM if invincible node boot is in progress
+            # Prevents dual VM provisioning race condition (A3)
+            if os.environ.get("JARVIS_INVINCIBLE_NODE_BOOTING") == "true":
+                logger.info(
+                    "[v235.1] Skipping Spot VM pre-warm — invincible node "
+                    "boot in progress (early_wake task running)"
+                )
+                return
+
             prewarm_task = start_trinity_gcp_prewarm()
             if prewarm_task:
                 logger.info("[v200.0] 🚀 GCP pre-warm task started")

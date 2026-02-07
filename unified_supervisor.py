@@ -58380,6 +58380,23 @@ class JarvisSystemKernel:
         except Exception:
             pass
 
+        # v235.1: Synchronize with orchestrator's Trinity GCP ready event (Fix E1)
+        # Prevents orchestrator from waiting for (or provisioning) its own Spot VM
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import (
+                _trinity_gcp_ready_event,
+            )
+            if _trinity_gcp_ready_event is not None and not _trinity_gcp_ready_event.is_set():
+                _trinity_gcp_ready_event.set()
+                self.logger.info(
+                    f"[InvincibleNode] v235.1: Trinity GCP ready event synchronized "
+                    f"(source={source})"
+                )
+        except ImportError:
+            pass
+        except Exception as e:
+            self.logger.debug(f"[InvincibleNode] Trinity event sync failed: {e}")
+
     async def _notify_prime_router_of_gcp(self, host: str, port: int) -> None:
         """v232.0: Notify PrimeRouter that GCP VM is ready for routing."""
         try:
@@ -58486,6 +58503,22 @@ class JarvisSystemKernel:
         # v234.0: Notify UnifiedModelServing to demote from GCP
         try:
             asyncio.ensure_future(self._notify_model_serving_demote())
+        except Exception:
+            pass
+
+        # v235.1: Clear Trinity GCP ready event so orchestrator knows to re-provision
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import (
+                _trinity_gcp_ready_event,
+            )
+            if _trinity_gcp_ready_event is not None and _trinity_gcp_ready_event.is_set():
+                _trinity_gcp_ready_event.clear()
+                self.logger.info(
+                    f"[InvincibleNode] v235.1: Trinity GCP ready event cleared "
+                    f"(reason={reason})"
+                )
+        except ImportError:
+            pass
         except Exception:
             pass
 
@@ -60176,11 +60209,13 @@ class JarvisSystemKernel:
                         timeout=_early_gcp_timeout,
                     )
                 except asyncio.TimeoutError:
+                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                     self.logger.warning(
                         f"[EarlyGCP] Hard timeout after {_early_gcp_timeout:.0f}s"
                     )
                     return False, None, "EARLY_TIMEOUT"
                 except Exception as e:
+                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                     self.logger.warning(
                         f"[EarlyGCP] Early pre-warm error (non-fatal): {e}"
                     )
@@ -60259,6 +60294,7 @@ class JarvisSystemKernel:
                     if success and ip:
                         self._invincible_node_ready = True
                         self._invincible_node_ip = ip
+                        os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1: Clear race guard
                         self.logger.info(
                             f"[EarlyGCP] VM ready at {ip} (early boot)"
                         )
@@ -60291,6 +60327,7 @@ class JarvisSystemKernel:
                             except (ValueError, ProcessLookupError, OSError):
                                 pass
                     else:
+                        os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                         self.logger.info(
                             f"[EarlyGCP] VM not ready yet: {status}"
                         )
@@ -60298,11 +60335,13 @@ class JarvisSystemKernel:
                     return success, ip, status
 
                 except ImportError as e:
+                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                     self.logger.warning(
                         f"[EarlyGCP] GCP module not available: {e}"
                     )
                     return False, None, f"IMPORT_ERROR: {e}"
                 except Exception as e:
+                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                     self.logger.warning(
                         f"[EarlyGCP] Early pre-warm error (non-fatal): {e}"
                     )
@@ -60313,8 +60352,12 @@ class JarvisSystemKernel:
                 name="early_invincible_node_prewarm",
             )
             self._background_tasks.append(self._early_invincible_task)
+            # v235.1: Signal to orchestrator that invincible node boot is in progress
+            # Prevents _start_gcp_prewarm() from provisioning a duplicate Spot VM
+            os.environ["JARVIS_INVINCIBLE_NODE_BOOTING"] = "true"
             self.logger.info(
-                "[Kernel] v233.4 Early invincible node task created"
+                "[Kernel] v233.4 Early invincible node task created "
+                "(JARVIS_INVINCIBLE_NODE_BOOTING=true)"
             )
 
         try:
