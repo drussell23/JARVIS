@@ -308,7 +308,12 @@ class VMInstance:
         self.total_cost = self.uptime_hours * self.cost_per_hour
 
     def update_efficiency_score(self):
-        """Calculate cost efficiency score (0-100, higher is better ROI)"""
+        """Calculate cost efficiency score (0-100, higher is better ROI).
+
+        Includes a startup ramp that gives young VMs (<30 min) benefit of the
+        doubt — a freshly provisioned VM hasn't had time to accumulate usage
+        counts, so raw usage_rate unfairly penalizes it.
+        """
         if self.uptime_hours == 0:
             self.cost_efficiency_score = 0.0
             return
@@ -323,11 +328,17 @@ class VMInstance:
         recency_score = max(0, 100 - (self.idle_time_minutes * 2))  # Decreases as idle time increases
         utilization_score = min(100, (self.cpu_percent + self.memory_percent) / 2)
 
+        # Startup ramp: VMs under 30 min get a declining bonus that compensates
+        # for insufficient usage data. At 0 min = +50 bonus, at 30 min = 0.
+        ramp_minutes = 30.0
+        startup_bonus = max(0.0, 50.0 * (1.0 - uptime_minutes / ramp_minutes))
+
         # Weighted average
         self.cost_efficiency_score = (
             usage_rate * 100 * 0.4 +  # 40% weight on usage frequency
             recency_score * 0.3 +       # 30% weight on recency
-            utilization_score * 0.3     # 30% weight on resource utilization
+            utilization_score * 0.3 +   # 30% weight on resource utilization
+            startup_bonus               # Ramp bonus for young VMs
         )
 
         self.cost_efficiency_score = min(100.0, self.cost_efficiency_score)
@@ -5855,12 +5866,14 @@ class GCPVMManager:
                                 logger.warning(f"⚠️  VM {vm_name} in unexpected state: {vm.state.value}")
 
                         # v137.2: Intelligent efficiency warnings with grace period and rate limiting
-                        # - Skip during VM startup grace period (first 5 minutes)
+                        # - Skip during VM startup grace period (first 30 minutes)
+                        #   Efficiency scores need ~30 min of usage data to stabilize;
+                        #   warning at 5 min would always fire for healthy young VMs.
                         # - Rate limit warnings to once every 5 minutes per VM
                         # - Only warn for RUNNING VMs (not during shutdown)
                         if vm.state == VMState.RUNNING and vm.cost_efficiency_score < 50:
                             vm_startup_minutes = vm.uptime_hours * 60
-                            startup_grace_minutes = 5.0  # Don't warn during first 5 minutes
+                            startup_grace_minutes = 30.0  # Don't warn until efficiency data stabilizes
                             
                             # Initialize rate limiting tracker if needed
                             if not hasattr(self, '_efficiency_warning_times'):
