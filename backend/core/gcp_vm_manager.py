@@ -6832,10 +6832,57 @@ update_apars 4 0 40 "validating_prebaked"
 
 VALIDATION_OK=true
 
-# Check code exists
+# Check code exists and is compatible with current startup script
 if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
     log "✅ jarvis_prime module found"
-    update_apars 4 25 45 "code_validated"
+    # v235.3: Verify code freshness — ASGI middleware requires module-level app export.
+    # Golden images may have old J-Prime code without this. If missing, pull latest.
+    if cd "$JARVIS_DIR" && "$JARVIS_DIR/venv/bin/python" -c "from jarvis_prime.server import app" 2>/dev/null; then
+        log "✅ jarvis_prime.server.app importable (v235.3+ code)"
+        update_apars 4 25 45 "code_validated"
+    else
+        log "⚠️  jarvis_prime.server.app not importable — code is stale (pre-v235.3)"
+        update_apars 4 15 43 "code_stale_pulling"
+        REPO_URL=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \\
+            http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-repo-url \\
+            2>/dev/null || echo "${JARVIS_PRIME_REPO_URL:-}")
+        if [ -n "$REPO_URL" ] && [ -d "$JARVIS_DIR/.git" ]; then
+            log "   Pulling latest from: $REPO_URL (timeout 60s)"
+            if timeout 60 git -C "$JARVIS_DIR" pull --ff-only 2>&1 | tee -a "$LOG_FILE"; then
+                log "✅ Code updated via git pull"
+                update_apars 4 25 45 "code_updated"
+            else
+                log "⚠️  git pull failed — trying fresh clone"
+                if timeout 120 git clone --depth 1 "$REPO_URL" /tmp/jprime-update 2>&1 | tee -a "$LOG_FILE"; then
+                    cp -a /tmp/jprime-update/jarvis_prime/* "$JARVIS_DIR/jarvis_prime/" 2>/dev/null
+                    cp -a /tmp/jprime-update/run_server.py "$JARVIS_DIR/" 2>/dev/null
+                    rm -rf /tmp/jprime-update
+                    log "✅ Code rescued via fresh clone"
+                    update_apars 4 25 45 "code_rescued"
+                else
+                    log "❌ Code update failed — proceeding with stale code (reverse proxy fallback)"
+                    rm -rf /tmp/jprime-update 2>/dev/null
+                    update_apars 4 25 44 "code_stale_proceeding"
+                fi
+            fi
+        elif [ -n "$REPO_URL" ]; then
+            log "   No .git dir — cloning fresh (timeout 120s)"
+            if timeout 120 git clone --depth 1 "$REPO_URL" /tmp/jprime-update 2>&1 | tee -a "$LOG_FILE"; then
+                cp -a /tmp/jprime-update/jarvis_prime/* "$JARVIS_DIR/jarvis_prime/" 2>/dev/null
+                cp -a /tmp/jprime-update/run_server.py "$JARVIS_DIR/" 2>/dev/null
+                rm -rf /tmp/jprime-update
+                log "✅ Code updated via clone"
+                update_apars 4 25 45 "code_cloned"
+            else
+                log "❌ Clone failed — proceeding with stale code"
+                rm -rf /tmp/jprime-update 2>/dev/null
+                update_apars 4 25 44 "code_stale_proceeding"
+            fi
+        else
+            log "⚠️  No repo URL — proceeding with stale code (reverse proxy fallback)"
+            update_apars 4 25 44 "code_stale_no_repo"
+        fi
+    fi
 else
     log "⚠️  jarvis_prime module NOT found — pulling latest code"
     update_apars 4 15 43 "code_rescue_starting"
@@ -7226,6 +7273,7 @@ fi
             source_image = None
             deployment_mode = "startup-script"
             golden_image_source = None
+            _code_stale_warning = False  # v235.3: Golden image code freshness flag
             effective_disk_size_gb = self.config.boot_disk_size_gb
             
             # Try golden image first (highest priority)
@@ -7246,6 +7294,18 @@ fi
                         if latest_golden.is_model_mismatched(self.config.golden_image_model):
                             _skip_reasons.append(
                                 f"model mismatch (has '{latest_golden.model_name}')"
+                            )
+                        # v235.3: Check if golden image predates current startup script.
+                        # The golden image's jarvis_version tracks when it was created.
+                        # If it's older than v235.3, the disk code lacks module-level
+                        # app export. The startup script's code freshness check (Phase 4)
+                        # will handle this at runtime, but log a heads-up here.
+                        if latest_golden.jarvis_version and latest_golden.jarvis_version < "235.3":
+                            _code_stale_warning = True
+                            logger.info(
+                                f"⚠️ [InvincibleNode] v235.3: Golden image '{latest_golden.name}' "
+                                f"has jarvis_version={latest_golden.jarvis_version} (pre-v235.3). "
+                                f"Startup script will auto-update J-Prime code on boot."
                             )
 
                         if _skip_reasons:
@@ -7338,6 +7398,12 @@ fi
                 metadata_items.append(
                     compute_v1.Items(key="jarvis-golden-image-source", value=golden_image_source)
                 )
+                # v235.3: Signal to startup script that code freshness check is mandatory
+                # because the golden image predates the current startup script version
+                if _code_stale_warning:
+                    metadata_items.append(
+                        compute_v1.Items(key="jarvis-force-code-update", value="true")
+                    )
 
             # Add startup script based on deployment mode
             if deployment_mode == "golden-image":
@@ -7419,6 +7485,8 @@ fi
         start_time = time.time()
         last_status = "starting"
         consecutive_errors = 0  # v235.0: Local variable, reset each polling session
+        has_seen_version = False  # v235.3: Track if valid startup_script_version ever received
+        has_seen_any_response = False  # v235.3: Track if VM has responded at all
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
@@ -7441,6 +7509,7 @@ fi
 
             if "apars" in health_data:
                 has_real_data = True  # v235.0: Real APARS data from VM
+                has_seen_any_response = True  # v235.3
                 consecutive_errors = 0  # v235.0: Reset on successful response
                 apars = health_data["apars"]
                 # v235.2: Detect startup script version mismatches at runtime
@@ -7456,25 +7525,26 @@ fi
                 if (
                     script_version
                     and script_version not in ("unknown", "none", "null")
-                    and elapsed > 60  # v235.2: Grace period for stale files
                 ):
-                    if script_version != _STARTUP_SCRIPT_VERSION:
-                        logger.warning(
-                            f"☁️ [InvincibleNode] Startup script version mismatch "
-                            f"(vm={script_version}, expected={_STARTUP_SCRIPT_VERSION}, "
-                            f"elapsed={int(elapsed)}s — past 60s grace period)."
-                        )
-                        return False, f"SCRIPT_VERSION_MISMATCH: {script_version}"
-                    if (
-                        metadata_version
-                        and metadata_version not in ("unknown", "none", "null")
-                        and metadata_version != script_version
-                    ):
-                        logger.warning(
-                            f"☁️ [InvincibleNode] Startup script metadata mismatch "
-                            f"(metadata={metadata_version}, vm={script_version})."
-                        )
-                        return False, f"SCRIPT_METADATA_MISMATCH: {metadata_version}"
+                    has_seen_version = True  # v235.3: Valid version received
+                    if elapsed > 60:  # v235.3: Grace period for stale files
+                        if script_version != _STARTUP_SCRIPT_VERSION:
+                            logger.warning(
+                                f"☁️ [InvincibleNode] Startup script version mismatch "
+                                f"(vm={script_version}, expected={_STARTUP_SCRIPT_VERSION}, "
+                                f"elapsed={int(elapsed)}s — past 60s grace period)."
+                            )
+                            return False, f"SCRIPT_VERSION_MISMATCH: {script_version}"
+                        if (
+                            metadata_version
+                            and metadata_version not in ("unknown", "none", "null")
+                            and metadata_version != script_version
+                        ):
+                            logger.warning(
+                                f"☁️ [InvincibleNode] Startup script metadata mismatch "
+                                f"(metadata={metadata_version}, vm={script_version})."
+                            )
+                            return False, f"SCRIPT_METADATA_MISMATCH: {metadata_version}"
                 progress_pct = apars.get("total_progress", 0)
                 phase_name = apars.get("phase_name", "unknown")
                 eta = apars.get("eta_seconds", 0)
@@ -7489,6 +7559,7 @@ fi
                 # so the supervisor gets the update. This is safe because we're
                 # past the stub phase (model_loaded/healthy means J-Prime is running),
                 # so deferring the synthetic generator is correct behavior.
+                has_seen_any_response = True  # v235.3
                 has_real_data = True
                 consecutive_errors = 0
                 model_loaded = health_data.get("model_loaded", False)
@@ -7518,6 +7589,7 @@ fi
                 # every 5s → permanently defers synthetic generator → dashboard
                 # stuck at whatever synthetic % was reached before first response.
                 # Let synthetic handle progress for non-APARS VMs.
+                has_seen_any_response = True  # v235.3
                 consecutive_errors = 0  # VM IS responding (reset error counter)
                 mode = health_data.get("mode", "unknown")
                 phase = health_data.get("phase", "starting")
@@ -7599,6 +7671,24 @@ fi
                 # Estimate progress based on elapsed time
                 progress_pct = min(90, int((elapsed / timeout) * 90) + 20)
                 detail = f"Polling health ({int(elapsed)}s elapsed)"
+
+            # v235.3: Enforce version contract — if VM is responding but has
+            # never reported a valid startup_script_version after the grace
+            # period, the startup script is too old (pre-v235) or the APARS
+            # enrichment pipeline is broken. Fail early so the outer retry
+            # logic can recycle the VM with a current startup script.
+            if (
+                elapsed > 90
+                and has_seen_any_response
+                and not has_seen_version
+            ):
+                logger.warning(
+                    f"☁️ [InvincibleNode] VM responding for {int(elapsed)}s "
+                    f"but has never reported startup_script_version. "
+                    f"Likely running pre-v235 startup script or APARS "
+                    f"enrichment is not active. Triggering recycle."
+                )
+                return False, "VERSION_NEVER_REPORTED"
 
             # v235.0: Only call progress callback for real APARS data.
             # Legacy "status=starting" (no APARS key), errors, and no-response
