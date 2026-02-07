@@ -172,7 +172,9 @@ class QueryComplexityClassifier:
             "expert_reasoning": [
                 re.compile(r"track\s+.*\s+from\s+.*\s+(?:to|until)", re.I),
                 re.compile(r"analyze\s+(?:the\s+)?(?:trend|pattern)", re.I),
-                re.compile(r"explain\s+(?:why|how)", re.I),
+                # v236.0: Narrowed — bare "explain how X works" is COMPLEX, not EXPERT.
+                # EXPERT requires multi-step causality/analysis indicators.
+                re.compile(r"explain\s+(?:why|how)\s+.*\b(?:interacts?|affects?|causes?|leads?\s+to|relates?)\b", re.I),
                 re.compile(r"root\s+cause", re.I),
                 re.compile(r"investigate", re.I),
             ],
@@ -317,9 +319,59 @@ class QueryComplexityClassifier:
             if pattern.search(query):
                 return QueryComplexity.MODERATE
 
-        # Level 1: Simple (Single Space, Single Question)
-        # Default to simple if only one space mentioned or basic query
-        return QueryComplexity.SIMPLE
+        # ================================================================
+        # GENERAL NL QUERY CLASSIFICATION (non-space queries)
+        # v236.0: For queries like "what is 5+5?" that don't match any
+        # space-based patterns above.
+        #
+        # PRIORITY ORDER: EXPERT → COMPLEX → SIMPLE (descending)
+        # This prevents compound queries like "what is 5+5 and explain
+        # the concept" from being classified as SIMPLE just because the
+        # math regex fires. Higher complexity wins.
+        # ================================================================
+
+        # Check EXPERT first (highest priority)
+        _expert_indicators = any([
+            bool(re.search(r"\bdesign\s+(?:a|an)\b.*\b(?:system|architecture|solution)\b", query, re.I)),
+            bool(re.search(r"\bimplement\b.*\bfrom\s+scratch\b", query, re.I)),
+            bool(re.search(r"\b(?:refactor|debug)\b.*\b(?:code|system|architecture)\b", query, re.I)),
+        ])
+        if _expert_indicators:
+            return QueryComplexity.EXPERT
+
+        # Check COMPLEX second
+        _complex_indicators = any([
+            bool(re.search(r"\bexplain\s+(?:how|why|the|what)\b", query, re.I)),
+            bool(re.search(r"\bwrite\s+(?:a|an|me)\b", query, re.I)),
+            bool(re.search(r"\bcompare\b.*\b(?:and|vs|versus|with)\b", query, re.I)),
+            bool(re.search(r"\bwhat\s+are\s+the\s+(?:pros|cons|differences|advantages|steps)\b", query, re.I)),
+            bool(re.search(r"\b(?:step.by.step|in\s+detail|thoroughly)\b", query, re.I)),
+        ])
+        if _complex_indicators:
+            return QueryComplexity.COMPLEX
+
+        # Check SIMPLE last (only if no complex/expert indicators)
+        _simple_indicators = any([
+            # Math expressions: 5+5, 10*3, 2^8
+            bool(re.search(r"\d+\s*[\+\-\*\/\^%]\s*\d+", query)),
+            # Short factual: "what is X", "what's X", "who is X", "define X"
+            bool(re.search(r"^(?:what(?:'?s|\s+is)|who\s+is|define|spell|translate)\s+", query, re.I))
+            and len(query.split()) <= 8,
+            # Yes/no questions under 8 words
+            bool(re.search(r"^(?:is|are|was|were|do|does|did|can|could|will|would|should)\s+", query, re.I))
+            and len(query.split()) <= 8,
+        ])
+        if _simple_indicators:
+            return QueryComplexity.SIMPLE
+
+        # Length-based fallback
+        word_count = len(query.split())
+        if word_count <= 6:
+            return QueryComplexity.SIMPLE
+        elif word_count <= 15:
+            return QueryComplexity.MODERATE
+        else:
+            return QueryComplexity.COMPLEX
 
     def _calculate_metrics(
         self,

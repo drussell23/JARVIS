@@ -851,11 +851,16 @@ class PrimeClient:
 
         Yields content chunks as they arrive.
         """
+        # v236.0: Extract adaptive params from kwargs before dumping rest to metadata.
+        # Without this, max_tokens/temperature from AdaptivePromptBuilder end up in
+        # metadata (ignored by llama-cpp-python) instead of PrimeRequest fields.
         request = PrimeRequest(
             prompt=prompt,
             system_prompt=system_prompt,
             context=context,
             stream=True,
+            max_tokens=kwargs.pop("max_tokens", 4096),
+            temperature=kwargs.pop("temperature", 0.7),
             metadata=kwargs,
         )
 

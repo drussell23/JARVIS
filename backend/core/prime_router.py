@@ -368,6 +368,11 @@ class PrimeRouter:
         if not self._initialized:
             await self.initialize()
 
+        logger.info(
+            f"[PrimeRouter] generate: max_tokens={max_tokens}, "
+            f"temp={temperature}, prompt_len={len(prompt)}"
+        )
+
         # v88.0: Use ultra coordinator protection if available
         ultra_coord = await _get_ultra_coordinator()
         if ultra_coord:
@@ -636,6 +641,7 @@ class PrimeRouter:
                 async with client.messages.stream(
                     model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
                     max_tokens=kwargs.get("max_tokens", 4096),
+                    temperature=kwargs.get("temperature", 0.7),
                     system=system_prompt or "You are JARVIS.",
                     messages=messages,
                 ) as stream:

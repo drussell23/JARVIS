@@ -1726,6 +1726,10 @@ class UnifiedCommandProcessor:
             except Exception as e:
                 logger.warning(f"[UNIFIED] Query complexity classification failed: {e}")
 
+        # v236.0: Store classified_query on self for downstream use by
+        # _execute_command_internal() which runs in a different method scope.
+        self._classified_query = classified_query
+
         # Step 2: Classify command intent (Already done above)
         # command_type, confidence = await self._classify_command(command_text)
         # logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
@@ -4475,8 +4479,15 @@ class UnifiedCommandProcessor:
                         "history": self.context_history if hasattr(self, 'context_history') else [],
                     }
 
-                    # Call the query handler (routes to J-Prime or cloud)
-                    result = await handle_query(command_text, query_context)
+                    # v236.0: Pass classified_query for adaptive prompt generation.
+                    # classified_query is set on self in process_command() (line ~1731)
+                    # and read here in _execute_command_internal() (different method scope).
+                    _classified_query = getattr(self, '_classified_query', None)
+                    result = await handle_query(
+                        command_text,
+                        query_context,
+                        classified_query=_classified_query,
+                    )
 
                     logger.info(f"[UNIFIED] ✅ Query response from {result.get('source', 'unknown')}")
 
@@ -4552,7 +4563,8 @@ class UnifiedCommandProcessor:
                 return get_voice_unlock_handler()
             elif command_type == CommandType.QUERY:
                 from api.query_handler import handle_query
-
+                # NOTE: This is only used for handler availability checking (line 3512).
+                # Actual QUERY execution is at line ~4462 which passes classified_query.
                 return handle_query
             # Add other handlers as needed
 
