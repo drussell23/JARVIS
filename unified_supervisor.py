@@ -60224,6 +60224,9 @@ class JarvisSystemKernel:
                     )
 
                     # Progress callback — identical to Phase 2's
+                    # v235.0: Only marks as "apars" source. Since _poll_health_until_ready
+                    # now only calls this for real APARS/status responses (not errors/empty),
+                    # the source label is accurate. Synthetic generator defers correctly.
                     def _gcp_progress_cb(pct, phase, detail):
                         dashboard_pct = 40 + int(pct * 0.6)
                         _mode = ""
@@ -60237,7 +60240,7 @@ class JarvisSystemKernel:
                             checkpoint=detail[:60],
                             progress=dashboard_pct,
                             source="apars",
-                            deployment_mode=_mode or None,
+                            deployment_mode=_mode if _mode else None,
                         )
 
                     port = self.config.invincible_node_port
@@ -62023,20 +62026,25 @@ class JarvisSystemKernel:
                                             continue
 
                                     elapsed = time.time() - _bg_start
-                                    # v229.0: Synthetic progress rate depends on deployment mode
-                                    # Golden image: 40% → 95% over 90s (fast boot)
-                                    # Standard: 40% → 95% over background_timeout (~600s)
-                                    _effective_timeout = 90.0 if _is_golden else background_timeout
+                                    # v235.0: Synthetic progress rate based on actual polling timeout.
+                                    # Previously golden image used hardcoded 90s, causing synthetic
+                                    # to reach 62% at 36s when actual startup takes 200-300s.
+                                    # Now uses background_timeout for both modes — scales correctly.
+                                    _effective_timeout = background_timeout
 
-                                    # v233.2: Cap synthetic below APARS value to prevent
-                                    # synthetic from re-overwriting real data after deferral
+                                    # v235.0: When real APARS data has arrived, cap synthetic
+                                    # to never exceed the last known APARS value. Prevents
+                                    # synthetic from overriding ground-truth after deferral expires.
                                     _syn_apars_cap = 95
                                     if _last_real_gcp_progress_update > 0:
                                         try:
                                             _syn_apars_last = float(_live_dashboard._gcp_state.get("progress", 0))
                                             _syn_source = _live_dashboard._gcp_state.get("source", "none")
                                             if _syn_source == "apars" and _syn_apars_last > 0:
-                                                _syn_apars_cap = int(_syn_apars_last)
+                                                # v235.0: Cap synthetic to APARS value + small buffer
+                                                # Allows synthetic to slightly lead (smoother UX)
+                                                # but never race far ahead of real data
+                                                _syn_apars_cap = min(95, int(_syn_apars_last) + 5)
                                         except Exception:
                                             pass
 

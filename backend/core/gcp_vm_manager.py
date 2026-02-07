@@ -5557,6 +5557,16 @@ class GCPVMManager:
                         await self.terminate_vm(vm_name, reason="Max lifetime exceeded")
                         continue
 
+                    # v235.0: Skip cost check during startup grace period
+                    grace_until = getattr(self, '_startup_grace_until', {}).get(vm_name, 0)
+                    if time.time() < grace_until:
+                        logger.debug(
+                            f"☁️ VM {vm_name} in startup grace period "
+                            f"({grace_until - time.time():.0f}s remaining), "
+                            f"skipping cost check"
+                        )
+                        continue
+
                     # 2. Check if VM is wasting money (idle + low efficiency)
                     idle_limit = float(self.config.idle_timeout_minutes)
                     is_idle = vm.idle_time_minutes > idle_limit
@@ -6031,10 +6041,22 @@ class GCPVMManager:
 
         # Step 5: Poll health endpoint until ready (outside lock to avoid blocking)
         logger.info(f"☁️ [InvincibleNode] Polling health endpoint (timeout: {max_timeout}s)...")
-        poll_success, final_status = await self._poll_health_until_ready(
-            static_ip, target_port, max_timeout, poll_interval,
-            progress_callback=progress_callback  # v220.1: Pass through for real-time updates
-        )
+
+        # v235.0: Protect VM from cost tracker termination during startup polling.
+        # Cost tracker runs in a separate async task and can kill "idle" VMs.
+        # Grace period = polling timeout + 60s buffer.
+        if not hasattr(self, '_startup_grace_until'):
+            self._startup_grace_until: Dict[str, float] = {}
+        self._startup_grace_until[instance_name] = time.time() + max_timeout + 60
+
+        try:
+            poll_success, final_status = await self._poll_health_until_ready(
+                static_ip, target_port, max_timeout, poll_interval,
+                progress_callback=progress_callback  # v220.1: Pass through for real-time updates
+            )
+        finally:
+            # v235.0: Clear startup grace (both success and failure paths)
+            self._startup_grace_until.pop(instance_name, None)
 
         if poll_success:
             logger.info(f"✅ [InvincibleNode] VM ready: {static_ip}")
@@ -6180,6 +6202,24 @@ class GCPVMManager:
             return False, {"error": "timeout"}
         except Exception as e:
             return False, {"error": str(e)}
+
+    async def _check_vm_ssh_reachable(self, ip: str) -> bool:
+        """v235.0: Quick SSH port check for diagnostic purposes.
+
+        Tests TCP connectivity to port 22. If SSH is reachable but the health
+        endpoint is not, the startup script likely failed or the service port
+        isn't open yet. If SSH is also unreachable, the VM may not have booted,
+        or there's a network/firewall issue.
+        """
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, 22), timeout=5.0
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            return False
 
     async def _describe_instance(self, instance_name: str) -> Tuple[str, Optional[str]]:
         """
@@ -6496,6 +6536,26 @@ import http.server, json, os, time
 PROGRESS_FILE = "/tmp/jarvis_progress.json"
 start_time = time.time()
 
+# v235.0: Phase-aware ETA — replaces hardcoded 60s countdown
+# Golden image phases: 0(5s), 1(20s), 4(30s), 5(120s), 6(30s)
+_PHASE_ETA = {0: 5, 1: 20, 4: 30, 5: 120, 6: 30}
+_TOTAL_ETA = sum(_PHASE_ETA.values())
+
+def _calc_eta(state, elapsed):
+    phase = state.get("phase", 0)
+    pp = state.get("phase_progress", 0)
+    remaining = 0
+    found = False
+    for p in sorted(_PHASE_ETA):
+        if p == phase:
+            found = True
+            remaining += _PHASE_ETA[p] * (1.0 - pp / 100.0)
+        elif found:
+            remaining += _PHASE_ETA[p]
+    if not found:
+        remaining = max(0, _TOTAL_ETA - elapsed)
+    return max(10, int(remaining))
+
 class APARSHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/health/"):
@@ -6515,13 +6575,13 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                 "model_loaded": state.get("model_loaded", False),
                 "ready_for_inference": ready,
                 "apars": {
-                    "version": "233.2",
+                    "version": "235.0",
                     "phase_number": state.get("phase", 0),
                     "phase_name": state.get("checkpoint", "starting"),
                     "phase_progress": state.get("phase_progress", 0),
                     "total_progress": state.get("total_progress", 5),
                     "checkpoint": state.get("checkpoint", "starting"),
-                    "eta_seconds": max(0, 60 - elapsed) if not ready else 0,
+                    "eta_seconds": _calc_eta(state, elapsed) if not ready else 0,
                     "elapsed_seconds": elapsed,
                     "error": state.get("error"),
                     "deployment_mode": "golden_image",
@@ -6529,7 +6589,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                     "skipped_phases": [2, 3]
                 },
                 "uptime_seconds": elapsed,
-                "version": "v233.2-golden"
+                "version": "v235.0-golden"
             }
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -6568,6 +6628,23 @@ if ! kill -0 $HEALTH_PID 2>/dev/null; then
 import http.server, json, os, time
 PROGRESS_FILE = "/tmp/jarvis_progress.json"
 start_time = time.time()
+# v235.0: Phase-aware ETA (same as primary handler)
+_PHASE_ETA = {0: 5, 1: 20, 4: 30, 5: 120, 6: 30}
+_TOTAL_ETA = sum(_PHASE_ETA.values())
+def _calc_eta(state, elapsed):
+    phase = state.get("phase", 0)
+    pp = state.get("phase_progress", 0)
+    remaining = 0
+    found = False
+    for p in sorted(_PHASE_ETA):
+        if p == phase:
+            found = True
+            remaining += _PHASE_ETA[p] * (1.0 - pp / 100.0)
+        elif found:
+            remaining += _PHASE_ETA[p]
+    if not found:
+        remaining = max(0, _TOTAL_ETA - elapsed)
+    return max(10, int(remaining))
 class APARSHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/health/"):
@@ -6581,7 +6658,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "starting", "apars": {"total_progress": state.get("total_progress", 5), "elapsed_seconds": elapsed}, "ready_for_inference": ready}).encode())
+            self.wfile.write(json.dumps({"status": "starting", "apars": {"total_progress": state.get("total_progress", 5), "phase_number": state.get("phase", 0), "phase_name": state.get("checkpoint", "starting"), "phase_progress": state.get("phase_progress", 0), "eta_seconds": _calc_eta(state, elapsed), "elapsed_seconds": elapsed, "deployment_mode": "golden_image"}, "ready_for_inference": ready}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -6604,16 +6681,39 @@ log "APARS health endpoint on port $JARVIS_PORT (PID: $HEALTH_PID)"
 update_apars 1 0 10 "loading_environment"
 
 if [ -f "$JARVIS_DIR/.env" ]; then
+    # v235.0: Timeout prevents indefinite hang on slow/broken .env
+    # Background watchdog sends SIGALRM after 15s; trap catches it
+    _env_loaded=false
+    (
+        sleep 15
+        kill -ALRM $$ 2>/dev/null
+    ) &
+    _watchdog_pid=$!
+    trap '_env_loaded=false' ALRM
     set -a
-    source "$JARVIS_DIR/.env"
+    source "$JARVIS_DIR/.env" 2>/dev/null && _env_loaded=true
     set +a
-    log "✅ Environment loaded from $JARVIS_DIR/.env"
+    kill "$_watchdog_pid" 2>/dev/null; wait "$_watchdog_pid" 2>/dev/null
+    trap - ALRM
+
+    if [ "$_env_loaded" = true ]; then
+        log "✅ Environment loaded from $JARVIS_DIR/.env"
+    else
+        log "⚠️  .env sourcing failed or timed out after 15s, continuing with defaults"
+    fi
+    update_apars 1 50 15 "environment_loaded"
 else
     log "⚠️  No .env file found at $JARVIS_DIR/.env"
+    update_apars 1 50 15 "no_env_file"
 fi
 
 # Ensure PYTHONPATH includes JARVIS_DIR
 export PYTHONPATH="${JARVIS_DIR}:${PYTHONPATH:-}"
+
+# v235.0: Smooth progress through skipped phases (stay in Phase 1
+# to avoid contradicting skipped_phases: [2, 3] in health response)
+update_apars 1 80 18 "env_ready_deps_prebaked"
+update_apars 1 100 35 "golden_ready_for_validation"
 
 # ─── Validate pre-baked integrity ───
 update_apars 4 0 40 "validating_prebaked"
@@ -6667,6 +6767,12 @@ fi
 # ─── Start the service ───
 update_apars 5 80 85 "starting_service" true false
 
+# v235.0: Write transitioning state BEFORE killing stub
+# Supervisor polls every 5s — if it polls during the 1-2s gap between
+# stub kill and real service start, last known state shows "transitioning"
+# (not a crash). Without this, Connection refused looks like a failure.
+update_apars 5 90 87 "transitioning_to_service" true false
+
 # Kill APARS health stub (the real server takes over the port)
 if [ -n "$HEALTH_PID" ]; then
     kill "$HEALTH_PID" 2>/dev/null || true
@@ -6691,7 +6797,8 @@ else
     cd "$JARVIS_DIR"
     source venv/bin/activate
     set -a
-    [ -f .env ] && source .env
+    # v235.0: Timeout protection — env already loaded in Phase 1, this is defensive
+    [ -f .env ] && timeout 10 bash -c 'source .env' 2>/dev/null && source .env
     set +a
     export JARVIS_PORT
     export PYTHONPATH="${JARVIS_DIR}:${PYTHONPATH:-}"
@@ -6981,6 +7088,7 @@ fi
         """
         start_time = time.time()
         last_status = "starting"
+        consecutive_errors = 0  # v235.0: Local variable, reset each polling session
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
@@ -6999,8 +7107,11 @@ fi
             progress_pct = 0
             phase_name = "starting"
             detail = "Waiting for VM..."
-            
+            has_real_data = False  # v235.0: Only call callback for real data
+
             if "apars" in health_data:
+                has_real_data = True  # v235.0: Real APARS data from VM
+                consecutive_errors = 0  # v235.0: Reset on successful response
                 apars = health_data["apars"]
                 progress_pct = apars.get("total_progress", 0)
                 phase_name = apars.get("phase_name", "unknown")
@@ -7011,6 +7122,8 @@ fi
                 last_status = f"phase={phase_name}, progress={progress_pct}%, eta={eta}s, mode={deploy_mode}"
                 logger.debug(f"☁️ [InvincibleNode] Health poll: {last_status}")
             elif health_data.get("status") == "starting":
+                has_real_data = True  # v235.0: VM is responding (legacy format)
+                consecutive_errors = 0  # v235.0: VM is responding
                 # VM is responding but not ready yet — show what we know
                 mode = health_data.get("mode", "unknown")
                 phase = health_data.get("phase", "starting")
@@ -7021,7 +7134,33 @@ fi
             elif "error" in health_data:
                 last_status = f"error={health_data['error']}"
                 detail = health_data.get("error", "Unknown error")[:40]
+                consecutive_errors += 1
+
+                # v235.0: Diagnostic escalation after sustained errors
+                if consecutive_errors == 6:  # ~30s of failures at 5s intervals
+                    logger.warning(
+                        f"☁️ [InvincibleNode] Health endpoint unreachable "
+                        f"for ~{consecutive_errors * poll_interval:.0f}s. "
+                        f"Error: {health_data.get('error')}. "
+                        f"Attempting SSH diagnostic..."
+                    )
+                    try:
+                        ssh_ok = await self._check_vm_ssh_reachable(ip)
+                        if ssh_ok:
+                            logger.info(
+                                f"☁️ [InvincibleNode] VM SSH reachable at {ip} "
+                                f"but port {port} not responding. "
+                                f"Likely: startup script failed or port not open."
+                            )
+                        else:
+                            logger.warning(
+                                f"☁️ [InvincibleNode] VM SSH also unreachable at {ip}. "
+                                f"Likely: VM not booted, network issue, or firewall."
+                            )
+                    except Exception:
+                        pass
             elif not health_data:
+                consecutive_errors += 1
                 # v229.1: No response at all — provide diagnostic transparency
                 # This typically means VM is still booting (startup script not yet running)
                 progress_pct = min(50, int((elapsed / timeout) * 40) + 5)
@@ -7035,13 +7174,40 @@ fi
                     detail = f"Waiting for health endpoint ({int(elapsed)}s)"
                     phase_name = "waiting_health"
                 last_status = f"no_response, elapsed={int(elapsed)}s"
+
+                # v235.0: Diagnostic escalation for no-response too
+                if consecutive_errors == 6:
+                    logger.warning(
+                        f"☁️ [InvincibleNode] No health response "
+                        f"for ~{consecutive_errors * poll_interval:.0f}s. "
+                        f"Attempting SSH diagnostic..."
+                    )
+                    try:
+                        ssh_ok = await self._check_vm_ssh_reachable(ip)
+                        if ssh_ok:
+                            logger.info(
+                                f"☁️ [InvincibleNode] VM SSH reachable at {ip} "
+                                f"but health endpoint not responding on port {port}. "
+                                f"Likely: startup script still running or crashed."
+                            )
+                        else:
+                            logger.warning(
+                                f"☁️ [InvincibleNode] VM SSH also unreachable at {ip}. "
+                                f"Likely: VM not booted, network issue, or firewall."
+                            )
+                    except Exception:
+                        pass
             else:
                 # Estimate progress based on elapsed time
                 progress_pct = min(90, int((elapsed / timeout) * 90) + 20)
                 detail = f"Polling health ({int(elapsed)}s elapsed)"
-            
-            # v220.1: Call progress callback for real-time dashboard updates
-            if progress_callback:
+
+            # v235.0: Only call progress callback for real VM data (APARS or
+            # legacy status). Error/no-response cases let the supervisor's
+            # synthetic progress generator run freely — prevents the callback
+            # from falsely marking synthetic estimates as "apars" source,
+            # which prematurely triggers deferral and creates yo-yo progress.
+            if progress_callback and has_real_data:
                 try:
                     progress_callback(progress_pct, phase_name, detail)
                 except Exception:
