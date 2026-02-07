@@ -58248,6 +58248,7 @@ class JarvisSystemKernel:
         self._invincible_node_ip: Optional[str] = None
         self._early_invincible_task: Optional[asyncio.Task] = None  # v233.4: Early GCP pre-warm
         self._model_serving = None  # v234.0: UnifiedModelServing instance
+        self._pending_gcp_endpoint: Optional[str] = None  # v236.0: Deferred GCP URL
 
         # v207.0: Startup Resilience Coordinator
         # Provides non-blocking health checks and background auto-recovery for:
@@ -58464,45 +58465,52 @@ class JarvisSystemKernel:
             self.logger.debug(f"[InvincibleNode] PrimeRouter demotion notification: {e}")
 
     async def _notify_model_serving_of_gcp(self, host: str, port: int) -> None:
-        """v234.0: Notify UnifiedModelServing that GCP VM is ready."""
-        try:
-            from backend.intelligence.unified_model_serving import (
-                notify_gcp_endpoint_ready,
-            )
-            url = f"http://{host}:{port}"
+        """v236.0: Notify UnifiedModelServing that GCP VM is ready.
 
-            # Retry with backoff — _model_serving may not be initialized yet
-            max_attempts = 4
-            for attempt in range(max_attempts):
+        If _model_serving exists, hot-swap immediately.
+        If not (early boot), store the URL as pending — _phase_intelligence
+        will apply it when UnifiedModelServing initializes.
+
+        This eliminates the timing race where early boot fires 4 retries
+        over 7s against a singleton that won't exist for another 30-60s.
+        """
+        url = f"http://{host}:{port}"
+
+        # Fast path: if _model_serving already exists, hot-swap immediately
+        if self._model_serving is not None:
+            try:
+                from backend.intelligence.unified_model_serving import (
+                    notify_gcp_endpoint_ready,
+                )
                 success = await notify_gcp_endpoint_ready(url)
                 if success:
                     self.logger.info(
-                        f"[InvincibleNode] v234.0: UnifiedModelServing "
+                        f"[InvincibleNode] v236.0: UnifiedModelServing "
                         f"notified of GCP: {url}"
-                        + (f" (attempt {attempt + 1})" if attempt > 0 else "")
                     )
+                    self._pending_gcp_endpoint = None
                     return
-                if attempt < max_attempts - 1:
-                    delay = 2 ** attempt  # 1s, 2s, 4s
-                    self.logger.debug(
-                        f"[InvincibleNode] GCP notification attempt {attempt + 1} "
-                        f"failed, retrying in {delay}s..."
+                else:
+                    self.logger.warning(
+                        f"[InvincibleNode] v236.0: GCP endpoint validation "
+                        f"failed ({url}), storing as pending for retry after init"
                     )
-                    await asyncio.sleep(delay)
+            except ImportError:
+                self.logger.debug(
+                    "[InvincibleNode] UnifiedModelServing not available"
+                )
+                return
+            except Exception as e:
+                self.logger.debug(
+                    f"[InvincibleNode] GCP notification error: {e}"
+                )
 
-            # All attempts exhausted
-            self.logger.warning(
-                f"[InvincibleNode] v234.0: UnifiedModelServing "
-                f"GCP notification failed after {max_attempts} attempts"
-            )
-        except ImportError:
-            self.logger.debug(
-                "[InvincibleNode] UnifiedModelServing not available"
-            )
-        except Exception as e:
-            self.logger.warning(
-                f"[InvincibleNode] UnifiedModelServing notification failed: {e}"
-            )
+        # Slow path: _model_serving not ready yet — defer
+        self._pending_gcp_endpoint = url
+        self.logger.info(
+            f"[InvincibleNode] v236.0: GCP endpoint stored as pending ({url}) "
+            f"— will apply when UnifiedModelServing initializes"
+        )
 
     async def _notify_model_serving_demote(self) -> None:
         """v234.0: Notify UnifiedModelServing to demote from GCP."""
@@ -62869,13 +62877,50 @@ class JarvisSystemKernel:
                             _auto = os.getenv(
                                 "JARVIS_PRIME_AUTO_DOWNLOAD", "false"
                             )
-                            self.logger.warning(
+                            # v236.0: Downgrade to INFO when GCP handles inference
+                            _has_gcp = (
+                                self._invincible_node_ready
+                                or self._pending_gcp_endpoint
+                                or bool(os.environ.get("JARVIS_INVINCIBLE_NODE_IP"))
+                            )
+                            _log_fn = self.logger.info if _has_gcp else self.logger.warning
+                            _suffix = (
+                                " (GCP InvincibleNode active — Tier 1 handles inference)"
+                                if _has_gcp else ""
+                            )
+                            _log_fn(
                                 "[Kernel] v234.2: Tier 2 local inference "
                                 "unavailable — no GGUF model found. "
                                 f"Auto-download: {_auto}. "
                                 "Set JARVIS_PRIME_AUTO_DOWNLOAD=true or "
                                 f"place a model in {PRIME_MODELS_DIR}"
+                                f"{_suffix}"
                             )
+
+                    # v236.0: Apply deferred GCP endpoint if InvincibleNode
+                    # came up before Phase 4 (common with early boot)
+                    if self._pending_gcp_endpoint and self._model_serving:
+                        try:
+                            from backend.intelligence.unified_model_serving import (
+                                notify_gcp_endpoint_ready as _notify_gcp,
+                            )
+                            _gcp_ok = await _notify_gcp(self._pending_gcp_endpoint)
+                            if _gcp_ok:
+                                self.logger.info(
+                                    f"[Kernel] v236.0: Deferred GCP endpoint applied: "
+                                    f"{self._pending_gcp_endpoint}"
+                                )
+                            else:
+                                self.logger.warning(
+                                    f"[Kernel] v236.0: Deferred GCP endpoint validation "
+                                    f"failed: {self._pending_gcp_endpoint}"
+                                )
+                            self._pending_gcp_endpoint = None
+                        except Exception as _gcp_err:
+                            self.logger.warning(
+                                f"[Kernel] v236.0: Deferred GCP apply failed: {_gcp_err}"
+                            )
+
                 except asyncio.TimeoutError:
                     self.logger.warning(
                         "[Kernel] v234.0: UnifiedModelServing init timed out "

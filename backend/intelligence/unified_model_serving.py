@@ -2516,11 +2516,20 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
         True if endpoint was updated successfully
     """
     global _model_serving, PRIME_API_URL
-    if _model_serving is None:
-        return False
 
     url = url.rstrip("/")
     logger = logging.getLogger("UnifiedModelServing")
+
+    if _model_serving is None:
+        # v236.0: Even without the singleton, update the module-level URL
+        # so any NEW PrimeAPIClient created after this point uses the GCP URL.
+        # The supervisor will also call us again after _model_serving is created.
+        PRIME_API_URL = url
+        logger.info(
+            f"[v236.0] GCP URL pre-registered ({PRIME_API_URL}) — "
+            f"will be used when PrimeAPIClient initializes"
+        )
+        return False  # Still return False so caller knows hot-swap didn't happen
 
     # v234.0: Update module-level constant so any NEW PrimeAPIClient
     # instances created after this point use the GCP URL, not localhost
