@@ -200,8 +200,8 @@ import os as _os
 import sys as _sys
 from pathlib import Path as _Path
 
-
-def _ensure_venv_python() -> None:
+# This is a function that ensures we're running with the venv Python.
+def _ensure_venv_python() -> None: 
     """
     Ensure we're running with the venv Python.
     Re-executes script with venv Python if necessary.
@@ -217,54 +217,54 @@ def _ensure_venv_python() -> None:
     if _os.environ.get('_JARVIS_VENV_REEXEC') == '1':
         return
 
-    script_dir = _Path(__file__).parent.resolve()
+    script_dir = _Path(__file__).parent.resolve() # This is the script directory.
 
     # Find venv Python (try multiple locations)
-    venv_candidates = [
-        script_dir / "venv" / "bin" / "python3",
-        script_dir / "venv" / "bin" / "python",
-        script_dir / ".venv" / "bin" / "python3",
-        script_dir / ".venv" / "bin" / "python",
+    venv_candidates = [ # This is a list of potential venv Python executables.
+        script_dir / "venv" / "bin" / "python3", # This is the venv Python executable.
+        script_dir / "venv" / "bin" / "python", # This is the venv Python executable.
+        script_dir / ".venv" / "bin" / "python3", # This is the venv Python executable.
+        script_dir / ".venv" / "bin" / "python", # This is the venv Python executable.
     ]
 
-    venv_python = None
-    for candidate in venv_candidates:
-        if candidate.exists():
-            venv_python = candidate
-            break
+    venv_python = None # This is the venv Python executable.
+    for candidate in venv_candidates: # This is a list of potential venv Python executables.
+        if candidate.exists(): # This is a check to see if the candidate exists.
+            venv_python = candidate # This is the venv Python executable.
+            break # This is a break statement to exit the loop.
 
-    if not venv_python:
-        return  # No venv found, continue with current Python
+    if not venv_python: # This is a check to see if the venv Python executable was found.  
+        return  # No venv found, continue with current Python. This is a return statement to exit the function.
 
     # Check if venv site-packages is in sys.path
-    venv_site_packages = str(script_dir / "venv" / "lib")
-    venv_in_path = any(venv_site_packages in p for p in _sys.path)
+    venv_site_packages = str(script_dir / "venv" / "lib") # This is the venv site-packages directory.
+    venv_in_path = any(venv_site_packages in p for p in _sys.path) # This is a check to see if the venv site-packages is in sys.path.
 
-    if venv_in_path:
-        return  # Already running with venv Python
+    if venv_in_path: # This is a check to see if the venv site-packages is in sys.path.
+        return  # Already running with venv Python. This is a return statement to exit the function.
 
     # Check if running from venv bin directory
-    current_exe = _Path(_sys.executable)
-    if str(script_dir / "venv" / "bin") in str(current_exe):
-        return
+    current_exe = _Path(_sys.executable) # This is the current executable.
+    if str(script_dir / "venv" / "bin") in str(current_exe): # This is a check to see if the current executable is in the venv bin directory.
+        return  # This is a return statement to exit the function.
 
     # NOT running with venv - need to re-exec
-    print(f"[KERNEL] Detected system Python without venv packages")
-    print(f"[KERNEL] Current: {_sys.executable}")
-    print(f"[KERNEL] Switching to: {venv_python}")
+    print(f"[KERNEL] Detected system Python without venv packages") # This is a print statement to print the message.
+    print(f"[KERNEL] Current: {_sys.executable}") # This is a print statement to print the current executable.
+    print(f"[KERNEL] Switching to: {venv_python}") # This is a print statement to print the venv Python executable.
 
-    _os.environ['_JARVIS_VENV_REEXEC'] = '1'
+    _os.environ['_JARVIS_VENV_REEXEC'] = '1' # This is a setting to indicate that we have re-executed with the venv Python.
 
     # Set PYTHONPATH to include project directories
-    pythonpath = _os.pathsep.join([
-        str(script_dir),
-        str(script_dir / "backend"),
-        _os.environ.get('PYTHONPATH', '')
+    pythonpath = _os.pathsep.join([ # This is the PYTHONPATH environment variable.
+        str(script_dir), # This is the script directory.
+        str(script_dir / "backend"), # This is the backend directory.
+        _os.environ.get('PYTHONPATH', '') # This is the PYTHONPATH environment variable.
     ])
-    _os.environ['PYTHONPATH'] = pythonpath
+    _os.environ['PYTHONPATH'] = pythonpath # This is the PYTHONPATH environment variable.
 
     # Re-execute with venv Python
-    _os.execv(str(venv_python), [str(venv_python)] + _sys.argv)
+    _os.execv(str(venv_python), [str(venv_python)] + _sys.argv) # This is the execv function to re-execute with the venv Python.
 
 
 # Execute venv check immediately
