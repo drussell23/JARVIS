@@ -4800,6 +4800,13 @@ class LiveProgressDashboard:
                 # GCP startup finished - reset tracking
                 self._gcp_loading_state["start_time"] = None
                 self._gcp_loading_state["max_progress_seen"] = 0
+            elif status == "recycling":
+                # v235.3: VM is being recycled — reset progress tracking so
+                # the new VM's lower progress doesn't trigger false regression
+                # warnings in the DMS (100% → 5% is expected during recycle)
+                self._gcp_loading_state["start_time"] = time.time()
+                self._gcp_loading_state["max_progress_seen"] = 0
+                self._gcp_state["progress"] = 0
             
             if phase is not None:
                 self._gcp_state["phase"] = phase
@@ -60264,9 +60271,27 @@ class JarvisSystemKernel:
                     # Legacy "status=starting" responses (no APARS) do NOT trigger the
                     # callback, so source="apars" here is always truthful.
                     def _gcp_progress_cb(pct, phase, detail):
+                        # v235.3: Detect VM recycle events — reset progress tracking
+                        # to prevent false DMS regression warnings (100% → 40%)
+                        _detail_lower = detail.lower() if detail else ""
+                        _is_recycle = (
+                            pct == 0 and
+                            ("recycl" in _detail_lower or "version_never" in _detail_lower)
+                        )
+                        if _is_recycle:
+                            update_dashboard_gcp_progress(
+                                phase=0,
+                                phase_name="recycling",
+                                checkpoint=detail[:60],
+                                progress=0,
+                                status="recycling",
+                                source="apars",
+                            )
+                            return
+
                         dashboard_pct = 40 + int(pct * 0.6)
                         _mode = ""
-                        if "golden" in detail.lower():
+                        if "golden" in _detail_lower:
                             _mode = "golden-image"
                         elif pct > 0:
                             _mode = "standard"
@@ -61770,6 +61795,22 @@ class JarvisSystemKernel:
                             #   logic blocks. Fix: use 40% floor so even initial polls advance the bar.
                             def _gcp_progress_callback(pct: int, phase: str, detail: str) -> None:
                                 """Callback from GCP VM manager to update dashboard with real APARS data."""
+                                # v235.3: Detect VM recycle events — reset progress tracking
+                                _detail_lower = detail.lower() if detail else ""
+                                _is_recycle = (
+                                    pct == 0 and
+                                    ("recycl" in _detail_lower or "version_never" in _detail_lower)
+                                )
+                                if _is_recycle:
+                                    update_dashboard_gcp_progress(
+                                        phase=0,
+                                        phase_name="recycling",
+                                        checkpoint=detail[:60],
+                                        progress=0,
+                                        status="recycling",
+                                        source="apars",
+                                    )
+                                    return
                                 # Map: VM reports 0-100% → dashboard shows 40-100%
                                 # This ensures progress ALWAYS advances from the 40% background baseline
                                 dashboard_pct = 40 + int(pct * 0.6)  # 40% floor + 60% range

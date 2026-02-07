@@ -2295,6 +2295,12 @@ class GCPVMManager:
                     )
                     logger.info("✅ VM monitoring started")
 
+                # v235.3: Start periodic orphan cleanup (runs every 30min)
+                self._orphan_cleanup_task = asyncio.create_task(
+                    self._periodic_orphan_cleanup(),
+                    name="gcp_orphan_cleanup"
+                )
+
                 self.initialized = True
                 logger.info("✅ GCP VM Manager ready")
                 logger.info(f"   Project: {self.config.project_id}")
@@ -2912,93 +2918,177 @@ class GCPVMManager:
 
     async def _sync_managed_vms_with_gcp(self):
         """
-        v134.0: Synchronize local VM tracking with actual GCP state.
+        v134.0 / v235.3: Synchronize local VM tracking with actual GCP state.
 
-        ROOT CAUSE FIX for stale managed_vms entries:
-        On startup, the managed_vms dict may contain entries from previous runs
-        that no longer exist in GCP (preempted, deleted, etc.). This causes 404
-        errors when trying to terminate them.
+        ROOT CAUSE FIX for stale managed_vms entries AND orphaned untracked VMs:
+        On startup (or after crash/re-exec), the managed_vms dict may:
+        - Contain entries for VMs that no longer exist (causes 404 errors)
+        - Be MISSING entries for VMs that ARE running in GCP (causes orphans)
 
         This method:
         1. Checks each tracked VM against GCP to verify existence
         2. Removes entries for VMs that no longer exist
         3. Updates state for VMs that exist but have changed status
-        4. Logs any discrepancies for debugging
+        4. v235.3: Discovers and ADOPTS running GCP VMs not in managed_vms
+        5. Logs any discrepancies for debugging
 
         Called during initialization to ensure clean state before operations begin.
         """
-        if not self.managed_vms:
-            logger.debug("[VMSync] No managed VMs to sync")
-            return
-
         if not self.instances_client:
             logger.warning("[VMSync] Instances client not available - skipping sync")
             return
 
-        logger.info(f"[VMSync] Syncing {len(self.managed_vms)} tracked VMs with GCP...")
-
         stale_vms = []
         updated_vms = []
+        adopted_vms = []
 
         async with self._vm_lock:
-            for vm_name, vm in list(self.managed_vms.items()):
-                try:
-                    exists, gcp_status = await self._check_vm_exists_in_gcp(vm_name)
+            # Phase 1: Validate tracked VMs against GCP
+            if self.managed_vms:
+                logger.info(f"[VMSync] Syncing {len(self.managed_vms)} tracked VMs with GCP...")
 
-                    if not exists:
-                        logger.info(
-                            f"[VMSync] VM '{vm_name}' no longer exists in GCP "
-                            f"(tracked state: {vm.state.value}) - marking for removal"
-                        )
-                        stale_vms.append(vm_name)
-                    elif gcp_status:
-                        # VM exists - update our tracking to match GCP state
-                        status_map = {
-                            "PROVISIONING": VMState.PROVISIONING,
-                            "STAGING": VMState.STAGING,
-                            "RUNNING": VMState.RUNNING,
-                            "STOPPING": VMState.STOPPING,
-                            "TERMINATED": VMState.TERMINATED,
-                        }
-                        new_state = status_map.get(gcp_status, VMState.UNKNOWN)
+                for vm_name, vm in list(self.managed_vms.items()):
+                    try:
+                        exists, gcp_status = await self._check_vm_exists_in_gcp(vm_name)
 
-                        if vm.state != new_state:
+                        if not exists:
                             logger.info(
-                                f"[VMSync] VM '{vm_name}' state updated: "
-                                f"{vm.state.value} → {new_state.value}"
-                            )
-                            vm.state = new_state
-                            updated_vms.append(vm_name)
-
-                        # If VM is terminated in GCP, mark for removal
-                        if gcp_status == "TERMINATED":
-                            logger.info(
-                                f"[VMSync] VM '{vm_name}' is TERMINATED in GCP - marking for removal"
+                                f"[VMSync] VM '{vm_name}' no longer exists in GCP "
+                                f"(tracked state: {vm.state.value}) - marking for removal"
                             )
                             stale_vms.append(vm_name)
+                        elif gcp_status:
+                            # VM exists - update our tracking to match GCP state
+                            status_map = {
+                                "PROVISIONING": VMState.PROVISIONING,
+                                "STAGING": VMState.STAGING,
+                                "RUNNING": VMState.RUNNING,
+                                "STOPPING": VMState.STOPPING,
+                                "TERMINATED": VMState.TERMINATED,
+                            }
+                            new_state = status_map.get(gcp_status, VMState.UNKNOWN)
 
-                except Exception as e:
-                    logger.warning(f"[VMSync] Error checking VM '{vm_name}': {e}")
-                    # Don't remove on error - could be transient
+                            if vm.state != new_state:
+                                logger.info(
+                                    f"[VMSync] VM '{vm_name}' state updated: "
+                                    f"{vm.state.value} → {new_state.value}"
+                                )
+                                vm.state = new_state
+                                updated_vms.append(vm_name)
 
-            # Remove stale VMs from tracking
-            for vm_name in stale_vms:
-                if vm_name in self.managed_vms:
-                    vm = self.managed_vms[vm_name]
-                    # Update stats
-                    self.stats["current_active"] = max(0, self.stats["current_active"] - 1)
-                    if vm.state == VMState.RUNNING:
-                        self.stats["total_terminated"] += 1
-                    # Remove from tracking
-                    del self.managed_vms[vm_name]
+                            # If VM is terminated in GCP, mark for removal
+                            if gcp_status == "TERMINATED":
+                                logger.info(
+                                    f"[VMSync] VM '{vm_name}' is TERMINATED in GCP - marking for removal"
+                                )
+                                stale_vms.append(vm_name)
 
-        if stale_vms or updated_vms:
-            logger.info(
-                f"[VMSync] Sync complete: {len(stale_vms)} stale VMs removed, "
-                f"{len(updated_vms)} VMs updated"
-            )
+                    except Exception as e:
+                        logger.warning(f"[VMSync] Error checking VM '{vm_name}': {e}")
+                        # Don't remove on error - could be transient
+
+                # Remove stale VMs from tracking
+                for vm_name in stale_vms:
+                    if vm_name in self.managed_vms:
+                        vm = self.managed_vms[vm_name]
+                        # Update stats
+                        self.stats["current_active"] = max(0, self.stats["current_active"] - 1)
+                        if vm.state == VMState.RUNNING:
+                            self.stats["total_terminated"] += 1
+                        # Remove from tracking
+                        del self.managed_vms[vm_name]
+
+            # Phase 2 (v235.3): Discover and adopt untracked running VMs
+            # This handles the case where managed_vms is empty (fresh restart)
+            # or VMs were created by a previous supervisor session
+            try:
+                request = compute_v1.ListInstancesRequest(
+                    project=self.config.project_id,
+                    zone=self.config.zone,
+                    filter="name:jarvis-* AND status=RUNNING",
+                )
+                gcp_instances = await asyncio.to_thread(
+                    lambda: list(self.instances_client.list(request=request))
+                )
+
+                for instance in gcp_instances:
+                    name = instance.name
+                    # Skip VMs already tracked
+                    if name in self.managed_vms:
+                        continue
+
+                    # Skip golden builder VMs — they're transient build artifacts
+                    if "golden-builder" in name:
+                        continue
+
+                    # Adopt this VM into managed_vms
+                    ip_address = None
+                    internal_ip = None
+                    for iface in (instance.network_interfaces or []):
+                        if iface.network_i_p:
+                            internal_ip = iface.network_i_p
+                        for access in (iface.access_configs or []):
+                            if access.nat_i_p:
+                                ip_address = access.nat_i_p
+
+                    # Parse creation time for age tracking
+                    created_at = time.time()
+                    if instance.creation_timestamp:
+                        try:
+                            created_dt = datetime.fromisoformat(
+                                instance.creation_timestamp.replace('Z', '+00:00')
+                            ).replace(tzinfo=None)
+                            created_at = created_dt.timestamp()
+                        except Exception:
+                            pass
+
+                    # Determine VM class from labels/name
+                    labels = dict(instance.labels) if instance.labels else {}
+                    is_invincible = (
+                        labels.get("vm-class") == "invincible"
+                        or name.startswith("jarvis-prime-node")
+                    )
+
+                    vm_instance = VMInstance(
+                        instance_id=str(instance.id) if instance.id else name,
+                        name=name,
+                        zone=self.config.zone,
+                        state=VMState.RUNNING,
+                        created_at=created_at,
+                        ip_address=ip_address,
+                        internal_ip=internal_ip,
+                        health_status="unknown",
+                        trigger_reason="adopted-on-startup",
+                        metadata={
+                            "adopted": True,
+                            "adopted_at": time.time(),
+                            "vm_class": "invincible" if is_invincible else "spot",
+                            "labels": labels,
+                        },
+                    )
+                    self.managed_vms[name] = vm_instance
+                    adopted_vms.append(name)
+                    logger.info(
+                        f"[VMSync] v235.3: Adopted untracked VM '{name}' "
+                        f"(ip={ip_address}, class={'invincible' if is_invincible else 'spot'}, "
+                        f"age={((time.time() - created_at) / 3600):.1f}h)"
+                    )
+
+            except Exception as e:
+                logger.warning(f"[VMSync] v235.3: VM discovery scan failed: {e}")
+
+        # Summary logging
+        parts = []
+        if stale_vms:
+            parts.append(f"{len(stale_vms)} stale removed")
+        if updated_vms:
+            parts.append(f"{len(updated_vms)} updated")
+        if adopted_vms:
+            parts.append(f"{len(adopted_vms)} adopted")
+        if parts:
+            logger.info(f"[VMSync] Sync complete: {', '.join(parts)}")
         else:
-            logger.info("[VMSync] All tracked VMs verified in GCP")
+            logger.info("[VMSync] All VMs in sync — no changes needed")
 
     async def _count_active_gcp_instances(self) -> int:
         """
@@ -3166,10 +3256,57 @@ class GCPVMManager:
         
         return results
 
+    async def _periodic_orphan_cleanup(self) -> None:
+        """
+        v235.3: Background task that periodically scans for and removes orphaned VMs.
+
+        Root cause: cleanup_orphaned_gcp_instances() only runs at startup (Clean Slate).
+        If a VM is orphaned AFTER startup (crash, failed termination, preemption
+        creating a replacement without cleaning up the old one), the orphan persists
+        until the next full restart — accumulating cost.
+
+        This task runs every 30 minutes to catch orphans between restarts.
+        Also re-syncs managed_vms to catch state drift.
+        """
+        _interval = float(os.environ.get("JARVIS_ORPHAN_CLEANUP_INTERVAL", "1800"))  # 30min
+        _max_age = float(os.environ.get("JARVIS_ORPHAN_MAX_AGE_HOURS", "3.0"))
+
+        # Wait for initial startup to complete before first run
+        await asyncio.sleep(120)
+
+        while self.is_monitoring:
+            try:
+                # Re-sync tracked VMs with GCP reality
+                await self._sync_managed_vms_with_gcp()
+
+                # Scan for and delete orphaned VMs
+                results = await asyncio.wait_for(
+                    self.cleanup_orphaned_gcp_instances(max_age_hours=_max_age),
+                    timeout=90.0,
+                )
+                if results.get("deleted", 0) > 0:
+                    logger.info(
+                        f"[PeriodicCleanup] v235.3: Cleaned {results['deleted']} "
+                        f"orphaned VMs (scanned: {results['scanned']})"
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except asyncio.TimeoutError:
+                logger.warning("[PeriodicCleanup] Orphan scan timed out (90s)")
+            except Exception as e:
+                logger.debug(f"[PeriodicCleanup] Error (non-fatal): {e}")
+
+            # Sleep with interruptible check
+            _remaining = _interval
+            while _remaining > 0 and self.is_monitoring:
+                await asyncio.sleep(min(5.0, _remaining))
+                _remaining -= 5.0
+
     async def get_active_vm(self) -> Optional[VMInstance]:
         """
         Get the currently active (RUNNING) VM instance.
-        
+
         Returns:
             VMInstance if found and running, None otherwise.
         """
@@ -5824,6 +5961,19 @@ class GCPVMManager:
                 pass
             except Exception as e:
                 logger.debug(f"Monitoring task cleanup error (non-critical): {e}")
+
+        # v235.3: Cancel periodic orphan cleanup task
+        if hasattr(self, '_orphan_cleanup_task') and self._orphan_cleanup_task and not self._orphan_cleanup_task.done():
+            self._orphan_cleanup_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._orphan_cleanup_task),
+                    timeout=5.0
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                pass
 
         # Cleanup VMs with timeout protection
         try:
