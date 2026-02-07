@@ -58470,17 +58470,31 @@ class JarvisSystemKernel:
                 notify_gcp_endpoint_ready,
             )
             url = f"http://{host}:{port}"
-            success = await notify_gcp_endpoint_ready(url)
-            if success:
-                self.logger.info(
-                    f"[InvincibleNode] v234.0: UnifiedModelServing "
-                    f"notified of GCP: {url}"
-                )
-            else:
-                self.logger.warning(
-                    f"[InvincibleNode] v234.0: UnifiedModelServing "
-                    f"GCP notification failed"
-                )
+
+            # Retry with backoff — _model_serving may not be initialized yet
+            max_attempts = 4
+            for attempt in range(max_attempts):
+                success = await notify_gcp_endpoint_ready(url)
+                if success:
+                    self.logger.info(
+                        f"[InvincibleNode] v234.0: UnifiedModelServing "
+                        f"notified of GCP: {url}"
+                        + (f" (attempt {attempt + 1})" if attempt > 0 else "")
+                    )
+                    return
+                if attempt < max_attempts - 1:
+                    delay = 2 ** attempt  # 1s, 2s, 4s
+                    self.logger.debug(
+                        f"[InvincibleNode] GCP notification attempt {attempt + 1} "
+                        f"failed, retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+
+            # All attempts exhausted
+            self.logger.warning(
+                f"[InvincibleNode] v234.0: UnifiedModelServing "
+                f"GCP notification failed after {max_attempts} attempts"
+            )
         except ImportError:
             self.logger.debug(
                 "[InvincibleNode] UnifiedModelServing not available"

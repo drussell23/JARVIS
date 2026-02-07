@@ -498,7 +498,12 @@ class HybridOrchestrator:
         Args:
             config_path: Path to configuration file. Defaults to backend/core/hybrid_config.yaml
         """
-        self.config_path = config_path or "backend/core/hybrid_config.yaml"
+        if config_path:
+            self.config_path = config_path
+        else:
+            # Resolve relative to this file (backend/core/hybrid_orchestrator.py)
+            # to get backend/core/hybrid_config.yaml regardless of cwd
+            self.config_path = str(Path(__file__).resolve().parent / "hybrid_config.yaml")
 
         # Initialize components
         self.client = HybridBackendClient(self.config_path)

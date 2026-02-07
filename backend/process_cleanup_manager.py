@@ -3776,8 +3776,6 @@ class ProcessCleanupManager:
                 try:
                     with open(full_path, "rb") as f:
                         hasher.update(f.read())
-                    # Also include file modification time
-                    hasher.update(str(full_path.stat().st_mtime).encode())
                 except Exception as e:
                     logger.error(f"Error hashing {file_path}: {e}")
 

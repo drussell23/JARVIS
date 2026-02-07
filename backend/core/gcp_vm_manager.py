@@ -5724,6 +5724,22 @@ class GCPVMManager:
 
                     # === INTELLIGENT COST-CUTTING CHECKS ===
 
+                    # Skip ALL cost-cutting checks for invincible VMs.
+                    # InvincibleGuard in terminate_vm() is the safety net, but we
+                    # avoid even reaching it to prevent repeated WARNING spam.
+                    vm_meta = vm.metadata or {}
+                    _is_invincible = (
+                        vm_name.startswith("jarvis-prime-node")
+                        or vm_meta.get("vm_class") == "invincible"
+                        or vm_meta.get("labels", {}).get("vm-class") == "invincible"
+                    )
+                    if _is_invincible:
+                        logger.debug(
+                            f"[InvincibleVM] Skipping cost-cutting checks for "
+                            f"persistent VM '{vm_name}' (uptime: {vm.uptime_hours:.1f}h)"
+                        )
+                        continue
+
                     # 1. Check VM lifetime (hard limit)
                     if vm.uptime_hours >= self.config.max_vm_lifetime_hours:
                         logger.info(

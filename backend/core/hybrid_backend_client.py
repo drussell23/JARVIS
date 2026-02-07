@@ -305,8 +305,9 @@ class HybridBackendClient:
         logger.info("Starting hybrid backend client...")
 
         # Start health check loop if enabled
-        if self.config['hybrid'].get('discovery', {}).get('enabled', True):
-            interval = self.config['hybrid']['discovery'].get('health_check_interval', 30)
+        discovery_config = self.config['hybrid'].get('discovery', {})
+        if discovery_config.get('enabled', True):
+            interval = discovery_config.get('health_check_interval', 30)
             self.health_check_task = asyncio.create_task(self._health_check_loop(interval))
 
         # Perform initial health check

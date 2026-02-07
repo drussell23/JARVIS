@@ -1091,13 +1091,19 @@ class AdvancedAsyncPipeline:
                     is_healthy = data.get("is_healthy", True)
                     
                     if current_health != _last_health_state["value"]:
-                        # Health state changed
-                        if not is_healthy:
+                        prev = _last_health_state["value"]
+                        if prev is None:
+                            # First health event after startup — normal initialization,
+                            # not a degradation. Log at DEBUG, not WARNING.
+                            logger.debug(
+                                f"[VBI-HEALTH] Initial health state: {current_health}"
+                            )
+                        elif not is_healthy:
                             logger.warning(
                                 f"[VBI-HEALTH] System health changed: "
-                                f"{_last_health_state['value'] or 'initial'} → {current_health}"
+                                f"{prev} → {current_health}"
                             )
-                        elif _last_health_state["value"] is not None and not _last_health_state.get("was_healthy", True):
+                        elif prev is not None and not _last_health_state.get("was_healthy", True):
                             # Recovered from unhealthy state
                             logger.info(f"[VBI-HEALTH] System health recovered: → {current_health}")
                         

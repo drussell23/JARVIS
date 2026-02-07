@@ -222,7 +222,7 @@ class CodingCouncilConfig:
 
     # Resource limits
     max_memory_mb: int = field(
-        default_factory=lambda: _get_env_int("CODING_COUNCIL_MAX_MEMORY_MB", 4096)
+        default_factory=lambda: _get_env_int("CODING_COUNCIL_MAX_MEMORY_MB", 1536)
     )
     max_concurrent_tasks: int = field(
         default_factory=lambda: _get_env_int("CODING_COUNCIL_MAX_CONCURRENT", 2)

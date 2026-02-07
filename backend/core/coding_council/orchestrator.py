@@ -367,7 +367,7 @@ class ResourceMonitor:
     Addresses Gap #22: Resource Exhaustion
     """
 
-    def __init__(self, max_memory_mb: int = 4096):
+    def __init__(self, max_memory_mb: int = 1536):
         self.max_memory_mb = max_memory_mb
         self._psutil_available = False
 
