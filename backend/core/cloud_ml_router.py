@@ -753,6 +753,17 @@ class CloudMLRouter:
 
         processing_time = (time.time() - start_time) * 1000
 
+        # Record VM activity for efficiency tracking (belt + suspenders with transport layer)
+        try:
+            from core.gcp_vm_manager import record_vm_activity
+            if self._gcp_ml_endpoint:
+                from urllib.parse import urlparse
+                ip = urlparse(self._gcp_ml_endpoint).hostname
+                if ip:
+                    record_vm_activity(ip_address=ip)
+        except Exception:
+            pass  # Never break ML requests for metrics
+
         # Calculate cost (e2-highmem-4 Spot: ~$0.029/hour)
         cost_per_second = 0.029 / 3600
         cost = (processing_time / 1000) * cost_per_second

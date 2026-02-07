@@ -562,7 +562,24 @@ class HybridBackendClient:
             raise ValueError(f"Unsupported HTTP method: {method}")
 
         response.raise_for_status()
+
+        # Transport-layer activity recording for GCP backends
+        # This automatically captures ALL GCP requests without per-consumer changes
+        if backend.type == BackendType.CLOUD:
+            self._record_gcp_activity(backend.base_url)
+
         return response.json()
+
+    def _record_gcp_activity(self, base_url: str):
+        """Record activity on GCP VM. Non-blocking, never fails the request."""
+        try:
+            from urllib.parse import urlparse
+            ip = urlparse(base_url).hostname
+            if ip:
+                from core.gcp_vm_manager import record_vm_activity
+                record_vm_activity(ip_address=ip)
+        except Exception:
+            pass  # Never break requests for metrics
 
     def get_metrics(self) -> Dict[str, Any]:
         """Get client metrics"""

@@ -263,6 +263,12 @@ class VMInstance:
     last_activity_time: float = field(default_factory=time.time)
     component_usage_count: int = 0  # How many times components were accessed
     cost_efficiency_score: float = 0.0  # 0-100, higher is better ROI
+    score_confidence: float = 0.0  # 0-1, how much real data backs the score
+
+    # Configurable thresholds (set from VMManagerConfig at creation time)
+    _idle_threshold_minutes: float = float(os.getenv("GCP_IDLE_TIMEOUT_MINUTES", os.getenv("JARVIS_SPOT_VM_IDLE_TIMEOUT", "30")))
+    _wasting_money_threshold: float = float(os.getenv("GCP_EFFICIENCY_TERMINATION_THRESHOLD", "30.0"))
+    _min_confidence_for_termination: float = float(os.getenv("GCP_EFFICIENCY_MIN_CONFIDENCE", "0.5"))
 
     # Detailed metrics (like GCP Console)
     cpu_percent: float = 0.0
@@ -290,13 +296,19 @@ class VMInstance:
 
     @property
     def is_idle(self) -> bool:
-        """Check if VM has been idle too long (no activity for 10 minutes)"""
-        return self.idle_time_minutes > 10
+        """Check if VM has been idle too long (uses configurable threshold)"""
+        return self.idle_time_minutes > self._idle_threshold_minutes
 
     @property
     def is_wasting_money(self) -> bool:
-        """Determine if VM is wasting money (idle + low efficiency)"""
-        return self.is_idle and self.cost_efficiency_score < 30.0
+        """Determine if VM is wasting money (idle + low efficiency + confident score).
+        Requires score_confidence > threshold to prevent killing new VMs
+        that haven't had time to accumulate real data."""
+        return (
+            self.is_idle
+            and self.cost_efficiency_score < self._wasting_money_threshold
+            and self.score_confidence > self._min_confidence_for_termination
+        )
 
     @property
     def memory_percent(self) -> float:
@@ -307,15 +319,25 @@ class VMInstance:
         """Update total cost based on uptime"""
         self.total_cost = self.uptime_hours * self.cost_per_hour
 
-    def update_efficiency_score(self):
+    def update_efficiency_score(
+        self,
+        ramp_minutes: float = 30.0,
+        startup_bonus_max: float = 50.0,
+    ):
         """Calculate cost efficiency score (0-100, higher is better ROI).
 
-        Includes a startup ramp that gives young VMs (<30 min) benefit of the
-        doubt — a freshly provisioned VM hasn't had time to accumulate usage
-        counts, so raw usage_rate unfairly penalizes it.
+        Also computes score_confidence (0-1) indicating how much real data
+        backs the score. Low-confidence scores won't trigger VM termination,
+        preventing false kills on newly created VMs.
+
+        Args:
+            ramp_minutes: Minutes over which startup bonus declines to 0.
+            startup_bonus_max: Maximum startup bonus for brand-new VMs.
         """
-        if self.uptime_hours == 0:
-            self.cost_efficiency_score = 0.0
+        # Guard: VM just created (<4 seconds), give benefit of the doubt
+        if self.uptime_hours < 0.001:
+            self.cost_efficiency_score = startup_bonus_max
+            self.score_confidence = 0.0  # No data at all
             return
 
         # Factors:
@@ -328,10 +350,9 @@ class VMInstance:
         recency_score = max(0, 100 - (self.idle_time_minutes * 2))  # Decreases as idle time increases
         utilization_score = min(100, (self.cpu_percent + self.memory_percent) / 2)
 
-        # Startup ramp: VMs under 30 min get a declining bonus that compensates
-        # for insufficient usage data. At 0 min = +50 bonus, at 30 min = 0.
-        ramp_minutes = 30.0
-        startup_bonus = max(0.0, 50.0 * (1.0 - uptime_minutes / ramp_minutes))
+        # Startup ramp: VMs under ramp_minutes get a declining bonus that
+        # compensates for insufficient usage data.
+        startup_bonus = max(0.0, startup_bonus_max * (1.0 - uptime_minutes / ramp_minutes))
 
         # Weighted average
         self.cost_efficiency_score = (
@@ -342,6 +363,18 @@ class VMInstance:
         )
 
         self.cost_efficiency_score = min(100.0, self.cost_efficiency_score)
+
+        # Confidence = how much real data backs this score
+        # 70% based on data signals, 30% based on time running
+        data_signals = 0
+        if self.component_usage_count > 0:
+            data_signals += 1
+        if self.cpu_percent > 0:
+            data_signals += 1
+        if self.memory_used_gb > 0:
+            data_signals += 1
+        time_factor = min(1.0, uptime_minutes / ramp_minutes)  # 0→1 over ramp period
+        self.score_confidence = min(1.0, (data_signals / 3.0) * 0.7 + time_factor * 0.3)
 
     def record_activity(self):
         """Record that VM components were used"""
@@ -628,6 +661,41 @@ class VMManagerConfig:
         default_factory=lambda: float(os.getenv("GCP_CIRCUIT_RECOVERY_TIMEOUT", "60.0"))
     )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EFFICIENCY SCORING CONFIGURATION — All thresholds env-var configurable
+    # ═══════════════════════════════════════════════════════════════════════════
+    efficiency_warning_threshold: float = field(
+        default_factory=lambda: float(os.getenv("GCP_EFFICIENCY_WARNING_THRESHOLD", "50.0"))
+    )
+    efficiency_termination_threshold: float = field(
+        default_factory=lambda: float(os.getenv("GCP_EFFICIENCY_TERMINATION_THRESHOLD", "30.0"))
+    )
+    efficiency_startup_bonus: float = field(
+        default_factory=lambda: float(os.getenv("GCP_EFFICIENCY_STARTUP_BONUS", "50.0"))
+    )
+    efficiency_ramp_minutes: float = field(
+        default_factory=lambda: float(os.getenv("GCP_EFFICIENCY_RAMP_MINUTES", "30.0"))
+    )
+    efficiency_grace_minutes: float = field(
+        default_factory=lambda: float(os.getenv("GCP_EFFICIENCY_GRACE_MINUTES", "30.0"))
+    )
+    efficiency_warning_interval_seconds: float = field(
+        default_factory=lambda: float(os.getenv("GCP_EFFICIENCY_WARNING_INTERVAL", "300"))
+    )
+    efficiency_min_confidence_for_termination: float = field(
+        default_factory=lambda: float(os.getenv("GCP_EFFICIENCY_MIN_CONFIDENCE", "0.5"))
+    )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # METRICS COLLECTION CONFIGURATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    metrics_collection_enabled: bool = field(
+        default_factory=lambda: os.getenv("GCP_METRICS_COLLECTION_ENABLED", "true").lower() == "true"
+    )
+    metrics_window_seconds: int = field(
+        default_factory=lambda: int(os.getenv("GCP_METRICS_WINDOW_SECONDS", "300"))
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization"""
         # Track validation status for pre-flight checks
@@ -711,6 +779,162 @@ class VMManagerConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "VMManagerConfig":
         """Create configuration from dictionary"""
         return cls(**{k: v for k, v in data.items() if hasattr(cls, k)})
+
+
+class GCPMetricsCollector:
+    """
+    Real VM metrics from GCP Monitoring API with circuit breaker.
+
+    Uses hypervisor-level compute.googleapis.com/instance/cpu/utilization
+    which is always available without installing the Ops Agent.
+    Memory metrics require the Ops Agent so are NOT collected here —
+    memory is estimated from activity patterns instead.
+
+    Features:
+    - Circuit breaker: opens after consecutive failures, auto-recovers
+    - Async-safe: all GCP API calls wrapped in asyncio.to_thread
+    - Graceful degradation: returns None on failure (never crashes caller)
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        circuit_threshold: int = 3,
+        circuit_timeout: float = 60.0,
+        metrics_window_seconds: int = 300,
+    ):
+        self._project_id = project_id
+        self._client: Any = None
+        self._available = False
+        self._metrics_window_seconds = metrics_window_seconds
+
+        # Circuit breaker state
+        self._consecutive_failures = 0
+        self._circuit_threshold = circuit_threshold
+        self._circuit_open_until = 0.0
+        self._circuit_timeout = circuit_timeout
+
+        self._initialize()
+
+    def _initialize(self):
+        """Try to import and create the Monitoring API client."""
+        try:
+            from google.cloud import monitoring_v3
+            self._client = monitoring_v3.MetricServiceClient()
+            self._available = True
+            logger.info("GCPMetricsCollector: Monitoring API client initialized")
+        except ImportError:
+            logger.info(
+                "GCPMetricsCollector: google-cloud-monitoring not installed — "
+                "falling back to estimated metrics"
+            )
+            self._available = False
+        except Exception as e:
+            logger.warning(f"GCPMetricsCollector: Failed to initialize Monitoring client: {e}")
+            self._available = False
+
+    @property
+    def is_available(self) -> bool:
+        """Whether the collector can attempt to fetch metrics."""
+        return self._available and time.time() >= self._circuit_open_until
+
+    async def fetch_vm_metrics(
+        self, instance_name: str, zone: str
+    ) -> Optional[Dict[str, float]]:
+        """
+        Fetch CPU utilization from GCP Monitoring API.
+
+        Uses hypervisor-level cpu/utilization (no Ops Agent needed).
+        Returns dict with 'cpu_percent' key, or None on failure.
+        Does NOT fetch memory (requires Ops Agent).
+
+        Args:
+            instance_name: GCP VM instance name
+            zone: GCP zone (e.g., 'us-central1-a')
+
+        Returns:
+            Dict with 'cpu_percent' (0-100 scale), or None on failure
+        """
+        if not self._available:
+            return None
+
+        if time.time() < self._circuit_open_until:
+            return None
+
+        try:
+            result = await asyncio.to_thread(
+                self._query_cpu_utilization, instance_name, zone
+            )
+            self._consecutive_failures = 0
+            return result
+        except Exception as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._circuit_threshold:
+                self._circuit_open_until = time.time() + self._circuit_timeout
+                logger.warning(
+                    f"GCPMetricsCollector: circuit breaker OPEN after "
+                    f"{self._consecutive_failures} failures "
+                    f"(will retry in {self._circuit_timeout}s): {e}"
+                )
+            else:
+                logger.debug(
+                    f"GCPMetricsCollector: fetch failed ({self._consecutive_failures}/"
+                    f"{self._circuit_threshold}): {e}"
+                )
+            return None
+
+    def _query_cpu_utilization(
+        self, instance_name: str, zone: str
+    ) -> Optional[Dict[str, float]]:
+        """
+        Synchronous GCP Monitoring API query for CPU utilization.
+
+        Queries compute.googleapis.com/instance/cpu/utilization which
+        returns a value 0.0-1.0 (fraction). We convert to 0-100%.
+        """
+        from google.cloud import monitoring_v3
+        from google.protobuf import timestamp_pb2
+
+        now = time.time()
+        window_start = now - self._metrics_window_seconds
+
+        interval = monitoring_v3.TimeInterval()
+        start_time = timestamp_pb2.Timestamp()
+        start_time.FromSeconds(int(window_start))
+        end_time = timestamp_pb2.Timestamp()
+        end_time.FromSeconds(int(now))
+        interval.start_time = start_time
+        interval.end_time = end_time
+
+        project_name = f"projects/{self._project_id}"
+
+        # Hypervisor-level CPU — always available, no agent needed
+        request = monitoring_v3.ListTimeSeriesRequest(
+            name=project_name,
+            filter=(
+                f'metric.type = "compute.googleapis.com/instance/cpu/utilization" '
+                f'AND resource.labels.instance_id = "{instance_name}" '
+                f'AND resource.labels.zone = "{zone}"'
+            ),
+            interval=interval,
+            view=monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+        )
+
+        results = self._client.list_time_series(request=request)
+
+        # Extract the most recent data point
+        for ts in results:
+            for point in ts.points:
+                # cpu/utilization is 0.0-1.0 fraction, convert to percentage
+                cpu_fraction = point.value.double_value
+                return {"cpu_percent": round(cpu_fraction * 100.0, 1)}
+
+        return None
+
+    def reset_circuit_breaker(self):
+        """Manually reset the circuit breaker (e.g., after config change)."""
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
 
 
 @dataclass
@@ -2146,6 +2370,22 @@ class GCPVMManager:
         self._cloud_offload_reason: str = ""
         self._cloud_offload_triggered_at: Optional[float] = None
 
+        # GCP Monitoring API metrics collector (circuit-breaker protected)
+        self._metrics_collector: Optional[GCPMetricsCollector] = None
+        if self.config.metrics_collection_enabled:
+            try:
+                self._metrics_collector = GCPMetricsCollector(
+                    project_id=self.config.project_id,
+                    circuit_threshold=self.config.circuit_failure_threshold,
+                    circuit_timeout=self.config.circuit_recovery_timeout,
+                    metrics_window_seconds=self.config.metrics_window_seconds,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create GCPMetricsCollector: {e}")
+
+        # IP-to-VM index for O(1) activity lookup by IP address
+        self._ip_to_vm: Dict[str, str] = {}
+
         # v224.0: Golden Image Builder for pre-baked VM images
         self._golden_image_builder: Optional[GoldenImageBuilder] = None
         self._golden_image_cache: Optional[GoldenImageInfo] = None
@@ -2212,6 +2452,32 @@ class GCPVMManager:
         self._cloud_offload_reason = ""
         self._cloud_offload_triggered_at = None
         logger.info("☁️ [GCPVMManager] Cloud offloading marked INACTIVE")
+
+    # =========================================================================
+    # Activity recording for efficiency tracking
+    # =========================================================================
+
+    def record_vm_activity_by_ip(self, ip_address: str) -> bool:
+        """Record activity on a VM identified by IP address. O(1) lookup."""
+        vm_name = self._ip_to_vm.get(ip_address)
+        if vm_name and vm_name in self.managed_vms:
+            self.managed_vms[vm_name].record_activity()
+            return True
+        return False
+
+    def record_vm_activity_by_name(self, vm_name: str) -> bool:
+        """Record activity on a VM identified by name."""
+        if vm_name in self.managed_vms:
+            self.managed_vms[vm_name].record_activity()
+            return True
+        return False
+
+    def _update_ip_index(self, vm: VMInstance) -> None:
+        """Update the IP-to-VM index when a VM's IP changes."""
+        if vm.ip_address:
+            self._ip_to_vm[vm.ip_address] = vm.name
+        if vm.internal_ip:
+            self._ip_to_vm[vm.internal_ip] = vm.name
 
     def get_status(self) -> Dict[str, Any]:
         """
@@ -3439,6 +3705,7 @@ class GCPVMManager:
                                     async with self._vm_lock:
                                         if vm.name in self.managed_vms:
                                             self.managed_vms[vm.name].ip_address = ip_address
+                                            self._update_ip_index(self.managed_vms[vm.name])
                                     logger.info(f"[v213.0] IP assigned after {time.time() - ip_wait_start:.1f}s: {ip_address}")
                                     return True, ip_address
                         
@@ -3817,8 +4084,20 @@ class GCPVMManager:
             )
             async with self._vm_lock:
                 self.managed_vms[vm_name] = vm_instance
+                self._update_ip_index(vm_instance)
                 self.stats["total_created"] += 1
                 self.stats["current_active"] += 1
+
+            # Set startup grace period for adopted VMs — they need time to be evaluated
+            if not hasattr(self, '_startup_grace_until'):
+                self._startup_grace_until: Dict[str, float] = {}
+            grace_seconds = self.config.efficiency_grace_minutes * 60
+            self._startup_grace_until[vm_name] = time.time() + grace_seconds
+            logger.info(
+                f"[AdoptVM] Set {self.config.efficiency_grace_minutes}m grace period "
+                f"for adopted VM '{vm_name}'"
+            )
+
             return vm_instance
         except Exception as e:
             logger.warning(f"[CreateVM] Failed to adopt VM '{vm_name}': {e}")
@@ -4146,6 +4425,7 @@ class GCPVMManager:
                     # Track the VM with lock protection
                     async with self._vm_lock:
                         self.managed_vms[vm_name] = vm_instance
+                        self._update_ip_index(vm_instance)
                         self.stats["total_created"] += 1
                         self.stats["current_active"] += 1
 
@@ -4164,6 +4444,12 @@ class GCPVMManager:
                     logger.info(f"   External IP: {ip_address or 'N/A'}")
                     logger.info(f"   Internal IP: {internal_ip or 'N/A'}")
                     logger.info(f"   Cost: ${vm_instance.cost_per_hour:.3f}/hour")
+
+                    # Set startup grace period for new VMs
+                    if not hasattr(self, '_startup_grace_until'):
+                        self._startup_grace_until: Dict[str, float] = {}
+                    grace_seconds = self.config.efficiency_grace_minutes * 60
+                    self._startup_grace_until[vm_name] = time.time() + grace_seconds
 
                     return vm_instance
 
@@ -5685,6 +5971,81 @@ class GCPVMManager:
             circuit.record_failure(e)
             logger.warning(f"⚠️  Failed to record VM termination in cost tracker (non-critical): {e}")
 
+    def _publish_vm_state(self) -> None:
+        """
+        Publish VM state to shared filesystem for cross-repo coordination.
+
+        Writes to ~/.jarvis/cross_repo/gcp/:
+        - discovered_endpoints.json: Format compatible with J-Prime's gcp_cross_repo_bridge.py
+        - jarvis_vms.json: Full debug state for troubleshooting
+
+        Called once per monitoring loop cycle (not per-VM).
+        Synchronous and non-blocking — just writes JSON to disk.
+        """
+        cross_repo_dir = os.path.expanduser("~/.jarvis/cross_repo/gcp")
+        os.makedirs(cross_repo_dir, exist_ok=True)
+
+        # Build endpoint list (format J-Prime's gcp_cross_repo_bridge.py expects)
+        endpoints = []
+        vm_states = {}
+        for vm_name, vm in self.managed_vms.items():
+            vm_info = {
+                "name": vm_name,
+                "instance_id": vm.instance_id,
+                "zone": vm.zone,
+                "state": vm.state.value if vm.state else "unknown",
+                "ip_address": vm.ip_address,
+                "internal_ip": vm.internal_ip,
+                "uptime_hours": round(vm.uptime_hours, 2),
+                "cost_efficiency_score": round(vm.cost_efficiency_score, 1),
+                "score_confidence": round(vm.score_confidence, 2),
+                "component_usage_count": vm.component_usage_count,
+                "idle_time_minutes": round(vm.idle_time_minutes, 1),
+                "cpu_percent": round(vm.cpu_percent, 1),
+                "memory_used_gb": round(vm.memory_used_gb, 1),
+                "total_cost": round(vm.total_cost, 4),
+                "health_status": vm.health_status,
+                "components": vm.components,
+                "last_updated": time.time(),
+            }
+            vm_states[vm_name] = vm_info
+
+            # Only publish running VMs with IPs as endpoints
+            if vm.state == VMState.RUNNING and vm.ip_address:
+                endpoints.append({
+                    "ip": vm.ip_address,
+                    "internal_ip": vm.internal_ip,
+                    "port": 8010,  # Default JARVIS backend port
+                    "name": vm_name,
+                    "zone": vm.zone,
+                    "health": vm.health_status,
+                    "source": "jarvis-body",
+                })
+
+        # Write discovered endpoints (J-Prime reads this)
+        endpoints_path = os.path.join(cross_repo_dir, "discovered_endpoints.json")
+        try:
+            with open(endpoints_path, "w") as f:
+                json.dump({
+                    "endpoints": endpoints,
+                    "updated_at": time.time(),
+                    "source": "gcp_vm_manager",
+                }, f, indent=2)
+        except Exception as e:
+            logger.debug(f"Failed to write {endpoints_path}: {e}")
+
+        # Write full VM state (for debugging / other consumers)
+        vms_path = os.path.join(cross_repo_dir, "jarvis_vms.json")
+        try:
+            with open(vms_path, "w") as f:
+                json.dump({
+                    "vms": vm_states,
+                    "updated_at": time.time(),
+                    "manager_stats": self.stats,
+                }, f, indent=2)
+        except Exception as e:
+            logger.debug(f"Failed to write {vms_path}: {e}")
+
     async def _monitoring_loop(self):
         """
         Background monitoring loop for VM health, lifecycle, and intelligent cost-cutting.
@@ -5729,11 +6090,81 @@ class GCPVMManager:
                     break
 
                 for vm_name, vm in list(self.managed_vms.items()):
-                    # Update cost and efficiency
+                    # === STEP 1: Always update cost (no GCP API needed) ===
                     vm.update_cost()
-                    vm.update_efficiency_score()
 
-                    # === INTELLIGENT COST-CUTTING CHECKS ===
+                    # === STEP 2: Collect GCP state + metrics (best-effort) ===
+                    # Failures keep last-known values — never reset to 0
+                    try:
+                        instance = await asyncio.to_thread(
+                            self.instances_client.get,
+                            project=self.config.project_id,
+                            zone=self.config.zone,
+                            instance=vm_name,
+                        )
+
+                        status_map = {
+                            "PROVISIONING": VMState.PROVISIONING,
+                            "STAGING": VMState.STAGING,
+                            "RUNNING": VMState.RUNNING,
+                            "STOPPING": VMState.STOPPING,
+                            "TERMINATED": VMState.TERMINATED,
+                        }
+                        vm.state = status_map.get(instance.status, VMState.UNKNOWN)
+
+                        # Collect real metrics via GCP Monitoring API (if available)
+                        metrics_collected = False
+                        if self.config.metrics_collection_enabled and hasattr(self, '_metrics_collector') and self._metrics_collector:
+                            try:
+                                metrics = await self._metrics_collector.fetch_vm_metrics(
+                                    vm_name, self.config.zone
+                                )
+                                if metrics:
+                                    vm.cpu_percent = metrics.get("cpu_percent", vm.cpu_percent)
+                                    vm.memory_used_gb = metrics.get("memory_used_gb", vm.memory_used_gb)
+                                    metrics_collected = True
+                            except Exception as mc_err:
+                                logger.debug(f"Metrics collector error for {vm_name}: {mc_err}")
+
+                        # Fallback estimation only when no real metrics AND VM has recent activity
+                        if not metrics_collected and vm.cpu_percent == 0.0:
+                            if vm.component_usage_count > 0 and vm.idle_time_minutes < 2.0:
+                                # Active VM with recent usage — conservative estimate
+                                vm.cpu_percent = max(vm.cpu_percent, 25.0)
+                                vm.memory_used_gb = max(vm.memory_used_gb, 8.0)
+                            # NOTE: idle VMs with no metrics keep 0.0 — that's honest data,
+                            # and the confidence system handles it correctly
+
+                        # Health status
+                        is_healthy = vm.state == VMState.RUNNING
+                        vm.last_health_check = time.time()
+                        vm.health_status = "healthy" if is_healthy else "unhealthy"
+
+                        # State-based logging (only for unexpected states)
+                        if not is_healthy:
+                            expected_shutdown_states = {VMState.STOPPING, VMState.TERMINATED}
+                            expected_startup_states = {VMState.CREATING, VMState.PROVISIONING, VMState.STAGING}
+                            if vm.state in expected_shutdown_states:
+                                logger.debug(f"VM {vm_name} in expected shutdown state: {vm.state.value}")
+                            elif vm.state in expected_startup_states:
+                                logger.info(f"VM {vm_name} starting up: {vm.state.value}")
+                            elif vm.state == VMState.FAILED:
+                                logger.warning(f"⚠️  VM {vm_name} health check failed (state: {vm.state.value})")
+                            else:
+                                logger.warning(f"⚠️  VM {vm_name} in unexpected state: {vm.state.value}")
+
+                    except Exception as metrics_error:
+                        # GCP API failed — keep last-known state and metrics, don't reset to 0
+                        logger.debug(f"Could not collect state/metrics for {vm_name}: {metrics_error}")
+
+                    # === STEP 3: ALWAYS calculate efficiency score (outside try/except) ===
+                    # This runs whether or not GCP API succeeded — uses whatever data is available
+                    vm.update_efficiency_score(
+                        ramp_minutes=self.config.efficiency_ramp_minutes,
+                        startup_bonus_max=self.config.efficiency_startup_bonus,
+                    )
+
+                    # === STEP 4: INTELLIGENT COST-CUTTING CHECKS ===
 
                     # Skip ALL cost-cutting checks for invincible VMs.
                     # InvincibleGuard in terminate_vm() is the safety net, but we
@@ -5751,7 +6182,7 @@ class GCPVMManager:
                         )
                         continue
 
-                    # 1. Check VM lifetime (hard limit)
+                    # 4a. Check VM lifetime (hard limit)
                     if vm.uptime_hours >= self.config.max_vm_lifetime_hours:
                         logger.info(
                             f"⏰ VM {vm_name} exceeded max lifetime ({self.config.max_vm_lifetime_hours}h)"
@@ -5759,7 +6190,7 @@ class GCPVMManager:
                         await self.terminate_vm(vm_name, reason="Max lifetime exceeded")
                         continue
 
-                    # v235.0: Skip cost check during startup grace period
+                    # 4b. Skip cost check during startup grace period
                     grace_until = getattr(self, '_startup_grace_until', {}).get(vm_name, 0)
                     if time.time() < grace_until:
                         logger.debug(
@@ -5769,32 +6200,38 @@ class GCPVMManager:
                         )
                         continue
 
-                    # 2. Check if VM is wasting money (idle + low efficiency)
+                    # 4c. Check if VM is wasting money (idle + low efficiency + high confidence)
+                    # Confidence gate prevents killing VMs with insufficient data
                     idle_limit = float(self.config.idle_timeout_minutes)
                     is_idle = vm.idle_time_minutes > idle_limit
-                    is_wasting_money = is_idle and (vm.cost_efficiency_score < 30.0)
+                    is_wasting_money = (
+                        is_idle
+                        and vm.cost_efficiency_score < self.config.efficiency_termination_threshold
+                        and vm.score_confidence > self.config.efficiency_min_confidence_for_termination
+                    )
 
                     if is_wasting_money:
                         logger.warning(
                             f"💰 VM {vm_name} is wasting money: "
                             f"idle for {vm.idle_time_minutes:.1f}m, "
-                            f"efficiency score: {vm.cost_efficiency_score:.1f}%"
+                            f"efficiency score: {vm.cost_efficiency_score:.1f}% "
+                            f"(confidence: {vm.score_confidence:.2f})"
                         )
                         await self.terminate_vm(
                             vm_name,
                             reason=(
                                 f"Cost waste: idle {vm.idle_time_minutes:.1f}m "
-                                f"(limit {idle_limit:.0f}m), efficiency {vm.cost_efficiency_score:.1f}%"
+                                f"(limit {idle_limit:.0f}m), efficiency {vm.cost_efficiency_score:.1f}% "
+                                f"(confidence: {vm.score_confidence:.2f})"
                             ),
                         )
                         continue
 
-                    # 3. Check if local memory pressure normalized (VM no longer needed)
+                    # 4d. Check if local memory pressure normalized (VM no longer needed)
                     try:
                         import psutil
                         local_mem_percent = psutil.virtual_memory().percent
 
-                        # If local RAM dropped below 70%, VM is no longer needed
                         if local_mem_percent < 70:
                             logger.info(
                                 f"📉 Local RAM normalized ({local_mem_percent:.1f}%) - "
@@ -5808,94 +6245,38 @@ class GCPVMManager:
                     except Exception as mem_check_error:
                         logger.debug(f"Could not check local memory: {mem_check_error}")
 
-                    # === DETAILED METRICS COLLECTION (GCP Console-like) ===
-                    try:
-                        # Get instance details from GCP
-                        instance = await asyncio.to_thread(
-                            self.instances_client.get,
-                            project=self.config.project_id,
-                            zone=self.config.zone,
-                            instance=vm_name,
+                    # === STEP 5: Efficiency warnings (configurable thresholds) ===
+                    if (vm.state == VMState.RUNNING
+                            and vm.cost_efficiency_score < self.config.efficiency_warning_threshold):
+                        vm_startup_minutes = vm.uptime_hours * 60
+
+                        # Initialize rate limiting tracker if needed
+                        if not hasattr(self, '_efficiency_warning_times'):
+                            self._efficiency_warning_times: Dict[str, float] = {}
+
+                        last_warning = self._efficiency_warning_times.get(vm_name, 0)
+
+                        should_warn = (
+                            vm_startup_minutes > self.config.efficiency_grace_minutes
+                            and time.time() - last_warning > self.config.efficiency_warning_interval_seconds
                         )
 
-                        # Update VM state
-                        status_map = {
-                            "PROVISIONING": VMState.PROVISIONING,
-                            "STAGING": VMState.STAGING,
-                            "RUNNING": VMState.RUNNING,
-                            "STOPPING": VMState.STOPPING,
-                            "TERMINATED": VMState.TERMINATED,
-                        }
-                        vm.state = status_map.get(instance.status, VMState.UNKNOWN)
-
-                        # Collect CPU metrics (from GCP Monitoring API if available)
-                        # For now, we'll use placeholder - in production, integrate with GCP Monitoring API
-                        # TODO: Integrate with google-cloud-monitoring for real CPU/network/disk metrics
-
-                        # Estimate metrics based on VM activity
-                        if vm.component_usage_count > 0:
-                            # Active VM - higher resource usage
-                            vm.cpu_percent = min(80.0, 30.0 + (vm.component_usage_count % 50))
-                            vm.memory_used_gb = min(28.0, 10.0 + (vm.component_usage_count % 18))
-                        else:
-                            # Idle VM - minimal resources
-                            vm.cpu_percent = 5.0
-                            vm.memory_used_gb = 2.0
-
-                        # v132.2: Smart health status - distinguish expected from unexpected states
-                        is_healthy = vm.state == VMState.RUNNING
-                        vm.last_health_check = time.time()
-                        vm.health_status = "healthy" if is_healthy else "unhealthy"
-
-                        # v132.2: Only warn for truly unexpected states, not shutdown transitions
-                        expected_shutdown_states = {VMState.STOPPING, VMState.TERMINATED}
-                        expected_startup_states = {VMState.CREATING, VMState.PROVISIONING, VMState.STAGING}
-
-                        if not is_healthy:
-                            if vm.state in expected_shutdown_states:
-                                # Expected during shutdown - debug level only
-                                logger.debug(f"VM {vm_name} in expected shutdown state: {vm.state.value}")
-                            elif vm.state in expected_startup_states:
-                                # Expected during startup - info level
-                                logger.info(f"VM {vm_name} starting up: {vm.state.value}")
-                            elif vm.state == VMState.FAILED:
-                                # Actual failure - warning
-                                logger.warning(f"⚠️  VM {vm_name} health check failed (state: {vm.state.value})")
-                            else:
-                                # Unknown state - warning
-                                logger.warning(f"⚠️  VM {vm_name} in unexpected state: {vm.state.value}")
-
-                        # v137.2: Intelligent efficiency warnings with grace period and rate limiting
-                        # - Skip during VM startup grace period (first 30 minutes)
-                        #   Efficiency scores need ~30 min of usage data to stabilize;
-                        #   warning at 5 min would always fire for healthy young VMs.
-                        # - Rate limit warnings to once every 5 minutes per VM
-                        # - Only warn for RUNNING VMs (not during shutdown)
-                        if vm.state == VMState.RUNNING and vm.cost_efficiency_score < 50:
-                            vm_startup_minutes = vm.uptime_hours * 60
-                            startup_grace_minutes = 30.0  # Don't warn until efficiency data stabilizes
-                            
-                            # Initialize rate limiting tracker if needed
-                            if not hasattr(self, '_efficiency_warning_times'):
-                                self._efficiency_warning_times: Dict[str, float] = {}
-                            
-                            last_warning = self._efficiency_warning_times.get(vm_name, 0)
-                            warning_interval = 300  # 5 minutes between warnings
-                            
-                            should_warn = (
-                                vm_startup_minutes > startup_grace_minutes and  # Past grace period
-                                time.time() - last_warning > warning_interval  # Rate limited
+                        if should_warn:
+                            logger.warning(
+                                f"⚠️  VM {vm_name} low efficiency: {vm.cost_efficiency_score:.1f}% "
+                                f"(idle: {vm.idle_time_minutes:.1f}m, uptime: {vm.uptime_hours:.1f}h, "
+                                f"confidence: {vm.score_confidence:.2f}, "
+                                f"usage: {vm.component_usage_count}, "
+                                f"cpu: {vm.cpu_percent:.1f}%)"
                             )
-                            
-                            if should_warn:
-                                logger.warning(
-                                    f"⚠️  VM {vm_name} low efficiency: {vm.cost_efficiency_score:.1f}% "
-                                    f"(idle: {vm.idle_time_minutes:.1f}m, uptime: {vm.uptime_hours:.1f}h)"
-                                )
-                                self._efficiency_warning_times[vm_name] = time.time()
+                            self._efficiency_warning_times[vm_name] = time.time()
 
-                    except Exception as metrics_error:
-                        logger.debug(f"Could not collect metrics for {vm_name}: {metrics_error}")
+                # === STEP 6: Publish VM state for cross-repo coordination ===
+                # Called once per monitoring cycle (not per-VM) — writes to ~/.jarvis/cross_repo/gcp/
+                try:
+                    self._publish_vm_state()
+                except Exception as pub_err:
+                    logger.debug(f"Cross-repo state publishing failed (non-critical): {pub_err}")
 
             except asyncio.CancelledError:
                 # v93.6: Graceful shutdown - don't log as error
@@ -8538,4 +8919,32 @@ def is_vm_manager_available() -> bool:
 def get_vm_manager_sync() -> Optional[GCPVMManager]:
     """Get VM manager synchronously (only if already initialized)"""
     return _gcp_vm_manager if _gcp_vm_manager and _gcp_vm_manager.initialized else None
+
+
+def record_vm_activity(ip_address: str = "", vm_name: str = "") -> bool:
+    """
+    Module-level helper for recording VM activity from any consumer.
+
+    Safe to call from anywhere — returns False if VM manager isn't running.
+    Never raises exceptions. Used by transport-layer hooks (HybridBackendClient)
+    and direct HTTP fallback paths (cloud_ml_router, prime_router).
+
+    Args:
+        ip_address: VM's external or internal IP address
+        vm_name: VM instance name (alternative to IP)
+
+    Returns:
+        True if activity was recorded, False otherwise
+    """
+    manager = get_vm_manager_sync()
+    if not manager:
+        return False
+    try:
+        if ip_address:
+            return manager.record_vm_activity_by_ip(ip_address)
+        if vm_name:
+            return manager.record_vm_activity_by_name(vm_name)
+    except Exception:
+        pass
+    return False
 

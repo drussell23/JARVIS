@@ -537,6 +537,16 @@ class PrimeRouter:
             **kwargs
         )
 
+        # Record VM activity when routed to GCP (belt + suspenders with transport layer)
+        if self._gcp_promoted or bool(os.environ.get("JARVIS_INVINCIBLE_NODE_IP")):
+            try:
+                from core.gcp_vm_manager import record_vm_activity
+                gcp_ip = os.environ.get("JARVIS_INVINCIBLE_NODE_IP", "")
+                if gcp_ip:
+                    record_vm_activity(ip_address=gcp_ip)
+            except Exception:
+                pass  # Never break inference for metrics
+
         return RouterResponse(
             content=response.content,
             # v235.4: Distinguish GCP from local for metrics/logging.
