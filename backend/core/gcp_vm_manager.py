@@ -125,7 +125,7 @@ T = TypeVar('T')
 # v235.0: Startup script version tag — bumped on every significant script change.
 # Embedded in VM metadata at creation. Running VMs with a stale version are
 # automatically recycled (deleted + recreated) to pick up the latest script.
-_STARTUP_SCRIPT_VERSION = "235.1"
+_STARTUP_SCRIPT_VERSION = "235.2"
 
 
 # ============================================================================
@@ -6501,7 +6501,7 @@ class GCPVMManager:
         Returns:
             str: Complete bash startup script for golden image VMs
         """
-        return '''#!/bin/bash
+        script = '''#!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
 # v229.0: Golden Image Startup - Enterprise-Grade Fast Boot
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6525,6 +6525,8 @@ LOG_FILE="/var/log/jarvis-golden-startup.log"
 PROGRESS_FILE="/tmp/jarvis_progress.json"
 JARVIS_DIR="/opt/jarvis-prime"
 START_TIME=$(date +%s)
+STARTUP_SCRIPT_VERSION="__STARTUP_SCRIPT_VERSION__"
+STARTUP_SCRIPT_METADATA_VERSION=""
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -6553,9 +6555,38 @@ update_apars() {
     "updated_at": ${now},
     "elapsed_seconds": ${elapsed},
     "deployment_mode": "golden_image",
-    "version": "229.0"
+    "version": "${STARTUP_SCRIPT_VERSION}",
+    "startup_script_version": "${STARTUP_SCRIPT_VERSION}",
+    "startup_script_metadata_version": "${STARTUP_SCRIPT_METADATA_VERSION}"
 }
 EOFPROGRESS
+}
+
+# SAFE_ENV_LOAD: Load .env in a sandboxed, time-bounded subshell
+safe_load_env() {
+    local env_file="$1"
+    local timeout_secs="$2"
+    local env_dump="/tmp/jarvis_env_dump.$$"
+
+    if [ ! -f "$env_file" ]; then
+        return 2
+    fi
+
+    if timeout "$timeout_secs" bash -c "set -a; source \"$env_file\" 2>/dev/null; env -0" > "$env_dump" 2>/dev/null; then
+        while IFS= read -r -d '' entry; do
+            case "$entry" in
+                ""|"PWD="*|"OLDPWD="*|"SHLVL="*|"_="*)
+                    continue
+                    ;;
+            esac
+            export "$entry"
+        done < "$env_dump"
+        rm -f "$env_dump"
+        return 0
+    fi
+
+    rm -f "$env_dump"
+    return 1
 }
 
 # ─── Phase 0: Read port from GCP metadata FIRST (before health endpoint) ───
@@ -6583,6 +6614,16 @@ if [ "$JARVIS_PORT" -lt 1 ] 2>/dev/null || [ "$JARVIS_PORT" -gt 65535 ] 2>/dev/n
 fi
 export JARVIS_PORT
 log "Port resolved from metadata: $JARVIS_PORT"
+
+# Record startup script metadata version (if present)
+STARTUP_SCRIPT_METADATA_VERSION=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \
+    http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-startup-script-version \
+    2>/dev/null)
+if [ -z "$STARTUP_SCRIPT_METADATA_VERSION" ]; then
+    STARTUP_SCRIPT_METADATA_VERSION="$STARTUP_SCRIPT_VERSION"
+fi
+
+export JARVIS_APARS_FILE="$PROGRESS_FILE"
 
 update_apars 0 50 2 "golden_image_booting"
 
@@ -6631,7 +6672,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                 "model_loaded": state.get("model_loaded", False),
                 "ready_for_inference": ready,
                 "apars": {
-                    "version": "235.1",
+                    "version": state.get("startup_script_version", "unknown"),
                     "phase_number": state.get("phase", 0),
                     "phase_name": state.get("checkpoint", "starting"),
                     "phase_progress": state.get("phase_progress", 0),
@@ -6640,6 +6681,8 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                     "eta_seconds": _calc_eta(state, elapsed) if not ready else 0,
                     "elapsed_seconds": elapsed,
                     "error": state.get("error"),
+                    "startup_script_version": state.get("startup_script_version", "unknown"),
+                    "startup_script_metadata_version": state.get("startup_script_metadata_version", "unknown"),
                     "deployment_mode": "golden_image",
                     "deps_prebaked": True,
                     "skipped_phases": [2, 3]
@@ -6714,7 +6757,21 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "starting", "apars": {"total_progress": state.get("total_progress", 5), "phase_number": state.get("phase", 0), "phase_name": state.get("checkpoint", "starting"), "phase_progress": state.get("phase_progress", 0), "eta_seconds": _calc_eta(state, elapsed), "elapsed_seconds": elapsed, "deployment_mode": "golden_image"}, "ready_for_inference": ready}).encode())
+            self.wfile.write(json.dumps({
+                "status": "starting",
+                "apars": {
+                    "total_progress": state.get("total_progress", 5),
+                    "phase_number": state.get("phase", 0),
+                    "phase_name": state.get("checkpoint", "starting"),
+                    "phase_progress": state.get("phase_progress", 0),
+                    "eta_seconds": _calc_eta(state, elapsed),
+                    "elapsed_seconds": elapsed,
+                    "deployment_mode": "golden_image",
+                    "startup_script_version": state.get("startup_script_version", "unknown"),
+                    "startup_script_metadata_version": state.get("startup_script_metadata_version", "unknown"),
+                },
+                "ready_for_inference": ready
+            }).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -6729,7 +6786,7 @@ EOFHEALTH2
 fi
 
 log "═══════════════════════════════════════════════════════════════════════════════"
-log "GOLDEN IMAGE STARTUP v233.2 - Pre-baked environment"
+log "GOLDEN IMAGE STARTUP v${STARTUP_SCRIPT_VERSION} - Pre-baked environment"
 log "═══════════════════════════════════════════════════════════════════════════════"
 log "APARS health endpoint on port $JARVIS_PORT (PID: $HEALTH_PID)"
 
@@ -6737,22 +6794,7 @@ log "APARS health endpoint on port $JARVIS_PORT (PID: $HEALTH_PID)"
 update_apars 1 0 10 "loading_environment"
 
 if [ -f "$JARVIS_DIR/.env" ]; then
-    # v235.0: Timeout prevents indefinite hang on slow/broken .env
-    # Background watchdog sends SIGALRM after 15s; trap catches it
-    _env_loaded=false
-    (
-        sleep 15
-        kill -ALRM $$ 2>/dev/null
-    ) &
-    _watchdog_pid=$!
-    trap '_env_loaded=false' ALRM
-    set -a
-    source "$JARVIS_DIR/.env" 2>/dev/null && _env_loaded=true
-    set +a
-    kill "$_watchdog_pid" 2>/dev/null; wait "$_watchdog_pid" 2>/dev/null
-    trap - ALRM
-
-    if [ "$_env_loaded" = true ]; then
+    if safe_load_env "$JARVIS_DIR/.env" 15; then
         log "✅ Environment loaded from $JARVIS_DIR/.env"
     else
         log "⚠️  .env sourcing failed or timed out after 15s, continuing with defaults"
@@ -6854,7 +6896,7 @@ else
     source venv/bin/activate
     set -a
     # v235.0: Timeout protection — env already loaded in Phase 1, this is defensive
-    [ -f .env ] && timeout 10 bash -c 'source .env' 2>/dev/null && source .env
+    [ -f .env ] && safe_load_env ".env" 10
     set +a
     export JARVIS_PORT
     export PYTHONPATH="${JARVIS_DIR}:${PYTHONPATH:-}"
@@ -6892,6 +6934,7 @@ else
     log "   Logs:  journalctl -u jarvis-prime.service"
 fi
 '''
+        return script.replace("__STARTUP_SCRIPT_VERSION__", _STARTUP_SCRIPT_VERSION)
 
     async def _start_instance(self, instance_name: str) -> Tuple[bool, Optional[str]]:
         """
@@ -7170,6 +7213,26 @@ fi
                 has_real_data = True  # v235.0: Real APARS data from VM
                 consecutive_errors = 0  # v235.0: Reset on successful response
                 apars = health_data["apars"]
+                # v235.2: Detect startup script version mismatches at runtime
+                script_version = apars.get("startup_script_version")
+                metadata_version = apars.get("startup_script_metadata_version")
+                if script_version and script_version not in ("unknown", "none", "null"):
+                    if script_version != _STARTUP_SCRIPT_VERSION:
+                        logger.warning(
+                            f"☁️ [InvincibleNode] Startup script version mismatch "
+                            f"(vm={script_version}, expected={_STARTUP_SCRIPT_VERSION})."
+                        )
+                        return False, f"SCRIPT_VERSION_MISMATCH: {script_version}"
+                    if (
+                        metadata_version
+                        and metadata_version not in ("unknown", "none", "null")
+                        and metadata_version != script_version
+                    ):
+                        logger.warning(
+                            f"☁️ [InvincibleNode] Startup script metadata mismatch "
+                            f"(metadata={metadata_version}, vm={script_version})."
+                        )
+                        return False, f"SCRIPT_METADATA_MISMATCH: {metadata_version}"
                 progress_pct = apars.get("total_progress", 0)
                 phase_name = apars.get("phase_name", "unknown")
                 eta = apars.get("eta_seconds", 0)
