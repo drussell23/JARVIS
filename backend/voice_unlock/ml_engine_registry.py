@@ -1906,9 +1906,19 @@ class MLEngineRegistry:
                     except Exception as e:
                         logger.debug(f"Local endpoint discovery failed: {e}")
 
-            self._use_cloud = True
-            logger.info("☁️  Cloud routing activated for ML operations")
-            return True
+            # v236.1: Only activate cloud mode if we actually found an endpoint.
+            # Previously this was unconditional, causing is_using_cloud == True
+            # with _cloud_endpoint == None — leading to spurious
+            # "Cloud endpoint not configured" warnings from
+            # _verify_cloud_backend_ready() called by ensure_ecapa_available().
+            if self._cloud_endpoint:
+                self._use_cloud = True
+                logger.info(f"☁️  Cloud routing activated for ML operations → {self._cloud_endpoint}")
+                return True
+            else:
+                self._use_cloud = False
+                logger.info("☁️  No cloud endpoint discovered — staying in local mode")
+                return False
 
         except Exception as e:
             logger.error(f"❌ Failed to activate cloud routing: {e}")
@@ -3145,9 +3155,13 @@ async def ensure_ecapa_available(
             logger.info("✅ [ENSURE_ECAPA] Cloud mode active and verified")
             return True, "Cloud ECAPA available", None
         else:
-            # Cloud mode but not verified - try to verify
-            logger.info("🔄 [ENSURE_ECAPA] Cloud mode active but not verified, checking...")
-            if hasattr(registry, '_verify_cloud_backend_ready'):
+            # v236.1: Only attempt verification if an endpoint is actually configured.
+            # _activate_cloud_routing() should guarantee this, but guard defensively
+            # to prevent spurious "Cloud endpoint not configured" warnings.
+            _has_endpoint = bool(getattr(registry, '_cloud_endpoint', None))
+            if _has_endpoint and hasattr(registry, '_verify_cloud_backend_ready'):
+                # Cloud mode but not verified - try to verify
+                logger.info("🔄 [ENSURE_ECAPA] Cloud mode active but not verified, checking...")
                 verified, verify_msg = await registry._verify_cloud_backend_ready(
                     timeout=min(10.0, timeout / 2),
                     test_extraction=True,
@@ -3158,6 +3172,12 @@ async def ensure_ecapa_available(
                 else:
                     logger.warning(f"⚠️ [ENSURE_ECAPA] Cloud verification failed: {verify_msg}")
                     # Fall through to try local loading
+            elif not _has_endpoint:
+                logger.info(
+                    "🔄 [ENSURE_ECAPA] Cloud mode flag set but no endpoint configured "
+                    "— falling through to local loading"
+                )
+                # Fall through to try local loading
 
     # Step 3: Check if ECAPA engine is already loaded locally
     # Use get_wrapper() which is safe (doesn't throw)
