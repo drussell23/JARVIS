@@ -554,7 +554,16 @@ class PrimeLocalClient(ModelClient):
         return response
 
     async def generate_stream(self, request: ModelRequest) -> AsyncIterator[str]:
-        """Generate a streaming response."""
+        """Generate a streaming response.
+
+        v234.1: Routes streaming inference through self._inference_executor
+        (single-worker ThreadPoolExecutor) to serialize with non-streaming
+        generate() calls. Uses asyncio.Queue as a thread-safe bridge between
+        the synchronous llama-cpp iterator and the async generator.
+
+        Without this, a concurrent streaming + non-streaming request could
+        run two inferences in parallel, causing OOM on 16GB Mac.
+        """
         if not self._loaded or self._model is None:
             if not await self.load_model():
                 yield "[Error: Model not loaded]"
@@ -562,17 +571,50 @@ class PrimeLocalClient(ModelClient):
 
         try:
             prompt = self._build_prompt(request.messages, request.system_prompt)
+            loop = asyncio.get_event_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            _sentinel = object()  # Marks end of stream
 
-            for chunk in self._model(
-                prompt,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                stop=["</s>", "Human:", "User:"],
-                stream=True,
-            ):
-                text = chunk["choices"][0]["text"]
-                if text:
-                    yield text
+            def _stream_in_thread() -> None:
+                """Run synchronous streaming inference inside the executor.
+
+                Puts each text chunk into the async queue via
+                call_soon_threadsafe, ensuring the event loop is never
+                blocked by the LLM inference.
+                """
+                try:
+                    for chunk in self._model(
+                        prompt,
+                        max_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                        stop=["</s>", "Human:", "User:"],
+                        stream=True,
+                    ):
+                        text = chunk["choices"][0]["text"]
+                        if text:
+                            loop.call_soon_threadsafe(queue.put_nowait, text)
+                    loop.call_soon_threadsafe(queue.put_nowait, _sentinel)
+                except Exception as exc:
+                    loop.call_soon_threadsafe(queue.put_nowait, exc)
+
+            # Submit to single-worker executor — serialized with generate()
+            fut = loop.run_in_executor(
+                self._inference_executor, _stream_in_thread
+            )
+
+            # Consume chunks from the queue as they arrive
+            while True:
+                item = await queue.get()
+                if item is _sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    self.logger.error(f"Prime streaming error: {item}")
+                    yield f"[Error: {item}]"
+                    break
+                yield item
+
+            # Ensure the executor thread has fully completed
+            await fut
 
         except Exception as e:
             self.logger.error(f"Prime streaming error: {e}")
@@ -1548,8 +1590,39 @@ class UnifiedModelServing:
         self.logger.info(f"UnifiedModelServing ready ({len(self._clients)} providers)")
 
     async def stop(self) -> None:
-        """Stop the model serving layer."""
+        """Stop the model serving layer.
+
+        v234.1: Properly shuts down PrimeLocalClient's single-worker
+        inference executor to release the thread and prevent resource leaks.
+        Also unloads any loaded GGUF models to free GPU/system memory.
+        """
         self._running = False
+
+        # v234.1: Clean up PrimeLocalClient resources
+        local_client = self._clients.get(ModelProvider.PRIME_LOCAL)
+        if local_client and isinstance(local_client, PrimeLocalClient):
+            # Shut down the single-worker inference executor
+            if hasattr(local_client, "_inference_executor"):
+                local_client._inference_executor.shutdown(wait=False)
+                self.logger.debug(
+                    "[v234.1] PrimeLocalClient inference executor shut down"
+                )
+            # Release the loaded model from memory
+            if local_client._model is not None:
+                local_client._model = None
+                local_client._loaded = False
+                self.logger.debug(
+                    "[v234.1] PrimeLocalClient model unloaded"
+                )
+
+        # Close aiohttp sessions for API-based clients
+        for provider, client in self._clients.items():
+            if hasattr(client, "_close_session"):
+                try:
+                    await client._close_session()
+                except Exception:
+                    pass
+
         self.logger.info("UnifiedModelServing stopped")
 
     async def generate(self, request: ModelRequest) -> ModelResponse:

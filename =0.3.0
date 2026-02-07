@@ -1,0 +1,9 @@
+Defaulting to user installation because normal site-packages is not writeable
+Requirement already satisfied: llama-cpp-python in /Users/djrussell23/Library/Python/3.9/lib/python/site-packages (0.3.16)
+Requirement already satisfied: numpy>=1.20.0 in /Users/djrussell23/Library/Python/3.9/lib/python/site-packages (from llama-cpp-python) (2.0.2)
+Requirement already satisfied: typing-extensions>=4.5.0 in /Users/djrussell23/Library/Python/3.9/lib/python/site-packages (from llama-cpp-python) (4.15.0)
+Requirement already satisfied: diskcache>=5.6.1 in /Users/djrussell23/Library/Python/3.9/lib/python/site-packages (from llama-cpp-python) (5.6.3)
+Requirement already satisfied: jinja2>=2.11.3 in /Users/djrussell23/Library/Python/3.9/lib/python/site-packages (from llama-cpp-python) (3.1.6)
+Requirement already satisfied: MarkupSafe>=2.0 in /Users/djrussell23/Library/Python/3.9/lib/python/site-packages (from jinja2>=2.11.3->llama-cpp-python) (3.0.3)
+WARNING: You are using pip version 21.2.4; however, version 26.0.1 is available.
+You should consider upgrading via the '/Library/Developer/CommandLineTools/usr/bin/python3 -m pip install --upgrade pip' command.
