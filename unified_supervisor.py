@@ -53731,8 +53731,15 @@ class StartupWatchdog:
         # v193.0: Trinity timeout increased to cover GCP VM startup (300s) + fallback (120s) + buffer (60s)
         # This prevents false DMS timeouts when GCP VM health check fails and fallback triggers
         "trinity": PhaseConfig("Trinity", 480.0, 65, 85, "restart"),
-        "enterprise": PhaseConfig("Enterprise", 120.0, 75, 85, "diagnostic"),  # v192.0: Increased
-        "frontend": PhaseConfig("Frontend", 60.0, 85, 100, "rollback"),
+        # v236.1: enterprise progress_start fixed from 75→80 to match actual update_phase(80)
+        "enterprise": PhaseConfig("Enterprise", 120.0, 80, 85, "diagnostic"),
+        # v236.1: AGI OS phase — autonomous features initialization
+        # Timeout 90s = 60s operational (JARVIS_AGI_OS_TIMEOUT) + 30s DMS buffer.
+        # register_phase_timeout() will overwrite with computed value, but this
+        # provides the correct fallback if operational_timeout is not passed.
+        "agi_os": PhaseConfig("AGI OS", 90.0, 85, 90, "diagnostic"),
+        # v236.1: frontend progress_start fixed from 85→90 to avoid overlap with agi_os
+        "frontend": PhaseConfig("Frontend", 60.0, 90, 100, "rollback"),
     }
     
     def __init__(

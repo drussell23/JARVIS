@@ -465,12 +465,13 @@ class AGIOSCoordinator:
             )
 
         # Speaker Verification Service (for voice biometrics)
+        # v236.1: Use singleton to avoid duplicate instances (double memory,
+        # competing encoder loads, enrollment updates not shared).
         try:
-            from voice.speaker_verification_service import SpeakerVerificationService
-            self._speaker_verification = SpeakerVerificationService(
+            from voice.speaker_verification_service import get_speaker_verification_service
+            self._speaker_verification = await get_speaker_verification_service(
                 learning_db=self._learning_db
             )
-            await self._speaker_verification.start()
             self._component_status['speaker_verification'] = ComponentStatus(
                 name='speaker_verification',
                 available=True

@@ -134,32 +134,40 @@ def _get_uae():
     return _uae_engine
 
 
+_sai_attempted = False
+
+
 def _get_sai():
     """Lazy load SAI (Self-Aware Intelligence).
-    
+
     Returns:
         SelfAwareIntelligence or None: SAI instance if available, None otherwise
     """
-    global _sai_system
-    if _sai_system is None:
+    global _sai_system, _sai_attempted
+    if _sai_system is None and not _sai_attempted:
+        _sai_attempted = True
         try:
             from intelligence.self_aware_intelligence import SelfAwareIntelligence
 
             _sai_system = SelfAwareIntelligence()
             logger.info("✅ SAI loaded")
         except Exception as e:
-            logger.warning(f"SAI not available: {e}")
+            logger.info(f"SAI not available: {e}")
     return _sai_system
+
+
+_cai_attempted = False
 
 
 def _get_cai():
     """Lazy load CAI (Context Awareness Intelligence).
-    
+
     Returns:
         ContextAwarenessIntelligence or None: CAI instance if available, None otherwise
     """
-    global _cai_system
-    if _cai_system is None:
+    global _cai_system, _cai_attempted
+    if _cai_system is None and not _cai_attempted:
+        _cai_attempted = True
         try:
             # CAI might be part of UAE or separate module
             from intelligence.context_awareness_intelligence import ContextAwarenessIntelligence
@@ -167,7 +175,7 @@ def _get_cai():
             _cai_system = ContextAwarenessIntelligence()
             logger.info("✅ CAI loaded")
         except Exception as e:
-            logger.warning(f"CAI not available: {e}")
+            logger.info(f"CAI not available: {e}")
     return _cai_system
 
 
