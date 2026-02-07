@@ -310,6 +310,34 @@ class PrimeLocalClient(ModelClient):
             "context_length": 2048,
             "quality_rank": 5,
         },
+        # v234.3: Lower quantization levels for constrained RAM
+        {
+            "name": "mistral-7b-q3",
+            "filename": "mistral-7b-instruct-v0.2.Q3_K_S.gguf",
+            "repo_id": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+            "size_mb": 3160,
+            "min_ram_gb": 5,
+            "context_length": 32768,
+            "quality_rank": 6,
+        },
+        {
+            "name": "mistral-7b-q2",
+            "filename": "mistral-7b-instruct-v0.2.Q2_K.gguf",
+            "repo_id": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+            "size_mb": 2720,
+            "min_ram_gb": 4,
+            "context_length": 32768,
+            "quality_rank": 7,
+        },
+        {
+            "name": "tinyllama-1.1b-q4",
+            "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+            "repo_id": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+            "size_mb": 670,
+            "min_ram_gb": 1,
+            "context_length": 2048,
+            "quality_rank": 8,
+        },
     ]
 
     # Model name aliases — discovers ANY model from the catalog
@@ -466,11 +494,15 @@ class PrimeLocalClient(ModelClient):
         self, available_gb: float
     ) -> Optional[Tuple[Dict[str, Any], Path]]:
         """
-        v234.2: Select the best quantization level that fits available RAM.
+        v234.2/v234.3: Select the best quantization level that fits
+        available RAM.
 
         Iterates QUANT_CATALOG by quality_rank (best first), checks if
         min_ram_gb fits, then looks for the model on disk. If no on-disk
         model fits, attempts auto-download of the best candidate.
+
+        v234.3: When mmap is enabled, min_ram_gb thresholds are reduced
+        by 40% since physical RAM usage is ~50% of file size.
 
         Args:
             available_gb: Available system RAM in GB
@@ -478,13 +510,22 @@ class PrimeLocalClient(ModelClient):
         Returns:
             Tuple of (catalog_entry, model_path) or None
         """
+        # v234.3: mmap reduces physical RAM requirements
+        _use_mmap = os.getenv(
+            "JARVIS_USE_MMAP", "true"
+        ).lower() in ("true", "1", "yes")
+        _mmap_factor = 0.6 if _use_mmap else 1.0
+
         download_candidate = None
 
         for entry in self.QUANT_CATALOG:
-            if entry["min_ram_gb"] > available_gb:
+            _effective_min = entry["min_ram_gb"] * _mmap_factor
+            if _effective_min > available_gb:
                 self.logger.debug(
-                    f"[v234.2] Skipping {entry['name']}: "
-                    f"needs {entry['min_ram_gb']}GB, "
+                    f"[v234.3] Skipping {entry['name']}: "
+                    f"needs {_effective_min:.1f}GB "
+                    f"(base={entry['min_ram_gb']}GB, "
+                    f"mmap={'on' if _use_mmap else 'off'}), "
                     f"have {available_gb:.1f}GB"
                 )
                 continue
@@ -493,9 +534,11 @@ class PrimeLocalClient(ModelClient):
             model_path = self._discover_model(entry["filename"])
             if model_path is not None:
                 self.logger.info(
-                    f"[v234.2] Selected {entry['name']} "
+                    f"[v234.3] Selected {entry['name']} "
                     f"(quality_rank={entry['quality_rank']}, "
-                    f"needs {entry['min_ram_gb']}GB, "
+                    f"needs {_effective_min:.1f}GB "
+                    f"[base={entry['min_ram_gb']}GB, "
+                    f"mmap={'on' if _use_mmap else 'off'}], "
                     f"have {available_gb:.1f}GB)"
                 )
                 return (entry, model_path)
@@ -596,13 +639,23 @@ class PrimeLocalClient(ModelClient):
                     return False
 
                 # Step 3: Final RAM check (actual file size + headroom)
+                # v234.3: mmap reduces physical RAM to ~50% of file size
+                _use_mmap = os.getenv(
+                    "JARVIS_USE_MMAP", "true"
+                ).lower() in ("true", "1", "yes")
                 _model_size_gb = model_path.stat().st_size / (1024 ** 3)
+                _effective_size_gb = (
+                    _model_size_gb * 0.5 if _use_mmap
+                    else _model_size_gb
+                )
                 if available_gb is not None:
-                    if _model_size_gb + 1.0 > available_gb:
+                    if _effective_size_gb + 1.0 > available_gb:
                         self.logger.warning(
-                            f"[v234.2] Insufficient RAM for "
+                            f"[v234.3] Insufficient RAM for "
                             f"{model_path.name}: need "
-                            f"{_model_size_gb + 1.0:.1f}GB, "
+                            f"{_effective_size_gb + 1.0:.1f}GB "
+                            f"(mmap={'on' if _use_mmap else 'off'}, "
+                            f"file={_model_size_gb:.1f}GB), "
                             f"available {available_gb:.1f}GB"
                         )
                         return False
@@ -616,15 +669,24 @@ class PrimeLocalClient(ModelClient):
                     _n_gpu = 0
 
                 # Use context_length from catalog if available
+                # v234.3: Reduce n_ctx under memory pressure to save
+                # KV cache RAM (~64MB per 1024 tokens for 7B models)
                 _ctx = PRIME_CONTEXT_LENGTH
                 if selected_entry and "context_length" in selected_entry:
                     _ctx = selected_entry["context_length"]
+                if available_gb is not None and available_gb < 6.0:
+                    _ctx = min(_ctx, 2048)
+                    self.logger.info(
+                        f"[v234.3] Reducing context to {_ctx} "
+                        f"(low RAM: {available_gb:.1f}GB)"
+                    )
 
                 self._model = Llama(
                     model_path=str(model_path),
                     n_ctx=_ctx,
                     n_threads=os.cpu_count() or 4,
                     n_gpu_layers=_n_gpu,
+                    use_mmap=_use_mmap,
                     verbose=False,
                 )
                 self._model_path = model_path
@@ -635,9 +697,11 @@ class PrimeLocalClient(ModelClient):
                     else model_path.name
                 )
                 self.logger.info(
-                    f"[v234.2] Loaded: {_name} "
+                    f"[v234.3] Loaded: {_name} "
                     f"(GPU layers: {_n_gpu}, "
                     f"size: {_model_size_gb:.1f}GB, "
+                    f"mmap: {_use_mmap}, "
+                    f"effective: {_effective_size_gb:.1f}GB, "
                     f"ctx: {_ctx})"
                 )
                 return True
