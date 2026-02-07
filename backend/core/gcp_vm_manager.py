@@ -6623,8 +6623,10 @@ VALIDATION_OK=true
 # Check code exists
 if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
     log "✅ jarvis_prime module found"
+    update_apars 4 25 45 "code_validated"
 else
     log "⚠️  jarvis_prime module NOT found — pulling latest code"
+    update_apars 4 15 43 "code_rescue_starting"
     REPO_URL=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \\
         http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-repo-url \\
         2>/dev/null || echo "${JARVIS_PRIME_REPO_URL:-}")
@@ -6635,8 +6637,10 @@ else
             cp -a /tmp/jprime-rescue/* "$JARVIS_DIR/" 2>/dev/null && \\
                 rm -rf /tmp/jprime-rescue && \\
                 log "✅ Code rescued via git clone"
+            update_apars 4 40 50 "code_rescue_complete"
         else
             log "❌ Git clone failed or timed out after 120s"
+            update_apars 4 40 48 "code_rescue_failed"
             rm -rf /tmp/jprime-rescue 2>/dev/null
         fi
     else
@@ -6645,12 +6649,15 @@ else
     fi
 fi
 
+update_apars 4 60 55 "checking_model_cache"
+
 # Check model cache
 MODEL_CACHE="${JARVIS_MODEL_CACHE:-$JARVIS_DIR/models}"
 if [ -d "$MODEL_CACHE" ] && [ "$(ls -A "$MODEL_CACHE" 2>/dev/null)" ]; then
     # v233.3: Add timeout to prevent hang on network mounts
     MODEL_SIZE=$(timeout 10 du -sm "$MODEL_CACHE" 2>/dev/null | cut -f1 || echo "0")
     log "✅ Model cache: ${MODEL_SIZE}MB"
+    update_apars 4 80 65 "model_size_calculated"
     update_apars 5 50 70 "model_cache_verified" true false
 else
     log "⚠️  Model cache empty — models will download on first use"

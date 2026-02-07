@@ -8016,12 +8016,24 @@ class ProcessOrchestrator:
 
     async def _start_gcp_prewarm(self) -> None:
         """
-        v200.0: Start the GCP pre-warm task in the background.
+        v200.0 / v233.4: Start the GCP pre-warm task in the background.
 
         This starts a background task to provision a GCP VM so it's ready
         when needed. Non-blocking - does not delay other startup operations.
+
+        v233.4: Skip Spot VM provisioning if invincible node (static IP)
+        is already ready — prevents duplicate VMs and wasted cost.
         """
         try:
+            # v233.4: Skip Spot VM if invincible node (static IP) already ready
+            _inv_ip = os.environ.get("JARVIS_INVINCIBLE_NODE_IP", "")
+            if _inv_ip and os.environ.get("JARVIS_HOLLOW_CLIENT_ACTIVE") == "true":
+                logger.info(
+                    f"[v233.4] Skipping Spot VM pre-warm — invincible node "
+                    f"already ready at {_inv_ip}"
+                )
+                return
+
             prewarm_task = start_trinity_gcp_prewarm()
             if prewarm_task:
                 logger.info("[v200.0] 🚀 GCP pre-warm task started")

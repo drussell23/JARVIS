@@ -58208,6 +58208,7 @@ class JarvisSystemKernel:
         # v199.0: Invincible Node (Static IP Spot VM) state
         self._invincible_node_ready: bool = False
         self._invincible_node_ip: Optional[str] = None
+        self._early_invincible_task: Optional[asyncio.Task] = None  # v233.4: Early GCP pre-warm
 
         # v207.0: Startup Resilience Coordinator
         # Provides non-blocking health checks and background auto-recovery for:
@@ -60071,7 +60072,185 @@ class JarvisSystemKernel:
                 name="early-prime-prewarm"
             )
             self._background_tasks.append(self._early_prime_task)
-        
+
+        # =============================================================
+        # v233.4: EARLY GCP PRE-WARM — Start Invincible Node Before Phase 0
+        # =============================================================
+        # The golden image VM needs ~100-150s. Previously, provisioning
+        # started at Phase 2 (~60-90s in). By starting here, we gain
+        # 60-90s of parallel boot time. Phase 2 reuses this task.
+        # =============================================================
+        _early_gcp_golden = os.getenv(
+            "JARVIS_GCP_USE_GOLDEN_IMAGE", "false"
+        ).lower() == "true"
+        _early_gcp_on = any(
+            os.getenv(k, "false").lower() == "true"
+            for k in ("GCP_ENABLED", "GCP_VM_ENABLED",
+                       "JARVIS_SPOT_VM_ENABLED", "JARVIS_GCP_ENABLED")
+        )
+
+        if (self.config.invincible_node_enabled
+                and self.config.invincible_node_static_ip_name
+                and (_early_gcp_golden or _early_gcp_on)):
+
+            self.logger.info(
+                "[Kernel] v233.4 EARLY GCP PRE-WARM: Starting invincible "
+                "node provisioning before Phase 0"
+            )
+            add_dashboard_log(
+                "Early GCP pre-warm: starting VM provisioning", "INFO"
+            )
+
+            _early_gcp_timeout = float(os.environ.get(
+                "GCP_VM_STARTUP_TIMEOUT",
+                str(self.config.invincible_node_health_timeout),
+            )) + 60  # +60s buffer for manager init + network latency
+
+            async def _early_wake_invincible_node():
+                """v233.4: Early boot invincible node provisioning with hard timeout."""
+                try:
+                    return await asyncio.wait_for(
+                        _early_wake_inner(),
+                        timeout=_early_gcp_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"[EarlyGCP] Hard timeout after {_early_gcp_timeout:.0f}s"
+                    )
+                    return False, None, "EARLY_TIMEOUT"
+                except Exception as e:
+                    self.logger.warning(
+                        f"[EarlyGCP] Early pre-warm error (non-fatal): {e}"
+                    )
+                    return False, None, f"EARLY_ERROR: {e}"
+
+            async def _early_wake_inner():
+                """v233.4: Inner provisioning logic (wrapped with timeout)."""
+                try:
+                    from backend.core.gcp_vm_manager import get_gcp_vm_manager
+
+                    update_dashboard_gcp_progress(
+                        phase=1, phase_name="Early Init",
+                        checkpoint="Loading GCP manager (early boot)",
+                        progress=5, status="starting",
+                        deployment_mode=(
+                            "golden-image" if _early_gcp_golden
+                            else "standard"
+                        ),
+                    )
+
+                    manager = await get_gcp_vm_manager()
+
+                    update_dashboard_gcp_progress(
+                        phase=2, phase_name="Connecting",
+                        checkpoint="GCP manager loaded (early boot)",
+                        progress=15,
+                    )
+
+                    if not manager.is_static_vm_mode:
+                        self.logger.info(
+                            "[EarlyGCP] Not in static VM mode — skipping"
+                        )
+                        return False, None, "NOT_STATIC_VM_MODE"
+
+                    self.logger.info("[EarlyGCP] Waking invincible node...")
+
+                    update_dashboard_gcp_progress(
+                        phase=3, phase_name="Waking VM",
+                        checkpoint="Sending wake request (early boot)",
+                        progress=20,
+                    )
+
+                    # Progress callback — identical to Phase 2's
+                    def _gcp_progress_cb(pct, phase, detail):
+                        dashboard_pct = 40 + int(pct * 0.6)
+                        _mode = ""
+                        if "golden" in detail.lower():
+                            _mode = "golden-image"
+                        elif pct > 0:
+                            _mode = "standard"
+                        update_dashboard_gcp_progress(
+                            phase=4,
+                            phase_name=phase.title()[:15],
+                            checkpoint=detail[:60],
+                            progress=dashboard_pct,
+                            source="apars",
+                            deployment_mode=_mode or None,
+                        )
+
+                    port = self.config.invincible_node_port
+                    timeout = float(os.environ.get(
+                        "GCP_VM_STARTUP_TIMEOUT",
+                        str(self.config.invincible_node_health_timeout),
+                    ))
+
+                    success, ip, status = await manager.ensure_static_vm_ready(
+                        port=port,
+                        timeout=timeout,
+                        progress_callback=_gcp_progress_cb,
+                    )
+
+                    if success and ip:
+                        self._invincible_node_ready = True
+                        self._invincible_node_ip = ip
+                        self.logger.info(
+                            f"[EarlyGCP] VM ready at {ip} (early boot)"
+                        )
+                        add_dashboard_log(
+                            f"Early GCP: VM ready at {ip}", "SUCCESS"
+                        )
+                        self._propagate_invincible_node_url(
+                            ip, source="early_boot"
+                        )
+                        update_dashboard_gcp_progress(
+                            phase=5, phase_name="Ready",
+                            checkpoint=f"VM ready at {ip} (early boot)",
+                            progress=100, status="healthy",
+                        )
+
+                        # v233.4: Kill Early Prime if running (same as Phase 2 lines 61624-61640)
+                        _early_prime_pid_str = os.environ.get("JARVIS_EARLY_PRIME_PID")
+                        if _early_prime_pid_str:
+                            try:
+                                import signal as _sig
+                                _early_pid = int(_early_prime_pid_str)
+                                os.kill(_early_pid, _sig.SIGTERM)
+                                self.logger.info(
+                                    f"[EarlyGCP] Terminated local Early Prime "
+                                    f"(PID: {_early_pid}) — cloud VM ready"
+                                )
+                                for _k in ("JARVIS_EARLY_PRIME_PID",
+                                           "JARVIS_EARLY_PRIME_PORT"):
+                                    os.environ.pop(_k, None)
+                            except (ValueError, ProcessLookupError, OSError):
+                                pass
+                    else:
+                        self.logger.info(
+                            f"[EarlyGCP] VM not ready yet: {status}"
+                        )
+
+                    return success, ip, status
+
+                except ImportError as e:
+                    self.logger.warning(
+                        f"[EarlyGCP] GCP module not available: {e}"
+                    )
+                    return False, None, f"IMPORT_ERROR: {e}"
+                except Exception as e:
+                    self.logger.warning(
+                        f"[EarlyGCP] Early pre-warm error (non-fatal): {e}"
+                    )
+                    return False, None, f"EARLY_ERROR: {e}"
+
+            self._early_invincible_task = create_safe_task(
+                _early_wake_invincible_node(),
+                name="early_invincible_node_prewarm",
+            )
+            self._background_tasks.append(self._early_invincible_task)
+            self.logger.info(
+                "[Kernel] v233.4 Early invincible node task created"
+            )
+
         try:
             # =================================================================
             # PHASE 0: LOADING EXPERIENCE (v117.0)
@@ -61426,6 +61605,7 @@ class JarvisSystemKernel:
             # Start waking the cloud node in parallel with other resource init.
             # This saves ~30-60s by not waiting sequentially.
             invincible_node_task: Optional[asyncio.Task] = None
+            _reuse_early = False  # v233.4: Track if reusing early boot task
             if self.config.invincible_node_enabled and self.config.invincible_node_static_ip_name:
                 self.logger.info("[Kernel] Starting Invincible Node wake-up in parallel...")
                 
@@ -61544,11 +61724,37 @@ class JarvisSystemKernel:
                         )
                         return False, None, f"ERROR: {e}"
 
-                invincible_node_task = create_safe_task(
-                    _wake_invincible_node(),
-                    name="invincible_node_wakeup"
-                )
-                self.logger.debug("[Kernel] Invincible Node task created")
+                # v233.4: Deduplication — check if early boot already started
+                _early_task = getattr(self, '_early_invincible_task', None)
+
+                if _early_task is not None:
+                    if not _early_task.done():
+                        self.logger.info(
+                            "[Phase 2] Reusing early boot invincible "
+                            "node task (still running)"
+                        )
+                        invincible_node_task = _early_task
+                        _reuse_early = True
+                    elif self._invincible_node_ready:
+                        self.logger.info(
+                            f"[Phase 2] Invincible node already ready "
+                            f"from early boot ({self._invincible_node_ip})"
+                        )
+                        invincible_node_task = _early_task
+                        _reuse_early = True
+                    else:
+                        self.logger.info(
+                            "[Phase 2] Early boot pre-warm failed — "
+                            "retrying invincible node"
+                        )
+
+                if not _reuse_early:
+                    invincible_node_task = create_safe_task(
+                        _wake_invincible_node(),
+                        name="invincible_node_wakeup"
+                    )
+
+                self.logger.debug("[Kernel] Invincible Node task ready")
 
             # v188.0: Initialize all in parallel with timeout and progress reporting
             try:
@@ -61564,7 +61770,8 @@ class JarvisSystemKernel:
                 self.logger.error(f"[Kernel] Resource initialization timed out after {resource_timeout}s")
                 heartbeat_stop.set()
                 heartbeat_task.cancel()
-                if invincible_node_task:
+                # v233.4: Don't cancel early boot task — it's independent
+                if invincible_node_task and not _reuse_early:
                     invincible_node_task.cancel()
                 self._update_component_status("resources", "error", f"Timed out after {resource_timeout}s")
                 return False
