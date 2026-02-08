@@ -1202,7 +1202,7 @@ class HybridDatabaseSync:
         fallback to ensure SQLite-first strategy always succeeds.
         """
         # v113.0: Configurable per-step timeouts
-        sqlite_timeout = float(os.getenv("HYBRID_SQLITE_TIMEOUT", "5.0"))
+        sqlite_timeout = float(os.getenv("HYBRID_SQLITE_TIMEOUT", "10.0"))
         cloudsql_timeout = float(os.getenv("HYBRID_CLOUDSQL_TIMEOUT", "10.0"))
         redis_timeout = float(os.getenv("HYBRID_REDIS_TIMEOUT", "5.0"))
         faiss_timeout = float(os.getenv("HYBRID_FAISS_TIMEOUT", "5.0"))
@@ -2081,11 +2081,12 @@ class HybridDatabaseSync:
                     except Exception as e:
                         # v112.0: Don't log "Connection refused" at warning level during startup
                         # This is expected when CloudSQL proxy isn't ready
-                        error_str = str(e)
+                        # v236.3: Use repr() fallback — some asyncpg exceptions have empty str()
+                        error_str = str(e) or repr(e)
                         if "Connection refused" in error_str or "Errno 61" in error_str:
                             logger.debug(f"[HybridSync v112.0] CloudSQL connection refused (proxy not ready)")
                         else:
-                            logger.warning(f"⚠️  CloudSQL health check failed: {e}")
+                            logger.warning(f"⚠️  CloudSQL health check failed ({type(e).__name__}): {e!r}")
                         self.cloudsql_healthy = False
                         self.metrics.cloudsql_available = False
 

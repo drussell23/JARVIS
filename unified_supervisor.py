@@ -58899,7 +58899,7 @@ class JarvisSystemKernel:
                 pass  # Already shutting down
             return 130  # Standard exit code for SIGINT
         except Exception as e:
-            self.logger.error(f"🚨 Startup failed: {e}")
+            self.logger.error(f"🚨 Startup failed ({type(e).__name__}): {e!r}")
             self.logger.error(traceback.format_exc())
             try:
                 await self._emergency_shutdown()
@@ -61274,12 +61274,13 @@ class JarvisSystemKernel:
             return 0
 
         except Exception as e:
+            # v236.3: Include exception type and repr() — asyncio.TimeoutError has empty str()
             issue_collector.add_critical(
-                f"Startup failed with exception: {e}",
+                f"Startup failed with exception ({type(e).__name__}): {e!r}",
                 IssueCategory.GENERAL,
                 traceback_str=traceback.format_exc(),
             )
-            self.logger.error(f"[Kernel] Startup failed: {e}")
+            self.logger.error(f"[Kernel] Startup failed ({type(e).__name__}): {e!r}")
 
             # v197.1: Stop the live progress dashboard on error
             try:
@@ -61291,7 +61292,8 @@ class JarvisSystemKernel:
             # Voice narrator error announcement
             if self._narrator:
                 try:
-                    await self._narrator.narrate_error(str(e), critical=True)
+                    _err_msg = f"{type(e).__name__}: {e!r}" if not str(e) else str(e)
+                    await self._narrator.narrate_error(_err_msg, critical=True)
                 except Exception:
                     pass
             issue_collector.print_health_report()
@@ -65685,13 +65687,25 @@ class JarvisSystemKernel:
             # Log service list
             self.logger.info("[Zone6] Services: " + ", ".join(s[0] for s in services))
 
-            # Create coroutines for parallel execution
-            coros = [
-                self._init_enterprise_service_with_timeout(
-                    display_name,
-                    init_func(),
-                    SERVICE_TIMEOUT,
+            # v236.3: Track per-service completion for DMS progress updates.
+            # Without this, 5 parallel services with 30s timeouts cause a 60s
+            # gap with no progress → DMS stall warning fires.
+            _completed_count = 0
+
+            async def _tracked_service(display_name, coro, timeout):
+                nonlocal _completed_count
+                result = await self._init_enterprise_service_with_timeout(
+                    display_name, coro, timeout
                 )
+                _completed_count += 1
+                if self._startup_watchdog:
+                    # Progress from 80 (start) to 85 (end) proportionally
+                    _pct = 80 + int(5 * _completed_count / len(services))
+                    self._startup_watchdog.update_phase("enterprise", _pct)
+                return result
+
+            coros = [
+                _tracked_service(display_name, init_func(), SERVICE_TIMEOUT)
                 for display_name, _, init_func in services
             ]
 

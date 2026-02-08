@@ -46,7 +46,7 @@ if sys.platform == "win32":
 # =============================================================================
 
 LOCK_DIR_RAW = os.environ.get("JARVIS_LOCK_DIR", "~/.jarvis/cross_repo/locks")
-LOCK_ACQUIRE_TIMEOUT_S = float(os.environ.get("LOCK_ACQUIRE_TIMEOUT_S", "5.0"))
+LOCK_ACQUIRE_TIMEOUT_S = float(os.environ.get("LOCK_ACQUIRE_TIMEOUT_S", "10.0"))
 LOCK_POLL_INTERVAL_S = float(os.environ.get("LOCK_POLL_INTERVAL_S", "0.05"))
 LOCK_STALE_WARNING_S = float(os.environ.get("LOCK_STALE_WARNING_S", "30.0"))
 

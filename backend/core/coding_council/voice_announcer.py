@@ -1205,7 +1205,7 @@ class AnnouncementConfig:
     max_history_size: int = 100
     # v79.1: Enhanced config
     voice_timeout: float = field(
-        default_factory=lambda: float(os.getenv("JARVIS_VOICE_TIMEOUT", "10.0"))
+        default_factory=lambda: float(os.getenv("JARVIS_VOICE_TIMEOUT", "15.0"))
     )
     max_concurrent_announcements: int = field(
         default_factory=lambda: int(os.getenv("JARVIS_MAX_VOICE_CONCURRENT", "5"))
@@ -2065,7 +2065,8 @@ class CodingCouncilVoiceAnnouncer:
         message: str,
         priority: str = "medium",
         wait: bool = False,
-        use_agi_os: bool = False
+        use_agi_os: bool = False,
+        timeout: Optional[float] = None,  # v236.3: None=use default, 0=no timeout (caller handles it)
     ) -> bool:
         """
         Speak through voice systems with circuit breaker protection.
@@ -2104,15 +2105,18 @@ class CodingCouncilVoiceAnnouncer:
                     "critical": VoicePriority.CRITICAL,
                 }
 
-                # Execute with timeout
-                result = await asyncio.wait_for(
-                    speak_evolution(
-                        message,
-                        priority=priority_map.get(priority, VoicePriority.MEDIUM),
-                        wait=wait
-                    ),
-                    timeout=self.config.voice_timeout
+                # v236.3: Conditional timeout — callers wrapped by spawn() pass timeout=0
+                # to avoid double-timeout; direct callers get the default timeout protection.
+                _effective_timeout = timeout if timeout is not None else self.config.voice_timeout
+                _voice_coro = speak_evolution(
+                    message,
+                    priority=priority_map.get(priority, VoicePriority.MEDIUM),
+                    wait=wait
                 )
+                if _effective_timeout and _effective_timeout > 0:
+                    result = await asyncio.wait_for(_voice_coro, timeout=_effective_timeout)
+                else:
+                    result = await _voice_coro
 
                 if result:
                     await self._circuit_breaker.record_success()
@@ -2346,7 +2350,7 @@ class CodingCouncilVoiceAnnouncer:
         # Compose and speak
         message = self._composer.compose_start_message(ctx)
         result = await self._task_registry.spawn(
-            self._speak(message, priority="medium"),
+            self._speak(message, priority="medium", timeout=0),
             task_id=f"start_{task_id}",
             timeout=self.config.voice_timeout
         )
@@ -2450,7 +2454,7 @@ class CodingCouncilVoiceAnnouncer:
         priority = "medium" if success else "high"
 
         result = await self._task_registry.spawn(
-            self._speak(message, priority=priority, wait=True),
+            self._speak(message, priority=priority, wait=True, timeout=0),
             task_id=f"complete_{task_id}",
             timeout=self.config.voice_timeout
         )

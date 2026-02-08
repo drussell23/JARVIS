@@ -952,19 +952,28 @@ class CrossRepoStateInitializer:
     async def _write_jarvis_state(self) -> None:
         """Write JARVIS state to vbia_state.json (thread-safe)."""
         state_file = self._state_files["vbia_state"]
+
+        # v236.3: Pre-serialize OUTSIDE lock to minimize hold time.
+        # During startup, event loop saturation delays aiofiles completion,
+        # keeping the lock held for tens of seconds. Pre-serializing and using
+        # a synchronous write reduces lock scope to just the I/O.
+        self._jarvis_state.last_update = datetime.now().isoformat()
+        _serialized = json.dumps(asdict(self._jarvis_state), indent=2)
+
         # v6.5: Guard against None lock manager
         if self._lock_manager is None:
             logger.debug("[CrossRepoState] Writing state without lock (manager not initialized)")
-            self._jarvis_state.last_update = datetime.now().isoformat()
-            await self._write_json_file(state_file, asdict(self._jarvis_state))
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._write_file_sync, str(state_file), _serialized)
             return
         # v6.4: Use RobustFileLock (fcntl.flock-based, fixes temp file race conditions)
         async with RobustFileLock("vbia_state", source="jarvis") as acquired:
             if not acquired:
                 logger.warning("Could not acquire vbia_state lock")
                 return
-            self._jarvis_state.last_update = datetime.now().isoformat()
-            await self._write_json_file(state_file, asdict(self._jarvis_state))
+            # v236.3: Synchronous write in executor — bypasses aiofiles thread pool
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._write_file_sync, str(state_file), _serialized)
 
     async def update_jarvis_status(self, status: StateStatus, metrics: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -1461,6 +1470,15 @@ class CrossRepoStateInitializer:
         except Exception as e:
             logger.error(f"[CrossRepoState] Failed to read {file_path}: {e}")
             return default
+
+    @staticmethod
+    def _write_file_sync(path: str, data: str) -> None:
+        """v236.3: Synchronous atomic write — called inside executor.
+        Uses temp file + rename for crash safety on POSIX."""
+        tmp_path = path + ".tmp"
+        with open(tmp_path, 'w') as f:
+            f.write(data)
+        os.rename(tmp_path, path)  # Atomic on POSIX same-filesystem
 
     async def _write_json_file(self, file_path: Path, data: Any) -> None:
         """Write JSON file asynchronously."""
