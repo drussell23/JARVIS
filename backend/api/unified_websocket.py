@@ -2048,11 +2048,13 @@ class UnifiedWebSocketManager:
                         logger.info(f"[WS-VBI] Sending voice_unlock response to frontend: success={response_dict['success']}")
                     else:
                         # Standard command response
+                        # v238.0: Echo requestId for frontend dedup.
                         response_dict = {
                             "type": "command_response",
                             "response": result.get("response"),
                             "success": result.get("success", True),
                             "speak": True,  # Enable text-to-speech for all responses
+                            "requestId": message.get("requestId"),
                         }
 
                     # Add additional metadata for lock/unlock commands

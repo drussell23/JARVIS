@@ -2186,7 +2186,31 @@ const JarvisVoice = () => {
           console.log('%c═══════════════════════════════════════════════════════════════════════════════\n', 'color: #00ff88; font-weight: bold');
         }
 
+        // v238.0: requestId dedup — same pattern as 'response' handler.
+        // Backend now echoes requestId. Drop stale responses.
+        const cmdRequestId = data.requestId;
+        if (cmdRequestId && activeRequestIdRef.current !== cmdRequestId) {
+          console.debug(`[WS] Ignoring stale command_response (got ${cmdRequestId}, active ${activeRequestIdRef.current})`);
+          break;
+        }
+
         if (data.response) {
+          // v238.0: Clear active request — prevents zombie timeout from firing.
+          // Without this, the 10s timeout always sends a duplicate request via
+          // sendTextCommand even after a valid response arrived.
+          activeRequestIdRef.current = null;
+
+          // v238.0: Client-side degenerate response filter.
+          // If the model returned only punctuation/whitespace (e.g., "..."),
+          // don't display or speak it — let the zombie fallback try again.
+          const stripped = (data.response || '').replace(/[\s.,!?…]+/g, '');
+          if (stripped.length === 0) {
+            console.warn(`[WS] Degenerate command_response suppressed: "${data.response}"`);
+            // Re-arm the zombie by restoring activeRequestIdRef
+            activeRequestIdRef.current = cmdRequestId;
+            break;
+          }
+
           // Update the UI with the response
           setResponse(data.response);
           setIsProcessing(false);
@@ -2233,6 +2257,18 @@ const JarvisVoice = () => {
           console.debug(`[WS] Ignoring stale response (got ${incomingRequestId}, active ${activeRequestIdRef.current})`);
           return;
         }
+
+        // v238.0: Suppress degenerate responses before TTS (defense-in-depth).
+        // Check BEFORE clearing activeRequestIdRef — if degenerate, don't clear
+        // the ref so the zombie timeout can fire and retry.
+        const respResponseText = data.text || data.response || '';
+        const respStripped = respResponseText.replace(/[\s.,!?…]+/g, '');
+        if (respStripped.length === 0 && respResponseText.length > 0) {
+          console.warn(`[WS] Degenerate response suppressed: "${respResponseText}"`);
+          // Don't clear activeRequestIdRef — let zombie retry
+          break;
+        }
+
         // Clear active request — any subsequent response for this ID is stale
         activeRequestIdRef.current = null;
 

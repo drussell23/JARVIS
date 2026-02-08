@@ -29,6 +29,7 @@ v236.0: Adaptive Prompt System
 """
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
@@ -262,6 +263,36 @@ async def handle_query(
                         )
                         break
 
+            # v238.0: Degenerate response detection.
+            # If the model produced only punctuation/whitespace (e.g., "..."),
+            # retry once with MODERATE params to get a real answer.
+            _stripped_check = re.sub(r'[\s\.\!\?\,\;\:…]+', '', content or '')
+            if len(_stripped_check) == 0:
+                logger.warning(
+                    f"[QUERY] Degenerate response detected: '{content}' "
+                    f"(level={params.complexity_level}). Retrying with MODERATE."
+                )
+                try:
+                    retry_params = AdaptivePromptBuilder.build(
+                        classified_query=None, is_fallback=False
+                    )
+                    retry_response = await router.generate(
+                        prompt=command,
+                        system_prompt=retry_params.system_prompt,
+                        max_tokens=retry_params.max_tokens,
+                        temperature=retry_params.temperature,
+                        context=conversation_context if conversation_context else None,
+                    )
+                    content = retry_response.content
+                    logger.info(
+                        f"[QUERY] Retry produced: '{(content or '')[:80]}' "
+                        f"from {retry_response.source}"
+                    )
+                except Exception as retry_err:
+                    logger.error(f"[QUERY] Retry failed: {retry_err}")
+                    # Fall through with original degenerate content —
+                    # client-side validation (Change 2) will suppress it
+
             return {
                 "success": True,
                 "response": content,
@@ -368,6 +399,13 @@ async def _fallback_to_cloud(command: str) -> Dict[str, Any]:
         if isinstance(response, dict):
             source = response.get('source', 'prime_router_fallback')
 
+        # v238.0: Log degenerate response from fallback path
+        _stripped_fb = re.sub(r'[\s\.\!\?\,\;\:…]+', '', content or '')
+        if len(_stripped_fb) == 0:
+            logger.warning(
+                f"[QUERY] Degenerate fallback response: '{content}'"
+            )
+
         return {
             "success": True,
             "response": content,
@@ -395,6 +433,10 @@ async def handle_query_stream(
     Handle a streaming query response.
 
     Yields response chunks as they arrive.
+
+    v238.0: Note — degenerate detection is not applied to streaming responses
+    because chunks arrive incrementally. Client-side validation provides
+    defense-in-depth for the streaming path.
 
     Args:
         command: The query text

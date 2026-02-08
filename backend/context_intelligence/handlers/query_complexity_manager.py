@@ -350,12 +350,20 @@ class QueryComplexityClassifier:
         if _complex_indicators:
             return QueryComplexity.COMPLEX
 
+        # v238.0: Strip query before classification
+        query = query.strip()
+
         # Check SIMPLE last (only if no complex/expert indicators)
+        # v238.0: Removed "what is/who is/define" — these need at least MODERATE
+        # because even "what is the capital of France?" benefits from a full
+        # sentence, and the risk of SIMPLE (48 tokens, stop sequences) producing
+        # degenerate output on abstract queries ("what is mathematics?") is too high.
+        # "what is 5+5?" stays SIMPLE via the math regex (first indicator).
         _simple_indicators = any([
             # Math expressions: 5+5, 10*3, 2^8
             bool(re.search(r"\d+\s*[\+\-\*\/\^%]\s*\d+", query)),
-            # Short factual: "what is X", "what's X", "who is X", "define X"
-            bool(re.search(r"^(?:what(?:'?s|\s+is)|who\s+is|define|spell|translate)\s+", query, re.I))
+            # Spell/translate are genuinely single-word-answer operations
+            bool(re.search(r"^(?:spell|translate)\s+", query, re.I))
             and len(query.split()) <= 8,
             # Yes/no questions under 8 words
             bool(re.search(r"^(?:is|are|was|were|do|does|did|can|could|will|would|should)\s+", query, re.I))
@@ -364,11 +372,12 @@ class QueryComplexityClassifier:
         if _simple_indicators:
             return QueryComplexity.SIMPLE
 
-        # Length-based fallback
+        # v238.0: Length-based fallback — removed SIMPLE tier.
+        # Short abstract queries like "tell me about math" (4 words) or
+        # "what is time?" (4 words) were incorrectly classified as SIMPLE.
+        # MODERATE (512 tokens, 0.3 temp) is cheap and safe for all short queries.
         word_count = len(query.split())
-        if word_count <= 6:
-            return QueryComplexity.SIMPLE
-        elif word_count <= 15:
+        if word_count <= 15:
             return QueryComplexity.MODERATE
         else:
             return QueryComplexity.COMPLEX
