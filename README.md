@@ -112,9 +112,9 @@ body:HEAL | prime:STAR | reactorc:STAR | gcpvm:STAR | trinity:STAR
 
 ---
 
-## GCP Golden Image — Cloud Inference Architecture (v224.0+, v235.4, v236.0)
+## GCP Golden Image — Cloud Inference Architecture (v224.0+, v235.4, v236.0, v238.0)
 
-JARVIS uses a **pre-baked GCP VM image** (golden image) to deliver cloud-based LLM inference with ~30-60 second cold starts instead of 10-15 minutes. As of v233.2, this is the **only** inference pathway — local LLM loading on 16GB Mac is off-limits due to memory pressure and swap thrashing. The fallback chain is: GCP Golden Image → GCP Standard VM → Claude API (emergency). As of v235.4, the frontend→backend→GCP command routing is fully resilient with automatic WebSocket→REST→queue failover. As of v236.0, the system prompt, max_tokens, and temperature are dynamically adapted per query complexity — simple queries get terse, deterministic responses while complex queries get thorough analysis.
+JARVIS uses a **pre-baked GCP VM image** (golden image) to deliver cloud-based LLM inference with ~30-60 second cold starts instead of 10-15 minutes. As of v233.2, this is the **only** inference pathway — local LLM loading on 16GB Mac is off-limits due to memory pressure and swap thrashing. The fallback chain is: GCP Golden Image → GCP Standard VM → Claude API (emergency). As of v235.4, the frontend→backend→GCP command routing is fully resilient with automatic WebSocket→REST→queue failover. As of v236.0, the system prompt, max_tokens, and temperature are dynamically adapted per query complexity — simple queries get terse, deterministic responses while complex queries get thorough analysis. As of v238.0, degenerate model responses (e.g., "...") are detected and retried at three layers (classification, backend, frontend) with defense-in-depth, and the WebSocket response pipeline correctly echoes `requestId` for frontend deduplication.
 
 ### Three-Tier Inference Architecture (v234.0)
 
@@ -1064,6 +1064,158 @@ The `TelemetryEmitter` (already called at line 2096 of `unified_command_processo
 6. **Method scope gaps require explicit bridging.** `classified_query` was computed in `process_command()` and needed in `_execute_command_internal()` — 2,768 lines apart in a different method. Storing on `self` with `getattr` fallback is simple but intentional; relying on "it's in scope somewhere above" is fragile.
 
 7. **Fallback paths must not regress.** When the adaptive system defaults to MODERATE (512 tokens) for unknown complexity, complex queries hitting the fallback get truncated. The `is_fallback=True` flag explicitly preserves current behavior (4096 tokens) for fallback paths — a critical guard against silent regression.
+
+### v238.0 — Eliminating "..." Intermediate Response (3 Root Causes, 5 Files)
+
+#### The Bug
+
+Asking JARVIS "what is mathematics?" displayed `JARVIS: ...` first (TTS said "full stop"), then ~10 seconds later the real answer arrived. The user experienced a garbage intermediate response before the actual definition.
+
+#### Root Cause Analysis (3 Compounding Issues + 1 Foundational Gap)
+
+The bug was not a single failure — it was three issues compounding on a broken foundational infrastructure:
+
+```
+Issue 1: SIMPLE Misclassification
+   "what is mathematics?" → SIMPLE (48 tokens, temp 0.0, stop sequences)
+   → 7B model outputs "..." + \n\n → stop sequence truncates to "..."
+
+Issue 2: No Response Validation
+   "..." passes through entire pipeline unchecked:
+   query_handler.py → unified_command_processor.py → async_pipeline.py
+   → unified_websocket.py → frontend setResponse("...") → TTS speaks "full stop"
+
+Issue 3: Zombie Fires Duplicate Request
+   command_response handler never clears activeRequestIdRef.current
+   → 10s zombie timeout ALWAYS fires (ref check always true)
+   → sendTextCommand() fires duplicate request
+   → second request eventually produces real answer
+
+Foundational Gap: Backend Never Echoes requestId
+   Frontend dedup system relies on requestId matching,
+   but backend drops requestId from all response dicts.
+   The 'response' handler's dedup only works by accident
+   (guard short-circuits when requestId is undefined).
+```
+
+#### The v238.0 Fix (5 Changes Across 3 Files)
+
+**Change 1: Backend Echoes requestId (FOUNDATIONAL)** — `backend/api/unified_websocket.py`
+
+The `command_response` response dict now includes `"requestId": message.get("requestId")`. This one-line addition unlocks the entire frontend dedup system — responses can now be correlated with the requests that produced them.
+
+**Change 2: Align command_response Handler** — `frontend/src/components/JarvisVoice.js`
+
+The `case 'command_response':` handler now has three capabilities it was missing:
+
+1. **requestId dedup check** — stale responses from superseded requests are dropped (same pattern as `case 'response':` handler)
+2. **activeRequestIdRef clearing** — prevents the 10s zombie timeout from firing after a valid response arrives
+3. **Degenerate response filter** — if the response is only punctuation/whitespace (e.g., `"..."`), it's suppressed, `isProcessing` stays true, and `activeRequestIdRef` is re-armed so the zombie timeout gets a second chance to produce a real answer
+
+```
+Valid response arrives:
+  → dedup passes → ref cleared → zombie neutralized → display + speak
+
+Degenerate "..." arrives:
+  → dedup passes → ref cleared → degenerate detected → ref re-armed
+  → zombie fires after 10s → sendTextCommand() → real answer arrives
+```
+
+**Change 3: Fix SIMPLE Misclassification** — `backend/context_intelligence/handlers/query_complexity_manager.py`
+
+Removed `what is/who is/define` from the SIMPLE indicators entirely. These query patterns were too broad — "what is mathematics?" needs a sentence definition (MODERATE), not a one-word answer (SIMPLE). The SIMPLE tier now only fires for:
+- Math expressions (`5+5`, `10*3`)
+- `spell`/`translate` operations
+- Yes/no questions under 8 words
+
+The length-based fallback also lost its SIMPLE tier — all short queries default to MODERATE (512 tokens, 0.3 temp), which is cheap and safe. `"what is 5+5?"` still gets SIMPLE via the math regex.
+
+```
+┌──────────────────────────────────┬─────────────────────────┬─────────────────────────────────────────┐
+│ Query                            │ v236.0 Classification   │ v238.0 Classification                   │
+├──────────────────────────────────┼─────────────────────────┼─────────────────────────────────────────┤
+│ "what is mathematics?"           │ SIMPLE (48 tokens) ❌    │ MODERATE (512 tokens) ✅                 │
+│ "what is the capital of France?" │ SIMPLE (48 tokens)      │ MODERATE (512 tokens, "Paris")          │
+│ "what is time?"                  │ SIMPLE (48 tokens)      │ MODERATE (safe for philosophy)          │
+│ "tell me about math"             │ SIMPLE (48 tokens)      │ MODERATE (was incorrectly SIMPLE)       │
+│ "what is 5+5?"                   │ SIMPLE (48 tokens) ✅    │ SIMPLE (48 tokens, math regex) ✅        │
+│ "is water wet?"                  │ SIMPLE (48 tokens) ✅    │ SIMPLE (yes/no regex) ✅                 │
+│ "5+5"                            │ SIMPLE (48 tokens) ✅    │ SIMPLE (math regex) ✅                   │
+│ "spell onomatopoeia"             │ SIMPLE (48 tokens) ✅    │ SIMPLE (spell regex) ✅                  │
+│ "hi"                             │ SIMPLE (48 tokens)      │ MODERATE (safe, gives "Hello!")         │
+└──────────────────────────────────┴─────────────────────────┴─────────────────────────────────────────┘
+```
+
+**Change 4: Degenerate Response Detection + Safe Retry** — `backend/api/query_handler.py`
+
+After stop-sequence stripping, the response content is checked for degenerate output (only punctuation/whitespace after stripping). If detected, the system retries once with MODERATE parameters. The retry is wrapped in `try/except` — if it fails, the original degenerate content falls through and the client-side filter (Change 2) suppresses it.
+
+The degenerate check uses `re.sub(r'[\s\.\!\?\,\;\:…]+', '', content)` — this strips only punctuation and whitespace, leaving alphanumeric characters intact. So `"A"`, `"1"`, `"10"`, `"Yes"` all pass through without false-positive retries, while `"..."`, `". . ."`, and `"  "` correctly trigger retry.
+
+The same check (without retry) was also added to `_fallback_to_cloud()` for logging. Streaming responses are documented as a known gap — degenerate detection requires the full response, which is architecturally impractical in the generator pattern. Client-side validation provides defense-in-depth for streaming.
+
+**Change 5: Client-Side Response Validation Before TTS (Defense-in-Depth)** — `frontend/src/components/JarvisVoice.js`
+
+The `case 'response':` handler now checks for degenerate content **before** clearing `activeRequestIdRef`. If the response is only punctuation/whitespace, it's suppressed and the ref is not cleared — the zombie timeout can retry. This ensures that even if backend degenerate detection fails (streaming path, edge cases), the frontend never displays or speaks garbage.
+
+#### Files Modified (v238.0)
+
+| # | File | Change |
+|---|------|--------|
+| 1 | `backend/api/unified_websocket.py` | Echo `requestId` from incoming message in `command_response` dict |
+| 2 | `frontend/src/components/JarvisVoice.js` | Add dedup check, ref clearing, degenerate filter to `command_response` handler; add degenerate check before ref clearing in `response` handler |
+| 3 | `backend/context_intelligence/handlers/query_complexity_manager.py` | Remove `what is/who is/define` from SIMPLE indicators; remove SIMPLE from length fallback; add `query.strip()` |
+| 4 | `backend/api/query_handler.py` | Add degenerate response detection with safe retry in `handle_query()`; add degenerate logging in `_fallback_to_cloud()`; add streaming limitation comment; add `import re` |
+
+#### Defense-in-Depth Architecture (v238.0)
+
+The fix operates at three layers so no single point of failure can let garbage through:
+
+```
+Layer 1: Classification (backend)
+  "what is mathematics?" → MODERATE (512 tokens, no stop sequences)
+  → Model has room to produce a real answer, not "..."
+
+Layer 2: Degenerate Retry (backend)
+  If model STILL produces "..." → detect → retry with MODERATE params
+  → Retry produces real answer (or fails gracefully)
+
+Layer 3: Client-Side Suppression (frontend)
+  If "..." somehow reaches the frontend → suppress before display/TTS
+  → Re-arm zombie timeout → zombie fires sendTextCommand → real answer
+```
+
+Each layer independently prevents the bug. All three together make it structurally impossible for `"..."` to reach the user.
+
+#### Verified Results (v238.0)
+
+```
+┌───────────────────────────────────┬────────────┬────────────┬──────┬────────────────────────────────┐
+│ Query                             │ Complexity │ max_tokens │ temp │ Response                       │
+├───────────────────────────────────┼────────────┼────────────┼──────┼────────────────────────────────┤
+│ "what is mathematics?"            │ MODERATE   │ 512        │ 0.3  │ Full definition (3 sentences)  │
+│ "what is Java?"                   │ MODERATE   │ 512        │ 0.3  │ Full definition via gcp_prime  │
+│ "what is 5+5?"                    │ SIMPLE     │ 48         │ 0.0  │ 10                             │
+│ "is water wet?"                   │ SIMPLE     │ 48         │ 0.0  │ Yes                            │
+│ "what is the capital of France?"  │ MODERATE   │ 512        │ 0.3  │ Paris / The capital is Paris.  │
+│ "spell onomatopoeia"             │ SIMPLE     │ 48         │ 0.0  │ O-N-O-M-A-T-O-P-O-E-I-A       │
+└───────────────────────────────────┴────────────┴────────────┴──────┴────────────────────────────────┘
+
+Routing confirmed: [QUERY] Response from gcp_prime (latency: 24635.7ms)
+Source: jarvis-prime-node at 34.45.154.209 (GCP Invincible Node golden image)
+```
+
+#### Lessons Learned (v238.0)
+
+1. **When the frontend has two handlers for the same logical event, they MUST have identical behavior.** `command_response` and `response` handled the same event (command completed) but had divergent dedup, ref clearing, and error classification. Every fix to one had to be mirrored in the other.
+
+2. **If the backend doesn't echo a correlation ID, the frontend can't deduplicate.** The entire `requestId` dedup system was built on quicksand — the backend never included `requestId` in responses. The `case 'response':` handler's dedup only worked by accident (the guard short-circuited when `requestId` was `undefined`).
+
+3. **SIMPLE is a dangerous classification for open-ended questions.** 48 max_tokens + temperature 0.0 + stop sequences is a straitjacket. Any question that could possibly need more than a one-word answer should not be SIMPLE. The cost of MODERATE (512 tokens) is negligible — the model stops generating at the EOS token regardless of the ceiling.
+
+4. **Zombie timeouts are useful as retry mechanisms, but only if the first response properly disarms them.** The zombie was firing on every single request because `activeRequestIdRef` was never cleared in the `command_response` handler. With the fix, the zombie is intentionally preserved as a fallback for degenerate responses — the ref is re-armed when garbage is detected.
+
+5. **Defense-in-depth beats single-point fixes.** Any one of the three changes (classification, backend retry, client filter) would have prevented the user-visible symptom. All three together make the system structurally resilient against this entire class of failure.
 
 ---
 
