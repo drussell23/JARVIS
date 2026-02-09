@@ -112,9 +112,9 @@ body:HEAL | prime:STAR | reactorc:STAR | gcpvm:STAR | trinity:STAR
 
 ---
 
-## GCP Golden Image — Cloud Inference Architecture (v224.0+, v235.4, v236.0, v238.0)
+## GCP Golden Image — Cloud Inference Architecture (v224.0+, v235.4, v236.0, v238.0, v241.1)
 
-JARVIS uses a **pre-baked GCP VM image** (golden image) to deliver cloud-based LLM inference with ~30-60 second cold starts instead of 10-15 minutes. As of v233.2, this is the **only** inference pathway — local LLM loading on 16GB Mac is off-limits due to memory pressure and swap thrashing. The fallback chain is: GCP Golden Image → GCP Standard VM → Claude API (emergency). As of v235.4, the frontend→backend→GCP command routing is fully resilient with automatic WebSocket→REST→queue failover. As of v236.0, the system prompt, max_tokens, and temperature are dynamically adapted per query complexity — simple queries get terse, deterministic responses while complex queries get thorough analysis. As of v238.0, degenerate model responses (e.g., "...") are detected and retried at three layers (classification, backend, frontend) with defense-in-depth, and the WebSocket response pipeline correctly echoes `requestId` for frontend deduplication.
+JARVIS uses a **pre-baked GCP VM image** (golden image) to deliver cloud-based LLM inference with ~30-60 second cold starts instead of 10-15 minutes. As of v233.2, this is the **only** inference pathway — local LLM loading on 16GB Mac is off-limits due to memory pressure and swap thrashing. The fallback chain is: GCP Golden Image → GCP Standard VM → Claude API (emergency). As of v235.4, the frontend→backend→GCP command routing is fully resilient with automatic WebSocket→REST→queue failover. As of v236.0, the system prompt, max_tokens, and temperature are dynamically adapted per query complexity — simple queries get terse, deterministic responses while complex queries get thorough analysis. As of v238.0, degenerate model responses (e.g., "...") are detected and retried at three layers (classification, backend, frontend) with defense-in-depth, and the WebSocket response pipeline correctly echoes `requestId` for frontend deduplication. As of v241.0/v241.1, the golden image contains **11 specialist models** (~40.4 GB) with intelligent task-type routing — math queries go to a math specialist, code queries go to a code specialist, and simple queries go to a fast lightweight model. See [§ v241.0/v241.1](#v2410v2411--multi-model-gcp-golden-image--task-type-routing-11-models-8-routable) below for the full model inventory and routing architecture.
 
 ### Three-Tier Inference Architecture (v234.0)
 
@@ -158,9 +158,9 @@ The golden image is a custom GCP machine image with everything pre-installed and
 | Component | Details |
 |-----------|---------|
 | **Python** | 3.11 with virtual environment |
-| **ML dependencies** | PyTorch, Transformers, llama-cpp-python, SentenceTransformers |
+| **ML dependencies** | PyTorch, Transformers, llama-cpp-python, SentenceTransformers, sympy |
 | **JARVIS-Prime** | Full codebase with all dependencies |
-| **Model files** | 7B+ parameter models already downloaded (default: Mistral-7B-Instruct-v0.2) |
+| **Model files** | 11 GGUF models (~40.4 GB) pre-downloaded with `manifest.json` — 8 routable specialists + 3 pre-staged (v241.1). See [§ v241.1 Model Inventory](#the-11-model-inventory) for full list. |
 | **System config** | .env, PYTHONPATH, systemd service — configured and tested |
 
 ### Golden Image Startup Flow (APARS Protocol)
@@ -1216,6 +1216,182 @@ Source: jarvis-prime-node at 34.45.154.209 (GCP Invincible Node golden image)
 4. **Zombie timeouts are useful as retry mechanisms, but only if the first response properly disarms them.** The zombie was firing on every single request because `activeRequestIdRef` was never cleared in the `command_response` handler. With the fix, the zombie is intentionally preserved as a fallback for degenerate responses — the ref is re-armed when garbage is detected.
 
 5. **Defense-in-depth beats single-point fixes.** Any one of the three changes (classification, backend retry, client filter) would have prevented the user-visible symptom. All three together make the system structurally resilient against this entire class of failure.
+
+---
+
+### v241.0/v241.1 — Multi-Model GCP Golden Image + Task-Type Routing (11 Models, 8 Routable)
+
+**The Problem:** Prior to v241, the GCP golden image contained a single model — Mistral-7B-Instruct-v0.2. Every query, regardless of type, went to this one generalist model. Math queries produced hallucinated answers (e.g., `5x+3=18` → `x=11`). Code queries went to a model not trained on code. Simple factual queries ("what is the capital of France?") waited 8.6 seconds for a 7B model when a 2.2 GB model could answer in 3 seconds.
+
+**The Fix:** The golden image now contains **11 specialist models** (~40.4 GB on 80 GB SSD), with **8 routable** via intelligent task-type routing. JARVIS Body infers the task type from the user's query, passes it as metadata through the existing PrimeRouter → PrimeClient → HTTP pipeline, and J-Prime's GCP Model Swap Coordinator loads the optimal model before inference.
+
+#### How It Works — User Query to Specialist Model
+
+When a user interacts with JARVIS through the frontend (voice or text), the query flows through a task-type classification and routing pipeline:
+
+```
+User: "solve 5x + 3 = 18"
+  │
+  ▼
+Frontend (localhost:3000)
+  └── WebSocket to Backend (localhost:8010)
+        │
+        ▼
+Backend (JARVIS Body)
+  ├── 1. UnifiedCommandProcessor classifies as QUERY
+  ├── 2. QueryComplexityManager → complexity_level = "SIMPLE"
+  ├── 3. AdaptivePromptBuilder → system prompt, max_tokens, temperature
+  ├── 4. ★ _infer_task_type("solve 5x+3=18", "SIMPLE") → "math_simple"
+  │      (v241.0: regex detects equation pattern \d+[a-z][+\-*/^])
+  ├── 5. PrimeRouter.generate(prompt, task_type="math_simple", ...)
+  │      └── PrimeClient.generate(**kwargs)
+  │            └── metadata = {"task_type": "math_simple", ...}
+  │                  └── HTTP POST to GCP VM:8000/v1/chat/completions
+  │
+  ▼
+GCP Invincible Node (J-Prime, port 8000)
+  ├── 6. ChatRequest.metadata.task_type = "math_simple"
+  ├── 7. ★ GCPModelSwapCoordinator.ensure_model("math_simple")
+  │      ├── _resolve_model("math_simple") → "qwen-2.5-7b" (via GCP_TASK_MODEL_MAPPING)
+  │      ├── Is qwen-2.5-7b already loaded? If yes → skip swap (instant)
+  │      └── If no → unload current → load qwen-2.5-7b with per-model config → validate
+  ├── 8. _executor.generate(prompt) — runs on the now-loaded Qwen2.5-7B
+  ├── 9. Response includes X-Model-Id: qwen-2.5-7b header
+  │
+  ▼
+Backend receives response
+  └── WebSocket/REST → Frontend
+        └── User sees: "x = 3" (correct answer from math specialist)
+```
+
+#### The 11-Model Inventory
+
+All models are Q4_K_M quantized GGUF files, pre-downloaded during golden image creation (not at runtime boot). Only **routable** models participate in task-type routing; pre-staged models are downloaded but not yet activated.
+
+**Routable Models (8) — Active in Task-Type Routing:**
+
+| Model | Size | Role | Strengths | Weaknesses | Routed From |
+|-------|------|------|-----------|------------|-------------|
+| **Phi-3.5-mini** (3.8B) | 2.2 GB | Fast lightweight | ~3s latency, good for factual Q&A, definitions, yes/no | Limited depth on complex topics, small context (4K) | `greeting`, `simple_chat`, `quick_question`, `voice_command` |
+| **Mistral-7B-Instruct-v0.2** | 4.4 GB | Translation | Strong multilingual, good instruction following | Weaker than Gemma-2 on general knowledge, hallucinates math | `translate` |
+| **Qwen2.5-7B-Instruct** | 4.4 GB | Basic math & reasoning | Good at algebra and arithmetic, 128K context capable | Struggles with proofs, competition math, multi-step logic | `math_simple`, `reason_simple` |
+| **Qwen2.5-Math-7B-Instruct** | 4.4 GB | Math specialist | 83.6% on MATH benchmark (vs GPT-4 ~76%), chain-of-thought math | Narrow focus — weaker on non-math tasks | `math_complex` |
+| **DeepSeek-R1-Distill-Qwen-7B** | 4.4 GB | Chain-of-thought reasoning | Explicit step-by-step reasoning, 55.5% on AIME 2024, strong analysis | Slower generation (produces reasoning tokens), verbose | `reason_complex`, `analyze` |
+| **Qwen2.5-Coder-7B-Instruct** | 4.4 GB | Code specialist | 70.4% HumanEval, trained on 5.5T code tokens, multi-language | Limited to code — weaker on general conversation | `code_simple`, `code_complex`, `code_review`, `code_explain`, `code_architecture`, `code_debug` |
+| **Llama-3.1-8B-Instruct** | 4.9 GB | Long context & creative | 128K context window, strong narrative and creative writing | Slightly weaker on code than Qwen-Coder, not a math specialist | `creative_write`, `creative_brainstorm`, `summarize` |
+| **Gemma-2-9B-Instruct** | 5.5 GB | General intelligence (default) | Best sub-10B generalist — MMLU 72.3%, HellaSwag 81.9%, ARC-C 68.4% | Largest routable model (5.5 GB), slightly slower to load | `general_chat`, `unknown` |
+
+**Pre-Staged Models (3) — Downloaded But Not Routable:**
+
+| Model | Size | Status | Why Not Routable |
+|-------|------|--------|-----------------|
+| **LLaVA-v1.6-Mistral-7B** | 4.9 GB | Pre-staged for v242 | Requires CLIP vision encoder + multimodal inference path (not built yet) |
+| **TinyLlama-1.1B-Chat** | 0.67 GB | Pre-staged | Speculative decoding draft model — used to accelerate other models, not independently routable |
+| **BGE-large-en-v1.5** | 0.17 GB | Pre-staged | Embedding model for RAG — no `generate()` path, needs vector DB pipeline |
+
+#### Task-Type Inference (JARVIS Body Side)
+
+The `_infer_task_type()` function in `backend/api/query_handler.py` classifies user queries into task types using compiled regex patterns:
+
+| Detection | Patterns | Example | Task Type |
+|-----------|----------|---------|-----------|
+| **Math** | Equation patterns (`\d+[a-z][+\-*/^]`), keywords (`solve`, `calculate`, `integral`, `probability`) | "solve 5x+3=18" | `math_simple` or `math_complex` |
+| **Code** | Strong indicators (`function`, `debug`, `refactor`, `algorithm`, `` ``` ``), language names (`python`, `javascript`, `rust`), requires 2+ signals to avoid false positives | "write a Python function to sort a list" | `code_simple` or `code_complex` |
+| **Reasoning** | Complexity-based — `ADVANCED`/`EXPERT` complexity queries without math or code signals | "explain the implications of quantum computing on cryptography" | `reason_complex` |
+| **Simple** | `SIMPLE` complexity with no specialist signals | "hello", "what is the capital of France?" | `simple_chat` |
+| **General** | Everything else at `MODERATE`/`COMPLEX` | "compare electric and gas vehicles" | `general_chat` |
+
+**Code Detection — False Positive Prevention (Issue #5, R2-2):**
+
+The code detector uses a three-tier keyword system to prevent false positives:
+- **Strong** indicators (`function`, `debug`, `implement`, `algorithm`) — standalone triggers
+- **Weak** indicators (`import`, `class`, `return`, `async`) — only trigger with a second signal
+- **Language names** (`python`, `javascript`, `rust`) — unambiguous code context
+
+This prevents "import the data into a spreadsheet" (weak `import` alone) or "what class should I take?" (weak `class` alone) from being misrouted to the code model.
+
+#### GCP Model Swap Coordinator (J-Prime Side)
+
+The `GCPModelSwapCoordinator` is a **pre-hook** — it runs before generation to ensure the correct model is loaded, then returns control to the existing `_executor.generate()` pipeline unchanged.
+
+**Key Design Decisions:**
+- **Single model at a time** — Only one model loaded in RAM (~5.5 GB for a 7B on the 32 GB VM). Models are swapped on demand.
+- **Sticky routing with per-model-size cooldowns** — Prevents model thrashing. After a swap, the model stays loaded for 30s (small <3 GB), 60s (medium 3-5 GB), or 90s (large >5 GB). All cooldowns are env-var configurable.
+- **Bounded queue** — If >50 requests pile up during a 20-30s model swap, excess requests get HTTP 503 + `Retry-After: 30` instead of blocking indefinitely.
+- **Post-swap validation** — After every model load, a 5-token warmup generation verifies the model responds. If validation fails, the coordinator rolls back to the previous model.
+- **Manifest-first inventory** — The golden image builder writes a `manifest.json` with model paths, sizes, routability flags, and per-model config overrides. The coordinator reads this at startup. Filename-regex scanning is the fallback only if the manifest is missing.
+- **Per-model executor configs** — Each model gets its own `n_ctx`, `chat_template`, `n_gpu_layers`, and `flash_attn` settings passed as `**kwargs` to `LlamaCppExecutor.load()`.
+- **Backward compatible** — Requests without `task_type` metadata use the currently loaded model. No swap, no delay.
+
+**Swap Behavior:**
+
+| Scenario | Behavior |
+|----------|----------|
+| Same task type as current model | No swap, instant response |
+| Different task type, within cooldown | Use current model (cooldown: 30/60/90s by model size) |
+| Different task type, past cooldown | Swap to optimal model (~20-30s from SSD) |
+| Request arrives during swap | Queued behind swap lock, served by NEW model after swap completes |
+| Queue full (>50 during swap) | HTTP 503 + Retry-After: 30 |
+| No task_type in metadata (old client) | Use current model (backward compatible) |
+| Target model not in inventory or not routable | Fallback to current/default model |
+| Swap fails (load error or validation failure) | Roll back to previous model |
+
+#### Metadata Flow (End-to-End)
+
+The task type flows through the existing request pipeline without any new network protocols or endpoints:
+
+```
+JARVIS Body                                    J-Prime (GCP)
+────────────                                   ──────────────
+_infer_task_type()                             ChatRequest.metadata
+  → gen_kwargs["task_type"] = "math_simple"      → task_type = "math_simple"
+    → router.generate(**gen_kwargs)                 → coordinator.ensure_model("math_simple")
+      → PrimeClient.generate(**kwargs)                → _resolve_model() → "qwen-2.5-7b"
+        → PrimeRequest(metadata=kwargs)                 → _swap_model() if needed
+          → payload["metadata"] = {...}                   → _executor.generate(prompt)
+            → HTTP POST to J-Prime                          → Response + X-Model-Id header
+```
+
+**Telemetry:** Every response includes the active model ID via the `X-Model-Id` HTTP header, enabling per-model performance tracking, Reactor-Core DPO training data attribution, and debugging.
+
+#### Files Modified (v241.0/v241.1)
+
+**JARVIS Body (this repo):**
+
+| File | Change |
+|------|--------|
+| `backend/api/query_handler.py` | Added `_infer_task_type()` with tightened code detection (2+ indicators). Passes `task_type` as metadata kwarg through `router.generate()`. |
+| `backend/core/gcp_vm_manager.py` | Multi-model download in builder startup script. Writes `manifest.json` with per-model metadata (routable flag, config overrides). Disk default increased to 80 GB. |
+
+**JARVIS-Prime:**
+
+| File | Change |
+|------|--------|
+| `run_server.py` | Added `metadata` field to `ChatRequest`. Pre-hook coordinator call in `chat_completions()`. `X-Model-Id` response header. Coordinator initialization in `background_initialization()`. |
+| `jarvis_prime/core/dynamic_model_registry.py` | 11 `ModelSpec` entries in `KNOWN_MODELS`. `GCP_TASK_MODEL_MAPPING` dict. `GCP_MODEL_CONFIGS` per-model overrides. |
+| `jarvis_prime/core/gcp_model_swap_coordinator.py` | **NEW FILE.** Pre-hook coordinator with manifest inventory, task-to-model resolution, sticky routing, bounded queue, post-swap validation, and rollback. |
+| `jarvis_prime/core/llama_cpp_executor.py` | Added `"qwen"`, `"deepseek"`, `"gemma-2"` to `MODEL_TEMPLATE_MAP` for chat template auto-detection. |
+| `config/unified_config.yaml` | `gcp_model_routing` section with 11 model entries, per-model configs, cooldowns, and routing parameters. |
+
+#### Disk & RAM Budget
+
+| Resource | Value |
+|----------|-------|
+| **VM Machine Type** | `e2-highmem-4` (4 vCPUs, 32 GB RAM) |
+| **Disk** | 80 GB SSD (`pd-standard`) |
+| **Total model size on disk** | ~40.4 GB |
+| **Remaining disk** | ~27.6 GB |
+| **RAM per loaded model** | ~3-6.5 GB (depends on model size and `n_ctx`) |
+| **Available RAM after OS + deps + one model** | ~22-25 GB |
+
+#### Verified Results (v241.1)
+
+- 11 models registered, 8 routable, 3 pre-staged
+- Task-type inference: 10/10 routing assertions pass (including false positive checks for "import the data", "class action lawsuit", "return the package")
+- Filename patterns: 11/11 matches correct (Qwen coder/math/generic disambiguation verified)
+- Template detection: 7/7 tests pass (deepseek→chatml, gemma-2→gemma, qwen→chatml)
+- Config consistency: 21/21 routing targets have matching GCP_MODEL_CONFIGS entries
+- All 5 modified files compile clean
 
 ---
 
