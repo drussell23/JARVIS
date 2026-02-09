@@ -1048,45 +1048,62 @@ class PyTorchExecutor:
         return self._executor
 
     def _check_health(self) -> bool:
-        """Check if the executor thread is healthy."""
+        """Check if the executor thread is healthy.
+
+        v3.4: Health flag writes protected by self._lock (RLock) to prevent
+        torn reads from concurrent threads. The submit + result() call is
+        intentionally outside the lock to avoid holding it during the 5s wait.
+        """
         if self._executor is None:
             return False
 
         # Check if thread is alive
         try:
-            # Submit a quick health check
+            # Submit a quick health check — intentionally outside lock to
+            # avoid holding lock during the blocking 5s wait
             future = self._executor.submit(lambda: True)
             result = future.result(timeout=5.0)
-            self._thread_healthy = result
-            self._last_heartbeat = time.time()
+            with self._lock:
+                self._thread_healthy = result
+                self._last_heartbeat = time.time()
             return True
         except Exception as e:
             logger.warning(f"⚠️ Executor health check failed: {e}")
-            self._thread_healthy = False
+            with self._lock:
+                self._thread_healthy = False
             return False
 
     def _maybe_recover(self) -> bool:
-        """Attempt to recover if the executor is unhealthy."""
-        if self._thread_healthy:
-            return True
+        """Attempt to recover if the executor is unhealthy.
 
-        logger.warning("🔄 Attempting executor recovery...")
-        self._stats.recoveries += 1
-
-        try:
-            self._create_executor()
-
-            # Verify recovery
-            if self._check_health():
-                logger.info("✅ Executor recovered successfully")
-                self._stats.thread_restarts += 1
+        v3.4: Serialized under self._lock (RLock) to prevent concurrent
+        recovery attempts. Multiple callers seeing _thread_healthy == False
+        will serialize — the first recovers, subsequent callers see the
+        flag is True and exit early.
+        """
+        with self._lock:
+            # Re-check under lock — another caller may have already recovered
+            if self._thread_healthy:
                 return True
-            else:
-                logger.error("❌ Executor recovery failed")
+
+            logger.warning("🔄 Attempting executor recovery...")
+            self._stats.recoveries += 1
+
+            try:
+                # _create_executor() also acquires self._lock, but RLock is reentrant
+                self._create_executor()
+
+                # Verify recovery (also runs under RLock — reentrant)
+                if self._check_health():
+                    logger.info("✅ Executor recovered successfully")
+                    self._stats.thread_restarts += 1
+                    return True
+                else:
+                    logger.error("❌ Executor recovery failed")
+                    return False
+            except Exception as e:
+                logger.error(f"❌ Executor recovery error: {e}")
                 return False
-        except Exception as e:
-            logger.error(f"❌ Executor recovery error: {e}")
-            return False
 
     def _get_memory_mb(self) -> Optional[float]:
         """Get current process memory usage in MB."""

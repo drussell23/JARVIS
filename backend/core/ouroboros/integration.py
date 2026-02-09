@@ -741,10 +741,13 @@ try:
 except ImportError as e:
     logger.warning(f"IntelligentModelSelector not available: {e}")
     # Define stub classes for graceful degradation
+    # v3.4: Match real ModelState enum values from model_registry.py
     class ModelState(Enum):
         LOADED = "loaded"
         CACHED = "cached"
         ARCHIVED = "archived"
+        LOADING = "loading"
+        UNLOADING = "unloading"
 
 
 class EnhancedCodeComplexityAnalyzer:
@@ -1283,7 +1286,7 @@ class AdvancedModelCapabilityRegistry:
         }
     ]
 
-    def __init__(self, api_base: str = None, enable_persistence: bool = True):
+    def __init__(self, api_base: Optional[str] = None, enable_persistence: bool = True):
         self.api_base = api_base or os.getenv("JARVIS_PRIME_API_BASE", "http://localhost:8000/v1")
         self._models: Dict[str, ModelMetadata] = {}
         self._cached_models: Optional[List[Dict]] = None
@@ -2217,11 +2220,13 @@ class IntelligentOuroborosModelSelector:
                     if model:
                         reasoning.append(f"IntelligentModelSelector chose: {model.name}")
 
+                        # v3.4: Use actual ModelDefinition fields — no hasattr guessing.
+                        # ModelDefinition has: name, backend_preference, resources, deployment
                         result = SelectionResult(
-                            provider=model.provider if hasattr(model, 'provider') else "intelligent",
-                            model=model.model_id if hasattr(model, 'model_id') else str(model.name),
-                            api_base=model.api_base if hasattr(model, 'api_base') else "",
-                            context_window=model.context_window if hasattr(model, 'context_window') else 8192,
+                            provider=model.backend_preference,
+                            model=model.name,
+                            api_base="",  # Resolved at call time by provider config
+                            context_window=8192,  # ModelDefinition doesn't carry context_window
                             strategy_used=strategy,
                             reasoning=reasoning,
                             fallback_chain=await self._build_fallback_chain(complexity, task_type),
@@ -2661,7 +2666,9 @@ class MultiModelOrchestrator:
             }
 
         tasks = [execute_subtask(st) for st in subtasks]
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        # v3.4: Filter out exceptions from gather results — callers expect List[Dict]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [r for r in raw_results if isinstance(r, dict)]
 
     async def _sequential_execution(
         self,
@@ -2791,14 +2798,15 @@ class TrinityCoordinator:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for (repo_id, _), result in zip(self.REPOS.items(), results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 self._health_status[repo_id] = {
                     "healthy": False,
                     "error": str(result),
                     "timestamp": datetime.now().isoformat(),
                 }
             else:
-                self._health_status[repo_id] = result
+                health_dict: Dict[str, Any] = result
+                self._health_status[repo_id] = health_dict
 
         return self._health_status
 
@@ -3669,19 +3677,29 @@ class MultiProviderLLMClient:
                         task_type=task_type,
                         prefer_local=prefer_local,
                     )
-                    self._last_model_selection = selection
+                    # v3.4: SelectionResult is a dataclass — use attribute access,
+                    # store as dict for _last_model_selection (typed Dict[str, Any])
+                    self._last_model_selection = {
+                        "provider": selection.provider,
+                        "model": selection.model,
+                        "api_base": selection.api_base,
+                        "context_window": selection.context_window,
+                        "confidence": selection.confidence,
+                        "strategy": selection.strategy_used.value if hasattr(selection.strategy_used, 'value') else str(selection.strategy_used),
+                        "reasoning": selection.reasoning,
+                    }
 
                     logger.info(
-                        f"Intelligent selection: {selection['provider']}/{selection['model']} "
-                        f"(context: {selection.get('context_window', 'unknown')})"
+                        f"Intelligent selection: {selection.provider}/{selection.model} "
+                        f"(context: {selection.context_window})"
                     )
 
                     # Build provider config from selection
                     selected_provider = {
-                        "name": f"{selection['provider']}-intelligent",
-                        "api_base": selection["api_base"],
-                        "api_key": self._get_api_key_for_provider(selection["provider"]),
-                        "model": selection["model"],
+                        "name": f"{selection.provider}-intelligent",
+                        "api_base": selection.api_base,
+                        "api_key": self._get_api_key_for_provider(selection.provider),
+                        "model": selection.model,
                         "timeout": 120.0,
                     }
 
