@@ -82,16 +82,24 @@ from typing import Any, Dict, List, Optional, Callable, Awaitable
 
 from backend.core.async_safety import LazyAsyncLock
 
-# v242.0: Canonical experience schema for cross-repo compatibility
+# v242.2: Canonical experience schema (repo-local first, ~/.jarvis fallback)
+_HAS_CANONICAL_SCHEMA = False
 try:
-    import sys as _sys
-    if str(Path.home() / ".jarvis") not in _sys.path:
-        _sys.path.insert(0, str(Path.home() / ".jarvis"))
-    from schemas.experience_schema import ExperienceEvent, from_telemetry_emitter_format, SCHEMA_VERSION
+    from backend.schemas.experience_schema import ExperienceEvent, from_telemetry_emitter_format, SCHEMA_VERSION
     _HAS_CANONICAL_SCHEMA = True
 except ImportError:
-    _HAS_CANONICAL_SCHEMA = False
-    SCHEMA_VERSION = "1.0"
+    try:
+        from schemas.experience_schema import ExperienceEvent, from_telemetry_emitter_format, SCHEMA_VERSION
+        _HAS_CANONICAL_SCHEMA = True
+    except ImportError:
+        try:
+            import sys as _sys
+            if str(Path.home() / ".jarvis") not in _sys.path:
+                _sys.path.insert(0, str(Path.home() / ".jarvis"))
+            from schemas.experience_schema import ExperienceEvent, from_telemetry_emitter_format, SCHEMA_VERSION
+            _HAS_CANONICAL_SCHEMA = True
+        except ImportError:
+            SCHEMA_VERSION = "1.0"
 
 logger = logging.getLogger(__name__)
 
