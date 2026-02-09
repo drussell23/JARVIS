@@ -240,7 +240,18 @@ class OwnerIdentityService:
 
         try:
             # Check if speaker verification has profiles loaded
+            # v3.4: When speaker_verification is a GhostModelProxy (AI Loader),
+            # attribute access returns an async deferred callable instead of the
+            # actual dict. Only use profiles if it's actually a dict — otherwise
+            # the service isn't materialized yet, so fall back gracefully.
             profiles = getattr(self._speaker_verification, 'speaker_profiles', {})
+            if not isinstance(profiles, dict):
+                logger.debug(
+                    "Speaker verification profiles not available yet "
+                    f"(got {type(profiles).__name__}, expected dict) — using fallback"
+                )
+                await self._set_fallback_owner()
+                return
 
             # Find primary user profile
             primary_owner = None

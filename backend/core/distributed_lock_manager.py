@@ -1083,7 +1083,12 @@ class DistributedLockManager:
                 # acquire/release cycles (e.g., heartbeat loops) where the next
                 # iteration acquires a new token before the previous finally block
                 # completes. Only warn if this is genuinely unexpected.
-                lock_name = lock_file.stem.replace(self.config.lock_extension.lstrip('.'), '').rstrip('.')
+                # NOTE: lock_file.stem strips only the LAST dot-extension, so
+                # "heartbeat.dlm.lock" → stem="heartbeat.dlm". We need to strip
+                # the full extension (".dlm.lock") from the filename instead.
+                fname = lock_file.name  # "heartbeat.dlm.lock"
+                ext = self.config.lock_extension  # ".dlm.lock"
+                lock_name = fname[:-len(ext)] if fname.endswith(ext) else lock_file.stem
                 if lock_name in self._keepalive_stopping:
                     # Expected: we're in the finally block releasing, and another
                     # iteration already acquired. This is normal — downgrade to DEBUG.

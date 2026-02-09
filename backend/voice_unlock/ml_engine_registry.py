@@ -1826,8 +1826,15 @@ class MLEngineRegistry:
 
     @property
     def is_using_cloud(self) -> bool:
-        """Check if registry is routing to cloud."""
-        return self._use_cloud
+        """Check if registry is routing to cloud.
+
+        v3.4: Gate on _cloud_endpoint too. _use_cloud can be set True before
+        endpoint discovery completes (or after discovery fails to find one).
+        Without this, callers see is_using_cloud=True, attempt cloud extraction,
+        and hit "Cloud endpoint not configured" → ERROR → fallback to local
+        on every single call. The extra check makes the property truthful.
+        """
+        return self._use_cloud and self._cloud_endpoint is not None
 
     @property
     def cloud_endpoint(self) -> Optional[str]:
