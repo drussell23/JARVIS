@@ -1664,37 +1664,77 @@ class JARVISVoiceAPI:
             logger.debug(f"[CAI] Could not speak: {e}")
 
     async def _perform_cai_unlock(self, command: "JARVISCommand") -> Dict:
-        """Perform screen unlock via VBI."""
+        """Perform screen unlock via VBI (with audio) or keychain (without audio).
+
+        Strategy:
+        1. If audio_data is available → use process_voice_unlock_robust (full VBI)
+        2. If no audio_data → use MacOSKeychainUnlock singleton (cached password)
+           This is the common case for CAI — the user said "search for dogs",
+           not "unlock my screen", so audio verification was already done by
+           the voice pipeline's speaker identification.
+        3. Fallback: MacOSController.unlock_screen() if both fail
+        """
+        import time as _time
+        start = _time.monotonic()
+        audio_data = getattr(command, 'audio_data', None)
+
+        # ─────────────────────────────────────────────────────────────────
+        # Path A: Full VBI unlock (audio available)
+        # ─────────────────────────────────────────────────────────────────
+        if audio_data:
+            try:
+                from voice_unlock.intelligent_voice_unlock_service import process_voice_unlock_robust
+
+                result = await process_voice_unlock_robust(
+                    command="unlock my screen",
+                    audio_data=audio_data,
+                    sample_rate=16000,
+                    mime_type="audio/webm",
+                )
+                elapsed = int((_time.monotonic() - start) * 1000)
+                return {
+                    "success": result.get("success", False),
+                    "response": result.get("response", ""),
+                    "latency_ms": elapsed,
+                }
+            except Exception as e:
+                logger.warning(f"[CAI] VBI unlock failed ({e}), falling through to keychain")
+
+        # ─────────────────────────────────────────────────────────────────
+        # Path B: Keychain unlock (no audio or VBI failed)
+        # Uses cached password + SecurePasswordTyper (CG Events + caffeinate)
+        # ─────────────────────────────────────────────────────────────────
         try:
-            # Try robust unlock service
-            from voice_unlock.intelligent_voice_unlock_service import process_voice_unlock_robust
+            from macos_keychain_unlock import get_keychain_unlock_service
 
-            audio_data = getattr(command, 'audio_data', None)
-
-            result = await process_voice_unlock_robust(
-                command="unlock my screen",
-                audio_data=audio_data,
-                sample_rate=16000,
-                mime_type="audio/webm",
+            unlock_service = await get_keychain_unlock_service()
+            result = await asyncio.wait_for(
+                unlock_service.unlock_screen(verified_speaker="Derek"),
+                timeout=20.0,
             )
-
+            elapsed = int((_time.monotonic() - start) * 1000)
             return {
                 "success": result.get("success", False),
-                "response": result.get("response", ""),
-                "latency_ms": result.get("total_duration_ms", 0),
+                "response": result.get("message", ""),
+                "latency_ms": elapsed,
             }
+        except asyncio.TimeoutError:
+            logger.error("[CAI] Keychain unlock timed out after 20s")
         except Exception as e:
-            logger.error(f"[CAI] Unlock error: {e}")
+            logger.error(f"[CAI] Keychain unlock error: {e}")
 
-            # Fallback: try direct unlock
-            try:
-                from backend.system_control.macos_controller import MacOSController
-                controller = MacOSController()
-                success, message = await controller.unlock_screen()
-                return {"success": success, "response": message, "latency_ms": 0}
-            except Exception as fallback_error:
-                logger.error(f"[CAI] Fallback unlock error: {fallback_error}")
-                return {"success": False, "response": str(fallback_error), "latency_ms": 0}
+        # ─────────────────────────────────────────────────────────────────
+        # Path C: Last resort fallback
+        # ─────────────────────────────────────────────────────────────────
+        try:
+            from system_control.macos_controller import MacOSController
+            controller = MacOSController()
+            success, message = await controller.unlock_screen()
+            elapsed = int((_time.monotonic() - start) * 1000)
+            return {"success": success, "response": message, "latency_ms": elapsed}
+        except Exception as fallback_error:
+            logger.error(f"[CAI] All unlock paths failed: {fallback_error}")
+            return {"success": False, "response": str(fallback_error), "latency_ms": 0}
 
     @dynamic_error_handler
     @graceful_endpoint

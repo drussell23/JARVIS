@@ -3,26 +3,37 @@
 Enhanced Simple Context Handler for JARVIS
 ==========================================
 
-Provides context-aware command processing with clear step-by-step feedback
+Provides context-aware command processing with:
+- Screen lock detection via Quartz (no daemon dependency)
+- Password-based unlock via MacOSKeychainUnlock singleton (cached password)
+- Voice deduplication: only ONE spoken message per phase (no overlapping TTS)
+- Step-by-step WebSocket status updates (silent) with one spoken summary
 """
 
 import asyncio
 import logging
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any
 from datetime import datetime
-
-# Use the fixed direct unlock handler
-from api.direct_unlock_handler_fixed import (
-    unlock_screen_direct,
-    check_screen_locked_direct,
-)
 
 logger = logging.getLogger(__name__)
 
 
 class EnhancedSimpleContextHandler:
-    """Enhanced handler for context-aware command processing with step-by-step feedback"""
+    """Enhanced handler for context-aware command processing with step-by-step feedback.
+
+    Architecture:
+        WebSocket voice → STT → command_text → process_with_context()
+            ├─ _requires_screen(command) → True
+            ├─ _check_screen_locked()    → Quartz CGSessionCopyCurrentDictionary (no daemon)
+            ├─ _unlock_screen()          → MacOSKeychainUnlock.unlock_screen() (password typing)
+            └─ command_processor.process_command(command, websocket)
+
+    Voice deduplication contract:
+        - Intermediate status updates sent via WebSocket with speak=False (silent)
+        - Only the INITIAL acknowledgment and FINAL result are spoken (speak=True)
+        - All speech goes through _speech_lock to prevent overlapping TTS
+    """
 
     def __init__(self, command_processor):
         self.command_processor = command_processor
@@ -85,7 +96,11 @@ class EnhancedSimpleContextHandler:
     async def process_with_context(
         self, command: str, websocket=None
     ) -> Dict[str, Any]:
-        """Process command with enhanced context awareness and feedback"""
+        """Process command with enhanced context awareness and feedback.
+
+        Voice deduplication: only speak the initial acknowledgment and final result.
+        All intermediate updates are sent as silent WebSocket status messages.
+        """
         try:
             # Reset steps for new command
             self.execution_steps = []
@@ -115,15 +130,19 @@ class EnhancedSimpleContextHandler:
                 if is_locked:
                     # Build context-aware response
                     action = self._extract_action_description(command)
-                    context_message = f"I see your screen is locked. I'll unlock it now by typing in your password so I can {action}."
+                    context_message = (
+                        f"Your screen is locked. Let me unlock it so I can {action}."
+                    )
 
                     self._add_step(
                         "Screen unlock required", {"message": context_message}
                     )
 
-                    # Send context message to user
+                    # ─────────────────────────────────────────────────────────
+                    # SPEAK: Initial acknowledgment (the ONLY spoken message
+                    # until the final result). All subsequent updates are silent.
+                    # ─────────────────────────────────────────────────────────
                     if websocket:
-                        # Send as response type to ensure it's spoken
                         await websocket.send_json(
                             {
                                 "type": "response",
@@ -132,11 +151,11 @@ class EnhancedSimpleContextHandler:
                                 "status": "unlocking_screen",
                                 "steps": self.execution_steps,
                                 "speak": True,
-                                "intermediate": True,  # Mark as intermediate response
+                                "intermediate": True,
                             }
                         )
 
-                    # Perform unlock
+                    # Perform unlock (uses keychain password + secure typer)
                     logger.info("[ENHANCED CONTEXT] Attempting to unlock screen...")
                     unlock_success = await self._unlock_screen(command)
 
@@ -145,19 +164,22 @@ class EnhancedSimpleContextHandler:
                             "Screen unlocked successfully", {"success": True}
                         )
 
-                        # Brief pause for unlock to fully complete
-                        await asyncio.sleep(2.0)
+                        # Brief pause for unlock animation to complete
+                        await asyncio.sleep(1.5)
 
-                        # Send progress update
+                        # ─────────────────────────────────────────────────────
+                        # SILENT status update — do NOT speak this.
+                        # The final command result will be spoken instead.
+                        # ─────────────────────────────────────────────────────
                         if websocket:
                             await websocket.send_json(
                                 {
-                                    "type": "response",
+                                    "type": "status",
                                     "text": "Screen unlocked. Now executing your command...",
                                     "command_type": "context_aware",
                                     "status": "executing_command",
                                     "steps": self.execution_steps,
-                                    "speak": True,
+                                    "speak": False,
                                     "intermediate": True,
                                 }
                             )
@@ -181,8 +203,8 @@ class EnhancedSimpleContextHandler:
                             # Build step-by-step summary
                             steps_summary = self._build_steps_summary()
 
-                            # Don't duplicate the context message - it was already spoken
-                            # Just use the original response
+                            # Don't duplicate the context message — it was already spoken.
+                            # Just use the original response.
                             result["response"] = original_response
                             result["context_handled"] = True
                             result["screen_unlocked"] = True
@@ -199,7 +221,10 @@ class EnhancedSimpleContextHandler:
                         self._add_step("Screen unlock failed", {"success": False})
                         return {
                             "success": False,
-                            "response": "I tried to unlock your screen but couldn't. Please unlock it manually and try your command again.",
+                            "response": (
+                                "I wasn't able to unlock your screen. "
+                                "Please unlock it manually and try your command again."
+                            ),
                             "context_handled": True,
                             "screen_unlocked": False,
                             "execution_steps": self.execution_steps,
@@ -281,12 +306,78 @@ class EnhancedSimpleContextHandler:
         return " ".join(summary_parts)
 
     async def _check_screen_locked(self) -> bool:
-        """Check if screen is currently locked"""
-        return await check_screen_locked_direct()
+        """Check if screen is currently locked.
 
-    async def _unlock_screen(self, command: str) -> bool:
-        """Unlock the screen with context"""
-        return await unlock_screen_direct(f"Context-aware execution: {command}")
+        Uses Quartz CGSessionCopyCurrentDictionary directly — no daemon dependency.
+        Falls back to async subprocess if Quartz import fails.
+        """
+        try:
+            from Quartz import CGSessionCopyCurrentDictionary
+
+            session_dict = CGSessionCopyCurrentDictionary()
+            if session_dict:
+                screen_locked = session_dict.get("CGSSessionScreenIsLocked", False)
+                screen_saver = session_dict.get("CGSSessionScreenSaverIsActive", False)
+                is_locked = bool(screen_locked or screen_saver)
+                logger.info(f"[ENHANCED CONTEXT] Screen locked (Quartz): {is_locked}")
+                return is_locked
+            return False
+        except ImportError:
+            logger.debug("[ENHANCED CONTEXT] Quartz not available, using subprocess")
+        except Exception as e:
+            logger.debug(f"[ENHANCED CONTEXT] Quartz check failed: {e}")
+
+        # Fallback: async subprocess (never blocks event loop)
+        try:
+            check_script = (
+                "import Quartz; d=Quartz.CGSessionCopyCurrentDictionary(); "
+                "print('true' if d and (d.get('CGSSessionScreenIsLocked',False) "
+                "or d.get('CGSSessionScreenSaverIsActive',False)) else 'false')"
+            )
+            proc = await asyncio.create_subprocess_exec(
+                "python3", "-c", check_script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            return stdout.decode().strip().lower() == "true"
+        except Exception as e:
+            logger.error(f"[ENHANCED CONTEXT] Screen lock check failed: {e}")
+            return False
+
+    async def _unlock_screen(self, _command: str) -> bool:
+        """Unlock the screen using MacOSKeychainUnlock singleton.
+
+        This is the REAL unlock path that:
+        1. Retrieves cached password from keychain (com.jarvis.voiceunlock)
+        2. Wakes display via caffeinate -u (no keyboard events)
+        3. Types password via SecurePasswordTyper (CG Events)
+        4. Submits and verifies unlock
+
+        Does NOT depend on the voice unlock WebSocket daemon (port 8765).
+        """
+        try:
+            from macos_keychain_unlock import get_keychain_unlock_service
+
+            unlock_service = await get_keychain_unlock_service()
+            result = await asyncio.wait_for(
+                unlock_service.unlock_screen(verified_speaker="Derek"),
+                timeout=20.0,
+            )
+
+            success = result.get("success", False)
+            message = result.get("message", "")
+            logger.info(
+                f"[ENHANCED CONTEXT] Keychain unlock: success={success}, msg={message}"
+            )
+            return success
+
+        except asyncio.TimeoutError:
+            logger.error("[ENHANCED CONTEXT] Keychain unlock timed out after 20s")
+            return False
+        except Exception as e:
+            logger.error(f"[ENHANCED CONTEXT] Keychain unlock error: {e}")
+            return False
 
 
 def wrap_with_enhanced_context(processor):
