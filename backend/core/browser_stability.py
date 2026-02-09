@@ -717,7 +717,39 @@ class StabilizedChromeLauncher:
         if self._chrome_process is None:
             return False
         return self._chrome_process.returncode is None
-    
+
+    async def _is_chrome_process_running(self) -> bool:
+        """v3.4: Check if ANY Chrome process is running on the system.
+
+        Used to detect the macOS single-instance handoff case: our launched
+        process exits with code 0 after handing off to an existing Chrome
+        instance. The existing instance IS running, we just don't own it.
+        """
+        try:
+            import psutil
+            for proc in psutil.process_iter(['name']):
+                try:
+                    name = (proc.info.get('name') or '').lower()
+                    if 'google chrome' in name or name == 'chrome':
+                        return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return False
+        except ImportError:
+            # psutil not available — fall back to pgrep
+            try:
+                result = await asyncio.create_subprocess_exec(
+                    'pgrep', '-x', 'Google Chrome',
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await result.wait()
+                return result.returncode == 0
+            except Exception:
+                return False
+        except Exception:
+            return False
+
     def get_cdp_port(self) -> Optional[int]:
         """Get the active CDP port."""
         return self._cdp_port
@@ -816,10 +848,36 @@ class StabilizedChromeLauncher:
                 
                 # Wait a bit for Chrome to start
                 await asyncio.sleep(2.0)
-                
+
                 # Check if still running
                 if self._chrome_process.returncode is not None:
                     exit_code = self._chrome_process.returncode
+
+                    # v3.4: Exit code 0 is NEVER a crash. On macOS, Chrome uses a
+                    # single-instance model: when Chrome is already running, a new
+                    # Chrome process sends its arguments (URL, flags) to the existing
+                    # instance via Mach IPC and exits with code 0 (successful handoff).
+                    # Treating this as a crash caused the caller to fall back to
+                    # AppleScript, opening a SECOND window (the "double window" bug).
+                    if exit_code == 0:
+                        chrome_running = await self._is_chrome_process_running()
+                        if chrome_running:
+                            logger.info(
+                                "[StabilizedChromeLauncher] Chrome process exited with code 0 "
+                                "(handed off to existing instance). Chrome is running."
+                            )
+                            # Update our tracking — we don't own the process anymore,
+                            # but Chrome IS running and our URL/flags were delivered.
+                            self._chrome_process = None
+                            self._chrome_pid = None
+                            return True
+                        else:
+                            logger.warning(
+                                "[StabilizedChromeLauncher] Chrome exited with code 0 "
+                                "but no Chrome process found — genuine launch failure"
+                            )
+                            return False
+
                     crash_info = get_crash_info(exit_code)
                     logger.error(
                         f"[StabilizedChromeLauncher] Chrome crashed immediately with code {exit_code}: "
