@@ -3186,7 +3186,10 @@ class CircuitBreaker:
             # Still failing, reopen
             self.state = CircuitState.OPEN
             logger.warning(f"Circuit breaker {self.name} re-OPENED (still failing)")
-        elif self.failures >= effective_threshold:
+        elif self.state != CircuitState.OPEN and self.failures >= effective_threshold:
+            # v3.4: Only log + transition when not already OPEN. Previously,
+            # the missing state check caused log spam for every failure past
+            # the threshold (30, 31, 32...) because >= kept matching.
             self.state = CircuitState.OPEN
             if in_startup:
                 elapsed = time.time() - self._creation_time
