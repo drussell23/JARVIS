@@ -81,6 +81,31 @@ if backend_dir not in sys.path:
 
 logger = logging.getLogger(__name__)
 
+# v240.0: Module-level math detection patterns (compiled once at import time).
+# Used to skip the vision handler for commands containing equations.
+# All patterns require '=' sign to prevent false positives on non-math commands
+# like "set volume 5x speed", "open file v2+notes", "set timer 5m+30s".
+import re as _re
+_MATH_EQUATION_GUARD = _re.compile(
+    r'\d+\s*[a-zA-Z]\s*[\+\-\*/\^]\s*\d+\s*=\s*[\-]?\d+'   # 5x+3=18
+    r'|[a-zA-Z]\s*[\+\-\*/\^]\s*\d+\s*=\s*[\-]?\d+'          # x+3=18
+    r'|\d+\s*[\+\-\*/\^]\s*\d+\s*=\s*[\-]?\d+'                # 5+3=8
+)
+_MATH_VERB_WITH_EQUATION = _re.compile(
+    r'\b(?:solve|calculate|compute|simplify|factor|expand|evaluate'
+    r'|derive|integrate|differentiate)\b.*=',
+    _re.IGNORECASE,
+)
+_MATH_PURE_ARITHMETIC_GUARD = _re.compile(
+    r'\b(?:what\s+is|what\'s|calculate|compute)\b.*\d+\s*[\+\-\*/\^]\s*\d+',
+    _re.IGNORECASE,
+)
+
+
+class _MathBypassSignal(Exception):
+    """v240.0: Internal signal to skip vision handler for math commands."""
+    pass
+
 # ============================================================================
 # WEBSOCKET CONNECTION TRACKING - For shutdown notifications
 # ============================================================================
@@ -2055,8 +2080,25 @@ class JARVISVoiceAPI:
                         "success": False,
                     }
 
+            # v240.0: Math expression guard — skip vision handler for equations.
+            # "solve this problem 5x+3=18" must NOT trigger vision/screenshot.
+            _skip_vision_for_math = bool(
+                _MATH_EQUATION_GUARD.search(command.text)
+                or _MATH_VERB_WITH_EQUATION.search(command.text)
+                or _MATH_PURE_ARITHMETIC_GUARD.search(command.text)
+            )
+            if _skip_vision_for_math:
+                logger.info(
+                    f"[JARVIS API] v240.0: Math equation detected in "
+                    f"'{command.text[:60]}', skipping vision handler"
+                )
+
             try:
                 from .vision_command_handler import vision_command_handler
+
+                # v240.0: Bail out of the vision try-block immediately for math.
+                if _skip_vision_for_math:
+                    raise _MathBypassSignal()
 
                 # Ensure vision handler is initialized - WITH TIMEOUT PROTECTION
                 if not vision_command_handler.intelligence:
@@ -2210,6 +2252,9 @@ class JARVISVoiceAPI:
                         "command_type": "vision",
                         "monitoring_active": vision_result.get("monitoring_active"),
                     }
+            except _MathBypassSignal:
+                # v240.0: Math commands skip vision handler entirely — not an error.
+                pass
             except Exception as e:
                 logger.error(f"Vision command handler error: {e}", exc_info=True)
 
