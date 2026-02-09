@@ -859,13 +859,41 @@ class DistributedLockManager:
         return cleaned
 
     async def shutdown(self) -> None:
-        """Shutdown lock manager and cleanup resources."""
+        """Shutdown lock manager and cleanup resources.
+
+        v3.3: Now cancels ALL active keepalive tasks, not just _cleanup_task.
+        Previously, orphaned keepalive tasks could survive shutdown/crash and
+        extend stale lock TTLs, causing token mismatch warnings on restart
+        when a new instance acquires the same lock with a different token.
+        """
+        # v3.3: Cancel all keepalive tasks FIRST — prevents stale TTL extension
+        if self._keepalive_tasks:
+            task_names = list(self._keepalive_tasks.keys())
+            logger.info(
+                f"Cancelling {len(task_names)} active keepalive task(s): "
+                f"{', '.join(task_names)}"
+            )
+            for lock_name, task in list(self._keepalive_tasks.items()):
+                if not task.done():
+                    task.cancel()
+            # Await all cancellations with timeout to avoid hanging on shutdown
+            if self._keepalive_tasks:
+                await asyncio.gather(
+                    *(t for t in self._keepalive_tasks.values() if not t.done()),
+                    return_exceptions=True,
+                )
+            self._keepalive_tasks.clear()
+
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
+
+        # v3.3: Clear expiration tracking state
+        self._expired_locks.clear()
+        self._lock_events.clear()
 
         logger.info("Distributed Lock Manager shut down")
 

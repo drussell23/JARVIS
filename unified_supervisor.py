@@ -66173,6 +66173,56 @@ class JarvisSystemKernel:
                 )
 
             # =================================================================
+            # STEP 1b: Clean up stale DLM lock files from previous crash
+            # =================================================================
+            # v3.3: The DistributedLockManager stores lock files at
+            # ~/.jarvis/cross_repo/locks/*.dlm.lock with JSON metadata
+            # including an expires_at timestamp. After a crash, keepalive
+            # tasks die but lock files remain on disk with unexpired TTLs.
+            # A new instance then acquires the same lock with a NEW token,
+            # causing "Cannot release lock - owned by different token" warnings.
+            # Fix: Remove expired .dlm.lock files at startup, and if a crash
+            # was detected (confidence >= 0.8), remove ALL .dlm.lock files
+            # regardless of expiry since the owning process is dead.
+            try:
+                dlm_lock_dir = JARVIS_HOME / "cross_repo" / "locks"
+                if dlm_lock_dir.exists():
+                    dlm_cleaned = 0
+                    import time as _time
+                    for dlm_file in dlm_lock_dir.glob("*.dlm.lock"):
+                        should_remove = False
+                        if crash_confidence >= 0.8:
+                            # Crash detected — owning process is dead, all locks are stale
+                            should_remove = True
+                        else:
+                            # No crash — only remove expired locks
+                            try:
+                                import json as _json
+                                lock_data = _json.loads(dlm_file.read_text())
+                                expires_at = lock_data.get("expires_at", 0)
+                                if expires_at < _time.time():
+                                    should_remove = True
+                            except (ValueError, KeyError, OSError):
+                                # Corrupted lock file — safe to remove
+                                should_remove = True
+
+                        if should_remove:
+                            try:
+                                dlm_file.unlink()
+                                dlm_cleaned += 1
+                            except OSError:
+                                pass
+
+                    if dlm_cleaned > 0:
+                        self.logger.info(
+                            f"[Clean Slate] Cleaned {dlm_cleaned} stale DLM lock file(s) "
+                            f"from {dlm_lock_dir}"
+                        )
+                        recovery_stats["actions_taken"].append(f"cleaned_{dlm_cleaned}_dlm_locks")
+            except Exception as e:
+                self.logger.debug(f"[Clean Slate] DLM lock cleanup failed (non-fatal): {e}")
+
+            # =================================================================
             # STEP 2: Clean up orphaned semaphores
             # =================================================================
             if GRACEFUL_SHUTDOWN_AVAILABLE and cleanup_orphaned_semaphores:
@@ -66230,7 +66280,8 @@ class JarvisSystemKernel:
                 self.logger.warning(
                     f"[Clean Slate] Crash recovery completed: "
                     f"files_cleared={recovery_stats['files_cleared']}, "
-                    f"semaphores_cleaned={recovery_stats['semaphores_cleaned']}"
+                    f"semaphores_cleaned={recovery_stats['semaphores_cleaned']}, "
+                    f"actions={recovery_stats['actions_taken']}"
                 )
                 if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                     try:
