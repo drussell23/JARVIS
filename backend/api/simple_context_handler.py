@@ -34,7 +34,7 @@ class SimpleContextHandler:
             'find file', 'open file', 'open document',
         ]
         
-    async def process_with_context(self, command: str, websocket=None) -> Dict[str, Any]:
+    async def process_with_context(self, command: str, websocket=None, **kwargs) -> Dict[str, Any]:
         """Process command with basic context awareness"""
         try:
             logger.info(f"[CONTEXT] ========= START CONTEXT PROCESSING =========")
