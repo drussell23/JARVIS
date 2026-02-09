@@ -172,6 +172,51 @@ class AdaptivePromptBuilder:
 
 
 # =============================================================================
+# v240.0: SYMPY MATH SOLVER — DETERMINISTIC INTERCEPT
+# =============================================================================
+
+def _try_math_solve(command: str) -> Optional[Dict[str, Any]]:
+    """
+    v240.0: Try to solve math with sympy before LLM.
+    Returns complete response dict if solved, None otherwise.
+    Synchronous — sympy is CPU-bound and fast (<50ms).
+    """
+    try:
+        try:
+            from context_intelligence.handlers.math_solver import get_math_solver
+        except ImportError:
+            from backend.context_intelligence.handlers.math_solver import get_math_solver
+
+        solver = get_math_solver()
+        result = solver.detect_and_solve(command)
+        if result.solved:
+            formatted = solver.format_response(result)
+            logger.info(
+                f"[QUERY] v240.0: Math solved by sympy: "
+                f"{result.expression_type.value} -> {str(result.solution)[:60]}"
+            )
+            return {
+                "success": True,
+                "response": formatted,
+                "source": "local_sympy",
+                "model": "sympy",
+                "latency_ms": 0,
+                "tokens_used": 0,
+                "fallback_used": False,
+                "math_result": {
+                    "type": result.expression_type.value,
+                    "steps": result.solution_steps,
+                    "variables": result.variables,
+                },
+            }
+    except ImportError:
+        logger.debug("[QUERY] Math solver not available")
+    except Exception as e:
+        logger.debug(f"[QUERY] Math solver error (non-fatal): {e}")
+    return None
+
+
+# =============================================================================
 # QUERY HANDLERS
 # =============================================================================
 
@@ -231,6 +276,11 @@ async def handle_query(
 
             # v236.0: Adaptive prompt based on query complexity
             params = AdaptivePromptBuilder.build(classified_query)
+
+            # v240.0: Sympy math solver — intercept equations before LLM.
+            math_response = _try_math_solve(command)
+            if math_response is not None:
+                return math_response
 
             # v237.0: Build kwargs with stop sequences if present
             gen_kwargs = {}
@@ -362,6 +412,11 @@ async def _fallback_to_cloud(command: str) -> Dict[str, Any]:
     v236.0: Uses is_fallback=True for generous defaults (4096 tokens, 0.7 temp)
     to avoid truncating complex queries that reach this fallback path.
     """
+    # v240.0: Math solver in fallback path too.
+    math_response = _try_math_solve(command)
+    if math_response is not None:
+        return math_response
+
     try:
         # v2.7: Use Prime Router instead of direct Anthropic client
         try:
@@ -453,6 +508,12 @@ async def handle_query_stream(
 
         # v236.0: Adaptive prompt for streaming
         params = AdaptivePromptBuilder.build(classified_query)
+
+        # v240.0: Math solver for streaming path.
+        math_response = _try_math_solve(command)
+        if math_response is not None:
+            yield math_response["response"]
+            return
 
         # v237.0: Build kwargs with stop sequences if present
         gen_kwargs = {}

@@ -8,8 +8,17 @@ Every response is generated fresh by Claude based on what it sees.
 import asyncio
 import logging
 import os
+import re as _re
 from typing import Dict, Any, Optional, Callable, List
 from datetime import datetime
+
+# v240.0: Defense-in-depth — reject math expressions in the vision handler
+# even if the voice API guard somehow doesn't catch them.
+_VISION_MATH_BYPASS = _re.compile(
+    r'\d+\s*[a-zA-Z]\s*[\+\-\*/\^]\s*\d+\s*='   # 5x+3=..
+    r'|[a-zA-Z]\s*[\+\-\*/\^]\s*\d+\s*='          # x+3=..
+    r'|\b(?:solve|calculate|compute)\b.*\d+\s*[\+\-\*/\^]\s*\d+'  # solve...5+3
+)
 
 from .pure_vision_intelligence import (
     PureVisionIntelligence, 
@@ -596,6 +605,11 @@ class VisionCommandHandler:
                 "handled": False,
                 "reason": "Lock/unlock screen commands are system commands, not vision",
             }
+
+        # v240.0: Math commands should never be handled by vision.
+        if _VISION_MATH_BYPASS.search(command_text):
+            logger.info(f"[VISION] v240.0: Math expression detected, deferring: '{command_text[:60]}'")
+            return {"handled": False, "reason": "math_expression"}
 
         # =========================================================================
         # 🪃 v63.0: BOOMERANG PROTOCOL - Voice-Activated Window Return

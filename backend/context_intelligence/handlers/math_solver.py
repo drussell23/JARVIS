@@ -60,8 +60,8 @@ _DANGEROUS_TOKENS = re.compile(
 # =============================================================================
 
 _EQUATION_WITH_VARIABLE = re.compile(
-    r'(\d+\s*[a-zA-Z][\s\+\-\*/\^\d a-zA-Z()]*=\s*[\-]?\d+[\.\d]*)'  # 5x+3=18
-    r'|([a-zA-Z][\s\+\-\*/\^\d a-zA-Z()]*=\s*[\-]?\d+[\.\d]*)'        # x+3=18
+    r'(\d+\s*[a-zA-Z][\s\+\-\*/\^\d a-zA-Z()]*=\s*[\-]?\d+[\.\d]*)'       # 5x+3=18
+    r'|(?<![a-zA-Z])([a-zA-Z](?![a-zA-Z])[\s\+\-\*/\^\d a-zA-Z()]*=\s*[\-]?\d+[\.\d]*)'  # x+3=18 (single-letter var start)
 )
 
 _PURE_ARITHMETIC = re.compile(
