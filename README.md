@@ -1395,6 +1395,63 @@ _infer_task_type()                             ChatRequest.metadata
 
 ---
 
+### Roadmap — Next Phases
+
+#### v241.2 — 14B Model Tier + Ouroboros Foundation (Planned)
+
+Add two 14B-class models for significantly stronger reasoning and code generation, plus the foundation for JARVIS self-programming:
+
+- [ ] **DeepSeek-R1-Distill-Qwen-14B** (~8.1 GB) — Upgrade from 7B distillation. 55.5% → 69.7% on AIME 2024. Explicit `<think>` chain-of-thought reasoning. Route `reason_complex` and `analyze` here.
+- [ ] **Phi-4** (14B, ~8.0 GB) — Microsoft's strongest small model. 80.4% MATH, 95%+ GSM8K. Route `math_complex` word problems here.
+- [ ] **Qwen2.5-Coder-14B-Instruct** (~8.1 GB) — Code specialist upgrade. ~80-85% HumanEval (vs 70.4% for 7B). Foundation for Ouroboros self-programming.
+- [ ] Update `_infer_task_type()` to distinguish `reason_complex` → 14B vs `reason_simple` → 7B
+- [ ] Update `gcp_vm_manager.py` builder script with 3 new model entries
+- [ ] Disk impact: +24.3 GB → total ~64.7 GB on 80 GB SSD (~15.3 GB headroom)
+
+#### v242.0 — Training Data Pipeline Activation (Planned)
+
+Activate the telemetry → Reactor Core → fine-tuning → deployment loop. Infrastructure is ~80% built; key connection points need wiring:
+
+- [ ] **Fix A: TelemetryEmitter JSONL output** — Ensure `backend/core/telemetry_emitter.py` writes interaction logs to `~/.jarvis/telemetry/*.jsonl` in the format Reactor Core's `TelemetryIngestor` expects (event_type, properties.user_input, properties.output, metrics.model_id, metrics.latency_ms)
+- [ ] **Fix B: v241.1 model metadata in telemetry** — Include `X-Model-Id` (which specialist model answered) in every telemetry event, enabling per-model DPO pair generation
+- [ ] **Fix C: Verify Reactor Core ingestion** — Confirm `TrinityExperienceReceiver` picks up JSONL files from `~/.jarvis/telemetry/` and feeds them to `UnifiedTrainingPipeline`
+- [ ] **Automatic DPO pair generation** — When the same query gets different answers from different specialist models (e.g., Mistral-7B says x=11, Qwen-Math-7B says x=3), automatically generate preference pairs: `{chosen: "x=3", rejected: "x=11"}`
+- [ ] Multi-model architecture becomes a **training data goldmine** — each model swap produces implicit quality comparisons
+
+**Pipeline when active:**
+```
+User talks to JARVIS
+  → TelemetryEmitter captures interaction + model_id
+    → JSONL to ~/.jarvis/telemetry/
+      → Reactor Core TelemetryIngestor reads files
+        → UnifiedTrainingPipeline generates DPO pairs
+          → LoRA/QLoRA fine-tuning on preference data
+            → GGUF export → deploy to golden image
+              → Models get better at being JARVIS, automatically
+```
+
+#### v243.0 — Ouroboros: JARVIS Self-Programming (Planned)
+
+JARVIS becomes capable of reading, understanding, and improving its own codebase:
+
+- [ ] **Architect phase** — DeepSeek-R1-14B analyzes codebase, plans changes with `<think>` reasoning traces
+- [ ] **Implementer phase** — Qwen2.5-Coder-14B generates code diffs from the architect's plan
+- [ ] **Verifier phase** — DeepSeek-R1-14B reviews generated code for correctness and completeness
+- [ ] **Two-model pipeline** — Architect → model swap → Implementer → model swap → Verifier (~2-3 min per cycle)
+- [ ] Safety guardrails: changes require human approval before commit, automated test suite must pass, rollback on failure
+
+#### v244.0 — LLaVA Vision Integration (Planned)
+
+Activate the pre-staged LLaVA-v1.6-Mistral-7B for self-hosted vision:
+
+- [ ] Build CLIP vision encoder pipeline in J-Prime
+- [ ] Multimodal inference path (image + text → response)
+- [ ] Mark LLaVA as `routable: true` in manifest
+- [ ] Route vision commands to LLaVA instead of Claude Vision API
+- [ ] Eliminate last external API dependency for core JARVIS features
+
+---
+
 ## Key Components (Backend)
 
 | Area | Location | Description |
