@@ -3662,6 +3662,17 @@ class ClaudeVisionAnalyzer:
 
     async def _preprocess_image(self, image: Any) -> Tuple[Image.Image, str]:
         """Preprocess image for optimal performance"""
+        # v239.0: Explicit None check with clear error message.
+        # Callers should guard against None before calling, but if they don't,
+        # this provides a clear diagnostic instead of falling through all type
+        # checks to "Unsupported image type: NoneType".
+        if image is None:
+            raise ValueError(
+                "Screenshot image is None — capture likely failed. "
+                "Check screen recording permissions in System Settings → "
+                "Privacy & Security → Screen Recording."
+            )
+
         # Convert to PIL Image
         if isinstance(image, np.ndarray):
             if image.dtype == object:

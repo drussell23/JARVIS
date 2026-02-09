@@ -2600,18 +2600,20 @@ async def unified_websocket_endpoint(websocket: WebSocket):
 
             # Handle ping/pong for health monitoring
             if data.get("type") == "ping":
-                # Respond with pong immediately
-                await websocket.send_json(
-                    {
-                        "type": "pong",
-                        "timestamp": data.get("timestamp"),
-                        "server_time": datetime.now().isoformat(),
-                    }
-                )
-                logger.debug(
-                    f"[UNIFIED-WS] 🏓 Received ping from {client_id}, sent pong | "
-                    f"Health: {manager.connection_health[client_id].health_score:.1f}"
-                )
+                # v239.0: Use safe send — client may have disconnected
+                pong_sent = await manager._safe_send_json(client_id, {
+                    "type": "pong",
+                    "timestamp": data.get("timestamp"),
+                    "server_time": datetime.now().isoformat(),
+                })
+                if pong_sent:
+                    logger.debug(
+                        f"[UNIFIED-WS] 🏓 Received ping from {client_id}, sent pong | "
+                        f"Health: {manager.connection_health[client_id].health_score:.1f}"
+                    )
+                else:
+                    logger.debug(f"[UNIFIED-WS] Ping from {client_id} but connection closed, exiting loop")
+                    break
                 continue
 
             # Log incoming command for debugging
@@ -2633,7 +2635,12 @@ async def unified_websocket_endpoint(websocket: WebSocket):
                 logger.info(f"[WS] Sending lock/unlock response: {response}")
 
             # Send response
-            await websocket.send_json(response)
+            # v239.0: Use safe send — client may disconnect during handle_message()
+            # processing (LLM calls take 2-10s). _safe_send_json handles close
+            # detection, health tracking, and error recovery.
+            if not await manager._safe_send_json(client_id, response):
+                logger.info(f"[UNIFIED-WS] Client {client_id} disconnected during processing, exiting loop")
+                break
 
     except WebSocketDisconnect:
         logger.info(f"[UNIFIED-WS] Client {client_id} disconnected (WebSocketDisconnect)")

@@ -720,6 +720,15 @@ class UIElementMonitor:
             if screenshot is None:
                 screenshot = await self._capture_screenshot()
 
+            # v239.0: Guard against failed screenshot capture.
+            # pyautogui.screenshot() can return None on permission failure.
+            if screenshot is None:
+                logger.error(
+                    f"[SAI] Screenshot capture failed for element '{element_id}'. "
+                    "Check screen recording permissions."
+                )
+                return None
+
             # Build vision prompt from descriptor
             prompt = self._build_detection_prompt(descriptor)
 
@@ -822,10 +831,15 @@ If not found, respond with: NOT_FOUND"""
             logger.error(f"Error parsing detection result: {e}")
             return None
 
-    async def _capture_screenshot(self) -> Image.Image:
-        """Capture current screenshot"""
-        import pyautogui
-        return pyautogui.screenshot()
+    async def _capture_screenshot(self) -> Optional[Image.Image]:
+        """Capture current screenshot. Returns None if capture fails."""
+        try:
+            import pyautogui
+            screenshot = pyautogui.screenshot()
+            return screenshot
+        except Exception as e:
+            logger.error(f"[SAI] Screenshot capture error: {e}")
+            return None
 
 
 # ============================================================================

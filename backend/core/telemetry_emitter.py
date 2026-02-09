@@ -705,9 +705,14 @@ class TelemetryEmitter:
         # Retry loop
         for attempt in range(self._config.max_retries):
             try:
-                # Handle both aiohttp and httpx
-                if hasattr(self._http_client, 'post') and hasattr(self._http_client.post, '__aenter__'):
-                    # aiohttp
+                # v239.0: Fixed client type detection. The previous check
+                # hasattr(self._http_client.post, '__aenter__') was always
+                # False for both libraries, causing aiohttp to receive httpx's
+                # 'content=' parameter, which crashes with:
+                #   _request() got an unexpected keyword argument 'content'
+                _is_aiohttp = type(self._http_client).__name__ == 'ClientSession'
+                if _is_aiohttp:
+                    # aiohttp: uses context manager, 'data=' parameter
                     async with self._http_client.post(url, data=data, headers=headers) as resp:
                         if resp.status == 200:
                             await self._circuit.record_success()
