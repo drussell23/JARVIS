@@ -1215,21 +1215,45 @@ class AsyncModelManager:
         # v242.4: Daemon thread factory — prevents ai_loader_0 from blocking
         # process exit when a model is still loading during shutdown.
         # Non-daemon workers forced os._exit(1) which skips atexit handlers.
+        # v242.5: Fixed — must set daemon BEFORE Thread.start(), not after.
+        # Previous patch tried to set daemon on already-started threads →
+        # RuntimeError: "cannot set daemon status of active thread".
+        # Fix: replace _adjust_thread_count entirely with CPython-compatible
+        # version that creates daemon threads before starting them.
         self._executor = ThreadPoolExecutor(
             max_workers=self._config.max_workers,
             thread_name_prefix="ai_loader",
         )
-        # Patch workers to daemon (same technique as ManagedThreadPoolExecutor)
-        _original_adjust = self._executor._adjust_thread_count
-        _executor_ref = self._executor
+        try:
+            import concurrent.futures.thread as _cft_module
 
-        def _daemon_adjust():
-            _original_adjust()
-            for t in _executor_ref._threads:
-                if not t.daemon:
-                    t.daemon = True
+            def _make_daemon_adjuster(exc):
+                def _adjust():
+                    if exc._idle_semaphore.acquire(timeout=0):
+                        return
+                    def weakref_cb(_, q=exc._work_queue):
+                        q.put(None)
+                    num_threads = len(exc._threads)
+                    if num_threads < exc._max_workers:
+                        t = threading.Thread(
+                            target=_cft_module._worker,
+                            args=(
+                                weakref.ref(exc, weakref_cb),
+                                exc._work_queue,
+                                exc._initializer,
+                                exc._initargs,
+                            ),
+                            name=f"{exc._thread_name_prefix or 'pool'}_{num_threads}",
+                        )
+                        t.daemon = True  # Set BEFORE start (key fix)
+                        t.start()
+                        exc._threads.add(t)
+                        _cft_module._threads_queues[t] = exc._work_queue
+                return _adjust
 
-        self._executor._adjust_thread_count = _daemon_adjust
+            self._executor._adjust_thread_count = _make_daemon_adjuster(self._executor)
+        except (ImportError, AttributeError):
+            logger.debug("[AILoader] CPython thread internals unavailable — daemon patch skipped")
         self._lock = threading.RLock()
         self._shutdown = False
         self._total_memory_bytes = 0

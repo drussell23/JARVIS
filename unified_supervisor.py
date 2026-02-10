@@ -67394,6 +67394,16 @@ class JarvisSystemKernel:
 
         self.logger.info("[Frontend] Starting...")
 
+        # v242.5: Clean up stale frontend process on target port before starting.
+        # After a crash, the previous React dev server may still be running as an
+        # orphan. `npm start` detects "Something is already running on port 3000"
+        # and exits with code 0 — a silent failure that looks like success.
+        frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+        try:
+            await self._cleanup_stale_port_process(frontend_port, "frontend")
+        except Exception as e:
+            self.logger.debug(f"[Frontend] Port cleanup check: {e}")
+
         try:
             # Check for node_modules
             node_modules = frontend_dir / "node_modules"
@@ -67584,6 +67594,165 @@ class JarvisSystemKernel:
                 pass
             self._frontend_log_file = None
             self._frontend_log_fd = None
+
+    async def _cleanup_stale_port_process(self, port: int, label: str) -> None:
+        """
+        v242.5: Clean up stale/orphaned processes occupying a port before startup.
+
+        After a supervisor crash, child processes (React dev server, etc.) may
+        survive as orphans still bound to their port. When the supervisor restarts
+        and tries to start a new instance, the port conflict causes silent failure
+        (e.g., React's `npm start` exits code 0 with "Something already running").
+
+        Strategy:
+        1. Use `lsof` to find PIDs listening on the target port
+        2. Filter out our own PID and known-safe system processes
+        3. Verify the process is actually stale (not a legitimate user process)
+        4. SIGTERM → wait → SIGKILL escalation if needed
+
+        This is safe because:
+        - Only called at startup BEFORE we launch our own process
+        - Only targets LISTEN state (not ephemeral client connections)
+        - Skips our own PID and parent PID
+        - Uses graceful SIGTERM first with escalation timeout
+        """
+        import signal as _signal
+
+        our_pid = os.getpid()
+        our_ppid = os.getppid()
+
+        # --- Step 1: Find PIDs listening on the port via lsof ---
+        # lsof is the most reliable cross-platform (macOS/Linux) tool for this.
+        # `-i :{port}` filters by port, `-sTCP:LISTEN` restricts to listeners,
+        # `-t` outputs only PIDs (one per line), `-n -P` avoids DNS/service lookups.
+        try:
+            lsof_proc = await asyncio.create_subprocess_exec(
+                "lsof", "-i", f":{port}", "-sTCP:LISTEN", "-t", "-n", "-P",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                lsof_proc.communicate(),
+                timeout=_get_env_float("JARVIS_PORT_CLEANUP_LSOF_TIMEOUT", 5.0),
+            )
+        except asyncio.TimeoutError:
+            self.logger.debug(f"[{label}] lsof timed out checking port {port}")
+            return
+        except FileNotFoundError:
+            self.logger.debug(f"[{label}] lsof not found — skipping port cleanup")
+            return
+        except Exception as e:
+            self.logger.debug(f"[{label}] lsof error: {e}")
+            return
+
+        if not stdout or not stdout.strip():
+            self.logger.debug(f"[{label}] Port {port} is free")
+            return
+
+        # Parse PIDs from lsof output
+        pids_to_clean = []
+        for line in stdout.decode("utf-8", errors="replace").strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pid = int(line)
+            except ValueError:
+                continue
+
+            # --- Step 2: Filter out safe PIDs ---
+            if pid == our_pid or pid == our_ppid:
+                self.logger.debug(f"[{label}] Skipping own process PID {pid}")
+                continue
+            if pid <= 1:
+                continue  # Never touch init/launchd
+
+            pids_to_clean.append(pid)
+
+        if not pids_to_clean:
+            self.logger.debug(f"[{label}] Port {port} held by safe processes only")
+            return
+
+        # --- Step 3: Verify staleness and identify processes ---
+        for pid in pids_to_clean:
+            proc_name = "unknown"
+            try:
+                # Get process name for logging (ps is lightweight)
+                ps_proc = await asyncio.create_subprocess_exec(
+                    "ps", "-p", str(pid), "-o", "comm=",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                ps_out, _ = await asyncio.wait_for(
+                    ps_proc.communicate(), timeout=2.0,
+                )
+                if ps_out:
+                    proc_name = ps_out.decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+
+            self.logger.warning(
+                f"[{label}] Stale process PID {pid} ({proc_name}) "
+                f"occupying port {port} — cleaning up"
+            )
+
+            # --- Step 4: SIGTERM → wait → SIGKILL escalation ---
+            try:
+                os.kill(pid, _signal.SIGTERM)
+            except ProcessLookupError:
+                self.logger.debug(f"[{label}] PID {pid} already gone before SIGTERM")
+                continue
+            except PermissionError:
+                self.logger.warning(
+                    f"[{label}] No permission to kill PID {pid} ({proc_name}) — "
+                    f"port {port} may remain occupied"
+                )
+                continue
+            except OSError as e:
+                self.logger.debug(f"[{label}] SIGTERM to PID {pid} failed: {e}")
+                continue
+
+            # Wait for graceful exit
+            sigterm_wait = _get_env_float("JARVIS_PORT_CLEANUP_SIGTERM_WAIT", 5.0)
+            exited = False
+            deadline = time.time() + sigterm_wait
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)  # Check if still alive
+                    await asyncio.sleep(0.2)
+                except ProcessLookupError:
+                    exited = True
+                    break
+                except (PermissionError, OSError):
+                    break
+
+            if exited:
+                self.logger.info(
+                    f"[{label}] Stale PID {pid} ({proc_name}) exited gracefully "
+                    f"— port {port} freed"
+                )
+                continue
+
+            # Escalate to SIGKILL
+            self.logger.warning(
+                f"[{label}] PID {pid} ({proc_name}) didn't exit after SIGTERM, "
+                f"escalating to SIGKILL"
+            )
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                # Brief wait for kernel to reap
+                await asyncio.sleep(0.5)
+                self.logger.info(
+                    f"[{label}] Stale PID {pid} ({proc_name}) force-killed "
+                    f"— port {port} freed"
+                )
+            except ProcessLookupError:
+                self.logger.debug(f"[{label}] PID {pid} gone before SIGKILL")
+            except (PermissionError, OSError) as e:
+                self.logger.warning(
+                    f"[{label}] SIGKILL to PID {pid} failed: {e} — "
+                    f"port {port} may remain occupied"
+                )
 
     # =========================================================================
     # v182.0: DYNAMIC COMPONENT TRACKING
