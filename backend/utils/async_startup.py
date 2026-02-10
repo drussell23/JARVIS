@@ -64,10 +64,23 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Bounded executor for startup blocking operations (prevents exhausting default pool)
+# v242.4: Daemon thread factory — prevents startup_async__0 from blocking
+# process exit. Non-daemon workers forced os._exit(1) which skips atexit handlers.
 _STARTUP_EXECUTOR = ThreadPoolExecutor(
     max_workers=4,
     thread_name_prefix="startup_async_"
 )
+
+# Patch workers to daemon threads
+_original_adjust = _STARTUP_EXECUTOR._adjust_thread_count
+
+def _daemon_adjust():
+    _original_adjust()
+    for t in _STARTUP_EXECUTOR._threads:
+        if not t.daemon:
+            t.daemon = True
+
+_STARTUP_EXECUTOR._adjust_thread_count = _daemon_adjust
 
 
 def shutdown_startup_executor() -> None:

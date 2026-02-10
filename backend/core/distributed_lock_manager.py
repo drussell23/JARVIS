@@ -131,6 +131,59 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# v3.5: Env-var helpers + async executor bridge for blocking syscalls
+# =============================================================================
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var with fallback."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var with fallback."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+# v3.5: Cleanup budget limits — prevents event loop starvation from
+# blocking syscalls (os.kill, psutil.Process) during initialization.
+DLM_CLEANUP_TEMP_TIMEOUT = _env_float("DLM_CLEANUP_TEMP_TIMEOUT", 5.0)
+DLM_CLEANUP_STALE_TIMEOUT = _env_float("DLM_CLEANUP_STALE_TIMEOUT", 10.0)
+DLM_CLEANUP_MAX_FILES = _env_int("DLM_CLEANUP_MAX_FILES", 200)
+DLM_BLOCKING_OP_TIMEOUT = _env_float("DLM_BLOCKING_OP_TIMEOUT", 5.0)
+DLM_REDIS_CONNECT_TIMEOUT = _env_float("DLM_REDIS_CONNECT_TIMEOUT", 5.0)
+DLM_REDIS_SOCKET_TIMEOUT = _env_float("DLM_REDIS_SOCKET_TIMEOUT", 5.0)
+
+
+async def _run_blocking(func, *args, timeout: float = DLM_BLOCKING_OP_TIMEOUT):
+    """Run a synchronous blocking function in an executor with timeout.
+
+    Prevents os.kill(), psutil.Process(), os.fsync(), etc. from blocking
+    the asyncio event loop. Returns None on timeout instead of raising.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, func, *args),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[v3.5] Blocking op timed out ({timeout}s): "
+            f"{getattr(func, '__name__', str(func))}"
+        )
+        return None
+    except Exception as e:
+        logger.debug(f"[v3.5] Blocking op error: {e}")
+        return None
+
+
+# =============================================================================
 # v3.0: Backend Configuration
 # =============================================================================
 
@@ -230,15 +283,21 @@ class AsyncRedisLockClient:
                         return False
 
                 url = f"redis://{self.host}:{self.port}/{self.db}"
+                # v3.5: Explicit socket timeouts prevent hanging on unreachable Redis
                 self._client = await redis_module.from_url(
                     url,
                     password=self.password,
                     encoding="utf-8",
                     decode_responses=True,
+                    socket_timeout=DLM_REDIS_SOCKET_TIMEOUT,
+                    socket_connect_timeout=DLM_REDIS_CONNECT_TIMEOUT,
                 )
 
-                # Test connection
-                await self._client.ping()
+                # Test connection with timeout
+                await asyncio.wait_for(
+                    self._client.ping(),
+                    timeout=DLM_REDIS_CONNECT_TIMEOUT,
+                )
                 self._available = True
                 logger.info(f"[v3.0] Connected to Redis at {self.host}:{self.port}")
                 return True
@@ -698,13 +757,23 @@ class DistributedLockManager:
             return ""
 
     def _get_machine_id(self) -> str:
-        """v96.0: Get machine identifier for distributed environments."""
-        try:
-            import platform
-            import socket
+        """v96.0: Get machine identifier for distributed environments.
+
+        v3.5: Uses a thread with timeout to prevent hanging on misconfigured
+        DNS/NSS where socket.gethostname() blocks indefinitely.
+        """
+        import concurrent.futures
+        import platform
+
+        def _resolve():
             return f"{platform.system().lower()}-{socket.gethostname()}"
-        except Exception:
-            return "unknown"
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_resolve)
+                return future.result(timeout=2.0)
+        except (concurrent.futures.TimeoutError, Exception):
+            return f"{os.uname().sysname.lower()}-unknown" if hasattr(os, "uname") else "unknown"
 
     async def _get_lock_semaphore(self, lock_name: str) -> asyncio.Semaphore:
         """
@@ -759,16 +828,34 @@ class DistributedLockManager:
                 logger.error(f"Failed to create lock directory: {e}")
                 raise
 
-            # v2.0: Clean up orphaned temp files from crashed/interrupted writes
-            temp_cleaned = await self._cleanup_orphaned_temp_files()
-            if temp_cleaned > 0:
-                logger.info(f"[v2.0] Cleaned {temp_cleaned} orphaned temp file(s) at startup")
+            # v3.5: Wrap cleanup operations with timeouts to prevent hanging
+            # during startup. Both methods contain blocking syscalls that are
+            # now offloaded to executors, but we still cap total wall-clock time.
+            try:
+                temp_cleaned = await asyncio.wait_for(
+                    self._cleanup_orphaned_temp_files(),
+                    timeout=DLM_CLEANUP_TEMP_TIMEOUT,
+                )
+                if temp_cleaned > 0:
+                    logger.info(f"[v2.0] Cleaned {temp_cleaned} orphaned temp file(s) at startup")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[v3.5] Temp file cleanup timed out ({DLM_CLEANUP_TEMP_TIMEOUT}s) — "
+                    "continuing with possibly orphaned temp files"
+                )
 
-            # v93.0: CRITICAL - Aggressive pre-cleanup of stale locks
-            # This runs SYNCHRONOUSLY before anything else to ensure clean state
-            cleaned = await self._aggressive_stale_cleanup()
-            if cleaned > 0:
-                logger.info(f"[v93.0] Pre-cleaned {cleaned} stale lock(s) at startup")
+            try:
+                cleaned = await asyncio.wait_for(
+                    self._aggressive_stale_cleanup(),
+                    timeout=DLM_CLEANUP_STALE_TIMEOUT,
+                )
+                if cleaned > 0:
+                    logger.info(f"[v93.0] Pre-cleaned {cleaned} stale lock(s) at startup")
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[v3.5] Stale lock cleanup timed out ({DLM_CLEANUP_STALE_TIMEOUT}s) — "
+                    "continuing with possibly stale locks (cleanup loop will handle them)"
+                )
 
             # Start cleanup task
             if self.config.cleanup_enabled:
@@ -802,6 +889,16 @@ class DistributedLockManager:
             all_files = await aiofiles.os.listdir(self.config.lock_dir)
             temp_files = [f for f in all_files if '.tmp.' in f]
 
+            # v3.5: Cap iteration count — if there are 200+ temp files,
+            # something is seriously wrong; the cleanup loop will handle the rest.
+            if len(temp_files) > DLM_CLEANUP_MAX_FILES:
+                logger.warning(
+                    f"[v3.5] {len(temp_files)} orphaned temp files exceeds cap "
+                    f"({DLM_CLEANUP_MAX_FILES}) — processing oldest {DLM_CLEANUP_MAX_FILES} only"
+                )
+                # Sort by name (which includes PID/counter) and take first N
+                temp_files = temp_files[:DLM_CLEANUP_MAX_FILES]
+
             current_time = time.time()
 
             for temp_name in temp_files:
@@ -820,6 +917,7 @@ class DistributedLockManager:
                         reason = f"stale ({age_seconds:.0f}s old)"
 
                     # Check 2: Try to extract PID and check if process is alive
+                    # v3.5: os.kill() offloaded to executor via _run_blocking
                     else:
                         # Format: {name}.tmp.{pid}.{counter}.{token}
                         parts = temp_name.split('.tmp.')
@@ -829,22 +927,31 @@ class DistributedLockManager:
                             if len(pid_parts) >= 1:
                                 try:
                                     temp_pid = int(pid_parts[0])
-                                    # Check if this PID is alive
-                                    try:
-                                        os.kill(temp_pid, 0)
-                                        # Process exists - don't remove unless very old
-                                        if age_seconds > 10:
-                                            # 10 seconds is long for a write - likely stuck
-                                            should_remove = True
-                                            reason = f"stuck write ({age_seconds:.0f}s)"
-                                    except ProcessLookupError:
+
+                                    def _check_pid(p=temp_pid):
+                                        try:
+                                            os.kill(p, 0)
+                                            return True  # alive
+                                        except ProcessLookupError:
+                                            return False  # dead
+                                        except PermissionError:
+                                            return True  # exists, can't signal
+                                        except OSError:
+                                            return False
+
+                                    pid_alive = await _run_blocking(
+                                        _check_pid, timeout=2.0
+                                    )
+                                    if pid_alive is None:
+                                        # Timeout checking PID — skip this file
+                                        pass
+                                    elif not pid_alive:
                                         should_remove = True
                                         reason = f"owner process {temp_pid} dead"
-                                    except PermissionError:
-                                        # Process exists, can't check - leave it
-                                        pass
+                                    elif age_seconds > 10:
+                                        should_remove = True
+                                        reason = f"stuck write ({age_seconds:.0f}s)"
                                 except ValueError:
-                                    # Can't parse PID - remove if old
                                     if age_seconds > 30:
                                         should_remove = True
                                         reason = "unparseable and old"
@@ -989,7 +1096,8 @@ class DistributedLockManager:
                         remove_reason = f"expired {-existing_lock.time_remaining():.1f}s ago"
 
                     # v93.0: Check 2: Owner process is dead - DON'T WAIT!
-                    elif not self._is_process_alive(existing_lock.owner):
+                    # v3.5: Now async — blocking syscalls offloaded to executor
+                    elif not await self._is_process_alive(existing_lock.owner):
                         should_remove = True
                         remove_reason = f"owner process {existing_lock.owner} is dead"
 
@@ -1239,7 +1347,9 @@ class DistributedLockManager:
                             await f.write(content_bytes)
                             await f.flush()
                             # v93.0: Force write to disk before rename
-                            os.fsync(f.fileno())
+                            # v3.5: Offload to executor to avoid blocking event loop
+                            fd = f.fileno()
+                            await _run_blocking(os.fsync, fd, timeout=2.0)
 
                         # v96.1: Verify temp file was written correctly before rename
                         try:
@@ -1265,15 +1375,18 @@ class DistributedLockManager:
                         raise
 
                     # v93.0: Sync directory to ensure rename is durable
-                    try:
-                        dir_fd = os.open(str(lock_dir), os.O_RDONLY | os.O_DIRECTORY)
+                    # v3.5: Offloaded to executor to avoid blocking event loop
+                    def _sync_dir(d=str(lock_dir)):
                         try:
-                            os.fsync(dir_fd)
-                        finally:
-                            os.close(dir_fd)
-                    except (OSError, AttributeError):
-                        # O_DIRECTORY not supported on some platforms - fall back to brief sleep
-                        await asyncio.sleep(0.001)
+                            fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+                            try:
+                                os.fsync(fd)
+                            finally:
+                                os.close(fd)
+                        except (OSError, AttributeError):
+                            pass  # O_DIRECTORY not supported on some platforms
+
+                    await _run_blocking(_sync_dir, timeout=2.0)
 
                     # v96.1: Verify final file was written correctly
                     final_size = (await aiofiles.os.stat(lock_file)).st_size
@@ -1324,67 +1437,39 @@ class DistributedLockManager:
     # v96.0: Advanced Cleanup with PID Reuse Detection
     # =========================================================================
 
-    def _is_process_alive(
-        self,
+    @staticmethod
+    def _is_process_alive_sync(
         owner_id: str,
-        lock_metadata: Optional[LockMetadata] = None,
+        lock_metadata_dict: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """
-        v96.0: Check if the process that owns a lock is still alive.
+        """v3.5: Synchronous process liveness check — runs in executor thread.
 
-        CRITICAL FIX for Problem 19 (PID reuse detection):
-        - Extracts PID from owner ID
-        - Validates process start time against stored value
-        - Detects PID reuse and treats as stale lock
+        All blocking syscalls (os.kill, psutil.Process) are contained here
+        so the asyncio event loop is never blocked.
 
         Args:
             owner_id: Lock owner identifier (format: "jarvis-{pid}-{start_time}")
-            lock_metadata: Optional metadata for additional validation
+            lock_metadata_dict: Optional dict with process_start_time, process_name
 
         Returns:
             True if process is alive AND matches stored identity
-            False if dead, PID reused, or unable to determine
-
-        Validation Phases:
-        ┌─────────────────────────────────────────────────────────────────────┐
-        │ Phase 1: PID Extraction                                             │
-        │   - Parse owner_id for PID                                          │
-        │   - Handle both old "jarvis-{pid}" and new "jarvis-{pid}-{start}"  │
-        ├─────────────────────────────────────────────────────────────────────┤
-        │ Phase 2: Process Existence Check                                    │
-        │   - Use signal 0 to check if PID exists                            │
-        │   - Handle permission errors                                        │
-        ├─────────────────────────────────────────────────────────────────────┤
-        │ Phase 3: PID Reuse Detection (v96.0 CRITICAL FIX)                  │
-        │   - Compare process start time with stored value                    │
-        │   - If mismatch > 1s, PID was reused → treat as stale             │
-        │   - Optionally validate process name/cmdline                        │
-        └─────────────────────────────────────────────────────────────────────┘
         """
         import psutil
 
         try:
-            # ═══════════════════════════════════════════════════════════════
             # Phase 1: PID Extraction
-            # ═══════════════════════════════════════════════════════════════
             if "-" not in owner_id:
-                logger.debug(f"Cannot extract PID from owner_id: {owner_id}")
                 return True  # Can't validate, assume alive (conservative)
 
             parts = owner_id.split("-")
-
-            # Extract PID (always second part)
             try:
                 pid = int(parts[1]) if len(parts) >= 2 else 0
             except ValueError:
-                logger.debug(f"Invalid PID in owner_id: {owner_id}")
-                return False  # Invalid PID format = dead process
+                return False
 
             if pid <= 0:
-                logger.debug(f"Invalid PID value: {pid}")
-                return False  # Invalid PID = dead process
+                return False
 
-            # v96.0: Extract stored start time from owner_id (third part)
             stored_start_time = 0.0
             if len(parts) >= 3:
                 try:
@@ -1392,107 +1477,94 @@ class DistributedLockManager:
                 except ValueError:
                     pass
 
-            # Fall back to metadata if owner_id doesn't have start time
-            if stored_start_time == 0.0 and lock_metadata:
-                stored_start_time = lock_metadata.process_start_time
+            if stored_start_time == 0.0 and lock_metadata_dict:
+                stored_start_time = lock_metadata_dict.get("process_start_time", 0.0)
 
-            # ═══════════════════════════════════════════════════════════════
-            # Phase 2: Process Existence Check
-            # ═══════════════════════════════════════════════════════════════
+            # Phase 2: Process Existence Check (blocking syscall)
             try:
                 os.kill(pid, 0)
-                # Process exists - continue to Phase 3
             except ProcessLookupError:
-                # Process doesn't exist - definitely dead
-                logger.debug(f"[v96.0] Process {pid} does not exist (ProcessLookupError)")
                 return False
             except PermissionError:
-                # Process exists but we can't signal it (different user)
-                # Continue to Phase 3 for start time validation
-                pass
+                pass  # Exists, can't signal
             except OSError as e:
                 import errno
-                if e.errno == errno.ESRCH:  # No such process
+                if e.errno == errno.ESRCH:
                     return False
-                elif e.errno == errno.EPERM:  # Permission denied
-                    pass  # Process exists, continue to Phase 3
+                elif e.errno == errno.EPERM:
+                    pass
                 else:
-                    logger.debug(f"OSError checking PID {pid}: {e}")
-                    return False  # Conservative: assume dead
+                    return False
 
-            # ═══════════════════════════════════════════════════════════════
-            # Phase 3: PID Reuse Detection (v96.0 CRITICAL FIX)
-            # ═══════════════════════════════════════════════════════════════
+            # Phase 3: PID Reuse Detection (blocking psutil calls)
             if stored_start_time > 0.0:
                 try:
                     process = psutil.Process(pid)
                     current_start_time = process.create_time()
 
-                    # Allow 1 second tolerance for timing differences
                     time_diff = abs(current_start_time - stored_start_time)
                     if time_diff > 1.0:
-                        logger.info(
-                            f"[v96.0] PID REUSE DETECTED for {owner_id}: "
-                            f"stored_start={stored_start_time:.1f}, "
-                            f"current_start={current_start_time:.1f}, "
-                            f"diff={time_diff:.1f}s"
-                        )
-                        return False  # PID was reused → stale lock
+                        return False  # PID was reused
 
-                    # v96.0: Optional process name validation
-                    if lock_metadata and lock_metadata.process_name:
+                    stored_name = (lock_metadata_dict or {}).get("process_name", "")
+                    if stored_name:
                         current_name = process.name()
-                        if current_name != lock_metadata.process_name:
-                            logger.info(
-                                f"[v96.0] Process NAME MISMATCH for PID {pid}: "
-                                f"expected={lock_metadata.process_name}, "
-                                f"actual={current_name}"
-                            )
-                            return False  # Different process → stale lock
+                        if current_name != stored_name:
+                            return False  # Different process
 
                 except psutil.NoSuchProcess:
-                    logger.debug(f"[v96.0] Process {pid} gone during validation")
                     return False
-                except psutil.AccessDenied:
-                    # Can't validate start time, assume process is valid
-                    logger.debug(f"[v96.0] Access denied validating PID {pid}")
-                    pass
-                except Exception as e:
-                    logger.debug(f"[v96.0] Error validating PID {pid}: {e}")
+                except (psutil.AccessDenied, Exception):
                     pass
 
-            # Process exists and passed all validation checks
             return True
 
-        except Exception as e:
-            # v93.0: Log unexpected errors instead of silently assuming alive
-            logger.warning(f"Unexpected error checking process {owner_id}: {e}")
-            # Conservative approach: assume dead to prevent stale lock accumulation
-            return False
+        except Exception:
+            return False  # Assume dead to prevent stale lock accumulation
 
-    def _validate_lock_owner_identity(
+    async def _is_process_alive(
         self,
-        metadata: LockMetadata,
-    ) -> Tuple[bool, str]:
+        owner_id: str,
+        lock_metadata: Optional[LockMetadata] = None,
+    ) -> bool:
+        """v3.5: Async wrapper for process liveness check.
+
+        Offloads all blocking syscalls (os.kill, psutil.Process) to a thread
+        executor so the asyncio event loop is never blocked during DLM cleanup.
         """
-        v96.0: Comprehensive validation of lock owner identity.
+        # Build a plain dict from metadata to pass to the sync function
+        # (LockMetadata dataclass can't be pickled across thread boundaries safely)
+        meta_dict = None
+        if lock_metadata:
+            meta_dict = {
+                "process_start_time": lock_metadata.process_start_time,
+                "process_name": lock_metadata.process_name,
+            }
 
-        This is used during lock acquisition to determine if an existing lock
-        is still valid or should be removed as stale.
+        result = await _run_blocking(
+            self._is_process_alive_sync,
+            owner_id,
+            meta_dict,
+            timeout=DLM_BLOCKING_OP_TIMEOUT,
+        )
+        # _run_blocking returns None on timeout — treat as dead (conservative)
+        return result if result is not None else False
 
-        Args:
-            metadata: Lock metadata to validate
+    @staticmethod
+    def _validate_lock_owner_identity_sync(
+        pid: int,
+        stored_start_time: float,
+        process_name: str,
+    ) -> Tuple[bool, str]:
+        """v3.5: Synchronous identity validation — runs in executor thread.
 
-        Returns:
-            Tuple of (is_valid: bool, reason: str)
+        All blocking psutil calls are contained here.
         """
         import psutil
 
-        pid = metadata.get_pid()
         if pid <= 0:
             return False, "invalid_pid"
 
-        # Check if process exists
         try:
             process = psutil.Process(pid)
             if not process.is_running():
@@ -1504,11 +1576,9 @@ class DistributedLockManager:
         except psutil.NoSuchProcess:
             return False, "process_not_found"
         except psutil.AccessDenied:
-            # Process exists but can't inspect - assume valid
             return True, "access_denied_assumed_valid"
 
         # Validate start time
-        stored_start_time = metadata.get_owner_start_time()
         if stored_start_time > 0.0:
             try:
                 current_start_time = process.create_time()
@@ -1519,24 +1589,49 @@ class DistributedLockManager:
                 pass
 
         # Validate process name
-        if metadata.process_name:
+        if process_name:
             try:
                 current_name = process.name()
-                if current_name != metadata.process_name:
-                    return False, f"name_mismatch:{metadata.process_name}!={current_name}"
+                if current_name != process_name:
+                    return False, f"name_mismatch:{process_name}!={current_name}"
             except (psutil.AccessDenied, psutil.NoSuchProcess):
                 pass
 
-        # Validate machine ID (for distributed setups)
+        return True, "identity_verified"
+
+    async def _validate_lock_owner_identity(
+        self,
+        metadata: LockMetadata,
+    ) -> Tuple[bool, str]:
+        """v3.5: Async identity validation — offloads blocking psutil to executor.
+
+        Returns:
+            Tuple of (is_valid: bool, reason: str)
+        """
+        pid = metadata.get_pid()
+        if pid <= 0:
+            return False, "invalid_pid"
+
+        # Distributed: different machine can't validate PID — check TTL only
         if metadata.machine_id and metadata.machine_id != self._machine_id:
-            # Different machine - can't validate PID, but lock may be valid
-            # Check TTL instead
             if metadata.is_expired():
                 return False, "expired_remote_lock"
-            # Assume valid if not expired (distributed scenario)
             return True, "remote_lock_not_expired"
 
-        return True, "identity_verified"
+        stored_start_time = metadata.get_owner_start_time()
+
+        result = await _run_blocking(
+            self._validate_lock_owner_identity_sync,
+            pid,
+            stored_start_time,
+            metadata.process_name,
+            timeout=DLM_BLOCKING_OP_TIMEOUT,
+        )
+
+        if result is None:
+            # Timeout — assume dead to prevent stale lock accumulation
+            return False, "validation_timeout"
+        return result
 
     async def _aggressive_stale_cleanup(self) -> int:
         """
@@ -1566,6 +1661,14 @@ class DistributedLockManager:
                 if f.endswith(ext)
             ]
 
+            # v3.5: Cap iteration count — prevents unbounded cleanup time
+            if len(lock_files) > DLM_CLEANUP_MAX_FILES:
+                logger.warning(
+                    f"[v3.5] {len(lock_files)} lock files exceeds cap "
+                    f"({DLM_CLEANUP_MAX_FILES}) — processing first {DLM_CLEANUP_MAX_FILES}"
+                )
+                lock_files = lock_files[:DLM_CLEANUP_MAX_FILES]
+
             for lock_file_name in lock_files:
                 lock_file = self.config.lock_dir / lock_file_name
                 metadata = await self._read_lock_metadata(lock_file)
@@ -1579,30 +1682,27 @@ class DistributedLockManager:
                 should_clean = False
                 reason = ""
 
-                # Check 1: Lock is expired
+                # Check 1: Lock is expired (pure computation — no blocking)
                 if metadata.is_expired():
                     should_clean = True
                     reason = f"expired {-metadata.time_remaining():.1f}s ago"
 
                 # Check 2: Owner process is dead (even if not expired yet)
-                # v96.0: Pass metadata for enhanced PID reuse detection
-                elif not self._is_process_alive(metadata.owner, metadata):
+                # v3.5: Now async — blocking syscalls offloaded to executor
+                elif not await self._is_process_alive(metadata.owner, metadata):
                     should_clean = True
                     reason = f"owner process dead (was {metadata.owner})"
 
-                # Check 3: v96.0 Enhanced - Validate lock owner identity comprehensively
+                # Check 3: v96.0 Enhanced - Validate lock owner identity
+                # v3.5: Now async — blocking psutil calls offloaded to executor
                 else:
-                    is_valid, validation_reason = self._validate_lock_owner_identity(metadata)
+                    is_valid, validation_reason = await self._validate_lock_owner_identity(metadata)
                     if not is_valid:
                         should_clean = True
                         reason = f"identity validation failed: {validation_reason}"
                     # Also check for our own stale lock from previous run
                     elif metadata.owner == self._owner_id:
-                        # Same owner ID as us - check if this is truly our lock
-                        # or a stale lock from a previous run that got same PID + start_time collision
-                        if metadata.acquired_at < time.time() - 60:  # More than 1 min old
-                            # If lock was acquired more than 60s ago but we just started,
-                            # this is definitely stale
+                        if metadata.acquired_at < time.time() - 60:
                             should_clean = True
                             reason = "own stale lock from previous run"
 
@@ -1671,7 +1771,8 @@ class DistributedLockManager:
                     should_clean = True
 
                 # v96.0: Enhanced - Check if owner process is dead with PID reuse detection
-                elif not self._is_process_alive(metadata.owner, metadata):
+                # v3.5: Now async — blocking syscalls offloaded to executor
+                elif not await self._is_process_alive(metadata.owner, metadata):
                     logger.warning(
                         f"Cleaning orphaned lock: {metadata.lock_name} "
                         f"(owner process {metadata.owner} is dead)"
@@ -1679,8 +1780,9 @@ class DistributedLockManager:
                     should_clean = True
 
                 # v96.0: Also validate lock owner identity comprehensively
+                # v3.5: Now async — blocking psutil calls offloaded to executor
                 else:
-                    is_valid, validation_reason = self._validate_lock_owner_identity(metadata)
+                    is_valid, validation_reason = await self._validate_lock_owner_identity(metadata)
                     if not is_valid:
                         logger.warning(
                             f"Cleaning invalid lock: {metadata.lock_name} "
@@ -1717,8 +1819,9 @@ class DistributedLockManager:
             return None
 
         # v96.0: Include identity validation in status
-        is_valid, validation_reason = self._validate_lock_owner_identity(metadata)
-        is_alive = self._is_process_alive(metadata.owner, metadata)
+        # v3.5: Now async — blocking calls offloaded to executor
+        is_valid, validation_reason = await self._validate_lock_owner_identity(metadata)
+        is_alive = await self._is_process_alive(metadata.owner, metadata)
 
         return {
             "lock_name": metadata.lock_name,
@@ -1863,7 +1966,7 @@ class DistributedLockManager:
         if existing_value:
             try:
                 existing = LockMetadata(**json.loads(existing_value))
-                if existing.is_expired() or not self._is_process_alive(existing.owner, existing):
+                if existing.is_expired() or not await self._is_process_alive(existing.owner, existing):
                     if await self._redis_client.delete(redis_key):
                         if await self._redis_client.set_nx(redis_key, value, ttl):
                             logger.info(f"[v3.0] Redis lock acquired after stale cleanup: {lock_name}")

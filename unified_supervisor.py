@@ -1568,6 +1568,10 @@ TRINITY_PROGRESS_POLL_INTERVAL = 15.0  # Seconds between progress checks
 TRINITY_PROGRESS_EXTENSION_BUFFER = 120.0  # Seconds to add when progress observed
 TRINITY_MAX_EXTENDED_TIMEOUT = float(os.environ.get("JARVIS_TRINITY_MAX_TIMEOUT", "1200.0"))  # Configurable hard cap
 TRINITY_PROGRESS_STALL_THRESHOLD = 90.0  # Seconds without progress before considering stalled
+# v242.4: Hard cap on phase hold duration — prevents a leaked has_active_subsystem=True
+# from suppressing stall detection indefinitely. Even if a subsystem claims to be active,
+# if there's been zero progress for this long, treat it as a stall.
+TRINITY_PHASE_HOLD_HARD_CAP = float(os.environ.get("JARVIS_PHASE_HOLD_HARD_CAP", "300.0"))
 
 # =============================================================================
 # v223.0: SMARTWATCHDOG CONFIGURATION - Enterprise-Grade Async Handshake
@@ -1888,6 +1892,26 @@ class ProgressAwareStartupController:
                                 f"for {time_since_progress:.0f}s "
                                 f"(subsystem active, ETA: {eta_remaining:.0f}s)"
                             )
+
+                        # v242.4: Phase hold HARD CAP — prevents a leaked
+                        # has_active_subsystem=True from indefinitely suppressing
+                        # stall detection. If we've been in phase hold for longer
+                        # than the hard cap with NO progress, it's a stall regardless.
+                        if time_since_progress >= TRINITY_PHASE_HOLD_HARD_CAP:
+                            self.logger.error(
+                                f"[ProgressController] PHASE HOLD HARD CAP ({TRINITY_PHASE_HOLD_HARD_CAP:.0f}s) "
+                                f"exceeded at {progress_pct:.1f}% — subsystem claims active but "
+                                f"zero progress for {time_since_progress:.0f}s. "
+                                f"Treating as TRUE STALL (likely leaked active flag)."
+                            )
+                            if progress_pct < 95:
+                                task.cancel()
+                                raise asyncio.TimeoutError(
+                                    f"Phase hold hard cap ({TRINITY_PHASE_HOLD_HARD_CAP:.0f}s) "
+                                    f"exceeded at {progress_pct:.1f}% — "
+                                    f"active subsystem made no progress"
+                                )
+
                     elif time_since_activity > self.stall_threshold:
                         # TRUE stall: no progress AND no subsystem activity
                         self.logger.warning(
@@ -4643,6 +4667,48 @@ def get_startup_display(enabled: bool = True) -> StartupProgressDisplay:
 # This replaces the log spam with a clean, real-time dashboard.
 # =============================================================================
 
+
+class ModelLoadingState(dict):
+    """v242.4: Dict subclass that enforces model loading state invariants.
+
+    Drop-in replacement for the raw dict — all dict-style reads ([], .get(),
+    iteration) work unchanged. Writes through __setitem__ are validated:
+
+    INVARIANT: ``active=True`` + ``progress_pct>=100`` + ``stage="ready"``
+    is semantically contradictory (model is fully loaded, not "actively loading").
+    This state leaked previously and suppressed ProgressController stall detection
+    for 916 seconds. Now enforced structurally — the setter auto-corrects it.
+    """
+
+    # Valid stage transitions (informational, not enforced — stages may be set
+    # out-of-order by different monitors and health checks)
+    VALID_STAGES = frozenset({
+        "idle", "downloading", "loading_weights", "initializing",
+        "warming_up", "ready", "error",
+    })
+
+    def __setitem__(self, key, value):
+        """Validate invariants on write."""
+        super().__setitem__(key, value)
+
+        # After any write, enforce the core invariant
+        if key in ("active", "progress_pct", "stage"):
+            self._enforce_invariants()
+
+    def _enforce_invariants(self):
+        """Auto-correct contradictory states.
+
+        active=True + progress_pct>=100 + stage="ready" → active=False
+        This is the structural fix for the 916s startup stall.
+        """
+        active = super().get("active", False)
+        progress_pct = super().get("progress_pct", 0)
+        stage = super().get("stage", "idle")
+
+        if active and progress_pct is not None and progress_pct >= 100 and stage == "ready":
+            super().__setitem__("active", False)
+
+
 class LiveProgressDashboard:
     """
     v197.1: Real-time CLI dashboard showing all component status.
@@ -4722,7 +4788,8 @@ class LiveProgressDashboard:
             "source": "none",
         }
         # v220.0: Model loading state for detailed user feedback
-        self._model_loading_state = {
+        # v242.4: ModelLoadingState enforces invariant: active+100%+ready → auto-correct
+        self._model_loading_state = ModelLoadingState({
             "active": False,
             "model_name": "",
             "model_size_gb": 0.0,
@@ -4736,7 +4803,7 @@ class LiveProgressDashboard:
             "start_time": None,  # Set when loading starts, prevents reset
             "max_progress_seen": 0,  # Never go backwards
             "progress_source": "unknown",  # v233.1: "health_endpoint", "time_estimate", "stall_detected", "unknown"
-        }
+        })
         # v220.1: GCP progress also needs persistent tracking
         self._gcp_loading_state = {
             "start_time": None,
@@ -4944,6 +5011,15 @@ class LiveProgressDashboard:
                     # KEEP max_progress_seen - this is the critical fix!
             
             if active is not None:
+                # v242.3: Auto-clear active when model is fully loaded and ready.
+                # A model at 100% with stage="ready" is no longer "actively loading".
+                # Leaving active=True misleads the ProgressController into thinking a
+                # subsystem is still working, which suppresses stall detection and causes
+                # the 916s startup hang (phase hold until hard cap).
+                if active and progress_pct is not None and progress_pct >= 100:
+                    effective_stage = stage or self._model_loading_state.get("stage", "")
+                    if effective_stage == "ready":
+                        active = False
                 self._model_loading_state["active"] = active
             if model_name is not None:
                 self._model_loading_state["model_name"] = model_name
@@ -60734,6 +60810,13 @@ class JarvisSystemKernel:
                 if self._narrator:
                     await self._narrator.narrate_zone_complete(4, success=True)
 
+            # v242.3: Defensive cleanup — ensure model loading state is cleared
+            # before entering Two-Tier Security phase. If EarlyPrime or InvincibleNode
+            # detection left _model_loading_state["active"] = True, the ProgressController
+            # would see has_active_subsystem=True during Phase 4.5, suppressing stall
+            # detection and causing a 916s hang until the hard cap fires.
+            update_dashboard_model_loading(active=False)
+
             await self._broadcast_startup_progress(
                 stage="intelligence",
                 message="Intelligence layer ready - initializing Two-Tier Security...",
@@ -63106,8 +63189,16 @@ class JarvisSystemKernel:
                         get_cross_repo_initializer,
                     )
 
-                    # Initialize cross-repo communication
-                    self._cross_repo_initialized = await initialize_cross_repo_state()
+                    # v242.3: Initialize cross-repo communication with timeout.
+                    # This is file I/O + DLM initialization — should complete in <5s.
+                    # Without a timeout, a stale DLM lock or hung filesystem blocks
+                    # startup indefinitely at 58% (the ProgressController can't help if
+                    # has_active_subsystem is True due to the model loading state leak).
+                    _cross_repo_timeout = float(os.environ.get("JARVIS_CROSS_REPO_INIT_TIMEOUT", "30.0"))
+                    self._cross_repo_initialized = await asyncio.wait_for(
+                        initialize_cross_repo_state(),
+                        timeout=_cross_repo_timeout,
+                    )
 
                     self._two_tier_status["cross_repo"] = {
                         "status": "active" if self._cross_repo_initialized else "failed",
@@ -63118,6 +63209,15 @@ class JarvisSystemKernel:
                     else:
                         self.logger.warning("[TwoTier] ⚠ Cross-Repo State failed to initialize")
 
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"[TwoTier] Cross-Repo init timed out ({_cross_repo_timeout}s) — "
+                        "possible stale DLM lock or hung filesystem. Continuing without cross-repo."
+                    )
+                    self._two_tier_status["cross_repo"] = {
+                        "status": "timeout",
+                        "initialized": False,
+                    }
                 except ImportError as e:
                     self.logger.warning(f"[TwoTier] Cross-Repo module not available: {e}")
                     self._two_tier_status["cross_repo"]["status"] = "unavailable"

@@ -1212,10 +1212,24 @@ class AsyncModelManager:
         self._config = config or get_config()
         self._proxies: Dict[str, GhostModelProxy] = {}
         self._load_order: List[str] = []
+        # v242.4: Daemon thread factory — prevents ai_loader_0 from blocking
+        # process exit when a model is still loading during shutdown.
+        # Non-daemon workers forced os._exit(1) which skips atexit handlers.
         self._executor = ThreadPoolExecutor(
             max_workers=self._config.max_workers,
             thread_name_prefix="ai_loader",
         )
+        # Patch workers to daemon (same technique as ManagedThreadPoolExecutor)
+        _original_adjust = self._executor._adjust_thread_count
+        _executor_ref = self._executor
+
+        def _daemon_adjust():
+            _original_adjust()
+            for t in _executor_ref._threads:
+                if not t.daemon:
+                    t.daemon = True
+
+        self._executor._adjust_thread_count = _daemon_adjust
         self._lock = threading.RLock()
         self._shutdown = False
         self._total_memory_bytes = 0
