@@ -1784,6 +1784,11 @@ class JARVISVoiceAPI:
 
             monitor = get_display_monitor()
 
+            # v242.5: Guard against None monitor — get_display_monitor()
+            # returns None if display subsystem hasn't initialized yet.
+            if monitor is None:
+                raise AttributeError("Display monitor not initialized")
+
             # Debug logging
             logger.info(
                 f"[JARVIS CMD] Display check - pending_prompt: {getattr(monitor, 'pending_prompt_display', None)}, has_pending: {monitor.has_pending_prompt()}"
@@ -3262,6 +3267,11 @@ class JARVISVoiceAPI:
                                 from display import get_display_monitor
 
                                 monitor = get_display_monitor()
+
+                                # v242.5: Guard against None monitor — get_display_monitor()
+                                # returns None if display subsystem hasn't initialized yet.
+                                if monitor is None:
+                                    raise AttributeError("Display monitor not initialized")
 
                                 # Debug logging
                                 logger.info(
