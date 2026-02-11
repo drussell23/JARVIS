@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
@@ -161,6 +162,7 @@ class AGIOSCoordinator:
         self._jarvis_bridge: Optional[Any] = None  # v237.0: JARVISNeuralMeshBridge
         self._event_bridge: Optional[Any] = None  # v237.2: NeuralMesh ↔ EventStream bridge
         self._notification_monitor: Optional[Any] = None  # v237.2: macOS notification listener
+        self._system_event_monitor: Optional[Any] = None  # v237.3: macOS system event listener
 
         # Hybrid Orchestrator
         self._hybrid_orchestrator: Optional[Any] = None
@@ -305,6 +307,21 @@ class AGIOSCoordinator:
             except Exception as e:
                 logger.warning("Error stopping NotificationMonitor: %s", e)
 
+        # v237.3: Stop system event monitor
+        if self._system_event_monitor:
+            try:
+                from macos_helper.system_event_monitor import stop_system_event_monitor
+                await stop_system_event_monitor()
+            except Exception as e:
+                logger.warning("Error stopping SystemEventMonitor: %s", e)
+
+        # v237.3: Stop screen analyzer (stop monitoring before event stream stops)
+        if self._screen_analyzer:
+            try:
+                await self._screen_analyzer.stop_monitoring()
+            except Exception as e:
+                logger.warning("Error stopping screen analyzer: %s", e)
+
         # Stop components in reverse order
         await stop_action_orchestrator()
         await stop_event_stream()
@@ -430,6 +447,23 @@ class AGIOSCoordinator:
             logger.warning("NotificationMonitor not available: %s", e)
             self._component_status['notification_monitor'] = ComponentStatus(
                 name='notification_monitor',
+                available=False,
+                error=str(e)
+            )
+
+        # v237.3: Start macOS system event monitor (app focus, idle, sleep/wake, spaces)
+        try:
+            from macos_helper.system_event_monitor import get_system_event_monitor
+            self._system_event_monitor = await get_system_event_monitor(auto_start=True)
+            self._component_status['system_event_monitor'] = ComponentStatus(
+                name='system_event_monitor',
+                available=True
+            )
+            logger.info("SystemEventMonitor started")
+        except Exception as e:
+            logger.warning("SystemEventMonitor not available: %s", e)
+            self._component_status['system_event_monitor'] = ComponentStatus(
+                name='system_event_monitor',
                 available=False,
                 error=str(e)
             )
@@ -612,20 +646,49 @@ class AGIOSCoordinator:
             )
 
     async def _init_screen_analyzer(self) -> None:
-        """Initialize screen analyzer for proactive monitoring."""
+        """Initialize screen analyzer for proactive monitoring.
+
+        v237.3: Fully wired. Uses ClaudeVisionAnalyzer as the vision handler
+        (provides both capture_screen() and describe_screen(params) that
+        MemoryAwareScreenAnalyzer requires). Connected to EventStream via
+        ScreenAnalyzerBridge for proactive detection.
+        """
         if not self._config['enable_proactive_monitoring']:
             return
 
         try:
+            from vision.claude_vision_analyzer_main import ClaudeVisionAnalyzer
             from vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer
-            # Note: Full initialization would require vision_handler
-            # For now, we mark it as available but not started
+            from .jarvis_integration import connect_screen_analyzer
+
+            # ClaudeVisionAnalyzer provides both capture_screen() and
+            # describe_screen(params) — the exact interface MemoryAwareScreenAnalyzer needs
+            api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+            if not api_key:
+                logger.warning("Screen analyzer disabled: ANTHROPIC_API_KEY not set")
+                self._component_status['screen_analyzer'] = ComponentStatus(
+                    name='screen_analyzer',
+                    available=False,
+                    error='ANTHROPIC_API_KEY not set'
+                )
+                return
+
+            vision_handler = ClaudeVisionAnalyzer(api_key=api_key)
+            self._screen_analyzer = MemoryAwareScreenAnalyzer(vision_handler)
+            await self._screen_analyzer.start_monitoring()
+
+            # Bridge to event stream for proactive detection
+            await connect_screen_analyzer(
+                self._screen_analyzer,
+                enable_claude_vision=True,
+            )
+
             self._component_status['screen_analyzer'] = ComponentStatus(
                 name='screen_analyzer',
                 available=True,
                 healthy=True
             )
-            logger.info("Screen analyzer ready (requires vision handler)")
+            logger.info("Screen analyzer initialized and monitoring")
         except Exception as e:
             logger.warning("Screen analyzer not available: %s", e)
             self._component_status['screen_analyzer'] = ComponentStatus(
@@ -636,8 +699,6 @@ class AGIOSCoordinator:
 
     async def _connect_components(self) -> None:
         """Connect components together."""
-        # Connect screen analyzer to event stream
-        # (This would be done when screen analyzer is fully initialized)
 
         # Connect approval callbacks
         if self._approval_manager and self._event_stream:
