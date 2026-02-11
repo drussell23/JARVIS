@@ -573,8 +573,29 @@ class CoordinateExtractor:
     def screen_size(self) -> Tuple[int, int]:
         """Get screen size (width, height)."""
         if not self._calibrated:
-            asyncio.get_event_loop().run_until_complete(self.calibrate())
+            self._calibrate_sync()
         return self._screen_width or 1920, self._screen_height or 1080
+
+    def _calibrate_sync(self) -> bool:
+        """Synchronous calibration — safe to call from any context."""
+        try:
+            import pyautogui
+            self._screen_width, self._screen_height = pyautogui.size()
+            if platform.system() == "Darwin":
+                try:
+                    from AppKit import NSScreen
+                    main_screen = NSScreen.mainScreen()
+                    if main_screen:
+                        self._is_retina = main_screen.backingScaleFactor() > 1.0
+                except ImportError:
+                    self._is_retina = True
+            else:
+                self._is_retina = False
+            self._calibrated = True
+            return True
+        except Exception as e:
+            logger.error(f"[CoordinateExtractor] Sync calibration failed: {e}")
+            return False
 
     @property
     def grid_unit_size(self) -> Tuple[float, float]:

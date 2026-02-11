@@ -1241,14 +1241,13 @@ class HybridOrchestrator:
                 engine.set_narration_style(style_map[style])
                 logger.info(f"🎤 Narration style set to: {style}")
 
-        # Run async function
+        # Run async function — avoid nested event loop crash.
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(_set_style())
-            else:
-                loop.run_until_complete(_set_style())
+            loop = asyncio.get_running_loop()
+            # Loop is running: schedule as a task (safe).
+            loop.create_task(_set_style())
         except RuntimeError:
+            # No running loop: safe to create one.
             asyncio.run(_set_style())
 
     # ============== PHASE 3.1: LLM Helper Methods ==============

@@ -1168,55 +1168,89 @@ def cleanup_orphaned_semaphores_on_startup() -> Dict[str, Any]:
 def register_handlers() -> None:
     """
     Register signal and atexit handlers.
-    
+
+    v237.0: Registers with central SignalDispatcher when available,
+    falling back to direct signal.signal() if the kernel module is
+    not importable.
+
     This is called automatically when the module is imported,
     but can also be called manually to re-register after fork.
     """
     global _original_sigterm, _original_sigint, _handlers_registered
-    
+
     if _handlers_registered:
         logger.debug("Handlers already registered")
         return
-    
+
     try:
-        # Register signal handlers (preserve originals for chaining)
+        # Prefer the central SignalDispatcher (prevents clobbering).
+        from backend.kernel.signals import get_signal_dispatcher
+        dispatcher = get_signal_dispatcher()
+        dispatcher.register(
+            signal.SIGTERM,
+            _signal_handler,
+            name="shutdown_hook",
+            priority=50,
+        )
+        dispatcher.register(
+            signal.SIGINT,
+            _signal_handler,
+            name="shutdown_hook",
+            priority=50,
+        )
+        # No originals to save — the dispatcher owns the OS handler.
+        _original_sigterm = None
+        _original_sigint = None
+        logger.debug("Shutdown hook registered via central SignalDispatcher @ priority 50")
+    except ImportError:
+        # Fallback: direct installation (preserves originals for chaining)
         _original_sigterm = signal.signal(signal.SIGTERM, _signal_handler)
         _original_sigint = signal.signal(signal.SIGINT, _signal_handler)
-        
+        logger.debug("Shutdown hook registered via direct signal.signal() (fallback)")
+
+    try:
         # Register atexit handler
         atexit.register(_atexit_handler)
-        
+
         _handlers_registered = True
-        logger.debug("✅ Shutdown hook handlers registered (SIGTERM, SIGINT, atexit)")
-        
+        logger.debug("Shutdown hook handlers registered (SIGTERM, SIGINT, atexit)")
+
     except Exception as e:
-        logger.warning(f"⚠️ Failed to register some handlers: {e}")
+        logger.warning(f"Failed to register some handlers: {e}")
 
 
 def unregister_handlers() -> None:
     """
     Unregister signal handlers and restore originals.
-    
+
     Useful for testing or when forking processes.
     """
     global _original_sigterm, _original_sigint, _handlers_registered
-    
+
     if not _handlers_registered:
         return
-    
+
     try:
-        if _original_sigterm is not None:
-            signal.signal(signal.SIGTERM, _original_sigterm)
-        if _original_sigint is not None:
-            signal.signal(signal.SIGINT, _original_sigint)
-        
+        # Try dispatcher-based removal first
+        try:
+            from backend.kernel.signals import get_signal_dispatcher
+            dispatcher = get_signal_dispatcher()
+            dispatcher.unregister(signal.SIGTERM, _signal_handler)
+            dispatcher.unregister(signal.SIGINT, _signal_handler)
+        except ImportError:
+            # Fallback: restore originals directly
+            if _original_sigterm is not None:
+                signal.signal(signal.SIGTERM, _original_sigterm)
+            if _original_sigint is not None:
+                signal.signal(signal.SIGINT, _original_sigint)
+
         # Note: atexit handlers can't be easily unregistered
-        
+
         _handlers_registered = False
-        logger.debug("✅ Shutdown hook handlers unregistered")
-        
+        logger.debug("Shutdown hook handlers unregistered")
+
     except Exception as e:
-        logger.warning(f"⚠️ Failed to unregister handlers: {e}")
+        logger.warning(f"Failed to unregister handlers: {e}")
 
 
 # ============================================================================

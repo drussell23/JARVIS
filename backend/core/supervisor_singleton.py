@@ -1839,7 +1839,7 @@ class HTTPHealthStrategy(HealthCheckStrategy):
                 if response.status == 200:
                     try:
                         data = json.loads(response.read().decode())
-                    except:
+                    except Exception:
                         data = {}
                     return HealthCheckResult(
                         healthy=True,
@@ -4372,6 +4372,28 @@ def _setup_sighup_handler() -> None:
         args = [python] + filtered_argv
         logger.info(f"[Singleton] Executing: {' '.join(args[:5])}...")
 
+        # v237.0: Pre-execv cleanup — os.execv() bypasses atexit handlers,
+        # doesn't flush Python buffers, and doesn't release fcntl locks.
+        # Run critical cleanup that atexit would normally handle.
+        try:
+            from backend.scripts.shutdown_hook import cleanup_remote_resources_sync
+            cleanup_remote_resources_sync(timeout=5.0, reason="SIGHUP restart (pre-execv)")
+            logger.debug("[Singleton] v237.0: Pre-execv remote resource cleanup complete")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Pre-execv cleanup warning: {e}")
+
+        # v237.0: Flush all Python I/O buffers before process replacement.
+        # Without this, buffered log lines and print() output can be lost.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # Flush the logging system too
+            logging.shutdown()
+        except Exception:
+            pass
+
         # v120.0: Update RestartMarker phase right before execv
         try:
             RestartMarker.update_phase("execv_triggered")
@@ -4405,10 +4427,17 @@ def _setup_sighup_handler() -> None:
             # Exit cleanly since we can't restart
             os._exit(1)
 
-    # Install the handler
-    signal.signal(signal.SIGHUP, _handle_sighup)
+    # Install the handler via the central SignalDispatcher when available.
+    try:
+        from backend.kernel.signals import get_signal_dispatcher
+        get_signal_dispatcher().register(
+            signal.SIGHUP, _handle_sighup,
+            name="supervisor_singleton_restart", priority=100,
+        )
+    except ImportError:
+        signal.signal(signal.SIGHUP, _handle_sighup)
     _sighup_handler_installed = True
-    logger.debug("[Singleton] v109.4: SIGHUP handler installed for clean restart")
+    logger.debug("[Singleton] v237.0: SIGHUP handler installed for clean restart")
 
 
 def setup_restart_handlers() -> None:

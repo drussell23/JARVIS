@@ -1022,9 +1022,18 @@ class CoordinatedShutdownManager:
         }
 
         try:
-            with open(state_file, "w") as f:
-                json.dump(state, f, indent=2)
-            logger.info(f"[ShutdownManager] State saved to {state_file}")
+            import tempfile
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".tmp", dir=state_file.parent,
+            )
+            try:
+                os.write(fd, json.dumps(state, indent=2).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp_path, str(state_file))
+            logger.info(f"[ShutdownManager] State saved atomically to {state_file}")
         except Exception as e:
             logger.warning(f"[ShutdownManager] Failed to save state: {e}")
 

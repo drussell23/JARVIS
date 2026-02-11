@@ -2419,8 +2419,13 @@ class UnifiedCodingCouncil:
         if self._event_store:
             try:
                 import asyncio
-                stats_coro = self._event_store.get_statistics()
-                module_details["event_store"] = asyncio.get_event_loop().run_until_complete(stats_coro) if asyncio.get_event_loop().is_running() else {"status": "running"}
+                try:
+                    asyncio.get_running_loop()
+                    # Loop is running — can't call run_until_complete.
+                    module_details["event_store"] = {"status": "running"}
+                except RuntimeError:
+                    # No running loop — safe to drive the coroutine.
+                    module_details["event_store"] = asyncio.run(self._event_store.get_statistics())
             except Exception:
                 module_details["event_store"] = {"status": "running"}
 

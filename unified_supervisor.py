@@ -51912,7 +51912,7 @@ class UnifiedSignalHandler:
 
     def install(self, loop: asyncio.AbstractEventLoop) -> None:
         """
-        Install signal handlers on the event loop.
+        Install signal handlers via the central SignalDispatcher.
 
         Args:
             loop: The running asyncio event loop
@@ -51922,22 +51922,51 @@ class UnifiedSignalHandler:
 
         self._loop = loop
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                # Unix: Use async-safe loop.add_signal_handler
-                loop.add_signal_handler(
+        # Register with the central SignalDispatcher instead of
+        # calling loop.add_signal_handler() directly.  This prevents
+        # clobbering handlers installed by shutdown_hook or other modules.
+        try:
+            from backend.kernel.signals import get_signal_dispatcher
+            dispatcher = get_signal_dispatcher()
+            dispatcher.set_loop(loop)
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                dispatcher.register(
                     sig,
-                    lambda s=sig: self._schedule_signal_handling(s)
+                    self._dispatcher_callback,
+                    name="UnifiedSignalHandler",
+                    priority=100,
                 )
-            except NotImplementedError:
-                # Windows doesn't support add_signal_handler
-                signal.signal(sig, lambda s, f, sig=sig: self._sync_handle_signal(sig))
-            except Exception as e:
-                # Log but don't fail - signal handling is best-effort
-                print(f"[Kernel] Warning: Could not install handler for {sig.name}: {e}")
+        except ImportError:
+            # Fallback: direct installation if kernel.signals not available
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(
+                        sig,
+                        lambda s=sig: self._schedule_signal_handling(s)
+                    )
+                except NotImplementedError:
+                    signal.signal(sig, lambda s, f, sig=sig: self._sync_handle_signal(sig))
+                except Exception as e:
+                    print(f"[Kernel] Warning: Could not install handler for {sig.name}: {e}")
 
         self._installed = True
         print("[Kernel] Unified signal handlers installed (SIGINT, SIGTERM)")
+
+    def _dispatcher_callback(self, signum: int, frame: Any) -> None:
+        """
+        Callback invoked by the central SignalDispatcher.
+
+        Bridges from the sync signal context into async handling
+        when an event loop is available.
+        """
+        if self._loop is not None and self._loop.is_running():
+            try:
+                sig = signal.Signals(signum)
+            except (ValueError, AttributeError):
+                sig = signum
+            self._schedule_signal_handling(sig)
+        else:
+            self._sync_handle_signal(signum)
 
     def _schedule_signal_handling(self, sig: signal.Signals) -> None:
         """

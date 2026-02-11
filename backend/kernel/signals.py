@@ -428,26 +428,40 @@ class KernelSignalHandler:
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
         """
-        Install signal handlers.
-        
+        Install signal handlers via the central SignalDispatcher.
+
         Args:
             shutdown_coordinator: Coordinator for graceful shutdown
             loop: Event loop for async signal handling
         """
         self._shutdown_coordinator = shutdown_coordinator or ShutdownCoordinator()
         self._loop = loop
-        
-        # Install handlers for common signals
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        
+
+        # Register with the central dispatcher instead of calling
+        # signal.signal() directly.  Priority 200 = fallback handler.
+        dispatcher = get_signal_dispatcher()
+        if loop is not None:
+            dispatcher.set_loop(loop)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            dispatcher.register(
+                sig, self._handle_signal,
+                name="KernelSignalHandler", priority=200,
+            )
+
         if hasattr(signal, 'SIGHUP'):
-            signal.signal(signal.SIGHUP, self._handle_signal)
-        
+            dispatcher.register(
+                signal.SIGHUP, self._handle_signal,
+                name="KernelSignalHandler", priority=200,
+            )
+
         if hasattr(signal, 'SIGUSR1'):
-            signal.signal(signal.SIGUSR1, self._handle_signal)
-        
-        logger.debug("[KernelSignalHandler] Signal handlers installed")
+            dispatcher.register(
+                signal.SIGUSR1, self._handle_signal,
+                name="KernelSignalHandler", priority=200,
+            )
+
+        logger.debug("[KernelSignalHandler] Signal handlers installed via dispatcher")
     
     def _handle_signal(self, signum: int, frame: Any) -> None:
         """Handle received signal."""
@@ -494,6 +508,142 @@ class KernelSignalHandler:
 
 
 # =============================================================================
+# CENTRAL SIGNAL DISPATCHER
+# =============================================================================
+
+@dataclass(order=True)
+class _PrioritizedCallback:
+    """A callback with a priority for ordered dispatch."""
+    priority: int
+    name: str = field(compare=False)
+    callback: Callable[[int, Any], None] = field(compare=False)
+
+
+class SignalDispatcher:
+    """
+    Central, authoritative signal dispatcher.
+
+    All components MUST register callbacks here instead of calling
+    ``signal.signal()`` or ``loop.add_signal_handler()`` directly.
+    The dispatcher owns the OS-level handler and fans out to callbacks
+    in ascending priority order (lower number = called first).
+
+    Priority guide:
+        10  - Forensic logging / diagnostics (shutdown_hook)
+        50  - Resource cleanup (shutdown_hook cleanup)
+        100 - Kernel shutdown coordination (UnifiedSignalHandler)
+        200 - KernelSignalHandler fallback
+
+    Thread-safety: Registration is guarded by a threading lock.
+    Callbacks are invoked from the signal-handler context (sync) or
+    from an asyncio loop callback (when an event loop is available).
+    """
+
+    _instance: Optional["SignalDispatcher"] = None
+
+    def __new__(cls) -> "SignalDispatcher":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._init_done = False
+        return cls._instance
+
+    def __init__(self) -> None:
+        if self._init_done:
+            return
+        self._init_done = True
+        self._lock = threading.Lock()
+        # signal_num -> sorted list of _PrioritizedCallback
+        self._callbacks: Dict[int, List[_PrioritizedCallback]] = {}
+        self._installed_signals: Set[int] = set()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    # ── public API ──────────────────────────────────────────────────────
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Store the running event loop for async-aware dispatch."""
+        self._loop = loop
+
+    def register(
+        self,
+        sig: int,
+        callback: Callable[[int, Any], None],
+        *,
+        name: str = "",
+        priority: int = 100,
+    ) -> None:
+        """
+        Register a callback for *sig*.
+
+        Args:
+            sig:      Signal number (e.g. ``signal.SIGINT``).
+            callback: ``(signum, frame) -> None``.  Called in priority order.
+            name:     Human-readable label (for logging).
+            priority: Lower = called first.  See class docstring for guide.
+        """
+        entry = _PrioritizedCallback(priority=priority, name=name or repr(callback), callback=callback)
+        with self._lock:
+            self._callbacks.setdefault(sig, []).append(entry)
+            self._callbacks[sig].sort()  # maintain priority order
+            self._ensure_os_handler(sig)
+        logger.debug(
+            f"[SignalDispatcher] Registered '{entry.name}' for "
+            f"{get_signal_name(sig)} @ priority {priority}"
+        )
+
+    def unregister(self, sig: int, callback: Callable[[int, Any], None]) -> bool:
+        """Remove a previously registered callback.  Returns True if found."""
+        with self._lock:
+            entries = self._callbacks.get(sig, [])
+            for i, entry in enumerate(entries):
+                if entry.callback is callback:
+                    entries.pop(i)
+                    logger.debug(
+                        f"[SignalDispatcher] Unregistered '{entry.name}' "
+                        f"from {get_signal_name(sig)}"
+                    )
+                    return True
+        return False
+
+    # ── internals ───────────────────────────────────────────────────────
+
+    def _ensure_os_handler(self, sig: int) -> None:
+        """Install our master handler on the OS for *sig* (idempotent)."""
+        if sig in self._installed_signals:
+            return
+        try:
+            signal.signal(sig, self._dispatch)
+            self._installed_signals.add(sig)
+        except (OSError, ValueError):
+            pass  # e.g. SIGKILL, or not main thread
+
+    def _dispatch(self, signum: int, frame: Any) -> None:
+        """Master OS handler — fans out to registered callbacks."""
+        with self._lock:
+            entries = list(self._callbacks.get(signum, []))
+
+        for entry in entries:
+            try:
+                entry.callback(signum, frame)
+            except Exception:
+                logger.exception(
+                    f"[SignalDispatcher] Callback '{entry.name}' "
+                    f"raised on {get_signal_name(signum)}"
+                )
+
+
+# Module-level singleton accessor
+_signal_dispatcher: Optional[SignalDispatcher] = None
+
+
+def get_signal_dispatcher() -> SignalDispatcher:
+    """Get the global SignalDispatcher singleton."""
+    global _signal_dispatcher
+    if _signal_dispatcher is None:
+        _signal_dispatcher = SignalDispatcher()
+    return _signal_dispatcher
+
+
+# =============================================================================
 # SINGLETON ACCESS
 # =============================================================================
 
@@ -525,7 +675,7 @@ def get_shutdown_coordinator() -> Optional[ShutdownCoordinator]:
 def protected_section(name: str = "unknown"):
     """
     Context manager for signal-protected code sections.
-    
+
     Usage:
         with protected_section("startup"):
             # Critical code
@@ -537,7 +687,7 @@ def protected_section(name: str = "unknown"):
 def protect(name: str = "decorated"):
     """
     Decorator for protecting functions from signals.
-    
+
     Usage:
         @protect("initialization")
         async def init_components():

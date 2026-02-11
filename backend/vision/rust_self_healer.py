@@ -35,9 +35,63 @@ except ImportError:
     def register_executor_for_cleanup(*args, **kwargs):
         pass  # No-op fallback
 
+import fcntl
 import aiofiles
 
 logger = logging.getLogger(__name__)
+
+# v237.0: File-lock guard for maturin/cargo builds.
+# Prevents concurrent builds from corrupting the target directory.
+_BUILD_LOCK_PATH = Path(__file__).parent / "jarvis-rust-core" / ".build.lock"
+
+
+class _BuildLock:
+    """
+    Non-blocking, advisory file lock for Rust builds.
+
+    Usage::
+
+        async with _BuildLock() as acquired:
+            if not acquired:
+                logger.info("Build already in progress elsewhere")
+                return
+            # ... safe to build ...
+    """
+
+    def __init__(self, timeout: float = 0):
+        self._fd: Optional[int] = None
+        self._timeout = timeout
+
+    async def __aenter__(self) -> bool:
+        _BUILD_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(str(_BUILD_LOCK_PATH), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (OSError, BlockingIOError):
+            # Another build holds the lock.
+            if self._timeout > 0:
+                # Wait with periodic retry.
+                deadline = asyncio.get_event_loop().time() + self._timeout
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(2)
+                    try:
+                        fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        return True
+                    except (OSError, BlockingIOError):
+                        continue
+            os.close(self._fd)
+            self._fd = None
+            return False
+
+    async def __aexit__(self, *exc_info) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(self._fd)
+            self._fd = None
 
 class RustIssueType(Enum):
     """Types of issues that can prevent Rust from working."""
@@ -614,27 +668,25 @@ class RustSelfHealer:
         if not self._ensure_maturin_project():
             logger.error("Cannot build Rust components without pyproject.toml")
             return False
-        
-        # Check if a build is already running
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                if proc.info['name'] == 'cargo' and any('build' in arg for arg in proc.info['cmdline']):
-                    logger.info(f"Cargo build already running (PID: {proc.info['pid']}), waiting for it to complete...")
-                    # Wait a bit and check if build completed
-                    await asyncio.sleep(10)
-                    if await self._quick_validate_rust():
-                        logger.info("✅ Rust components built by external process!")
-                        return True
-                    else:
-                        logger.info("External build still in progress, continuing with our strategies...")
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
+
+        # v237.0: Acquire file-lock to prevent concurrent maturin/cargo builds.
+        # Replaces the racy psutil.process_iter() check with a proper advisory lock.
+        async with _BuildLock(timeout=120) as acquired:
+            if not acquired:
+                logger.info("Another Rust build is in progress (lock held); skipping")
+                # The other build may succeed — validate before giving up.
+                await asyncio.sleep(5)
+                return await self._quick_validate_rust()
+
+            return await self._build_rust_components_locked(retry_count, max_retries)
+
+    async def _build_rust_components_locked(self, retry_count: int, max_retries: int) -> bool:
+        """Inner build logic — must be called with _BuildLock held."""
         # Check if we can do a quick validation first
         if await self._quick_validate_rust():
             logger.info("✅ Rust components already built and working!")
             return True
-        
+
         # Prepare multiple build strategies to run concurrently
         build_strategies = [
             self._try_cached_build(),
