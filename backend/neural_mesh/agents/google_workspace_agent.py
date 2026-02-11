@@ -3789,11 +3789,15 @@ async def get_google_workspace_agent() -> Optional["GoogleWorkspaceAgent"]:
     """
     global _workspace_agent_instance
     if _workspace_agent_instance is not None:
-        return _workspace_agent_instance
+        # Staleness check — don't return a stopped/dead agent
+        if hasattr(_workspace_agent_instance, '_running') and not _workspace_agent_instance._running:
+            _workspace_agent_instance = None
+        else:
+            return _workspace_agent_instance
 
     # Tier 1: Try the running Neural Mesh (without triggering creation)
     try:
-        from backend.neural_mesh.neural_mesh_coordinator import _coordinator
+        from neural_mesh.neural_mesh_coordinator import _coordinator
         if _coordinator is not None and _coordinator._running:
             for agent in _coordinator.get_all_agents():
                 if isinstance(agent, GoogleWorkspaceAgent):

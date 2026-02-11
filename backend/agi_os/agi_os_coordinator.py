@@ -158,6 +158,7 @@ class AGIOSCoordinator:
 
         # Neural Mesh
         self._neural_mesh: Optional[Any] = None
+        self._jarvis_bridge: Optional[Any] = None  # v237.0: JARVISNeuralMeshBridge
 
         # Hybrid Orchestrator
         self._hybrid_orchestrator: Optional[Any] = None
@@ -292,7 +293,16 @@ class AGIOSCoordinator:
         await stop_event_stream()
         await stop_voice_communicator()
 
-        # Stop Neural Mesh
+        # v237.0: Stop JARVIS Bridge first (stops adapter agents, cancels startup tasks)
+        if self._jarvis_bridge:
+            try:
+                await self._jarvis_bridge.stop()
+            except Exception as e:
+                logger.warning("Error stopping JARVIS Bridge: %s", e)
+
+        # Stop Neural Mesh (stops production agents, bus, registry, orchestrator)
+        # Note: bridge.stop() above already calls coordinator.stop() internally.
+        # This second call is a defensive no-op (coordinator.stop() is idempotent).
         if self._neural_mesh:
             try:
                 await self._neural_mesh.stop()
@@ -516,12 +526,26 @@ class AGIOSCoordinator:
             self._neural_mesh = await start_neural_mesh()
 
             # v237.0: Register production agents (previously only called from deprecated supervisor)
+            n_production = 0
             try:
                 from neural_mesh.agents.agent_initializer import initialize_production_agents
                 registered = await initialize_production_agents(self._neural_mesh)
-                logger.info("Neural Mesh started with %d production agents", len(registered))
+                n_production = len(registered)
             except Exception as agent_exc:
                 logger.warning("Production agent initialization failed (mesh still running): %s", agent_exc)
+
+            # v237.0: Wire system adapters (voice, vision, intelligence, autonomy)
+            # Bridge uses the same coordinator singleton — no conflict with production agents
+            n_adapters = 0
+            try:
+                from neural_mesh import start_jarvis_neural_mesh
+                self._jarvis_bridge = await start_jarvis_neural_mesh()
+                n_adapters = len(self._jarvis_bridge.registered_agents) if hasattr(self._jarvis_bridge, 'registered_agents') else 0
+            except Exception as bridge_exc:
+                logger.warning("JARVIS Neural Mesh Bridge failed (mesh still running): %s", bridge_exc)
+
+            total = len(self._neural_mesh.get_all_agents()) if hasattr(self._neural_mesh, 'get_all_agents') else n_production + n_adapters
+            logger.info("Neural Mesh started: %d agents total (%d production, %d adapters)", total, n_production, n_adapters)
 
             self._component_status['neural_mesh'] = ComponentStatus(
                 name='neural_mesh',

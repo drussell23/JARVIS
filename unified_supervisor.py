@@ -59172,7 +59172,7 @@ class JarvisSystemKernel:
         except asyncio.TimeoutError:
             self.logger.debug("[Kernel] AGI OS stop timed out (10s)")
         except Exception as e:
-            self.logger.debug("[Kernel] AGI OS cleanup error: %s", e)
+            self.logger.debug(f"[Kernel] AGI OS cleanup error: {e}")
 
         # Kill backend immediately
         if self._backend_process:
