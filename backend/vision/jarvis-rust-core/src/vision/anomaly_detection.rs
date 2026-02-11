@@ -411,7 +411,7 @@ impl AnomalyDetector {
 }
 
 /// Python bindings
-#[cfg(feature = "python")]
+#[cfg(feature = "python-bindings")]
 pub mod python {
     use super::*;
     use pyo3::prelude::*;

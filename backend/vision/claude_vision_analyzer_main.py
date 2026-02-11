@@ -2100,7 +2100,18 @@ class ClaudeVisionAnalyzer:
                 # Setup Rust pipeline if enabled
                 if self._orchestrator_config["use_rust_pipeline"]:
                     try:
-                        from .jarvis_rust_core.vision import IntegrationPipeline
+                        try:
+                            from jarvis_rust_core.vision import IntegrationPipeline
+                        except Exception:
+                            from .jarvis_rust_core import jrc as _jrc
+
+                            if (
+                                _jrc is None
+                                or not hasattr(_jrc, "vision")
+                                or not hasattr(_jrc.vision, "IntegrationPipeline")
+                            ):
+                                raise
+                            IntegrationPipeline = _jrc.vision.IntegrationPipeline
 
                         rust_pipeline = IntegrationPipeline(
                             self._orchestrator_config["total_memory_mb"]

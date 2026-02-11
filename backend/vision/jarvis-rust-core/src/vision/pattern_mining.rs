@@ -437,7 +437,7 @@ impl PatternMiner {
 }
 
 /// Python FFI bindings
-#[cfg(feature = "python")]
+#[cfg(feature = "python-bindings")]
 pub mod python_bindings {
     use super::*;
     use pyo3::prelude::*;

@@ -128,6 +128,6 @@ strip = true
 
 # Lint configuration
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\", \"python\", \"gpu\"))"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\", \"python\", \"python-bindings\", \"gpu\", \"simd\", \"gpu-compute\", \"mimalloc\"))"] }
 
 # Note: M1-specific rustflags should be in .cargo/config.toml, not Cargo.toml

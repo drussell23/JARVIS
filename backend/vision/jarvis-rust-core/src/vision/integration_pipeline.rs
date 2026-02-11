@@ -459,7 +459,7 @@ pub struct ComponentMemory {
 }
 
 // Python bindings
-#[cfg(feature = "python")]
+#[cfg(feature = "python-bindings")]
 mod python_bindings {
     use super::*;
     use pyo3::prelude::*;

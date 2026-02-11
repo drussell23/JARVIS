@@ -171,6 +171,49 @@ class DynamicComponentLoader:
             class_name=class_name,
             performance_score=performance_score
         )
+
+    def _load_canonical_rust_loader(self):
+        """Load canonical Rust loader module (backend.vision.jarvis_rust_core)."""
+        try:
+            from . import jarvis_rust_core as canonical_loader
+            return canonical_loader
+        except Exception:
+            try:
+                import backend.vision.jarvis_rust_core as canonical_loader
+                return canonical_loader
+            except Exception:
+                return None
+
+    def _resolve_module(self, impl: ComponentImplementation) -> Optional[Any]:
+        """
+        Resolve implementation module/object.
+
+        Rust implementations are resolved through the canonical loader to avoid
+        accepting the local Python stub as a real Rust backend.
+        """
+        if impl.implementation == ImplementationType.RUST and impl.module_path.startswith("jarvis_rust_core"):
+            canonical = self._load_canonical_rust_loader()
+            if canonical is None:
+                return None
+
+            if not getattr(canonical, "RUST_AVAILABLE", False):
+                return None
+
+            rust_module = getattr(canonical, "jrc", None)
+            if rust_module is None:
+                return None
+
+            if impl.module_path == "jarvis_rust_core":
+                return rust_module
+
+            target = rust_module
+            for part in impl.module_path.split(".")[1:]:
+                target = getattr(target, part, None)
+                if target is None:
+                    return None
+            return target
+
+        return importlib.import_module(impl.module_path)
         
     async def start(self):
         """Start the dynamic component loader."""
@@ -304,8 +347,9 @@ class DynamicComponentLoader:
     async def _check_component_availability(self, impl: ComponentImplementation) -> bool:
         """Check if a specific component implementation is available."""
         try:
-            # Try to import the module
-            module = importlib.import_module(impl.module_path)
+            module = self._resolve_module(impl)
+            if module is None:
+                return False
             
             # Check if the class exists
             if hasattr(module, impl.class_name):
@@ -410,7 +454,9 @@ class DynamicComponentLoader:
     async def _load_component(self, impl: ComponentImplementation) -> Optional[Any]:
         """Load and instantiate a component."""
         try:
-            module = importlib.import_module(impl.module_path)
+            module = self._resolve_module(impl)
+            if module is None:
+                return None
             cls = getattr(module, impl.class_name)
             
             # Create instance with appropriate parameters
@@ -419,7 +465,7 @@ class DynamicComponentLoader:
             elif impl.type == ComponentType.SLIDING_WINDOW:
                 return cls(window_size=30, overlap_threshold=0.9)
             elif impl.type == ComponentType.ZERO_COPY_POOL:
-                return cls()
+                return cls(max_memory_mb=1024)
             elif impl.type == ComponentType.MEMORY_POOL:
                 return cls()
             elif impl.type == ComponentType.METAL_ACCELERATOR:
@@ -571,7 +617,6 @@ class DynamicComponentLoader:
 
 
 # Global instance
-import sys
 _component_loader: Optional[DynamicComponentLoader] = None
 
 def get_component_loader() -> DynamicComponentLoader:

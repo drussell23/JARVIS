@@ -435,6 +435,7 @@ mod python_bindings {
     #[pymethods]
     impl PyZeroCopyPool {
         #[new]
+        #[pyo3(signature = (max_memory_mb=1024))]
         fn new(max_memory_mb: usize) -> Self {
             Self {
                 pool: ZeroCopyPool::new(max_memory_mb),
