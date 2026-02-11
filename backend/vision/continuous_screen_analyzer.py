@@ -333,25 +333,60 @@ class MemoryAwareScreenAnalyzer:
             return 1024 * 1024  # Default 1MB
     
     async def _quick_screen_analysis(self) -> Dict[str, Any]:
-        """Perform quick analysis to detect major changes"""
-        params = {
-            'query': 'What application is currently in focus? Just name the app, nothing else.'
-        }
-        
-        result = await self.vision_handler.describe_screen(params)
-        
-        # Handle different result formats
-        if hasattr(result, 'success'):
-            app_name = result.description if result.success else 'Unknown'
-        elif isinstance(result, dict):
-            app_name = result.get('description', 'Unknown')
-        else:
-            app_name = 'Unknown'
-        
+        """Detect major screen changes using local APIs (zero API cost).
+
+        v237.3: Uses macOS NSWorkspace/osascript for focused app detection
+        instead of Claude API call. This runs every capture cycle (~3s) so
+        it MUST be local — describe_screen() is reserved for full analysis
+        only (gated by _needs_full_analysis()).
+        """
+        app_name = await self._get_focused_app_local()
+
         return {
             'current_app': app_name,
             'timestamp': time.time()
         }
+
+    async def _get_focused_app_local(self) -> str:
+        """Get focused application name using local macOS APIs.
+
+        Zero API cost. Fallback chain:
+        1. NSWorkspace (PyObjC) — <1ms, most reliable
+        2. osascript via subprocess — ~50ms, reliable fallback
+        3. 'Unknown' — safe default (triggers full analysis on first cycle)
+        """
+        # Method 1: PyObjC NSWorkspace (fastest, <1ms)
+        try:
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app:
+                name = app.localizedName()
+                if name:
+                    return name
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # Method 2: osascript fallback (~50ms)
+        try:
+            import subprocess
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ['osascript', '-e',
+                     'tell application "System Events" to get name of '
+                     'first application process whose frontmost is true'],
+                    capture_output=True, text=True, timeout=2
+                )
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+
+        return 'Unknown'
     
     async def _full_screen_analysis(self) -> Dict[str, Any]:
         """Perform comprehensive screen analysis with caching"""

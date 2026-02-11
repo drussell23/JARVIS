@@ -299,19 +299,21 @@ class AGIOSCoordinator:
             except Exception as e:
                 logger.warning("Error stopping event bridge: %s", e)
 
-        # v237.2: Stop notification monitor
+        # v237.3: Stop macOS monitors via instance .stop() — NOT the singleton
+        # destructors (stop_notification_monitor / stop_system_event_monitor).
+        # Singleton destructors null the global reference, which breaks other
+        # lifecycle managers (e.g. MacOSHelperCoordinator) that hold the same
+        # singleton. Instance .stop() is idempotent (checks _running) and
+        # preserves the global for potential restart by other coordinators.
         if self._notification_monitor:
             try:
-                from macos_helper.notification_monitor import stop_notification_monitor
-                await stop_notification_monitor()
+                await self._notification_monitor.stop()
             except Exception as e:
                 logger.warning("Error stopping NotificationMonitor: %s", e)
 
-        # v237.3: Stop system event monitor
         if self._system_event_monitor:
             try:
-                from macos_helper.system_event_monitor import stop_system_event_monitor
-                await stop_system_event_monitor()
+                await self._system_event_monitor.stop()
             except Exception as e:
                 logger.warning("Error stopping SystemEventMonitor: %s", e)
 
@@ -674,6 +676,37 @@ class AGIOSCoordinator:
                 return
 
             vision_handler = ClaudeVisionAnalyzer(api_key=api_key)
+
+            # v237.3: Permission pre-check — test capture before starting monitoring.
+            # macOS requires Screen Recording permission for Quartz/CGDisplay capture.
+            # Without it, capture returns None or unusably small images.
+            try:
+                test_capture = await vision_handler.capture_screen()
+                capture_ok = test_capture is not None
+                # Check for permission-denied indicators (1x1 or tiny images)
+                if capture_ok and hasattr(test_capture, 'size'):
+                    w, h = test_capture.size
+                    if w < 100 or h < 100:
+                        capture_ok = False
+                if capture_ok and hasattr(test_capture, 'shape'):
+                    if test_capture.shape[0] < 100 or test_capture.shape[1] < 100:
+                        capture_ok = False
+            except Exception:
+                capture_ok = False
+
+            if not capture_ok:
+                logger.warning(
+                    "Screen capture permission not granted. "
+                    "Grant Screen Recording permission in System Settings > "
+                    "Privacy & Security > Screen Recording, then restart JARVIS."
+                )
+                self._component_status['screen_analyzer'] = ComponentStatus(
+                    name='screen_analyzer',
+                    available=False,
+                    error='Screen Recording permission not granted'
+                )
+                return
+
             self._screen_analyzer = MemoryAwareScreenAnalyzer(vision_handler)
             await self._screen_analyzer.start_monitoring()
 
