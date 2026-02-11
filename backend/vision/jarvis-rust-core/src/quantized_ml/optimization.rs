@@ -135,7 +135,7 @@ impl ModelOptimizer {
             .map(|&val| val.abs())
             .collect();
         
-        magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        magnitudes.sort_by(|a, b| a.total_cmp(b));
         
         let cutoff_idx = (magnitudes.len() as f32 * self.config.pruning_threshold) as usize;
         magnitudes[cutoff_idx.min(magnitudes.len() - 1)]

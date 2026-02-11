@@ -166,7 +166,7 @@ impl UserStateDetector {
         }
         
         // Select highest scoring state
-        state_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        state_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
         let best_state = state_scores[0];
         
         // Update current state
@@ -376,10 +376,10 @@ impl UserStateDetector {
         signals.iter()
             .filter(|s| s.signal_type == SignalType::BackspaceRate)
             .map(|s| s.value)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(0.0)
     }
-    
+
     fn calculate_repetition_score(&self, signals: &[UserSignal]) -> f64 {
         // Look for repeated patterns in navigation
         let nav_signals: Vec<&UserSignal> = signals.iter()
@@ -463,9 +463,9 @@ impl TimingOptimizer {
             .take(10)
             .filter(|s| s.signal_type == SignalType::IdleTime)
             .map(|s| s.value)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(0.0);
-        
+
         // Check for context switches
         let switch_count = signals.iter()
             .rev()
@@ -520,9 +520,9 @@ impl TimingOptimizer {
             .take(20)
             .filter(|s| s.signal_type == SignalType::ErrorRate)
             .map(|s| s.value)
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(0.0);
-        
+
         let help_score = (help_signals as f64 / 5.0).min(1.0);
         let error_score = error_rate;
         

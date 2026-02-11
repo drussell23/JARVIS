@@ -431,7 +431,7 @@ mod tests {
     
     #[test]
     fn test_similarity_index() {
-        let index = SimilarityIndex::new(64, 5);
+        let mut index = SimilarityIndex::new(64, 5);
         
         let vec1 = vec![0.5; 64];
         let vec2 = vec![0.6; 64];

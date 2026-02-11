@@ -537,14 +537,12 @@ mod tests {
         let window = super::super::capture::WindowInfo {
             window_id: 1,
             app_name: "Terminal".to_string(),
-            window_title: "bash".to_string(),
+            title: "bash".to_string(),
+            owner_name: "Terminal".to_string(),
             bounds: CaptureRegion { x: 100, y: 100, width: 800, height: 600 },
-            is_visible: true,
-            is_minimized: false,
-            is_focused: true,
+            is_on_screen: true,
             layer: 0,
             alpha: 1.0,
-            pid: 1234,
         };
         
         tracker.update_positions(vec![window]);
@@ -560,14 +558,12 @@ mod tests {
             super::super::capture::WindowInfo {
                 window_id: 1,
                 app_name: "Chrome".to_string(),
-                window_title: "Tab 1".to_string(),
+                title: "Tab 1".to_string(),
+                owner_name: "Chrome".to_string(),
                 bounds: CaptureRegion { x: 0, y: 0, width: 100, height: 100 },
-                is_visible: true,
-                is_minimized: false,
-                is_focused: false,
+                is_on_screen: true,
                 layer: 0,
                 alpha: 1.0,
-                pid: 1000,
             },
         ];
         

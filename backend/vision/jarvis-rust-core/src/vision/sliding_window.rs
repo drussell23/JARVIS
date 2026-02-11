@@ -298,7 +298,7 @@ impl SlidingWindowCapture {
         }
         
         // Sort by priority (highest first)
-        windows.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap());
+        windows.sort_by(|a, b| b.priority.total_cmp(&a.priority));
         
         // Keep only top N windows based on memory constraints
         let max_windows = if available_memory_mb < memory_threshold_mb {

@@ -121,13 +121,14 @@ impl ImportanceCalculator {
         }
         
         // Process remainder
-        for &byte in remainder {
+        for i in 0..remainder.len() {
+            let byte = remainder[i];
             sum += byte as u32;
             sum_sq += (byte as u64) * (byte as u64);
-            
-            // Simple edge check
-            if remainder.len() > 1 {
-                let diff = (byte as i16 - remainder[1] as i16).abs();
+
+            // Edge check: compare adjacent elements
+            if i + 1 < remainder.len() {
+                let diff = (byte as i16 - remainder[i + 1] as i16).abs();
                 if diff > self.edge_threshold as i16 {
                     edge_count += 1;
                 }
@@ -403,7 +404,7 @@ impl SpatialQuadtree {
         regions.sort_by(|a, b| {
             let score_a = a.1 * (a.0.area() as f32);
             let score_b = b.1 * (b.0.area() as f32);
-            score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
+            score_b.total_cmp(&score_a)
         });
         
         regions.truncate(max_regions);
@@ -552,7 +553,7 @@ impl PartialEq for PriorityRegion {
 
 impl Ord for PriorityRegion {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority.partial_cmp(&other.priority).unwrap_or(Ordering::Equal)
+        self.priority.total_cmp(&other.priority)
     }
 }
 

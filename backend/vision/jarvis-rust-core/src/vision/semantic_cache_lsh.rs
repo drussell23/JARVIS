@@ -111,24 +111,27 @@ impl LSHIndex {
         for (bit_idx, projection) in projections.iter().enumerate() {
             let mut sum = _mm256_setzero_ps();
             
-            // Process 8 floats at a time
-            let chunks = vector.chunks_exact(8);
-            let remainder = chunks.remainder();
-            
-            for (i, chunk) in chunks.enumerate() {
-                let v = _mm256_loadu_ps(chunk.as_ptr());
+            // Process 8 floats at a time, bounded by both vector and projection length
+            let simd_len = vector.len().min(projection.len()) / 8;
+            let mut i = 0;
+
+            while i < simd_len {
+                let v = _mm256_loadu_ps(vector[i * 8..].as_ptr());
                 let p = _mm256_loadu_ps(projection[i * 8..].as_ptr());
                 let prod = _mm256_mul_ps(v, p);
                 sum = _mm256_add_ps(sum, prod);
+                i += 1;
             }
-            
+
             // Sum the vector elements
             let sum_array = std::mem::transmute::<__m256, [f32; 8]>(sum);
             let mut total: f32 = sum_array.iter().sum();
-            
-            // Process remainder
-            for (i, &val) in remainder.iter().enumerate() {
-                total += val * projection[vector.len() - remainder.len() + i];
+
+            // Process remainder (elements beyond SIMD-processed range)
+            let scalar_start = simd_len * 8;
+            let scalar_end = vector.len().min(projection.len());
+            for j in scalar_start..scalar_end {
+                total += vector[j] * projection[j];
             }
             
             // Set bit if positive

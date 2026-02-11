@@ -112,7 +112,7 @@ impl GoalPatternMatcher {
         }
         
         // Sort by confidence
-        matches.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        matches.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
         
         // Cache results
         let mut cache = self.match_cache.write();

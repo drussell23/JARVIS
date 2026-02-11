@@ -29,6 +29,18 @@ pub struct MetalAccelerator {
     shader_config: Arc<RwLock<HashMap<String, ShaderConfig>>>,
 }
 
+// All fields are Arc-wrapped, so Clone is cheap and correct.
+#[cfg(target_os = "macos")]
+impl Clone for MetalAccelerator {
+    fn clone(&self) -> Self {
+        Self {
+            bridge: Arc::clone(&self.bridge),
+            performance_stats: Arc::clone(&self.performance_stats),
+            shader_config: Arc::clone(&self.shader_config),
+        }
+    }
+}
+
 // Mark as thread-safe (no raw Metal pointers!)
 #[cfg(target_os = "macos")]
 unsafe impl Send for MetalAccelerator {}
