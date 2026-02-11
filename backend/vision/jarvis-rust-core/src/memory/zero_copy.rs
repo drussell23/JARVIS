@@ -34,8 +34,12 @@ struct ZeroCopyBufferInner {
     allocated_at: Instant,
 }
 
-// ZeroCopyBufferInner is Send+Sync because we manage synchronization via atomics
+// SAFETY:
+// - `ptr` points to uniquely owned heap memory for this allocation.
+// - shared ownership is via `Arc`, and destruction is coordinated by atomics.
+// - no thread may produce mutable references unless `Arc::get_mut` proves uniqueness.
 unsafe impl Send for ZeroCopyBufferInner {}
+// SAFETY: same invariants as `Send` above apply for cross-thread shared access.
 unsafe impl Sync for ZeroCopyBufferInner {}
 
 impl ZeroCopyBuffer {
@@ -71,11 +75,13 @@ impl ZeroCopyBuffer {
         }
     }
     
-    /// Get buffer as mutable slice
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(self.inner.ptr.as_ptr(), self.inner.size)
-        }
+    /// Get buffer as mutable slice when this handle is the unique owner.
+    /// Returns `None` if cloned references exist.
+    pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        let inner = Arc::get_mut(&mut self.inner)?;
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(inner.ptr.as_ptr(), inner.size)
+        })
     }
     
     /// Get raw pointer for zero-copy operations
@@ -83,9 +89,11 @@ impl ZeroCopyBuffer {
         self.inner.ptr.as_ptr()
     }
     
-    /// Get mutable raw pointer
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.inner.ptr.as_ptr()
+    /// Get mutable raw pointer when this handle is the unique owner.
+    /// Returns `None` if cloned references exist.
+    pub fn as_mut_ptr(&mut self) -> Option<*mut u8> {
+        let inner = Arc::get_mut(&mut self.inner)?;
+        Some(inner.ptr.as_ptr())
     }
     
     /// Clone with reference counting
@@ -152,7 +160,9 @@ struct MemoryBlock {
 // 2. All access is synchronized through RwLock in ZeroCopyPool
 // 3. The raw pointer points to heap-allocated memory that won't be freed
 //    until the block is consumed
+// SAFETY: `MemoryBlock` has ownership-only semantics and does not provide aliasing APIs.
 unsafe impl Send for MemoryBlock {}
+// SAFETY: shared access is synchronized by pool locks.
 unsafe impl Sync for MemoryBlock {}
 
 /// Zero-copy memory pool with dynamic sizing
@@ -169,8 +179,8 @@ pub struct ZeroCopyPool {
     max_memory_mb: usize,
     enable_defrag: AtomicBool,
     
-    // Background thread for maintenance
-    maintenance_thread: Option<thread::JoinHandle<()>>,
+    // Background thread for maintenance; populated after Arc<Self> construction.
+    maintenance_handle: Mutex<Option<thread::JoinHandle<()>>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -185,19 +195,19 @@ impl ZeroCopyPool {
             allocation_count: AtomicUsize::new(0),
             max_memory_mb,
             enable_defrag: AtomicBool::new(true),
-            maintenance_thread: None,
+            maintenance_handle: Mutex::new(None),
             shutdown: shutdown.clone(),
         });
         
         // Start maintenance thread
         let pool_weak = Arc::downgrade(&pool);
-        let pool_clone = pool.clone();
+        let shutdown_clone = shutdown.clone();
         let maintenance_thread = thread::spawn(move || {
-            Self::maintenance_loop(pool_weak, shutdown);
+            Self::maintenance_loop(pool_weak, shutdown_clone);
         });
         
-        // Store thread handle in a separate structure to avoid the need for get_mut_unchecked
-        // This will be managed separately from the pool
+        // Store thread handle for deterministic shutdown.
+        *pool.maintenance_handle.lock() = Some(maintenance_thread);
         
         pool
     }
@@ -297,18 +307,14 @@ impl ZeroCopyPool {
         let mut reclaimed = 0;
         let mut free_lists = self.free_lists.write();
         
-        // Remove old buffers from free lists
+        // Remove unused buffers from free lists and deallocate backing memory.
         for (size_class, list) in free_lists.iter_mut() {
-            let old_len = list.len();
-            
-            // Keep only recent buffers (less than 30 seconds old)
-            list.retain(|_| {
-                // In real implementation, would track age
-                false // Remove all for now
-            });
-            
-            let removed = old_len - list.len();
-            reclaimed += removed * size_class;
+            for block in list.drain(..) {
+                unsafe {
+                    dealloc(block.ptr.as_ptr(), block.layout);
+                }
+                reclaimed += *size_class;
+            }
         }
         
         self.total_allocated.fetch_sub(reclaimed, Ordering::SeqCst);
@@ -371,20 +377,21 @@ impl Drop for ZeroCopyPool {
         // Signal shutdown
         self.shutdown.store(true, Ordering::SeqCst);
         
-        // Wait for maintenance thread
-        if let Some(thread) = self.maintenance_thread.take() {
+        // Join maintenance thread first so it cannot race with free-list teardown.
+        if let Some(thread) = self.maintenance_handle.lock().take() {
             let _ = thread.join();
         }
         
-        // Deallocate all buffers
-        let free_lists = self.free_lists.read();
-        for (_, list) in free_lists.iter() {
-            for block in list.iter() {
+        // Deallocate all buffers only after maintenance has stopped.
+        let mut free_lists = self.free_lists.write();
+        for list in free_lists.values_mut() {
+            for block in list.drain(..) {
                 unsafe {
                     dealloc(block.ptr.as_ptr(), block.layout);
                 }
             }
         }
+        free_lists.clear();
     }
 }
 

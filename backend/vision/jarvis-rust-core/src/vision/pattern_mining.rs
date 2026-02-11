@@ -29,10 +29,12 @@ struct FPNode {
     parent: Option<*const FPNode>,
 }
 
-// FPNode is safe to Send/Sync because:
-// 1. The parent pointer is only used for tree traversal within synchronized contexts
-// 2. All access to the tree is protected by RwLock
+// SAFETY:
+// - `parent` is a non-owning back-pointer into the same FP-tree allocation graph.
+// - dereferencing `parent` is only valid while holding the enclosing tree's `RwLock` guard.
+// - nodes are never moved while visible through that guard.
 unsafe impl Send for FPNode {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for FPNode {}
 
 impl FPNode {

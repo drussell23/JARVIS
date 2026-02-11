@@ -32,8 +32,10 @@ pub struct PyScreenCapture {
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
-// These are safe because ScreenCapture no longer contains raw pointers
+// SAFETY: `PyScreenCapture` only contains `Arc<ScreenCapture>` and `Arc<Runtime>`.
+// `ScreenCapture` is thread-safe by invariant in `vision/capture.rs`.
 unsafe impl Send for PyScreenCapture {}
+// SAFETY: same invariants as `Send`; all shared state is synchronized.
 unsafe impl Sync for PyScreenCapture {}
 
 #[pymethods]
@@ -192,8 +194,10 @@ pub struct PyMetalAccelerator {
 }
 
 #[cfg(target_os = "macos")]
+// SAFETY: `PyMetalAccelerator` only stores `Arc`-wrapped thread-safe internals.
 unsafe impl Send for PyMetalAccelerator {}
 #[cfg(target_os = "macos")]
+// SAFETY: same invariants as `Send`; no unsynchronized interior mutation.
 unsafe impl Sync for PyMetalAccelerator {}
 
 #[cfg(target_os = "macos")]
@@ -294,7 +298,9 @@ pub struct PyMemoryManager {
     inner: Arc<MemoryManager>,
 }
 
+// SAFETY: `PyMemoryManager` contains only `Arc<MemoryManager>`, which is thread-safe.
 unsafe impl Send for PyMemoryManager {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for PyMemoryManager {}
 
 #[pymethods]
@@ -429,7 +435,9 @@ pub struct PyRustImageProcessor {
     processor: Arc<ImageProcessor>,
 }
 
+// SAFETY: `PyRustImageProcessor` contains only `Arc<ImageProcessor>`.
 unsafe impl Send for PyRustImageProcessor {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for PyRustImageProcessor {}
 
 impl PyRustImageProcessor {
@@ -557,7 +565,9 @@ pub struct PyRustRuntimeManager {
     runtime: Arc<RuntimeManager>,
 }
 
+// SAFETY: `PyRustRuntimeManager` contains only `Arc<RuntimeManager>`.
 unsafe impl Send for PyRustRuntimeManager {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for PyRustRuntimeManager {}
 
 #[pymethods]
@@ -613,7 +623,9 @@ pub struct PyRustTrackedBuffer {
     buffer: Arc<Mutex<Option<TrackedBuffer>>>,
 }
 
+// SAFETY: `PyRustTrackedBuffer` is synchronized through `parking_lot::Mutex`.
 unsafe impl Send for PyRustTrackedBuffer {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for PyRustTrackedBuffer {}
 
 #[pymethods]
@@ -654,7 +666,9 @@ pub struct PyRustAdvancedMemoryPool {
     leaks: Arc<Mutex<Vec<String>>>,
 }
 
+// SAFETY: `PyRustAdvancedMemoryPool` only stores `Arc`-wrapped synchronized structures.
 unsafe impl Send for PyRustAdvancedMemoryPool {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for PyRustAdvancedMemoryPool {}
 
 #[pymethods]
@@ -707,7 +721,9 @@ pub struct PyIntegrationPipeline {
     inner: Arc<IntegrationPipeline>,
 }
 
+// SAFETY: `PyIntegrationPipeline` contains only `Arc<IntegrationPipeline>`.
 unsafe impl Send for PyIntegrationPipeline {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for PyIntegrationPipeline {}
 
 #[pymethods]

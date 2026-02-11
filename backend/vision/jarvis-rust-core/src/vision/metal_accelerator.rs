@@ -41,10 +41,13 @@ impl Clone for MetalAccelerator {
     }
 }
 
-// Mark as thread-safe (no raw Metal pointers!)
+// SAFETY:
+// - `MetalAccelerator` owns no raw Metal pointers directly.
+// - all cross-thread state is `Arc` + lock guarded and accessed through message passing.
 #[cfg(target_os = "macos")]
 unsafe impl Send for MetalAccelerator {}
 #[cfg(target_os = "macos")]
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for MetalAccelerator {}
 
 #[derive(Debug, Clone)]

@@ -351,8 +351,11 @@ pub struct ScreenCapture {
     capture_generation: Arc<AtomicU64>,
 }
 
-// Thread-safe by design - no raw pointers
+// SAFETY:
+// - `ScreenCapture` stores thread-safe primitives (`Arc`, atomics, lock-guarded state).
+// - it does not contain raw pointers requiring thread-affinity.
 unsafe impl Send for ScreenCapture {}
+// SAFETY: same invariants as `Send`.
 unsafe impl Sync for ScreenCapture {}
 
 impl ScreenCapture {

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::collections::VecDeque;
 use bumpalo::Bump;
 use mimalloc::MiMalloc;
@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 /// Global memory pool for vision processing
-static mut GLOBAL_POOL: Option<Arc<Mutex<MemoryPool>>> = None;
+static GLOBAL_POOL: OnceLock<Arc<Mutex<MemoryPool>>> = OnceLock::new();
 
 pub struct MemoryPool {
     image_buffers: VecDeque<Vec<u8>>,
@@ -76,19 +76,13 @@ struct PoolStats {
 }
 
 pub fn initialize_global_pool() {
-    unsafe {
-        if GLOBAL_POOL.is_none() {
-            GLOBAL_POOL = Some(Arc::new(Mutex::new(MemoryPool::new(100))));
-        }
-    }
+    GLOBAL_POOL.get_or_init(|| Arc::new(Mutex::new(MemoryPool::new(100))));
 }
 
 fn get_global_pool() -> Arc<Mutex<MemoryPool>> {
-    unsafe {
-        GLOBAL_POOL.as_ref()
-            .expect("Global memory pool not initialized")
-            .clone()
-    }
+    GLOBAL_POOL
+        .get_or_init(|| Arc::new(Mutex::new(MemoryPool::new(100))))
+        .clone()
 }
 
 #[pyclass]

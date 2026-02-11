@@ -107,8 +107,10 @@ impl Drop for AlignedBuffer {
     }
 }
 
-// Safety: AlignedBuffer owns the memory exclusively
+// SAFETY: `AlignedBuffer` owns its heap allocation exclusively.
+// No aliased mutable references exist: `as_mut_ptr` requires `&mut self`.
 unsafe impl Send for AlignedBuffer {}
+// SAFETY: same invariants as `Send`; no interior mutation API.
 unsafe impl Sync for AlignedBuffer {}
 
 #[cfg(test)]
