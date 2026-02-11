@@ -1172,3 +1172,73 @@ async def create_memory_adapter(
         component_type=AutonomyComponentType.MEMORY,
         agent_name=agent_name,
     )
+
+
+async def create_dual_agent_adapter(
+    autonomy_component: Optional[Any] = None,
+    agent_name: str = "ouroboros_dual_agent",
+) -> AutonomyEngineAdapter:
+    """Create an adapter for the Ouroboros DualAgentSystem.
+
+    The DualAgentSystem provides an architect/reviewer pattern for
+    code improvement — useful for other mesh agents to invoke for
+    code quality analysis and improvement before deployment.
+
+    Args:
+        autonomy_component: Existing DualAgentSystem (creates new if None)
+        agent_name: Name for the adapter
+
+    Returns:
+        Configured AutonomyEngineAdapter
+    """
+    if autonomy_component is None:
+        try:
+            from core.ouroboros.native_integration import DualAgentSystem
+            autonomy_component = DualAgentSystem()
+        except ImportError:
+            logger.warning("Could not import DualAgentSystem")
+            raise
+
+    return AutonomyEngineAdapter(
+        autonomy_component=autonomy_component,
+        component_type=AutonomyComponentType.REASONING,
+        agent_name=agent_name,
+    )
+
+
+async def create_watchdog_adapter(
+    autonomy_component: Optional[Any] = None,
+    agent_name: str = "agentic_watchdog",
+) -> Optional[AutonomyEngineAdapter]:
+    """Create an adapter for the AgenticWatchdog safety layer.
+
+    Exposes watchdog status, operating mode, and kill-switch state
+    to the mesh so other agents can query safety constraints before
+    taking autonomous actions.
+
+    Returns None (not raise) if the watchdog hasn't been started yet,
+    enabling v93.1 graceful degradation in the bridge.
+
+    Args:
+        autonomy_component: Existing watchdog instance (discovers if None)
+        agent_name: Name for the adapter
+
+    Returns:
+        Configured AutonomyEngineAdapter, or None if watchdog not started
+    """
+    if autonomy_component is None:
+        try:
+            from core.agentic_watchdog import _watchdog_instance
+            if _watchdog_instance is None:
+                logger.info("AgenticWatchdog not yet started, skipping adapter")
+                return None
+            autonomy_component = _watchdog_instance
+        except ImportError:
+            logger.warning("Could not import AgenticWatchdog")
+            raise
+
+    return AutonomyEngineAdapter(
+        autonomy_component=autonomy_component,
+        component_type=AutonomyComponentType.INTEGRATION,
+        agent_name=agent_name,
+    )

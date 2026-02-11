@@ -117,12 +117,10 @@ except ImportError:
 # Import Neural Mesh for agent registration
 try:
     from backend.neural_mesh.base.base_neural_mesh_agent import BaseNeuralMeshAgent
-    from backend.neural_mesh.data_models import AgentCapability, AgentType
     NEURAL_MESH_AVAILABLE = True
 except ImportError:
     try:
         from neural_mesh.base.base_neural_mesh_agent import BaseNeuralMeshAgent
-        from neural_mesh.data_models import AgentCapability, AgentType
         NEURAL_MESH_AVAILABLE = True
     except ImportError:
         NEURAL_MESH_AVAILABLE = False
@@ -572,11 +570,13 @@ if NEURAL_MESH_AVAILABLE:
         ):
             super().__init__(
                 agent_name="computer_use_agent",
-                agent_type=AgentType.EXECUTOR,
-                capabilities=[
-                    AgentCapability.UI_AUTOMATION,
-                    AgentCapability.VISION,
-                ],
+                agent_type="autonomy",
+                capabilities={
+                    "ui_automation",
+                    "vision",
+                    "computer_use",
+                    "screen_interaction",
+                },
                 **kwargs
             )
             self.tool = tool or ComputerUseTool()

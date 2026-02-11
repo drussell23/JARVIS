@@ -73,6 +73,7 @@ from .adapters.intelligence_adapter import (
     create_cot_adapter,
     create_rge_adapter,
     create_pie_adapter,
+    create_wisdom_adapter,  # v237.1: Wisdom Pattern Engine
 )
 from .adapters.autonomy_adapter import (
     AutonomyEngineAdapter,
@@ -81,6 +82,8 @@ from .adapters.autonomy_adapter import (
     create_reasoning_adapter,
     create_tool_orchestrator_adapter,
     create_memory_adapter,
+    create_dual_agent_adapter,  # v237.1: Ouroboros architect/reviewer
+    create_watchdog_adapter,    # v237.1: Safety layer
 )
 from .adapters.voice_adapter import (
     VoiceSystemAdapter,
@@ -371,6 +374,7 @@ class JARVISNeuralMeshBridge:
             ("intelligence_cot", create_cot_adapter, IntelligenceEngineType.COT),
             ("intelligence_rge", create_rge_adapter, IntelligenceEngineType.RGE),
             ("intelligence_pie", create_pie_adapter, IntelligenceEngineType.PIE),
+            ("intelligence_wisdom", create_wisdom_adapter, IntelligenceEngineType.WISDOM),  # v237.1
         ]
 
         for name, factory, engine_type in intelligence_agents:
@@ -391,6 +395,8 @@ class JARVISNeuralMeshBridge:
             ("autonomy_reasoning", create_reasoning_adapter),
             ("autonomy_tools", create_tool_orchestrator_adapter),
             ("autonomy_memory", create_memory_adapter),
+            ("autonomy_dual_agent", create_dual_agent_adapter),  # v237.1: Ouroboros
+            ("autonomy_watchdog", create_watchdog_adapter),      # v237.1: Safety layer
         ]
 
         for name, factory in autonomy_agents:

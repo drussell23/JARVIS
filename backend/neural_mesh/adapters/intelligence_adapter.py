@@ -64,6 +64,7 @@ class IntelligenceEngineType(str, Enum):
     COT = "cot"  # Chain of Thought Engine
     RGE = "rge"  # Reasoning Graph Engine
     PIE = "pie"  # Proactive Intelligence Engine
+    WISDOM = "wisdom"  # v237.1: Wisdom Pattern Engine
 
 
 @dataclass
@@ -130,6 +131,11 @@ ENGINE_CAPABILITIES: Dict[IntelligenceEngineType, IntelligenceCapabilities] = {
         proactive_suggestions=True,
         contextual_understanding=True,
         goal_tracking=True,
+    ),
+    IntelligenceEngineType.WISDOM: IntelligenceCapabilities(  # v237.1
+        chain_of_thought=True,
+        contextual_understanding=True,
+        workspace_learning=True,
     ),
 }
 
@@ -251,6 +257,10 @@ class IntelligenceEngineAdapter(BaseNeuralMeshAgent):
         if self._engine_type == IntelligenceEngineType.PIE:
             self._task_handlers["predict_needs"] = self._handle_predict_needs
             self._task_handlers["suggest_actions"] = self._handle_suggest_actions
+
+        if self._engine_type == IntelligenceEngineType.WISDOM:  # v237.1
+            self._task_handlers["enhance_prompt"] = self._handle_enhance_prompt
+            self._task_handlers["get_pattern"] = self._handle_get_pattern
 
     async def on_initialize(self) -> None:
         """Initialize the adapter and underlying engine."""
@@ -725,6 +735,41 @@ class IntelligenceEngineAdapter(BaseNeuralMeshAgent):
         return {"suggestions": []}
 
     # =========================================================================
+    # Wisdom Handlers (v237.1)
+    # =========================================================================
+
+    async def _handle_enhance_prompt(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Enhance a prompt using wisdom patterns."""
+        prompt = input_data.get("prompt", "")
+        context = input_data.get("context", {})
+
+        if hasattr(self._engine, "enhance_prompt"):
+            result = self._engine.enhance_prompt(prompt, context=context)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return {"enhanced_prompt": result}
+
+        return {"enhanced_prompt": prompt}
+
+    async def _handle_get_pattern(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Get a wisdom pattern for a task type."""
+        task_type = input_data.get("task_type", "")
+
+        if hasattr(self._engine, "get_pattern_for_task"):
+            pattern = self._engine.get_pattern_for_task(task_type)
+            if asyncio.iscoroutine(pattern):
+                pattern = await pattern
+            return {"pattern": pattern}
+
+        return {"pattern": None}
+
+    # =========================================================================
     # Message Handlers
     # =========================================================================
 
@@ -993,5 +1038,43 @@ async def create_cai_adapter(
     return IntelligenceEngineAdapter(
         engine=engine,
         engine_type=IntelligenceEngineType.CAI,
+        agent_name=agent_name,
+    )
+
+
+async def create_wisdom_adapter(
+    engine: Optional[Any] = None,
+    agent_name: str = "wisdom_adapter",
+) -> IntelligenceEngineAdapter:
+    """Create an adapter for the Wisdom Pattern Engine.
+
+    The Wisdom Agent provides pattern-based prompt enhancement and
+    task-specific wisdom patterns for intelligent code generation,
+    debugging, and architectural decisions.
+
+    Args:
+        engine: Existing WisdomAgent instance (creates new if None)
+        agent_name: Name for the adapter agent
+
+    Returns:
+        Configured IntelligenceEngineAdapter
+    """
+    if engine is None:
+        try:
+            from intelligence.wisdom_patterns import get_wisdom_agent, WisdomAgent
+            engine = get_wisdom_agent()
+            if engine is None:
+                engine = WisdomAgent()
+                if hasattr(engine, "initialize"):
+                    result = engine.initialize()
+                    if asyncio.iscoroutine(result):
+                        await result
+        except ImportError:
+            logger.warning("Could not import WisdomAgent")
+            raise
+
+    return IntelligenceEngineAdapter(
+        engine=engine,
+        engine_type=IntelligenceEngineType.WISDOM,
         agent_name=agent_name,
     )

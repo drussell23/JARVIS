@@ -28,6 +28,13 @@ from .visual_monitor_agent import VisualMonitorAgent  # v10.6: VMSI - The Watche
 from .goal_inference_agent import GoalInferenceAgent  # v2.7: Intent Understanding (formerly dormant)
 from .activity_recognition_agent import ActivityRecognitionAgent  # v2.7: Activity Context (formerly dormant)
 
+# v237.1: ComputerUseAgent already inherits BaseNeuralMeshAgent, zero-arg constructor
+try:
+    from autonomy.computer_use_tool import ComputerUseAgent
+    _COMPUTER_USE_AVAILABLE = True
+except ImportError:
+    _COMPUTER_USE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,7 +67,7 @@ PRODUCTION_AGENTS: List[Type[BaseNeuralMeshAgent]] = [
 
     # Admin/Communication agents (Chief of Staff role)
     GoogleWorkspaceAgent,
-]
+] + ([ComputerUseAgent] if _COMPUTER_USE_AVAILABLE else [])  # v237.1: Autonomous execution
 
 
 class AgentInitializer:
