@@ -98,6 +98,7 @@ _lazy_modules = {
     # Coordinator Functions
     "get_neural_mesh": (".neural_mesh_coordinator", "get_neural_mesh"),
     "start_neural_mesh": (".neural_mesh_coordinator", "start_neural_mesh"),
+    "stop_neural_mesh": (".neural_mesh_coordinator", "stop_neural_mesh"),
 
     # JARVIS Bridge (heavy - loads many systems)
     "JARVISNeuralMeshBridge": (".jarvis_bridge", "JARVISNeuralMeshBridge"),
@@ -167,6 +168,7 @@ __all__ = [
     # Coordinator Functions
     "get_neural_mesh",
     "start_neural_mesh",
+    "stop_neural_mesh",
     # JARVIS Bridge
     "JARVISNeuralMeshBridge",
     "AgentDiscoveryConfig",

@@ -510,15 +510,23 @@ class AGIOSCoordinator:
             )
 
     async def _init_neural_mesh(self) -> None:
-        """Initialize Neural Mesh coordinator."""
+        """Initialize Neural Mesh coordinator and production agents."""
         try:
             from neural_mesh import start_neural_mesh
             self._neural_mesh = await start_neural_mesh()
+
+            # v237.0: Register production agents (previously only called from deprecated supervisor)
+            try:
+                from neural_mesh.agents.agent_initializer import initialize_production_agents
+                registered = await initialize_production_agents(self._neural_mesh)
+                logger.info("Neural Mesh started with %d production agents", len(registered))
+            except Exception as agent_exc:
+                logger.warning("Production agent initialization failed (mesh still running): %s", agent_exc)
+
             self._component_status['neural_mesh'] = ComponentStatus(
                 name='neural_mesh',
                 available=True
             )
-            logger.info("Neural Mesh started")
         except Exception as e:
             logger.warning("Neural Mesh not available: %s", e)
             self._component_status['neural_mesh'] = ComponentStatus(

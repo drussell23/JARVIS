@@ -59164,6 +59164,16 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.debug(f"[Kernel] Startup resilience cleanup error: {e}")
 
+        # v237.0: Stop AGI OS + Neural Mesh + agents (prevents dangling agent tasks)
+        try:
+            from agi_os import stop_agi_os
+            await asyncio.wait_for(stop_agi_os(), timeout=10.0)
+            self.logger.info("[Kernel] AGI OS + Neural Mesh stopped")
+        except asyncio.TimeoutError:
+            self.logger.debug("[Kernel] AGI OS stop timed out (10s)")
+        except Exception as e:
+            self.logger.debug("[Kernel] AGI OS cleanup error: %s", e)
+
         # Kill backend immediately
         if self._backend_process:
             self._backend_process.kill()

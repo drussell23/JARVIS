@@ -3771,3 +3771,43 @@ EMAIL BODY:"""
             stats["unified_executor"] = self._unified_executor.get_stats()
 
         return stats
+
+
+# ---------------------------------------------------------------------------
+# v237.0: Singleton getter (required by tiered_command_router.py:1072)
+# ---------------------------------------------------------------------------
+_workspace_agent_instance: Optional["GoogleWorkspaceAgent"] = None
+
+
+async def get_google_workspace_agent() -> Optional["GoogleWorkspaceAgent"]:
+    """Get the GoogleWorkspaceAgent from Neural Mesh registry, or create standalone.
+
+    Tier 1: Check running Neural Mesh coordinator for a registered instance.
+    Tier 2: Create a standalone instance (no coordinator required).
+
+    Does NOT create a coordinator as a side effect.
+    """
+    global _workspace_agent_instance
+    if _workspace_agent_instance is not None:
+        return _workspace_agent_instance
+
+    # Tier 1: Try the running Neural Mesh (without triggering creation)
+    try:
+        from backend.neural_mesh.neural_mesh_coordinator import _coordinator
+        if _coordinator is not None and _coordinator._running:
+            for agent in _coordinator.get_all_agents():
+                if isinstance(agent, GoogleWorkspaceAgent):
+                    _workspace_agent_instance = agent
+                    return _workspace_agent_instance
+    except Exception:
+        pass
+
+    # Tier 2: Create standalone instance
+    try:
+        instance = GoogleWorkspaceAgent()
+        await instance.on_initialize()
+        _workspace_agent_instance = instance
+        return _workspace_agent_instance
+    except Exception as exc:
+        logger.error("Failed to create standalone GoogleWorkspaceAgent: %s", exc)
+        return None
