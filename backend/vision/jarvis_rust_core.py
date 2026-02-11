@@ -18,6 +18,7 @@ import sys
 logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
+_THIS_FILE = Path(__file__).resolve()
 _STUB_DIR = _THIS_DIR / "jarvis-rust-core"
 _STUB_FILE = (_STUB_DIR / "jarvis_rust_core.py").resolve()
 _REQUIRED_SYMBOLS = ("RustRuntimeManager", "RustAdvancedMemoryPool", "RustImageProcessor")
@@ -34,7 +35,14 @@ def _module_origin(module: Any) -> str:
         return str(origin)
 
 
-def _is_stub_module(module: Any) -> bool:
+def _is_wrapper_or_stub(module: Any) -> bool:
+    """Detect modules that are NOT the real Rust native extension.
+
+    Returns True for:
+    - The Python stub (``__rust_available__ = False``)
+    - This canonical loader itself (accidental self-import when
+      ``backend/vision`` is in ``sys.path``)
+    """
     if module is None:
         return False
     if getattr(module, "__rust_available__", None) is False:
@@ -43,24 +51,47 @@ def _is_stub_module(module: Any) -> bool:
     if origin is None:
         return False
     try:
-        return Path(origin).resolve() == _STUB_FILE
+        resolved = Path(origin).resolve()
+        # Detect the Python stub file
+        if resolved == _STUB_FILE:
+            return True
+        # Detect self-import of this canonical loader
+        if resolved == _THIS_FILE:
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
-def _strip_stub_path() -> list[Tuple[int, str]]:
+# Keep old name for backwards compatibility with external callers
+_is_stub_module = _is_wrapper_or_stub
+
+
+def _strip_interfering_paths() -> list[Tuple[int, str]]:
+    """Remove sys.path entries that would shadow the real Rust extension.
+
+    Strips both the stub directory (``jarvis-rust-core/``) and the
+    canonical loader's own directory (``backend/vision/``) so that
+    ``importlib.import_module("jarvis_rust_core")`` resolves to the
+    installed native extension in site-packages rather than to a
+    Python wrapper.
+    """
+    blocked = {str(_STUB_DIR.resolve()), str(_THIS_DIR.resolve())}
     removed: list[Tuple[int, str]] = []
-    stub_path = str(_STUB_DIR.resolve())
     for idx in range(len(sys.path) - 1, -1, -1):
         candidate = sys.path[idx]
         try:
             resolved = str(Path(candidate).resolve())
         except Exception:
             resolved = candidate
-        if resolved == stub_path:
+        if resolved in blocked:
             removed.append((idx, sys.path.pop(idx)))
     removed.reverse()
     return removed
+
+
+# Keep old name for backwards compat
+_strip_stub_path = _strip_interfering_paths
 
 
 def _restore_paths(entries: list[Tuple[int, str]]) -> None:

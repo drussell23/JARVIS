@@ -164,7 +164,14 @@ class RustSelfHealer:
     def _stub_module_file(self) -> Path:
         return self.rust_core_dir / "jarvis_rust_core.py"
 
-    def _is_stub_module(self, module: Any) -> bool:
+    def _is_wrapper_or_stub(self, module: Any) -> bool:
+        """Detect modules that are NOT the real Rust native extension.
+
+        Returns True for:
+        - The Python stub  (``__rust_available__ = False``)
+        - The canonical loader wrapper at ``backend/vision/jarvis_rust_core.py``
+          (can be found when ``backend/vision`` is in ``sys.path``)
+        """
         if module is None:
             return False
         if getattr(module, "__rust_available__", None) is False:
@@ -173,27 +180,47 @@ class RustSelfHealer:
         if origin is None:
             return False
         try:
-            return Path(origin).resolve() == self._stub_module_file().resolve()
+            resolved = Path(origin).resolve()
+            # Detect the Python stub
+            if resolved == self._stub_module_file().resolve():
+                return True
+            # Detect the canonical loader wrapper (it lives next to us in
+            # backend/vision/ and has a ``jrc`` attribute the real module lacks).
+            if resolved.name == "jarvis_rust_core.py" and resolved.parent == self.vision_dir.resolve():
+                return True
         except Exception:
-            return False
+            pass
+        return False
+
+    # Keep old name for internal callers
+    _is_stub_module = _is_wrapper_or_stub
 
     def _validate_module_symbols(self, module: Any) -> Tuple[bool, List[str]]:
         missing = [symbol for symbol in self._required_symbols if not hasattr(module, symbol)]
         return len(missing) == 0, missing
 
-    def _strip_stub_path(self) -> List[Tuple[int, str]]:
+    def _strip_interfering_paths(self) -> List[Tuple[int, str]]:
+        """Strip sys.path entries that shadow the real Rust extension.
+
+        Removes both the stub directory (``jarvis-rust-core/``) and the
+        canonical loader's directory (``backend/vision/``) so
+        ``importlib.import_module("jarvis_rust_core")`` resolves to the
+        installed native extension rather than a Python wrapper.
+        """
+        blocked = {str(self.rust_core_dir.resolve()), str(self.vision_dir.resolve())}
         removed: List[Tuple[int, str]] = []
-        stub_dir = str(self.rust_core_dir.resolve())
         for idx in range(len(sys.path) - 1, -1, -1):
             candidate = sys.path[idx]
             try:
                 resolved = str(Path(candidate).resolve())
             except Exception:
                 resolved = candidate
-            if resolved == stub_dir:
+            if resolved in blocked:
                 removed.append((idx, sys.path.pop(idx)))
         removed.reverse()
         return removed
+
+    _strip_stub_path = _strip_interfering_paths
 
     def _restore_sys_path(self, removed: List[Tuple[int, str]]) -> None:
         for idx, value in removed:
@@ -204,20 +231,20 @@ class RustSelfHealer:
 
     def _import_real_rust_module(self) -> Tuple[Optional[Any], Optional[str]]:
         existing = sys.modules.get(self._rust_module_name)
-        existing_is_stub = self._is_stub_module(existing)
+        existing_is_wrapper = self._is_wrapper_or_stub(existing)
 
-        if existing is not None and not existing_is_stub:
+        if existing is not None and not existing_is_wrapper:
             return existing, None
 
-        if existing_is_stub:
+        if existing_is_wrapper:
             sys.modules.pop(self._rust_module_name, None)
 
-        removed = self._strip_stub_path()
+        removed = self._strip_interfering_paths()
         try:
             module = importlib.import_module(self._rust_module_name)
-            if self._is_stub_module(module):
+            if self._is_wrapper_or_stub(module):
                 module_path = getattr(module, "__file__", "<unknown>")
-                return None, f"stub module loaded from {module_path}"
+                return None, f"wrapper/stub module loaded from {module_path}"
             return module, None
         except ImportError as exc:
             return None, str(exc)
