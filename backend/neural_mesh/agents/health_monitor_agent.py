@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
-from ..data_models import AgentMessage, AgentStatus, KnowledgeType, MessageType
+from ..data_models import AgentMessage, AgentStatus, KnowledgeType, MessagePriority, MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
         # Check agents
         if self.registry:
             try:
-                agents = await self.registry.get_all()
+                agents = await self.registry.get_all_agents()
                 online = sum(1 for a in agents if a.status == AgentStatus.ONLINE)
                 total = len(agents)
 
@@ -145,6 +145,20 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
                     }
                     if agent.status != AgentStatus.ONLINE:
                         health["issues"].append(f"Agent {agent.agent_name} is {agent.status.value}")
+                        # v238.0: Broadcast health alert for unhealthy agents
+                        try:
+                            await self.broadcast(
+                                message_type=MessageType.ALERT_RAISED,
+                                payload={
+                                    "type": "agent_health_alert",
+                                    "agent_name": agent.agent_name,
+                                    "status": agent.status.value,
+                                    "agent_type": agent.agent_type,
+                                },
+                                priority=MessagePriority.HIGH,
+                            )
+                        except Exception:
+                            pass  # Best-effort broadcast
             except Exception as e:
                 health["agents"] = {"error": str(e)}
 
@@ -184,7 +198,7 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
 
             # Agent metrics
             if self.registry:
-                agents = await self.registry.get_all()
+                agents = await self.registry.get_all_agents()
                 metrics["agents"] = {
                     "total": len(agents),
                     "by_status": {},
@@ -209,7 +223,7 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
             return {"status": "error", "error": "Agent name required"}
 
         if self.registry:
-            agent = await self.registry.get(agent_name)
+            agent = await self.registry.get_agent(agent_name)
             if agent:
                 return {
                     "status": "success",

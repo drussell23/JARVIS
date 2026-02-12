@@ -536,6 +536,22 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
                 confidence=confidence,
             )
 
+        # v238.0: Broadcast prediction for cross-agent awareness
+        try:
+            await self.broadcast(
+                message_type=MessageType.ANNOUNCEMENT,
+                payload={
+                    "type": "prediction_generated",
+                    "intent": intent.value,
+                    "confidence": confidence,
+                    "tasks_count": len(result.expanded_tasks),
+                    "goals": result.goals[:3] if result.goals else [],
+                },
+                priority=MessagePriority.LOW,
+            )
+        except Exception:
+            pass  # Best-effort broadcast
+
         # Narrate if enabled
         if self.config.narrate_predictions:
             await self._narrate_prediction(result)

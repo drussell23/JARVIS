@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
-from ..data_models import AgentMessage, KnowledgeType, MessageType
+from ..data_models import AgentMessage, KnowledgeType, MessagePriority, MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -310,7 +310,7 @@ class ErrorAnalyzerAgent(BaseNeuralMeshAgent):
 
         # Store in knowledge graph
         if self.knowledge_graph:
-            entry = await self.contribute_knowledge(
+            entry = await self.add_knowledge(
                 knowledge_type=KnowledgeType.SOLUTION,
                 data={
                     "error_message": error_message,
@@ -406,10 +406,28 @@ class ErrorAnalyzerAgent(BaseNeuralMeshAgent):
 
     async def _handle_error_report(self, message: AgentMessage) -> None:
         """Handle error report messages."""
-        if message.content.get("type") == "error_report":
-            await self._analyze_error({
-                "error_message": message.content.get("error_message", ""),
-                "error_type": message.content.get("error_type", ""),
-                "stack_trace": message.content.get("stack_trace", ""),
-                "context": message.content.get("context", {}),
+        if message.payload.get("type") == "error_report":
+            result = await self._analyze_error({
+                "error_message": message.payload.get("error_message", ""),
+                "error_type": message.payload.get("error_type", ""),
+                "stack_trace": message.payload.get("stack_trace", ""),
+                "context": message.payload.get("context", {}),
             })
+
+            # v238.0: Broadcast error analysis results
+            if result and result.get("classification"):
+                try:
+                    classification = result["classification"]
+                    await self.broadcast(
+                        message_type=MessageType.ERROR_DETECTED,
+                        payload={
+                            "type": "error_analysis",
+                            "error_type": classification.get("category", "unknown"),
+                            "severity": classification.get("severity", "medium"),
+                            "suggestions_count": len(result.get("suggestions", [])),
+                            "pattern_count": result.get("pattern_count", 1),
+                        },
+                        priority=MessagePriority.HIGH,
+                    )
+                except Exception:
+                    pass  # Best-effort broadcast

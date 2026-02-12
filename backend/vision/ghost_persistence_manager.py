@@ -494,6 +494,50 @@ class GhostPersistenceManager:
             "total": len(stranded),
         }
 
+    async def restore_windows_async(
+        self,
+        app_filter: Optional[str] = None,
+        narrate_callback: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """
+        v240.0: Bridge method for Trinity handler compatibility.
+
+        Audits for stranded windows, optionally filters by app name,
+        and repatriates them. Returns a dict matching the contract
+        expected by handle_bring_back_window in trinity_handlers.py.
+
+        Args:
+            app_filter: Optional app name to filter by (case-insensitive)
+            narrate_callback: Optional async callback for voice narration
+
+        Returns:
+            {"success": bool, "restored_count": int, "error": str | None}
+        """
+        try:
+            stranded = await self._audit_stranded_windows()
+
+            if app_filter:
+                stranded = [
+                    s for s in stranded
+                    if s.app_name.lower() == app_filter.lower()
+                ]
+
+            if not stranded:
+                return {"success": True, "restored_count": 0, "error": None}
+
+            result = await self.repatriate_stranded_windows(stranded, narrate_callback)
+
+            restored = result.get("success", 0)
+            return {
+                "success": restored > 0,
+                "restored_count": restored,
+                "error": None if restored > 0 else "Repatriation failed",
+            }
+
+        except Exception as e:
+            logger.error(f"[GhostPersistence] restore_windows_async error: {e}")
+            return {"success": False, "restored_count": 0, "error": str(e)}
+
     async def _move_window_to_space(
         self,
         window_id: int,

@@ -31,7 +31,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
-from ..data_models import AgentMessage, KnowledgeType, MessageType
+from ..data_models import AgentMessage, KnowledgeType, MessagePriority, MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -321,11 +321,26 @@ class ActivityRecognitionAgent(BaseNeuralMeshAgent):
     async def handle_message(self, message: AgentMessage) -> Optional[Dict[str, Any]]:
         """Handle incoming messages requesting activity recognition."""
         try:
-            content = message.content
+            content = message.payload
             action = content.get("action", "")
 
             if action == "recognize_activity":
-                return await self._recognize_activity(content)
+                result = await self._recognize_activity(content)
+                # v238.0: Broadcast activity recognition results
+                if result and result.get("activity"):
+                    try:
+                        await self.broadcast(
+                            message_type=MessageType.CONTEXT_UPDATE,
+                            payload={
+                                "type": "activity_transition",
+                                "current_activity": result.get("activity", "unknown"),
+                                "confidence": result.get("confidence", 0.0),
+                            },
+                            priority=MessagePriority.NORMAL,
+                        )
+                    except Exception:
+                        pass  # Best-effort broadcast
+                return result
             elif action == "get_focus_state":
                 return await self._get_focus_state()
             elif action == "track_app_switch":

@@ -21,7 +21,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
-from ..data_models import AgentMessage, KnowledgeType, MessageType
+from ..data_models import AgentMessage, KnowledgeType, MessagePriority, MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -658,12 +658,12 @@ class PatternRecognitionAgent(BaseNeuralMeshAgent):
 
     async def _handle_event(self, message: AgentMessage) -> None:
         """Handle incoming events for pattern tracking."""
-        if message.content.get("type") == "event":
+        if message.payload.get("type") == "event":
             event = {
                 "timestamp": datetime.now().isoformat(),
-                "event_type": message.content.get("event_type", "unknown"),
-                "data": message.content.get("data", {}),
-                "source": message.sender,
+                "event_type": message.payload.get("event_type", "unknown"),
+                "data": message.payload.get("data", {}),
+                "source": message.from_agent,
             }
             self._event_history.append(event)
 
@@ -672,6 +672,21 @@ class PatternRecognitionAgent(BaseNeuralMeshAgent):
                 "event_type": event["event_type"],
                 "category": "all_events",
             })
+
+            # v238.0: Broadcast notable events for cross-agent awareness
+            try:
+                await self.broadcast(
+                    message_type=MessageType.KNOWLEDGE_SHARED,
+                    payload={
+                        "type": "pattern_event_tracked",
+                        "event_type": event["event_type"],
+                        "source": event["source"],
+                        "event_count": len(self._event_history),
+                    },
+                    priority=MessagePriority.LOW,
+                )
+            except Exception:
+                pass  # Best-effort broadcast
 
             # Limit history size
             if len(self._event_history) > 10000:

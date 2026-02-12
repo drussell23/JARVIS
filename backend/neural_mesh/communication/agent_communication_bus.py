@@ -68,6 +68,15 @@ class BusMetrics:
         return self.total_latency_ms / self.messages_delivered
 
 
+@dataclass
+class _AgentCircuitBreaker:
+    """Per-agent circuit breaker for callback failure isolation."""
+    failures: int = 0
+    threshold: int = 5
+    open_until: Optional[float] = None  # time.monotonic() timestamp
+    recovery_seconds: float = 30.0
+
+
 class AgentCommunicationBus:
     """
     Ultra-fast async message routing between agents.
@@ -150,6 +159,13 @@ class AgentCommunicationBus:
         # Locks for thread safety
         self._subscription_lock = asyncio.Lock()
         self._response_lock = asyncio.Lock()
+
+        # v238.0: Deadletter queue for undelivered messages
+        self._deadletter: asyncio.Queue[AgentMessage] = asyncio.Queue(maxsize=1000)
+        self._deadletter_count: int = 0
+
+        # v238.0: Per-agent circuit breakers
+        self._circuit_breakers: Dict[str, _AgentCircuitBreaker] = {}
 
         logger.info("AgentCommunicationBus initialized")
 
@@ -252,13 +268,24 @@ class AgentCommunicationBus:
             )
 
         except asyncio.QueueFull:
-            self._metrics.messages_dropped += 1
-            logger.warning(
-                "Queue full for priority %s, dropping message %s",
-                message.priority.name,
-                message.message_id[:8],
-            )
-            raise
+            # v238.0: Backpressure retry — yield briefly to let consumers drain
+            await asyncio.sleep(0.01)
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                self._metrics.messages_dropped += 1
+                logger.warning(
+                    "Queue full for priority %s after retry, dropping message %s",
+                    message.priority.name,
+                    message.message_id[:8],
+                )
+                # Route to deadletter instead of silent loss
+                try:
+                    self._deadletter.put_nowait(message)
+                    self._deadletter_count += 1
+                except asyncio.QueueFull:
+                    pass  # Deadletter full — truly drop
+                raise
 
         return message.message_id
 
@@ -611,8 +638,14 @@ class AgentCommunicationBus:
             self._metrics.messages_delivered += 1
 
         if not delivered:
+            # v238.0: Route to deadletter instead of silent drop
+            try:
+                self._deadletter.put_nowait(message)
+                self._deadletter_count += 1
+            except asyncio.QueueFull:
+                pass  # Deadletter full — truly drop
             logger.debug(
-                "No subscribers for message %s (to=%s, type=%s)",
+                "No subscribers for message %s (to=%s, type=%s) → deadletter",
                 message.message_id[:8],
                 message.to_agent,
                 message.message_type.value,
@@ -623,7 +656,18 @@ class AgentCommunicationBus:
         callback: MessageCallback,
         message: AgentMessage,
     ) -> None:
-        """Execute a callback with timeout and error handling."""
+        """Execute a callback with timeout, error handling, and circuit breaker."""
+        agent_name = message.to_agent or "broadcast"
+
+        # v238.0: Check circuit breaker before executing
+        cb = self._circuit_breakers.get(agent_name)
+        if cb and cb.open_until:
+            if time.monotonic() < cb.open_until:
+                return  # Circuit open — skip delivery
+            # Half-open — try again
+            cb.open_until = None
+            cb.failures = 0
+
         try:
             result = callback(message)
             if asyncio.iscoroutine(result):
@@ -631,16 +675,39 @@ class AgentCommunicationBus:
                     result,
                     timeout=self.config.handler_timeout_seconds,
                 )
+            # Success — reset failures
+            if cb:
+                cb.failures = 0
         except asyncio.TimeoutError:
+            self._record_circuit_failure(agent_name)
             logger.warning(
-                "Callback timed out for message %s",
+                "Callback timed out for message %s (agent=%s)",
                 message.message_id[:8],
+                agent_name,
             )
         except Exception as e:
+            self._record_circuit_failure(agent_name)
             logger.exception(
-                "Callback error for message %s: %s",
+                "Callback error for message %s (agent=%s): %s",
                 message.message_id[:8],
+                agent_name,
                 e,
+            )
+
+    def _record_circuit_failure(self, agent_name: str) -> None:
+        """Record a callback failure and open circuit breaker if threshold reached."""
+        cb = self._circuit_breakers.get(agent_name)
+        if not cb:
+            cb = _AgentCircuitBreaker()
+            self._circuit_breakers[agent_name] = cb
+        cb.failures += 1
+        if cb.failures >= cb.threshold:
+            cb.open_until = time.monotonic() + cb.recovery_seconds
+            logger.warning(
+                "Circuit breaker OPEN for %s after %d failures (recovery in %ds)",
+                agent_name,
+                cb.failures,
+                int(cb.recovery_seconds),
             )
 
     async def _cleanup_expired(self) -> None:
@@ -663,6 +730,20 @@ class AgentCommunicationBus:
                 break
             except Exception as e:
                 logger.exception("Error in cleanup task: %s", e)
+
+    async def drain_deadletter(self, limit: int = 100) -> List[AgentMessage]:
+        """Drain up to `limit` messages from the deadletter queue.
+
+        Returns:
+            List of undelivered messages for inspection or retry.
+        """
+        messages: List[AgentMessage] = []
+        while len(messages) < limit and not self._deadletter.empty():
+            try:
+                messages.append(self._deadletter.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return messages
 
     async def persist_history(self, path: Optional[str] = None) -> None:
         """

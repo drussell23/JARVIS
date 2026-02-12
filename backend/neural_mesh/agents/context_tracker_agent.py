@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
-from ..data_models import AgentMessage, KnowledgeType, MessageType
+from ..data_models import AgentMessage, KnowledgeType, MessagePriority, MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -246,9 +246,24 @@ class ContextTrackerAgent(BaseNeuralMeshAgent):
 
     async def _handle_context_update(self, message: AgentMessage) -> None:
         """Handle context update messages."""
-        if message.content.get("type") == "context_update":
+        if message.payload.get("type") == "context_update":
+            context_type = message.payload.get("context_type", "general")
             await self._track_context({
-                "context_type": message.content.get("context_type", "general"),
-                "data": message.content.get("data", {}),
-                "source": message.sender,
+                "context_type": context_type,
+                "data": message.payload.get("data", {}),
+                "source": message.from_agent,
             })
+
+            # v238.0: Broadcast tracked context for cross-agent awareness
+            try:
+                await self.broadcast(
+                    message_type=MessageType.CONTEXT_UPDATE,
+                    payload={
+                        "type": "context_tracked",
+                        "context_type": context_type,
+                        "source": message.from_agent,
+                    },
+                    priority=MessagePriority.LOW,
+                )
+            except Exception:
+                pass  # Best-effort broadcast

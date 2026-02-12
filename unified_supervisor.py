@@ -53055,7 +53055,9 @@ class StartupWatchdog:
         # Timeout 90s = 60s operational (JARVIS_AGI_OS_TIMEOUT) + 30s DMS buffer.
         # register_phase_timeout() will overwrite with computed value, but this
         # provides the correct fallback if operational_timeout is not passed.
-        "agi_os": PhaseConfig("AGI OS", 90.0, 85, 90, "diagnostic"),
+        "agi_os": PhaseConfig("AGI OS", 90.0, 85, 88, "diagnostic"),  # v240.0: narrowed from 85-90
+        # v240.0: Ghost Display — software-defined virtual display via BetterDisplay
+        "ghost_display": PhaseConfig("Ghost Display", 45.0, 88, 90, "diagnostic"),
         # v236.1: frontend progress_start fixed from 85→90 to avoid overlap with agi_os
         "frontend": PhaseConfig("Frontend", 60.0, 90, 100, "rollback"),
     }
@@ -57582,6 +57584,7 @@ class JarvisSystemKernel:
             "reactor_core": {"status": "pending", "message": "Waiting to start"},
             "enterprise": {"status": "pending", "message": "Waiting to start"},
             "agi_os": {"status": "pending", "message": "Waiting to start"},  # v200.0: AGI OS
+            "ghost_display": {"status": "pending", "message": "Waiting to start"},  # v240.0: Virtual Display
             "frontend": {"status": "pending", "message": "Waiting to start"},
         }
 
@@ -60374,6 +60377,7 @@ class JarvisSystemKernel:
                         "intelligence": {"status": "complete"},
                         "trinity": {"status": "complete"},
                         "enterprise": {"status": "running"},
+                        "ghost_display": {"status": "pending"},
                         "frontend": {"status": "pending"},
                     }
                 }
@@ -60409,6 +60413,7 @@ class JarvisSystemKernel:
                         "trinity": {"status": "complete"},
                         "enterprise": {"status": "complete"},
                         "agi_os": {"status": "running"},
+                        "ghost_display": {"status": "pending"},
                         "frontend": {"status": "pending"},
                     }
                 }
@@ -60439,8 +60444,8 @@ class JarvisSystemKernel:
 
             await self._broadcast_startup_progress(
                 stage="agi_os",
-                message="AGI OS active - launching frontend...",
-                progress=90,
+                message="AGI OS active — initializing Ghost Display...",
+                progress=88,  # v240.0: narrowed from 90 to make room for ghost display phase
                 metadata={
                     "icon": "brain",
                     "phase": 6.5,
@@ -60454,6 +60459,56 @@ class JarvisSystemKernel:
                         "trinity": {"status": "complete"},
                         "enterprise": {"status": "complete"},
                         "agi_os": {"status": "complete"},
+                        "ghost_display": {"status": "running"},
+                        "frontend": {"status": "pending"},
+                    }
+                }
+            )
+
+            # =================================================================
+            # PHASE 6.7: GHOST DISPLAY INITIALIZATION (v240.0)
+            # =================================================================
+            # Initialize software-defined virtual display for background window
+            # management via BetterDisplay/PhantomHardwareManager.
+            # Optional — continues without if BetterDisplay unavailable.
+            # Includes crash recovery for stranded windows and health monitoring.
+            # =================================================================
+            issue_collector.set_current_phase("Phase 6.7: Ghost Display")
+            issue_collector.set_current_zone("Zone 6.7")
+            ghost_display_timeout = _get_env_float("JARVIS_GHOST_DISPLAY_TIMEOUT", 30.0)
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase(
+                    "ghost_display", 88, operational_timeout=ghost_display_timeout
+                )
+
+            if not await self._initialize_ghost_display():
+                # Non-fatal — continue without Ghost Display
+                issue_collector.add_warning(
+                    "Ghost Display failed to initialize — continuing without virtual display",
+                    IssueCategory.SYSTEM,
+                    suggestion="Check BetterDisplay installation and permissions"
+                )
+
+            await self._broadcast_startup_progress(
+                stage="ghost_display",
+                message="Ghost Display ready — launching frontend...",
+                progress=90,
+                metadata={
+                    "icon": "monitor",
+                    "phase": 6.7,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "complete"},
+                        "intelligence": {"status": "complete"},
+                        "two_tier": {"status": "complete"},
+                        "trinity": {"status": "complete"},
+                        "enterprise": {"status": "complete"},
+                        "agi_os": {"status": "complete"},
+                        "ghost_display": {"status": self._component_status.get(
+                            "ghost_display", {}
+                        ).get("status", "pending")},
                         "frontend": {"status": "running"},
                     }
                 }
@@ -60488,6 +60543,9 @@ class JarvisSystemKernel:
                         "intelligence": {"status": "complete"},
                         "trinity": {"status": "complete"},
                         "enterprise": {"status": "complete"},
+                        "ghost_display": {"status": self._component_status.get(
+                            "ghost_display", {}
+                        ).get("status", "complete")},
                         "frontend": {"status": "complete"},
                     }
                 }
@@ -62938,6 +62996,271 @@ class JarvisSystemKernel:
                 self._agi_os_status["status"] = "error"
                 self._update_component_status("agi_os", "error", f"Error: {e}")
                 return False  # Graceful degradation - don't crash kernel
+
+    # =========================================================================
+    # v240.0: GHOST DISPLAY — SOFTWARE-DEFINED VIRTUAL DISPLAY
+    # =========================================================================
+    # Initialize Ghost Display via BetterDisplay/PhantomHardwareManager.
+    # Optional — gracefully degrades if BetterDisplay not installed.
+    # Includes crash recovery (stranded windows) and background health monitoring.
+    # =========================================================================
+
+    async def _initialize_ghost_display(self) -> bool:
+        """
+        v240.0: Initialize Ghost Display (software-defined virtual display via BetterDisplay).
+
+        Steps:
+        1. Check BetterDisplay availability via PhantomHardwareManager
+        2. Ensure ghost display exists (create if needed)
+        3. Audit & repatriate stranded windows from previous sessions (crash recovery)
+        4. Publish ghost display state to ~/.jarvis/trinity/state/ for cross-repo exchange
+        5. Start background health monitor
+
+        On failure: Log warning and continue (graceful degradation).
+        All timeouts are env-var configurable.
+
+        Returns:
+            True if ghost display initialized or skipped, False on error
+        """
+        # Skip if disabled via env var
+        if not _get_env_bool("JARVIS_GHOST_DISPLAY_ENABLED", True):
+            self.logger.info("[GhostDisplay] Ghost Display disabled via JARVIS_GHOST_DISPLAY_ENABLED")
+            self._update_component_status("ghost_display", "skipped", "Disabled via config")
+            return True
+
+        self._update_component_status("ghost_display", "running", "Initializing Ghost Display...")
+        timeout = _get_env_float("JARVIS_GHOST_DISPLAY_TIMEOUT", 30.0)
+
+        try:
+            # Import PhantomHardwareManager (dual-import for Python dual-module aliasing)
+            get_phantom_manager = None
+            try:
+                from backend.system.phantom_hardware_manager import get_phantom_manager
+            except ImportError:
+                try:
+                    from system.phantom_hardware_manager import get_phantom_manager
+                except ImportError:
+                    pass
+
+            if get_phantom_manager is None:
+                self.logger.info("[GhostDisplay] PhantomHardwareManager not available — skipping")
+                self._update_component_status("ghost_display", "skipped", "Module not available")
+                return True
+
+            phantom_mgr = get_phantom_manager()
+
+            # Ensure ghost display exists (with timeout)
+            try:
+                success, error = await asyncio.wait_for(
+                    phantom_mgr.ensure_ghost_display_exists_async(),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"[GhostDisplay] Timed out after {timeout}s — continuing without"
+                )
+                self._update_component_status("ghost_display", "error", f"Timeout ({timeout}s)")
+                return False
+
+            if not success:
+                self.logger.warning(f"[GhostDisplay] Failed to ensure ghost display: {error}")
+                self._update_component_status("ghost_display", "error", error or "Creation failed")
+                return False
+
+            self.logger.info("[GhostDisplay] Virtual display ready")
+
+            # Crash recovery — audit & repatriate stranded windows
+            if _get_env_bool("JARVIS_GHOST_CRASH_RECOVERY", True):
+                await self._ghost_display_crash_recovery()
+
+            # Publish state file for cross-repo exchange
+            await self._publish_ghost_display_state(phantom_mgr)
+
+            # Start background health monitor
+            if ASYNC_SAFETY_AVAILABLE:
+                task = create_safe_task(
+                    self._ghost_display_health_loop(phantom_mgr),
+                    name="ghost-display-health",
+                )
+            else:
+                task = asyncio.create_task(self._ghost_display_health_loop(phantom_mgr))
+            self._background_tasks.append(task)
+
+            self._update_component_status("ghost_display", "complete", "Ghost Display ready")
+            return True
+
+        except Exception as e:
+            self.logger.warning(f"[GhostDisplay] Initialization failed: {e}")
+            self._update_component_status("ghost_display", "error", f"Error: {e}")
+            return False
+
+    async def _ghost_display_crash_recovery(self) -> None:
+        """
+        v240.0: Audit for stranded windows from previous sessions and repatriate them.
+
+        Stranded windows are those that were on the Ghost Display when JARVIS crashed.
+        The GhostPersistenceManager persists window state to disk before teleportation,
+        enabling recovery even after full kernel crash.
+        """
+        try:
+            get_persistence_manager = None
+            try:
+                from backend.vision.ghost_persistence_manager import get_persistence_manager
+            except ImportError:
+                try:
+                    from vision.ghost_persistence_manager import get_persistence_manager
+                except ImportError:
+                    pass
+
+            if get_persistence_manager is None:
+                return
+
+            pm = get_persistence_manager()
+            stranded = await asyncio.wait_for(pm.startup(), timeout=10.0)
+
+            if stranded:
+                self.logger.info(
+                    f"[GhostDisplay] Found {len(stranded)} stranded windows — repatriating"
+                )
+                result = await asyncio.wait_for(
+                    pm.repatriate_stranded_windows(stranded, narrate_callback=None),
+                    timeout=15.0,
+                )
+                self.logger.info(
+                    f"[GhostDisplay] Repatriation: success={result.get('success', 0)}, "
+                    f"failed={result.get('failed', 0)}, skipped={result.get('skipped', 0)}"
+                )
+            else:
+                self.logger.info("[GhostDisplay] No stranded windows from previous sessions")
+
+        except asyncio.TimeoutError:
+            self.logger.warning("[GhostDisplay] Crash recovery timed out — continuing")
+        except Exception as e:
+            self.logger.warning(f"[GhostDisplay] Crash recovery error: {e}")
+
+    async def _publish_ghost_display_state(self, phantom_mgr=None) -> None:
+        """
+        v240.0: Publish ghost display state to ~/.jarvis/trinity/state/ for cross-repo exchange.
+
+        J-Prime and Reactor-Core can read this file to query ghost display readiness,
+        following the same pattern as jarvis-body_readiness.json.
+
+        Uses atomic write (temp file + rename) to prevent corruption.
+        """
+        try:
+            state_dir = Path.home() / ".jarvis" / "trinity" / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_file = state_dir / "ghost_display_state.json"
+
+            status_data = {"ghost_display_active": False}
+            if phantom_mgr:
+                try:
+                    hw_status = await asyncio.wait_for(
+                        phantom_mgr.get_display_status_async(),
+                        timeout=5.0,
+                    )
+                    if hw_status:
+                        status_data = {
+                            "ghost_display_active": hw_status.ghost_display_active,
+                            "cli_available": getattr(hw_status, "cli_available", False),
+                            "app_running": getattr(hw_status, "app_running", False),
+                        }
+                except Exception:
+                    pass
+
+            state = {
+                "timestamp": time.time(),
+                "is_ready": status_data.get("ghost_display_active", False),
+                "status": status_data,
+                "component_status": self._component_status.get(
+                    "ghost_display", {}
+                ).get("status", "unknown"),
+            }
+
+            # Atomic write: temp file + rename (same pattern as AtomicIPCFile)
+            import tempfile
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=str(state_dir), suffix=".tmp")
+            try:
+                os.write(tmp_fd, json.dumps(state, indent=2).encode("utf-8"))
+                os.fsync(tmp_fd)
+            finally:
+                os.close(tmp_fd)
+            os.rename(tmp_path, str(state_file))
+
+        except Exception as e:
+            self.logger.debug(f"[GhostDisplay] Failed to publish state: {e}")
+
+    async def _ghost_display_health_loop(self, phantom_mgr) -> None:
+        """
+        v240.0: Background health monitoring for Ghost Display.
+
+        Periodically checks if the BetterDisplay virtual display is still alive.
+        After JARVIS_GHOST_MAX_HEALTH_FAILURES consecutive failures, attempts
+        auto-recovery by re-creating the display.
+
+        Env vars:
+            JARVIS_GHOST_HEALTH_INTERVAL: Check frequency (default: 30.0s)
+            JARVIS_GHOST_MAX_HEALTH_FAILURES: Failures before recovery (default: 3)
+            JARVIS_GHOST_DISPLAY_TIMEOUT: Recovery creation timeout (default: 30.0s)
+        """
+        interval = _get_env_float("JARVIS_GHOST_HEALTH_INTERVAL", 30.0)
+        max_failures = int(os.environ.get("JARVIS_GHOST_MAX_HEALTH_FAILURES", "3"))
+        consecutive_failures = 0
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval)
+
+                hw_status = await asyncio.wait_for(
+                    phantom_mgr.get_display_status_async(),
+                    timeout=10.0,
+                )
+
+                if hw_status and hw_status.ghost_display_active:
+                    consecutive_failures = 0
+                    # Refresh state file periodically for cross-repo consumers
+                    await self._publish_ghost_display_state(phantom_mgr)
+                else:
+                    consecutive_failures += 1
+                    self.logger.warning(
+                        f"[GhostDisplay] Health check failed "
+                        f"({consecutive_failures}/{max_failures})"
+                    )
+
+                    if consecutive_failures >= max_failures:
+                        self.logger.warning("[GhostDisplay] Attempting auto-recovery...")
+                        self._update_component_status(
+                            "ghost_display", "running", "Recovering ghost display..."
+                        )
+                        try:
+                            recovery_timeout = _get_env_float(
+                                "JARVIS_GHOST_DISPLAY_TIMEOUT", 30.0
+                            )
+                            success, error = await asyncio.wait_for(
+                                phantom_mgr.ensure_ghost_display_exists_async(),
+                                timeout=recovery_timeout,
+                            )
+                            if success:
+                                consecutive_failures = 0
+                                self._update_component_status(
+                                    "ghost_display", "complete", "Ghost Display recovered"
+                                )
+                                self.logger.info("[GhostDisplay] Recovery successful")
+                                await self._publish_ghost_display_state(phantom_mgr)
+                            else:
+                                self._update_component_status(
+                                    "ghost_display", "error",
+                                    f"Recovery failed: {error}",
+                                )
+                        except asyncio.TimeoutError:
+                            self._update_component_status(
+                                "ghost_display", "error", "Recovery timed out"
+                            )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug(f"[GhostDisplay] Health loop error: {e}")
 
     # =========================================================================
     # v186.0: TRINITY PROGRESS CALLBACK
@@ -67134,6 +67457,27 @@ class JarvisSystemKernel:
                     f"Reconciled: live probe on port {actual_port} succeeded"
                 )
 
+        # v240.0: Ghost display reconciliation (no HTTP port — check display status directly)
+        ghost_cs = self._component_status.get("ghost_display", {})
+        if ghost_cs.get("status") in ("error", "unavailable"):
+            try:
+                from backend.system.phantom_hardware_manager import get_phantom_manager
+                phantom = get_phantom_manager()
+                hw = await asyncio.wait_for(
+                    phantom.get_display_status_async(), timeout=5.0
+                )
+                if hw and hw.ghost_display_active:
+                    self.logger.info(
+                        f"[Reconcile] ghost_display was '{ghost_cs.get('status')}' "
+                        "but display is actually alive — correcting"
+                    )
+                    self._update_component_status(
+                        "ghost_display", "complete",
+                        "Reconciled: display probe succeeded"
+                    )
+            except Exception:
+                pass  # Reconciliation is best-effort
+
     def _update_component_status(
         self,
         component: str,
@@ -67187,6 +67531,7 @@ class JarvisSystemKernel:
                     "jarvis_prime": "jarvis-prime",
                     "reactor_core": "reactor-core",
                     "gcp_vm": "gcp-vm",
+                    "ghost_display": "ghost-display",  # v240.0
                 }
                 dash_name = dashboard_name_map.get(component, component)
                 
@@ -67218,7 +67563,8 @@ class JarvisSystemKernel:
             "trinity": 5,
             "jarvis_prime": 12,
             "reactor_core": 10,
-            "enterprise": 5,
+            "enterprise": 3,       # v240.0: reduced from 5 (2 redistributed to ghost_display)
+            "ghost_display": 2,    # v240.0: optional, fast init
             "frontend": 10,
         }
 

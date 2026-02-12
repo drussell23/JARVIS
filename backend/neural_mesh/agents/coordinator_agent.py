@@ -160,9 +160,10 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
         }
 
         # Send task to agent
-        await self.send_message(
-            recipient=selected.agent_name,
-            content={
+        await self.publish(
+            to_agent=selected.agent_name,
+            message_type=MessageType.TASK_ASSIGNED,
+            payload={
                 "type": "task",
                 "task_id": task_id,
                 "action": required_capability,
@@ -191,10 +192,10 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
                 found = await self.registry.find_by_capability(capability)
                 agents.extend(found)
             elif agent_type:
-                all_agents = await self.registry.get_all()
+                all_agents = await self.registry.get_all_agents()
                 agents = [a for a in all_agents if a.agent_type == agent_type]
             else:
-                agents = await self.registry.get_all()
+                agents = await self.registry.get_all_agents()
 
         return {
             "status": "success",
@@ -217,7 +218,7 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
         exclude_self = payload.get("exclude_self", True)
 
         if self.registry:
-            agents = await self.registry.get_all()
+            agents = await self.registry.get_all_agents()
         else:
             agents = []
 
@@ -228,9 +229,10 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
             if target_type and agent.agent_type != target_type:
                 continue
 
-            await self.send_message(
-                recipient=agent.agent_name,
-                content=message_content,
+            await self.publish(
+                to_agent=agent.agent_name,
+                message_type=MessageType.BROADCAST,
+                payload=message_content,
             )
             sent_count += 1
 
@@ -245,7 +247,7 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
 
         if agent_name:
             if self.registry:
-                agent = await self.registry.get(agent_name)
+                agent = await self.registry.get_agent(agent_name)
                 if agent:
                     return {
                         "status": "success",
@@ -261,7 +263,7 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
         else:
             # Return all agent statuses
             if self.registry:
-                agents = await self.registry.get_all()
+                agents = await self.registry.get_all_agents()
             else:
                 agents = []
 
@@ -347,12 +349,12 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
 
     async def _handle_task_response(self, message: AgentMessage) -> None:
         """Handle task responses from agents."""
-        task_id = message.content.get("task_id")
+        task_id = message.payload.get("task_id")
         if task_id in self._pending_tasks:
             task = self._pending_tasks.pop(task_id)
             task["completed_at"] = datetime.now()
             task["status"] = "completed"
-            task["result"] = message.content.get("result")
+            task["result"] = message.payload.get("result")
             self._task_history.append(task)
 
             # Update load
@@ -375,12 +377,12 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
                     timeout=queue_timeout
                 )
                 # Process the message with timeout protection
-                capability = message.content.get("capability")
+                capability = message.payload.get("capability")
                 if capability:
                     await asyncio.wait_for(
                         self._delegate_task({
                             "capability": capability,
-                            "task_payload": message.content,
+                            "task_payload": message.payload,
                         }),
                         timeout=task_timeout,
                     )

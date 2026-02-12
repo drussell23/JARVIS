@@ -31,7 +31,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
-from ..data_models import AgentMessage, KnowledgeType, MessageType
+from ..data_models import AgentMessage, KnowledgeType, MessagePriority, MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +304,7 @@ class GoalInferenceAgent(BaseNeuralMeshAgent):
         )
 
         # Publish knowledge about inferred goal
-        await self.publish_knowledge(
+        await self.add_knowledge(
             knowledge_type=KnowledgeType.INSIGHT,
             data={
                 "type": "goal_inferred",
@@ -314,6 +314,22 @@ class GoalInferenceAgent(BaseNeuralMeshAgent):
                 "confidence": confidence,
             },
         )
+
+        # v238.0: Broadcast inferred goal for cross-agent awareness
+        try:
+            await self.broadcast(
+                message_type=MessageType.ANNOUNCEMENT,
+                payload={
+                    "type": "goal_inferred",
+                    "goal_id": goal_id,
+                    "category": category.value,
+                    "description": description,
+                    "confidence": confidence,
+                },
+                priority=MessagePriority.NORMAL,
+            )
+        except Exception:
+            pass  # Best-effort broadcast
 
         return {
             "goal_id": goal_id,

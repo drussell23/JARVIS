@@ -25,6 +25,7 @@ from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
 from ..data_models import (
     AgentMessage,
     KnowledgeType,
+    MessagePriority,
     MessageType,
 )
 from ..knowledge.semantic_memory import (
@@ -473,31 +474,47 @@ class MemoryAgent(BaseNeuralMeshAgent):
 
     async def _handle_memory_request(self, message: AgentMessage) -> None:
         """Handle incoming memory requests from other agents."""
-        if message.content.get("type") != "memory_request":
+        if message.payload.get("type") != "memory_request":
             return
 
-        action = message.content.get("action")
-        payload = message.content.get("payload", {})
+        action = message.payload.get("action")
+        data = message.payload.get("data", {})
 
         try:
-            result = await self.execute_task({"action": action, **payload})
+            result = await self.execute_task({"action": action, **data})
 
             # Send response
-            await self.send_message(
-                recipient=message.sender,
-                content={
+            await self.publish(
+                to_agent=message.from_agent,
+                message_type=MessageType.RESPONSE,
+                payload={
                     "type": "memory_response",
-                    "request_id": message.content.get("request_id"),
+                    "request_id": message.payload.get("request_id"),
                     "result": result,
                 },
             )
+
+            # v238.0: Broadcast memory operation for cross-agent awareness
+            try:
+                await self.broadcast(
+                    message_type=MessageType.KNOWLEDGE_SHARED,
+                    payload={
+                        "type": "memory_insight",
+                        "action": action,
+                        "key_count": len(result) if isinstance(result, list) else 1,
+                    },
+                    priority=MessagePriority.LOW,
+                )
+            except Exception:
+                pass  # Best-effort broadcast
         except Exception as e:
             logger.exception(f"Error handling memory request: {e}")
-            await self.send_message(
-                recipient=message.sender,
-                content={
+            await self.publish(
+                to_agent=message.from_agent,
+                message_type=MessageType.RESPONSE,
+                payload={
                     "type": "memory_response",
-                    "request_id": message.content.get("request_id"),
+                    "request_id": message.payload.get("request_id"),
                     "error": str(e),
                 },
             )

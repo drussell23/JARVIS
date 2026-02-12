@@ -1625,6 +1625,13 @@ class NeuralMeshBridge:
         'action_failed':    ('alert_raised',     True),
         'pattern_learned':  ('knowledge_shared', True),
         'user_command':     ('task_assigned',     False),  # targeted to coordinator
+        # v238.0: Complete reverse mapping coverage
+        'error_detected':        ('error_detected',     True),
+        'warning_detected':      ('alert_raised',       True),
+        'notification_detected': ('notification',       True),
+        'health_check':          ('agent_health_check', True),
+        'content_changed':       ('context_update',     True),
+        'security_concern':      ('alert_raised',       True),
     }
 
     # CUSTOM message payload keys that indicate bridgeable intent
