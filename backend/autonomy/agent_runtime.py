@@ -945,15 +945,44 @@ class UnifiedAgentRuntime:
         }
 
     def _get_available_tools_text(self) -> str:
-        """v239.0: Build available tools list for THINK prompts."""
+        """v239.0: Build available tools list for THINK prompts.
+
+        Groups mesh tools by agent for compact representation.
+        Shows built-in tools first, then mesh agent groups.
+        Cap total lines via AGENT_RUNTIME_MAX_TOOLS_IN_PROMPT.
+        """
         try:
             from backend.autonomy.langchain_tools import ToolRegistry
             registry = ToolRegistry.get_instance()
-            max_tools = int(os.getenv("AGENT_RUNTIME_MAX_TOOLS_IN_PROMPT", "50"))
-            tools = list(registry.get_all())[:max_tools]
-            if not tools:
+            max_lines = int(os.getenv("AGENT_RUNTIME_MAX_TOOLS_IN_PROMPT", "60"))
+            all_tools = registry.get_all()
+            if not all_tools:
                 return ""
-            lines = [f"  - {t.metadata.name}: {t.metadata.description[:150]}" for t in tools]
+
+            lines: list = []
+            # Partition: built-in tools first, then mesh tools grouped by agent
+            mesh_by_agent: dict = {}  # agent_name -> [capability_name]
+            for t in all_tools:
+                name = t.metadata.name
+                if name.startswith("mesh:"):
+                    parts = name.split(":", 2)
+                    agent_key = parts[1] if len(parts) > 1 else "unknown"
+                    cap = parts[2] if len(parts) > 2 else name
+                    mesh_by_agent.setdefault(agent_key, []).append(cap)
+                else:
+                    lines.append(f"  - {name}: {t.metadata.description[:120]}")
+
+            # Mesh tools: one summary line per agent listing capabilities
+            for agent_name, caps in sorted(mesh_by_agent.items()):
+                cap_str = ", ".join(caps[:8])
+                if len(caps) > 8:
+                    cap_str += f", ... (+{len(caps) - 8} more)"
+                lines.append(f"  - mesh:{agent_name}:<capability>: [{cap_str}]")
+
+            if not lines:
+                return ""
+
+            lines = lines[:max_lines]
             return (
                 "\nAvailable tools (use exact name in 'tool' field of action):\n"
                 + "\n".join(lines) + "\n"

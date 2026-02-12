@@ -859,6 +859,66 @@ class AGIOSCoordinator:
                     registered,
                     len(self._jarvis_bridge.registered_agents),
                 )
+
+                if registered == 0:
+                    logger.warning(
+                        "Neural Mesh → ToolRegistry: 0 capabilities registered — "
+                        "agents may have empty capability sets"
+                    )
+
+                # v239.0: Health-aware tool lifecycle — deregister on agent death,
+                # re-register on agent recovery. Uses AgentRegistry status callbacks.
+                coordinator = getattr(self._jarvis_bridge, '_coordinator', None)
+                agent_registry = getattr(coordinator, '_registry', None) if coordinator else None
+                if agent_registry and hasattr(agent_registry, 'on_status_change'):
+                    bridge_ref = self._jarvis_bridge
+                    timeout_ref = default_timeout
+
+                    def _on_agent_status_change(agent_info, old_status):
+                        """Sync/deregister mesh tools based on agent health."""
+                        from neural_mesh.data_models import AgentStatus as AS
+                        name = agent_info.agent_name
+                        new_status = agent_info.status
+
+                        # Agent went offline/error → remove its tools
+                        if new_status in (AS.OFFLINE, AS.ERROR, AS.SHUTTING_DOWN):
+                            agent = bridge_ref.get_agent(name)
+                            if agent:
+                                for cap in agent.capabilities:
+                                    tool_name = f"mesh:{name}:{cap}"
+                                    registry.unregister(tool_name)
+                                logger.info(
+                                    "[MeshToolLifecycle] Agent %s → %s: %d tools deregistered",
+                                    name, new_status.value, len(agent.capabilities),
+                                )
+
+                        # Agent recovered → re-register its tools
+                        elif (
+                            new_status in (AS.ONLINE, AS.BUSY)
+                            and old_status in (AS.OFFLINE, AS.ERROR, AS.INITIALIZING)
+                        ):
+                            agent = bridge_ref.get_agent(name)
+                            if agent:
+                                re_registered = 0
+                                for cap in agent.capabilities:
+                                    try:
+                                        tool = NeuralMeshAgentTool(
+                                            agent=agent,
+                                            capability=cap,
+                                            timeout_seconds=timeout_ref,
+                                        )
+                                        registry.register(tool, replace=True)
+                                        re_registered += 1
+                                    except Exception:
+                                        pass
+                                logger.info(
+                                    "[MeshToolLifecycle] Agent %s recovered: %d tools re-registered",
+                                    name, re_registered,
+                                )
+
+                    agent_registry.on_status_change(_on_agent_status_change)
+                    logger.info("[MeshToolLifecycle] Health-aware tool lifecycle active")
+
             except Exception as e:
                 logger.warning("Mesh tool registration failed (non-fatal): %s", e)
 

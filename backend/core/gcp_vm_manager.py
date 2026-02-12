@@ -1535,7 +1535,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             try:
                 with open("/tmp/golden_image_status.json", "r") as f:
                     status = json.load(f)
-            except:
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
                 status = {{"status": "booting", "progress_pct": 0, "current_step": "Starting..."}}
             
             self.send_response(200)
@@ -7387,7 +7387,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
             try:
                 with open(PROGRESS_FILE, "r") as f:
                     state = json.load(f)
-            except:
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
                 state = {"phase": 0, "total_progress": 5, "checkpoint": "golden_booting",
                          "model_loaded": False, "ready_for_inference": False}
 
@@ -7426,7 +7426,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
             try:
                 with open(PROGRESS_FILE) as f:
                     ready = json.load(f).get("ready_for_inference", False)
-            except:
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
                 ready = False
             code = 200 if ready else 503
             self.send_response(code)
@@ -7478,7 +7478,7 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
             try:
                 with open(PROGRESS_FILE, "r") as f:
                     state = json.load(f)
-            except:
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
                 state = {"phase": 0, "total_progress": 5, "checkpoint": "golden_booting"}
             elapsed = int(time.time() - start_time)
             ready = state.get("ready_for_inference", False)
