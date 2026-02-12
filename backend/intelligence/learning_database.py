@@ -1160,22 +1160,54 @@ class DatabaseCursorWrapper:
             raise
         except Exception as e:
             if self._can_retry_with_fresh_connection(e, query_type, query_upper):
+                replay_attempts = max(
+                    1,
+                    int(os.getenv("LEARNING_DB_FRESH_CONN_REPLAY_ATTEMPTS", "3"))
+                )
+                replay_base_delay = float(
+                    os.getenv("LEARNING_DB_FRESH_CONN_REPLAY_BASE_DELAY", "0.25")
+                )
+
                 logger.warning(
                     "[LearningDB] Transient connection drop detected for idempotent query; "
-                    "replaying once on a fresh pooled connection"
+                    f"replaying on fresh pooled connection (max_attempts={replay_attempts})"
                 )
-                try:
-                    async with self.connection_wrapper.adapter.connection() as fresh_conn:
-                        self.adapter_conn = fresh_conn
-                        await _execute_with_connection(fresh_conn)
-                    await circuit_breaker.record_success()
-                    return self
-                except Exception as replay_error:
-                    logger.error(
-                        f"Error replaying query after transient disconnect: {sql[:100]}... "
-                        f"original={type(e).__name__}: {e}, replay={type(replay_error).__name__}: {replay_error}"
-                    )
-                    e = replay_error
+
+                for replay_idx in range(1, replay_attempts + 1):
+                    try:
+                        async with self.connection_wrapper.adapter.connection() as fresh_conn:
+                            self.adapter_conn = fresh_conn
+                            await _execute_with_connection(fresh_conn)
+                        await circuit_breaker.record_success()
+                        if replay_idx > 1:
+                            logger.info(
+                                f"[LearningDB] Query replay succeeded on attempt {replay_idx}/{replay_attempts}"
+                            )
+                        return self
+                    except Exception as replay_error:
+                        should_retry_replay = (
+                            replay_idx < replay_attempts
+                            and self._can_retry_with_fresh_connection(
+                                replay_error, query_type, query_upper
+                            )
+                        )
+                        if should_retry_replay:
+                            delay = min(replay_base_delay * (2 ** (replay_idx - 1)), 2.0)
+                            logger.warning(
+                                "[LearningDB] Fresh-connection replay failed "
+                                f"(attempt {replay_idx}/{replay_attempts}): "
+                                f"{type(replay_error).__name__}: {replay_error}. "
+                                f"Retrying in {delay:.2f}s..."
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+
+                        logger.error(
+                            f"Error replaying query after transient disconnect: {sql[:100]}... "
+                            f"original={type(e).__name__}: {e}, replay={type(replay_error).__name__}: {replay_error}"
+                        )
+                        e = replay_error
+                        break
 
             logger.error(f"Error executing query: {sql[:100]}... with params {parameters}: {e}")
             # Reset state on error
@@ -2525,7 +2557,25 @@ class JARVISLearningDatabase:
     async def _initialize_standard_mode(self):
         """Standard sequential initialization (original behavior)."""
         # Initialize async SQLite
-        await self._init_sqlite()
+        try:
+            await self._init_sqlite()
+        except Exception as init_error:
+            if _is_connection_drop_error(init_error):
+                logger.warning(
+                    "[LearningDB] Cloud-backed schema initialization failed due transient "
+                    "connection drop; retrying with local SQLite fallback",
+                    exc_info=True,
+                )
+                try:
+                    if self.db:
+                        await self.db.close()
+                except Exception as close_error:
+                    logger.debug(f"[LearningDB] Cloud connection cleanup during fallback failed: {close_error}")
+
+                self.db = None
+                await self._init_sqlite(allow_cloud=False)
+            else:
+                raise
 
         # Initialize Cloud Database Adapter for redundant Cloud SQL storage (v10.6)
         # This enables parallel writes to both local SQLite and Cloud SQL for voice samples
@@ -2633,10 +2683,10 @@ class JARVISLearningDatabase:
         assert self.db is not None, "Database not initialized. Call initialize() first."
         return self.db
 
-    async def _init_sqlite(self):
+    async def _init_sqlite(self, allow_cloud: bool = True):
         """Initialize async database (SQLite or Cloud SQL) with enhanced schema and timeout protection"""
         # Try to use Cloud SQL if available (with timeout protection)
-        if CLOUD_ADAPTER_AVAILABLE:
+        if allow_cloud and CLOUD_ADAPTER_AVAILABLE:
             try:
                 # CRITICAL FIX: Add timeout protection to prevent infinite hangs
                 # If Cloud SQL proxy isn't running, this will timeout and fallback to SQLite
@@ -3472,7 +3522,7 @@ class JARVISLearningDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_suggestions_confidence ON proactive_suggestions(confidence DESC)"
             )
 
-        await self.db.commit()
+        await db.commit()
         logger.info("SQLite database initialized with enhanced async schema")
 
     async def _init_hybrid_sync(self):
@@ -7200,192 +7250,210 @@ class JARVISLearningDatabase:
             if not self.db:
                 logger.warning("Database not initialized yet - returning empty profiles")
                 return []
-            async with self.db.cursor() as cursor:
-                await cursor.execute(
+
+            async def _query_profiles():
+                async with self.db.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT speaker_id, speaker_name, voiceprint_embedding,
+                               total_samples, average_pitch_hz, recognition_confidence,
+                               is_primary_user, security_level, created_at, last_updated,
+                               -- BEAST MODE: Acoustic features
+                               pitch_mean_hz, pitch_std_hz, pitch_range_hz, pitch_min_hz, pitch_max_hz,
+                               formant_f1_hz, formant_f1_std, formant_f2_hz, formant_f2_std,
+                               formant_f3_hz, formant_f3_std, formant_f4_hz, formant_f4_std,
+                               spectral_centroid_hz, spectral_centroid_std, spectral_rolloff_hz, spectral_rolloff_std,
+                               spectral_flux, spectral_flux_std, spectral_entropy, spectral_entropy_std,
+                               spectral_flatness, spectral_bandwidth_hz,
+                               speaking_rate_wpm, speaking_rate_std, pause_ratio, pause_ratio_std,
+                               syllable_rate, articulation_rate,
+                               energy_mean, energy_std, energy_dynamic_range_db,
+                               jitter_percent, jitter_std, shimmer_percent, shimmer_std,
+                               harmonic_to_noise_ratio_db, hnr_std,
+                               feature_covariance_matrix, feature_statistics,
+                               enrollment_quality_score, feature_extraction_version,
+                               embedding_dimension
+                        FROM speaker_profiles
                     """
-                    SELECT speaker_id, speaker_name, voiceprint_embedding,
-                           total_samples, average_pitch_hz, recognition_confidence,
-                           is_primary_user, security_level, created_at, last_updated,
-                           -- BEAST MODE: Acoustic features
-                           pitch_mean_hz, pitch_std_hz, pitch_range_hz, pitch_min_hz, pitch_max_hz,
-                           formant_f1_hz, formant_f1_std, formant_f2_hz, formant_f2_std,
-                           formant_f3_hz, formant_f3_std, formant_f4_hz, formant_f4_std,
-                           spectral_centroid_hz, spectral_centroid_std, spectral_rolloff_hz, spectral_rolloff_std,
-                           spectral_flux, spectral_flux_std, spectral_entropy, spectral_entropy_std,
-                           spectral_flatness, spectral_bandwidth_hz,
-                           speaking_rate_wpm, speaking_rate_std, pause_ratio, pause_ratio_std,
-                           syllable_rate, articulation_rate,
-                           energy_mean, energy_std, energy_dynamic_range_db,
-                           jitter_percent, jitter_std, shimmer_percent, shimmer_std,
-                           harmonic_to_noise_ratio_db, hnr_std,
-                           feature_covariance_matrix, feature_statistics,
-                           enrollment_quality_score, feature_extraction_version,
-                           embedding_dimension
-                    FROM speaker_profiles
-                """
-                )
-                rows = await cursor.fetchall()
-                # v116.0: Moved from INFO to DEBUG to reduce log noise
-                logger.debug(f"Got {len(rows) if rows else 0} speaker profile rows")
-                logger.debug(
-                    f"Type of rows: {type(rows)}, Type of first row: {type(rows[0]) if rows else 'empty'}"
-                )
-
-                if rows and len(rows) > 0:
-                    logger.debug(f"First row content: {rows[0]}")
-                    logger.debug(
-                        f"First row keys: {list(rows[0].keys()) if hasattr(rows[0], 'keys') else 'no keys'}"
                     )
+                    return await cursor.fetchall()
 
-                profiles = []
-                for raw_row in rows:
-                    # Convert sqlite3.Row to dict for .get() support
-                    row = _row_to_dict(raw_row)
-                    profile = {
-                        "speaker_id": row.get("speaker_id"),
-                        "speaker_name": row.get("speaker_name"),
-                        "voiceprint_embedding": row.get("voiceprint_embedding"),
-                        "total_samples": row.get("total_samples"),
-                        "average_pitch_hz": row.get("average_pitch_hz"),
-                        "recognition_confidence": row.get("recognition_confidence"),
-                        "is_primary_user": bool(row.get("is_primary_user", False)),
-                        "security_level": row.get("security_level") or "standard",
-                        "created_at": row.get("created_at"),
-                        "last_updated": row.get("last_updated"),
-                        "embedding_dimension": row.get("embedding_dimension"),
-                        "updated_at": row.get("last_updated"),  # Map last_updated to updated_at for compatibility
-                        "enrollment_quality_score": row.get("enrollment_quality_score"),
-                        "feature_extraction_version": row.get("feature_extraction_version"),
+            try:
+                rows = await _query_profiles()
+            except RuntimeError as runtime_error:
+                if "connection is closed" not in str(runtime_error).lower():
+                    raise
 
-                        # BEAST MODE: Add all acoustic features
-                        "pitch_mean_hz": row.get("pitch_mean_hz"),
-                        "pitch_std_hz": row.get("pitch_std_hz"),
-                        "pitch_range_hz": row.get("pitch_range_hz"),
-                        "pitch_min_hz": row.get("pitch_min_hz"),
-                        "pitch_max_hz": row.get("pitch_max_hz"),
+                logger.warning(
+                    "[LearningDB] Speaker profile query hit closed connection; "
+                    "refreshing singleton and retrying once"
+                )
+                refreshed_db = await get_learning_database()
+                if refreshed_db is not self:
+                    return await refreshed_db.get_all_speaker_profiles()
+                rows = await _query_profiles()
 
-                        "formant_f1_hz": row.get("formant_f1_hz"),
-                        "formant_f1_std": row.get("formant_f1_std"),
-                        "formant_f2_hz": row.get("formant_f2_hz"),
-                        "formant_f2_std": row.get("formant_f2_std"),
-                        "formant_f3_hz": row.get("formant_f3_hz"),
-                        "formant_f3_std": row.get("formant_f3_std"),
-                        "formant_f4_hz": row.get("formant_f4_hz"),
-                        "formant_f4_std": row.get("formant_f4_std"),
+            # v116.0: Moved from INFO to DEBUG to reduce log noise
+            logger.debug(f"Got {len(rows) if rows else 0} speaker profile rows")
+            logger.debug(
+                f"Type of rows: {type(rows)}, Type of first row: {type(rows[0]) if rows else 'empty'}"
+            )
 
-                        "spectral_centroid_hz": row.get("spectral_centroid_hz"),
-                        "spectral_centroid_std": row.get("spectral_centroid_std"),
-                        "spectral_rolloff_hz": row.get("spectral_rolloff_hz"),
-                        "spectral_rolloff_std": row.get("spectral_rolloff_std"),
-                        "spectral_flux": row.get("spectral_flux"),
-                        "spectral_flux_std": row.get("spectral_flux_std"),
-                        "spectral_entropy": row.get("spectral_entropy"),
-                        "spectral_entropy_std": row.get("spectral_entropy_std"),
-                        "spectral_flatness": row.get("spectral_flatness"),
-                        "spectral_bandwidth_hz": row.get("spectral_bandwidth_hz"),
+            if rows and len(rows) > 0:
+                logger.debug(f"First row content: {rows[0]}")
+                logger.debug(
+                    f"First row keys: {list(rows[0].keys()) if hasattr(rows[0], 'keys') else 'no keys'}"
+                )
 
-                        "speaking_rate_wpm": row.get("speaking_rate_wpm"),
-                        "speaking_rate_std": row.get("speaking_rate_std"),
-                        "pause_ratio": row.get("pause_ratio"),
-                        "pause_ratio_std": row.get("pause_ratio_std"),
-                        "syllable_rate": row.get("syllable_rate"),
-                        "articulation_rate": row.get("articulation_rate"),
+            profiles = []
+            for raw_row in rows:
+                # Convert sqlite3.Row to dict for .get() support
+                row = _row_to_dict(raw_row)
+                profile = {
+                    "speaker_id": row.get("speaker_id"),
+                    "speaker_name": row.get("speaker_name"),
+                    "voiceprint_embedding": row.get("voiceprint_embedding"),
+                    "total_samples": row.get("total_samples"),
+                    "average_pitch_hz": row.get("average_pitch_hz"),
+                    "recognition_confidence": row.get("recognition_confidence"),
+                    "is_primary_user": bool(row.get("is_primary_user", False)),
+                    "security_level": row.get("security_level") or "standard",
+                    "created_at": row.get("created_at"),
+                    "last_updated": row.get("last_updated"),
+                    "embedding_dimension": row.get("embedding_dimension"),
+                    "updated_at": row.get("last_updated"),  # Map last_updated to updated_at for compatibility
+                    "enrollment_quality_score": row.get("enrollment_quality_score"),
+                    "feature_extraction_version": row.get("feature_extraction_version"),
 
-                        "energy_mean": row.get("energy_mean"),
-                        "energy_std": row.get("energy_std"),
-                        "energy_dynamic_range_db": row.get("energy_dynamic_range_db"),
+                    # BEAST MODE: Add all acoustic features
+                    "pitch_mean_hz": row.get("pitch_mean_hz"),
+                    "pitch_std_hz": row.get("pitch_std_hz"),
+                    "pitch_range_hz": row.get("pitch_range_hz"),
+                    "pitch_min_hz": row.get("pitch_min_hz"),
+                    "pitch_max_hz": row.get("pitch_max_hz"),
 
-                        "jitter_percent": row.get("jitter_percent"),
-                        "jitter_std": row.get("jitter_std"),
-                        "shimmer_percent": row.get("shimmer_percent"),
-                        "shimmer_std": row.get("shimmer_std"),
-                        "harmonic_to_noise_ratio_db": row.get("harmonic_to_noise_ratio_db"),
-                        "hnr_std": row.get("hnr_std"),
+                    "formant_f1_hz": row.get("formant_f1_hz"),
+                    "formant_f1_std": row.get("formant_f1_std"),
+                    "formant_f2_hz": row.get("formant_f2_hz"),
+                    "formant_f2_std": row.get("formant_f2_std"),
+                    "formant_f3_hz": row.get("formant_f3_hz"),
+                    "formant_f3_std": row.get("formant_f3_std"),
+                    "formant_f4_hz": row.get("formant_f4_hz"),
+                    "formant_f4_std": row.get("formant_f4_std"),
 
-                        "feature_covariance_matrix": row.get("feature_covariance_matrix"),
-                        "feature_statistics": row.get("feature_statistics"),
+                    "spectral_centroid_hz": row.get("spectral_centroid_hz"),
+                    "spectral_centroid_std": row.get("spectral_centroid_std"),
+                    "spectral_rolloff_hz": row.get("spectral_rolloff_hz"),
+                    "spectral_rolloff_std": row.get("spectral_rolloff_std"),
+                    "spectral_flux": row.get("spectral_flux"),
+                    "spectral_flux_std": row.get("spectral_flux_std"),
+                    "spectral_entropy": row.get("spectral_entropy"),
+                    "spectral_entropy_std": row.get("spectral_entropy_std"),
+                    "spectral_flatness": row.get("spectral_flatness"),
+                    "spectral_bandwidth_hz": row.get("spectral_bandwidth_hz"),
+
+                    "speaking_rate_wpm": row.get("speaking_rate_wpm"),
+                    "speaking_rate_std": row.get("speaking_rate_std"),
+                    "pause_ratio": row.get("pause_ratio"),
+                    "pause_ratio_std": row.get("pause_ratio_std"),
+                    "syllable_rate": row.get("syllable_rate"),
+                    "articulation_rate": row.get("articulation_rate"),
+
+                    "energy_mean": row.get("energy_mean"),
+                    "energy_std": row.get("energy_std"),
+                    "energy_dynamic_range_db": row.get("energy_dynamic_range_db"),
+
+                    "jitter_percent": row.get("jitter_percent"),
+                    "jitter_std": row.get("jitter_std"),
+                    "shimmer_percent": row.get("shimmer_percent"),
+                    "shimmer_std": row.get("shimmer_std"),
+                    "harmonic_to_noise_ratio_db": row.get("harmonic_to_noise_ratio_db"),
+                    "hnr_std": row.get("hnr_std"),
+
+                    "feature_covariance_matrix": row.get("feature_covariance_matrix"),
+                    "feature_statistics": row.get("feature_statistics"),
                     }
 
-                    # Add compatibility mappings for components expecting different field names
-                    profile["name"] = profile["speaker_name"]  # Map speaker_name -> name
-                    profile["embedding"] = profile["voiceprint_embedding"]  # Map voiceprint_embedding -> embedding
+                # Add compatibility mappings for components expecting different field names
+                profile["name"] = profile["speaker_name"]  # Map speaker_name -> name
+                profile["embedding"] = profile["voiceprint_embedding"]  # Map voiceprint_embedding -> embedding
 
-                    # Convert embedding to list if it's bytes
-                    if profile["embedding"] and isinstance(profile["embedding"], (bytes, memoryview)):
-                        import numpy as np
-                        # Convert bytes to numpy array (assuming float32)
-                        try:
-                            embedding_array = np.frombuffer(profile["embedding"], dtype=np.float32)
+                # Convert embedding to list if it's bytes
+                if profile["embedding"] and isinstance(profile["embedding"], (bytes, memoryview)):
+                    import numpy as np
+                    # Convert bytes to numpy array (assuming float32)
+                    try:
+                        embedding_array = np.frombuffer(profile["embedding"], dtype=np.float32)
 
-                            # CRITICAL: Validate for NaN/Inf values before using embedding
-                            # NaN values can occur from:
-                            # - Corrupted audio during enrollment
-                            # - Failed ML model inference
-                            # - Database corruption
-                            # - Previous bugs in embedding extraction
-                            if not np.all(np.isfinite(embedding_array)):
-                                nan_count = np.sum(np.isnan(embedding_array))
-                                inf_count = np.sum(np.isinf(embedding_array))
-                                logger.error(
-                                    f"❌ Profile '{profile['speaker_name']}' contains INVALID embedding! "
-                                    f"NaN values: {nan_count}, Inf values: {inf_count}. "
-                                    f"Profile will be SKIPPED - re-enrollment required."
-                                )
-                                profile["embedding"] = None
-                                profile["voiceprint_embedding"] = None  # Mark as invalid
-                                continue
-
-                            # Validate embedding dimension (ECAPA-TDNN produces 192 dims)
-                            expected_dims = profile.get("embedding_dimension", 192)
-                            if len(embedding_array) != expected_dims and len(embedding_array) not in (192, 256, 512):
-                                logger.warning(
-                                    f"⚠️ Profile '{profile['speaker_name']}' has unexpected embedding dimension: "
-                                    f"{len(embedding_array)} (expected {expected_dims})"
-                                )
-
-                            profile["embedding"] = embedding_array.tolist()
-                        except Exception as e:
-                            logger.warning(f"Could not convert embedding for {profile['speaker_name']}: {e}")
+                        # CRITICAL: Validate for NaN/Inf values before using embedding
+                        # NaN values can occur from:
+                        # - Corrupted audio during enrollment
+                        # - Failed ML model inference
+                        # - Database corruption
+                        # - Previous bugs in embedding extraction
+                        if not np.all(np.isfinite(embedding_array)):
+                            nan_count = np.sum(np.isnan(embedding_array))
+                            inf_count = np.sum(np.isinf(embedding_array))
+                            logger.error(
+                                f"❌ Profile '{profile['speaker_name']}' contains INVALID embedding! "
+                                f"NaN values: {nan_count}, Inf values: {inf_count}. "
+                                f"Profile will be SKIPPED - re-enrollment required."
+                            )
                             profile["embedding"] = None
+                            profile["voiceprint_embedding"] = None  # Mark as invalid
+                            continue
 
-                    # Check if this is a valid profile with embedding
-                    has_embedding = profile.get("voiceprint_embedding") is not None
-
-                    # Log if acoustic features are present
-                    has_acoustic = any([
-                        profile.get("pitch_mean_hz"),
-                        profile.get("formant_f1_hz"),
-                        profile.get("spectral_centroid_hz")
-                    ])
-
-                    # Skip profiles without embeddings (they're useless for recognition)
-                    if not has_embedding:
-                        logger.debug(f"⏭️  Skipping profile '{profile['speaker_name']}' - no embedding (incomplete enrollment)")
-                        continue
-
-                    if has_acoustic:
-                        logger.debug(f"✅ Profile '{profile['speaker_name']}' has enhanced acoustic features")
-                    else:
-                        # Acoustic features are optional enhancements - only log at debug level
-                        # The voiceprint embedding is the primary authentication method
-                        # Acoustic features (pitch, formants, spectral) add extra verification
-                        speaker_name_lower = profile['speaker_name'].lower()
-                        if speaker_name_lower not in ('unknown', 'test', 'placeholder', ''):
-                            # Log at INFO level (not WARNING) since profile is still functional
-                            # Acoustic features enhance accuracy but aren't required
-                            logger.debug(
-                                f"ℹ️  Profile '{profile['speaker_name']}' uses voiceprint authentication "
-                                f"(acoustic features available after next enrollment)"
+                        # Validate embedding dimension (ECAPA-TDNN produces 192 dims)
+                        expected_dims = profile.get("embedding_dimension", 192)
+                        if len(embedding_array) != expected_dims and len(embedding_array) not in (192, 256, 512):
+                            logger.warning(
+                                f"⚠️ Profile '{profile['speaker_name']}' has unexpected embedding dimension: "
+                                f"{len(embedding_array)} (expected {expected_dims})"
                             )
 
-                    profiles.append(profile)
+                        profile["embedding"] = embedding_array.tolist()
+                    except Exception as e:
+                        logger.warning(f"Could not convert embedding for {profile['speaker_name']}: {e}")
+                        profile["embedding"] = None
 
-                # v83.0: Sync profiles with acoustic features to SQLite cache
-                # This ensures SQLite has the latest data when Cloud SQL becomes unavailable
-                if profiles and isinstance(self.db, DatabaseConnectionWrapper):
-                    asyncio.create_task(self._sync_profiles_to_sqlite_cache(profiles))
+                # Check if this is a valid profile with embedding
+                has_embedding = profile.get("voiceprint_embedding") is not None
 
-                return profiles
+                # Log if acoustic features are present
+                has_acoustic = any([
+                    profile.get("pitch_mean_hz"),
+                    profile.get("formant_f1_hz"),
+                    profile.get("spectral_centroid_hz")
+                ])
+
+                # Skip profiles without embeddings (they're useless for recognition)
+                if not has_embedding:
+                    logger.debug(f"⏭️  Skipping profile '{profile['speaker_name']}' - no embedding (incomplete enrollment)")
+                    continue
+
+                if has_acoustic:
+                    logger.debug(f"✅ Profile '{profile['speaker_name']}' has enhanced acoustic features")
+                else:
+                    # Acoustic features are optional enhancements - only log at debug level
+                    # The voiceprint embedding is the primary authentication method
+                    # Acoustic features (pitch, formants, spectral) add extra verification
+                    speaker_name_lower = profile['speaker_name'].lower()
+                    if speaker_name_lower not in ('unknown', 'test', 'placeholder', ''):
+                        # Log at INFO level (not WARNING) since profile is still functional
+                        # Acoustic features enhance accuracy but aren't required
+                        logger.debug(
+                            f"ℹ️  Profile '{profile['speaker_name']}' uses voiceprint authentication "
+                            f"(acoustic features available after next enrollment)"
+                        )
+
+                profiles.append(profile)
+
+            # v83.0: Sync profiles with acoustic features to SQLite cache
+            # This ensures SQLite has the latest data when Cloud SQL becomes unavailable
+            if profiles and isinstance(self.db, DatabaseConnectionWrapper):
+                asyncio.create_task(self._sync_profiles_to_sqlite_cache(profiles))
+
+            return profiles
 
         except Exception as e:
             logger.error(f"Failed to get speaker profiles: {e}", exc_info=True)
@@ -8682,6 +8750,46 @@ _db_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running e
 _cross_repo_sync = None
 
 
+async def _singleton_instance_has_healthy_connection(db_instance: "JARVISLearningDatabase") -> bool:
+    """
+    Validate that the singleton instance is initialized and can execute a basic query.
+
+    This prevents returning a poisoned singleton that still has `_initialized=True`
+    but whose underlying transport was closed (for example after a transient
+    Cloud SQL reset or a partial shutdown/restart race).
+    """
+    if db_instance is None or not getattr(db_instance, "_initialized", False):
+        return False
+
+    db = getattr(db_instance, "db", None)
+    if db is None:
+        return False
+
+    if isinstance(db, DatabaseConnectionWrapper) and getattr(db, "_closed", False):
+        return False
+
+    try:
+        async def _ping():
+            async with db.execute("SELECT 1") as cursor:
+                await cursor.fetchone()
+
+        await asyncio.wait_for(_ping(), timeout=2.0)
+        return True
+    except Exception as health_error:
+        if _is_connection_drop_error(health_error):
+            logger.warning(
+                "[LearningDB] Singleton health check detected closed/broken connection; "
+                "forcing singleton rebuild"
+            )
+            return False
+        else:
+            # Non-connection errors during a lightweight probe (lock contention,
+            # transient timeout, circuit breaker noise) should not force a full
+            # singleton teardown.
+            logger.debug(f"[LearningDB] Singleton health probe inconclusive: {health_error}")
+            return True
+
+
 async def get_learning_database(config: Optional[Dict] = None) -> JARVISLearningDatabase:
     """Get or create the global async learning database.
 
@@ -8699,7 +8807,16 @@ async def get_learning_database(config: Optional[Dict] = None) -> JARVISLearning
     async with _db_lock:
         # Fast path: already initialized and healthy
         if _db_instance is not None and _db_instance._initialized:
-            return _db_instance
+            if await _singleton_instance_has_healthy_connection(_db_instance):
+                return _db_instance
+
+            # Singleton is initialized but unhealthy (stale/closed connection).
+            # Dispose and recreate to avoid propagating broken state.
+            try:
+                await _db_instance.close(force=True)
+            except BaseException:
+                pass
+            _db_instance = None
 
         # Discard broken instance from a previous failed initialization.
         # Without this, the singleton is permanently poisoned: _db_instance

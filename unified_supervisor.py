@@ -57740,6 +57740,7 @@ class JarvisSystemKernel:
         # Backend process
         self._backend_process: Optional[asyncio.subprocess.Process] = None
         self._backend_server: Optional[Any] = None  # uvicorn.Server if in-process
+        self._backend_server_task: Optional[asyncio.Task] = None  # uvicorn serve task
 
         # Frontend and loading server processes
         self._frontend_process: Optional[asyncio.subprocess.Process] = None
@@ -58583,11 +58584,15 @@ class JarvisSystemKernel:
         except Exception as e:
             self.logger.debug(f"[Kernel] AGI OS cleanup error: {e}")
 
-        # Kill backend immediately
+        # Stop backend deterministically (in-process first, then subprocess fallback)
+        if self._backend_server or self._backend_server_task:
+            await self._stop_backend_in_process(
+                reason="emergency-shutdown",
+                timeout=5.0,
+                force_cancel_on_timeout=True,
+            )
         if self._backend_process:
             self._backend_process.kill()
-        if self._backend_server:
-            self._backend_server.should_exit = True
 
         # Kill frontend/loading server
         if self._frontend_process:
@@ -58627,8 +58632,11 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.debug(f"[Kernel] Agent Runtime cleanup error: {e}")
 
-        # Cancel all background tasks
-        for task in self._background_tasks:
+        # Cancel all background tasks (backend serve task is managed separately)
+        background_tasks = [
+            task for task in self._background_tasks if task is not self._backend_server_task
+        ]
+        for task in background_tasks:
             task.cancel()
 
         # v183.0: Cancel heartbeat task
@@ -58642,10 +58650,10 @@ class JarvisSystemKernel:
                 self.logger.debug(f"[Kernel] Heartbeat task cleanup error: {e}")
 
         # Wait briefly for task cancellation
-        if self._background_tasks:
+        if background_tasks:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*self._background_tasks, return_exceptions=True),
+                    asyncio.gather(*background_tasks, return_exceptions=True),
                     timeout=2.0
                 )
             except asyncio.TimeoutError:
@@ -62487,17 +62495,23 @@ class JarvisSystemKernel:
             self._backend_server = uvicorn.Server(uvicorn_config)
 
             # Run server in background task
-            task = create_safe_task(self._backend_server.serve())
-            self._background_tasks.append(task)
+            self._backend_server_task = create_safe_task(
+                self._backend_server.serve(),
+                name="backend-uvicorn-serve",
+            )
 
             # Wait for server to be ready
             for _ in range(30):  # 30 second timeout
                 if self._backend_server.started:
                     self.logger.success(f"[Kernel] Backend running at http://{self.config.backend_host}:{self.config.backend_port}")
                     return True
+                if self._backend_server_task.done():
+                    self.logger.error("[Kernel] Backend server task exited before startup completed")
+                    break
                 await asyncio.sleep(1.0)
 
             self.logger.error("[Kernel] Backend failed to start in time")
+            await self._stop_backend_in_process(reason="startup-timeout", timeout=5.0)
             return False
 
         except ImportError:
@@ -62505,7 +62519,52 @@ class JarvisSystemKernel:
             return False
         except Exception as e:
             self.logger.error(f"[Kernel] In-process backend failed: {e}")
+            await self._stop_backend_in_process(reason="startup-exception", timeout=3.0)
             return False
+
+    async def _stop_backend_in_process(
+        self,
+        reason: str = "shutdown",
+        timeout: float = 15.0,
+        force_cancel_on_timeout: bool = True,
+    ) -> None:
+        """
+        Gracefully stop in-process uvicorn server without task-level hard cancel first.
+
+        Root fix:
+        - Request uvicorn shutdown via should_exit
+        - Await serve() task completion
+        - Only cancel as a bounded last resort
+        """
+        if not self._backend_server and not self._backend_server_task:
+            return
+
+        if self._backend_server:
+            self._backend_server.should_exit = True
+
+        if self._backend_server_task:
+            try:
+                await asyncio.wait_for(self._backend_server_task, timeout=timeout)
+                self.logger.info(f"[Kernel] Backend server stopped gracefully ({reason})")
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"[Kernel] Backend server stop timed out after {timeout:.1f}s ({reason})"
+                )
+                if force_cancel_on_timeout:
+                    self._backend_server_task.cancel()
+                    try:
+                        await asyncio.wait_for(self._backend_server_task, timeout=2.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+            except asyncio.CancelledError:
+                # Shutdown cancellation is expected during process teardown paths.
+                self.logger.debug(f"[Kernel] Backend stop cancelled ({reason})")
+            except Exception as e:
+                self.logger.debug(f"[Kernel] Backend server stop error ({reason}): {e}")
+            finally:
+                self._backend_server_task = None
+
+        self._backend_server = None
 
     async def _start_backend_subprocess(self) -> bool:
         """Start backend as subprocess."""
@@ -69453,12 +69512,24 @@ class JarvisSystemKernel:
                     pass
                 self.logger.debug("[Kernel] Readiness monitor stopped")
 
-            # Cancel background tasks
-            for task in self._background_tasks:
+            # Stop in-process backend before broad task cancellation so uvicorn can
+            # complete lifespan shutdown without abrupt task cancellation.
+            if self._backend_server or self._backend_server_task:
+                await self._stop_backend_in_process(
+                    reason="cleanup",
+                    timeout=15.0,
+                    force_cancel_on_timeout=True,
+                )
+
+            # Cancel background tasks (backend serve task is managed separately)
+            background_tasks = [
+                task for task in self._background_tasks if task is not self._backend_server_task
+            ]
+            for task in background_tasks:
                 task.cancel()
 
-            if self._background_tasks:
-                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
 
             # Stop Trinity (v206.0: PILLAR 5 - use tiered_stop for guaranteed cleanup)
             if self._trinity:
@@ -69516,11 +69587,8 @@ class JarvisSystemKernel:
             await self._stop_frontend()
             await self._stop_loading_server()
 
-            # Stop backend
-            if self._backend_server:
-                self._backend_server.should_exit = True
-                self.logger.info("[Kernel] Backend server stopping")
-            elif self._backend_process:
+            # Stop backend subprocess (in-process backend already handled above)
+            if self._backend_process:
                 self._backend_process.terminate()
                 try:
                     await asyncio.wait_for(self._backend_process.wait(), timeout=10.0)
