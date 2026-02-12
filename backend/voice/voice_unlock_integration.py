@@ -67,6 +67,7 @@ class VoiceUnlockIntegration:
         self.speaker_verification = None
         self.keychain_service = None
         self.learning_db = None
+        self._owns_learning_db = False
         self.initialized = False
         self.enable_voice_feedback = True  # Enable spoken responses
 
@@ -110,6 +111,7 @@ class VoiceUnlockIntegration:
             # Initialize learning database using singleton
             from intelligence.learning_database import get_learning_database
             self.learning_db = await get_learning_database()
+            self._owns_learning_db = False
             logger.info("✅ Learning database initialized")
 
             self.initialized = True
@@ -466,7 +468,10 @@ class VoiceUnlockIntegration:
         if self.speaker_verification:
             await self.speaker_verification.cleanup()
         if self.learning_db:
-            await self.learning_db.close()
+            if self._owns_learning_db:
+                await self.learning_db.close()
+            self.learning_db = None
+            self._owns_learning_db = False
         self.initialized = False
         logger.info("🧹 Voice Unlock Integration cleaned up")
 

@@ -1526,9 +1526,10 @@ class TrinityVoiceCoordinator:
         """Load voice personalities from environment variables (zero hardcoding)."""
         # Detect best available voice from system
         default_voice = self._detect_best_voice()
+        canonical_voice = os.getenv("JARVIS_VOICE_NAME", default_voice)
 
         # Startup personality (formal, professional)
-        startup_voice = os.getenv("JARVIS_STARTUP_VOICE_NAME", default_voice)
+        startup_voice = os.getenv("JARVIS_STARTUP_VOICE_NAME", canonical_voice)
         startup_rate = int(os.getenv("JARVIS_STARTUP_VOICE_RATE", "175"))
         startup_pitch = int(os.getenv("JARVIS_STARTUP_VOICE_PITCH", "50"))
         startup_volume = float(os.getenv("JARVIS_STARTUP_VOICE_VOLUME", "0.9"))
@@ -1542,7 +1543,7 @@ class TrinityVoiceCoordinator:
         )
 
         # Narrator personality (clear, informative)
-        narrator_voice = os.getenv("JARVIS_NARRATOR_VOICE_NAME", default_voice)
+        narrator_voice = os.getenv("JARVIS_NARRATOR_VOICE_NAME", canonical_voice)
         narrator_rate = int(os.getenv("JARVIS_NARRATOR_VOICE_RATE", "180"))
         narrator_pitch = int(os.getenv("JARVIS_NARRATOR_VOICE_PITCH", "50"))
         narrator_volume = float(os.getenv("JARVIS_NARRATOR_VOICE_VOLUME", "0.85"))
@@ -1556,7 +1557,7 @@ class TrinityVoiceCoordinator:
         )
 
         # Runtime personality (friendly, conversational)
-        runtime_voice = os.getenv("JARVIS_RUNTIME_VOICE_NAME", default_voice)
+        runtime_voice = os.getenv("JARVIS_RUNTIME_VOICE_NAME", canonical_voice)
         runtime_rate = int(os.getenv("JARVIS_RUNTIME_VOICE_RATE", "190"))
         runtime_pitch = int(os.getenv("JARVIS_RUNTIME_VOICE_PITCH", "55"))
         runtime_volume = float(os.getenv("JARVIS_RUNTIME_VOICE_VOLUME", "0.8"))
@@ -1570,7 +1571,7 @@ class TrinityVoiceCoordinator:
         )
 
         # Alert personality (urgent, attention-grabbing)
-        alert_voice = os.getenv("JARVIS_ALERT_VOICE_NAME", default_voice)
+        alert_voice = os.getenv("JARVIS_ALERT_VOICE_NAME", canonical_voice)
         alert_rate = int(os.getenv("JARVIS_ALERT_VOICE_RATE", "165"))
         alert_pitch = int(os.getenv("JARVIS_ALERT_VOICE_PITCH", "60"))
         alert_volume = float(os.getenv("JARVIS_ALERT_VOICE_VOLUME", "1.0"))
@@ -1584,7 +1585,7 @@ class TrinityVoiceCoordinator:
         )
 
         # Success personality (celebratory, upbeat)
-        success_voice = os.getenv("JARVIS_SUCCESS_VOICE_NAME", default_voice)
+        success_voice = os.getenv("JARVIS_SUCCESS_VOICE_NAME", canonical_voice)
         success_rate = int(os.getenv("JARVIS_SUCCESS_VOICE_RATE", "195"))
         success_pitch = int(os.getenv("JARVIS_SUCCESS_VOICE_PITCH", "58"))
         success_volume = float(os.getenv("JARVIS_SUCCESS_VOICE_VOLUME", "0.9"))
@@ -1598,7 +1599,7 @@ class TrinityVoiceCoordinator:
         )
 
         # Trinity personality (synchronized)
-        trinity_voice = os.getenv("JARVIS_TRINITY_VOICE_NAME", default_voice)
+        trinity_voice = os.getenv("JARVIS_TRINITY_VOICE_NAME", canonical_voice)
         trinity_rate = int(os.getenv("JARVIS_TRINITY_VOICE_RATE", "185"))
         trinity_pitch = int(os.getenv("JARVIS_TRINITY_VOICE_PITCH", "52"))
         trinity_volume = float(os.getenv("JARVIS_TRINITY_VOICE_VOLUME", "0.9"))
@@ -1681,7 +1682,11 @@ class TrinityVoiceCoordinator:
             if self._cached_voice is not None:
                 return self._cached_voice
 
-        default_voice = os.getenv("JARVIS_DEFAULT_VOICE_NAME", "Daniel")
+        default_voice = (
+            os.getenv("JARVIS_VOICE_NAME")
+            or os.getenv("JARVIS_DEFAULT_VOICE_NAME")
+            or "Daniel"
+        )
         detected_voice = default_voice
 
         try:
@@ -1697,38 +1702,45 @@ class TrinityVoiceCoordinator:
 
             if result.returncode == 0:
                 voices = result.stdout.strip().split('\n')
+                available_voice_names = [
+                    voice_line.split()[0]
+                    for voice_line in voices
+                    if voice_line and voice_line.split()
+                ]
+                available_voice_names_lower = {name.lower() for name in available_voice_names}
 
-                # ⭐ ABSOLUTE PRIORITY: UK Daniel is JARVIS's voice
-                for voice_line in voices:
-                    if "daniel" in voice_line.lower():
-                        logger.info(
-                            "[Trinity Voice] ✅ Using JARVIS signature voice: Daniel (UK Male)"
-                        )
-                        detected_voice = "Daniel"
-                        break
-                else:
-                    # Fallback chain (only log once, not as error)
+                # If configured voice exists, keep it to preserve deterministic startup voice.
+                if default_voice.lower() in available_voice_names_lower:
+                    detected_voice = default_voice
                     logger.info(
-                        "[Trinity Voice] UK Daniel voice not found, checking fallbacks..."
+                        f"[Trinity Voice] Using configured voice: {default_voice}"
                     )
+                else:
+                    # Dynamic fallback chain from environment (comma-separated).
+                    # Defaults prioritize canonical JARVIS voice family while keeping
+                    # deterministic behavior when Daniel is unavailable.
+                    fallback_chain = [
+                        voice.strip()
+                        for voice in os.getenv(
+                            "JARVIS_VOICE_FALLBACK_ORDER",
+                            "Daniel,Alex,Tom,Karen,Samantha",
+                        ).split(",")
+                        if voice.strip()
+                    ]
 
-                    preferred_fallbacks = ["Samantha", "Alex", "Tom", "Karen"]
                     found_fallback = False
-
-                    for pref in preferred_fallbacks:
-                        for voice_line in voices:
-                            if pref.lower() in voice_line.lower():
-                                logger.info(f"[Trinity Voice] Using fallback voice: {pref}")
-                                detected_voice = pref
-                                found_fallback = True
-                                break
-                        if found_fallback:
+                    for pref in fallback_chain:
+                        if pref.lower() in available_voice_names_lower:
+                            detected_voice = pref
+                            found_fallback = True
+                            logger.info(f"[Trinity Voice] Using fallback voice: {pref}")
                             break
 
-                    if not found_fallback and voices:
-                        first_voice = voices[0].split()[0]
-                        detected_voice = first_voice
-                        logger.info(f"[Trinity Voice] Using first available voice: {first_voice}")
+                    if not found_fallback and available_voice_names:
+                        detected_voice = available_voice_names[0]
+                        logger.info(
+                            f"[Trinity Voice] Using first available voice: {detected_voice}"
+                        )
 
         except subprocess.TimeoutExpired:
             # v93.1: Graceful timeout handling - not an error, just use default
@@ -1894,11 +1906,28 @@ class TrinityVoiceCoordinator:
             f"{announcement.message[:80]} [corr={announcement.correlation_id}]"
         )
 
-        # Try engines in order of health score
+        # Engine ordering is context-aware and environment-driven.
+        # For startup/narrator contexts we prefer macOS `say` first to keep voice
+        # timbre consistent and avoid noisy fallback engines during boot.
+        default_engine_order = "macos_say,pyttsx3,edge_tts"
+        if announcement.context in (VoiceContext.STARTUP, VoiceContext.NARRATOR):
+            order_raw = os.getenv("JARVIS_STARTUP_TTS_ENGINE_ORDER", default_engine_order)
+        else:
+            order_raw = os.getenv("JARVIS_TTS_ENGINE_ORDER", default_engine_order)
+
+        engine_order = [
+            engine_name.strip().lower()
+            for engine_name in order_raw.split(",")
+            if engine_name.strip()
+        ]
+        order_index = {name: idx for idx, name in enumerate(engine_order)}
+
         engines = sorted(
             self._engines,
-            key=lambda e: e.get_health_score(),
-            reverse=True
+            key=lambda e: (
+                order_index.get(e.name.lower(), len(engine_order)),
+                -e.get_health_score(),
+            ),
         )
 
         for engine in engines:

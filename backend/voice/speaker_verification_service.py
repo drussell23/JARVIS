@@ -3190,14 +3190,23 @@ class SpeakerVerificationService:
     Verifies speaker identity using voice biometrics
     """
 
-    def __init__(self, learning_db: Optional[JARVISLearningDatabase] = None):
+    def __init__(
+        self,
+        learning_db: Optional[JARVISLearningDatabase] = None,
+        owns_learning_db: Optional[bool] = None,
+    ):
         """
         Initialize speaker verification service
 
         Args:
             learning_db: LearningDatabase instance (optional, will create if not provided)
+            owns_learning_db:
+                Whether this service owns lifecycle of `learning_db`.
+                Defaults to False so shared singleton instances are never closed
+                from component-level cleanup.
         """
         self.learning_db = learning_db
+        self._owns_learning_db = bool(owns_learning_db) if owns_learning_db is not None else False
         self.speechbrain_engine = None
         self.initialized = False
         self.speaker_profiles = {}  # Cache of speaker profiles
@@ -3426,6 +3435,7 @@ class SpeakerVerificationService:
         if self.learning_db is None:
             from intelligence.learning_database import get_learning_database
             self.learning_db = await get_learning_database()
+            self._owns_learning_db = False
 
         # ========================================================================
         # CRITICAL FIX: Ensure ECAPA is loaded from ML Engine Registry!
@@ -3923,6 +3933,7 @@ class SpeakerVerificationService:
         if self.learning_db is None:
             from intelligence.learning_database import get_learning_database
             self.learning_db = await get_learning_database()
+            self._owns_learning_db = False
 
         # Initialize SpeechBrain engine for embeddings
         # Lazy load the ML components
@@ -5239,6 +5250,7 @@ class SpeakerVerificationService:
             # Use singleton to get the shared database instance
             from intelligence.learning_database import get_learning_database
             self.learning_db = await get_learning_database()
+            self._owns_learning_db = False
 
             # Verify database connection
             if not self.learning_db or not self.learning_db._initialized:
@@ -7955,13 +7967,16 @@ class SpeakerVerificationService:
             except Exception as e:
                 logger.debug(f"   Event loop cleanup error: {e}")
 
-        # Clean up learning database (closes background tasks and threads)
+        # Clean up learning database only if this service owns it.
+        # Shared singleton lifecycle is managed by close_learning_database().
         if self.learning_db:
             try:
-                logger.debug("   Closing learning database...")
-                from intelligence.learning_database import close_learning_database
-                await close_learning_database()
-                logger.debug("   ✅ Learning database closed")
+                if self._owns_learning_db:
+                    logger.debug("   Closing owned learning database...")
+                    await self.learning_db.close()
+                    logger.debug("   ✅ Owned learning database closed")
+                else:
+                    logger.debug("   Releasing shared learning database reference")
             except Exception as e:
                 logger.warning(f"   ⚠ Learning database cleanup error: {e}")
 
@@ -7983,6 +7998,7 @@ class SpeakerVerificationService:
         self._encoder_preloading = False
         self._preload_thread = None
         self.learning_db = None
+        self._owns_learning_db = False
 
         logger.info("✅ Speaker Verification Service cleaned up")
 

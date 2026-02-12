@@ -1018,6 +1018,37 @@ class CloudSQLConnection:
         if CloudSQLConnection._circuit_breaker is None:
             CloudSQLConnection._circuit_breaker = CloudSQLCircuitBreaker()
 
+    def _is_retryable_connection_error(self, error: Exception) -> bool:
+        """Classify transient transport/connection errors that should be retried."""
+        if isinstance(error, (ConnectionError, OSError, asyncio.InvalidStateError)):
+            return True
+
+        if ASYNCPG_AVAILABLE:
+            asyncpg_connection_errors = tuple(
+                err_type for err_type in (
+                    getattr(asyncpg, "PostgresConnectionError", None),
+                    getattr(asyncpg, "InterfaceError", None),
+                    getattr(asyncpg.exceptions, "ConnectionDoesNotExistError", None),
+                    getattr(asyncpg.exceptions, "ConnectionFailureError", None),
+                    getattr(asyncpg.exceptions, "ConnectionRejectionError", None),
+                )
+                if isinstance(err_type, type)
+            )
+            if asyncpg_connection_errors and isinstance(error, asyncpg_connection_errors):
+                return True
+
+        error_text = str(error).lower()
+        transient_markers = (
+            "connection is closed",
+            "connection was closed",
+            "connection closed in the middle of operation",
+            "connection reset by peer",
+            "server closed the connection unexpectedly",
+            "connection does not exist",
+            "terminating connection",
+        )
+        return any(marker in error_text for marker in transient_markers)
+
     async def _execute_with_retry(
         self,
         operation: str,
@@ -1108,30 +1139,34 @@ class CloudSQLConnection:
                     else:
                         logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts (timeout)")
 
-                except (ConnectionError, OSError) as e:
-                    # Network errors - retry with backoff
-                    last_exception = e
-                    if circuit:
-                        await circuit.record_failure()
-
-                    if attempt < max_retries:
-                        delay = min(
-                            self.DEFAULT_BASE_DELAY * (2 ** attempt),
-                            self.DEFAULT_MAX_DELAY
-                        )
-                        logger.warning(
-                            f"[v19.0] Connection error on {operation} (attempt {attempt + 1}): {e}, "
-                            f"retrying in {delay:.2f}s..."
-                        )
-                        await asyncio.sleep(delay)
-                    else:
-                        logger.error(f"[v19.0] {operation} failed after {max_retries + 1} attempts: {e}")
-
                 except Exception as e:
-                    # Unexpected errors - log but don't retry (likely query error)
-                    last_exception = e
-                    logger.error(f"[v19.0] Unexpected error on {operation}: {type(e).__name__}: {e}")
-                    raise
+                    if self._is_retryable_connection_error(e):
+                        # Transport errors - retry with backoff
+                        last_exception = e
+                        if circuit:
+                            await circuit.record_failure()
+
+                        if attempt < max_retries:
+                            delay = min(
+                                self.DEFAULT_BASE_DELAY * (2 ** attempt),
+                                self.DEFAULT_MAX_DELAY
+                            )
+                            logger.warning(
+                                f"[v19.0] Connection error on {operation} "
+                                f"(attempt {attempt + 1}/{max_retries + 1}): {type(e).__name__}: {e}. "
+                                f"Retrying in {delay:.2f}s..."
+                            )
+                            await asyncio.sleep(delay)
+                        else:
+                            logger.error(
+                                f"[v19.0] {operation} failed after {max_retries + 1} attempts "
+                                f"(connection error): {type(e).__name__}: {e}"
+                            )
+                    else:
+                        # Unexpected errors - log but don't retry (likely query error)
+                        last_exception = e
+                        logger.error(f"[v19.0] Unexpected error on {operation}: {type(e).__name__}: {e}")
+                        raise
 
             # All retries exhausted
             if last_exception:

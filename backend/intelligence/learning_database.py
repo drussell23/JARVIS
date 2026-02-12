@@ -248,6 +248,44 @@ def _safe_get(row, key: str, default: Any = None) -> Any:
         return default
 
 
+def _is_connection_drop_error(error: Exception) -> bool:
+    """
+    Detect transient connection-drop errors across asyncpg/SQLite layers.
+
+    This is intentionally message+type based so it works even when asyncpg
+    exception classes are wrapped by adapter layers.
+    """
+    if isinstance(error, (ConnectionError, OSError, asyncio.InvalidStateError)):
+        return True
+
+    error_name = type(error).__name__.lower()
+    if any(
+        token in error_name
+        for token in (
+            "connectiondoesnotexisterror",
+            "connectionfailureerror",
+            "postgresconnectionerror",
+            "interfaceerror",
+            "operationalerror",
+        )
+    ):
+        return True
+
+    error_text = str(error).lower()
+    transient_markers = (
+        "connection is closed",
+        "connection was closed",
+        "connection closed",
+        "connection reset by peer",
+        "connection reset",
+        "server closed the connection",
+        "connection does not exist",
+        "terminating connection",
+        "cannot perform operation: connection is closed",
+    )
+    return any(marker in error_text for marker in transient_markers)
+
+
 # ============================================================================
 # SQLITE CONNECTION FACTORY WITH CONCURRENCY PROTECTION
 # ============================================================================
@@ -932,6 +970,54 @@ class DatabaseCursorWrapper:
 
         self._description = descriptions
 
+    def _should_retry_statement_replay(self, query_type: str, query_upper: str) -> bool:
+        """
+        Allow one-shot replay only for idempotent/read operations.
+
+        We explicitly avoid automatic replay for INSERT/UPDATE/DELETE because a
+        transport drop can occur after the server already applied the mutation.
+        """
+        if query_type in ("SELECT", "RETURNING"):
+            return True
+
+        if query_type in ("DDL", "OTHER"):
+            query_upper_compact = " ".join(query_upper.split())
+            if " IF NOT EXISTS " in f" {query_upper_compact} ":
+                return True
+            safe_prefixes = (
+                "CREATE TABLE IF NOT EXISTS",
+                "CREATE INDEX IF NOT EXISTS",
+                "CREATE UNIQUE INDEX IF NOT EXISTS",
+                "CREATE VIEW IF NOT EXISTS",
+                "PRAGMA",
+            )
+            if any(query_upper_compact.startswith(prefix) for prefix in safe_prefixes):
+                return True
+
+        return False
+
+    def _can_retry_with_fresh_connection(
+        self,
+        error: Exception,
+        query_type: str,
+        query_upper: str,
+    ) -> bool:
+        """Check whether a fresh-connection replay is safe and applicable."""
+        if not _is_connection_drop_error(error):
+            return False
+
+        if self.connection_wrapper is None:
+            return False
+
+        # Replay is only safe in non-transactional cloud operations where we can
+        # reacquire a fresh pooled connection.
+        if not getattr(self.connection_wrapper, "is_cloud", False):
+            return False
+        if getattr(self.connection_wrapper, "in_transaction", False):
+            return False
+
+        return self._should_retry_statement_replay(query_type, query_upper)
+
     async def execute(self, sql: str, parameters: Tuple = ()) -> "DatabaseCursorWrapper":
         """
         v18.0: Execute SQL with parameters and timeout protection.
@@ -964,42 +1050,37 @@ class DatabaseCursorWrapper:
             logger.warning(f"[v18.0] Circuit breaker OPEN - fast-failing query: {sql[:50]}...")
             raise RuntimeError("Database circuit breaker is open - too many recent failures")
 
-        try:
-            # Convert %s placeholders to $1, $2, etc. for PostgreSQL/asyncpg
-            if "%s" in sql:
-                # Simple sequential replacement
-                i = 1
-                while "%s" in sql:
-                    sql = sql.replace("%s", f"${i}", 1)
-                    i += 1
+        # Convert %s placeholders to $1, $2, etc. for PostgreSQL/asyncpg
+        if "%s" in sql:
+            i = 1
+            while "%s" in sql:
+                sql = sql.replace("%s", f"${i}", 1)
+                i += 1
 
-            # Reset state for new query
-            self._last_query = sql
-            self._last_params = parameters
-            self._current_index = 0
-            self._lastrowid = None
-            self._column_metadata.clear()
+        # Reset state for new query
+        self._last_query = sql
+        self._last_params = parameters
+        self._current_index = 0
+        self._lastrowid = None
+        self._column_metadata.clear()
 
-            # Skip PRAGMA commands for PostgreSQL
-            if sql.strip().upper().startswith("PRAGMA"):
-                logger.debug(f"Skipping PRAGMA command: {sql}")
-                self._last_results = []
-                self._row_count = 0
-                self._description = None
-                return self
+        # Skip PRAGMA commands for PostgreSQL
+        if sql.strip().upper().startswith("PRAGMA"):
+            logger.debug(f"Skipping PRAGMA command: {sql}")
+            self._last_results = []
+            self._row_count = 0
+            self._description = None
+            return self
 
-            # Detect query type dynamically
-            query_upper = sql.strip().upper()
-            query_type = self._detect_query_type(query_upper)
+        query_upper = sql.strip().upper()
+        query_type = self._detect_query_type(query_upper)
+        query_timeout = DB_QUERY_TIMEOUT
 
-            # v18.0: Use configurable timeout for all queries
-            query_timeout = DB_QUERY_TIMEOUT
-
+        async def _execute_with_connection(adapter_conn) -> None:
             if query_type in ("SELECT", "RETURNING"):
-                # Query that returns rows - with timeout protection
                 try:
                     results = await asyncio.wait_for(
-                        self.adapter_conn.fetch(sql, *parameters),
+                        adapter_conn.fetch(sql, *parameters),
                         timeout=query_timeout
                     )
                 except asyncio.TimeoutError:
@@ -1010,34 +1091,28 @@ class DatabaseCursorWrapper:
                 self._last_results = results if results else []
                 self._row_count = len(self._last_results)
 
-                # Build dynamic column descriptions
                 if self._last_results:
                     self._build_description_from_results()
                 else:
                     self._description = None
 
-                # Extract lastrowid from RETURNING results
                 if query_type == "RETURNING" and self._last_results:
                     self._extract_lastrowid()
 
             elif query_type in ("INSERT", "UPDATE", "DELETE"):
-                # DML operation - with timeout protection
                 try:
-                    # For PostgreSQL with asyncpg, we can use execute and get status
                     result = await asyncio.wait_for(
-                        self.adapter_conn.execute(sql, *parameters),
+                        adapter_conn.execute(sql, *parameters),
                         timeout=query_timeout
                     )
 
-                    # Try to extract row count from result status
-                    # PostgreSQL returns status like "INSERT 0 1" or "UPDATE 5"
                     if hasattr(result, "decode"):
                         result = result.decode("utf-8")
 
                     if isinstance(result, str):
                         self._row_count = self._parse_rowcount_from_status(result)
                     else:
-                        self._row_count = -1  # Not available
+                        self._row_count = -1
 
                 except asyncio.TimeoutError:
                     logger.warning(f"[v18.0] Query timeout ({query_timeout}s): {sql[:80]}...")
@@ -1047,22 +1122,21 @@ class DatabaseCursorWrapper:
                     logger.debug(f"Could not determine rowcount: {e}")
                     try:
                         await asyncio.wait_for(
-                            self.adapter_conn.execute(sql, *parameters),
+                            adapter_conn.execute(sql, *parameters),
                             timeout=query_timeout
                         )
                     except asyncio.TimeoutError:
                         await circuit_breaker.record_failure()
                         raise
-                    self._row_count = -1  # Not available
+                    self._row_count = -1
 
                 self._last_results = []
                 self._description = None
 
             else:
-                # Other operations (CREATE, DROP, ALTER, etc.) - with timeout
                 try:
                     await asyncio.wait_for(
-                        self.adapter_conn.execute(sql, *parameters),
+                        adapter_conn.execute(sql, *parameters),
                         timeout=query_timeout
                     )
                 except asyncio.TimeoutError:
@@ -1071,8 +1145,11 @@ class DatabaseCursorWrapper:
                     raise
 
                 self._last_results = []
-                self._row_count = -1  # Not applicable
+                self._row_count = -1
                 self._description = None
+
+        try:
+            await _execute_with_connection(self.adapter_conn)
 
             # v18.0: Record success
             await circuit_breaker.record_success()
@@ -1082,6 +1159,24 @@ class DatabaseCursorWrapper:
             # Re-raise timeout errors (already logged above)
             raise
         except Exception as e:
+            if self._can_retry_with_fresh_connection(e, query_type, query_upper):
+                logger.warning(
+                    "[LearningDB] Transient connection drop detected for idempotent query; "
+                    "replaying once on a fresh pooled connection"
+                )
+                try:
+                    async with self.connection_wrapper.adapter.connection() as fresh_conn:
+                        self.adapter_conn = fresh_conn
+                        await _execute_with_connection(fresh_conn)
+                    await circuit_breaker.record_success()
+                    return self
+                except Exception as replay_error:
+                    logger.error(
+                        f"Error replaying query after transient disconnect: {sql[:100]}... "
+                        f"original={type(e).__name__}: {e}, replay={type(replay_error).__name__}: {replay_error}"
+                    )
+                    e = replay_error
+
             logger.error(f"Error executing query: {sql[:100]}... with params {parameters}: {e}")
             # Reset state on error
             self._row_count = -1
@@ -2290,6 +2385,11 @@ class JARVISLearningDatabase:
 
         # Initialization flag to prevent multiple initializations
         self._initialized = False
+        # Set by get_learning_database() for process-wide singleton ownership.
+        # When true, callers must close via close_learning_database() so one
+        # component cannot tear down shared state used by others.
+        self._singleton_managed = False
+        self._direct_close_warning_emitted = False
 
         # Background task management for clean shutdown
         self._background_tasks: List[asyncio.Task] = []
@@ -8138,8 +8238,17 @@ class JARVISLearningDatabase:
             logger.error(f"Failed to update speaker embedding: {e}")
             return False
 
-    async def close(self):
+    async def close(self, force: bool = False):
         """Close database connections gracefully with timeout protection"""
+        if self._singleton_managed and not force:
+            if not self._direct_close_warning_emitted:
+                logger.warning(
+                    "Direct close() ignored on singleton learning database. "
+                    "Use close_learning_database() to shut down the shared instance."
+                )
+                self._direct_close_warning_emitted = True
+            return
+
         logger.info("🧹 Closing learning database...")
 
         # Signal shutdown to background tasks
@@ -8609,6 +8718,7 @@ async def get_learning_database(config: Optional[Dict] = None) -> JARVISLearning
 
         # Create and initialize fresh instance
         _db_instance = JARVISLearningDatabase(config=config)
+        _db_instance._singleton_managed = True
         try:
             await _db_instance.initialize()
         except BaseException:
@@ -8665,7 +8775,7 @@ async def close_learning_database():
 
         # Then close database
         if _db_instance is not None:
-            await _db_instance.close()
+            await _db_instance.close(force=True)
             _db_instance = None
             logger.info("✅ Global learning database instance closed")
 
