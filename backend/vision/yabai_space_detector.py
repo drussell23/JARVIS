@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -1645,7 +1646,12 @@ class GhostDisplayManager:
         self._last_emitted_status: Optional[str] = None
 
         # v241.0: External capture metrics provider (registered by VisualMonitorAgent)
-        self._capture_metrics_provider: Optional[Callable[[], Dict[str, Any]]] = None
+        # v242.1: weakref prevents GhostDisplayManager (singleton) from preventing GC
+        # of dead VisualMonitorAgent instances. _capture_metrics_provider_ref is a
+        # weakref.ref to the bound method's __self__ (the agent), and
+        # _capture_metrics_provider_name stores the method name for getattr lookup.
+        self._capture_metrics_provider_ref: Optional[weakref.ref] = None
+        self._capture_metrics_provider_name: Optional[str] = None
 
     @property
     def status(self) -> GhostDisplayStatus:
@@ -1692,12 +1698,23 @@ class GhostDisplayManager:
     def register_capture_metrics_provider(self, provider: Callable[[], Dict[str, Any]]) -> None:
         """
         v241.0: Register an external capture metrics provider.
+        v242.1: Uses weakref to prevent singleton from preventing GC of provider's owner.
 
         The VisualMonitorAgent registers a callable that returns Ferrari Engine
         capture metrics (active watchers, FPS, frames captured, etc.).
         These metrics are included in get_state_snapshot() for frontend/cross-repo visibility.
         """
-        self._capture_metrics_provider = provider
+        # For bound methods, store weakref to __self__ + method name.
+        # For plain functions/lambdas, weakref.ref works directly but lambdas
+        # are typically short-lived — we store a strong ref as fallback.
+        if hasattr(provider, '__self__') and hasattr(provider, '__func__'):
+            # Bound method — weakref the object, store method name
+            self._capture_metrics_provider_ref = weakref.ref(provider.__self__)
+            self._capture_metrics_provider_name = provider.__func__.__name__
+        else:
+            # Plain function — wrap in a ref-like container
+            self._capture_metrics_provider_ref = lambda: provider  # type: ignore[assignment]
+            self._capture_metrics_provider_name = None
 
     def get_state_snapshot(self) -> Dict[str, Any]:
         """Get current ghost display state as a serializable dict."""
@@ -1722,11 +1739,24 @@ class GhostDisplayManager:
         }
 
         # v241.0: Include capture metrics if provider registered
-        if self._capture_metrics_provider:
+        # v242.1: Resolve through weakref — returns None if agent was GC'd
+        if self._capture_metrics_provider_ref is not None:
             try:
-                capture_metrics = self._capture_metrics_provider()
-                if isinstance(capture_metrics, dict):
-                    snapshot["capture_metrics"] = capture_metrics
+                obj = self._capture_metrics_provider_ref()
+                if obj is not None:
+                    if self._capture_metrics_provider_name:
+                        # Bound method — resolve via getattr
+                        method = getattr(obj, self._capture_metrics_provider_name, None)
+                        capture_metrics = method() if method else None
+                    else:
+                        # Plain function stored directly
+                        capture_metrics = obj()
+                    if isinstance(capture_metrics, dict):
+                        snapshot["capture_metrics"] = capture_metrics
+                else:
+                    # Referent was GC'd — clear the dead ref
+                    self._capture_metrics_provider_ref = None
+                    self._capture_metrics_provider_name = None
             except Exception:
                 pass
 
@@ -1771,8 +1801,9 @@ class GhostDisplayManager:
         except Exception as e:
             logger.debug(f"[GhostManager] Event bus publish skipped: {e}")
 
-        # Notify local observers
-        for observer in self._state_observers:
+        # Notify local observers (v242.1: snapshot to prevent RuntimeError if
+        # a callback triggers add_observer() during iteration)
+        for observer in list(self._state_observers):
             try:
                 result = observer(event_type, payload)
                 if asyncio.iscoroutine(result):

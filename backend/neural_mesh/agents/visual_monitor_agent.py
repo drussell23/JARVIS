@@ -877,6 +877,12 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # v241.0: Ghost display observer unsubscribe callable
         self._ghost_observer_unsubscribe: Optional[Callable] = None
 
+        # v242.1: MosaicWatcher hot-swap signal — set by _handle_ghost_resolution_change()
+        # when a new MosaicWatcher is created due to display resolution change.
+        # The _mosaic_visual_detection() loop checks this event each iteration
+        # and swaps its local watcher reference to self._active_mosaic_watcher.
+        self._mosaic_watcher_changed = asyncio.Event()
+
         # v12.0: Direct VideoWatcher management (Ferrari Engine)
         self._active_video_watchers: Dict[str, Any] = {}  # watcher_id -> VideoWatcher instance
         self._fast_capture_engine = None  # For window discovery
@@ -1212,15 +1218,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
             if success:
                 self._active_mosaic_watcher = new_watcher
+                # v242.1: Signal the detection loop to swap to the new watcher.
+                # Without this, the loop holds a stale reference to the stopped
+                # old watcher and spins on None frames until timeout.
+                self._mosaic_watcher_changed.set()
                 logger.info(
-                    f"[VisualMonitor v241.0] MosaicWatcher recreated with "
-                    f"{new_width}x{new_height} resolution"
+                    f"[VisualMonitor v242.1] MosaicWatcher recreated with "
+                    f"{new_width}x{new_height} resolution — detection loop signaled"
                 )
             else:
-                logger.warning("[VisualMonitor v241.0] Failed to start new MosaicWatcher after resolution change")
+                logger.warning("[VisualMonitor v242.1] Failed to start new MosaicWatcher after resolution change")
 
         except Exception as e:
-            logger.warning(f"[VisualMonitor v241.0] Resolution change handler error: {e}")
+            logger.warning(f"[VisualMonitor v242.1] Resolution change handler error: {e}")
 
     def _create_spatial_agent_sync(self):
         """
@@ -7773,6 +7783,19 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
         try:
             while True:
+                # v242.1: Check if resolution change handler swapped the MosaicWatcher.
+                # Without this, a stopped old watcher yields None frames forever.
+                if self._mosaic_watcher_changed.is_set():
+                    self._mosaic_watcher_changed.clear()
+                    new_watcher = getattr(self, '_active_mosaic_watcher', None)
+                    if new_watcher is not None and new_watcher is not watcher:
+                        logger.info(
+                            f"[Mosaic Detection v242.1] Hot-swapped to new MosaicWatcher "
+                            f"(resolution change detected)"
+                        )
+                        watcher = new_watcher
+                        watcher_id = getattr(watcher, 'watcher_id', f"mosaic_{id(watcher)}")
+
                 elapsed = time.time() - start_time
                 if elapsed > timeout:
                     logger.info(
