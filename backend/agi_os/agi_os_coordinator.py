@@ -107,6 +107,12 @@ from .owner_identity_service import (
 logger = logging.getLogger(__name__)
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    """Read a boolean from env vars. v241.0."""
+    val = os.getenv(key, str(default)).lower()
+    return val in ("true", "1", "yes")
+
+
 class AGIOSState(Enum):
     """State of the AGI OS."""
     OFFLINE = "offline"
@@ -177,6 +183,9 @@ class AGIOSCoordinator:
 
         # Speaker Verification Service (for voice biometrics)
         self._speaker_verification: Optional[Any] = None
+
+        # v241.0: Agent Runtime reference (lazy-resolved from singleton)
+        self._agent_runtime: Optional[Any] = None
 
         # Component status
         self._component_status: Dict[str, ComponentStatus] = {}
@@ -1058,28 +1067,192 @@ class AGIOSCoordinator:
             return await self._voice.speak(text, mode=mode)
         return None
 
-    async def process_command(self, command: str) -> str:
-        """
-        Process a user command.
+    async def process_command(self, command: str, source: str = "chat") -> str:
+        """Process a user command.
+
+        v241.0: When AGI_OS_NL_GOAL_BRIDGE_ENABLED=true, also submits the
+        command as an agent runtime goal for autonomous tracking.  The hybrid
+        orchestrator still handles the immediate response (primary path).
 
         Args:
             command: User command text
+            source: Origin of the command ("voice", "chat", "api")
 
         Returns:
             Response text
         """
         self._stats['commands_processed'] += 1
 
-        # Use hybrid orchestrator for command processing
+        # v241.0: Opportunistic goal submission (fire-and-forget)
+        goal_id = None
+        if _env_bool("AGI_OS_NL_GOAL_BRIDGE_ENABLED", False):
+            try:
+                goal_id = await self.submit_nl_command(
+                    text=command, source=source, skip_inference=False,
+                )
+            except Exception as e:
+                logger.debug("[AGI-OS] NL goal bridge failed (non-blocking): %s", e)
+
+        # Use hybrid orchestrator for command processing (primary path)
         if self._hybrid_orchestrator:
             try:
                 result = await self._hybrid_orchestrator.process(command)
-                return result.get('response', "Command processed.")
+                response = result.get('response', "Command processed.")
+                if goal_id:
+                    response += f"\n\n[Tracking as goal {goal_id}]"
+                return response
             except Exception as e:
                 logger.error("Command processing error: %s", e)
                 return f"Error processing command: {e}"
 
         return "Command processing not available."
+
+    # ─────────────────────────────────────────────────────────
+    # v241.0: NL Command → Goal Bridge
+    # ─────────────────────────────────────────────────────────
+
+    def _resolve_agent_runtime(self):
+        """Lazily resolve the agent runtime singleton.
+
+        v241.0: Uses module-level get_agent_runtime(). Cached after
+        first successful resolve.
+        """
+        if self._agent_runtime is not None:
+            return self._agent_runtime
+        try:
+            from backend.autonomy.agent_runtime import get_agent_runtime
+            runtime = get_agent_runtime()
+            if runtime is not None:
+                self._agent_runtime = runtime
+            return runtime
+        except ImportError:
+            return None
+
+    async def submit_nl_command(
+        self,
+        text: str,
+        source: str = "voice",
+        context: Optional[Dict[str, Any]] = None,
+        skip_inference: bool = False,
+    ) -> Optional[str]:
+        """Submit a natural language command as an agent runtime goal.
+
+        v241.0: NL-to-Goal bridge. Optionally uses GoalInferenceAgent
+        from the neural mesh to classify intent and enrich the goal.
+
+        Args:
+            text: Natural language command text
+            source: Origin ("voice", "chat", "api")
+            context: Optional additional context
+            skip_inference: If True, skip GoalInferenceAgent classification
+
+        Returns:
+            goal_id if successfully submitted, None if unavailable.
+        """
+        runtime = self._resolve_agent_runtime()
+        if runtime is None:
+            logger.debug("[AGI-OS] submit_nl_command: agent runtime not available")
+            return None
+
+        goal_description = text
+        goal_context = dict(context or {})
+        goal_context["nl_source"] = source
+        goal_context["original_text"] = text
+        needs_vision = False
+
+        # Default priority — may be overridden by inference
+        try:
+            from backend.autonomy.agent_runtime_models import GoalPriority
+            goal_priority = GoalPriority.NORMAL
+        except ImportError:
+            goal_priority = None  # submit_goal will use default
+
+        # ── Optional: GoalInferenceAgent classification ──────
+        if not skip_inference and self._jarvis_bridge:
+            try:
+                inference_result = await self._safe_infer_goal(text, goal_context)
+                if inference_result and isinstance(inference_result, dict):
+                    inferred_desc = inference_result.get("description")
+                    if inferred_desc and isinstance(inferred_desc, str):
+                        goal_description = inferred_desc
+
+                    category = inference_result.get("category", "")
+                    if goal_priority is not None and category:
+                        if category in ("system", "productivity"):
+                            goal_priority = GoalPriority.HIGH
+                        elif category in ("automation",):
+                            goal_priority = GoalPriority.BACKGROUND
+
+                    goal_context["inferred_category"] = category
+                    goal_context["inferred_confidence"] = inference_result.get(
+                        "confidence", 0.0
+                    )
+                    goal_context["inferred_level"] = inference_result.get("level", "")
+
+                    if category in ("system",):
+                        needs_vision = True
+            except Exception as e:
+                logger.debug(
+                    "[AGI-OS] GoalInferenceAgent classification failed "
+                    "(proceeding with raw text): %s", e
+                )
+
+        # ── Vision keyword detection in raw text ─────────────
+        if not needs_vision:
+            vision_keywords = {"open", "click", "navigate", "show", "display", "look at", "screen"}
+            text_lower = text.lower()
+            needs_vision = any(kw in text_lower for kw in vision_keywords)
+
+        # ── Submit to agent runtime ──────────────────────────
+        try:
+            submit_kwargs: Dict[str, Any] = {
+                "description": goal_description,
+                "source": source,
+                "context": goal_context,
+                "needs_vision": needs_vision,
+            }
+            if goal_priority is not None:
+                submit_kwargs["priority"] = goal_priority
+
+            goal_id = await runtime.submit_goal(**submit_kwargs)
+            logger.info(
+                "[AGI-OS] NL command submitted as goal %s: %s (source=%s)",
+                goal_id, goal_description[:60], source,
+            )
+            return goal_id
+        except Exception as e:
+            logger.warning("[AGI-OS] Failed to submit NL command as goal: %s", e)
+            return None
+
+    async def _safe_infer_goal(
+        self, text: str, context: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Query GoalInferenceAgent with timeout and error isolation.
+
+        v241.0: Uses jarvis_bridge.get_agent() to access the agent
+        directly.  Payload uses 'command' key per GoalInferenceAgent's
+        _infer_goal() interface.
+        """
+        timeout = float(os.getenv("AGI_OS_NL_INFERENCE_TIMEOUT", "5.0"))
+        try:
+            agent = self._jarvis_bridge.get_agent("GoalInferenceAgent")
+            if agent is None:
+                return None
+            result = await asyncio.wait_for(
+                agent.execute_task({
+                    "action": "infer_goal",
+                    "command": text,
+                    "context": context,
+                }),
+                timeout=timeout,
+            )
+            return result if isinstance(result, dict) else None
+        except asyncio.TimeoutError:
+            logger.debug("[AGI-OS] GoalInferenceAgent timed out (%.1fs)", timeout)
+            return None
+        except Exception as e:
+            logger.debug("[AGI-OS] GoalInferenceAgent query failed: %s", e)
+            return None
 
     async def trigger_action(
         self,
@@ -1153,6 +1326,7 @@ class AGIOSCoordinator:
             'learning_db': self._learning_db,
             'ghost_hands': self._ghost_hands,
             'ghost_display': self._ghost_display,
+            'agent_runtime': self._resolve_agent_runtime(),
         }
         return components.get(name)
 

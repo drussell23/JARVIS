@@ -299,6 +299,17 @@ class UnifiedAgentRuntime:
         # v240.0: Mesh coordinator reference for heartbeat context gathering
         self._mesh_coordinator = None
 
+        # v241.0: Proactive goal deduplication — per-situation-type cooldowns
+        self._proactive_cooldowns: Dict[str, float] = {}
+        self._situation_cooldowns: Dict[str, float] = {
+            "critical_error": _env_float("AGENT_RUNTIME_COOLDOWN_CRITICAL_ERROR", 300.0),
+            "security_concern": _env_float("AGENT_RUNTIME_COOLDOWN_SECURITY_CONCERN", 300.0),
+            "health_reminder": _env_float("AGENT_RUNTIME_COOLDOWN_HEALTH_REMINDER", 3600.0),
+        }
+        self._default_proactive_cooldown = _env_float(
+            "AGENT_RUNTIME_PROACTIVE_COOLDOWN", 1800.0
+        )
+
     # ─────────────────────────────────────────────────────────
     # Lifecycle
     # ─────────────────────────────────────────────────────────
@@ -563,6 +574,8 @@ class UnifiedAgentRuntime:
                 if now - last_goal_gen >= self._goal_gen_interval:
                     last_goal_gen = now
                     await self._maybe_generate_proactive_goal()
+                    # v241.0: Clean up expired cooldown entries
+                    self._cleanup_proactive_cooldowns()
 
             except Exception as e:
                 logger.error("[AgentRuntime] Housekeeping error: %s", e, exc_info=True)
@@ -1686,22 +1699,106 @@ class UnifiedAgentRuntime:
             logger.debug("[AgentRuntime] Failed to record trajectory: %s", e)
 
     # ─────────────────────────────────────────────────────────
+    # v241.0: Proactive Goal Deduplication
+    # ─────────────────────────────────────────────────────────
+
+    def _is_proactive_goal_cooled_down(self, situation_type: str) -> bool:
+        """Check if a proactive goal for this situation type is within cooldown.
+        Returns True if still cooling down (should SKIP generation)."""
+        try:
+            last_ts = self._proactive_cooldowns.get(situation_type)
+            if last_ts is None:
+                return False
+            cooldown = self._situation_cooldowns.get(
+                situation_type, self._default_proactive_cooldown
+            )
+            elapsed = time.time() - last_ts
+            if elapsed < cooldown:
+                logger.debug(
+                    "[AgentRuntime] Proactive goal '%s' cooled down "
+                    "(%.0fs elapsed, %.0fs cooldown)",
+                    situation_type, elapsed, cooldown,
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.debug("[AgentRuntime] Cooldown check failed: %s", e)
+            return False
+
+    def _has_active_proactive_goal(self, situation_type: str) -> bool:
+        """Check if a proactive goal with this situation_type is already active."""
+        try:
+            for goal in self._active_goals.values():
+                if goal.source != "proactive":
+                    continue
+                if goal.status in TERMINAL_STATES:
+                    continue
+                goal_sit_type = goal.metadata.get("situation_type")
+                if goal_sit_type == situation_type:
+                    logger.debug(
+                        "[AgentRuntime] Active proactive goal %s already "
+                        "has situation_type='%s'",
+                        goal.goal_id, situation_type,
+                    )
+                    return True
+            return False
+        except Exception as e:
+            logger.debug("[AgentRuntime] Active goal scan failed: %s", e)
+            return False
+
+    def _cleanup_proactive_cooldowns(self):
+        """Remove expired cooldown entries to prevent unbounded growth."""
+        try:
+            now = time.time()
+            max_cooldown = max(
+                self._situation_cooldowns.values(),
+                default=self._default_proactive_cooldown,
+            )
+            cutoff = now - (max_cooldown * 2)
+            expired = [
+                k for k, ts in self._proactive_cooldowns.items()
+                if ts < cutoff
+            ]
+            for k in expired:
+                del self._proactive_cooldowns[k]
+        except Exception as e:
+            logger.debug("[AgentRuntime] Cooldown cleanup failed: %s", e)
+
+    # ─────────────────────────────────────────────────────────
     # Self-Directed Goal Generation
     # ─────────────────────────────────────────────────────────
 
     async def _maybe_generate_proactive_goal(self):
-        """Check if the intervention engine suggests a proactive goal."""
+        """Check if the intervention engine suggests a proactive goal.
+
+        v241.0: Per-situation-type cooldown deduplication and active-goal
+        dedup prevent heartbeat flooding.
+        """
         try:
             from backend.autonomy.intervention_decision_engine import (
                 get_intervention_engine,
             )
             engine = get_intervention_engine()
             if engine and hasattr(engine, 'generate_goal'):
-                # v240.0: Feed context to the heartbeat so the engine can
-                # detect situations (deadline, idle, repetition, etc.)
+                # v240.0: Feed context to the heartbeat
                 context = await self._gather_heartbeat_context()
                 goal_spec = await engine.generate_goal(context=context)
                 if goal_spec:
+                    # ── v241.0: Deduplication guard ──────────
+                    goal_context = goal_spec.get("context") or {}
+                    situation_type = (
+                        goal_context.get("situation_type", "")
+                        if isinstance(goal_context, dict) else ""
+                    )
+                    if situation_type:
+                        if self._is_proactive_goal_cooled_down(situation_type):
+                            return
+                        if self._has_active_proactive_goal(situation_type):
+                            return
+                        # Record BEFORE submit so failures don't cause immediate retry
+                        self._proactive_cooldowns[situation_type] = time.time()
+                    # ── End dedup guard ──────────────────────
+
                     await self.submit_goal(
                         description=goal_spec["description"],
                         priority=GoalPriority[
@@ -1711,8 +1808,9 @@ class UnifiedAgentRuntime:
                         context=goal_spec.get("context"),
                     )
                     logger.info(
-                        "[AgentRuntime] Proactive goal generated: %s",
+                        "[AgentRuntime] Proactive goal generated: %s (type=%s)",
                         goal_spec["description"][:60],
+                        situation_type or "unknown",
                     )
         except Exception as e:
             logger.debug("[AgentRuntime] Proactive goal generation failed: %s", e)
