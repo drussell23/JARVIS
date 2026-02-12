@@ -45,8 +45,8 @@ def _check_ferrari() -> bool:
     if _FERRARI_AVAILABLE is not None:
         return _FERRARI_AVAILABLE
     try:
-        from backend.display import fast_capture
-        _FERRARI_AVAILABLE = hasattr(fast_capture, "get_visible_windows")
+        from backend.native_extensions.fast_capture_wrapper import FastCaptureEngine
+        _FERRARI_AVAILABLE = True
     except ImportError:
         _FERRARI_AVAILABLE = False
     return _FERRARI_AVAILABLE
@@ -276,8 +276,9 @@ class BounceTestBrowser:
         """
         # Try Ferrari Engine window discovery
         try:
-            from backend.display import fast_capture
-            windows = fast_capture.get_visible_windows()
+            from backend.native_extensions.fast_capture_wrapper import FastCaptureEngine
+            engine = FastCaptureEngine()
+            windows = engine.get_visible_windows()
             for w in windows:
                 title = w.get("title", "") or w.get("kCGWindowName", "")
                 owner = w.get("owner", "") or w.get("kCGWindowOwnerName", "")
@@ -379,7 +380,7 @@ async def ferrari_watcher():
 
     async def _create(window_id: int, fps: int = FERRARI_FPS):
         try:
-            from backend.display.fast_capture import VideoWatcher
+            from backend.vision.macos_video_capture_advanced import VideoWatcher
             watcher = VideoWatcher(window_id, fps=fps)
             await watcher.start()
             watchers.append(watcher)

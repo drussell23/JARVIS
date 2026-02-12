@@ -66,7 +66,7 @@ class TestFerrariOCRPipeline:
         if window_id is None:
             pytest.skip("Could not find bounce test window")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         watcher = VideoWatcher(window_id, fps=FERRARI_FPS)
         try:
@@ -126,7 +126,7 @@ class TestFerrariOCRPipeline:
         if window_id is None:
             pytest.skip("Could not find bounce test window")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         watcher = VideoWatcher(window_id, fps=FERRARI_FPS)
         try:
@@ -178,7 +178,7 @@ class TestFerrariOCRPipeline:
         if window_id is None:
             pytest.skip("Could not find bounce test window")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         watcher = VideoWatcher(window_id, fps=FERRARI_FPS)
         try:
@@ -437,7 +437,7 @@ class TestGodModeConcurrentDetection:
         if v_id is None or h_id is None:
             pytest.skip("Could not find both bounce test windows")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         v_watcher = VideoWatcher(v_id, fps=15)
         h_watcher = VideoWatcher(h_id, fps=15)
@@ -517,7 +517,7 @@ class TestGodModeConcurrentDetection:
         if v_id is None or h_id is None:
             pytest.skip("Could not find both bounce test windows")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         v_watcher = VideoWatcher(v_id, fps=10)
         h_watcher = VideoWatcher(h_id, fps=10)

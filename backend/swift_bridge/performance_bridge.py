@@ -338,7 +338,7 @@ class SwiftAudioProcessor:
         Example:
             >>> features = await processor.process_audio_async(audio_data)
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.executor, self.process_audio, audio_data)
     
     def detect_voice_activity(self, audio_data: np.ndarray) -> bool:
@@ -483,7 +483,7 @@ class SwiftVisionProcessor:
         Example:
             >>> result = await processor.process_image_async(image_data)
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.process_image, image_data)
     
     def __del__(self) -> None:

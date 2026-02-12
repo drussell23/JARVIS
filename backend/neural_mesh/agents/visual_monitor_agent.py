@@ -882,6 +882,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # The _mosaic_visual_detection() loop checks this event each iteration
         # and swaps its local watcher reference to self._active_mosaic_watcher.
         self._mosaic_watcher_changed = asyncio.Event()
+        self._mosaic_swap_lock = asyncio.Lock()  # v243.0: Serialize resolution-change swaps
 
         # v12.0: Direct VideoWatcher management (Ferrari Engine)
         self._active_video_watchers: Dict[str, Any] = {}  # watcher_id -> VideoWatcher instance
@@ -1163,11 +1164,15 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
     async def _handle_ghost_resolution_change(self, payload: Dict[str, Any]) -> None:
         """
-        v241.0: Handle ghost display resolution change by recreating MosaicWatcher.
+        v243.0: Handle ghost display resolution change by recreating MosaicWatcher.
 
         AVFoundation capture session resolution is set at creation time and
         cannot be changed dynamically. When the ghost display resolution changes,
         we must stop the old MosaicWatcher and create a new one with updated dimensions.
+
+        CRITICAL: The old watcher stays alive and serving frames until the new
+        watcher confirms its first frame. This eliminates the frame gap where
+        the detection loop would see None/stale frames during the swap window.
         """
         new_width = payload.get("new_width")
         new_height = payload.get("new_height")
@@ -1178,59 +1183,85 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             return
 
         logger.info(
-            f"[VisualMonitor v241.0] Ghost display resolution changed: "
+            f"[VisualMonitor v243.0] Ghost display resolution changed: "
             f"{old_width}x{old_height} -> {new_width}x{new_height}"
         )
 
         # Only recreate if MosaicWatcher is currently active
         if not hasattr(self, '_active_mosaic_watcher') or self._active_mosaic_watcher is None:
-            logger.debug("[VisualMonitor v241.0] No active MosaicWatcher — skipping recreation")
+            logger.debug("[VisualMonitor v243.0] No active MosaicWatcher — skipping recreation")
             return
 
-        try:
-            # Stop existing MosaicWatcher
-            old_watcher = self._active_mosaic_watcher
-            self._active_mosaic_watcher = None
-
+        # Serialize concurrent resolution changes (e.g., rapid display config toggles)
+        async with self._mosaic_swap_lock:
             try:
-                await asyncio.wait_for(old_watcher.stop(), timeout=5.0)
-                logger.info("[VisualMonitor v241.0] Stopped old MosaicWatcher for resolution update")
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning(f"[VisualMonitor v241.0] Old MosaicWatcher stop error: {e}")
+                old_watcher = self._active_mosaic_watcher
 
-            # Create new MosaicWatcher with updated dimensions
-            from backend.vision.macos_video_capture_advanced import (
-                MosaicWatcher, MosaicWatcherConfig
-            )
-
-            ghost_cg_display_id = self._get_ghost_cg_display_id()  # v242.0: CGDirectDisplayID for capture
-
-            new_config = MosaicWatcherConfig(
-                display_id=ghost_cg_display_id,
-                display_width=new_width,
-                display_height=new_height,
-                fps=self.config.mosaic_fps,
-                window_tiles=old_watcher.config.window_tiles if hasattr(old_watcher, 'config') else []
-            )
-
-            new_watcher = MosaicWatcher(new_config)
-            success = await new_watcher.start()
-
-            if success:
-                self._active_mosaic_watcher = new_watcher
-                # v242.1: Signal the detection loop to swap to the new watcher.
-                # Without this, the loop holds a stale reference to the stopped
-                # old watcher and spins on None frames until timeout.
-                self._mosaic_watcher_changed.set()
-                logger.info(
-                    f"[VisualMonitor v242.1] MosaicWatcher recreated with "
-                    f"{new_width}x{new_height} resolution — detection loop signaled"
+                # Create new MosaicWatcher with updated dimensions (old still running)
+                from backend.vision.macos_video_capture_advanced import (
+                    MosaicWatcher, MosaicWatcherConfig
                 )
-            else:
-                logger.warning("[VisualMonitor v242.1] Failed to start new MosaicWatcher after resolution change")
 
-        except Exception as e:
-            logger.warning(f"[VisualMonitor v242.1] Resolution change handler error: {e}")
+                ghost_cg_display_id = self._get_ghost_cg_display_id()
+
+                new_config = MosaicWatcherConfig(
+                    display_id=ghost_cg_display_id,
+                    display_width=new_width,
+                    display_height=new_height,
+                    fps=self.config.mosaic_fps,
+                    window_tiles=old_watcher.config.window_tiles if hasattr(old_watcher, 'config') else []
+                )
+
+                new_watcher = MosaicWatcher(new_config)
+                started = await new_watcher.start()
+
+                if started:
+                    # Wait for new watcher to produce its first frame before swapping.
+                    # Old watcher continues serving frames to the detection loop.
+                    _validation_timeout = float(os.environ.get(
+                        "JARVIS_MOSAIC_SWAP_VALIDATION_TIMEOUT", "3.0"
+                    ))
+                    first_frame = await new_watcher.wait_for_first_frame(
+                        timeout=_validation_timeout
+                    )
+
+                    if first_frame:
+                        # Atomic swap: detection loop sees new watcher immediately
+                        self._active_mosaic_watcher = new_watcher
+                        self._mosaic_watcher_changed.set()
+
+                        # Stop old watcher AFTER swap — no frame gap
+                        if old_watcher:
+                            try:
+                                await asyncio.wait_for(old_watcher.stop(), timeout=5.0)
+                            except (asyncio.TimeoutError, Exception) as e:
+                                logger.warning(
+                                    f"[VisualMonitor v243.0] Old watcher stop error "
+                                    f"(non-critical, already swapped): {e}"
+                                )
+
+                        logger.info(
+                            f"[VisualMonitor v243.0] MosaicWatcher hot-swapped to "
+                            f"{new_width}x{new_height} — zero frame gap"
+                        )
+                    else:
+                        # New watcher produced no frames — keep old one running
+                        logger.warning(
+                            f"[VisualMonitor v243.0] New watcher produced no frames "
+                            f"within {_validation_timeout}s — keeping old watcher"
+                        )
+                        try:
+                            await asyncio.wait_for(new_watcher.stop(), timeout=5.0)
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                else:
+                    logger.warning(
+                        "[VisualMonitor v243.0] New MosaicWatcher failed to start "
+                        "— keeping old watcher active"
+                    )
+
+            except Exception as e:
+                logger.warning(f"[VisualMonitor v243.0] Resolution change handler error: {e}")
 
     def _create_spatial_agent_sync(self):
         """
@@ -10689,6 +10720,21 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                 },
                 "last_updated": datetime.now().isoformat(),
             }
+
+            # v243.0: Include mosaic watcher status for cross-repo visibility
+            mosaic = getattr(self, '_active_mosaic_watcher', None)
+            if mosaic is not None:
+                state["mosaic_watcher"] = {
+                    "active": True,
+                    "mode": (
+                        "per_window_composite"
+                        if getattr(mosaic, '_use_per_window_fallback', False)
+                        else "avfoundation"
+                    ),
+                    "display_id": getattr(mosaic, 'display_id', None),
+                }
+            else:
+                state["mosaic_watcher"] = None
 
             # Write to file
             state_file.write_text(json.dumps(state, indent=2))

@@ -190,7 +190,7 @@ class TestE2EVerticalBounce:
             )
 
             # Step 2: Start GPU-accelerated capture
-            from backend.display.fast_capture import VideoWatcher
+            from backend.vision.macos_video_capture_advanced import VideoWatcher
 
             watcher = VideoWatcher(window_id, fps=FERRARI_FPS)
             await watcher.start()
@@ -262,7 +262,7 @@ class TestE2EHorizontalBounce:
             window_id = await browser.find_window_id()
             assert window_id is not None, "Should discover bounce window"
 
-            from backend.display.fast_capture import VideoWatcher
+            from backend.vision.macos_video_capture_advanced import VideoWatcher
 
             watcher = VideoWatcher(window_id, fps=FERRARI_FPS)
             await watcher.start()
@@ -329,7 +329,7 @@ class TestE2EGodModeDualWindow:
             if v_id is None or h_id is None:
                 pytest.skip("Could not discover both bounce windows")
 
-            from backend.display.fast_capture import VideoWatcher
+            from backend.vision.macos_video_capture_advanced import VideoWatcher
 
             v_watcher = VideoWatcher(v_id, fps=15)
             h_watcher = VideoWatcher(h_id, fps=15)
@@ -573,7 +573,7 @@ class TestE2EPerformanceCharacterization:
             if window_id is None:
                 pytest.skip("Could not find bounce window")
 
-            from backend.display.fast_capture import VideoWatcher
+            from backend.vision.macos_video_capture_advanced import VideoWatcher
 
             watcher = VideoWatcher(window_id, fps=60)
             await watcher.start()
@@ -623,7 +623,7 @@ class TestE2EPerformanceCharacterization:
             if window_id is None:
                 pytest.skip("Could not find bounce window")
 
-            from backend.display.fast_capture import VideoWatcher
+            from backend.vision.macos_video_capture_advanced import VideoWatcher
 
             watcher = VideoWatcher(window_id, fps=30)
             await watcher.start()

@@ -63543,6 +63543,7 @@ class JarvisSystemKernel:
                     pass
 
             state = {
+                "schema_version": 1,
                 "timestamp": time.time(),
                 "is_ready": status_data.get("ghost_display_active", False),
                 "status": status_data,

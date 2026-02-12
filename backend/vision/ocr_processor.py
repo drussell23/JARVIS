@@ -6,6 +6,8 @@ Extracts and structures text from screenshots using OCR
 
 import asyncio
 import logging
+import os
+import time as _time
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -88,10 +90,33 @@ class OCRProcessor:
         else:
 
             self.executor = ThreadPoolExecutor(max_workers=2)
-        
-        # OCR configuration
-        self.custom_config = '--oem 3 --psm 11'  # Use best OCR engine mode, sparse text
-        
+
+        # v243.0 (#9): PSM configurable by source context
+        self._default_psm = int(os.getenv('JARVIS_OCR_PSM', '11'))
+        self.custom_config = f'--oem 3 --psm {self._default_psm}'
+
+        # v243.0 (#6): Image downsampling for faster OCR
+        self._max_dimension = int(os.getenv('JARVIS_OCR_MAX_DIMENSION', '1280'))
+
+        # v243.0 (#6): Adaptive OCR interval tracking
+        self._last_ocr_duration: float = 0.0
+
+        # v243.0 (#8): Ghost display dark background detection
+        self._dark_threshold = int(os.getenv('JARVIS_OCR_DARK_THRESHOLD', '80'))
+
+        # v243.0 (#7): Apple Vision Framework via existing SwiftVisionProcessor
+        # Reuses backend/swift_bridge/performance_bridge.py — no duplication
+        self._vision_processor = None
+        self._use_vision = os.getenv('JARVIS_OCR_USE_VISION', 'true').lower() == 'true'
+        if self._use_vision:
+            try:
+                from backend.swift_bridge.performance_bridge import SwiftVisionProcessor
+                self._vision_processor = SwiftVisionProcessor()
+                logger.info("[OCRProcessor v243.0] Apple Vision Framework available via SwiftVisionProcessor")
+            except (ImportError, OSError) as e:
+                logger.debug(f"[OCRProcessor v243.0] Vision Framework unavailable, using pytesseract: {e}")
+                self._vision_processor = None
+
         # Text classification patterns
         self.text_patterns = {
             'title': {
@@ -123,11 +148,30 @@ class OCRProcessor:
             logger.error("Tesseract OCR not found. Please install tesseract-ocr.")
             self.tesseract_available = False
             
-    async def process_image(self, image: Image.Image, region: Optional[Tuple[int, int, int, int]] = None) -> OCRResult:
-        """Process an image to extract text"""
+    @property
+    def recommended_interval_ms(self) -> float:
+        """v243.0 (#6): Adaptive OCR interval = 2x measured latency.
+        Prevents CPU saturation from calling OCR faster than it can process."""
+        return max(200.0, self._last_ocr_duration * 2000.0)
+
+    async def process_image(
+        self,
+        image: Image.Image,
+        region: Optional[Tuple[int, int, int, int]] = None,
+        source_context: Optional[str] = None,
+    ) -> OCRResult:
+        """Process an image to extract text.
+
+        Args:
+            image: PIL Image to process
+            region: Optional crop region (x, y, width, height)
+            source_context: v243.0 (#9) hint for PSM selection.
+                'window' = single app, 'display' = full mosaic, 'region' = known area
+        """
         start_time = datetime.now()
-        
-        if not self.tesseract_available:
+        wall_start = _time.monotonic()
+
+        if not self.tesseract_available and self._vision_processor is None:
             return OCRResult(
                 timestamp=start_time,
                 regions=[],
@@ -135,32 +179,49 @@ class OCRProcessor:
                 processing_time=0,
                 image_size=image.size
             )
-            
+
         # Crop to region if specified
         if region:
             x, y, width, height = region
             image = image.crop((x, y, x + width, y + height))
-            
-        # Preprocess image
+
+        # v243.0 (#6): Downsample large images before OCR
+        image = self._downsample_if_needed(image)
+
+        # v243.0 (#7): Try Apple Vision Framework first (5-10x faster than pytesseract)
+        if self._vision_processor is not None:
+            try:
+                vision_result = await self._perform_vision_ocr(image)
+                if vision_result is not None:
+                    self._last_ocr_duration = _time.monotonic() - wall_start
+                    return vision_result
+            except Exception as e:
+                logger.debug(f"[OCRProcessor v243.0] Vision Framework failed, falling back: {e}")
+
+        # Preprocess image (pytesseract path)
         processed_image = await self._preprocess_image(image)
-        
+
+        # v243.0 (#9): Select optimal PSM based on source context
+        ocr_config = self._get_config_for_context(source_context)
+
         # Run OCR in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        from functools import partial
+        loop = asyncio.get_running_loop()
         ocr_data = await loop.run_in_executor(
             self.executor,
-            self._perform_ocr,
-            processed_image
+            partial(self._perform_ocr, processed_image, ocr_config),
         )
-        
+
         # Parse OCR results
         regions = self._parse_ocr_data(ocr_data, image.size)
-        
+
         # Extract full text
         full_text = '\n'.join(r.text for r in regions if r.text.strip())
-        
+
         # Calculate processing time
         processing_time = (datetime.now() - start_time).total_seconds()
-        
+        self._last_ocr_duration = _time.monotonic() - wall_start
+
         return OCRResult(
             timestamp=start_time,
             regions=regions,
@@ -169,32 +230,109 @@ class OCRProcessor:
             image_size=image.size,
             language='+'.join(self.languages)
         )
+
+    def _downsample_if_needed(self, image: Image.Image) -> Image.Image:
+        """v243.0 (#6): Downsample large images to reduce OCR latency."""
+        w, h = image.size
+        max_dim = self._max_dimension
+        if max(w, h) <= max_dim:
+            return image
+        scale = max_dim / max(w, h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return image.resize((new_w, new_h), Image.LANCZOS)
+
+    def _get_config_for_context(self, source_context: Optional[str]) -> str:
+        """v243.0 (#9): Select optimal Tesseract config based on source context."""
+        psm_map = {
+            'window': 6,    # Single app capture → uniform block
+            'display': 11,  # Full display/mosaic → sparse text
+            'region': 7,    # Cropped known region → single line
+        }
+        psm = psm_map.get(source_context, self._default_psm) if source_context else self._default_psm
+        return f'--oem 3 --psm {psm}'
+
+    async def _perform_vision_ocr(self, image: Image.Image) -> Optional[OCRResult]:
+        """v243.0 (#7): OCR using Apple Vision Framework via SwiftVisionProcessor."""
+        import io
+        start_time = datetime.now()
+        buf = io.BytesIO()
+        image.save(buf, format='JPEG', quality=85)
+        jpeg_bytes = buf.getvalue()
+
+        result = await asyncio.get_running_loop().run_in_executor(
+            self.executor,
+            self._vision_processor.process_image,
+            jpeg_bytes,
+        )
+
+        if result is None:
+            return None
+
+        # SwiftVisionProcessor returns VisionResult with .text and .detections
+        full_text = getattr(result, 'text', '') or ''
+        detections = getattr(result, 'detections', []) or []
+
+        regions = []
+        for det in detections:
+            text = det.get('text', '') if isinstance(det, dict) else getattr(det, 'text', '')
+            conf = det.get('confidence', 0.0) if isinstance(det, dict) else getattr(det, 'confidence', 0.0)
+            bbox = det.get('bounding_box', (0, 0, 0, 0)) if isinstance(det, dict) else getattr(det, 'bounding_box', (0, 0, 0, 0))
+            if text.strip():
+                bx, by, bw, bh = bbox if len(bbox) == 4 else (0, 0, 0, 0)
+                regions.append(TextRegion(
+                    text=text.strip(),
+                    confidence=conf,
+                    bounding_box=(int(bx), int(by), int(bw), int(bh)),
+                    center_point=(int(bx + bw / 2), int(by + bh / 2)),
+                    area_type='body',
+                ))
+
+        processing_time = (datetime.now() - start_time).total_seconds()
+        return OCRResult(
+            timestamp=start_time,
+            regions=regions,
+            full_text=full_text,
+            processing_time=processing_time,
+            image_size=image.size,
+            language='vision',
+        )
         
     async def _preprocess_image(self, image: Image.Image) -> np.ndarray:
-        """Preprocess image for better OCR results"""
+        """Preprocess image for better OCR results.
+        v243.0 (#8): Detects ghost display (dark background) and applies
+        specialized preprocessing (invert + Otsu + morphological close)."""
         # Convert to numpy array
         img_array = np.array(image)
-        
+
         # Convert to grayscale if needed
         if len(img_array.shape) == 3:
             gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
         else:
             gray = img_array
-            
-        # Apply adaptive thresholding
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
-        
-        # Denoise
-        denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
-        
+
+        # v243.0 (#8): Detect dark background (ghost display capture)
+        mean_intensity = float(np.mean(gray))
+        if mean_intensity < self._dark_threshold:
+            # Ghost display: light text on dark background
+            # Invert → Otsu threshold → morphological close (removes glow artifacts)
+            inverted = cv2.bitwise_not(gray)
+            _, thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            denoised = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        else:
+            # Normal display: existing adaptive threshold + denoise pipeline
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
+            )
+            denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
+
         # Optional: Deskew image
         angle = self._get_skew_angle(denoised)
         if abs(angle) > 0.5:
             denoised = self._rotate_image(denoised, angle)
-            
+
         return denoised
         
     def _get_skew_angle(self, image: np.ndarray) -> float:
@@ -232,19 +370,20 @@ class OCRProcessor:
         
         return rotated
         
-    def _perform_ocr(self, image: np.ndarray) -> pd.DataFrame:
-        """Perform OCR using Tesseract"""
+    def _perform_ocr(self, image: np.ndarray, config: Optional[str] = None) -> pd.DataFrame:
+        """Perform OCR using Tesseract.
+        v243.0 (#9): Accepts optional config override for context-specific PSM."""
         try:
-            # Get detailed OCR data
+            ocr_config = config or self.custom_config
             ocr_df = pytesseract.image_to_data(
                 image,
                 lang='+'.join(self.languages),
-                config=self.custom_config,
+                config=ocr_config,
                 output_type=pytesseract.Output.DATAFRAME
             )
-            
+
             return ocr_df
-            
+
         except Exception as e:
             logger.error(f"OCR failed: {e}")
             return pd.DataFrame()

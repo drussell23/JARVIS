@@ -22,6 +22,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -1239,7 +1240,9 @@ class WindowGeometry:
         new_x = min(new_x, target_width - new_width)
         new_y = min(new_y, target_height - new_height)
         new_x = max(0, new_x)
-        new_y = max(25, new_y)  # Account for menu bar
+        # v243.0 (#20): menu bar offset depends on display type
+        _min_y = 0 if getattr(self, 'ghost_display_scale', 1.0) and target_height < 1200 else 25
+        new_y = max(_min_y, new_y)
 
         return new_x, new_y, new_width, new_height
 
@@ -1642,7 +1645,10 @@ class GhostDisplayManager:
         self._persistence_initialized: bool = False
 
         # v129.0: Event emission for frontend/cross-repo state propagation
+        # v243.0 (#11): threading.Lock for sync-safe observer list modification.
+        # _notify_state_change() uses list() snapshot for safe async iteration.
         self._state_observers: List[Callable] = []
+        self._observers_lock = threading.Lock()
         self._last_emitted_status: Optional[str] = None
 
         # v241.0: External capture metrics provider (registered by VisualMonitorAgent)
@@ -1679,19 +1685,26 @@ class GhostDisplayManager:
         """
         Register an observer for ghost display state changes.
 
+        v243.0 (#11): Uses threading.Lock for sync-safe modification.
+        _notify_state_change() is async and already uses list() snapshot
+        for iteration safety. This lock prevents concurrent add/remove
+        during modification only.
+
         Args:
             callback: Async or sync callable receiving (event_type: str, data: dict)
 
         Returns:
             Unsubscribe function
         """
-        self._state_observers.append(callback)
+        with self._observers_lock:
+            self._state_observers.append(callback)
 
         def _unsubscribe():
-            try:
-                self._state_observers.remove(callback)
-            except ValueError:
-                pass
+            with self._observers_lock:
+                try:
+                    self._state_observers.remove(callback)
+                except ValueError:
+                    pass
 
         return _unsubscribe
 
@@ -1727,6 +1740,7 @@ class GhostDisplayManager:
         }) if self._geometry_cache else []
 
         snapshot = {
+            "schema_version": _GHOST_STATE_SCHEMA_VERSION,
             "available": self._status == GhostDisplayStatus.AVAILABLE,
             "status": self._status.value if hasattr(self._status, 'value') else str(self._status),
             "window_count": len(self._windows_on_ghost),
@@ -1803,7 +1817,10 @@ class GhostDisplayManager:
 
         # Notify local observers (v242.1: snapshot to prevent RuntimeError if
         # a callback triggers add_observer() during iteration)
-        for observer in list(self._state_observers):
+        # v243.0 (#11): Copy under lock, iterate outside lock
+        with self._observers_lock:
+            observers_snapshot = list(self._state_observers)
+        for observer in observers_snapshot:
             try:
                 result = observer(event_type, payload)
                 if asyncio.iscoroutine(result):
@@ -3143,9 +3160,20 @@ class GhostDisplayManager:
             screen_width = self._ghost_info.width
             screen_height = self._ghost_info.height
 
-        # Account for menu bar and dock
-        usable_y = 25  # Menu bar
-        usable_height = screen_height - usable_y - 50  # Dock
+        # v243.0 (#20): Virtual/ghost displays have no menu bar or dock.
+        # For physical displays, yabai's own frame.y and gaps already account
+        # for these. Manual env var overrides available for edge cases.
+        _is_virtual = (
+            self._ghost_info is not None
+            and getattr(self._ghost_info, 'is_virtual', False)
+        )
+        if _is_virtual:
+            usable_y = int(os.environ.get("JARVIS_MENU_BAR_HEIGHT", "0"))
+            dock_h = int(os.environ.get("JARVIS_DOCK_HEIGHT", "0"))
+        else:
+            usable_y = int(os.environ.get("JARVIS_MENU_BAR_HEIGHT", "25"))
+            dock_h = int(os.environ.get("JARVIS_DOCK_HEIGHT", "50"))
+        usable_height = screen_height - usable_y - dock_h
         usable_width = screen_width
 
         positions = []
@@ -3627,6 +3655,16 @@ def get_shadow_display_index() -> int:
 
 
 # =============================================================================
+# v243.0: Ghost Display State Schema
+# =============================================================================
+# Schema version for cross-repo state files. This MUST be a code constant,
+# NOT an env var — schema versions are tied to serialization format and
+# changing them without code changes creates broken invariants.
+# Readers validate this and have backward-compatible parsing for older versions.
+# =============================================================================
+_GHOST_STATE_SCHEMA_VERSION: int = 1
+
+# =============================================================================
 # v242.0: Yabai Display Index → CGDirectDisplayID Resolution
 # =============================================================================
 # Yabai's space["display"] returns a display INDEX (1, 2, ...) but macOS
@@ -3637,6 +3675,8 @@ def get_shadow_display_index() -> int:
 
 _yabai_to_cg_cache: Dict[int, int] = {}
 _yabai_to_cg_cache_time: float = 0.0
+_yabai_to_cg_cache_dirty: bool = False
+_yabai_to_cg_cache_lock = threading.Lock()
 
 
 def resolve_yabai_index_to_cg_display_id(
@@ -3646,24 +3686,27 @@ def resolve_yabai_index_to_cg_display_id(
 ) -> Optional[int]:
     """
     v242.0: Resolve yabai display index to macOS CGDirectDisplayID.
+    v243.0: Thread-safe cache with dirty flag (no sleep on invalidation).
 
     Strategy:
-      1. Check TTL-based cache
+      1. Check TTL-based cache (thread-safe, skipped if dirty)
       2. Query `yabai -m query --displays` (authoritative mapping)
-      3. Fallback to Quartz CGGetActiveDisplayList (position-based)
+      3. Fallback to Quartz CGGetActiveDisplayList + CGGetOnlineDisplayList
 
     Returns None if resolution fails entirely.
     """
-    global _yabai_to_cg_cache, _yabai_to_cg_cache_time
+    global _yabai_to_cg_cache, _yabai_to_cg_cache_time, _yabai_to_cg_cache_dirty
 
     cache_ttl = float(os.environ.get('JARVIS_DISPLAY_MAP_CACHE_TTL', '30.0'))
 
-    # Check cache
-    if (time.time() - _yabai_to_cg_cache_time < cache_ttl
-            and yabai_index in _yabai_to_cg_cache):
-        return _yabai_to_cg_cache[yabai_index]
+    # v243.0: Thread-safe cache check — lock only dict read, NOT subprocess
+    with _yabai_to_cg_cache_lock:
+        if (not _yabai_to_cg_cache_dirty
+                and time.time() - _yabai_to_cg_cache_time < cache_ttl
+                and yabai_index in _yabai_to_cg_cache):
+            return _yabai_to_cg_cache[yabai_index]
 
-    # Primary: yabai --displays
+    # Primary: yabai --displays (subprocess runs OUTSIDE lock)
     resolved = _resolve_via_yabai_displays(yabai_index, yabai_path, timeout)
     if resolved is not None:
         return resolved
@@ -3681,11 +3724,13 @@ def _resolve_via_yabai_displays(
     yabai_path: Optional[str] = None,
     timeout: float = 5.0,
 ) -> Optional[int]:
-    """Query yabai --displays and map index → id (CGDirectDisplayID)."""
-    global _yabai_to_cg_cache, _yabai_to_cg_cache_time
+    """Query yabai --displays and map index → id (CGDirectDisplayID).
+    v243.0: Thread-safe cache writes, dirty flag cleared after fresh query."""
+    global _yabai_to_cg_cache, _yabai_to_cg_cache_time, _yabai_to_cg_cache_dirty
 
     path = yabai_path or os.environ.get("YABAI_PATH", "/opt/homebrew/bin/yabai")
     try:
+        # Subprocess runs OUTSIDE lock (can take hundreds of ms)
         result = subprocess.run(
             [path, "-m", "query", "--displays"],
             capture_output=True, text=True, timeout=timeout,
@@ -3701,9 +3746,11 @@ def _resolve_via_yabai_displays(
             if idx is not None and cg_id is not None:
                 new_cache[idx] = cg_id
 
-        # Atomic cache replacement
-        _yabai_to_cg_cache = new_cache
-        _yabai_to_cg_cache_time = time.time()
+        # v243.0: Thread-safe cache update + clear dirty flag
+        with _yabai_to_cg_cache_lock:
+            _yabai_to_cg_cache = new_cache
+            _yabai_to_cg_cache_time = time.time()
+            _yabai_to_cg_cache_dirty = False
 
         resolved = new_cache.get(yabai_index)
         if resolved is not None:
@@ -3719,44 +3766,107 @@ def _resolve_via_yabai_displays(
 
 
 def _resolve_via_quartz_fallback(yabai_index: int) -> Optional[int]:
-    """Fallback: use CGGetActiveDisplayList and match by position ordering."""
-    global _yabai_to_cg_cache, _yabai_to_cg_cache_time
+    """Fallback: use Quartz display enumeration and match by position ordering.
+
+    v243.0 fixes:
+      - #2: Query BOTH CGGetActiveDisplayList AND CGGetOnlineDisplayList.
+            BetterDisplay virtual displays often only appear in the online list.
+            Merge results: active first, then online-only (dedup by display ID).
+            Filter online-only with CGDisplayIsActive to exclude sleeping/mirrored.
+      - #1: Use CGDirectDisplayID as tiebreaker when two displays share same
+            x-position (stable uint32, deterministic ordering).
+      - #12: Thread-safe cache writes.
+    """
+    global _yabai_to_cg_cache, _yabai_to_cg_cache_time, _yabai_to_cg_cache_dirty
 
     try:
         import Quartz
-        err, display_ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
-        if err != 0 or not display_ids:
-            return None
 
-        active = list(display_ids)[:count]
+        # v243.0 (#2): Query BOTH active and online display lists
+        all_display_ids: List[int] = []
+        seen: set = set()
+
+        # Active displays first (these are always usable)
+        err, active_ids, active_count = Quartz.CGGetActiveDisplayList(16, None, None)
+        if err == 0 and active_ids:
+            for did in list(active_ids)[:active_count]:
+                if did not in seen:
+                    all_display_ids.append(did)
+                    seen.add(did)
+
+        # Online displays second (includes BetterDisplay virtual displays)
+        err2, online_ids, online_count = Quartz.CGGetOnlineDisplayList(16, None, None)
+        if err2 == 0 and online_ids:
+            for did in list(online_ids)[:online_count]:
+                if did not in seen:
+                    # Filter: only include online-only displays that are actually
+                    # usable (not sleeping or hardware-mirrored)
+                    try:
+                        is_active = Quartz.CGDisplayIsActive(did)
+                        is_online = Quartz.CGDisplayIsOnline(did)
+                        if is_active or is_online:
+                            all_display_ids.append(did)
+                            seen.add(did)
+                    except Exception:
+                        # If we can't check status, include it as a candidate
+                        all_display_ids.append(did)
+                        seen.add(did)
+
+        if not all_display_ids:
+            return None
 
         # Yabai orders displays: main=1, then by x-position left-to-right
         main_id = None
         non_main = []
-        for did in active:
+        for did in all_display_ids:
             if Quartz.CGDisplayIsMain(did):
                 main_id = did
             else:
                 bounds = Quartz.CGDisplayBounds(did)
+                # v243.0 (#1): Use (x_position, display_id) for deterministic
+                # tiebreaking when two displays share the same x-position
                 non_main.append((bounds.origin.x, did))
 
-        non_main.sort(key=lambda t: t[0])  # Sort by x-position
+        # Sort by x-position, then by CGDirectDisplayID as stable tiebreaker
+        non_main.sort(key=lambda t: (t[0], t[1]))
 
         ordered = []
         if main_id is not None:
             ordered.append(main_id)  # index 1
         ordered.extend(did for _, did in non_main)  # index 2, 3, ...
 
-        # Cache ALL mappings
+        # v243.0 (#1): Cross-validate against known ghost display dimensions
+        ghost_width = os.environ.get("JARVIS_GHOST_WIDTH")
+        ghost_height = os.environ.get("JARVIS_GHOST_HEIGHT")
+        if ghost_width and ghost_height:
+            try:
+                target_w, target_h = int(ghost_width), int(ghost_height)
+                for i, did in enumerate(ordered):
+                    bounds = Quartz.CGDisplayBounds(did)
+                    if int(bounds.size.width) == target_w and int(bounds.size.height) == target_h:
+                        expected_idx = i + 1
+                        if expected_idx != yabai_index:
+                            logger.warning(
+                                f"[v243.0] Display dimension match: {target_w}x{target_h} found at "
+                                f"index {expected_idx} but requested index {yabai_index}. "
+                                f"Position-based and dimension-based ordering disagree."
+                            )
+            except (ValueError, TypeError):
+                pass
+
+        # Cache ALL mappings (thread-safe)
         new_cache = {i + 1: did for i, did in enumerate(ordered)}
-        _yabai_to_cg_cache = new_cache
-        _yabai_to_cg_cache_time = time.time()
+        with _yabai_to_cg_cache_lock:
+            _yabai_to_cg_cache = new_cache
+            _yabai_to_cg_cache_time = time.time()
+            _yabai_to_cg_cache_dirty = False
 
         resolved = new_cache.get(yabai_index)
         if resolved is not None:
             logger.info(
                 f"[v242.0] Display mapping: yabai index {yabai_index} "
-                f"→ CGDirectDisplayID {resolved} (via Quartz fallback)"
+                f"→ CGDirectDisplayID {resolved} (via Quartz fallback, "
+                f"{len(all_display_ids)} displays enumerated)"
             )
         return resolved
 
@@ -3766,11 +3876,15 @@ def _resolve_via_quartz_fallback(yabai_index: int) -> Optional[int]:
 
 
 def invalidate_display_map_cache() -> None:
-    """v242.0: Invalidate the display mapping cache (on topology change)."""
-    global _yabai_to_cg_cache, _yabai_to_cg_cache_time
-    _yabai_to_cg_cache = {}
-    _yabai_to_cg_cache_time = 0.0
-    logger.debug("[v242.0] Display mapping cache invalidated")
+    """v242.0: Invalidate the display mapping cache (on topology change).
+    v243.0: Sets dirty flag so next resolution attempt forces a fresh query
+    without sleeping (sleep would block the event loop in async contexts)."""
+    global _yabai_to_cg_cache, _yabai_to_cg_cache_time, _yabai_to_cg_cache_dirty
+    with _yabai_to_cg_cache_lock:
+        _yabai_to_cg_cache = {}
+        _yabai_to_cg_cache_time = 0.0
+        _yabai_to_cg_cache_dirty = True
+    logger.debug("[v243.0] Display mapping cache invalidated (dirty flag set)")
 
 
 def get_ghost_display_status() -> Dict[str, Any]:

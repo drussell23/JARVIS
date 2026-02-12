@@ -273,7 +273,7 @@ class OCREngine:
                 lambda: self._pytesseract.image_to_string(
                     image,
                     lang=self.language,
-                    config="--psm 6"  # Assume uniform block of text
+                    config=f"--psm {os.getenv('JARVIS_OPTIC_OCR_PSM', '6')}"
                 )
             )
             return text.strip()

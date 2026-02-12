@@ -186,9 +186,10 @@ class TestFerrariFrameCapture:
     @pytest.mark.vision
     async def test_ferrari_window_discovery(self):
         """Ferrari can discover visible windows."""
-        from backend.display import fast_capture
+        from backend.native_extensions.fast_capture_wrapper import FastCaptureEngine
 
-        windows = fast_capture.get_visible_windows()
+        engine = FastCaptureEngine()
+        windows = engine.get_visible_windows()
         assert isinstance(windows, list), "get_visible_windows() should return a list"
         # Should find at least the desktop
         assert len(windows) > 0, "No visible windows found"
@@ -207,7 +208,7 @@ class TestFerrariFrameCapture:
         if window_id is None:
             pytest.skip("Could not find bounce test window")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         watcher = VideoWatcher(window_id, fps=30)
         try:
@@ -227,7 +228,7 @@ class TestFerrariFrameCapture:
         if window_id is None:
             pytest.skip("Could not find bounce test window")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         target_fps = 30
         watcher = VideoWatcher(window_id, fps=target_fps)
@@ -268,7 +269,7 @@ class TestFerrariFrameCapture:
         if v_id is None or h_id is None:
             pytest.skip("Could not find both bounce test windows")
 
-        from backend.display.fast_capture import VideoWatcher
+        from backend.vision.macos_video_capture_advanced import VideoWatcher
 
         v_watcher = VideoWatcher(v_id, fps=15)
         h_watcher = VideoWatcher(h_id, fps=15)

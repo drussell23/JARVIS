@@ -2346,6 +2346,34 @@ class WindowTileInfo:
         return x_overlap * y_overlap
 
 
+def _resolve_ghost_display_width() -> int:
+    """v243.0 (#19): Resolve ghost display width dynamically."""
+    try:
+        from backend.vision.yabai_space_detector import get_ghost_manager
+        mgr = get_ghost_manager()
+        if mgr is not None:
+            dims = mgr.ghost_display_dimensions
+            if dims and dims[0] > 0:
+                return dims[0]
+    except Exception:
+        pass
+    return int(os.getenv('JARVIS_GHOST_WIDTH', '1920'))
+
+
+def _resolve_ghost_display_height() -> int:
+    """v243.0 (#19): Resolve ghost display height dynamically."""
+    try:
+        from backend.vision.yabai_space_detector import get_ghost_manager
+        mgr = get_ghost_manager()
+        if mgr is not None:
+            dims = mgr.ghost_display_dimensions
+            if dims and dims[1] > 0:
+                return dims[1]
+    except Exception:
+        pass
+    return int(os.getenv('JARVIS_GHOST_HEIGHT', '1080'))
+
+
 @dataclass
 class MosaicWatcherConfig:
     """
@@ -2357,9 +2385,10 @@ class MosaicWatcherConfig:
     # Target display (Ghost Display ID from yabai)
     display_id: int
 
-    # Display dimensions
-    display_width: int = field(default_factory=lambda: int(os.getenv('JARVIS_GHOST_WIDTH', '1920')))
-    display_height: int = field(default_factory=lambda: int(os.getenv('JARVIS_GHOST_HEIGHT', '1080')))
+    # v243.0 (#19): Display dimensions — dynamic resolution from GhostDisplayManager,
+    # falling back to env vars, then 1920x1080.
+    display_width: int = field(default_factory=lambda: _resolve_ghost_display_width())
+    display_height: int = field(default_factory=lambda: _resolve_ghost_display_height())
 
     # Capture settings (lower FPS acceptable since we only need to detect text)
     fps: int = field(default_factory=lambda: int(os.getenv('JARVIS_MOSAIC_FPS', '5')))
@@ -3549,6 +3578,15 @@ class MosaicWatcher:
         self._runloop_thread: Optional[threading.Thread] = None
         self._runloop: Optional[Any] = None
 
+        # v243.0 (#4): First frame event for validation + resolution swap handoff
+        self._first_frame_event = threading.Event()
+
+        # v243.0 (#3/#14): Per-window composite fallback state
+        self._use_per_window_fallback: bool = False
+        self._composite_executor: Optional[Any] = None
+        self._composite_canvas: Optional[Any] = None
+        self._composite_scale: Optional[float] = None
+
         logger.info(
             f"[MosaicWatcher] Created for display {config.display_id} "
             f"({config.display_width}x{config.display_height} @ {config.fps} FPS)"
@@ -3613,17 +3651,40 @@ class MosaicWatcher:
             logger.debug(f"[MosaicWatcher v242.0] Pre-flight check skipped: {e}")
 
         try:
+            success = False
             if self._is_avfoundation:
                 success = await self._start_avfoundation_capture()
-            else:
-                # Fallback: Use thread-based CGDisplayStream
-                success = await self._start_cgdisplay_capture()
+                # v243.0 (#4): Validate first frame — if AVFoundation started but
+                # produces no frames, fall back to per-window composite.
+                if success:
+                    validation_timeout = float(os.getenv(
+                        'JARVIS_MOSAIC_VALIDATION_TIMEOUT', '3.0'
+                    ))
+                    has_frame = await self.wait_for_first_frame(timeout=validation_timeout)
+                    if not has_frame:
+                        logger.warning(
+                            f"[MosaicWatcher v243.0] Display ID {self.config.display_id}: "
+                            f"no frames received within {validation_timeout}s — "
+                            f"falling back to per-window composite capture"
+                        )
+                        # Stop the non-producing AVFoundation session
+                        if self._capture_session:
+                            try:
+                                self._capture_session.stopRunning()
+                            except Exception:
+                                pass
+                        success = False
+
+            if not success:
+                # v243.0 (#3/#14): Per-window composite fallback
+                success = await self._start_per_window_composite_capture()
 
             if success:
                 self.status = MosaicCaptureStatus.CAPTURING
+                mode = "per_window_composite" if self._use_per_window_fallback else "avfoundation"
                 logger.info(
                     f"[MosaicWatcher] ✅ Started capturing display {self.config.display_id} "
-                    f"(tiles: {len(self.config.window_tiles)})"
+                    f"(tiles: {len(self.config.window_tiles)}, mode: {mode})"
                 )
             else:
                 self.status = MosaicCaptureStatus.ERROR
@@ -3759,6 +3820,253 @@ class MosaicWatcher:
             logger.error(f"[MosaicWatcher] CGDisplayStream capture failed: {e}")
             return False
 
+    async def _start_per_window_composite_capture(self) -> bool:
+        """v243.0 (#3/#14): Fallback capture using individual per-window CG captures.
+
+        When AVFoundation display-level capture fails (common with BetterDisplay
+        virtual displays), this method captures each window tile individually via
+        CGWindowListCreateImage(kCGWindowListOptionIncludingWindow, window_id) and
+        composites them into a single mosaic frame.
+
+        Handles:
+        - Retina scaling: CGWindowListCreateImage returns physical pixels, but
+          WindowTileInfo coordinates are logical pixels from yabai. Detects scale
+          factor from first capture and either downsamples tiles (default) or
+          scales coordinates.
+        - Temporal skew: Uses ThreadPoolExecutor to capture tiles in parallel,
+          minimizing the time gap between first and last capture.
+        - Memory: Reuses canvas buffer across capture cycles.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        if not self.config.window_tiles:
+            logger.warning(
+                "[MosaicWatcher v243.0] No window tiles configured — "
+                "per-window composite requires at least one tile"
+            )
+            return False
+
+        self._use_per_window_fallback = True
+        max_workers = min(
+            len(self.config.window_tiles),
+            int(os.getenv('JARVIS_COMPOSITE_CAPTURE_WORKERS', '4'))
+        )
+        self._composite_executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="CompositeCapture"
+        )
+
+        # Start composite capture thread
+        self._capture_thread = threading.Thread(
+            target=self._per_window_composite_loop,
+            name=f"MosaicComposite-{self.config.display_id}",
+            daemon=True
+        )
+        self._capture_thread.start()
+
+        # Wait briefly for first frame
+        await asyncio.sleep(0.5)
+        with self._stats_lock:
+            if self._frames_captured > 0:
+                logger.info(
+                    f"[MosaicWatcher v243.0] ✅ Per-window composite capture started "
+                    f"({len(self.config.window_tiles)} tiles, {max_workers} workers)"
+                )
+                return True
+
+        logger.info(
+            "[MosaicWatcher v243.0] Per-window composite started (no frames yet, may be slow)"
+        )
+        return True
+
+    def _per_window_composite_loop(self):
+        """v243.0: Background thread for per-window composite capture."""
+        try:
+            from Quartz import (
+                CGWindowListCreateImage, CGRectNull,
+                kCGWindowListOptionIncludingWindow, kCGWindowImageDefault,
+                CGImageGetWidth, CGImageGetHeight,
+                CGImageGetDataProvider, CGDataProviderCopyData
+            )
+            import numpy as np
+
+            frame_interval = 1.0 / self.config.fps
+            composite_resolution = os.getenv('JARVIS_COMPOSITE_RESOLUTION', 'logical')
+            max_tiles = int(os.getenv('JARVIS_COMPOSITE_MAX_TILES', '8'))
+
+            logger.info(
+                f"[MosaicWatcher v243.0] Composite loop started "
+                f"(mode={composite_resolution}, interval={frame_interval:.3f}s)"
+            )
+
+            def _capture_single_tile(tile: 'WindowTileInfo'):
+                """Capture a single window tile. Runs in thread pool."""
+                try:
+                    cg_image = CGWindowListCreateImage(
+                        CGRectNull,
+                        kCGWindowListOptionIncludingWindow,
+                        tile.window_id,
+                        kCGWindowImageDefault,
+                    )
+                    if not cg_image:
+                        return tile, None
+
+                    width = CGImageGetWidth(cg_image)
+                    height = CGImageGetHeight(cg_image)
+                    data_provider = CGImageGetDataProvider(cg_image)
+                    raw_data = CGDataProviderCopyData(data_provider)
+
+                    arr = np.frombuffer(raw_data, dtype=np.uint8)
+                    arr = arr.reshape((height, width, 4))
+                    frame = arr[:, :, [2, 1, 0]]  # BGRA -> RGB
+
+                    return tile, frame
+                except Exception as e:
+                    logger.debug(f"[Composite] Tile {tile.window_id} capture failed: {e}")
+                    return tile, None
+
+            while not self._stop_event.is_set():
+                try:
+                    tiles = self.config.window_tiles[:max_tiles]
+                    if not tiles:
+                        time.sleep(frame_interval)
+                        continue
+
+                    # Capture all tiles in parallel (minimizes temporal skew)
+                    futures = []
+                    for tile in tiles:
+                        futures.append(
+                            self._composite_executor.submit(_capture_single_tile, tile)
+                        )
+
+                    results = []
+                    for f in futures:
+                        try:
+                            results.append(f.result(timeout=2.0))
+                        except Exception:
+                            pass
+
+                    # Filter successful captures
+                    captured = [(tile, frame) for tile, frame in results if frame is not None]
+                    if not captured:
+                        time.sleep(frame_interval)
+                        continue
+
+                    # Detect Retina scale factor from first capture
+                    if self._composite_scale is None:
+                        first_tile, first_frame = captured[0]
+                        if first_tile.width > 0:
+                            self._composite_scale = first_frame.shape[1] / first_tile.width
+                            logger.info(
+                                f"[MosaicWatcher v243.0] Detected Retina scale: "
+                                f"{self._composite_scale:.1f}x "
+                                f"(physical {first_frame.shape[1]}px / "
+                                f"logical {first_tile.width}px)"
+                            )
+                        else:
+                            self._composite_scale = 1.0
+
+                    scale = self._composite_scale
+
+                    # Build composite canvas
+                    if composite_resolution == 'physical':
+                        # Scale tile coordinates UP to physical resolution
+                        canvas_w = int(self.config.display_width * scale)
+                        canvas_h = int(self.config.display_height * scale)
+                    else:
+                        # Default: logical resolution — downsample tiles
+                        canvas_w = self.config.display_width
+                        canvas_h = self.config.display_height
+
+                    # Reuse canvas buffer (avoid re-allocation every frame)
+                    if (self._composite_canvas is None
+                            or self._composite_canvas.shape[:2] != (canvas_h, canvas_w)):
+                        self._composite_canvas = np.zeros(
+                            (canvas_h, canvas_w, 3), dtype=np.uint8
+                        )
+                    else:
+                        self._composite_canvas[:] = 0  # Zero-fill for reuse
+
+                    for tile, frame in captured:
+                        if composite_resolution == 'physical':
+                            # Place at scaled coordinates
+                            tx = int(tile.x * scale)
+                            ty = int(tile.y * scale)
+                            tw = frame.shape[1]
+                            th = frame.shape[0]
+                        else:
+                            # Downsample tile to logical size, place at logical coords
+                            tx = tile.x
+                            ty = tile.y
+                            tw = tile.width
+                            th = tile.height
+                            if frame.shape[1] != tw or frame.shape[0] != th:
+                                try:
+                                    import cv2
+                                    frame = cv2.resize(frame, (tw, th),
+                                                       interpolation=cv2.INTER_AREA)
+                                except ImportError:
+                                    # PIL fallback
+                                    from PIL import Image
+                                    pil_img = Image.fromarray(frame)
+                                    pil_img = pil_img.resize((tw, th), Image.LANCZOS)
+                                    frame = np.array(pil_img)
+
+                        # Clip to canvas bounds
+                        src_x = max(0, -tx)
+                        src_y = max(0, -ty)
+                        dst_x = max(0, tx)
+                        dst_y = max(0, ty)
+                        copy_w = min(tw - src_x, canvas_w - dst_x)
+                        copy_h = min(th - src_y, canvas_h - dst_y)
+
+                        if copy_w > 0 and copy_h > 0:
+                            self._composite_canvas[
+                                dst_y:dst_y + copy_h,
+                                dst_x:dst_x + copy_w
+                            ] = frame[
+                                src_y:src_y + copy_h,
+                                src_x:src_x + copy_w
+                            ]
+
+                    frame_data = {
+                        'frame': self._composite_canvas.copy(),
+                        'width': canvas_w,
+                        'height': canvas_h,
+                        'timestamp': time.time(),
+                        'frame_number': self._frames_captured,
+                        'fps': self.config.fps,
+                        'capture_method': 'per_window_composite',
+                        'tiles_captured': len(captured),
+                        'tiles_total': len(tiles),
+                        'retina_scale': scale,
+                    }
+
+                    self._put_frame_atomic(frame_data)
+
+                    with self._stats_lock:
+                        self._frames_captured += 1
+                        self._last_frame_time = time.time()
+
+                    # Signal first frame
+                    if not self._first_frame_event.is_set():
+                        self._first_frame_event.set()
+
+                    time.sleep(frame_interval)
+
+                except Exception as e:
+                    logger.error(f"[MosaicWatcher v243.0] Composite frame error: {e}")
+                    time.sleep(0.1)
+
+        except Exception as e:
+            logger.error(
+                f"[MosaicWatcher v243.0] Composite loop crashed: {e}", exc_info=True
+            )
+        finally:
+            if self._composite_executor:
+                self._composite_executor.shutdown(wait=False)
+            logger.info("[MosaicWatcher v243.0] Composite capture loop ended")
+
     def _cgdisplay_capture_loop(self):
         """Background thread for CGDisplayStream capture."""
         try:
@@ -3810,6 +4118,10 @@ class MosaicWatcher:
                             self._frames_captured += 1
                             self._last_frame_time = time.time()
 
+                        # v243.0 (#4): Signal first frame
+                        if not self._first_frame_event.is_set():
+                            self._first_frame_event.set()
+
                     # Sleep for frame interval
                     time.sleep(frame_interval)
 
@@ -3850,8 +4162,17 @@ class MosaicWatcher:
                 self._frames_captured += 1
                 self._last_frame_time = time.time()
 
+            # v243.0 (#4): Signal first frame received for validation
+            if not self._first_frame_event.is_set():
+                self._first_frame_event.set()
+
         except Exception as e:
             logger.error(f"[MosaicWatcher] Frame handling error: {e}")
+
+    async def wait_for_first_frame(self, timeout: float = 3.0) -> bool:
+        """v243.0: Wait for first frame to confirm capture is producing output.
+        Used by resolution swap (#10) to confirm new watcher works before swapping."""
+        return await asyncio.to_thread(self._first_frame_event.wait, timeout)
 
     def _start_runloop(self):
         """Start NSRunLoop in background thread for ObjC callbacks."""
