@@ -69018,6 +69018,19 @@ class JarvisSystemKernel:
             self._state = KernelState.STOPPED
             self.logger.success("[Kernel] Shutdown complete")
 
+            # v249.0: Emit shutdown complete + stop event bus and renderer
+            self._emit_event(SupervisorEventType.SHUTDOWN_END, "Shutdown complete")
+            if hasattr(self, '_event_bus') and self._event_bus:
+                try:
+                    await self._event_bus.stop()
+                except Exception:
+                    pass
+            if hasattr(self, '_cli_renderer') and self._cli_renderer:
+                try:
+                    self._cli_renderer.stop()
+                except Exception:
+                    pass
+
             # v180.0: Diagnostic checkpoint - shutdown complete
             if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                 try:
