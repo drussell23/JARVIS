@@ -53218,8 +53218,11 @@ class StartupWatchdog:
         "agi_os": PhaseConfig("AGI OS", 90.0, 85, 88, "diagnostic"),  # v240.0: narrowed from 85-90
         # v240.0: Ghost Display — software-defined virtual display via BetterDisplay
         "ghost_display": PhaseConfig("Ghost Display", 45.0, 88, 90, "diagnostic"),
+        # v250.0: Visual Pipeline — Ghost Hands, N-Optic Nerve, Ferrari Engine lifecycle
+        "visual_pipeline": PhaseConfig("Visual Pipeline", 60.0, 90, 93, "diagnostic"),
         # v236.1: frontend progress_start fixed from 85→90 to avoid overlap with agi_os
-        "frontend": PhaseConfig("Frontend", 60.0, 90, 100, "rollback"),
+        # v250.0: frontend progress_start adjusted from 90→93 for visual_pipeline phase
+        "frontend": PhaseConfig("Frontend", 60.0, 93, 100, "rollback"),
     }
     
     def __init__(
@@ -57745,6 +57748,7 @@ class JarvisSystemKernel:
             "enterprise": {"status": "pending", "message": "Waiting to start"},
             "agi_os": {"status": "pending", "message": "Waiting to start"},  # v200.0: AGI OS
             "ghost_display": {"status": "pending", "message": "Waiting to start"},  # v240.0: Virtual Display
+            "visual_pipeline": {"status": "pending", "message": "Waiting to start"},  # v250.0: Visual Pipeline
             "frontend": {"status": "pending", "message": "Waiting to start"},
         }
 
@@ -57758,6 +57762,12 @@ class JarvisSystemKernel:
         # Background tasks
         self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
+
+        # v250.0: Visual Pipeline state (Phase 6.8)
+        self._ghost_hands_orchestrator = None
+        self._n_optic_nerve = None
+        self._visual_pipeline_health_task: Optional[asyncio.Task] = None
+        self._visual_pipeline_initialized: bool = False
 
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
@@ -58564,6 +58574,28 @@ class JarvisSystemKernel:
             self._frontend_process.kill()
         if self._loading_server_process:
             self._loading_server_process.kill()
+
+        # v250.0: Visual Pipeline teardown (N-Optic → Ghost Hands order)
+        try:
+            if self._n_optic_nerve and getattr(self._n_optic_nerve, '_is_running', False):
+                await asyncio.wait_for(self._n_optic_nerve.stop(), timeout=5.0)
+                self.logger.info("[Kernel] N-Optic Nerve stopped")
+        except (asyncio.TimeoutError, Exception) as e:
+            self.logger.debug(f"[Kernel] N-Optic stop error: {e}")
+
+        try:
+            if self._ghost_hands_orchestrator and getattr(self._ghost_hands_orchestrator, '_is_running', False):
+                await asyncio.wait_for(self._ghost_hands_orchestrator.stop(), timeout=5.0)
+                self.logger.info("[Kernel] Ghost Hands Orchestrator stopped")
+        except (asyncio.TimeoutError, Exception) as e:
+            self.logger.debug(f"[Kernel] Ghost Hands stop error: {e}")
+
+        # Publish final "inactive" visual pipeline state
+        try:
+            self._visual_pipeline_initialized = False
+            await self._publish_visual_pipeline_state()
+        except Exception:
+            pass
 
         # Stop Agent Runtime (checkpoint all active goals)
         if hasattr(self, '_agent_runtime') and self._agent_runtime:
@@ -60797,6 +60829,59 @@ class JarvisSystemKernel:
                         "ghost_display": {"status": self._component_status.get(
                             "ghost_display", {}
                         ).get("status", "pending")},
+                        "visual_pipeline": {"status": "pending"},
+                        "frontend": {"status": "running"},
+                    }
+                }
+            )
+
+            # =================================================================
+            # PHASE 6.8: VISUAL PIPELINE INITIALIZATION (v250.0)
+            # =================================================================
+            # Initialize visual processing software pipeline: Ghost Hands
+            # Orchestrator, N-Optic Nerve, Ferrari Engine verification.
+            # Requires Ghost Display (Phase 6.7) — skips gracefully if absent.
+            # Non-fatal: continues without if components unavailable.
+            # =================================================================
+            issue_collector.set_current_phase("Phase 6.8: Visual Pipeline")
+            issue_collector.set_current_zone("Zone 6.8")
+            visual_pipeline_timeout = _get_env_float("JARVIS_VISUAL_PIPELINE_TIMEOUT", 45.0)
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase(
+                    "visual_pipeline", 90, operational_timeout=visual_pipeline_timeout
+                )
+
+            if not await self._initialize_visual_pipeline():
+                # Non-fatal — continue without Visual Pipeline
+                issue_collector.add_warning(
+                    "Visual Pipeline failed to initialize — continuing without visual processing",
+                    IssueCategory.SYSTEM,
+                    suggestion="Check Ghost Hands Orchestrator and N-Optic Nerve availability"
+                )
+
+            await self._broadcast_startup_progress(
+                stage="visual_pipeline",
+                message="Visual Pipeline ready — launching frontend...",
+                progress=93,
+                metadata={
+                    "icon": "eye",
+                    "phase": 6.8,
+                    "components": {
+                        "loading_server": {"status": "complete"},
+                        "preflight": {"status": "complete"},
+                        "resources": {"status": "complete"},
+                        "backend": {"status": "complete"},
+                        "intelligence": {"status": "complete"},
+                        "two_tier": {"status": "complete"},
+                        "trinity": {"status": "complete"},
+                        "enterprise": {"status": "complete"},
+                        "agi_os": {"status": "complete"},
+                        "ghost_display": {"status": self._component_status.get(
+                            "ghost_display", {}
+                        ).get("status", "pending")},
+                        "visual_pipeline": {"status": self._component_status.get(
+                            "visual_pipeline", {}
+                        ).get("status", "pending")},
                         "frontend": {"status": "running"},
                     }
                 }
@@ -60812,7 +60897,7 @@ class JarvisSystemKernel:
             issue_collector.set_current_zone("Zone 7")
             # v187.0: Update DMS at phase START to fix timeout tracking
             if self._startup_watchdog:
-                self._startup_watchdog.update_phase("frontend", 90)
+                self._startup_watchdog.update_phase("frontend", 93)  # v250.0: adjusted from 90→93
 
             # v249.0: Phase event emission
             _cid_fe = f"phase-frontend-{uuid.uuid4().hex[:8]}"
@@ -63636,6 +63721,362 @@ class JarvisSystemKernel:
                 break
             except Exception as e:
                 self.logger.debug(f"[GhostDisplay] Health loop error: {e}")
+
+    # =========================================================================
+    # v250.0: VISUAL PIPELINE MANAGEMENT (Phase 6.8)
+    # =========================================================================
+    # Lifecycle management for the visual processing software pipeline:
+    # Ghost Hands Orchestrator, N-Optic Nerve, Ferrari Engine verification.
+    # Follows the same pattern as Ghost Display (Phase 6.7) for initialization,
+    # state publishing, and health monitoring.
+    # =========================================================================
+
+    async def _initialize_visual_pipeline(self) -> bool:
+        """
+        v250.0: Initialize Visual Pipeline (Ghost Hands + N-Optic Nerve + Ferrari Engine).
+
+        Steps:
+        1. Pre-checks: enabled flag, ghost display prerequisite
+        2. Initialize Ghost Hands Orchestrator (singleton via get_ghost_hands)
+        3. Verify N-Optic Nerve (singleton via get_instance)
+        4. Verify Ferrari Engine (stateless C++ extension)
+        5. Publish readiness signal file for VisualMonitorAgent
+        6. Publish initial state + start health monitor
+
+        On failure: Log warning and continue (graceful degradation).
+        All timeouts are env-var configurable.
+
+        Returns:
+            True if visual pipeline initialized or skipped, False on error
+        """
+        # Step 1: Pre-checks
+        if not _get_env_bool("JARVIS_VISUAL_PIPELINE_ENABLED", True):
+            self.logger.info("[VisualPipeline] Disabled via JARVIS_VISUAL_PIPELINE_ENABLED")
+            self._update_component_status("visual_pipeline", "skipped", "Disabled via config")
+            return True
+
+        ghost_display_status = self._component_status.get("ghost_display", {}).get("status", "pending")
+        if ghost_display_status != "complete":
+            self.logger.info(
+                f"[VisualPipeline] Ghost Display not ready (status={ghost_display_status}) "
+                f"— skipping visual pipeline (no display to process)"
+            )
+            self._update_component_status("visual_pipeline", "skipped", "Ghost Display not ready")
+            return True
+
+        self._update_component_status("visual_pipeline", "running", "Initializing Visual Pipeline...")
+        ferrari_available = False
+
+        try:
+            # Step 2: Initialize Ghost Hands Orchestrator
+            get_ghost_hands = None
+            try:
+                from backend.ghost_hands.orchestrator import get_ghost_hands
+            except ImportError:
+                try:
+                    from ghost_hands.orchestrator import get_ghost_hands
+                except ImportError:
+                    pass
+
+            if get_ghost_hands is not None:
+                try:
+                    init_timeout = _get_env_float("JARVIS_GHOST_HANDS_INIT_TIMEOUT", 10.0)
+                    if asyncio.iscoroutinefunction(get_ghost_hands):
+                        result = await asyncio.wait_for(get_ghost_hands(), timeout=init_timeout)
+                    else:
+                        loop = asyncio.get_running_loop()
+                        result = await asyncio.wait_for(
+                            loop.run_in_executor(None, get_ghost_hands),
+                            timeout=init_timeout,
+                        )
+                    self._ghost_hands_orchestrator = result
+                    if self._ghost_hands_orchestrator:
+                        self.logger.info("[VisualPipeline] Ghost Hands Orchestrator started")
+                    else:
+                        self.logger.info("[VisualPipeline] Ghost Hands returned None — continuing without")
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"[VisualPipeline] Ghost Hands init timed out ({init_timeout}s) — continuing"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"[VisualPipeline] Ghost Hands init error: {e}")
+            else:
+                self.logger.info("[VisualPipeline] Ghost Hands module not available — skipping")
+
+            # Step 3: Verify N-Optic Nerve
+            NOpticNerve = None
+            try:
+                from backend.ghost_hands.n_optic_nerve import NOpticNerve
+            except ImportError:
+                try:
+                    from ghost_hands.n_optic_nerve import NOpticNerve
+                except ImportError:
+                    pass
+
+            if NOpticNerve is not None:
+                try:
+                    verify_timeout = _get_env_float("JARVIS_N_OPTIC_VERIFY_TIMEOUT", 10.0)
+                    nerve = NOpticNerve.get_instance()
+                    if nerve and not getattr(nerve, '_is_running', False):
+                        await asyncio.wait_for(nerve.start(), timeout=verify_timeout)
+                    self._n_optic_nerve = nerve
+                    if self._n_optic_nerve:
+                        self.logger.info("[VisualPipeline] N-Optic Nerve verified and running")
+                    else:
+                        self.logger.info("[VisualPipeline] N-Optic Nerve instance is None — continuing")
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"[VisualPipeline] N-Optic Nerve verify timed out ({verify_timeout}s) — continuing"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"[VisualPipeline] N-Optic Nerve error: {e}")
+            else:
+                self.logger.info("[VisualPipeline] N-Optic Nerve module not available — skipping")
+
+            # Step 4: Verify Ferrari Engine (stateless C++ extension)
+            try:
+                FastCaptureEngine = None
+                try:
+                    from backend.native_extensions.fast_capture_wrapper import FastCaptureEngine
+                except ImportError:
+                    try:
+                        from native_extensions.fast_capture_wrapper import FastCaptureEngine
+                    except ImportError:
+                        pass
+
+                if FastCaptureEngine is not None:
+                    ferrari_timeout = _get_env_float("JARVIS_FERRARI_VERIFY_TIMEOUT", 10.0)
+                    engine = FastCaptureEngine()
+                    # Quick health check in executor (C++ call, avoid blocking event loop)
+                    loop = asyncio.get_running_loop()
+                    await asyncio.wait_for(
+                        loop.run_in_executor(None, engine.get_visible_windows),
+                        timeout=ferrari_timeout,
+                    )
+                    ferrari_available = True
+                    self.logger.info("[VisualPipeline] Ferrari Engine verified")
+                else:
+                    self.logger.info("[VisualPipeline] Ferrari Engine not available — MosaicWatcher will use composite fallback")
+            except asyncio.TimeoutError:
+                self.logger.warning("[VisualPipeline] Ferrari Engine verify timed out — continuing")
+            except Exception as e:
+                self.logger.warning(f"[VisualPipeline] Ferrari Engine error: {e}")
+
+            # Step 5: Publish readiness signal file
+            try:
+                signal_dir = Path.home() / ".jarvis" / "trinity" / "state"
+                signal_dir.mkdir(parents=True, exist_ok=True)
+                signal_file = signal_dir / "visual_pipeline_ready.signal"
+
+                signal_data = {
+                    "ready": True,
+                    "timestamp": time.time(),
+                    "ghost_hands_active": self._ghost_hands_orchestrator is not None,
+                    "n_optic_active": self._n_optic_nerve is not None,
+                    "ferrari_available": ferrari_available,
+                }
+
+                import tempfile
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=str(signal_dir), suffix=".tmp")
+                try:
+                    os.write(tmp_fd, json.dumps(signal_data, indent=2).encode("utf-8"))
+                    os.fsync(tmp_fd)
+                finally:
+                    os.close(tmp_fd)
+                os.rename(tmp_path, str(signal_file))
+                self.logger.info("[VisualPipeline] Readiness signal published")
+            except Exception as e:
+                self.logger.warning(f"[VisualPipeline] Failed to write readiness signal: {e}")
+
+            # Step 6: Publish initial state + start health monitor
+            await self._publish_visual_pipeline_state(ferrari_available=ferrari_available)
+
+            if ASYNC_SAFETY_AVAILABLE:
+                task = create_safe_task(
+                    self._visual_pipeline_health_loop(ferrari_available=ferrari_available),
+                    name="visual-pipeline-health",
+                )
+            else:
+                task = asyncio.create_task(self._visual_pipeline_health_loop(ferrari_available=ferrari_available))
+            self._visual_pipeline_health_task = task
+            self._background_tasks.append(task)
+
+            self._visual_pipeline_initialized = True
+            self._update_component_status("visual_pipeline", "complete", "Visual Pipeline ready")
+            return True
+
+        except Exception as e:
+            self.logger.warning(f"[VisualPipeline] Initialization failed: {e}")
+            self._update_component_status("visual_pipeline", "error", f"Error: {e}")
+            return False
+
+    async def _publish_visual_pipeline_state(self, ferrari_available: bool = False) -> None:
+        """
+        v250.0: Publish visual pipeline state to ~/.jarvis/trinity/state/ for cross-repo exchange.
+
+        J-Prime and Reactor-Core can read this file to query visual pipeline readiness,
+        following the same pattern as _publish_ghost_display_state().
+
+        Uses atomic write (temp file + rename) to prevent corruption.
+        """
+        try:
+            state_dir = Path.home() / ".jarvis" / "trinity" / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_file = state_dir / "visual_pipeline_state.json"
+
+            # Collect Ghost Hands stats
+            ghost_hands_data = {"available": self._ghost_hands_orchestrator is not None, "running": False}
+            if self._ghost_hands_orchestrator:
+                try:
+                    ghost_hands_data["running"] = getattr(
+                        self._ghost_hands_orchestrator, '_is_running', False
+                    )
+                    stats = None
+                    if hasattr(self._ghost_hands_orchestrator, 'get_stats'):
+                        stats_fn = self._ghost_hands_orchestrator.get_stats
+                        if asyncio.iscoroutinefunction(stats_fn):
+                            stats = await asyncio.wait_for(stats_fn(), timeout=5.0)
+                        else:
+                            stats = stats_fn()
+                    if stats and isinstance(stats, dict):
+                        ghost_hands_data["active_tasks"] = stats.get("active_tasks", 0)
+                        ghost_hands_data["watching_tasks"] = stats.get("watching_tasks", 0)
+                except Exception:
+                    pass
+
+            # Collect N-Optic Nerve stats
+            n_optic_data = {"available": self._n_optic_nerve is not None, "running": False}
+            if self._n_optic_nerve:
+                try:
+                    n_optic_data["running"] = getattr(
+                        self._n_optic_nerve, '_is_running', False
+                    )
+                    stats = None
+                    if hasattr(self._n_optic_nerve, 'get_stats'):
+                        stats_fn = self._n_optic_nerve.get_stats
+                        if asyncio.iscoroutinefunction(stats_fn):
+                            stats = await asyncio.wait_for(stats_fn(), timeout=5.0)
+                        else:
+                            stats = stats_fn()
+                    if stats and isinstance(stats, dict):
+                        n_optic_data["active_watchers"] = stats.get("active_watchers", 0)
+                        n_optic_data["total_events"] = stats.get("total_events", 0)
+                except Exception:
+                    pass
+
+            state = {
+                "schema_version": 1,
+                "timestamp": time.time(),
+                "is_ready": self._visual_pipeline_initialized,
+                "components": {
+                    "ghost_hands": ghost_hands_data,
+                    "n_optic_nerve": n_optic_data,
+                    "ferrari_engine": {"available": ferrari_available},
+                },
+                "component_status": self._component_status.get(
+                    "visual_pipeline", {}
+                ).get("status", "unknown"),
+            }
+
+            # Atomic write: temp file + rename (same pattern as _publish_ghost_display_state)
+            import tempfile
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=str(state_dir), suffix=".tmp")
+            try:
+                os.write(tmp_fd, json.dumps(state, indent=2).encode("utf-8"))
+                os.fsync(tmp_fd)
+            finally:
+                os.close(tmp_fd)
+            os.rename(tmp_path, str(state_file))
+
+        except Exception as e:
+            self.logger.debug(f"[VisualPipeline] Failed to publish state: {e}")
+
+    async def _visual_pipeline_health_loop(self, ferrari_available: bool = False) -> None:
+        """
+        v250.0: Background health monitoring for Visual Pipeline components.
+
+        Periodically checks Ghost Hands Orchestrator and N-Optic Nerve health.
+        After max consecutive failures per component, attempts auto-recovery.
+        Ferrari Engine is NOT health-checked (stateless C++ extension).
+        MosaicWatcher is NOT health-checked (managed by VisualMonitorAgent).
+
+        Env vars:
+            JARVIS_VISUAL_PIPELINE_GRACE_PERIOD: Delay before first check (default: 30.0s)
+            JARVIS_VISUAL_PIPELINE_HEALTH_INTERVAL: Check frequency (default: 30.0s)
+            JARVIS_VISUAL_PIPELINE_MAX_FAILURES: Failures before recovery (default: 3)
+        """
+        grace_period = _get_env_float("JARVIS_VISUAL_PIPELINE_GRACE_PERIOD", 30.0)
+        interval = _get_env_float("JARVIS_VISUAL_PIPELINE_HEALTH_INTERVAL", 30.0)
+        max_failures = int(os.environ.get("JARVIS_VISUAL_PIPELINE_MAX_FAILURES", "3"))
+
+        ghost_hands_failures = 0
+        n_optic_failures = 0
+
+        # Grace period — let components stabilize before checking
+        try:
+            await asyncio.sleep(grace_period)
+        except asyncio.CancelledError:
+            return
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval)
+
+                # Check Ghost Hands Orchestrator
+                if self._ghost_hands_orchestrator:
+                    if getattr(self._ghost_hands_orchestrator, '_is_running', False):
+                        ghost_hands_failures = 0
+                    else:
+                        ghost_hands_failures += 1
+                        self.logger.warning(
+                            f"[VisualPipeline] Ghost Hands not running "
+                            f"({ghost_hands_failures}/{max_failures})"
+                        )
+                        if ghost_hands_failures >= max_failures:
+                            self.logger.warning("[VisualPipeline] Attempting Ghost Hands recovery...")
+                            try:
+                                start_fn = getattr(self._ghost_hands_orchestrator, 'start', None)
+                                if start_fn:
+                                    if asyncio.iscoroutinefunction(start_fn):
+                                        await asyncio.wait_for(start_fn(), timeout=10.0)
+                                    else:
+                                        start_fn()
+                                    ghost_hands_failures = 0
+                                    self.logger.info("[VisualPipeline] Ghost Hands recovery successful")
+                            except Exception as e:
+                                self.logger.warning(f"[VisualPipeline] Ghost Hands recovery failed: {e}")
+
+                # Check N-Optic Nerve
+                if self._n_optic_nerve:
+                    if getattr(self._n_optic_nerve, '_is_running', False):
+                        n_optic_failures = 0
+                    else:
+                        n_optic_failures += 1
+                        self.logger.warning(
+                            f"[VisualPipeline] N-Optic Nerve not running "
+                            f"({n_optic_failures}/{max_failures})"
+                        )
+                        if n_optic_failures >= max_failures:
+                            self.logger.warning("[VisualPipeline] Attempting N-Optic recovery...")
+                            try:
+                                start_fn = getattr(self._n_optic_nerve, 'start', None)
+                                if start_fn:
+                                    if asyncio.iscoroutinefunction(start_fn):
+                                        await asyncio.wait_for(start_fn(), timeout=10.0)
+                                    else:
+                                        start_fn()
+                                    n_optic_failures = 0
+                                    self.logger.info("[VisualPipeline] N-Optic recovery successful")
+                            except Exception as e:
+                                self.logger.warning(f"[VisualPipeline] N-Optic recovery failed: {e}")
+
+                # Refresh state file for cross-repo consumers
+                await self._publish_visual_pipeline_state(ferrari_available=ferrari_available)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug(f"[VisualPipeline] Health loop error: {e}")
 
     # =========================================================================
     # v186.0: TRINITY PROGRESS CALLBACK
