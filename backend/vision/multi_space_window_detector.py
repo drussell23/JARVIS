@@ -504,7 +504,11 @@ class MultiSpaceWindowDetector:
             List of space IDs that JARVIS can see (visible OR on Ghost Display)
         """
         visible_space_ids = []
-        ghost_display_index = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+        try:
+            from .yabai_space_detector import get_shadow_display_index
+            ghost_display_index = get_shadow_display_index()
+        except ImportError:
+            ghost_display_index = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
 
         try:
             from .yabai_space_detector import get_yabai_detector
@@ -579,7 +583,11 @@ class MultiSpaceWindowDetector:
         as not visible, because they ARE capturable.
         """
         visible_space_ids = []
-        ghost_display_index = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+        try:
+            from .yabai_space_detector import get_shadow_display_index
+            ghost_display_index = get_shadow_display_index()
+        except ImportError:
+            ghost_display_index = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
 
         try:
             from .yabai_space_detector import get_yabai_detector

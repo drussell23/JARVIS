@@ -3570,6 +3570,31 @@ def reset_ghost_manager() -> None:
     _GHOST_MANAGER = None
 
 
+def get_shadow_display_index() -> int:
+    """
+    v242.1: Get the yabai display index for the Ghost/Shadow display dynamically.
+
+    Resolution order:
+        1. GhostDisplayManager's live _ghost_info.yabai_display_index (most accurate)
+        2. JARVIS_SHADOW_DISPLAY env var (user override)
+        3. Default: 2
+
+    This replaces all hardcoded int(os.getenv("JARVIS_SHADOW_DISPLAY", "2")) calls
+    throughout the codebase with a single source of truth that adapts to runtime
+    display topology changes (e.g., monitor reconnect, display rearrangement).
+    """
+    try:
+        manager = _GHOST_MANAGER  # Use module-level ref to avoid creating new instance
+        if manager is not None and manager._ghost_info is not None:
+            idx = manager._ghost_info.yabai_display_index
+            if idx and idx > 0:
+                return idx
+    except Exception:
+        pass
+
+    return int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+
+
 # =============================================================================
 # v242.0: Yabai Display Index → CGDirectDisplayID Resolution
 # =============================================================================
@@ -7704,7 +7729,7 @@ class YabaiSpaceDetector:
                 - final_window_id: The window ID that was summoned (may differ from input)
         """
         yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
-        shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+        shadow_display = get_shadow_display_index()
 
         logger.info(
             f"[YABAI v57.0] ✨ SUMMON PROTOCOL: Retrieving window from Shadow Realm "
@@ -8054,7 +8079,7 @@ class YabaiSpaceDetector:
             Tuple of (success, method, list of summoned window IDs)
         """
         yabai_path = self._health.yabai_path or os.getenv("YABAI_PATH", "/opt/homebrew/bin/yabai")
-        shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+        shadow_display = get_shadow_display_index()
 
         logger.info(
             f"[YABAI v57.0] ✨ MASS SUMMON: Retrieving all windows from Shadow Realm "
@@ -8592,7 +8617,7 @@ class YabaiSpaceDetector:
         # v242.0: Invalidate display mapping cache on any topology change
         invalidate_display_map_cache()
 
-        shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+        shadow_display = get_shadow_display_index()
 
         logger.info(
             f"[YABAI v63.0] 🖥️ BOOMERANG DISPLAY CHANGE: {display_event} on Display {affected_display}"
@@ -12364,7 +12389,7 @@ class YabaiSpaceDetector:
                 #
                 # This is now the PRIMARY strategy, not a fallback!
                 # ═══════════════════════════════════════════════════════════════
-                shadow_display = int(os.getenv("JARVIS_SHADOW_DISPLAY", "2"))
+                shadow_display = get_shadow_display_index()
                 use_shadow_realm = bool(os.getenv("JARVIS_SHADOW_REALM_ENABLED", "1") == "1")
 
                 if use_shadow_realm:

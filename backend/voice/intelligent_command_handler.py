@@ -1460,7 +1460,11 @@ class IntelligentCommandHandler:
             # v70.0: Fallback to display-based query (Display 2 = Ghost Display)
             # This is more reliable because it doesn't depend on space ID accuracy
             if not windows_on_ghost:
-                ghost_display_id = int(os.environ.get("JARVIS_SHADOW_DISPLAY", "2"))
+                try:
+                    from backend.vision.yabai_space_detector import get_shadow_display_index
+                    ghost_display_id = get_shadow_display_index()
+                except ImportError:
+                    ghost_display_id = int(os.environ.get("JARVIS_SHADOW_DISPLAY", "2"))
                 logger.info(f"[v70.0] 🔍 Space query empty - trying display-based query (Display {ghost_display_id})")
                 
                 try:
