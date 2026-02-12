@@ -1763,33 +1763,11 @@ class GlobalShutdownSignal:
             initiator: Identifier of the component that initiated shutdown
         """
         # ═══════════════════════════════════════════════════════════════════════════
-        # v151.0: DIAGNOSTIC LOGGING - Capture full context of shutdown trigger
-        # v201.4: Suppress verbose diagnostics in CLI-only mode
-        # ═══════════════════════════════════════════════════════════════════════════
-
-        # Skip verbose diagnostics for CLI-only commands (--status, --monitor-prime, etc.)
-        if not is_cli_only_mode():
-            import traceback
-            stack_trace = "".join(traceback.format_stack())
-
-            if _SHUTDOWN_DIAGNOSTICS_AVAILABLE:
-                log_shutdown_trigger(
-                    "GlobalShutdownSignal.initiate",
-                    f"Global shutdown signal - reason={reason}, initiator={initiator}",
-                    {
-                        "reason": reason,
-                        "initiator": initiator,
-                        "stack_trace": stack_trace,
-                        "system_state": capture_system_state(),
-                    }
-                )
-
-            logger.warning(
-                f"[v151.0] 🔬 GLOBAL SHUTDOWN TRIGGER:\n"
-                f"    Reason: {reason}\n"
-                f"    Initiator: {initiator}\n"
-                f"    Stack trace:\n{stack_trace}"
-            )
+        # v250.0: Idempotency guard BEFORE diagnostic logging.
+        # Previously, verbose stack traces (3 lines each) were emitted before
+        # checking _initiated, causing log spam on every duplicate call.
+        # Dual-module aliasing (backend.core.X vs core.X) means this fires
+        # from multiple atexit handlers — the fast pre-check prevents it.
         # ═══════════════════════════════════════════════════════════════════════════
 
         with self._state_lock:
@@ -1802,39 +1780,53 @@ class GlobalShutdownSignal:
             self._reason = reason
             self._initiator = initiator or f"pid-{os.getpid()}"
 
-            # v201.4: Only log in non-CLI mode
-            if not is_cli_only_mode():
-                if _SHUTDOWN_DIAGNOSTICS_AVAILABLE:
-                    log_state_change(
-                        "GlobalShutdownSignal",
-                        "idle",
-                        "initiated",
-                        f"reason={reason}"
-                    )
+        # v151.0: Diagnostic logging — AFTER the guard, so it fires exactly once
+        # v201.4: Suppress verbose diagnostics in CLI-only mode
+        if not is_cli_only_mode():
+            import traceback
+            stack_trace = "".join(traceback.format_stack())
 
-                logger.info(
-                    f"[v95.13] 🛑 Global shutdown initiated: "
-                    f"reason={reason}, initiator={self._initiator}"
+            if _SHUTDOWN_DIAGNOSTICS_AVAILABLE:
+                log_shutdown_trigger(
+                    "GlobalShutdownSignal.initiate",
+                    f"Global shutdown signal - reason={reason}, initiator={self._initiator}",
+                    {
+                        "reason": reason,
+                        "initiator": self._initiator,
+                        "stack_trace": stack_trace,
+                        "system_state": capture_system_state(),
+                    }
+                )
+                log_state_change(
+                    "GlobalShutdownSignal",
+                    "idle",
+                    "initiated",
+                    f"reason={reason}"
                 )
 
-            # Write to file for cross-process coordination (skip in CLI mode)
-            if not is_cli_only_mode():
-                self._write_signal_file()
+            logger.info(
+                f"[v95.13] 🛑 Global shutdown initiated: "
+                f"reason={reason}, initiator={self._initiator}"
+            )
 
-            # Set async event if it exists
-            if self._async_event is not None:
-                self._async_event.set()
+        # Write to file for cross-process coordination (skip in CLI mode)
+        if not is_cli_only_mode():
+            self._write_signal_file()
 
-            # Execute sync callbacks
-            # v117.0: Log callback names for observability
-            for name, callback in self._callbacks:
-                try:
-                    cb_name = name or "anonymous"
-                    logger.debug(f"[v117.0] Executing shutdown callback: {cb_name}")
-                    callback()
-                except Exception as e:
-                    cb_name = name or "anonymous"
-                    logger.warning(f"[v117.0] Shutdown callback error ({cb_name}): {e}")
+        # Set async event if it exists
+        if self._async_event is not None:
+            self._async_event.set()
+
+        # Execute sync callbacks
+        # v117.0: Log callback names for observability
+        for name, callback in self._callbacks:
+            try:
+                cb_name = name or "anonymous"
+                logger.debug(f"[v117.0] Executing shutdown callback: {cb_name}")
+                callback()
+            except Exception as e:
+                cb_name = name or "anonymous"
+                logger.warning(f"[v117.0] Shutdown callback error ({cb_name}): {e}")
 
             # Schedule async callbacks if event loop is running
             # v117.0: Unpack (name, callback) tuples
@@ -2548,6 +2540,14 @@ def _register_semaphore_cleanup_atexit():
     global _semaphore_cleanup_registered
     if _semaphore_cleanup_registered:
         return
+    # v250.0: Cross-module dedup for dual-module aliasing.
+    # backend.core.resilience.graceful_shutdown and core.resilience.graceful_shutdown
+    # are separate sys.modules entries with separate _semaphore_cleanup_registered flags.
+    # Without this env var guard, each registers its own atexit handler → 2x cleanup.
+    if os.environ.get("_JARVIS_SEMAPHORE_CLEANUP_REGISTERED"):
+        _semaphore_cleanup_registered = True
+        return
+    os.environ["_JARVIS_SEMAPHORE_CLEANUP_REGISTERED"] = "1"
     _semaphore_cleanup_registered = True
 
     import atexit
