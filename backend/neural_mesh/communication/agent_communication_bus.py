@@ -163,6 +163,7 @@ class AgentCommunicationBus:
         # v238.0: Deadletter queue for undelivered messages
         self._deadletter: asyncio.Queue[AgentMessage] = asyncio.Queue(maxsize=1000)
         self._deadletter_count: int = 0
+        self._deadletter_task: Optional[asyncio.Task[None]] = None
 
         # v238.0: Per-agent circuit breakers
         self._circuit_breakers: Dict[str, _AgentCircuitBreaker] = {}
@@ -191,6 +192,12 @@ class AgentCommunicationBus:
             name="bus_cleanup",
         )
 
+        # v238.0: Start deadletter consumer
+        self._deadletter_task = asyncio.create_task(
+            self._periodic_deadletter_drain(),
+            name="bus_deadletter_drain",
+        )
+
         logger.info("AgentCommunicationBus started with %d processors", len(self._processor_tasks))
 
     async def stop(self) -> None:
@@ -206,15 +213,18 @@ class AgentCommunicationBus:
 
         if self._cleanup_task:
             self._cleanup_task.cancel()
+        if self._deadletter_task:
+            self._deadletter_task.cancel()
 
         # Wait for tasks to complete
-        all_tasks = self._processor_tasks + (
-            [self._cleanup_task] if self._cleanup_task else []
-        )
+        all_tasks = self._processor_tasks + [
+            t for t in (self._cleanup_task, self._deadletter_task) if t
+        ]
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
         self._processor_tasks.clear()
         self._cleanup_task = None
+        self._deadletter_task = None
 
         # Cancel pending responses
         async with self._response_lock:
@@ -744,6 +754,33 @@ class AgentCommunicationBus:
             except asyncio.QueueEmpty:
                 break
         return messages
+
+    async def _periodic_deadletter_drain(self) -> None:
+        """Periodically drain and log deadletter messages (runs every 60s)."""
+        while self._running:
+            try:
+                await asyncio.sleep(60)
+                if self._deadletter.empty():
+                    continue
+
+                messages = await self.drain_deadletter(limit=50)
+                if messages:
+                    # Group by message type for concise logging
+                    type_counts: Dict[str, int] = {}
+                    for msg in messages:
+                        key = msg.message_type.value if hasattr(msg.message_type, 'value') else str(msg.message_type)
+                        type_counts[key] = type_counts.get(key, 0) + 1
+
+                    logger.info(
+                        "Deadletter drain: %d messages (%s), total lifetime: %d",
+                        len(messages),
+                        ", ".join(f"{k}={v}" for k, v in type_counts.items()),
+                        self._deadletter_count,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("Deadletter drain error: %s", e)
 
     async def persist_history(self, path: Optional[str] = None) -> None:
         """

@@ -288,6 +288,9 @@ class ActivityRecognitionAgent(BaseNeuralMeshAgent):
 
     async def _on_context_update(self, message: AgentMessage) -> None:
         """Handle context updates for activity tracking."""
+        # v238.0: Guard against self-loop — skip our own broadcasts
+        if message.from_agent == self.agent_name:
+            return
         if message.payload.get("activity_signal"):
             await self._recognize_activity(message.payload)
 

@@ -244,6 +244,7 @@ class EventType(Enum):
     GHOST_DISPLAY_WINDOW_REMOVED = "vision.ghost_display.window_removed"
     GHOST_DISPLAY_STATUS_CHANGED = "vision.ghost_display.status_changed"
     GHOST_DISPLAY_CREATED = "vision.ghost_display.display_created"
+    GHOST_DISPLAY_RESOLUTION_CHANGED = "vision.ghost_display.resolution_changed"  # v241.0
 
     # System events
     ERROR = "system.error"

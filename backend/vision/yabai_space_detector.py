@@ -1643,6 +1643,9 @@ class GhostDisplayManager:
         self._state_observers: List[Callable] = []
         self._last_emitted_status: Optional[str] = None
 
+        # v241.0: External capture metrics provider (registered by VisualMonitorAgent)
+        self._capture_metrics_provider: Optional[Callable[[], Dict[str, Any]]] = None
+
     @property
     def status(self) -> GhostDisplayStatus:
         return self._status
@@ -1684,6 +1687,16 @@ class GhostDisplayManager:
                 pass
 
         return _unsubscribe
+
+    def register_capture_metrics_provider(self, provider: Callable[[], Dict[str, Any]]) -> None:
+        """
+        v241.0: Register an external capture metrics provider.
+
+        The VisualMonitorAgent registers a callable that returns Ferrari Engine
+        capture metrics (active watchers, FPS, frames captured, etc.).
+        These metrics are included in get_state_snapshot() for frontend/cross-repo visibility.
+        """
+        self._capture_metrics_provider = provider
 
     def get_state_snapshot(self) -> Dict[str, Any]:
         """Get current ghost display state as a serializable dict."""

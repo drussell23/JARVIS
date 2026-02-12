@@ -21432,10 +21432,6 @@ class CollectiveAI:
         if self._neural_mesh:
             state["subsystems"]["neural_mesh"] = self._neural_mesh.get_stats()
 
-        # Get MAS state
-        if self._mas:
-            state["subsystems"]["mas"] = self._mas.get_stats()
-
         # Get Learning Goals state
         if self._learning_goals:
             state["subsystems"]["learning_goals"] = self._learning_goals.get_stats()
@@ -21450,7 +21446,6 @@ class CollectiveAI:
             "connected_subsystems": sum(
                 [
                     self._neural_mesh is not None,
-                    self._mas is not None,
                     self._learning_goals is not None,
                 ]
             ),

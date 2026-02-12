@@ -731,15 +731,18 @@ class JARVISNeuralMeshBridge:
         if not self._coordinator or not self._coordinator.bus:
             return
 
-        await self._coordinator.bus.broadcast(
-            from_agent="jarvis_bridge",
-            message_type=MessageType.CUSTOM,
-            payload={
-                "event": event_name,
-                **payload,
-            },
-            priority=priority,
-        )
+        try:
+            await self._coordinator.bus.broadcast(
+                from_agent="jarvis_bridge",
+                message_type=MessageType.CUSTOM,
+                payload={
+                    "event": event_name,
+                    **payload,
+                },
+                priority=priority,
+            )
+        except Exception as e:
+            logger.warning("Bridge broadcast_event failed for %s: %s", event_name, e)
 
     async def health_check(self) -> Dict[str, Any]:
         """Get health status of all systems.
