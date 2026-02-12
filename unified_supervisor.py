@@ -2536,6 +2536,14 @@ class SystemKernelConfig:
     agi_os_voice_approvals: bool = field(default_factory=lambda: _get_env_bool("JARVIS_AGI_OS_VOICE_APPROVALS", True))
 
     # ═══════════════════════════════════════════════════════════════════════════
+    # UI / DISPLAY (v249.0)
+    # ═══════════════════════════════════════════════════════════════════════════
+    ui_mode: str = field(default_factory=lambda: os.environ.get("JARVIS_UI_MODE", "auto"))
+    ui_verbosity: str = field(default_factory=lambda: os.environ.get("JARVIS_UI_VERBOSITY", "ops"))
+    ui_no_ansi: bool = field(default_factory=lambda: _get_env_bool("JARVIS_UI_NO_ANSI", False))
+    ui_no_animation: bool = field(default_factory=lambda: _get_env_bool("JARVIS_UI_NO_ANIMATION", False))
+
+    # ═══════════════════════════════════════════════════════════════════════════
     # BROWSER PREFERENCE - v200.0
     # ═══════════════════════════════════════════════════════════════════════════
     browser_preference: str = field(default_factory=lambda: os.environ.get("JARVIS_BROWSER", "auto"))
@@ -5910,6 +5918,465 @@ def update_dashboard_memory() -> None:
             )
         except Exception:
             pass  # psutil may not be available
+
+
+# =============================================================================
+# v249.0: SUPERVISOR EVENT BUS & CLI PRESENTATION LAYER
+# =============================================================================
+# Typed event system decoupling control plane from UI rendering.
+# Phases emit SupervisorEvents → EventBus → Renderers consume them.
+# Renderer failures are fully isolated — startup NEVER depends on UI.
+#
+# Env vars:
+#   JARVIS_UI_MODE          = auto|rich|plain|json  (default: auto)
+#   JARVIS_UI_VERBOSITY     = summary|ops|debug     (default: ops)
+#   JARVIS_UI_NO_ANSI       = true/false            (default: false)
+#   JARVIS_UI_NO_ANIMATION  = true/false            (default: false)
+#   JARVIS_EVENT_BUS_QUEUE_SIZE = int               (default: 1000)
+#   JARVIS_EVENT_BUS_ENABLED    = true/false        (default: true)
+# =============================================================================
+
+
+class SupervisorEventType(Enum):
+    """Categories of supervisor lifecycle events."""
+    PHASE_START = "phase_start"
+    PHASE_END = "phase_end"
+    PHASE_PROGRESS = "phase_progress"
+    COMPONENT_STATUS = "component_status"
+    HEALTH_CHECK = "health_check"
+    RECOVERY_START = "recovery_start"
+    RECOVERY_END = "recovery_end"
+    ERROR = "error"
+    WARNING = "warning"
+    METRIC = "metric"
+    STARTUP_COMPLETE = "startup_complete"
+    SHUTDOWN_START = "shutdown_start"
+    SHUTDOWN_END = "shutdown_end"
+    LOG = "log"
+
+
+class SupervisorEventSeverity(Enum):
+    """Event severity levels."""
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+    SUCCESS = "success"
+
+
+@dataclass(frozen=True)
+class SupervisorEvent:
+    """
+    Lightweight immutable event emitted by the supervisor control plane.
+
+    Frozen dataclass ensures thread-safety — events are created once and
+    shared across handlers without locking. The ``metadata`` field uses a
+    tuple of (key, value) pairs instead of a dict to maintain hashability.
+    """
+    event_type: SupervisorEventType
+    timestamp: float                                    # time.time()
+    message: str
+    severity: SupervisorEventSeverity = SupervisorEventSeverity.INFO
+    phase: str = ""                                     # "preflight", "backend", etc.
+    component: str = ""                                 # "jarvis-body", "jarvis-prime", etc.
+    duration_ms: float = 0.0                            # For PHASE_END events
+    progress_pct: float = -1                            # -1 = not applicable
+    metadata: tuple = ()                                # Tuple of (key, value) pairs (frozen-safe)
+    correlation_id: str = ""                            # Links phase start/end pairs
+
+    @property
+    def metadata_dict(self) -> Dict[str, Any]:
+        """Convert metadata tuple to dict for convenient access."""
+        return dict(self.metadata) if self.metadata else {}
+
+    def to_json_dict(self) -> Dict[str, Any]:
+        """Serialize to a compact JSON-friendly dict (omits empty fields)."""
+        d: Dict[str, Any] = {
+            "event_type": self.event_type.value,
+            "timestamp": self.timestamp,
+            "message": self.message,
+            "severity": self.severity.value,
+        }
+        if self.phase:
+            d["phase"] = self.phase
+        if self.component:
+            d["component"] = self.component
+        if self.duration_ms > 0:
+            d["duration_ms"] = round(self.duration_ms, 1)
+        if self.progress_pct >= 0:
+            d["progress_pct"] = self.progress_pct
+        if self.metadata:
+            d["metadata"] = self.metadata_dict
+        if self.correlation_id:
+            d["correlation_id"] = self.correlation_id
+        return d
+
+
+class SupervisorEventBus:
+    """
+    In-process pub/sub for supervisor events.
+
+    Non-blocking, fault-isolated. Handler crashes never affect emitters.
+    Uses an asyncio.Queue internally when the event loop is running, with
+    synchronous fallback for pre-loop usage (e.g., during import-time init).
+
+    Thread-safe singleton — the bus is created once and shared across
+    all components in the supervisor process.
+
+    Backpressure: drop-oldest when queue is full (bounded to prevent
+    unbounded memory growth during heavy event bursts).
+    """
+    _instance: Optional["SupervisorEventBus"] = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __new__(cls) -> "SupervisorEventBus":
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    inst = super().__new__(cls)
+                    inst._initialize()
+                    cls._instance = inst
+        return cls._instance
+
+    def _initialize(self) -> None:
+        self._handlers: List[Callable] = []
+        self._queue: Optional[asyncio.Queue] = None
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._enabled: bool = _get_env_bool("JARVIS_EVENT_BUS_ENABLED", True)
+        self._max_queue: int = _get_env_int("JARVIS_EVENT_BUS_QUEUE_SIZE", 1000)
+        self._started: bool = False
+        self._dropped: int = 0
+
+    def subscribe(self, handler: Callable) -> None:
+        """Register an event handler. Handlers receive SupervisorEvent."""
+        self._handlers.append(handler)
+
+    def unsubscribe(self, handler: Callable) -> None:
+        """Remove a previously registered handler."""
+        try:
+            self._handlers.remove(handler)
+        except ValueError:
+            pass
+
+    def emit(self, event: SupervisorEvent) -> None:
+        """
+        Non-blocking event emission. Drops oldest on overflow. Never raises.
+
+        If the async consumer loop hasn't started yet, delivers synchronously
+        to all handlers (ignoring async handlers by closing their coroutines).
+        """
+        if not self._enabled:
+            return
+        if self._queue is None:
+            self._deliver_sync(event)
+            return
+        try:
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                    self._dropped += 1
+                except asyncio.QueueEmpty:
+                    pass
+            self._queue.put_nowait(event)
+        except Exception:
+            pass
+
+    def _deliver_sync(self, event: SupervisorEvent) -> None:
+        """Synchronous delivery fallback (pre-event-loop)."""
+        for handler in self._handlers:
+            try:
+                result = handler(event)
+                if asyncio.iscoroutine(result):
+                    result.close()  # Cannot await outside event loop
+            except Exception:
+                pass
+
+    async def start(self) -> None:
+        """Start the async consumer loop. Idempotent."""
+        if self._started:
+            return
+        self._queue = asyncio.Queue(maxsize=self._max_queue)
+        self._consumer_task = create_safe_task(
+            self._consumer_loop(), name="sv-event-bus"
+        )
+        self._started = True
+
+    async def stop(self) -> None:
+        """Stop the consumer loop and drain remaining events."""
+        self._started = False
+        if self._consumer_task:
+            self._consumer_task.cancel()
+            try:
+                await asyncio.wait_for(self._consumer_task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        # Drain remaining events
+        if self._queue:
+            while not self._queue.empty():
+                try:
+                    await self._deliver(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+    async def _consumer_loop(self) -> None:
+        """Main consumer: dequeue events and deliver to all handlers."""
+        while self._started:
+            try:
+                event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                await self._deliver(event)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                continue
+
+    async def _deliver(self, event: SupervisorEvent) -> None:
+        """Deliver one event to all handlers with per-handler fault isolation."""
+        for handler in self._handlers:
+            try:
+                result = handler(event)
+                if asyncio.iscoroutine(result):
+                    await asyncio.wait_for(result, timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+    @property
+    def dropped_count(self) -> int:
+        """Number of events dropped due to queue overflow."""
+        return self._dropped
+
+    @property
+    def handler_count(self) -> int:
+        """Number of registered handlers."""
+        return len(self._handlers)
+
+
+_supervisor_event_bus: Optional[SupervisorEventBus] = None
+
+
+def get_event_bus() -> SupervisorEventBus:
+    """Get the singleton SupervisorEventBus instance."""
+    global _supervisor_event_bus
+    if _supervisor_event_bus is None:
+        _supervisor_event_bus = SupervisorEventBus()
+    return _supervisor_event_bus
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI RENDERERS
+# ─────────────────────────────────────────────────────────────────────────────
+# Three rendering backends:
+#   RichCliRenderer  — wraps existing LiveProgressDashboard (TTY + Rich)
+#   PlainCliRenderer — text-only, no ANSI, CI/pipe-safe
+#   JsonCliRenderer  — JSON-lines, machine-readable
+#
+# All renderers implement the same CliRenderer ABC. The event bus delivers
+# events to whatever renderer is active. Renderer crashes are silenced —
+# they never affect the control plane.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class CliRenderer(ABC):
+    """Abstract base for CLI presentation renderers."""
+
+    def __init__(self, verbosity: str = "ops"):
+        self._verbosity = verbosity
+        self._running = False
+
+    @abstractmethod
+    def handle_event(self, event: SupervisorEvent) -> None:
+        """Process a single supervisor event for display."""
+        ...
+
+    def start(self) -> None:
+        """Activate the renderer."""
+        self._running = True
+
+    def stop(self) -> None:
+        """Deactivate the renderer."""
+        self._running = False
+
+    def should_display(self, event: SupervisorEvent) -> bool:
+        """
+        Verbosity-gated filter.
+
+        - ``debug``: show everything
+        - ``ops`` (default): hide DEBUG-severity events
+        - ``summary``: only phase transitions, completion, and critical errors
+        """
+        if self._verbosity == "debug":
+            return True
+        if self._verbosity == "summary":
+            return event.event_type in (
+                SupervisorEventType.PHASE_START,
+                SupervisorEventType.PHASE_END,
+                SupervisorEventType.STARTUP_COMPLETE,
+                SupervisorEventType.SHUTDOWN_START,
+                SupervisorEventType.SHUTDOWN_END,
+                SupervisorEventType.ERROR,
+            ) or event.severity == SupervisorEventSeverity.CRITICAL
+        # ops: everything except DEBUG
+        return event.severity != SupervisorEventSeverity.DEBUG
+
+
+class RichCliRenderer(CliRenderer):
+    """
+    Wraps existing LiveProgressDashboard + adds phase timeline tracking.
+
+    This renderer does NOT replace the dashboard — it coexists with it.
+    The dashboard is still managed by ``_startup_impl()``. This renderer
+    augments it by feeding events into the dashboard's log buffer and
+    maintaining a phase timeline for post-startup summary.
+    """
+
+    def __init__(self, verbosity: str = "ops", no_animation: bool = False):
+        super().__init__(verbosity)
+        self._no_animation = no_animation
+        self._dashboard: Optional[LiveProgressDashboard] = None
+        self._phase_timeline: List[Dict[str, Any]] = []
+
+    def start(self) -> None:
+        super().start()
+        if not self._no_animation:
+            self._dashboard = get_live_dashboard(enabled=True)
+
+    def stop(self) -> None:
+        super().stop()
+        # Don't stop dashboard here — it's managed by _startup_impl
+
+    def handle_event(self, event: SupervisorEvent) -> None:
+        if not self._running or not self.should_display(event):
+            return
+        try:
+            if event.event_type == SupervisorEventType.PHASE_START:
+                self._phase_timeline.append({
+                    "phase": event.phase,
+                    "start": event.timestamp,
+                    "end": None,
+                    "duration_ms": None,
+                    "status": "running",
+                    "cid": event.correlation_id,
+                })
+            elif event.event_type == SupervisorEventType.PHASE_END:
+                for entry in reversed(self._phase_timeline):
+                    if entry.get("cid") == event.correlation_id:
+                        entry["end"] = event.timestamp
+                        entry["duration_ms"] = event.duration_ms
+                        entry["status"] = (
+                            "error"
+                            if event.severity == SupervisorEventSeverity.ERROR
+                            else "complete"
+                        )
+                        break
+            elif event.event_type == SupervisorEventType.COMPONENT_STATUS:
+                if self._dashboard:
+                    status = event.metadata_dict.get("status", "pending")
+                    self._dashboard.update_component(event.component, status)
+            # Feed to dashboard log buffer
+            if self._dashboard and self._dashboard.enabled:
+                self._dashboard.add_log(
+                    event.message[:80], event.severity.value.upper()
+                )
+        except Exception:
+            pass
+
+    @property
+    def phase_timeline(self) -> List[Dict[str, Any]]:
+        """Access the recorded phase timeline for post-startup summary."""
+        return list(self._phase_timeline)
+
+
+class PlainCliRenderer(CliRenderer):
+    """
+    Text-only renderer. No ANSI codes, no Rich. CI/non-TTY safe.
+
+    Emits one line per event with elapsed time, event type, phase,
+    component, and message. Suitable for piping to log files or
+    CI systems that don't support terminal escape sequences.
+    """
+
+    def __init__(self, verbosity: str = "ops", no_ansi: bool = True):
+        super().__init__(verbosity)
+        self._no_ansi = no_ansi
+        self._start_time = time.time()
+
+    def handle_event(self, event: SupervisorEvent) -> None:
+        if not self._running or not self.should_display(event):
+            return
+        try:
+            elapsed = (event.timestamp - self._start_time) * 1000
+            parts = [
+                f"[+{elapsed:>7.0f}ms]",
+                f"[{event.event_type.value.upper()}]",
+            ]
+            if event.phase:
+                parts.append(f"[{event.phase}]")
+            if event.component:
+                parts.append(f"[{event.component}]")
+            parts.append(event.message)
+            if event.duration_ms > 0:
+                parts.append(f"({event.duration_ms:.1f}ms)")
+            if event.progress_pct >= 0:
+                parts.append(f"[{event.progress_pct:.0f}%]")
+            print(" ".join(parts), flush=True)
+        except Exception:
+            pass
+
+
+class JsonCliRenderer(CliRenderer):
+    """
+    JSON-lines renderer: one JSON object per line. Machine-readable.
+
+    Each line is a self-contained JSON object with the full SupervisorEvent
+    payload. Suitable for structured log aggregation (Datadog, Splunk, etc.).
+    """
+
+    def handle_event(self, event: SupervisorEvent) -> None:
+        if not self._running or not self.should_display(event):
+            return
+        try:
+            print(
+                json.dumps(event.to_json_dict(), separators=(",", ":")),
+                flush=True,
+            )
+        except Exception:
+            pass
+
+
+def _create_cli_renderer(
+    ui_mode: str,
+    verbosity: str,
+    no_ansi: bool,
+    no_animation: bool,
+) -> CliRenderer:
+    """
+    Factory: auto-detect TTY capabilities and create appropriate renderer.
+
+    Auto-detection logic (when ``ui_mode == "auto"``):
+      1. If JARVIS_LOG_JSON is set → JsonCliRenderer
+      2. If stdout is not a TTY → PlainCliRenderer
+      3. If Rich is available → RichCliRenderer
+      4. Fallback → PlainCliRenderer
+    """
+    mode = ui_mode
+    if mode == "auto":
+        if _get_env_bool("JARVIS_LOG_JSON", False):
+            mode = "json"
+        elif not sys.stdout.isatty():
+            mode = "plain"
+        elif RICH_AVAILABLE:
+            mode = "rich"
+        else:
+            mode = "plain"
+
+    if mode == "json":
+        return JsonCliRenderer(verbosity=verbosity)
+    elif mode == "plain":
+        return PlainCliRenderer(verbosity=verbosity, no_ansi=no_ansi)
+    else:
+        return RichCliRenderer(verbosity=verbosity, no_animation=no_animation)
 
 
 # =============================================================================
@@ -58833,7 +59300,21 @@ class JarvisSystemKernel:
         # v197.3: Now supports display modes - set JARVIS_DASHBOARD_MODE=passthrough to see logs
         dashboard = get_live_dashboard(enabled=sys.stdout.isatty())
         dashboard.start()
-        
+
+        # v249.0: Initialize event bus and CLI renderer
+        _event_bus = get_event_bus()
+        await _event_bus.start()
+        _renderer = _create_cli_renderer(
+            self.config.ui_mode,
+            self.config.ui_verbosity,
+            self.config.ui_no_ansi,
+            self.config.ui_no_animation,
+        )
+        _renderer.start()
+        _event_bus.subscribe(_renderer.handle_event)
+        self._event_bus = _event_bus
+        self._cli_renderer = _renderer
+
         # v197.3: Connect dashboard to logging system for real-time log display
         try:
             log_handler = get_dashboard_log_handler()
@@ -58879,7 +59360,18 @@ class JarvisSystemKernel:
         if self._startup_watchdog:
             self._startup_watchdog.update_phase("clean_slate", 0)
 
+        # v249.0: Phase event emission
+        _cid_cs = f"phase-clean_slate-{uuid.uuid4().hex[:8]}"
+        _t0_cs = time.time()
+        self._emit_event(SupervisorEventType.PHASE_START, "Phase: Clean Slate", phase="clean_slate", correlation_id=_cid_cs)
+
         await self._phase_clean_slate()
+
+        self._emit_event(
+            SupervisorEventType.PHASE_END, "Phase: Clean Slate complete",
+            severity=SupervisorEventSeverity.SUCCESS, phase="clean_slate",
+            duration_ms=(time.time() - _t0_cs) * 1000, correlation_id=_cid_cs,
+        )
 
         # =====================================================================
         # v186.0: ENTERPRISE STARTUP BANNER (with Rich CLI support)
@@ -59575,7 +60067,19 @@ class JarvisSystemKernel:
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase("loading_server", 0)
 
+            # v249.0: Phase event emission
+            _cid_le = f"phase-loading_experience-{uuid.uuid4().hex[:8]}"
+            _t0_le = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Loading Experience", phase="loading_experience", correlation_id=_cid_le)
+
             await self._phase_loading_experience()
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Loading Experience complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="loading_experience",
+                duration_ms=(time.time() - _t0_le) * 1000, correlation_id=_cid_le,
+            )
+
             await self._broadcast_startup_progress(
                 stage="loading",
                 message="Loading page ready - starting system initialization...",
@@ -59628,6 +60132,12 @@ class JarvisSystemKernel:
                 self._startup_watchdog.update_phase("preflight", 5)
             if self._narrator:
                 await self._narrator.narrate_phase_start("preflight")
+
+            # v249.0: Phase event emission
+            _cid_pf = f"phase-preflight-{uuid.uuid4().hex[:8]}"
+            _t0_pf = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Preflight", phase="preflight", correlation_id=_cid_pf)
+
             if not await self._phase_preflight():
                 issue_collector.add_critical(
                     "Preflight phase failed - cannot continue startup",
@@ -59636,6 +60146,12 @@ class JarvisSystemKernel:
                 )
                 issue_collector.print_health_report()
                 return 1
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Preflight complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="preflight",
+                duration_ms=(time.time() - _t0_pf) * 1000, correlation_id=_cid_pf,
+            )
 
             await self._broadcast_startup_progress(
                 stage="preflight",
@@ -59670,6 +60186,12 @@ class JarvisSystemKernel:
                 self._startup_watchdog.update_phase("resources", 15, operational_timeout=resource_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("resources")
+
+            # v249.0: Phase event emission
+            _cid_rs = f"phase-resources-{uuid.uuid4().hex[:8]}"
+            _t0_rs = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Resources", phase="resources", correlation_id=_cid_rs)
+
             if not await self._phase_resources():
                 issue_collector.add_critical(
                     "Resource initialization failed - cannot continue startup",
@@ -59682,6 +60204,12 @@ class JarvisSystemKernel:
                 return 1
             if self._narrator:
                 await self._narrator.narrate_zone_complete(3, success=True)
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Resources complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="resources",
+                duration_ms=(time.time() - _t0_rs) * 1000, correlation_id=_cid_rs,
+            )
 
             await self._broadcast_startup_progress(
                 stage="resources",
@@ -67313,6 +67841,36 @@ class JarvisSystemKernel:
             except Exception:
                 pass  # Reconciliation is best-effort
 
+    # v249.0: Event emission helper — never raises, never blocks
+    def _emit_event(
+        self,
+        event_type: SupervisorEventType,
+        message: str,
+        severity: SupervisorEventSeverity = SupervisorEventSeverity.INFO,
+        phase: str = "",
+        component: str = "",
+        duration_ms: float = 0.0,
+        progress_pct: float = -1,
+        metadata: Optional[Dict[str, Any]] = None,
+        correlation_id: str = "",
+    ) -> None:
+        """Emit a SupervisorEvent to the event bus. Never raises."""
+        try:
+            get_event_bus().emit(SupervisorEvent(
+                event_type=event_type,
+                timestamp=time.time(),
+                message=message,
+                severity=severity,
+                phase=phase,
+                component=component,
+                duration_ms=duration_ms,
+                progress_pct=progress_pct,
+                metadata=tuple(metadata.items()) if metadata else (),
+                correlation_id=correlation_id,
+            ))
+        except Exception:
+            pass
+
     def _update_component_status(
         self,
         component: str,
@@ -71808,6 +72366,35 @@ Environment Variables:
     )
 
     # =========================================================================
+    # UI / DISPLAY (v249.0)
+    # =========================================================================
+    ui_group = parser.add_argument_group("UI / Display")
+    ui_group.add_argument(
+        "--ui",
+        choices=["rich", "plain", "json", "auto"],
+        default="auto",
+        help="CLI rendering mode (default: auto-detect TTY)",
+    )
+    ui_group.add_argument(
+        "--verbosity",
+        choices=["summary", "ops", "debug"],
+        default=None,
+        help="Event verbosity: summary (phases only), ops (default), debug (all)",
+    )
+    ui_group.add_argument(
+        "--no-ansi",
+        action="store_true",
+        dest="no_ansi",
+        help="Disable ANSI color codes",
+    )
+    ui_group.add_argument(
+        "--no-animation",
+        action="store_true",
+        dest="no_animation",
+        help="Disable spinners and animated progress bars",
+    )
+
+    # =========================================================================
     # TASK EXECUTION
     # =========================================================================
     task = parser.add_argument_group("Task Execution")
@@ -74288,6 +74875,16 @@ def apply_cli_to_config(args: argparse.Namespace, config: SystemKernelConfig) ->
         config.tier2_require_liveness = True
     if hasattr(args, 'no_watchdog') and args.no_watchdog:
         config.watchdog_enabled = False
+
+    # v249.0: UI flags → env vars (picked up by SystemKernelConfig defaults)
+    if hasattr(args, 'ui') and args.ui != 'auto':
+        os.environ["JARVIS_UI_MODE"] = args.ui
+    if hasattr(args, 'verbosity') and args.verbosity:
+        os.environ["JARVIS_UI_VERBOSITY"] = args.verbosity
+    if hasattr(args, 'no_ansi') and args.no_ansi:
+        os.environ["JARVIS_UI_NO_ANSI"] = "true"
+    if hasattr(args, 'no_animation') and args.no_animation:
+        os.environ["JARVIS_UI_NO_ANIMATION"] = "true"
 
     # Trinity
     if args.skip_trinity:
