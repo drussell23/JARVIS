@@ -60245,6 +60245,12 @@ class JarvisSystemKernel:
                 self._startup_watchdog.update_phase("backend", 30, operational_timeout=backend_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("backend")
+
+            # v249.0: Phase event emission
+            _cid_be = f"phase-backend-{uuid.uuid4().hex[:8]}"
+            _t0_be = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Backend", phase="backend", correlation_id=_cid_be)
+
             if not await self._phase_backend():
                 issue_collector.add_critical(
                     "Backend server failed to start",
@@ -60255,6 +60261,12 @@ class JarvisSystemKernel:
                     await self._narrator.narrate_error("Backend server failed to start", critical=True)
                 issue_collector.print_health_report()
                 return 1
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Backend complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="backend",
+                duration_ms=(time.time() - _t0_be) * 1000, correlation_id=_cid_be,
+            )
 
             await self._broadcast_startup_progress(
                 stage="backend",
@@ -60329,6 +60341,12 @@ class JarvisSystemKernel:
                 self._startup_watchdog.update_phase("intelligence", 50, operational_timeout=intelligence_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("intelligence")
+
+            # v249.0: Phase event emission
+            _cid_in = f"phase-intelligence-{uuid.uuid4().hex[:8]}"
+            _t0_in = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Intelligence", phase="intelligence", correlation_id=_cid_in)
+
             if not await self._phase_intelligence():
                 # Non-fatal - continue without intelligence
                 issue_collector.add_warning(
@@ -60348,6 +60366,12 @@ class JarvisSystemKernel:
             # would see has_active_subsystem=True during Phase 4.5, suppressing stall
             # detection and causing a 916s hang until the hard cap fires.
             update_dashboard_model_loading(active=False)
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Intelligence complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="intelligence",
+                duration_ms=(time.time() - _t0_in) * 1000, correlation_id=_cid_in,
+            )
 
             await self._broadcast_startup_progress(
                 stage="intelligence",
@@ -60501,6 +60525,10 @@ class JarvisSystemKernel:
             self._current_startup_phase = "trinity"
             self._current_startup_progress = 68
             add_dashboard_log("Starting Phase 5: Trinity Integration", "INFO")
+            # v249.0: Phase event emission
+            _cid_tr = f"phase-trinity-{uuid.uuid4().hex[:8]}"
+            _t0_tr = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Trinity", phase="trinity", correlation_id=_cid_tr)
             issue_collector.set_current_phase("Phase 5: Trinity")
             issue_collector.set_current_zone("Zone 5.7")
             # v198.2: UNIFIED TRINITY TIMEOUT CALCULATION
@@ -60604,6 +60632,12 @@ class JarvisSystemKernel:
                 self.logger.info("[Kernel]   Trinity connects: JARVIS + J-Prime + Reactor-Core")
                 self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
 
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Trinity complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="trinity",
+                duration_ms=(time.time() - _t0_tr) * 1000, correlation_id=_cid_tr,
+            )
+
             await self._broadcast_startup_progress(
                 stage="trinity",
                 message="Trinity connected - starting enterprise services...",
@@ -60634,9 +60668,21 @@ class JarvisSystemKernel:
                 self._startup_watchdog.update_phase("enterprise", 80, operational_timeout=enterprise_timeout)
             if self._narrator:
                 await self._narrator.narrate_phase_start("enterprise")
+
+            # v249.0: Phase event emission
+            _cid_en = f"phase-enterprise-{uuid.uuid4().hex[:8]}"
+            _t0_en = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Enterprise Services", phase="enterprise", correlation_id=_cid_en)
+
             await self._phase_enterprise_services()
             if self._narrator:
                 await self._narrator.narrate_zone_complete(6, success=True)
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Enterprise Services complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="enterprise",
+                duration_ms=(time.time() - _t0_en) * 1000, correlation_id=_cid_en,
+            )
 
             await self._broadcast_startup_progress(
                 stage="enterprise",
@@ -60768,7 +60814,18 @@ class JarvisSystemKernel:
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase("frontend", 90)
 
+            # v249.0: Phase event emission
+            _cid_fe = f"phase-frontend-{uuid.uuid4().hex[:8]}"
+            _t0_fe = time.time()
+            self._emit_event(SupervisorEventType.PHASE_START, "Phase: Frontend Transition", phase="frontend", correlation_id=_cid_fe)
+
             await self._phase_frontend_transition()
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END, "Phase: Frontend Transition complete",
+                severity=SupervisorEventSeverity.SUCCESS, phase="frontend",
+                duration_ms=(time.time() - _t0_fe) * 1000, correlation_id=_cid_fe,
+            )
 
             await self._broadcast_startup_progress(
                 stage="complete",
@@ -60941,6 +60998,14 @@ class JarvisSystemKernel:
                 update_dashboard_memory()
 
             self.logger.success(f"[Kernel] ✅ Startup complete in {startup_duration:.2f}s")
+
+            # v249.0: Emit startup complete event
+            self._emit_event(
+                SupervisorEventType.STARTUP_COMPLETE,
+                f"Startup complete in {startup_duration:.2f}s",
+                severity=SupervisorEventSeverity.SUCCESS,
+                metadata={"duration_s": round(startup_duration, 2)},
+            )
 
             # =====================================================================
             # v180.0: DIAGNOSTIC CHECKPOINT - Startup complete
@@ -67937,6 +68002,17 @@ class JarvisSystemKernel:
         except Exception:
             pass  # Dashboard updates are non-critical
 
+        # v249.0: Emit component status event
+        try:
+            self._emit_event(
+                SupervisorEventType.COMPONENT_STATUS,
+                message or f"{component} {status}",
+                component=component,
+                metadata={"status": status},
+            )
+        except Exception:
+            pass
+
     def _calculate_dynamic_progress(self) -> int:
         """
         Calculate progress percentage based on actual component status.
@@ -68751,7 +68827,11 @@ class JarvisSystemKernel:
         """
         self._state = KernelState.SHUTTING_DOWN
         self.logger.info("[Kernel] Initiating shutdown...")
-        
+
+        # v249.0: Emit shutdown start event
+        shutdown_reason = self._signal_handler.shutdown_reason or "unknown"
+        self._emit_event(SupervisorEventType.SHUTDOWN_START, f"Shutdown: {shutdown_reason}")
+
         # v197.1: Stop live dashboard
         try:
             dashboard = get_live_dashboard()
@@ -68760,7 +68840,6 @@ class JarvisSystemKernel:
             pass
 
         # v180.0: Diagnostic checkpoint - shutdown start
-        shutdown_reason = self._signal_handler.shutdown_reason or "unknown"
         if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
             try:
                 log_shutdown_trigger("CLEANUP_START", f"Reason: {shutdown_reason}")
