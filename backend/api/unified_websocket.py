@@ -1371,6 +1371,22 @@ class UnifiedWebSocketManager:
             except Exception as e:
                 logger.warning(f"[WS] Failed to send display status to new client: {e}")
 
+        # v129.0: Send initial ghost display status on connect
+        try:
+            from backend.vision.yabai_space_detector import get_ghost_display_status
+            ghost_status = get_ghost_display_status()
+            await websocket.send_json({
+                "type": "ghost-display-status",
+                "event": "initial",
+                "data": ghost_status,
+                "timestamp": datetime.now().isoformat(),
+                "on_connect": True,
+            })
+        except ImportError:
+            pass  # Ghost display module not available
+        except Exception as e:
+            logger.debug(f"[WS] Failed to send ghost display status to new client: {e}")
+
     async def disconnect(self, client_id: str):
         """Remove WebSocket connection with learning and SAI notification"""
         # Gather final health metrics before removal

@@ -75,6 +75,9 @@ class UnifiedWebSocketService {
     this.trainingStatus = null;    // { status, stage, progress, message, job_id, metrics }
     this.trainingConnected = false;
 
+    // v129.0: Ghost Display State (Virtual Display Status)
+    this.ghostDisplayStatus = null; // { available, status, window_count, apps, resolution, display_id }
+
     // Wait for config and then connect
     this._initializeWhenReady();
   }
@@ -776,6 +779,36 @@ class UnifiedWebSocketService {
     this.client.on('pong', () => {
       // Training endpoint responded to ping - connection healthy
     });
+
+    // ═══════════════════════════════════════════════════════════════════
+    // v129.0: GHOST DISPLAY STATUS (Virtual Display State)
+    // ═══════════════════════════════════════════════════════════════════
+    // These events come from the unified WebSocket when ghost display
+    // state changes (windows added/removed, display created, etc.)
+    // ═══════════════════════════════════════════════════════════════════
+
+    this.client.on('ghost-display-status', (data) => {
+      const ghostData = data?.data || data;
+      const eventType = data?.event || 'update';
+
+      this.ghostDisplayStatus = {
+        available: ghostData.available || false,
+        status: ghostData.status || 'unavailable',
+        window_count: ghostData.window_count || 0,
+        windows: ghostData.windows || [],
+        apps: ghostData.apps || [],
+        resolution: ghostData.resolution || null,
+        display_id: ghostData.display_id || null,
+        space_id: ghostData.space_id || null,
+        is_fallback: ghostData.is_fallback || false,
+        timestamp: Date.now(),
+      };
+
+      this._notifySubscribers('ghost_display_status', {
+        ...this.ghostDisplayStatus,
+        event: eventType,
+      });
+    });
   }
 
   /**
@@ -1078,6 +1111,9 @@ export function useUnifiedWebSocket() {
   const [trainingStatus, setTrainingStatus] = React.useState(null);
   const [trainingConnected, setTrainingConnected] = React.useState(false);
 
+  // v129.0: Ghost Display Status (Virtual Display State)
+  const [ghostDisplayStatus, setGhostDisplayStatus] = React.useState(null);
+
   const service = React.useMemo(() => getUnifiedWebSocketService(), []);
 
   React.useEffect(() => {
@@ -1232,6 +1268,23 @@ export function useUnifiedWebSocket() {
       setTrainingConnected(data.connected);
     });
 
+    // v129.0: Subscribe to Ghost Display Status updates
+    const unsubscribeGhostDisplay = service.subscribe('ghost_display_status', (data) => {
+      setGhostDisplayStatus({
+        available: data.available || false,
+        status: data.status || 'unavailable',
+        window_count: data.window_count || 0,
+        windows: data.windows || [],
+        apps: data.apps || [],
+        resolution: data.resolution || null,
+        display_id: data.display_id || null,
+        space_id: data.space_id || null,
+        is_fallback: data.is_fallback || false,
+        event: data.event,
+        timestamp: data.timestamp || Date.now(),
+      });
+    });
+
     // Initial connection state
     setConnected(service.isConnected());
     setMaintenanceMode(service.isInMaintenanceMode());
@@ -1256,6 +1309,9 @@ export function useUnifiedWebSocket() {
     setTrainingStatus(service.trainingStatus || null);
     setTrainingConnected(service.trainingConnected || false);
 
+    // v129.0: Initial ghost display state
+    setGhostDisplayStatus(service.ghostDisplayStatus || null);
+
     return () => {
       unsubscribeConnection();
       unsubscribeMaintenance();
@@ -1269,6 +1325,7 @@ export function useUnifiedWebSocket() {
       unsubscribeSpeechState();
       unsubscribeTrainingStatus();
       unsubscribeTrainingConnection();
+      unsubscribeGhostDisplay();
       clearInterval(interval);
     };
   }, [service]);
@@ -1308,6 +1365,9 @@ export function useUnifiedWebSocket() {
     trainingStatus,
     trainingConnected,
     isTrainingActive: trainingStatus?.status === 'running', // Convenience helper
+    // v129.0: Ghost Display Status (Virtual Display State)
+    ghostDisplayStatus,
+    isGhostDisplayAvailable: ghostDisplayStatus?.available || false, // Convenience helper
     // Actions
     connect: (capability) => service.connect(capability),
     disconnect: () => service.disconnect(),

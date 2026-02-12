@@ -7088,6 +7088,14 @@ def mount_routers():
         except ImportError:
             logger.debug("Rust API not available")
 
+    # Ghost Hands API (background automation)
+    try:
+        from api.ghost_hands_api import ghost_hands_router
+        app.include_router(ghost_hands_router)
+        logger.info("✅ Ghost Hands API mounted")
+    except ImportError:
+        logger.debug("Ghost Hands API not available")
+
     # Self-healing API
     try:
         from api.self_healing_api import router as self_healing_router

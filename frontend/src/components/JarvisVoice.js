@@ -1365,15 +1365,43 @@ const JarvisVoice = () => {
         setTrinityStatus(trinity);
       }
 
-      // Ghost Display status handling
-      if (state.metadata?.ghost_display) {
-        const ghostDisplay = state.metadata.ghost_display;
-        console.log('[JarvisVoice] Ghost Display status:', ghostDisplay);
-        setGhostDisplayStatus(ghostDisplay);
+      // Ghost Display status handling (v129.0: also check progress broadcast path)
+      const ghostData = state.metadata?.ghost_display || state.ghost_display;
+      if (ghostData) {
+        console.log('[JarvisVoice] Ghost Display status from startup:', ghostData);
+        setGhostDisplayStatus(ghostData);
       }
     };
 
     window.addEventListener('jarvis-startup-state', handleStartupState);
+
+    // v129.0: Subscribe to ghost display status via WebSocket (primary path)
+    let unsubscribeGhostDisplay = null;
+    try {
+      const { getUnifiedWebSocketService } = require('../services/UnifiedWebSocketService');
+      const wsService = getUnifiedWebSocketService();
+      if (wsService) {
+        unsubscribeGhostDisplay = wsService.subscribe('ghost_display_status', (data) => {
+          console.log('[JarvisVoice] Ghost Display status via WebSocket:', data.event);
+          setGhostDisplayStatus({
+            available: data.available || false,
+            status: data.status || 'unavailable',
+            window_count: data.window_count || 0,
+            windows: data.windows || [],
+            apps: data.apps || [],
+            resolution: data.resolution || null,
+            display_id: data.display_id || null,
+            is_fallback: data.is_fallback || false,
+          });
+        });
+        // Load initial state from service
+        if (wsService.ghostDisplayStatus) {
+          setGhostDisplayStatus(wsService.ghostDisplayStatus);
+        }
+      }
+    } catch (e) {
+      console.debug('[JarvisVoice] Ghost display WebSocket subscription skipped:', e.message);
+    }
 
     return () => {
       // Remove from listeners
@@ -1381,6 +1409,7 @@ const JarvisVoice = () => {
       if (index > -1) backendStateListeners.splice(index, 1);
 
       if (typeof unsubscribe === 'function') unsubscribe();
+      if (typeof unsubscribeGhostDisplay === 'function') unsubscribeGhostDisplay();
       window.removeEventListener('jarvis-startup-state', handleStartupState);
     };
   }, [jarvisStatus]);
@@ -6426,7 +6455,9 @@ const JarvisVoice = () => {
           fontFamily: 'monospace',
           marginBottom: '8px',
         }}>
-          <span style={{ color: '#cc88ff' }}>👻 Ghost Display</span>
+          <span style={{ color: '#cc88ff' }}>
+            {ghostDisplayStatus.is_fallback ? '🔄' : '👻'} Ghost Display
+          </span>
           <span style={{ color: '#888' }}>
             {ghostDisplayStatus.window_count || 0} window{ghostDisplayStatus.window_count !== 1 ? 's' : ''}
           </span>
@@ -6440,6 +6471,24 @@ const JarvisVoice = () => {
               {ghostDisplayStatus.resolution}
             </span>
           )}
+        </div>
+      )}
+      {/* Ghost Display: status received but unavailable */}
+      {ghostDisplayStatus && !ghostDisplayStatus.available && ghostDisplayStatus.status !== 'unavailable' && (
+        <div className="ghost-display-status" style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          padding: '4px 14px',
+          background: 'rgba(80, 0, 120, 0.08)',
+          borderRadius: '6px',
+          border: '1px solid rgba(180, 100, 255, 0.15)',
+          fontSize: '10px',
+          fontFamily: 'monospace',
+          marginBottom: '8px',
+          opacity: 0.6,
+        }}>
+          <span style={{ color: '#9966bb' }}>👻 Ghost Display: {ghostDisplayStatus.status}</span>
         </div>
       )}
 

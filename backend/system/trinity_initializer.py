@@ -584,6 +584,9 @@ async def initialize_trinity(app=None) -> bool:
             app.state.trinity_instance_id = JARVIS_INSTANCE_ID
             logger.info("[Trinity] ✓ Attached to FastAPI app.state")
 
+        # Step 11: Register Ghost Display → WebSocket observer (v129.0)
+        register_ghost_display_observer()
+
         _trinity_initialized = True
 
         logger.info("=" * 60)
@@ -738,20 +741,31 @@ async def _gather_jarvis_state() -> Dict[str, Any]:
     if cryo:
         state["frozen_apps"] = cryo.get_frozen_app_names()
 
-    # Yabai/Ghost Display state
-    yabai = _get_yabai_detector()
-    if yabai:
+    # Yabai/Ghost Display state (v129.0: enriched with full status object)
+    try:
+        from backend.vision.yabai_space_detector import get_ghost_display_status
+        ghost_status = get_ghost_display_status()
+        state["ghost_display"] = ghost_status
+        # Backward compatibility: keep flat keys for existing consumers
+        state["ghost_display_available"] = ghost_status.get("available", False)
+        state["apps_on_ghost_display"] = ghost_status.get("apps", [])
+    except ImportError:
         try:
-            ghost_space = yabai.get_ghost_display_space()
-            state["ghost_display_available"] = ghost_space is not None
-
-            if ghost_space:
-                windows = yabai.get_windows_on_space(ghost_space)
-                state["apps_on_ghost_display"] = list(set(
-                    w.get("app", "") for w in windows if w.get("app")
-                ))
-        except Exception:
+            from vision.yabai_space_detector import get_ghost_display_status
+            ghost_status = get_ghost_display_status()
+            state["ghost_display"] = ghost_status
+            state["ghost_display_available"] = ghost_status.get("available", False)
+            state["apps_on_ghost_display"] = ghost_status.get("apps", [])
+        except ImportError:
+            logger.debug("[TrinityInit] Ghost display status unavailable (import failed)")
+            state["ghost_display"] = {"available": False, "status": "unavailable", "window_count": 0, "apps": []}
             state["ghost_display_available"] = False
+            state["apps_on_ghost_display"] = []
+    except Exception as e:
+        logger.warning(f"[TrinityInit] Ghost display state gathering failed: {e}")
+        state["ghost_display"] = {"available": False, "status": "error", "window_count": 0, "apps": []}
+        state["ghost_display_available"] = False
+        state["apps_on_ghost_display"] = []
 
     # Surveillance state (if available)
     state["surveillance_active"] = False
@@ -785,6 +799,68 @@ async def _write_state_to_orchestrator(state: Dict[str, Any]) -> None:
 
     except Exception as e:
         logger.debug(f"[Trinity] Could not write state: {e}")
+
+
+# =============================================================================
+# v129.0: GHOST DISPLAY → FRONTEND WEBSOCKET BRIDGE
+# =============================================================================
+
+_ghost_observer_registered = False
+
+
+async def _broadcast_ghost_display_status(event_type: str, payload: Dict[str, Any]):
+    """
+    Observer callback for GhostDisplayManager state changes.
+    Broadcasts ghost display status to all connected WebSocket clients.
+    """
+    try:
+        if _app is None:
+            return
+
+        # Get the unified websocket manager from app state
+        ws_manager = getattr(_app.state, "unified_ws", None)
+        if ws_manager is None:
+            ws_manager = getattr(_app.state, "ws_manager", None)
+        if ws_manager is None:
+            return
+
+        message = {
+            "type": "ghost-display-status",
+            "event": event_type,
+            "data": payload.get("state", {}),
+            "timestamp": time.time(),
+        }
+
+        if hasattr(ws_manager, "broadcast"):
+            await ws_manager.broadcast(message)
+        else:
+            logger.debug("[Trinity] WebSocket manager has no broadcast method")
+
+    except Exception as e:
+        logger.debug(f"[Trinity] Ghost display broadcast error: {e}")
+
+
+def register_ghost_display_observer():
+    """Register the WebSocket broadcast observer on the GhostDisplayManager singleton."""
+    global _ghost_observer_registered
+    if _ghost_observer_registered:
+        return
+
+    try:
+        from backend.vision.yabai_space_detector import get_ghost_manager
+        manager = get_ghost_manager()
+        manager.add_observer(_broadcast_ghost_display_status)
+        _ghost_observer_registered = True
+        logger.info("[Trinity] Ghost display → WebSocket observer registered")
+    except ImportError:
+        try:
+            from vision.yabai_space_detector import get_ghost_manager
+            manager = get_ghost_manager()
+            manager.add_observer(_broadcast_ghost_display_status)
+            _ghost_observer_registered = True
+            logger.info("[Trinity] Ghost display → WebSocket observer registered")
+        except ImportError:
+            logger.debug("[Trinity] GhostDisplayManager not available for observer registration")
 
 
 # =============================================================================

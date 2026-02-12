@@ -239,6 +239,12 @@ class EventType(Enum):
     PATTERN_DETECTED = "learning.pattern"
     KNOWLEDGE_UPDATED = "learning.knowledge"
 
+    # Vision / Ghost Display events
+    GHOST_DISPLAY_WINDOW_ADDED = "vision.ghost_display.window_added"
+    GHOST_DISPLAY_WINDOW_REMOVED = "vision.ghost_display.window_removed"
+    GHOST_DISPLAY_STATUS_CHANGED = "vision.ghost_display.status_changed"
+    GHOST_DISPLAY_CREATED = "vision.ghost_display.display_created"
+
     # System events
     ERROR = "system.error"
     WARNING = "system.warning"

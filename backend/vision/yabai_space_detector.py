@@ -1639,6 +1639,10 @@ class GhostDisplayManager:
         self._persistence_manager: Optional[GhostPersistenceManager] = None
         self._persistence_initialized: bool = False
 
+        # v129.0: Event emission for frontend/cross-repo state propagation
+        self._state_observers: List[Callable] = []
+        self._last_emitted_status: Optional[str] = None
+
     @property
     def status(self) -> GhostDisplayStatus:
         return self._status
@@ -1656,6 +1660,101 @@ class GhostDisplayManager:
     @property
     def window_count(self) -> int:
         return len(self._windows_on_ghost)
+
+    # =========================================================================
+    # v129.0: EVENT EMISSION & OBSERVER SUPPORT
+    # =========================================================================
+
+    def add_observer(self, callback: Callable) -> Callable:
+        """
+        Register an observer for ghost display state changes.
+
+        Args:
+            callback: Async or sync callable receiving (event_type: str, data: dict)
+
+        Returns:
+            Unsubscribe function
+        """
+        self._state_observers.append(callback)
+
+        def _unsubscribe():
+            try:
+                self._state_observers.remove(callback)
+            except ValueError:
+                pass
+
+        return _unsubscribe
+
+    def get_state_snapshot(self) -> Dict[str, Any]:
+        """Get current ghost display state as a serializable dict."""
+        dims = self.ghost_display_dimensions
+        apps = list({
+            self._geometry_cache[wid].app_name
+            for wid in self._windows_on_ghost
+            if wid in self._geometry_cache and hasattr(self._geometry_cache[wid], 'app_name')
+            and self._geometry_cache[wid].app_name
+        }) if self._geometry_cache else []
+
+        return {
+            "available": self._status == GhostDisplayStatus.AVAILABLE,
+            "status": self._status.value if hasattr(self._status, 'value') else str(self._status),
+            "window_count": len(self._windows_on_ghost),
+            "windows": list(self._windows_on_ghost),
+            "apps": apps,
+            "resolution": f"{dims[0]}x{dims[1]}",
+            "display_id": self.ghost_display_id,
+            "space_id": self.ghost_space,
+            "is_fallback": self._status == GhostDisplayStatus.FALLBACK,
+        }
+
+    async def _notify_state_change(self, event_type: str, data: Optional[Dict[str, Any]] = None):
+        """
+        Notify all observers of a ghost display state change.
+
+        Args:
+            event_type: One of 'window_added', 'window_removed', 'status_changed', 'display_created'
+            data: Additional event-specific data
+        """
+        snapshot = self.get_state_snapshot()
+        payload = {
+            "event_type": event_type,
+            "state": snapshot,
+            **(data or {}),
+        }
+
+        # Also publish to Trinity Event Bus if available
+        try:
+            from backend.core.trinity_event_bus import (
+                EventType, RepoType, is_event_bus_running, get_trinity_event_bus,
+            )
+            if is_event_bus_running():
+                bus = await get_trinity_event_bus()
+                topic_map = {
+                    "window_added": EventType.GHOST_DISPLAY_WINDOW_ADDED,
+                    "window_removed": EventType.GHOST_DISPLAY_WINDOW_REMOVED,
+                    "status_changed": EventType.GHOST_DISPLAY_STATUS_CHANGED,
+                    "display_created": EventType.GHOST_DISPLAY_CREATED,
+                }
+                topic = topic_map.get(event_type)
+                if topic:
+                    await bus.publish_raw(
+                        topic=topic.value,
+                        data=payload,
+                        target=RepoType.BROADCAST,
+                    )
+        except Exception as e:
+            logger.debug(f"[GhostManager] Event bus publish skipped: {e}")
+
+        # Notify local observers
+        for observer in self._state_observers:
+            try:
+                result = observer(event_type, payload)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.debug(f"[GhostManager] Observer notification error: {e}")
+
+        self._last_emitted_status = self._status.value if hasattr(self._status, 'value') else str(self._status)
 
     # =========================================================================
     # v38.0: MOSAIC STRATEGY SUPPORT
@@ -2388,6 +2487,12 @@ class GhostDisplayManager:
                         # v27.0: Initialize persistence manager for crash recovery
                         await self._initialize_persistence(yabai_detector)
 
+                        # v129.0: Emit display_created event
+                        await self._notify_state_change("display_created", {
+                            "display_id": self._ghost_info.display_id,
+                            "resolution": f"{self._ghost_info.width}x{self._ghost_info.height}",
+                        })
+
                         return True
 
             # No Ghost Display - try fallback
@@ -2395,6 +2500,7 @@ class GhostDisplayManager:
                 return await self._activate_fallback(yabai_detector)
 
             self._status = GhostDisplayStatus.UNAVAILABLE
+            await self._notify_state_change("status_changed", {"new_status": "unavailable"})
             logger.warning("[GhostManager] ❌ No Ghost Display available and fallback disabled")
             return False
 
@@ -2413,6 +2519,7 @@ class GhostDisplayManager:
                     f"[GhostManager] 🔄 FALLBACK: Using Space {self._fallback_space} "
                     f"as substitute Ghost Display"
                 )
+                await self._notify_state_change("status_changed", {"new_status": "fallback"})
                 return True
 
         # Strategy 2: Use current space (last resort - will be visible to user)
@@ -2422,9 +2529,11 @@ class GhostDisplayManager:
                 f"[GhostManager] ⚠️ FALLBACK: Using current Space {current_space} "
                 f"(windows will be visible to user)"
             )
+            await self._notify_state_change("status_changed", {"new_status": "fallback"})
             return True
 
         logger.error("[GhostManager] ❌ No fallback available")
+        await self._notify_state_change("status_changed", {"new_status": "unavailable"})
         return False
 
     # =========================================================================
@@ -2904,10 +3013,12 @@ class GhostDisplayManager:
         self._windows_on_ghost.add(window_id)
         if window_id in self._geometry_cache:
             self._geometry_cache[window_id].current_space = to_space
+        await self._notify_state_change("window_added", {"window_id": window_id, "space": to_space})
 
     async def track_window_return(self, window_id: int):
         """Track a window being returned from Ghost Display."""
         self._windows_on_ghost.discard(window_id)
+        await self._notify_state_change("window_removed", {"window_id": window_id})
 
     def calculate_layout(
         self,

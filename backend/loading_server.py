@@ -1141,6 +1141,20 @@ class LoadingServer:
             _, lock_free_seq = self._lock_free_progress.get_progress()
             sequence = max(sequence, lock_free_seq)
 
+        # v129.0: Get ghost display status for frontend
+        ghost_display_data = None
+        try:
+            from backend.vision.yabai_space_detector import get_ghost_display_status
+            ghost_display_data = get_ghost_display_status()
+        except ImportError:
+            try:
+                from vision.yabai_space_detector import get_ghost_display_status
+                ghost_display_data = get_ghost_display_status()
+            except ImportError:
+                pass
+        except Exception:
+            pass
+
         message = json.dumps({
             "type": "progress",
             "data": {
@@ -1152,6 +1166,7 @@ class LoadingServer:
                 "components": self._components,
                 "trinity": self._trinity_summary,  # v185.0: Trinity component summary
                 "trinity_ready": self._trinity_ready,  # v185.0: Trinity ready flag
+                "ghost_display": ghost_display_data,  # v129.0: Ghost display status
                 "init_progress": self._prime_init_progress,  # v225.0: Prime v2 phase data
                 "sequence": sequence,  # v186.0/v212.0: Sequence for detecting missed updates
                 "session_id": self._session_id,  # v212.0: Session correlation

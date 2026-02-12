@@ -141,6 +141,7 @@ class IntelligentActionOrchestrator:
         self._action_executor: Optional[Any] = None
         self._screen_analyzer: Optional[Any] = None
         self._permission_manager: Optional[Any] = None
+        self._uae_engine: Optional[Any] = None  # v237.4: UAE enrichment
 
         # State
         self._state = OrchestratorState.STOPPED
@@ -362,10 +363,17 @@ class IntelligentActionOrchestrator:
             logger.warning("Decision engine not available")
             return
 
-        # Get action suggestion from decision engine
-        # This is a simplified integration - full version would pass workspace state
         try:
             action_type, confidence, reasoning = await self._analyze_issue(issue)
+
+            # v237.4: Enrich with UAE learning database awareness
+            uae_enrichment = await self._enrich_with_uae(issue)
+            if uae_enrichment:
+                confidence_adj = uae_enrichment.get('confidence_adjustment', 0.0)
+                confidence = min(confidence + confidence_adj, 1.0)
+                supplement = uae_enrichment.get('reasoning_supplement', '')
+                if supplement:
+                    reasoning = f"{reasoning}. {supplement}"
 
             if action_type:
                 action = ProposedAction(
@@ -379,8 +387,6 @@ class IntelligentActionOrchestrator:
                 )
 
                 self._stats['actions_proposed'] += 1
-
-                # Route based on confidence
                 await self._route_action(action)
 
         except Exception as e:
@@ -420,6 +426,50 @@ class IntelligentActionOrchestrator:
             # Permission manager learning would adjust confidence here
 
         return action_type, confidence, reasoning
+
+    async def _enrich_with_uae(self, issue: DetectedIssue) -> Dict[str, Any]:
+        """
+        Enrich issue analysis with UAE learning database patterns.
+
+        Returns dict with: confidence_adjustment, reasoning_supplement.
+        Empty dict if UAE unavailable.
+        """
+        if not self._uae_engine:
+            return {}
+
+        enrichment = {}
+        try:
+            # Query learning database for historical patterns matching this issue type
+            learning_db = getattr(self._uae_engine, 'learning_db', None)
+            if learning_db and hasattr(learning_db, 'get_pattern_by_type'):
+                patterns = await learning_db.get_pattern_by_type(
+                    pattern_type=issue.issue_type,
+                    min_confidence=0.5,
+                    limit=5
+                )
+                if patterns:
+                    avg_confidence = sum(
+                        p.get('confidence', 0.5) for p in patterns
+                    ) / len(patterns)
+                    total_occurrences = sum(
+                        p.get('occurrence_count', 1) for p in patterns
+                    )
+
+                    # High historical confidence + many occurrences = boost
+                    if avg_confidence > 0.8 and total_occurrences > 3:
+                        enrichment['confidence_adjustment'] = 0.10
+                    elif avg_confidence > 0.6:
+                        enrichment['confidence_adjustment'] = 0.05
+
+                    enrichment['reasoning_supplement'] = (
+                        f"UAE learning: {len(patterns)} historical patterns "
+                        f"(avg confidence {avg_confidence:.0%}, "
+                        f"{total_occurrences} total occurrences)"
+                    )
+        except Exception as e:
+            logger.debug("UAE enrichment failed (non-fatal): %s", e)
+
+        return enrichment
 
     async def _route_action(self, action: ProposedAction) -> None:
         """

@@ -163,6 +163,8 @@ class AGIOSCoordinator:
         self._event_bridge: Optional[Any] = None  # v237.2: NeuralMesh ↔ EventStream bridge
         self._notification_monitor: Optional[Any] = None  # v237.2: macOS notification listener
         self._system_event_monitor: Optional[Any] = None  # v237.3: macOS system event listener
+        self._ghost_hands: Optional[Any] = None  # v237.4: Ghost Hands orchestrator
+        self._ghost_display: Optional[Any] = None  # v237.4: Ghost display manager
 
         # Hybrid Orchestrator
         self._hybrid_orchestrator: Optional[Any] = None
@@ -317,6 +319,21 @@ class AGIOSCoordinator:
             except Exception as e:
                 logger.warning("Error stopping SystemEventMonitor: %s", e)
 
+        # v237.4: Stop Ghost Display before Ghost Hands
+        if self._ghost_display:
+            try:
+                if hasattr(self._ghost_display, 'cleanup'):
+                    await self._ghost_display.cleanup()
+            except Exception as e:
+                logger.warning("Error stopping Ghost Display: %s", e)
+
+        # v237.4: Stop Ghost Hands orchestrator
+        if self._ghost_hands:
+            try:
+                await self._ghost_hands.stop()
+            except Exception as e:
+                logger.warning("Error stopping Ghost Hands: %s", e)
+
         # v237.3: Stop screen analyzer (stop monitoring before event stream stops)
         if self._screen_analyzer:
             try:
@@ -466,6 +483,40 @@ class AGIOSCoordinator:
             logger.warning("SystemEventMonitor not available: %s", e)
             self._component_status['system_event_monitor'] = ComponentStatus(
                 name='system_event_monitor',
+                available=False,
+                error=str(e)
+            )
+
+        # v237.4: Start Ghost Hands orchestrator (background automation)
+        try:
+            from ghost_hands.orchestrator import get_ghost_hands
+            self._ghost_hands = await get_ghost_hands()
+            self._component_status['ghost_hands'] = ComponentStatus(
+                name='ghost_hands',
+                available=True
+            )
+            logger.info("Ghost Hands orchestrator started")
+        except Exception as e:
+            logger.warning("Ghost Hands not available: %s", e)
+            self._component_status['ghost_hands'] = ComponentStatus(
+                name='ghost_hands',
+                available=False,
+                error=str(e)
+            )
+
+        # v237.4: Ghost Mode Display (virtual display management)
+        try:
+            from vision.yabai_space_detector import get_ghost_manager
+            self._ghost_display = get_ghost_manager()
+            self._component_status['ghost_display'] = ComponentStatus(
+                name='ghost_display',
+                available=True
+            )
+            logger.info("Ghost Display Manager registered")
+        except Exception as e:
+            logger.warning("Ghost Display Manager not available: %s", e)
+            self._component_status['ghost_display'] = ComponentStatus(
+                name='ghost_display',
                 available=False,
                 error=str(e)
             )
@@ -757,6 +808,22 @@ class AGIOSCoordinator:
             except Exception as e:
                 logger.warning("Event bridge not available: %s", e)
 
+        # v237.4: Initialize Ghost Display with YabaiSpaceDetector
+        if self._ghost_display:
+            try:
+                from vision.yabai_space_detector import get_yabai_detector
+                yabai_detector = get_yabai_detector(auto_start=False)
+                if yabai_detector:
+                    await self._ghost_display.initialize(yabai_detector)
+                    logger.info("Ghost Display Manager initialized with YabaiSpaceDetector")
+            except Exception as e:
+                logger.warning("Ghost Display initialization failed: %s", e)
+
+        # v237.4: Inject UAE into action orchestrator for enriched decisions
+        if self._action_orchestrator and self._uae_engine:
+            self._action_orchestrator._uae_engine = self._uae_engine
+            logger.info("UAE → Action Orchestrator connected")
+
         logger.debug("Components connected")
 
     async def _announce_startup(self) -> None:
@@ -986,6 +1053,8 @@ class AGIOSCoordinator:
             'neural_mesh': self._neural_mesh,
             'hybrid': self._hybrid_orchestrator,
             'learning_db': self._learning_db,
+            'ghost_hands': self._ghost_hands,
+            'ghost_display': self._ghost_display,
         }
         return components.get(name)
 
