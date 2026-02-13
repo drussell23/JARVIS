@@ -62870,12 +62870,13 @@ class JarvisSystemKernel:
             agent._runtime = self._agent_runtime
 
             # Spawn housekeeping as managed background task
-            task = asyncio.create_task(
+            # v250.1: Use create_safe_task (available in both imported and
+            # fallback paths) instead of manually referencing
+            # _fallback_task_done_callback which only exists in the
+            # except ImportError fallback scope.
+            task = create_safe_task(
                 self._agent_runtime.housekeeping_loop(),
                 name="agent-runtime-housekeeping",
-            )
-            task.add_done_callback(
-                lambda t: _fallback_task_done_callback(t, "agent-runtime-housekeeping")
             )
             self._background_tasks.append(task)
 

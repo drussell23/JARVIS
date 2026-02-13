@@ -581,13 +581,36 @@ if NEURAL_MESH_AVAILABLE:
             )
             self.tool = tool or ComputerUseTool()
 
-        async def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-            """Process a task from the Neural Mesh."""
-            goal = task.get("goal") or task.get("message", "")
-            context = task.get("context", {})
+        async def on_initialize(self, **kwargs) -> None:
+            """Initialize the Computer Use agent."""
+            logger.info("ComputerUseAgent initialized")
+
+        async def execute_task(self, payload: Dict[str, Any]) -> Any:
+            """Execute a task from the Neural Mesh orchestrator.
+
+            Implements the BaseNeuralMeshAgent abstract method. Delegates to
+            the underlying ComputerUseTool for UI automation actions.
+            """
+            action = payload.get("action", "")
+
+            if action == "computer_use":
+                goal = payload.get("goal") or payload.get("message", "")
+                context = payload.get("context", {})
+                result = await self.tool.run(goal=goal, context=context)
+                return {
+                    "success": result.success,
+                    "result": result.final_message,
+                    "actions_count": result.actions_count,
+                    "confidence": result.confidence,
+                }
+
+            # Default: treat entire payload as a task with goal/message
+            goal = payload.get("goal") or payload.get("message", "")
+            context = payload.get("context", {})
+            if not goal:
+                return {"success": False, "error": f"Unknown action: {action}"}
 
             result = await self.tool.run(goal=goal, context=context)
-
             return {
                 "success": result.success,
                 "result": result.final_message,
