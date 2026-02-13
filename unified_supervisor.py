@@ -63529,7 +63529,13 @@ class JarvisSystemKernel:
 
         with self.logger.section_start(LogSection.BOOT, "Zone 6.5 | AGI OS"):
             try:
-                agi_os_operational_timeout = _get_env_float("JARVIS_AGI_OS_TIMEOUT", 60.0)
+                # v251.1: Raised operational timeout from 60→90s to accommodate
+                # the neural mesh time-budget (default 75s).  init_timeout must
+                # exceed the neural mesh budget + headroom for other init phases
+                # (voice, approval, events, intelligence, orchestrator).
+                # Previously: operational=60, init=90 — neural mesh alone could
+                # take 300s (3 inner steps × 90-120s each), guaranteeing timeout.
+                agi_os_operational_timeout = _get_env_float("JARVIS_AGI_OS_TIMEOUT", 90.0)
                 agi_os_init_timeout = _get_env_float(
                     "JARVIS_AGI_OS_INIT_TIMEOUT",
                     agi_os_operational_timeout + 30.0,
@@ -63737,9 +63743,26 @@ class JarvisSystemKernel:
                 return False
 
             if not success:
-                self.logger.warning(f"[GhostDisplay] Failed to ensure ghost display: {error}")
-                self._update_component_status("ghost_display", "error", error or "Creation failed")
-                return False
+                # v251.1: Distinguish "not installed" (skip) from "runtime failure" (error).
+                # BetterDisplay CLI not found or app not running are missing optional
+                # dependencies — status should be "skipped", not "error".  Only true
+                # runtime failures (display creation crash, API error) merit "error".
+                _not_installed_signals = (
+                    "BetterDisplay CLI not found",
+                    "not running and could not be launched",
+                    "not installed",
+                )
+                is_missing_dependency = error and any(
+                    sig in error for sig in _not_installed_signals
+                )
+                if is_missing_dependency:
+                    self.logger.info(f"[GhostDisplay] Optional dependency not available: {error}")
+                    self._update_component_status("ghost_display", "skipped", error)
+                    return True  # Not a failure — just an unavailable optional feature
+                else:
+                    self.logger.warning(f"[GhostDisplay] Failed to ensure ghost display: {error}")
+                    self._update_component_status("ghost_display", "error", error or "Creation failed")
+                    return False
 
             self.logger.info("[GhostDisplay] Virtual display ready")
 
@@ -68647,26 +68670,28 @@ class JarvisSystemKernel:
         elif component == "reactor_core" and status == "complete":
             self._trinity_ready["reactor_core"] = True
 
+        # v213.0: Map internal names to dashboard names
+        # Dashboard uses hyphenated names, internal uses underscores
+        # v251.1: Computed BEFORE both dashboard and event-bus updates so
+        # the CliRenderer's COMPONENT_STATUS handler (line ~6276) writes
+        # the mapped name, not the raw internal name.  Previously the
+        # event carried "ghost_display" while the dashboard got "ghost-display",
+        # creating duplicate entries (ghostdis:EROR + ghost_di:EROR).
+        _DASHBOARD_NAME_MAP = {
+            "backend": "jarvis-body",
+            "jarvis_body": "jarvis-body",
+            "jarvis_prime": "jarvis-prime",
+            "reactor_core": "reactor-core",
+            "gcp_vm": "gcp-vm",
+            "ghost_display": "ghost-display",
+        }
+        dash_name = _DASHBOARD_NAME_MAP.get(component, component)
+
         # v197.1: Update LiveProgressDashboard with component status
         # v208.0: Use DASHBOARD_STATUS_MAP from readiness_config for consistent mapping
-        # v213.0: Map internal component names to dashboard component names
-        # CRITICAL FIX: "skipped" -> "skipped" (NOT "stopped")
         try:
             dashboard = get_live_dashboard()
             if dashboard.enabled:
-                # v213.0: Map internal names to dashboard names
-                # Dashboard uses hyphenated names, internal uses underscores
-                # "backend" -> "jarvis-body" for the main JARVIS service
-                dashboard_name_map = {
-                    "backend": "jarvis-body",
-                    "jarvis_body": "jarvis-body",
-                    "jarvis_prime": "jarvis-prime",
-                    "reactor_core": "reactor-core",
-                    "gcp_vm": "gcp-vm",
-                    "ghost_display": "ghost-display",  # v240.0
-                }
-                dash_name = dashboard_name_map.get(component, component)
-                
                 # Handle internal state aliases, then use unified mapping
                 # Internal states: "running" -> "starting", "complete" -> "healthy"
                 status_alias = {"running": "starting", "complete": "healthy"}
@@ -68677,11 +68702,12 @@ class JarvisSystemKernel:
             pass  # Dashboard updates are non-critical
 
         # v249.0: Emit component status event
+        # v251.1: Use dash_name (mapped) so CliRenderer writes the same key
         try:
             self._emit_event(
                 SupervisorEventType.COMPONENT_STATUS,
                 message or f"{component} {status}",
-                component=component,
+                component=dash_name,
                 metadata={"status": status},
             )
         except Exception:

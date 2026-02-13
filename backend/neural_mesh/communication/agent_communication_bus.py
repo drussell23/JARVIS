@@ -571,7 +571,12 @@ class AgentCommunicationBus:
                 )
 
                 if latency_ms > target_latency:
-                    logger.warning(
+                    # v251.1: Only WARNING for CRITICAL priority.
+                    # Other priorities log at DEBUG to avoid spam —
+                    # health checks and routine messages commonly exceed
+                    # targets when handlers do real work.
+                    _log = logger.warning if priority == MessagePriority.CRITICAL else logger.debug
+                    _log(
                         "Message %s exceeded latency target (%.2fms > %.2fms)",
                         message.message_id[:8],
                         latency_ms,

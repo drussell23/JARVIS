@@ -33,16 +33,12 @@ USAGE:
 """
 
 import asyncio
-import json
 import logging
 import os
-import shutil
-import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +170,28 @@ class PhantomHardwareManager:
         logger.info("[v68.0] 🔧 Ensuring Ghost Display exists...")
 
         # =================================================================
+        # STEP 0: Quick check — does the display already exist?
+        # v251.2: system_profiler works without CLI integration.
+        # If the display is already present, skip all CLI operations.
+        # =================================================================
+        existing_display = await self._find_display_via_system_profiler()
+        if existing_display:
+            logger.info(
+                f"[v68.0] Ghost Display '{self.ghost_display_name}' already "
+                f"exists (detected via system_profiler)"
+            )
+            self._ghost_display_info = existing_display
+
+            if wait_for_registration:
+                space_id = await self._verify_yabai_recognition_async(
+                    max_wait_seconds
+                )
+                if space_id and self._ghost_display_info:
+                    self._ghost_display_info.space_id = space_id
+
+            return True, None
+
+        # =================================================================
         # STEP 1: Discover BetterDisplay CLI
         # =================================================================
         cli_path = await self._discover_cli_path_async()
@@ -183,7 +201,7 @@ class PhantomHardwareManager:
                 "BetterDisplay CLI not found. Please install BetterDisplay from "
                 "https://betterdisplay.pro/ or use a physical HDMI dummy plug."
             )
-            logger.warning(f"[v68.0] ❌ {error_msg}")
+            logger.info(f"[v68.0] {error_msg}")
             return False, error_msg
 
         # =================================================================
@@ -199,28 +217,29 @@ class PhantomHardwareManager:
                     "BetterDisplay.app is not running and could not be launched. "
                     "Please start BetterDisplay manually."
                 )
-                logger.warning(f"[v68.0] ❌ {error_msg}")
+                logger.warning(f"[v68.0] {error_msg}")
                 return False, error_msg
 
             # Wait for app to initialize
             await asyncio.sleep(2.0)
 
         # =================================================================
-        # STEP 3: Check if Ghost Display Already Exists
+        # STEP 3: Check if Ghost Display Already Exists (via CLI)
         # =================================================================
         existing_display = await self._find_existing_ghost_display_async(cli_path)
 
         if existing_display:
             logger.info(
-                f"[v68.0] ✅ Ghost Display '{self.ghost_display_name}' already exists "
-                f"(ID: {existing_display.display_id})"
+                f"[v68.0] Ghost Display '{self.ghost_display_name}' already "
+                f"exists (ID: {existing_display.display_id})"
             )
             self._ghost_display_info = existing_display
 
-            # Verify yabai can see it
             if wait_for_registration:
-                space_id = await self._verify_yabai_recognition_async(max_wait_seconds)
-                if space_id:
+                space_id = await self._verify_yabai_recognition_async(
+                    max_wait_seconds
+                )
+                if space_id and self._ghost_display_info:
                     self._ghost_display_info.space_id = space_id
 
             return True, None
@@ -240,18 +259,20 @@ class PhantomHardwareManager:
         # =================================================================
         if wait_for_registration:
             self._stats["registration_waits"] += 1
-            space_id = await self._wait_for_display_registration_async(max_wait_seconds)
+            space_id = await self._wait_for_display_registration_async(
+                max_wait_seconds
+            )
 
             if space_id is None:
                 logger.warning(
-                    "[v68.0] ⚠️ Display created but yabai hasn't recognized it yet. "
-                    "It may appear shortly."
+                    "[v68.0] Display created but yabai hasn't recognized it "
+                    "yet. It may appear shortly."
                 )
 
             if self._ghost_display_info:
                 self._ghost_display_info.space_id = space_id
 
-        logger.info(f"[v68.0] ✅ Ghost Display '{self.ghost_display_name}' is ready")
+        logger.info(f"[v68.0] Ghost Display '{self.ghost_display_name}' is ready")
         return True, None
 
     # =========================================================================
@@ -329,22 +350,35 @@ class PhantomHardwareManager:
         except Exception as e:
             logger.debug(f"[v68.0] Spotlight discovery failed: {e}")
 
-        logger.warning("[v68.0] BetterDisplay CLI not found")
+        # v251.1: Downgraded from WARNING → INFO. BetterDisplay is optional.
+        logger.info("[v68.0] BetterDisplay CLI not found (optional)")
         return None
 
     async def _verify_cli_works_async(self, cli_path: str) -> bool:
-        """Verify the CLI is executable and responds."""
+        """Verify the CLI is executable and responds.
+
+        v251.2: Uses ``help`` instead of ``--version``.
+        BetterDisplay does NOT support ``--version`` — unrecognized flags
+        cause it to launch a **new app instance**, spawning zombie
+        processes and extra menu-bar icons on every verification attempt.
+        The ``help`` command exits cleanly and includes version info on
+        the first line (``BetterDisplay Version X.X.X Build NNNNN``).
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
-                cli_path, "--version",
+                cli_path, "help",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
             if proc.returncode == 0:
-                self._cli_version = stdout.decode().strip()
-                return True
+                output = stdout.decode().strip()
+                # First line: "BetterDisplay Version X.X.X Build NNNNN ..."
+                if output:
+                    first_line = output.split('\n')[0]
+                    self._cli_version = first_line.split(' - ')[0].strip()
+                    return True
 
         except Exception:
             pass
@@ -365,7 +399,7 @@ class PhantomHardwareManager:
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
 
-            return proc.returncode == 0 and stdout.decode().strip()
+            return proc.returncode == 0 and bool(stdout.decode().strip())
 
         except Exception:
             return False
@@ -402,36 +436,109 @@ class PhantomHardwareManager:
 
     async def _find_existing_ghost_display_async(
         self,
-        cli_path: str
+        cli_path: Optional[str] = None
     ) -> Optional[VirtualDisplayInfo]:
-        """Check if JARVIS Ghost Display already exists."""
+        """Check if JARVIS Ghost Display already exists.
+
+        v251.2: Uses two detection strategies:
+        1. BetterDisplay CLI ``get -nameLike=... -list`` (requires CLI
+           integration enabled in BetterDisplay settings)
+        2. ``system_profiler SPDisplaysDataType`` fallback — always
+           works, detects any display whose name contains the ghost
+           display name (case-insensitive, underscores treated as spaces)
+        """
+        # ==============================================================
+        # Strategy 1: BetterDisplay CLI (fast, but needs integration on)
+        # ==============================================================
+        if cli_path:
+            try:
+                # v251.2: Correct syntax is ``get -nameLike=... -list``
+                # (NOT ``list`` which is not a valid BetterDisplay operation
+                # and causes the app to launch a new instance).
+                search_name = self.ghost_display_name.replace("_", " ")
+                proc = await asyncio.create_subprocess_exec(
+                    cli_path, "get",
+                    f"-nameLike={search_name}", "-list",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=5.0
+                )
+
+                if proc.returncode == 0:
+                    output = stdout.decode()
+                    if output.strip() and "failed" not in output.lower():
+                        return VirtualDisplayInfo(
+                            name=self.ghost_display_name,
+                            is_active=True,
+                            is_jarvis_ghost=True,
+                            created_at=datetime.now()
+                        )
+            except Exception as e:
+                logger.debug(f"[v68.0] CLI display query failed: {e}")
+
+        # ==============================================================
+        # Strategy 2: system_profiler fallback (always available)
+        # ==============================================================
+        return await self._find_display_via_system_profiler()
+
+    async def _find_display_via_system_profiler(self) -> Optional[VirtualDisplayInfo]:
+        """Detect ghost display via macOS system_profiler.
+
+        v251.2: Works regardless of whether BetterDisplay CLI integration
+        is enabled.  Parses ``system_profiler SPDisplaysDataType`` output
+        for a display whose name contains our ghost display name
+        (case-insensitive, underscores→spaces).
+        """
         try:
-            # Query all virtual displays
             proc = await asyncio.create_subprocess_exec(
-                cli_path, "list",
+                "system_profiler", "SPDisplaysDataType",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=10.0
+            )
 
             if proc.returncode != 0:
                 return None
 
             output = stdout.decode()
+            # Match "JARVIS_GHOST" as "jarvis ghost" or "jarvis_ghost"
+            # in display names (system_profiler uses spaces)
+            search_variants = [
+                self.ghost_display_name.lower(),
+                self.ghost_display_name.lower().replace("_", " "),
+                self.ghost_display_name.lower().replace("_", ""),
+            ]
 
-            # Parse output to find our ghost display
-            # BetterDisplay CLI output format varies by version
-            if self.ghost_display_name.lower() in output.lower():
-                # Found our display - parse details
-                return VirtualDisplayInfo(
-                    name=self.ghost_display_name,
-                    is_active=True,
-                    is_jarvis_ghost=True,
-                    created_at=datetime.now()
-                )
+            output_lower = output.lower()
+            for variant in search_variants:
+                if variant in output_lower:
+                    # Parse resolution from nearby lines
+                    resolution = ""
+                    for line in output.splitlines():
+                        if any(v in line.lower() for v in search_variants):
+                            continue
+                        if "resolution" in line.lower() and resolution == "":
+                            # e.g. "Resolution: 5120 x 2880 ..."
+                            resolution = line.strip().split(":", 1)[-1].strip()
+
+                    logger.info(
+                        f"[v68.0] Found ghost display via system_profiler"
+                        f"{f': {resolution}' if resolution else ''}"
+                    )
+                    return VirtualDisplayInfo(
+                        name=self.ghost_display_name,
+                        resolution=resolution,
+                        is_active=True,
+                        is_jarvis_ghost=True,
+                        created_at=datetime.now()
+                    )
 
         except Exception as e:
-            logger.debug(f"[v68.0] Error checking existing displays: {e}")
+            logger.debug(f"[v68.0] system_profiler query failed: {e}")
 
         return None
 
@@ -440,12 +547,12 @@ class PhantomHardwareManager:
         cli_path: str
     ) -> Tuple[bool, Optional[str]]:
         """
-        v68.0: Create a new virtual display using BetterDisplay CLI.
+        v68.0/v251.2: Create a new virtual display using BetterDisplay CLI.
 
-        The display is created with:
-        - Custom name (JARVIS_GHOST)
-        - Preferred resolution (1920x1080 default)
-        - 16:9 aspect ratio
+        Uses the correct BetterDisplay CLI syntax:
+        ``create -type=VirtualScreen -virtualScreenName=NAME -aspectWidth=W -aspectHeight=H``
+
+        Requires CLI integration to be enabled in BetterDisplay settings.
         """
         logger.info(
             f"[v68.0] Creating virtual display: {self.ghost_display_name} "
@@ -453,63 +560,67 @@ class PhantomHardwareManager:
         )
 
         try:
-            # Parse resolution
-            width, height = self.preferred_resolution.split('x')
+            # Parse aspect ratio
+            aspect_parts = self.preferred_aspect.split(':')
+            aspect_w = aspect_parts[0] if len(aspect_parts) == 2 else "16"
+            aspect_h = aspect_parts[1] if len(aspect_parts) == 2 else "9"
 
-            # Build CLI command
-            # BetterDisplay CLI create command syntax may vary by version
-            # Try multiple command formats
-            commands_to_try = [
-                # Modern format
-                [cli_path, "create", "-name", self.ghost_display_name,
-                 "-resolution", self.preferred_resolution],
-                # Alternative format
-                [cli_path, "create", "--name", self.ghost_display_name,
-                 "--width", width, "--height", height],
-                # Simpler format
-                [cli_path, "create", self.ghost_display_name,
-                 self.preferred_resolution],
+            display_name = self.ghost_display_name.replace("_", " ")
+
+            # v251.2: Correct BetterDisplay CLI syntax (per help docs).
+            # ``create`` requires ``-type=VirtualScreen``.
+            cmd = [
+                cli_path, "create",
+                "-type=VirtualScreen",
+                f"-virtualScreenName={display_name}",
+                f"-aspectWidth={aspect_w}",
+                f"-aspectHeight={aspect_h}",
             ]
 
-            for cmd in commands_to_try:
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=10.0
+                )
+
+                combined = (stdout.decode() + stderr.decode()).strip()
+
+                if proc.returncode == 0 and "failed" not in combined.lower():
+                    self._ghost_display_info = VirtualDisplayInfo(
+                        name=self.ghost_display_name,
+                        resolution=self.preferred_resolution,
+                        is_active=True,
+                        is_jarvis_ghost=True,
+                        created_at=datetime.now()
                     )
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+                    logger.info("[v68.0] Virtual display created successfully")
+                    return True, None
 
-                    if proc.returncode == 0:
-                        self._ghost_display_info = VirtualDisplayInfo(
-                            name=self.ghost_display_name,
-                            resolution=self.preferred_resolution,
-                            is_active=True,
-                            is_jarvis_ghost=True,
-                            created_at=datetime.now()
-                        )
+                # "already exists" is success
+                if "already exists" in combined.lower():
+                    self._ghost_display_info = VirtualDisplayInfo(
+                        name=self.ghost_display_name,
+                        resolution=self.preferred_resolution,
+                        is_active=True,
+                        is_jarvis_ghost=True,
+                    )
+                    return True, None
 
-                        logger.info(f"[v68.0] ✅ Virtual display created successfully")
-                        return True, None
+                # "Failed." typically means CLI integration is disabled
+                if combined.lower().strip() == "failed.":
+                    return False, (
+                        "BetterDisplay CLI integration is disabled. "
+                        "Enable it in BetterDisplay > Settings > Integration."
+                    )
 
-                    # Check for specific errors
-                    error_output = stderr.decode() + stdout.decode()
-                    if "already exists" in error_output.lower():
-                        # Display already exists - this is fine
-                        self._ghost_display_info = VirtualDisplayInfo(
-                            name=self.ghost_display_name,
-                            resolution=self.preferred_resolution,
-                            is_active=True,
-                            is_jarvis_ghost=True
-                        )
-                        return True, None
+                return False, f"CLI create failed: {combined}"
 
-                except asyncio.TimeoutError:
-                    logger.debug(f"[v68.0] Command timed out: {cmd}")
-                    continue
-
-            # All commands failed
-            return False, "Failed to create virtual display - CLI command failed"
+            except asyncio.TimeoutError:
+                return False, "Display creation timed out"
 
         except Exception as e:
             error_msg = f"Display creation error: {e}"
@@ -639,12 +750,11 @@ class PhantomHardwareManager:
         # App status
         status.app_running = await self._check_app_running_async()
 
-        # Display status
-        if cli_path:
-            existing = await self._find_existing_ghost_display_async(cli_path)
-            if existing:
-                status.ghost_display_active = True
-                status.ghost_display_info = existing
+        # Display status (uses system_profiler fallback if CLI fails)
+        existing = await self._find_existing_ghost_display_async(cli_path)
+        if existing:
+            status.ghost_display_active = True
+            status.ghost_display_info = existing
 
         # Permissions
         permissions = await self.check_permissions_async()
@@ -664,20 +774,21 @@ class PhantomHardwareManager:
             return False, "BetterDisplay CLI not found"
 
         try:
-            # Try to delete the display
+            # v251.2: Correct syntax is ``discard -nameLike=...``
+            search_name = self.ghost_display_name.replace("_", " ")
             proc = await asyncio.create_subprocess_exec(
-                cli_path, "delete", "-name", self.ghost_display_name,
+                cli_path, "discard", f"-nameLike={search_name}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
             if proc.returncode == 0:
                 self._ghost_display_info = None
                 logger.info(f"[v68.0] Destroyed Ghost Display '{self.ghost_display_name}'")
                 return True, None
 
-            return False, "Failed to delete display"
+            return False, "Failed to discard display"
 
         except Exception as e:
             return False, str(e)

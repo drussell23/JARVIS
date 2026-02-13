@@ -211,6 +211,8 @@ class AGIOSCoordinator:
 
         # Background tasks
         self._health_task: Optional[asyncio.Task] = None
+        # v251.2: Strong refs prevent GC of fire-and-forget tasks
+        self._background_tasks: set = set()
 
         # Statistics
         self._stats = {
@@ -487,11 +489,21 @@ class AGIOSCoordinator:
             raise
 
     async def _init_agi_os_components(self) -> None:
-        """Initialize core AGI OS components."""
+        """Initialize core AGI OS components.
+
+        v251.2: Each component is wrapped in ``asyncio.wait_for()`` with
+        a per-component timeout.  Previously these were unbounded awaits
+        — any single hanging getter could stall the entire init chain.
+        Timeout default: 15s, override: ``JARVIS_AGI_OS_COMPONENT_TIMEOUT``.
+        """
+        _comp_timeout = _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT", 15.0)
+
         # Voice communicator
         if self._config['enable_voice']:
             try:
-                self._voice = await get_voice_communicator()
+                self._voice = await asyncio.wait_for(
+                    get_voice_communicator(), timeout=_comp_timeout
+                )
                 self._component_status['voice'] = ComponentStatus(
                     name='voice',
                     available=True
@@ -509,7 +521,9 @@ class AGIOSCoordinator:
 
         # Approval manager
         try:
-            self._approval_manager = await get_approval_manager()
+            self._approval_manager = await asyncio.wait_for(
+                get_approval_manager(), timeout=_comp_timeout
+            )
             self._component_status['approval'] = ComponentStatus(
                 name='approval',
                 available=True
@@ -527,7 +541,9 @@ class AGIOSCoordinator:
 
         # Event stream
         try:
-            self._event_stream = await get_event_stream()
+            self._event_stream = await asyncio.wait_for(
+                get_event_stream(), timeout=_comp_timeout
+            )
             self._component_status['events'] = ComponentStatus(
                 name='events',
                 available=True
@@ -546,7 +562,9 @@ class AGIOSCoordinator:
         # Action orchestrator
         if self._config['enable_autonomous_actions']:
             try:
-                self._action_orchestrator = await start_action_orchestrator()
+                self._action_orchestrator = await asyncio.wait_for(
+                    start_action_orchestrator(), timeout=_comp_timeout
+                )
                 self._component_status['orchestrator'] = ComponentStatus(
                     name='orchestrator',
                     available=True
@@ -565,7 +583,9 @@ class AGIOSCoordinator:
         # v237.2: Start macOS notification monitor
         try:
             from macos_helper.notification_monitor import get_notification_monitor
-            self._notification_monitor = await get_notification_monitor(auto_start=True)
+            self._notification_monitor = await asyncio.wait_for(
+                get_notification_monitor(auto_start=True), timeout=_comp_timeout
+            )
             self._component_status['notification_monitor'] = ComponentStatus(
                 name='notification_monitor',
                 available=True
@@ -583,7 +603,9 @@ class AGIOSCoordinator:
         # v237.3: Start macOS system event monitor (app focus, idle, sleep/wake, spaces)
         try:
             from macos_helper.system_event_monitor import get_system_event_monitor
-            self._system_event_monitor = await get_system_event_monitor(auto_start=True)
+            self._system_event_monitor = await asyncio.wait_for(
+                get_system_event_monitor(auto_start=True), timeout=_comp_timeout
+            )
             self._component_status['system_event_monitor'] = ComponentStatus(
                 name='system_event_monitor',
                 available=True
@@ -601,7 +623,9 @@ class AGIOSCoordinator:
         # v237.4: Start Ghost Hands orchestrator (background automation)
         try:
             from ghost_hands.orchestrator import get_ghost_hands
-            self._ghost_hands = await get_ghost_hands()
+            self._ghost_hands = await asyncio.wait_for(
+                get_ghost_hands(), timeout=_comp_timeout
+            )
             self._component_status['ghost_hands'] = ComponentStatus(
                 name='ghost_hands',
                 available=True
@@ -635,8 +659,28 @@ class AGIOSCoordinator:
         await self._report_init_progress("ghost_display", "Ghost Display done")
 
     async def _init_intelligence_systems(self) -> None:
-        """Initialize intelligence systems (UAE, SAI, CAI)."""
-        # UAE (Unified Awareness Engine)
+        """Initialize intelligence systems (UAE, SAI, CAI, voice biometrics).
+
+        v251.1: Time-budget pattern for the 3 timed steps (learning_db,
+        speaker_verification, owner_identity).  Previously each had independent
+        timeouts (60+90+45=195s) which could exceed the supervisor's outer
+        budget on their own.  UAE/SAI/CAI are synchronous imports (<1s).
+
+        Budget allocation for timed steps:
+          learning_db:           20%  (DB connection, usually fast)
+          speaker_verification:  50%  (heaviest — loads ECAPA-TDNN model)
+          owner_identity:        30%  (depends on speaker_verification)
+        """
+        # Total budget for intelligence timed steps.
+        # Default 45s — typical is 15-30s. The 3 sync imports (UAE/SAI/CAI)
+        # run first and don't count against this budget.
+        intel_budget = _env_float("JARVIS_AGI_OS_INTEL_BUDGET", 45.0)
+        intel_start = time.monotonic()
+
+        def _intel_remaining() -> float:
+            return max(1.0, intel_budget - (time.monotonic() - intel_start))
+
+        # UAE (Unified Awareness Engine) — sync import, no timeout needed
         try:
             from core.hybrid_orchestrator import _get_uae
             self._uae_engine = _get_uae()
@@ -655,7 +699,7 @@ class AGIOSCoordinator:
             )
         await self._report_init_progress("uae", "UAE initialization complete")
 
-        # SAI (Self-Aware Intelligence)
+        # SAI (Self-Aware Intelligence) — sync import, no timeout needed
         try:
             from core.hybrid_orchestrator import _get_sai
             self._sai_system = _get_sai()
@@ -674,7 +718,7 @@ class AGIOSCoordinator:
             )
         await self._report_init_progress("sai", "SAI initialization complete")
 
-        # CAI (Context Awareness Intelligence)
+        # CAI (Context Awareness Intelligence) — sync import, no timeout needed
         try:
             from core.hybrid_orchestrator import _get_cai
             self._cai_system = _get_cai()
@@ -693,10 +737,13 @@ class AGIOSCoordinator:
             )
         await self._report_init_progress("cai", "CAI initialization complete")
 
-        # Learning Database
+        # Learning Database (20% of budget)
         try:
             from core.hybrid_orchestrator import _get_learning_db
-            learning_db_timeout = _env_float("JARVIS_AGI_OS_LEARNING_DB_TIMEOUT", 60.0)
+            learning_db_timeout = min(
+                _env_float("JARVIS_AGI_OS_LEARNING_DB_TIMEOUT", intel_budget * 0.2),
+                _intel_remaining(),
+            )
             self._learning_db = await self._run_timed_init_step(
                 "learning_db",
                 _get_learning_db,
@@ -717,12 +764,15 @@ class AGIOSCoordinator:
             )
         await self._report_init_progress("learning_db", "Learning DB initialization complete")
 
-        # Speaker Verification Service (for voice biometrics)
+        # Speaker Verification Service (50% of budget — heaviest, loads ECAPA-TDNN)
         # v236.1: Use singleton to avoid duplicate instances (double memory,
         # competing encoder loads, enrollment updates not shared).
         try:
             from voice.speaker_verification_service import get_speaker_verification_service
-            speaker_timeout = _env_float("JARVIS_AGI_OS_SPEAKER_TIMEOUT", 90.0)
+            speaker_timeout = min(
+                _env_float("JARVIS_AGI_OS_SPEAKER_TIMEOUT", intel_budget * 0.5),
+                _intel_remaining(),
+            )
 
             async def _load_speaker_verification() -> Any:
                 return await get_speaker_verification_service(
@@ -751,9 +801,12 @@ class AGIOSCoordinator:
             "Speaker verification initialization complete",
         )
 
-        # Owner Identity Service (dynamic voice biometric identification)
+        # Owner Identity Service (30% of budget)
         try:
-            owner_identity_timeout = _env_float("JARVIS_AGI_OS_OWNER_ID_TIMEOUT", 45.0)
+            owner_identity_timeout = min(
+                _env_float("JARVIS_AGI_OS_OWNER_ID_TIMEOUT", intel_budget * 0.3),
+                _intel_remaining(),
+            )
 
             async def _load_owner_identity() -> tuple[Any, Any]:
                 service = await get_owner_identity(
@@ -792,22 +845,55 @@ class AGIOSCoordinator:
             )
         await self._report_init_progress("owner_identity", "Owner identity initialization complete")
 
+        elapsed = time.monotonic() - intel_start
+        logger.info("Intelligence systems initialized in %.1fs (budget: %.0fs)", elapsed, intel_budget)
+
     async def _init_neural_mesh(self) -> None:
-        """Initialize Neural Mesh coordinator and production agents."""
+        """Initialize Neural Mesh coordinator and production agents.
+
+        v251.1: Time-budget pattern — a single total budget is split across
+        the 3 sequential steps (coordinator, agents, bridge) so the sum of
+        inner timeouts never exceeds the outer timeout in the supervisor's
+        asyncio.wait_for().  Previously each step had independent 90-120s
+        defaults, summing to ~300s — far exceeding the supervisor's 90s
+        outer budget, guaranteeing a TimeoutError and agi_os:EROR status.
+
+        Budget allocation (proportional):
+          coordinator: 40%   (critical — must complete for agents/bridge)
+          agents:      30%   (important but non-fatal)
+          bridge:      30%   (important but non-fatal)
+        """
         try:
+            # Total budget for all neural mesh init steps.
+            # Default 75s fits comfortably within the supervisor's 90s outer timeout
+            # (JARVIS_AGI_OS_INIT_TIMEOUT default = 60+30 = 90s).
+            total_budget = _env_float("JARVIS_AGI_OS_NEURAL_MESH_BUDGET", 75.0)
+            budget_start = time.monotonic()
+
+            def _remaining() -> float:
+                """Remaining time in the budget."""
+                return max(1.0, total_budget - (time.monotonic() - budget_start))
+
+            # Step 1: Start coordinator (40% of budget)
             from neural_mesh import start_neural_mesh
-            mesh_timeout = _env_float("JARVIS_AGI_OS_NEURAL_MESH_TIMEOUT", 120.0)
+            mesh_timeout = min(
+                _env_float("JARVIS_AGI_OS_NEURAL_MESH_TIMEOUT", total_budget * 0.4),
+                _remaining(),
+            )
             self._neural_mesh = await self._run_timed_init_step(
                 "neural_mesh",
                 start_neural_mesh,
                 timeout_seconds=mesh_timeout,
             )
 
-            # v237.0: Register production agents (previously only called from deprecated supervisor)
+            # Step 2: Register production agents (30% of budget, non-fatal)
             n_production = 0
             try:
                 from neural_mesh.agents.agent_initializer import initialize_production_agents
-                agent_timeout = _env_float("JARVIS_AGI_OS_NEURAL_AGENT_TIMEOUT", 90.0)
+                agent_timeout = min(
+                    _env_float("JARVIS_AGI_OS_NEURAL_AGENT_TIMEOUT", total_budget * 0.3),
+                    _remaining(),
+                )
 
                 async def _init_production_agents() -> Any:
                     return await initialize_production_agents(self._neural_mesh)
@@ -821,12 +907,14 @@ class AGIOSCoordinator:
             except Exception as agent_exc:
                 logger.warning("Production agent initialization failed (mesh still running): %s", agent_exc)
 
-            # v237.0: Wire system adapters (voice, vision, intelligence, autonomy)
-            # Bridge uses the same coordinator singleton — no conflict with production agents
+            # Step 3: Wire system adapters (30% of budget, non-fatal)
             n_adapters = 0
             try:
                 from neural_mesh import start_jarvis_neural_mesh
-                bridge_timeout = _env_float("JARVIS_AGI_OS_NEURAL_BRIDGE_TIMEOUT", 90.0)
+                bridge_timeout = min(
+                    _env_float("JARVIS_AGI_OS_NEURAL_BRIDGE_TIMEOUT", total_budget * 0.3),
+                    _remaining(),
+                )
                 self._jarvis_bridge = await self._run_timed_init_step(
                     "neural_mesh_bridge",
                     start_jarvis_neural_mesh,
@@ -837,7 +925,11 @@ class AGIOSCoordinator:
                 logger.warning("JARVIS Neural Mesh Bridge failed (mesh still running): %s", bridge_exc)
 
             total = len(self._neural_mesh.get_all_agents()) if hasattr(self._neural_mesh, 'get_all_agents') else n_production + n_adapters
-            logger.info("Neural Mesh started: %d agents total (%d production, %d adapters)", total, n_production, n_adapters)
+            elapsed = time.monotonic() - budget_start
+            logger.info(
+                "Neural Mesh started: %d agents total (%d production, %d adapters) in %.1fs (budget: %.0fs)",
+                total, n_production, n_adapters, elapsed, total_budget,
+            )
 
             self._component_status['neural_mesh'] = ComponentStatus(
                 name='neural_mesh',
@@ -958,15 +1050,18 @@ class AGIOSCoordinator:
         # Connect approval callbacks
         if self._approval_manager and self._event_stream:
             def on_approval(request, response):
-                # Emit event for approval decisions
-                asyncio.create_task(
+                # v251.2: Store task ref to prevent GC + log errors
+                task = asyncio.create_task(
                     self._event_stream.emit(AGIEvent(
                         event_type=EventType.USER_APPROVED if response.approved else EventType.USER_DENIED,
                         source="approval_manager",
                         data={'request_id': request.request_id},
                         correlation_id=request.request_id,
-                    ))
+                    )),
+                    name="approval_event_emit",
                 )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
             self._approval_manager.on_approval(on_approval)
 
@@ -1096,7 +1191,26 @@ class AGIOSCoordinator:
         logger.debug("Components connected")
 
     async def _announce_startup(self) -> None:
-        """Announce AGI OS startup via voice with dynamic owner identification."""
+        """Announce AGI OS startup via voice with dynamic owner identification.
+
+        v251.2: Wrapped in a hard timeout to prevent voice TTS hangs from
+        stalling the entire startup sequence.  Default: 15s.
+        """
+        announce_timeout = _env_float("JARVIS_AGI_OS_ANNOUNCE_TIMEOUT", 15.0)
+        try:
+            await asyncio.wait_for(
+                self._announce_startup_inner(), timeout=announce_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Startup announcement timed out after %.0fs (non-fatal)",
+                announce_timeout,
+            )
+        except Exception as e:
+            logger.warning("Startup announcement failed (non-fatal): %s", e)
+
+    async def _announce_startup_inner(self) -> None:
+        """Inner implementation of startup announcement (no timeout here)."""
         # Count available components
         available = sum(1 for s in self._component_status.values() if s.available)
         total = len(self._component_status)

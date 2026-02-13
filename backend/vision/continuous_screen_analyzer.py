@@ -44,7 +44,11 @@ class MemoryAwareScreenAnalyzer:
             'max_captures_in_memory': int(os.getenv('VISION_MAX_CAPTURES', '10')),
             'capture_retention_seconds': int(os.getenv('VISION_CAPTURE_RETENTION', '300')),  # 5 minutes
             'cache_duration_seconds': float(os.getenv('VISION_CACHE_DURATION', '5.0')),
-            'memory_limit_mb': int(os.getenv('VISION_MEMORY_LIMIT_MB', '200')),  # 200MB for this component
+            # v251.1: Raised from 200→1500MB.  This checks PROCESS RSS (entire
+            # JARVIS monolith), not this component alone.  A normal JARVIS
+            # process loading ECAPA-TDNN + 60 neural mesh agents + learning DB
+            # easily uses 700MB+.  200MB guaranteed the check always fails.
+            'memory_limit_mb': int(os.getenv('VISION_MEMORY_LIMIT_MB', '1500')),
             'memory_check_interval': float(os.getenv('VISION_MEMORY_CHECK_INTERVAL', '10.0')),
             'low_memory_threshold_mb': int(os.getenv('VISION_LOW_MEMORY_MB', '2000')),  # 2GB free RAM
             'critical_memory_threshold_mb': int(os.getenv('VISION_CRITICAL_MEMORY_MB', '1000')),  # 1GB free RAM
@@ -227,10 +231,18 @@ class MemoryAwareScreenAnalyzer:
         if available_mb < self.config['critical_memory_threshold_mb']:
             return False
         
-        # Check process memory limit
+        # v251.1: Check process memory against limit.  Only log once per
+        # threshold crossing to avoid log spam (was logging every check cycle).
         if process_mb > self.config['memory_limit_mb']:
-            logger.warning(f"Process memory {process_mb}MB exceeds limit {self.config['memory_limit_mb']}MB")
+            if not getattr(self, '_memory_warned', False):
+                logger.warning(
+                    "Process memory %.0fMB exceeds limit %dMB — skipping captures",
+                    process_mb, self.config['memory_limit_mb'],
+                )
+                self._memory_warned = True
             return False
+        else:
+            self._memory_warned = False
         
         return True
     

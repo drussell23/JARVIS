@@ -30,12 +30,16 @@ class CommunicationBusConfig:
     # Message history size for debugging
     message_history_size: int = 1000
 
-    # Latency targets in milliseconds
+    # v251.1: Latency targets in milliseconds — includes handler execution
+    # time, not just transport.  Previous targets (1/5/10/50ms) were pure
+    # transport aspirations — any handler doing real work (health checks,
+    # DB queries, ML inference) exceeds them, generating constant WARNINGs.
+    # Raised to realistic end-to-end delivery targets.
     latency_targets_ms: Dict[int, float] = field(default_factory=lambda: {
-        0: 1.0,    # CRITICAL: <1ms
-        1: 5.0,    # HIGH: <5ms
-        2: 10.0,   # NORMAL: <10ms
-        3: 50.0,   # LOW: <50ms
+        0: 50.0,    # CRITICAL: <50ms  (was 1ms)
+        1: 200.0,   # HIGH: <200ms     (was 5ms)
+        2: 500.0,   # NORMAL: <500ms   (was 10ms)
+        3: 2000.0,  # LOW: <2s         (was 50ms)
     })
 
     # Message expiration defaults (seconds)
