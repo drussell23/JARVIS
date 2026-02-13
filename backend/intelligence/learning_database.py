@@ -5592,6 +5592,140 @@ class JARVISLearningDatabase:
 
             return result
 
+    async def get_preferences(
+        self,
+        category: Optional[str] = None,
+        min_confidence: float = 0.5,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get learned preferences ordered by confidence and recency.
+
+        Args:
+            category: Optional preference category filter
+            min_confidence: Minimum confidence score (0.0-1.0)
+            limit: Maximum number of preferences to return
+
+        Returns:
+            List of preference records
+        """
+        safe_limit = max(1, min(int(limit), 5000))
+
+        query = """
+            SELECT *
+            FROM user_preferences
+            WHERE confidence >= ?
+        """
+        params: List[Any] = [min_confidence]
+
+        if category:
+            query += " AND category = ?"
+            params.append(category)
+
+        query += " ORDER BY confidence DESC, updated_at DESC LIMIT ?"
+        params.append(safe_limit)
+
+        async with self.db.cursor() as cursor:
+            await cursor.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+
+        return [dict(row) for row in rows]
+
+    async def get_recent_interactions(
+        self,
+        limit: int = 200,
+        session_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        response_types: Optional[List[str]] = None,
+        significant_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get recent conversation interactions from persistent storage.
+
+        Args:
+            limit: Maximum records to return
+            session_id: Optional session filter
+            since: Optional timestamp lower-bound
+            response_types: Optional response_type allow-list
+            significant_only: If True, keep only high-signal interactions
+
+        Returns:
+            List of interaction records ordered by newest first
+        """
+        safe_limit = max(1, min(int(limit), 5000))
+        params: List[Any] = []
+
+        query = """
+            SELECT
+                interaction_id,
+                timestamp,
+                session_id,
+                user_query,
+                jarvis_response,
+                response_type,
+                confidence_score,
+                execution_time_ms,
+                success,
+                user_feedback,
+                feedback_score,
+                was_corrected,
+                correction_text,
+                context_snapshot,
+                active_apps,
+                current_space,
+                system_state,
+                embedding_id,
+                created_at
+            FROM conversation_history
+            WHERE 1=1
+        """
+
+        if session_id:
+            query += " AND session_id = ?"
+            params.append(session_id)
+
+        if since:
+            query += " AND timestamp >= ?"
+            params.append(since)
+
+        if response_types:
+            cleaned_types = [str(t).strip() for t in response_types if str(t).strip()]
+            if cleaned_types:
+                placeholders = ", ".join(["?"] * len(cleaned_types))
+                query += f" AND response_type IN ({placeholders})"
+                params.extend(cleaned_types)
+
+        if significant_only:
+            query += """
+                AND (
+                    was_corrected = TRUE
+                    OR feedback_score IS NOT NULL
+                    OR success = FALSE
+                    OR response_type IN ('decision', 'system_decision', 'security', 'error', 'command')
+                )
+            """
+
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(safe_limit)
+
+        async with self.db.cursor() as cursor:
+            await cursor.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+
+        interactions: List[Dict[str, Any]] = []
+        for row in rows:
+            record = dict(row)
+            for json_field in ("context_snapshot", "active_apps", "system_state"):
+                raw_value = record.get(json_field)
+                if isinstance(raw_value, str) and raw_value:
+                    try:
+                        record[json_field] = json.loads(raw_value)
+                    except Exception:
+                        pass
+            interactions.append(record)
+
+        return interactions
+
     # ==================== Analytics & Metrics ====================
 
     async def get_learning_metrics(self) -> Dict[str, Any]:

@@ -2718,17 +2718,20 @@ The email should:
 
 EMAIL BODY:"""
 
-                    # Use workspace_email task type for routing
-                    result = await model_serving.generate(
-                        prompt=email_prompt,
-                        task_type="workspace_email",
+                    # Build ModelRequest for the unified serving API
+                    from intelligence.unified_model_serving import ModelRequest, TaskType as MSTaskType
+                    request = ModelRequest(
+                        messages=[{"role": "user", "content": email_prompt}],
+                        task_type=MSTaskType.CHAT,
                         max_tokens=800,
+                        temperature=0.7,
                     )
+                    result = await model_serving.generate(request)
 
-                    if result.get("text"):
-                        body = result["text"].strip()
+                    if result.success and result.content:
+                        body = result.content.strip()
                         generated_body = True
-                        model_used = result.get("provider", "prime")
+                        model_used = result.provider.value if result.provider else "prime"
                         generation_time_ms = (time_module.time() - generation_start) * 1000
 
                         logger.info(

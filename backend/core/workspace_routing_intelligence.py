@@ -148,7 +148,10 @@ class WorkspaceIntentDetector:
                 "email draft", "prepare email",
             ],
             entity_patterns={
-                "recipient": r"to\s+(\S+(?:\s+[a-z]+)?)",  # "to John Smith" or "to user@email.com"
+                # Captures email addresses (user@domain) or names (John Smith).
+                # Stops before prepositions (about, regarding, for, with, on, at)
+                # so "to test@example.com about X" captures only "test@example.com".
+                "recipient": r"to\s+(\S+@\S+|[A-Za-z]+(?:\s+[A-Za-z]+)?)(?=\s+(?:about|regarding|for|with|on|at)\b|\s*$)",
                 "subject": r"(?:about|regarding|re:|subject:?)\s+(.+?)(?:\s+to|\s+for|$)",
             },
             visual_keywords=["draft", "compose", "write", "type"],
@@ -162,7 +165,7 @@ class WorkspaceIntentDetector:
                 "email to", "message to", "send to",
             ],
             entity_patterns={
-                "recipient": r"(?:to|email)\s+(\S+(?:\s+[a-z]+)?)",
+                "recipient": r"(?:to|email)\s+(\S+@\S+|[A-Za-z]+(?:\s+[A-Za-z]+)?)(?=\s+(?:about|regarding|for|with|on|at|saying|that)\b|\s*$)",
                 "content": r"(?:saying|that says|message:?)\s+(.+)$",
             },
             visual_keywords=[],

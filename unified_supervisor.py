@@ -20642,6 +20642,496 @@ class IntelligenceRegistry:
         return {name: manager.status for name, manager in self._managers.items()}
 
 
+class PersistentConversationMemoryAgent:
+    """
+    Durable conversation-memory bridge for kernel-level orchestration.
+
+    Responsibilities:
+    - Load high-signal historical interactions and preferences on boot
+    - Persist significant conversations, decisions, and preferences to SQLite
+    - Publish cross-repo memory snapshot for JARVIS/Prime/Reactor coordination
+    - Provide bounded, async, non-blocking ingestion with deterministic shutdown
+    """
+
+    def __init__(self, kernel_id: str, repo_name: str = "jarvis") -> None:
+        self.kernel_id = kernel_id
+        self.repo_name = repo_name
+        self.session_id = f"memory_{uuid.uuid4().hex[:12]}"
+        self._logger = logging.getLogger("jarvis.memory_agent")
+
+        self._queue_maxsize = max(100, int(os.getenv("JARVIS_MEMORY_QUEUE_SIZE", "2000")))
+        self._worker_count = max(1, int(os.getenv("JARVIS_MEMORY_WORKERS", "2")))
+        self._drain_timeout = float(os.getenv("JARVIS_MEMORY_DRAIN_TIMEOUT", "20.0"))
+        self._init_timeout = float(os.getenv("JARVIS_MEMORY_INIT_TIMEOUT", "25.0"))
+        self._boot_interaction_limit = max(
+            10, int(os.getenv("JARVIS_MEMORY_BOOT_INTERACTIONS", "200"))
+        )
+        self._boot_preference_limit = max(
+            10, int(os.getenv("JARVIS_MEMORY_BOOT_PREFERENCES", "200"))
+        )
+        self._min_preference_confidence = float(
+            os.getenv("JARVIS_MEMORY_MIN_PREF_CONFIDENCE", "0.55")
+        )
+        self._persist_only_significant = (
+            os.getenv("JARVIS_MEMORY_SIGNIFICANT_ONLY", "true").lower()
+            in ("1", "true", "yes")
+        )
+
+        self._state_dir = Path.home() / ".jarvis" / "trinity" / "state"
+        self._state_file = self._state_dir / "conversation_memory_state.json"
+
+        self._running = False
+        self._queue: "asyncio.Queue[Tuple[str, Dict[str, Any]]]" = asyncio.Queue(
+            maxsize=self._queue_maxsize
+        )
+        self._workers: List[asyncio.Task] = []
+        self._boot_context: Dict[str, Any] = {
+            "loaded_at": None,
+            "interactions": [],
+            "preferences": [],
+            "stats": {
+                "interactions_loaded": 0,
+                "preferences_loaded": 0,
+            },
+        }
+
+        self._stats: Dict[str, Any] = {
+            "events_enqueued": 0,
+            "events_persisted": 0,
+            "events_dropped": 0,
+            "events_failed": 0,
+            "interactions_skipped": 0,
+            "last_persisted_at": None,
+            "started_at": None,
+        }
+
+    async def start(self) -> bool:
+        """Initialize DB integration, load boot context, and start workers."""
+        if self._running:
+            return True
+
+        try:
+            await asyncio.wait_for(self._load_boot_context(), timeout=self._init_timeout)
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                f"[MemoryAgent] Boot context load timed out ({self._init_timeout:.1f}s)"
+            )
+            return False
+        except Exception as e:
+            self._logger.warning(f"[MemoryAgent] Boot context load failed: {e}")
+            return False
+
+        self._running = True
+        self._stats["started_at"] = datetime.now().isoformat()
+
+        for idx in range(self._worker_count):
+            task = create_safe_task(
+                self._worker_loop(worker_id=idx),
+                name=f"memory-agent-worker-{idx}",
+            )
+            self._workers.append(task)
+
+        self._logger.info(
+            f"[MemoryAgent] Started (session={self.session_id}, workers={self._worker_count})"
+        )
+        return True
+
+    async def stop(self) -> None:
+        """Drain and stop workers, then close singleton learning DB."""
+        if not self._running and not self._workers:
+            return
+
+        self._running = False
+
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=self._drain_timeout)
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                f"[MemoryAgent] Queue drain timed out ({self._drain_timeout:.1f}s)"
+            )
+
+        for task in self._workers:
+            task.cancel()
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers.clear()
+
+        # Final state snapshot for cross-repo consumers.
+        try:
+            await self._publish_state_snapshot()
+        except Exception:
+            pass
+
+        # Shared singleton close (safe/no-op if never initialized).
+        try:
+            from backend.intelligence.learning_database import close_learning_database
+        except Exception:
+            close_learning_database = None
+        if close_learning_database:
+            try:
+                await close_learning_database()
+            except Exception as e:
+                self._logger.debug(f"[MemoryAgent] close_learning_database warning: {e}")
+
+        self._logger.info(
+            f"[MemoryAgent] Stopped (persisted={self._stats['events_persisted']}, "
+            f"failed={self._stats['events_failed']}, dropped={self._stats['events_dropped']})"
+        )
+
+    async def record_interaction(
+        self,
+        user_query: str,
+        jarvis_response: str,
+        response_type: Optional[str] = None,
+        confidence_score: Optional[float] = None,
+        execution_time_ms: Optional[float] = None,
+        success: bool = True,
+        session_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        force_persist: bool = False,
+    ) -> bool:
+        """Queue a conversation interaction for async persistence."""
+        if not self._running:
+            return False
+
+        if not force_persist and not self._is_significant_interaction(
+            user_query=user_query,
+            response_type=response_type,
+            success=success,
+            confidence_score=confidence_score,
+            context=context or {},
+        ):
+            self._stats["interactions_skipped"] += 1
+            return False
+
+        payload = {
+            "user_query": user_query,
+            "jarvis_response": jarvis_response,
+            "response_type": response_type,
+            "confidence_score": confidence_score,
+            "execution_time_ms": execution_time_ms,
+            "success": success,
+            "session_id": session_id or self.session_id,
+            "context": context or {},
+        }
+        return self._enqueue("interaction", payload)
+
+    async def record_decision(
+        self,
+        decision_type: str,
+        summary: str,
+        outcome: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        confidence: Optional[float] = None,
+        success: bool = True,
+        source_component: str = "kernel",
+    ) -> bool:
+        """Persist a high-signal system decision as a conversation event."""
+        decision_context = dict(metadata or {})
+        decision_context.update(
+            {
+                "decision_type": decision_type,
+                "source_component": source_component,
+                "memory_class": "decision",
+            }
+        )
+        return await self.record_interaction(
+            user_query=f"[decision:{decision_type}] {summary}",
+            jarvis_response=outcome,
+            response_type="system_decision",
+            confidence_score=confidence,
+            execution_time_ms=None,
+            success=success,
+            context=decision_context,
+            force_persist=True,
+        )
+
+    async def record_preference(
+        self,
+        category: str,
+        key: str,
+        value: Any,
+        confidence: float = 0.7,
+        learned_from: str = "explicit",
+    ) -> bool:
+        """Queue a preference update for async persistence."""
+        if not self._running:
+            return False
+
+        payload = {
+            "category": category,
+            "key": key,
+            "value": value,
+            "confidence": confidence,
+            "learned_from": learned_from,
+        }
+        return self._enqueue("preference", payload)
+
+    def enqueue_supervisor_event(
+        self,
+        event_type: Any,
+        message: str,
+        severity: Any,
+        phase: str = "",
+        component: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        correlation_id: str = "",
+    ) -> bool:
+        """Capture significant supervisor events as durable system decisions."""
+        if not self._running:
+            return False
+
+        event_type_value = getattr(event_type, "value", str(event_type))
+        severity_value = getattr(severity, "value", str(severity))
+
+        significant_event_types = {
+            "shutdown_start",
+            "shutdown_end",
+            "component_error",
+            "phase_end",
+            "startup_error",
+        }
+        if (
+            event_type_value not in significant_event_types
+            and str(severity_value).lower() not in ("warning", "error", "critical", "fatal")
+        ):
+            return False
+
+        payload = {
+            "user_query": f"[event:{event_type_value}] {phase or component or 'kernel'}",
+            "jarvis_response": message,
+            "response_type": "system_event",
+            "confidence_score": None,
+            "execution_time_ms": None,
+            "success": str(severity_value).lower() not in ("error", "critical", "fatal"),
+            "session_id": self.session_id,
+            "context": {
+                "event_type": event_type_value,
+                "severity": severity_value,
+                "phase": phase,
+                "component": component,
+                "correlation_id": correlation_id,
+                "metadata": metadata or {},
+                "source_repo": self.repo_name,
+            },
+        }
+        return self._enqueue("interaction", payload)
+
+    def get_boot_context(self) -> Dict[str, Any]:
+        """Return a copy of loaded boot context."""
+        return json.loads(json.dumps(self._boot_context, default=str))
+
+    def get_boot_summary(self) -> Dict[str, Any]:
+        stats = self._boot_context.get("stats", {})
+        return {
+            "interactions_loaded": int(stats.get("interactions_loaded", 0)),
+            "preferences_loaded": int(stats.get("preferences_loaded", 0)),
+            "loaded_at": self._boot_context.get("loaded_at"),
+        }
+
+    def get_stats(self) -> Dict[str, Any]:
+        data = dict(self._stats)
+        data["queue_size"] = self._queue.qsize()
+        data["running"] = self._running
+        data["session_id"] = self.session_id
+        return data
+
+    def _is_significant_interaction(
+        self,
+        user_query: str,
+        response_type: Optional[str],
+        success: bool,
+        confidence_score: Optional[float],
+        context: Dict[str, Any],
+    ) -> bool:
+        """Decide whether an interaction should be persisted."""
+        if not self._persist_only_significant:
+            return True
+
+        response_type_norm = (response_type or "").lower()
+        significant_types = {
+            "command",
+            "decision",
+            "system_decision",
+            "system_event",
+            "error",
+            "security",
+            "authentication",
+            "auth",
+            "policy",
+            "preference",
+        }
+        if response_type_norm in significant_types:
+            return True
+        if not success:
+            return True
+        if confidence_score is not None and confidence_score < 0.45:
+            return True
+        if context.get("critical") or context.get("memory_force"):
+            return True
+        if len((user_query or "").split()) >= 12:
+            return True
+        return False
+
+    def _enqueue(self, event_kind: str, payload: Dict[str, Any]) -> bool:
+        """Non-blocking bounded enqueue with drop-oldest on overflow."""
+        if not self._running:
+            return False
+
+        try:
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                    self._stats["events_dropped"] += 1
+                except asyncio.QueueEmpty:
+                    pass
+
+            self._queue.put_nowait((event_kind, payload))
+            self._stats["events_enqueued"] += 1
+            return True
+        except Exception:
+            self._stats["events_failed"] += 1
+            return False
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        """Background persistence worker."""
+        while self._running or not self._queue.empty():
+            try:
+                try:
+                    event_kind, payload = await asyncio.wait_for(
+                        self._queue.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                try:
+                    if event_kind == "interaction":
+                        await self._persist_interaction(payload)
+                    elif event_kind == "preference":
+                        await self._persist_preference(payload)
+                    else:
+                        self._logger.debug(f"[MemoryAgent] Unknown event kind: {event_kind}")
+
+                    self._stats["events_persisted"] += 1
+                    self._stats["last_persisted_at"] = datetime.now().isoformat()
+                except Exception as e:
+                    self._stats["events_failed"] += 1
+                    self._logger.warning(
+                        f"[MemoryAgent] Worker {worker_id} failed persisting {event_kind}: {e}"
+                    )
+                finally:
+                    self._queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._stats["events_failed"] += 1
+                self._logger.debug(f"[MemoryAgent] Worker loop warning: {e}")
+
+    async def _persist_interaction(self, payload: Dict[str, Any]) -> None:
+        learning_db = await self._get_learning_db()
+        await learning_db.record_interaction(
+            user_query=payload["user_query"],
+            jarvis_response=payload["jarvis_response"],
+            response_type=payload.get("response_type"),
+            confidence_score=payload.get("confidence_score"),
+            execution_time_ms=payload.get("execution_time_ms"),
+            success=bool(payload.get("success", True)),
+            session_id=payload.get("session_id"),
+            context=payload.get("context", {}),
+        )
+
+    async def _persist_preference(self, payload: Dict[str, Any]) -> None:
+        learning_db = await self._get_learning_db()
+        await learning_db.learn_preference(
+            category=str(payload["category"]),
+            key=str(payload["key"]),
+            value=payload.get("value"),
+            confidence=float(payload.get("confidence", 0.7)),
+            learned_from=str(payload.get("learned_from", "explicit")),
+        )
+
+    async def _get_learning_db(self):
+        try:
+            from backend.intelligence.learning_database import get_learning_database
+        except Exception:
+            from intelligence.learning_database import get_learning_database
+        return await get_learning_database(config={"enable_ml_features": False})
+
+    async def _load_boot_context(self) -> None:
+        """Load historical conversational context + preferences on startup."""
+        learning_db = await self._get_learning_db()
+
+        interactions = await learning_db.get_recent_interactions(
+            limit=self._boot_interaction_limit,
+            significant_only=True,
+        )
+        preferences = await learning_db.get_preferences(
+            category=None,
+            min_confidence=self._min_preference_confidence,
+            limit=self._boot_preference_limit,
+        )
+
+        # Keep payload bounded for cross-repo snapshot handoff.
+        interaction_preview = [
+            {
+                "interaction_id": i.get("interaction_id"),
+                "timestamp": i.get("timestamp"),
+                "session_id": i.get("session_id"),
+                "user_query": (i.get("user_query") or "")[:400],
+                "jarvis_response": (i.get("jarvis_response") or "")[:600],
+                "response_type": i.get("response_type"),
+                "success": i.get("success"),
+                "feedback_score": i.get("feedback_score"),
+            }
+            for i in interactions[:100]
+        ]
+        preference_preview = [
+            {
+                "category": p.get("category"),
+                "key": p.get("key"),
+                "value": p.get("value"),
+                "confidence": p.get("confidence"),
+                "updated_at": p.get("updated_at"),
+            }
+            for p in preferences[:100]
+        ]
+
+        self._boot_context = {
+            "loaded_at": datetime.now().isoformat(),
+            "interactions": interaction_preview,
+            "preferences": preference_preview,
+            "stats": {
+                "interactions_loaded": len(interactions),
+                "preferences_loaded": len(preferences),
+            },
+        }
+
+        await self._publish_state_snapshot()
+
+    async def _publish_state_snapshot(self) -> None:
+        """Publish current memory snapshot to a Trinity-shared state file."""
+        snapshot = {
+            "schema_version": 1,
+            "kernel_id": self.kernel_id,
+            "repo_name": self.repo_name,
+            "memory_session_id": self.session_id,
+            "timestamp": time.time(),
+            "running": self._running,
+            "boot_context": self._boot_context,
+            "stats": self.get_stats(),
+        }
+        await asyncio.to_thread(self._write_state_file_sync, snapshot)
+
+    def _write_state_file_sync(self, snapshot: Dict[str, Any]) -> None:
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = self._state_file.with_suffix(
+            f".{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp"
+        )
+        tmp_file.write_text(json.dumps(snapshot, indent=2, default=str), encoding="utf-8")
+        os.replace(tmp_file, self._state_file)
+
+
 # =============================================================================
 # ZONE 4.5: LEARNING GOALS DISCOVERY SYSTEM
 # =============================================================================
@@ -47941,11 +48431,13 @@ class NotificationHub:
         self._running = False
         self._delivery_task: Optional[asyncio.Task[None]] = None
         self._handlers: Dict[str, Callable[..., Awaitable[bool]]] = {}
+        self._preferences_loaded = False
 
     async def initialize(self) -> bool:
         """Initialize the notification hub."""
         self._running = True
         self._delivery_task = create_safe_task(self._delivery_loop())
+        await self._load_persisted_preferences()
         return True
 
     async def cleanup(self) -> None:
@@ -48237,7 +48729,111 @@ class NotificationHub:
             )
 
             self._preferences[user_id] = pref
-            return pref
+
+        await self._persist_preference(pref)
+        return pref
+
+    async def _load_persisted_preferences(self) -> None:
+        """Load notification preferences from persistent learning storage."""
+        if self._preferences_loaded:
+            return
+
+        try:
+            try:
+                from backend.intelligence.learning_database import get_learning_database
+            except Exception:
+                from intelligence.learning_database import get_learning_database
+
+            learning_db = await get_learning_database(config={"enable_ml_features": False})
+            rows = await learning_db.get_preferences(
+                category="notification",
+                min_confidence=0.4,
+                limit=1000,
+            )
+
+            for row in rows:
+                key = str(row.get("key", ""))
+                if not key.endswith(".preferences"):
+                    continue
+                user_id = key[: -len(".preferences")]
+                if not user_id:
+                    continue
+
+                raw_value = row.get("value")
+                if not isinstance(raw_value, str) or not raw_value:
+                    continue
+
+                try:
+                    data = json.loads(raw_value)
+                except Exception:
+                    continue
+
+                quiet_hours_val = data.get("quiet_hours")
+                quiet_hours: Optional[Tuple[int, int]] = None
+                if (
+                    isinstance(quiet_hours_val, (list, tuple))
+                    and len(quiet_hours_val) == 2
+                ):
+                    try:
+                        quiet_hours = (
+                            int(quiet_hours_val[0]),
+                            int(quiet_hours_val[1]),
+                        )
+                    except Exception:
+                        quiet_hours = None
+
+                channel_preferences_raw = data.get("channel_preferences", {})
+                frequency_limit_raw = data.get("frequency_limit", {})
+                opt_outs_raw = data.get("opt_outs", [])
+
+                pref = NotificationPreference(
+                    user_id=user_id,
+                    channel_preferences=(
+                        dict(channel_preferences_raw)
+                        if isinstance(channel_preferences_raw, dict)
+                        else {}
+                    ),
+                    quiet_hours=quiet_hours,
+                    frequency_limit=(
+                        dict(frequency_limit_raw)
+                        if isinstance(frequency_limit_raw, dict)
+                        else {}
+                    ),
+                    opt_outs=list(opt_outs_raw) if isinstance(opt_outs_raw, list) else [],
+                )
+                self._preferences[user_id] = pref
+
+            self._preferences_loaded = True
+        except Exception:
+            # Preference persistence is best-effort and must not block startup.
+            pass
+
+    async def _persist_preference(self, pref: NotificationPreference) -> None:
+        """Persist a notification preference record to learning storage."""
+        try:
+            payload = {
+                "channel_preferences": pref.channel_preferences,
+                "quiet_hours": list(pref.quiet_hours) if pref.quiet_hours else None,
+                "frequency_limit": pref.frequency_limit,
+                "opt_outs": pref.opt_outs,
+            }
+
+            try:
+                from backend.intelligence.learning_database import get_learning_database
+            except Exception:
+                from intelligence.learning_database import get_learning_database
+
+            learning_db = await get_learning_database(config={"enable_ml_features": False})
+            await learning_db.learn_preference(
+                category="notification",
+                key=f"{pref.user_id}.preferences",
+                value=json.dumps(payload),
+                confidence=0.9,
+                learned_from="explicit",
+            )
+        except Exception:
+            # Best-effort persistence to avoid impacting notification flow.
+            pass
 
     def get_notification(self, notification_id: str) -> Optional[Notification]:
         """Get a notification by ID."""
@@ -57804,6 +58400,7 @@ class JarvisSystemKernel:
             "resources": {"status": "pending", "message": "Waiting to start"},
             "backend": {"status": "pending", "message": "Waiting to start"},
             "intelligence": {"status": "pending", "message": "Waiting to start"},
+            "conversation_memory": {"status": "pending", "message": "Waiting to start"},
             "two_tier": {"status": "pending", "message": "Waiting to start"},  # v200.0: VBIA/Watchdog
             "trinity": {"status": "pending", "message": "Waiting to start"},
             "jarvis_prime": {"status": "pending", "message": "Waiting to start"},
@@ -57880,6 +58477,9 @@ class JarvisSystemKernel:
         # v197.1: Browser crash monitor for system-wide crash tracking
         self._browser_crash_monitor: Optional[BrowserCrashMonitor] = None
         self._init_browser_crash_monitor()
+
+        # Persistent conversation memory (cross-session conversational learning)
+        self._persistent_memory_agent: Optional[PersistentConversationMemoryAgent] = None
 
         # =====================================================================
         # v200.0: Two-Tier Security (VBIA/PAVA) Components
@@ -58785,6 +59385,12 @@ class JarvisSystemKernel:
             await asyncio.to_thread(self._startup_lock.release)
         except Exception as e:
             self.logger.debug(f"[Kernel] Lock release error: {e}")
+
+        # Best-effort flush of persistent memory in emergency path.
+        try:
+            await asyncio.wait_for(self._shutdown_persistent_memory_agent(), timeout=3.0)
+        except Exception:
+            pass
 
         # v251.0: Deterministic final task drain before loop teardown.
         # This prevents "Task was destroyed but it is pending" and leaked
@@ -62944,6 +63550,7 @@ class JarvisSystemKernel:
         - Hybrid workload router
         - Goal inference engine
         - Hybrid intelligence coordinator
+        - Persistent conversation memory agent
         """
         self._state = KernelState.STARTING_INTELLIGENCE
         self._update_component_status("intelligence", "running", "Initializing intelligence layer")
@@ -62970,6 +63577,15 @@ class JarvisSystemKernel:
 
                 if self._readiness_manager:
                     self._readiness_manager.mark_component_ready("intelligence", ready_count > 0)
+
+                # Bootstrap durable conversational memory after core intelligence
+                # managers are live. This creates cross-session continuity for
+                # conversation context, decisions, and preferences.
+                memory_ready = await self._initialize_persistent_memory_agent()
+                if not memory_ready:
+                    self.logger.warning(
+                        "[Kernel] Persistent conversation memory unavailable (degraded mode)"
+                    )
 
                 # v234.0: Initialize UnifiedModelServing (3-tier inference routing)
                 try:
@@ -63080,6 +63696,157 @@ class JarvisSystemKernel:
                 self.logger.warning(f"[Kernel] Intelligence initialization failed: {e}")
                 self._update_component_status("intelligence", "error", f"Failed: {e}")
                 return False
+
+    async def _initialize_persistent_memory_agent(self) -> bool:
+        """
+        Initialize durable conversational memory.
+
+        Non-fatal on failure: kernel continues, but startup status is marked degraded.
+        """
+        enabled = os.getenv("JARVIS_MEMORY_AGENT_ENABLED", "true").lower() in (
+            "1", "true", "yes"
+        )
+        if not enabled:
+            self._update_component_status(
+                "conversation_memory", "skipped", "Disabled via JARVIS_MEMORY_AGENT_ENABLED"
+            )
+            return True
+
+        if self._persistent_memory_agent is not None:
+            return True
+
+        self._update_component_status(
+            "conversation_memory", "running", "Loading persistent conversation memory..."
+        )
+
+        init_timeout = float(os.getenv("JARVIS_MEMORY_AGENT_INIT_TIMEOUT", "30.0"))
+        agent = PersistentConversationMemoryAgent(
+            kernel_id=self.config.kernel_id,
+            repo_name="jarvis",
+        )
+
+        try:
+            started = await asyncio.wait_for(agent.start(), timeout=init_timeout)
+            if not started:
+                self._update_component_status(
+                    "conversation_memory",
+                    "error",
+                    "Initialization failed",
+                )
+                return False
+
+            self._persistent_memory_agent = agent
+            summary = agent.get_boot_summary()
+            self._update_component_status(
+                "conversation_memory",
+                "complete",
+                "Loaded "
+                f"{summary.get('interactions_loaded', 0)} interactions, "
+                f"{summary.get('preferences_loaded', 0)} preferences",
+            )
+            return True
+        except asyncio.TimeoutError:
+            self._update_component_status(
+                "conversation_memory",
+                "error",
+                f"Initialization timed out after {init_timeout:.0f}s",
+            )
+            return False
+        except Exception as e:
+            self._update_component_status(
+                "conversation_memory",
+                "error",
+                f"Error: {e}",
+            )
+            return False
+
+    async def _shutdown_persistent_memory_agent(self) -> None:
+        """Gracefully drain and stop durable conversational memory."""
+        if self._persistent_memory_agent is None:
+            return
+
+        stop_timeout = float(os.getenv("JARVIS_MEMORY_AGENT_STOP_TIMEOUT", "20.0"))
+        try:
+            await asyncio.wait_for(
+                self._persistent_memory_agent.stop(),
+                timeout=stop_timeout,
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"[Kernel] Memory agent stop timed out ({stop_timeout:.1f}s)"
+            )
+        except Exception as e:
+            self.logger.warning(f"[Kernel] Memory agent stop error: {e}")
+        finally:
+            self._persistent_memory_agent = None
+
+    async def remember_interaction(
+        self,
+        user_query: str,
+        jarvis_response: str,
+        response_type: Optional[str] = None,
+        confidence_score: Optional[float] = None,
+        execution_time_ms: Optional[float] = None,
+        success: bool = True,
+        context: Optional[Dict[str, Any]] = None,
+        force_persist: bool = False,
+    ) -> bool:
+        """Public helper for persisting high-signal conversation events."""
+        if not self._persistent_memory_agent:
+            return False
+        return await self._persistent_memory_agent.record_interaction(
+            user_query=user_query,
+            jarvis_response=jarvis_response,
+            response_type=response_type,
+            confidence_score=confidence_score,
+            execution_time_ms=execution_time_ms,
+            success=success,
+            session_id=self.config.kernel_id,
+            context=context,
+            force_persist=force_persist,
+        )
+
+    async def remember_decision(
+        self,
+        decision_type: str,
+        summary: str,
+        outcome: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        confidence: Optional[float] = None,
+        success: bool = True,
+        source_component: str = "kernel",
+    ) -> bool:
+        """Persist a system decision."""
+        if not self._persistent_memory_agent:
+            return False
+        return await self._persistent_memory_agent.record_decision(
+            decision_type=decision_type,
+            summary=summary,
+            outcome=outcome,
+            metadata=metadata,
+            confidence=confidence,
+            success=success,
+            source_component=source_component,
+        )
+
+    async def remember_preference(
+        self,
+        category: str,
+        key: str,
+        value: Any,
+        confidence: float = 0.7,
+        learned_from: str = "explicit",
+    ) -> bool:
+        """Persist a user preference update."""
+        if not self._persistent_memory_agent:
+            return False
+        return await self._persistent_memory_agent.record_preference(
+            category=category,
+            key=key,
+            value=value,
+            confidence=confidence,
+            learned_from=learned_from,
+        )
 
     # =========================================================================
     # v200.0: TWO-TIER SECURITY INITIALIZATION (VBIA/PAVA)
@@ -68659,7 +69426,7 @@ class JarvisSystemKernel:
     ) -> None:
         """Emit a SupervisorEvent to the event bus. Never raises."""
         try:
-            get_event_bus().emit(SupervisorEvent(
+            event = SupervisorEvent(
                 event_type=event_type,
                 timestamp=time.time(),
                 message=message,
@@ -68670,7 +69437,24 @@ class JarvisSystemKernel:
                 progress_pct=progress_pct,
                 metadata=tuple(metadata.items()) if metadata else (),
                 correlation_id=correlation_id,
-            ))
+            )
+            get_event_bus().emit(event)
+
+            # Mirror high-signal supervisor events into durable conversation memory.
+            agent = getattr(self, "_persistent_memory_agent", None)
+            if agent is not None:
+                try:
+                    agent.enqueue_supervisor_event(
+                        event_type=event_type,
+                        message=message,
+                        severity=severity,
+                        phase=phase,
+                        component=component,
+                        metadata=metadata,
+                        correlation_id=correlation_id,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -69822,6 +70606,10 @@ class JarvisSystemKernel:
 
             # v249.0: Emit shutdown complete + stop event bus and renderer
             self._emit_event(SupervisorEventType.SHUTDOWN_END, "Shutdown complete")
+
+            # Flush and stop persistent conversation memory after final shutdown event.
+            await self._shutdown_persistent_memory_agent()
+
             if hasattr(self, '_event_bus') and self._event_bus:
                 try:
                     await self._event_bus.stop()
@@ -69940,6 +70728,9 @@ class JarvisSystemKernel:
 
         if self._process_manager:
             status["processes"] = self._process_manager.get_statistics()
+
+        if self._persistent_memory_agent:
+            status["conversation_memory"] = self._persistent_memory_agent.get_stats()
 
         # v200.0: Two-Tier Security status
         status["two_tier"] = {
