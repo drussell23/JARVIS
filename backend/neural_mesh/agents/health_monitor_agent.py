@@ -36,11 +36,13 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
     # v251.3: Statuses that are acceptable (not counted as issues)
     _HEALTHY_STATUSES = frozenset({AgentStatus.ONLINE, AgentStatus.BUSY})
 
-    # v251.3: Optional agents whose non-ONLINE state never degrades system health
+    # v251.3: Optional agents whose non-ONLINE state never degrades system health.
+    # Includes agents that depend on external services (Trinity cross-repo components)
+    # or conditionally-available features.
     _OPTIONAL_AGENTS: frozenset = frozenset(
         s.strip() for s in os.getenv(
             "JARVIS_OPTIONAL_AGENTS",
-            "computer_use_agent",
+            "computer_use_agent,mas-coordinator,reactor_core",
         ).split(",") if s.strip()
     )
 

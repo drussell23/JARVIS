@@ -2636,7 +2636,10 @@ class GhostDisplayManager:
             await self._notify_state_change("status_changed", {"new_status": "fallback"})
             return True
 
-        logger.error("[GhostManager] ❌ No fallback available")
+        # v251.3: Downgraded from ERROR to WARNING — Ghost Display is an optional
+        # enhancement for background visual monitoring. When yabai isn't installed,
+        # this is an expected state, not an error condition.
+        logger.warning("[GhostManager] No fallback available (yabai not installed)")
         await self._notify_state_change("status_changed", {"new_status": "unavailable"})
         return False
 
@@ -4165,7 +4168,11 @@ class YabaiSpaceDetector:
     def _attempt_startup(self) -> bool:
         """Attempt to start yabai service."""
         if not self._health.yabai_path:
-            logger.warning("[YABAI] Cannot start - yabai not installed")
+            # v251.3: Log-once pattern — "not installed" is a permanent condition
+            # during this process lifetime. No point re-warning every caller.
+            if not getattr(self, '_not_installed_warned', False):
+                logger.warning("[YABAI] Cannot start - yabai not installed")
+                self._not_installed_warned = True
             return False
 
         # Check if already running
@@ -4524,7 +4531,10 @@ class YabaiSpaceDetector:
             if self.ensure_running():
                 logger.info("[YABAI] Auto-started yabai service")
             else:
-                logger.warning("[YABAI] Yabai not available and could not be started")
+                # v251.3: Log-once — this fires on every enumerate call during startup
+                if not getattr(self, '_unavailable_warned', False):
+                    logger.warning("[YABAI] Yabai not available and could not be started")
+                    self._unavailable_warned = True
                 self._health.record_failure("Service not available")
                 return []
 

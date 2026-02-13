@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -374,6 +375,9 @@ class JARVISNeuralMeshBridge:
 
         v6.2 Grand Unification: Now includes CAI (Contextual Awareness Intelligence)
         for deep contextual understanding, emotional intelligence, and adaptive behavior.
+
+        v251.3: Parallel registration within category — all agents registered
+        concurrently instead of sequentially (saves 10-15s on a 7-agent category).
         """
         intelligence_agents = [
             ("intelligence_uae", create_uae_adapter, IntelligenceEngineType.UAE),
@@ -385,19 +389,24 @@ class JARVISNeuralMeshBridge:
             ("intelligence_wisdom", create_wisdom_adapter, IntelligenceEngineType.WISDOM),  # v237.1
         ]
 
+        tasks = []
         for name, factory, engine_type in intelligence_agents:
             if name in self._config.skip_agents:
                 continue
-
-            await self._try_register_agent(
-                name,
-                factory,
-                {"agent_name": name},
-                f"intelligence.{engine_type.value}",
+            tasks.append(
+                self._try_register_agent(
+                    name, factory, {"agent_name": name},
+                    f"intelligence.{engine_type.value}",
+                )
             )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _discover_autonomy_agents(self) -> None:
-        """Discover and register autonomy agents."""
+        """Discover and register autonomy agents.
+
+        v251.3: Parallel registration within category.
+        """
         autonomy_agents = [
             ("autonomy_agent", create_autonomous_agent_adapter),
             ("autonomy_reasoning", create_reasoning_adapter),
@@ -407,53 +416,56 @@ class JARVISNeuralMeshBridge:
             ("autonomy_watchdog", create_watchdog_adapter),      # v237.1: Safety layer
         ]
 
+        tasks = []
         for name, factory in autonomy_agents:
             if name in self._config.skip_agents:
                 continue
-
-            await self._try_register_agent(
-                name,
-                factory,
-                {"agent_name": name},
-                "autonomy",
+            tasks.append(
+                self._try_register_agent(name, factory, {"agent_name": name}, "autonomy")
             )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _discover_voice_agents(self) -> None:
-        """Discover and register voice agents."""
+        """Discover and register voice agents.
+
+        v251.3: Parallel registration within category.
+        """
         voice_agents = [
             ("voice_memory", create_voice_memory_adapter),
             ("voice_verification", create_speaker_verification_adapter),
             ("voice_unlock", create_voice_unlock_adapter),
         ]
 
+        tasks = []
         for name, factory in voice_agents:
             if name in self._config.skip_agents:
                 continue
-
-            await self._try_register_agent(
-                name,
-                factory,
-                {"agent_name": name},
-                "voice",
+            tasks.append(
+                self._try_register_agent(name, factory, {"agent_name": name}, "voice")
             )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _discover_vision_agents(self) -> None:
-        """Discover and register vision agents (v10.2)."""
+        """Discover and register vision agents (v10.2).
+
+        v251.3: Parallel registration within category.
+        """
         vision_agents = [
             ("vision_cognitive_loop", create_vision_cognitive_adapter),
             ("vision_yabai_multispace", create_yabai_adapter),
         ]
 
+        tasks = []
         for name, factory in vision_agents:
             if name in self._config.skip_agents:
                 continue
-
-            await self._try_register_agent(
-                name,
-                factory,
-                {"agent_name": name},
-                "vision",
+            tasks.append(
+                self._try_register_agent(name, factory, {"agent_name": name}, "vision")
             )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _try_register_agent(
         self,
@@ -472,6 +484,9 @@ class JARVISNeuralMeshBridge:
 
         Returns:
             Registered adapter or None on failure
+
+        v251.3: Added per-agent timeout so one slow agent can't burn the entire
+        bridge budget.  Default 10s per agent (env: JARVIS_BRIDGE_AGENT_TIMEOUT).
         """
         # v250.2: Skip if already registered (idempotent discovery).
         # Prevents log spam when multiple init paths converge.
@@ -479,13 +494,18 @@ class JARVISNeuralMeshBridge:
             logger.debug("Agent %s already discovered, skipping", name)
             return self._adapters[name]
 
+        # v251.3: Per-agent timeout — prevents one slow factory from starving others
+        agent_timeout = float(os.environ.get("JARVIS_BRIDGE_AGENT_TIMEOUT", "10.0"))
+
         retries = 0
         while retries <= self._config.max_retries:
             try:
                 logger.debug("Creating adapter for %s (%s)...", name, category)
 
-                # Create adapter
-                adapter = await factory(**factory_kwargs)
+                # Create adapter (with per-agent timeout)
+                adapter = await asyncio.wait_for(
+                    factory(**factory_kwargs), timeout=agent_timeout,
+                )
 
                 # v93.1: Handle graceful degradation from factories that return None
                 if adapter is None:
@@ -517,6 +537,17 @@ class JARVISNeuralMeshBridge:
                     name,
                     e,
                 )
+                return None
+
+            except asyncio.TimeoutError:
+                # v251.3: Per-agent timeout — don't retry, just skip
+                logger.warning(
+                    "Agent %s timed out after %.0fs (skipping)",
+                    name,
+                    agent_timeout,
+                )
+                self._failed_agents[name] = f"timeout ({agent_timeout}s)"
+                self._metrics.agents_failed += 1
                 return None
 
             except Exception as e:
