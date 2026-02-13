@@ -36,6 +36,7 @@ v4.0.0 NEW - Zero-Touch & Supervisor Integration:
 """
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -2635,7 +2636,7 @@ class ProcessCleanupManager:
             # JARVIS-specific patterns (improved detection)
             "jarvis_patterns": [
                 "jarvis",
-                "main.py",
+                "backend/main.py",
                 "jarvis_backend",
                 "jarvis_voice",
                 "voice_unlock",
@@ -2652,6 +2653,26 @@ class ProcessCleanupManager:
                 "vision_intelligence",
                 "vision_websocket",
                 "vision_manager",
+            ],
+            # Strong entrypoint markers for JARVIS runtime detection.
+            "jarvis_entrypoint_markers": [
+                "backend/main.py",
+                "start_system.py",
+                "unified_supervisor.py",
+                "backend.main",
+                "jarvis_voice_api",
+                "unified_command_processor",
+                "jarvis_event_driven",
+            ],
+            # Shell wrappers should not be treated as managed runtime processes
+            # unless they launch a strong entrypoint marker.
+            "shell_wrapper_names": [
+                "sh",
+                "bash",
+                "zsh",
+                "dash",
+                "ksh",
+                "fish",
             ],
             # v72.0: PROJECT TRINITY - Protected subprocess patterns
             # These are the components launched by run_supervisor.py Trinity auto-launch
@@ -2756,6 +2777,12 @@ class ProcessCleanupManager:
                 "voice/macos_voice.py",
                 "engines/voice_engine.py",
             ],
+            "code_change_cleanup_cooldown_seconds": float(
+                os.getenv("JARVIS_CODE_CHANGE_CLEANUP_COOLDOWN_SECONDS", "180")
+            ),
+            "code_change_cleanup_min_age_seconds": float(
+                os.getenv("JARVIS_CODE_CHANGE_CLEANUP_MIN_AGE_SECONDS", "20")
+            ),
         }
 
         # Learning patterns
@@ -2765,6 +2792,7 @@ class ProcessCleanupManager:
         # Code state tracking
         self.code_state_file = Path.home() / ".jarvis" / "code_state.json"
         self.code_state = self._load_code_state()
+        self._code_cleanup_guard = threading.Lock()
 
         # Load history if exists
         self._load_cleanup_history()
@@ -3862,6 +3890,78 @@ class ProcessCleanupManager:
             return True
         return False
 
+    @contextmanager
+    def _code_cleanup_lock(self):
+        """Cross-process lock to prevent concurrent code-change cleanup races."""
+        lock_file = None
+        last_error: Optional[Exception] = None
+        lock_candidates = [
+            Path.home() / ".jarvis" / "code_cleanup.lock",
+            Path(tempfile.gettempdir()) / "jarvis_code_cleanup.lock",
+        ]
+        for lock_path in lock_candidates:
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_file = open(lock_path, "a+")
+                break
+            except Exception as e:
+                last_error = e
+                continue
+
+        if lock_file is None:
+            logger.warning(
+                "Unable to create code cleanup lock file (%s); proceeding without cross-process lock",
+                last_error,
+            )
+            yield True
+            return
+
+        acquired = False
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            yield True
+        except (BlockingIOError, OSError):
+            yield False
+        finally:
+            if acquired:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            try:
+                lock_file.close()
+            except Exception:
+                pass
+
+    def _should_skip_recent_code_cleanup(self, current_hash: str) -> bool:
+        """Skip duplicate cleanup runs for the same hash during cooldown."""
+        try:
+            last_hash = str(self.code_state.get("last_cleanup_code_hash", ""))
+            last_ts = float(self.code_state.get("last_cleanup_at_ts", 0.0) or 0.0)
+            cooldown = float(self.config.get("code_change_cleanup_cooldown_seconds", 180.0))
+            if not last_hash or last_hash != current_hash or last_ts <= 0:
+                return False
+            return (time.time() - last_ts) < cooldown
+        except Exception:
+            return False
+
+    def _is_protected_runtime_process(self, pid: int, proc_name: str, cmdline: str) -> bool:
+        """Return True when process is protected from code-change cleanup."""
+        cmdline_lower = cmdline.lower()
+        if self._supervisor_state.is_process_protected(pid, cmdline):
+            return True
+
+        for pattern in self.config.get("trinity_protected_patterns", []):
+            if pattern.lower() in cmdline_lower:
+                return True
+
+        protected_control_plane = ("run_supervisor", "unified_supervisor.py", "dead_man_switch")
+        if any(token in cmdline_lower for token in protected_control_plane):
+            return True
+
+        return False
+
     def _save_code_state(self):
         """Save current code state"""
         self.code_state["code_hash"] = self._calculate_code_hash()
@@ -4395,244 +4495,320 @@ class ProcessCleanupManager:
         ensuring complete cache clearing and fresh code reload across all components.
         """
         cleaned = []
+        current_hash = self._calculate_code_hash()
+        last_hash = str(self.code_state.get("code_hash", ""))
+        cleanup_started = False
 
         # Check for code changes
-        if not self._detect_code_changes():
+        if current_hash == last_hash:
             logger.info("No code changes detected, skipping old instance cleanup")
             return cleaned
 
-        logger.warning("🔄 Code changes detected! Cleaning up old JARVIS instances...")
+        if not self._code_cleanup_guard.acquire(blocking=False):
+            logger.info("Code-change cleanup already running in this process, skipping duplicate run")
+            return cleaned
 
-        # Step 0: Gracefully shutdown ML Learning Engine before killing processes
         try:
-            logger.info("🧠 Attempting graceful ML Learning Engine shutdown...")
-            from voice_unlock.continuous_learning_engine import shutdown_learning_engine
-
-            # Use asyncio to run async shutdown
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(shutdown_learning_engine())
-                else:
-                    asyncio.run(shutdown_learning_engine())
-                logger.info("✅ ML Learning Engine shutdown complete (models saved)")
-            except RuntimeError:
-                # No event loop, create one
-                asyncio.run(shutdown_learning_engine())
-                logger.info("✅ ML Learning Engine shutdown complete (models saved)")
-            except Exception as e:
-                logger.warning(f"ML Learning Engine shutdown warning: {e}")
-        except ImportError:
-            logger.debug("ML Learning Engine not available")
-        except Exception as e:
-            logger.warning(f"Error during ML Learning Engine shutdown: {e}")
-
-        # Clear Python cache FIRST to ensure fresh code loads
-        # This affects the frontend process, but backend subprocesses need to be killed
-        cache_cleared = self._clear_python_cache()
-        if cache_cleared:
-            logger.info(f"✅ Cleared {cache_cleared} Python cache directories")
-
-        current_pid = os.getpid()
-        current_ppid = os.getppid()  # Track parent process too
-        current_time = time.time()
-
-        # Track PIDs that will be terminated (for VM cleanup)
-        pids_to_terminate = []
-
-        # Track backend processes separately for better logging
-        backend_processes = []
-        frontend_processes = []
-        related_processes = []
-
-        # Find all JARVIS processes
-        for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time", "ppid"]):
-            try:
-                if proc.pid == current_pid or proc.pid == current_ppid:
-                    continue  # Skip self and parent
-
-                if self._is_jarvis_process(proc):
-                    cmdline = " ".join(proc.cmdline())
-                    logger.debug(f"Found JARVIS process: PID {proc.pid} - {cmdline[:100]}...")
-
-                    # Categorize the process
-                    if "main.py" in cmdline and "backend" in cmdline.lower():
-                        # Backend process - ALWAYS kill these to reload fresh code
-                        backend_processes.append((proc, cmdline))
-                    elif "start_system.py" in cmdline:
-                        # Frontend process
-                        frontend_processes.append((proc, cmdline))
-                    elif any(
-                        pattern in cmdline
-                        for pattern in ["voice_unlock", "websocket_server", "jarvis_", "jarvis_reload"]
-                    ):
-                        # Related helper processes
-                        related_processes.append((proc, cmdline))
-
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        # Step 1: Kill ALL backend processes first (critical for fresh code)
-        if backend_processes:
-            logger.warning(f"🎯 Found {len(backend_processes)} backend process(es) to terminate")
-            for proc, cmdline in backend_processes:
-                try:
-                    age_seconds = current_time - proc.create_time()
-                    logger.warning(
-                        f"Terminating backend process (PID: {proc.pid}, Age: {age_seconds/60:.1f} min)"
-                    )
-                    logger.info(f"   Command: {cmdline[:120]}")
-
-                    pids_to_terminate.append(proc.pid)
-
-                    # Be aggressive with backend - use shorter timeout
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=3)  # Shorter timeout for backend
-                        cleaned.append({
-                            "pid": proc.pid,
-                            "name": proc.name(),
-                            "type": "backend",
-                            "cmdline": cmdline[:100],
-                            "age_minutes": age_seconds / 60,
-                            "status": "terminated",
-                        })
-                        logger.info(f"✅ Terminated backend process {proc.pid}")
-                    except psutil.TimeoutExpired:
-                        # Force kill backend immediately if it doesn't respond
-                        proc.kill()
-                        cleaned.append({
-                            "pid": proc.pid,
-                            "name": proc.name(),
-                            "type": "backend",
-                            "cmdline": cmdline[:100],
-                            "age_minutes": age_seconds / 60,
-                            "status": "force_killed",
-                        })
-                        logger.warning(f"⚠️ Force killed unresponsive backend {proc.pid}")
-                    except psutil.NoSuchProcess:
-                        logger.info(f"✅ Backend process {proc.pid} already terminated")
-
-                except Exception as e:
-                    logger.error(f"❌ Failed to clean up backend PID {proc.pid}: {e}")
-
-        # Step 2: Kill old frontend processes
-        if frontend_processes:
-            logger.info(f"Found {len(frontend_processes)} frontend process(es)")
-            for proc, cmdline in frontend_processes:
-                try:
-                    age_seconds = current_time - proc.create_time()
+            with self._code_cleanup_lock() as lock_acquired:
+                if not lock_acquired:
                     logger.info(
-                        f"Terminating frontend (PID: {proc.pid}, Age: {age_seconds/60:.1f} min)"
+                        "Code-change cleanup lock held by another process, skipping duplicate run"
+                    )
+                    return cleaned
+
+                if (
+                    os.environ.get("JARVIS_CODE_CLEANUP_DONE") == "1"
+                    and os.environ.get("JARVIS_CODE_CLEANUP_HASH") == current_hash
+                ):
+                    logger.info(
+                        "Code-change cleanup already completed in this startup for this hash"
+                    )
+                    return cleaned
+
+                if os.environ.get("JARVIS_CODE_CLEANUP_IN_PROGRESS") == "1":
+                    logger.info("Code-change cleanup already in progress, skipping duplicate run")
+                    return cleaned
+
+                os.environ["JARVIS_CODE_CLEANUP_IN_PROGRESS"] = "1"
+                cleanup_started = True
+
+                # Cross-process dedupe guard for recent same-hash cleanup.
+                self.code_state = self._load_code_state()
+                if self._should_skip_recent_code_cleanup(current_hash):
+                    logger.info("Recent code-change cleanup already performed for this hash, skipping")
+                    os.environ["JARVIS_CODE_CLEANUP_DONE"] = "1"
+                    os.environ["JARVIS_CODE_CLEANUP_HASH"] = current_hash
+                    return cleaned
+
+                logger.warning("🔄 Code changes detected! Cleaning up old JARVIS instances...")
+
+                # Step 0: Gracefully shutdown ML Learning Engine before killing processes
+                try:
+                    logger.info("🧠 Attempting graceful ML Learning Engine shutdown...")
+                    from voice_unlock.continuous_learning_engine import shutdown_learning_engine
+
+                    # Use asyncio to run async shutdown
+                    import asyncio
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(shutdown_learning_engine())
+                        else:
+                            asyncio.run(shutdown_learning_engine())
+                        logger.info("✅ ML Learning Engine shutdown complete (models saved)")
+                    except RuntimeError:
+                        # No event loop, create one
+                        asyncio.run(shutdown_learning_engine())
+                        logger.info("✅ ML Learning Engine shutdown complete (models saved)")
+                    except Exception as e:
+                        logger.warning(f"ML Learning Engine shutdown warning: {e}")
+                except ImportError:
+                    logger.debug("ML Learning Engine not available")
+                except Exception as e:
+                    logger.warning(f"Error during ML Learning Engine shutdown: {e}")
+
+                # Clear Python cache FIRST to ensure fresh code loads
+                # This affects the frontend process, but backend subprocesses need to be killed
+                cache_cleared = self._clear_python_cache()
+                if cache_cleared:
+                    logger.info(f"✅ Cleared {cache_cleared} Python cache directories")
+
+                current_pid = os.getpid()
+                current_ppid = os.getppid()  # Track parent process too
+                current_time = time.time()
+                min_age = float(self.config.get("code_change_cleanup_min_age_seconds", 20.0))
+                backend_timeout = float(
+                    os.getenv("JARVIS_BACKEND_TERMINATE_TIMEOUT_SECONDS", "8")
+                )
+
+                # Track PIDs that will be terminated (for VM cleanup)
+                pids_to_terminate = []
+
+                # Track backend processes separately for better logging
+                backend_processes = []
+                frontend_processes = []
+                related_processes = []
+
+                # Find all JARVIS processes
+                for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time", "ppid"]):
+                    try:
+                        if proc.pid == current_pid or proc.pid == current_ppid:
+                            continue  # Skip self and parent
+
+                        if max(0.0, current_time - proc.create_time()) < min_age:
+                            continue  # Avoid killing processes created moments ago.
+
+                        proc_name = proc.name()
+                        cmdline = " ".join(proc.cmdline())
+                        cmdline_lower = cmdline.lower()
+                        proc_name_lower = proc_name.lower()
+
+                        if self._is_protected_runtime_process(proc.pid, proc_name, cmdline):
+                            logger.debug(
+                                f"Skipping protected runtime process {proc_name} (PID {proc.pid})"
+                            )
+                            continue
+
+                        if proc_name_lower in self.config.get("shell_wrapper_names", []):
+                            continue
+
+                        if not self._is_jarvis_process(proc):
+                            continue
+
+                        logger.debug(f"Found JARVIS process: PID {proc.pid} - {cmdline[:100]}...")
+
+                        # Categorize the process
+                        is_backend_runtime = proc_name_lower.startswith("python") or any(
+                            runtime in proc_name_lower
+                            for runtime in ("uvicorn", "gunicorn", "hypercorn")
+                        )
+                        if is_backend_runtime and (
+                            "backend/main.py" in cmdline_lower
+                            or "backend.main" in cmdline_lower
+                            or ("uvicorn" in cmdline_lower and "backend" in cmdline_lower)
+                            or ("gunicorn" in cmdline_lower and "backend" in cmdline_lower)
+                            or ("hypercorn" in cmdline_lower and "backend" in cmdline_lower)
+                        ):
+                            backend_processes.append((proc, cmdline))
+                        elif "start_system.py" in cmdline_lower:
+                            frontend_processes.append((proc, cmdline))
+                        elif any(
+                            pattern in cmdline_lower
+                            for pattern in ["voice_unlock", "websocket_server", "jarvis_", "jarvis_reload"]
+                        ):
+                            related_processes.append((proc, cmdline))
+
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+
+                # Step 1: Kill ALL backend processes first (critical for fresh code)
+                if backend_processes:
+                    logger.warning(f"🎯 Found {len(backend_processes)} backend process(es) to terminate")
+                    for proc, cmdline in backend_processes:
+                        try:
+                            age_seconds = current_time - proc.create_time()
+                            logger.warning(
+                                f"Terminating backend process (PID: {proc.pid}, Age: {age_seconds/60:.1f} min)"
+                            )
+                            logger.info(f"   Command: {cmdline[:120]}")
+
+                            pids_to_terminate.append(proc.pid)
+
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=backend_timeout)
+                                cleaned.append({
+                                    "pid": proc.pid,
+                                    "name": proc.name(),
+                                    "type": "backend",
+                                    "cmdline": cmdline[:100],
+                                    "age_minutes": age_seconds / 60,
+                                    "status": "terminated",
+                                })
+                                logger.info(f"✅ Terminated backend process {proc.pid}")
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                                cleaned.append({
+                                    "pid": proc.pid,
+                                    "name": proc.name(),
+                                    "type": "backend",
+                                    "cmdline": cmdline[:100],
+                                    "age_minutes": age_seconds / 60,
+                                    "status": "force_killed",
+                                })
+                                logger.warning(f"⚠️ Force killed unresponsive backend {proc.pid}")
+                            except psutil.NoSuchProcess:
+                                logger.info(f"✅ Backend process {proc.pid} already terminated")
+
+                        except Exception as e:
+                            logger.error(f"❌ Failed to clean up backend PID {proc.pid}: {e}")
+
+                # Step 2: Kill old frontend processes
+                if frontend_processes:
+                    logger.info(f"Found {len(frontend_processes)} frontend process(es)")
+                    for proc, cmdline in frontend_processes:
+                        try:
+                            age_seconds = current_time - proc.create_time()
+                            logger.info(
+                                f"Terminating frontend (PID: {proc.pid}, Age: {age_seconds/60:.1f} min)"
+                            )
+
+                            pids_to_terminate.append(proc.pid)
+
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=5)
+                                cleaned.append({
+                                    "pid": proc.pid,
+                                    "name": proc.name(),
+                                    "type": "frontend",
+                                    "cmdline": cmdline[:100],
+                                    "age_minutes": age_seconds / 60,
+                                    "status": "terminated",
+                                })
+                                logger.info(f"✅ Terminated frontend process {proc.pid}")
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                                cleaned.append({
+                                    "pid": proc.pid,
+                                    "name": proc.name(),
+                                    "type": "frontend",
+                                    "cmdline": cmdline[:100],
+                                    "age_minutes": age_seconds / 60,
+                                    "status": "killed",
+                                })
+                                logger.warning(f"⚠️ Force killed frontend {proc.pid}")
+                            except psutil.NoSuchProcess:
+                                logger.info(f"✅ Frontend process {proc.pid} already terminated")
+
+                        except Exception as e:
+                            logger.error(f"❌ Failed to clean up frontend PID {proc.pid}: {e}")
+
+                # Step 3: Clean up related helper processes
+                if related_processes:
+                    logger.info(f"Cleaning up {len(related_processes)} related process(es)")
+                    for proc, cmdline in related_processes:
+                        try:
+                            logger.debug(f"Cleaning up related: {proc.name()} (PID: {proc.pid})")
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=2)
+                                cleaned.append({
+                                    "pid": proc.pid,
+                                    "name": proc.name(),
+                                    "type": "related",
+                                    "cmdline": cmdline[:50],
+                                    "status": "terminated",
+                                })
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                                cleaned.append({
+                                    "pid": proc.pid,
+                                    "name": proc.name(),
+                                    "type": "related",
+                                    "cmdline": cmdline[:50],
+                                    "status": "killed",
+                                })
+                        except Exception as e:
+                            logger.debug(f"Could not clean up related process {proc.pid}: {e}")
+
+                # Step 4: Wait a moment for processes to fully terminate and release resources
+                if cleaned:
+                    logger.info("⏳ Waiting for processes to release resources...")
+                    time.sleep(2)  # Increased wait time for clean shutdown
+
+                # Step 5: Clean up orphaned ports
+                self._cleanup_orphaned_ports()
+
+                # Step 6: Clean up IPC resources (semaphores, shared memory)
+                ipc_cleaned = self._cleanup_ipc_resources()
+                if sum(ipc_cleaned.values()) > 0:
+                    logger.info(
+                        f"Cleaned up {sum(ipc_cleaned.values())} IPC resources "
+                        f"({ipc_cleaned['semaphores']} semaphores, {ipc_cleaned['shared_memory']} shared memory)"
                     )
 
-                    pids_to_terminate.append(proc.pid)
+                # Step 7: Clean up VMs for terminated PIDs
+                if pids_to_terminate:
+                    logger.info(
+                        f"🌐 Checking for VMs associated with {len(pids_to_terminate)} terminated processes"
+                    )
+                    vms_cleaned = self._cleanup_vms_for_pids_sync(pids_to_terminate)
+                    if vms_cleaned:
+                        logger.info(f"🧹 Cleaned up {vms_cleaned} VMs from terminated processes")
 
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=5)
-                        cleaned.append({
-                            "pid": proc.pid,
-                            "name": proc.name(),
-                            "type": "frontend",
-                            "cmdline": cmdline[:100],
-                            "age_minutes": age_seconds / 60,
-                            "status": "terminated",
-                        })
-                        logger.info(f"✅ Terminated frontend process {proc.pid}")
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-                        cleaned.append({
-                            "pid": proc.pid,
-                            "name": proc.name(),
-                            "type": "frontend",
-                            "cmdline": cmdline[:100],
-                            "age_minutes": age_seconds / 60,
-                            "status": "killed",
-                        })
-                        logger.warning(f"⚠️ Force killed frontend {proc.pid}")
-                    except psutil.NoSuchProcess:
-                        logger.info(f"✅ Frontend process {proc.pid} already terminated")
+                # Step 8: Clear Python cache AGAIN after killing backend to be absolutely sure
+                # This handles any .pyc files that might have been regenerated
+                final_cache_clear = self._clear_python_cache()
+                if final_cache_clear:
+                    logger.debug(f"Final cache clear: {final_cache_clear} items removed")
 
-                except Exception as e:
-                    logger.error(f"❌ Failed to clean up frontend PID {proc.pid}: {e}")
+                # Step 9: Save new code state after cleanup
+                self.code_state["last_cleanup_code_hash"] = current_hash
+                self.code_state["last_cleanup_at_ts"] = time.time()
+                self.code_state["last_cleanup_pid"] = os.getpid()
+                self._save_code_state()
 
-        # Step 3: Clean up related helper processes
-        if related_processes:
-            logger.info(f"Cleaning up {len(related_processes)} related process(es)")
-            for proc, cmdline in related_processes:
-                try:
-                    logger.debug(f"Cleaning up related: {proc.name()} (PID: {proc.pid})")
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                        cleaned.append({
-                            "pid": proc.pid,
-                            "name": proc.name(),
-                            "type": "related",
-                            "cmdline": cmdline[:50],
-                            "status": "terminated",
-                        })
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-                        cleaned.append({
-                            "pid": proc.pid,
-                            "name": proc.name(),
-                            "type": "related",
-                            "cmdline": cmdline[:50],
-                            "status": "killed",
-                        })
-                except Exception as e:
-                    logger.debug(f"Could not clean up related process {proc.pid}: {e}")
+                os.environ["JARVIS_CODE_CLEANUP_DONE"] = "1"
+                os.environ["JARVIS_CODE_CLEANUP_HASH"] = current_hash
 
-        # Step 4: Wait a moment for processes to fully terminate and release resources
-        if cleaned:
-            logger.info("⏳ Waiting for processes to release resources...")
-            time.sleep(2)  # Increased wait time for clean shutdown
+                # Summary logging
+                if cleaned:
+                    backend_count = len([c for c in cleaned if c.get("type") == "backend"])
+                    frontend_count = len([c for c in cleaned if c.get("type") == "frontend"])
+                    related_count = len([c for c in cleaned if c.get("type") == "related"])
 
-        # Step 5: Clean up orphaned ports
-        self._cleanup_orphaned_ports()
-
-        # Step 6: Clean up IPC resources (semaphores, shared memory)
-        ipc_cleaned = self._cleanup_ipc_resources()
-        if sum(ipc_cleaned.values()) > 0:
-            logger.info(
-                f"Cleaned up {sum(ipc_cleaned.values())} IPC resources "
-                f"({ipc_cleaned['semaphores']} semaphores, {ipc_cleaned['shared_memory']} shared memory)"
-            )
-
-        # Step 7: Clean up VMs for terminated PIDs
-        if pids_to_terminate:
-            logger.info(
-                f"🌐 Checking for VMs associated with {len(pids_to_terminate)} terminated processes"
-            )
-            vms_cleaned = self._cleanup_vms_for_pids_sync(pids_to_terminate)
-            if vms_cleaned:
-                logger.info(f"🧹 Cleaned up {vms_cleaned} VMs from terminated processes")
-
-        # Step 8: Clear Python cache AGAIN after killing backend to be absolutely sure
-        # This handles any .pyc files that might have been regenerated
-        final_cache_clear = self._clear_python_cache()
-        if final_cache_clear:
-            logger.debug(f"Final cache clear: {final_cache_clear} items removed")
-
-        # Step 9: Save new code state after cleanup
-        self._save_code_state()
-
-        # Summary logging
-        if cleaned:
-            backend_count = len([c for c in cleaned if c.get("type") == "backend"])
-            frontend_count = len([c for c in cleaned if c.get("type") == "frontend"])
-            related_count = len([c for c in cleaned if c.get("type") == "related"])
-
-            logger.info(
-                f"🧹 Cleaned up {len(cleaned)} old JARVIS processes: "
-                f"{backend_count} backend, {frontend_count} frontend, {related_count} related"
-            )
-            logger.info("✅ System ready for fresh code reload")
-        else:
-            logger.info("No old processes found to clean up")
+                    logger.info(
+                        f"🧹 Cleaned up {len(cleaned)} old JARVIS processes: "
+                        f"{backend_count} backend, {frontend_count} frontend, {related_count} related"
+                    )
+                    logger.info("✅ System ready for fresh code reload")
+                else:
+                    logger.info("No old processes found to clean up")
+        finally:
+            if cleanup_started:
+                os.environ.pop("JARVIS_CODE_CLEANUP_IN_PROGRESS", None)
+            self._code_cleanup_guard.release()
 
         return cleaned
 
@@ -5011,9 +5187,20 @@ class ProcessCleanupManager:
                 if excluded_pattern.lower() in proc_name or excluded_pattern.lower() in cmdline:
                     return False
 
+            # Shell wrappers are control surfaces, not managed runtime targets.
+            if proc_name in self.config.get("shell_wrapper_names", []):
+                return False
+
             # Check if it's a generic python/Python process without JARVIS context
             if proc_name in ["python", "python3", "python3.11", "python3.12"] and not any(
-                pattern in cmdline for pattern in ["jarvis", "main.py", "backend"]
+                pattern in cmdline
+                for pattern in [
+                    "jarvis",
+                    "backend/main.py",
+                    "backend.main",
+                    "unified_supervisor.py",
+                    "start_system.py",
+                ]
             ):
                 return False
 
@@ -5029,11 +5216,20 @@ class ProcessCleanupManager:
                         return True
                     # Also check if it's running our Python files
                     if proc_name.startswith("python") and (
-                        "main.py" in cmdline or "start_system.py" in cmdline
+                        "backend/main.py" in cmdline
+                        or "backend.main" in cmdline
+                        or "start_system.py" in cmdline
+                        or "unified_supervisor.py" in cmdline
                     ):
                         return True
             except (psutil.AccessDenied, PermissionError, psutil.NoSuchProcess):
                 pass
+
+            # Entrypoint marker matching allows explicit runtime identity
+            # without relying on broad substring heuristics.
+            for marker in self.config.get("jarvis_entrypoint_markers", []):
+                if marker.lower() in cmdline:
+                    return True
 
             # Dynamic pattern matching
             for pattern in self.config["jarvis_patterns"]:
@@ -6269,9 +6465,6 @@ async def cleanup_system_for_jarvis(
     # Check for crash recovery first
     if manager.check_for_segfault_recovery():
         logger.info("Performed crash recovery cleanup")
-
-    # Always check for code changes and clean up old instances
-    manager.cleanup_old_instances_on_code_change()
 
     # Clean up orphaned VMs (async)
     logger.info("🌐 Checking for orphaned GCP VMs...")
