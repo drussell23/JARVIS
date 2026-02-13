@@ -134,6 +134,9 @@ class NeuralMeshCoordinator:
 
         # Registered agents
         self._agents: Dict[str, BaseNeuralMeshAgent] = {}
+        # v251.4: Slot reservation — names currently being registered (prevents
+        # concurrent register_agent() calls from double-initializing the same agent)
+        self._registering: set = set()
 
         # State
         self._initialized = False
@@ -360,37 +363,59 @@ class NeuralMeshCoordinator:
         """
         Register and initialize an agent with the Neural Mesh.
 
+        Uses slot-reservation pattern to prevent concurrent callers from
+        double-initializing the same agent name across await points.
+
         Args:
             agent: The agent to register
         """
         if not self._initialized:
             raise RuntimeError("Coordinator not initialized")
 
-        if agent.agent_name in self._agents:
+        name = agent.agent_name
+
+        if name in self._agents:
             # v250.2: Downgraded from WARNING to DEBUG — this is expected
             # when multiple init paths (bridge, initializer, task runner)
             # converge on the same singleton coordinator. The early return
             # is correct behavior; the log was just noise.
-            logger.debug("Agent %s already registered (idempotent skip)", agent.agent_name)
+            logger.debug("Agent %s already registered (idempotent skip)", name)
             return
 
-        # Initialize agent with components
-        await agent.initialize(
-            message_bus=self._bus,
-            registry=self._registry,
-            knowledge_graph=self._knowledge,
-        )
+        # v251.4: Slot reservation — check if another coroutine is already
+        # registering this name. Between the check above and self._agents[name]
+        # below, there are await points (initialize, start) where another
+        # coroutine could pass the same check. Reserve the slot BEFORE any await.
+        if name in self._registering:
+            logger.debug("Agent %s registration already in progress (skip)", name)
+            return
 
-        # Start if system is running
-        if self._running:
-            await agent.start()
+        self._registering.add(name)
 
-        self._agents[agent.agent_name] = agent
+        try:
+            # Initialize agent with components
+            await agent.initialize(
+                message_bus=self._bus,
+                registry=self._registry,
+                knowledge_graph=self._knowledge,
+            )
 
-        # v250.2: Downgraded from INFO to DEBUG — the caller (bridge or
-        # initializer) logs its own INFO line. Having both coordinator AND
-        # caller log "Registered agent" at INFO doubles the noise.
-        logger.debug("Coordinator registered: %s", agent.agent_name)
+            # Start if system is running
+            if self._running:
+                await agent.start()
+
+            self._agents[name] = agent
+
+            # v250.2: Downgraded from INFO to DEBUG — the caller (bridge or
+            # initializer) logs its own INFO line. Having both coordinator AND
+            # caller log "Registered agent" at INFO doubles the noise.
+            logger.debug("Coordinator registered: %s", name)
+        except Exception:
+            # Rollback — allow future registration attempts for this name
+            logger.debug("Agent %s registration failed, releasing slot", name)
+            raise
+        finally:
+            self._registering.discard(name)
 
     async def unregister_agent(self, agent_name: str) -> bool:
         """
