@@ -2559,11 +2559,10 @@ def _register_semaphore_cleanup_atexit():
             if is_cli_only_mode():
                 return
 
-            # Mark global shutdown to enable warning suppression
-            try:
-                initiate_global_shutdown("atexit_semaphore_cleanup")
-            except Exception:
-                pass
+            # Do not initiate global shutdown from atexit.
+            # At this point the interpreter is already finalizing, so triggering the
+            # control-plane shutdown signal creates duplicate diagnostics and late
+            # lifecycle callbacks that cannot complete safely.
 
             result = cleanup_all_semaphores_sync()
 

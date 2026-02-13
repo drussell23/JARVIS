@@ -311,8 +311,29 @@ class AGIOSCoordinator:
         self._state = AGIOSState.SHUTTING_DOWN
         logger.info("Stopping AGI OS...")
 
-        # Announce shutdown with dynamic owner name
-        if self._voice:
+        stop_step_timeout = max(0.1, _env_float("AGI_OS_STOP_STEP_TIMEOUT", 3.0))
+        health_task_timeout = max(0.1, _env_float("AGI_OS_HEALTH_TASK_STOP_TIMEOUT", 1.5))
+        farewell_timeout = max(0.1, _env_float("AGI_OS_SHUTDOWN_ANNOUNCE_TIMEOUT", 2.5))
+
+        async def _run_stop_step(
+            name: str,
+            step: Callable[[], Awaitable[Any]],
+            timeout: Optional[float] = None,
+        ) -> None:
+            step_timeout = stop_step_timeout if timeout is None else max(0.1, timeout)
+            try:
+                await asyncio.wait_for(step(), timeout=step_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Timed out stopping %s after %.1fs", name, step_timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Error stopping %s: %s", name, e)
+
+        async def _announce_shutdown() -> None:
+            if not self._voice:
+                return
+
             owner_name = "sir"  # Fallback
             if self._owner_identity:
                 try:
@@ -329,90 +350,63 @@ class AGIOSCoordinator:
                 f"JARVIS offline. Take care, {owner_name}.",
                 f"Systems shutting down. Until next time, {owner_name}.",
             ]
-            await self._voice.speak(
-                random.choice(shutdown_messages),
-                mode=VoiceMode.QUIET
-            )
-            await asyncio.sleep(2)
+            await self._voice.speak(random.choice(shutdown_messages), mode=VoiceMode.QUIET)
 
-        # Cancel health monitor
-        if self._health_task:
-            self._health_task.cancel()
-            try:
-                await self._health_task
-            except asyncio.CancelledError:
-                pass
+        try:
+            # Best-effort farewell with a strict timeout so it never blocks teardown.
+            if self._voice:
+                await _run_stop_step("shutdown announcement", _announce_shutdown, timeout=farewell_timeout)
 
-        # v237.2: Stop event bridge first (unsubscribes from bus + event stream)
-        if self._event_bridge:
-            try:
-                await self._event_bridge.stop()
-            except Exception as e:
-                logger.warning("Error stopping event bridge: %s", e)
+            # Cancel health monitor.
+            if self._health_task:
+                self._health_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(self._health_task, timeout=health_task_timeout)
+                self._health_task = None
 
-        # v237.3: Stop macOS monitors via instance .stop() — NOT the singleton
-        # destructors (stop_notification_monitor / stop_system_event_monitor).
-        # Singleton destructors null the global reference, which breaks other
-        # lifecycle managers (e.g. MacOSHelperCoordinator) that hold the same
-        # singleton. Instance .stop() is idempotent (checks _running) and
-        # preserves the global for potential restart by other coordinators.
-        if self._notification_monitor:
-            try:
-                await self._notification_monitor.stop()
-            except Exception as e:
-                logger.warning("Error stopping NotificationMonitor: %s", e)
+            # v237.2: Stop event bridge first (unsubscribes from bus + event stream).
+            if self._event_bridge:
+                await _run_stop_step("event bridge", self._event_bridge.stop)
 
-        if self._system_event_monitor:
-            try:
-                await self._system_event_monitor.stop()
-            except Exception as e:
-                logger.warning("Error stopping SystemEventMonitor: %s", e)
+            # v237.3: Stop macOS monitors via instance .stop() — NOT singleton destructors.
+            if self._notification_monitor:
+                await _run_stop_step("NotificationMonitor", self._notification_monitor.stop)
 
-        # v237.4: Stop Ghost Display before Ghost Hands
-        if self._ghost_display:
-            try:
-                if hasattr(self._ghost_display, 'cleanup'):
-                    await self._ghost_display.cleanup()
-            except Exception as e:
-                logger.warning("Error stopping Ghost Display: %s", e)
+            if self._system_event_monitor:
+                await _run_stop_step("SystemEventMonitor", self._system_event_monitor.stop)
 
-        # v237.4: Stop Ghost Hands orchestrator
-        if self._ghost_hands:
-            try:
-                await self._ghost_hands.stop()
-            except Exception as e:
-                logger.warning("Error stopping Ghost Hands: %s", e)
+            # v237.4: Stop Ghost Display before Ghost Hands.
+            if self._ghost_display and hasattr(self._ghost_display, 'cleanup'):
+                await _run_stop_step("Ghost Display", self._ghost_display.cleanup)
 
-        # v237.3: Stop screen analyzer (stop monitoring before event stream stops)
-        if self._screen_analyzer:
-            try:
-                await self._screen_analyzer.stop_monitoring()
-            except Exception as e:
-                logger.warning("Error stopping screen analyzer: %s", e)
+            if self._ghost_hands:
+                await _run_stop_step("Ghost Hands", self._ghost_hands.stop)
 
-        # Stop components in reverse order
-        await stop_action_orchestrator()
-        await stop_event_stream()
-        await stop_voice_communicator()
+            # v237.3: Stop screen analyzer before event stream shutdown.
+            if self._screen_analyzer and hasattr(self._screen_analyzer, 'stop_monitoring'):
+                await _run_stop_step("screen analyzer", self._screen_analyzer.stop_monitoring)
 
-        # v237.0: Stop JARVIS Bridge (stops adapter agents, cancels startup tasks)
-        if self._jarvis_bridge:
-            try:
-                await self._jarvis_bridge.stop()
-            except Exception as e:
-                logger.warning("Error stopping JARVIS Bridge: %s", e)
+            runtime = self._resolve_agent_runtime()
+            if runtime and hasattr(runtime, "stop"):
+                await _run_stop_step("agent runtime", runtime.stop)
 
-        # Stop Neural Mesh (stops production agents, bus, registry, orchestrator)
-        # Note: bridge.stop() above already calls coordinator.stop() internally.
-        # This second call is a defensive no-op (coordinator.stop() is idempotent).
-        if self._neural_mesh:
-            try:
-                await self._neural_mesh.stop()
-            except Exception as e:
-                logger.warning("Error stopping Neural Mesh: %s", e)
+            # Stop singleton-managed components in reverse order.
+            await _run_stop_step("action orchestrator", stop_action_orchestrator)
+            await _run_stop_step("event stream", stop_event_stream)
+            await _run_stop_step("voice communicator", stop_voice_communicator)
 
-        self._state = AGIOSState.OFFLINE
-        logger.info("AGI OS stopped")
+            # v237.0: Stop JARVIS Bridge (stops adapter agents, cancels startup tasks).
+            if self._jarvis_bridge:
+                await _run_stop_step("JARVIS Bridge", self._jarvis_bridge.stop)
+
+            # Stop Neural Mesh (stops production agents, bus, registry, orchestrator).
+            # Note: bridge.stop() above already calls coordinator.stop() internally.
+            # This second call is a defensive no-op when already stopped.
+            if self._neural_mesh:
+                await _run_stop_step("Neural Mesh", self._neural_mesh.stop)
+        finally:
+            self._state = AGIOSState.OFFLINE
+            logger.info("AGI OS stopped")
 
     def pause(self) -> None:
         """Pause autonomous operation (still responds to direct commands)."""

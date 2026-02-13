@@ -58589,13 +58589,16 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.debug(f"[Kernel] Startup resilience cleanup error: {e}")
 
-        # v237.0: Stop AGI OS + Neural Mesh + agents (prevents dangling agent tasks)
+        # v237.0/v251.0: Stop AGI OS + Neural Mesh + agents (prevents dangling tasks)
+        agi_stop_timeout = max(1.0, _get_env_float("JARVIS_AGI_OS_STOP_TIMEOUT", 20.0))
         try:
             from agi_os import stop_agi_os
-            await asyncio.wait_for(stop_agi_os(), timeout=10.0)
+            await asyncio.wait_for(stop_agi_os(), timeout=agi_stop_timeout)
             self.logger.info("[Kernel] AGI OS + Neural Mesh stopped")
         except asyncio.TimeoutError:
-            self.logger.debug("[Kernel] AGI OS stop timed out (10s)")
+            self.logger.warning(
+                f"[Kernel] AGI OS stop timed out after {agi_stop_timeout:.1f}s"
+            )
         except Exception as e:
             self.logger.debug(f"[Kernel] AGI OS cleanup error: {e}")
 
@@ -58721,6 +58724,46 @@ class JarvisSystemKernel:
             await asyncio.to_thread(self._startup_lock.release)
         except Exception as e:
             self.logger.debug(f"[Kernel] Lock release error: {e}")
+
+        # v251.0: Deterministic final task drain before loop teardown.
+        # This prevents "Task was destroyed but it is pending" and leaked
+        # fire-and-forget tasks from surviving into interpreter shutdown.
+        try:
+            pending_safe_tasks = await wait_for_fire_and_forget_tasks(timeout=2.0)
+            if pending_safe_tasks:
+                self.logger.debug(
+                    f"[Kernel] {pending_safe_tasks} fire-and-forget task(s) still pending after drain"
+                )
+        except Exception as e:
+            self.logger.debug(f"[Kernel] Safe task drain error: {e}")
+
+        try:
+            current_task = asyncio.current_task()
+            remaining_tasks = [
+                task for task in asyncio.all_tasks()
+                if task is not current_task and not task.done()
+            ]
+            if remaining_tasks:
+                for task in remaining_tasks:
+                    task.cancel()
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*remaining_tasks, return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    still_running = [
+                        task.get_name()
+                        for task in remaining_tasks
+                        if not task.done()
+                    ]
+                    if still_running:
+                        self.logger.debug(
+                            f"[Kernel] Tasks still pending after final drain: {still_running[:12]}"
+                        )
+        except Exception as e:
+            self.logger.debug(f"[Kernel] Final task drain error: {e}")
 
         self._state = KernelState.STOPPED
         self.logger.warning("[Kernel] ⚠️ Emergency shutdown complete")
@@ -75873,7 +75916,40 @@ async def async_main(args: argparse.Namespace) -> int:
     )
 
     # v210.1: Set up global asyncio exception handler as a safety net
-    # This catches any remaining unhandled task exceptions that slip through
+    # This catches any remaining unhandled task exceptions that slip through.
+    # v251.0: Make handler teardown-safe (avoid rich logger during interpreter finalization).
+    def _emit_async_exception_log(text: str, *, transient: bool = False) -> None:
+        """Best-effort log emission that remains safe during interpreter shutdown."""
+        interpreter_finalizing = (
+            getattr(sys, "meta_path", None) is None
+            or bool(getattr(sys, "is_finalizing", lambda: False)())
+        )
+
+        if not interpreter_finalizing:
+            try:
+                if transient:
+                    kernel.logger.info(text)
+                else:
+                    kernel.logger.warning(text)
+                return
+            except Exception:
+                # Fall through to std logging/stderr if rich logger stack is unavailable.
+                pass
+
+            try:
+                logging.log(logging.INFO if transient else logging.WARNING, text)
+                return
+            except Exception:
+                pass
+
+        try:
+            stderr = getattr(sys, "__stderr__", None) or sys.stderr
+            if stderr:
+                stderr.write(f"{text}\n")
+                stderr.flush()
+        except Exception:
+            pass
+
     def _global_exception_handler(loop, context):
         """Global asyncio exception handler for unhandled task exceptions."""
         exception = context.get('exception')
@@ -75891,22 +75967,19 @@ async def async_main(args: argparse.Namespace) -> int:
                 asyncio.TimeoutError,  # Background health checks, keepalive extensions
             ))
 
-            if _is_transient:
-                kernel.logger.info(
-                    f"[GlobalExceptionHandler] Transient error in '{task_name}': "
-                    f"{type(exception).__name__}: {exception}"
-                )
-            else:
-                kernel.logger.warning(
-                    f"[GlobalExceptionHandler] Unhandled task exception in '{task_name}': "
-                    f"{type(exception).__name__}: {exception}"
-                )
+            _emit_async_exception_log(
+                f"[GlobalExceptionHandler] "
+                f"{'Transient error' if _is_transient else 'Unhandled task exception'} "
+                f"in '{task_name}': {type(exception).__name__}: {exception}",
+                transient=_is_transient,
+            )
         else:
-            kernel.logger.warning(
+            _emit_async_exception_log(
                 f"[GlobalExceptionHandler] Async error in '{task_name}': {message}"
             )
-    
+
     loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
     loop.set_exception_handler(_global_exception_handler)
     
     # v119.0: Enterprise-grade try/finally with guaranteed lock release
@@ -75933,6 +76006,13 @@ async def async_main(args: argparse.Namespace) -> int:
     finally:
         # v119.0: Guaranteed cleanup on ALL exit paths (normal, exception, signal)
         try:
+            # Restore previous handler before late-loop teardown starts to avoid
+            # invoking kernel/rich logging during interpreter finalization.
+            try:
+                loop.set_exception_handler(previous_exception_handler)
+            except Exception:
+                pass
+
             # Step 1: Ensure kernel shutdown is complete
             if kernel._state not in (KernelState.STOPPED, KernelState.INITIALIZING):
                 kernel.logger.warning("[Kernel] Forcing shutdown in finally block...")
