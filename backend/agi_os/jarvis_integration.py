@@ -615,7 +615,22 @@ class ScreenAnalyzerBridge:
 
             message += "Let me know if I can assist."
 
-            await self._voice.speak(message, mode=VoiceMode.CONVERSATIONAL)
+            await self._voice.speak(
+                message,
+                mode=VoiceMode.CONVERSATIONAL,
+                context={
+                    "open_listen_window": True,
+                    "listen_reason": "user_help_offer",
+                    "listen_timeout_seconds": float(
+                        os.getenv("JARVIS_HELP_LISTEN_TIMEOUT_SECONDS", "20.0")
+                    ),
+                    "listen_close_on_utterance": True,
+                    "listen_metadata": {
+                        "trigger": "user_needs_help",
+                        "context": state.get("context"),
+                    },
+                },
+            )
 
         if self._event_stream:
             from .proactive_event_stream import AGIEvent, EventType, EventPriority
@@ -864,7 +879,18 @@ class ScreenAnalyzerBridge:
             await self._voice.speak(
                 f"I've analyzed the error. {result.ai_summary}. "
                 f"Would you like me to {suggestion}?",
-                mode=VoiceMode.THOUGHTFUL
+                mode=VoiceMode.THOUGHTFUL,
+                context={
+                    "open_listen_window": True,
+                    "listen_reason": "vision_error_followup",
+                    "listen_timeout_seconds": float(
+                        os.getenv("JARVIS_VISION_FOLLOWUP_LISTEN_TIMEOUT_SECONDS", "25.0")
+                    ),
+                    "listen_close_on_utterance": True,
+                    "listen_metadata": {
+                        "suggestion": suggestion,
+                    },
+                },
             )
 
     def _build_vision_prompt(
@@ -1117,7 +1143,23 @@ CONFIDENCE: <0.0-1.0 confidence score>
             owner_name = await self._get_owner_name()
             notification = pattern.voice_notification.replace("{owner}", owner_name)
 
-            await self._voice.speak(notification, mode=VoiceMode.NOTIFICATION)
+            await self._voice.speak(
+                notification,
+                mode=VoiceMode.NOTIFICATION,
+                context={
+                    "open_listen_window": bool(pattern.suggested_action),
+                    "listen_reason": "pattern_triggered",
+                    "listen_timeout_seconds": float(
+                        os.getenv("JARVIS_PATTERN_LISTEN_TIMEOUT_SECONDS", "15.0")
+                    ),
+                    "listen_close_on_utterance": True,
+                    "listen_metadata": {
+                        "pattern_id": pattern.pattern_id,
+                        "pattern_name": pattern.name,
+                        "suggested_action": pattern.suggested_action,
+                    },
+                },
+            )
 
         # Emit event
         if pattern.event_type and self._event_stream:
@@ -1532,7 +1574,11 @@ class VoiceSystemBridge:
         }
 
         voice_mode = voice_modes.get(mode, VoiceMode.NORMAL)
-        return await self._voice.speak(text, mode=voice_mode)
+        allowed_kwargs = {}
+        for key in ("priority", "callback", "context", "allow_repetition"):
+            if key in kwargs:
+                allowed_kwargs[key] = kwargs[key]
+        return await self._voice.speak(text, mode=voice_mode, **allowed_kwargs)
 
 
 class PermissionSystemBridge:

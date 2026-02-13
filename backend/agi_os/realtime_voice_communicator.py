@@ -441,8 +441,8 @@ class RealTimeVoiceCommunicator:
         """
         Ask a yes/no question and wait for response.
 
-        This is a placeholder that integrates with the voice approval manager
-        for actual voice recognition. For now, it speaks the question.
+        Speaks the question, opens a listening window, and waits for a
+        matching yes/no utterance from the voice input pipeline.
 
         Args:
             question: Question to ask

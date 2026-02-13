@@ -198,6 +198,7 @@ class VoiceApprovalManager:
         # Pending requests
         self._pending_requests: Dict[str, ApprovalRequest] = {}
         self._request_responses: Dict[str, asyncio.Event] = {}
+        self._resolved_responses: Dict[str, ApprovalResponse] = {}
 
         # History
         self._history: List[Tuple[ApprovalRequest, ApprovalResponse]] = []
@@ -520,6 +521,17 @@ class VoiceApprovalManager:
             voice_prompt,
             mode=self._get_voice_mode_for_urgency(request.urgency),
             priority=self._get_voice_priority_for_urgency(request.urgency),
+            context={
+                "open_listen_window": True,
+                "listen_reason": "approval_request",
+                "listen_timeout_seconds": request.timeout,
+                "listen_close_on_utterance": False,
+                "listen_metadata": {
+                    "approval_request_id": request.request_id,
+                    "action_type": request.action_type,
+                    "target": request.target,
+                },
+            },
         )
 
         # Get timeout based on urgency
@@ -528,12 +540,9 @@ class VoiceApprovalManager:
         )
 
         try:
-            # Wait for response (from voice recognition or other input)
-            # In full implementation, voice recognition would set this event
-            # For now, we simulate with timeout behavior
-
-            # TODO: Integrate with voice recognition to set response_event
-            # when user says "yes", "no", "approve", "deny", etc.
+            # Wait for response from voice/WebSocket integration.
+            # UnifiedWebSocketManager routes recognized utterances into
+            # process_voice_response(), which resolves this event.
 
             await asyncio.wait_for(response_event.wait(), timeout=timeout)
 
@@ -575,6 +584,8 @@ class VoiceApprovalManager:
             # Cleanup
             self._pending_requests.pop(request.request_id, None)
             self._request_responses.pop(request.request_id, None)
+            # Drop stale resolved response on timeout/cancellation paths.
+            self._resolved_responses.pop(request.request_id, None)
 
     async def _build_voice_prompt(self, request: ApprovalRequest) -> str:
         """Build a natural voice prompt for the request with dynamic owner name."""
@@ -660,8 +671,7 @@ class VoiceApprovalManager:
 
     def _get_pending_response(self, request_id: str) -> Optional[ApprovalResponse]:
         """Get response for a pending request if available."""
-        # This would be set by voice recognition handler
-        return None
+        return self._resolved_responses.pop(request_id, None)
 
     def _is_quiet_hours(self) -> bool:
         """Check if currently in quiet hours."""
@@ -778,7 +788,8 @@ class VoiceApprovalManager:
         request = self._pending_requests[request_id]
 
         # Record the decision
-        self.record_decision(request, approved, response_method)
+        response = self.record_decision(request, approved, response_method)
+        self._resolved_responses[request_id] = response
 
         # Signal the waiting coroutine
         if request_id in self._request_responses:

@@ -2371,6 +2371,17 @@ class UnifiedWebSocketManager:
                 return None
 
             request_id, approved = approval_result
+            try:
+                from agi_os.realtime_voice_communicator import get_voice_communicator
+
+                voice_comm = await asyncio.wait_for(get_voice_communicator(), timeout=0.5)
+                await voice_comm.close_listening_window(
+                    reason="approval_resolved",
+                    metadata={"approval_request_id": request_id, "approved": approved},
+                )
+            except Exception:
+                pass
+
             response_text = (
                 "Approval recorded. Proceeding with the requested action."
                 if approved
@@ -2701,6 +2712,11 @@ def get_ws_manager() -> UnifiedWebSocketManager:
     global _ws_manager
     if _ws_manager is None:
         _ws_manager = UnifiedWebSocketManager()
+    return _ws_manager
+
+
+def get_ws_manager_if_initialized() -> Optional[UnifiedWebSocketManager]:
+    """Get the existing WebSocket manager without side effects."""
     return _ws_manager
 
 

@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -513,8 +514,62 @@ class ProactiveEventStream:
             voice_mode = VoiceMode.NOTIFICATION
             voice_priority = VoicePriority.NORMAL
 
-        await voice.speak(text, mode=voice_mode, priority=voice_priority)
+        context = self._build_narration_context(event)
+        await voice.speak(text, mode=voice_mode, priority=voice_priority, context=context)
         self._stats['events_narrated'] += 1
+
+    def _build_narration_context(self, event: AGIEvent) -> Dict[str, Any]:
+        """
+        Build speech context for narration, including optional listen-window hints.
+
+        Interactive events open a short post-speech listening window so users can
+        reply without re-triggering a wake word.
+        """
+        context: Dict[str, Any] = {
+            "event_id": event.event_id,
+            "event_type": event.event_type.value,
+            "event_source": event.source,
+        }
+
+        interactive_types = {
+            EventType.MEETING_DETECTED,
+            EventType.SECURITY_CONCERN,
+            EventType.ACTION_REQUESTED,
+            EventType.ACTION_PROPOSED,
+        }
+        interactive_override = event.metadata.get("expect_user_response")
+        is_interactive = (
+            bool(interactive_override)
+            if interactive_override is not None
+            else event.event_type in interactive_types
+        )
+
+        if is_interactive:
+            high_priority_timeout = float(os.getenv("AGI_VOICE_LISTEN_TIMEOUT_HIGH", "18.0"))
+            normal_timeout = float(os.getenv("AGI_VOICE_LISTEN_TIMEOUT_NORMAL", "12.0"))
+            timeout_seconds = float(
+                event.metadata.get(
+                    "listen_timeout_seconds",
+                    high_priority_timeout
+                    if event.priority.value >= EventPriority.HIGH.value
+                    else normal_timeout,
+                )
+            )
+            context.update(
+                {
+                    "open_listen_window": True,
+                    "listen_reason": f"event:{event.event_type.value}",
+                    "listen_timeout_seconds": timeout_seconds,
+                    "listen_close_on_utterance": True,
+                    "listen_metadata": {
+                        "event_id": event.event_id,
+                        "event_type": event.event_type.value,
+                        "priority": event.priority.value,
+                    },
+                }
+            )
+
+        return context
 
     def _get_dedup_key(self, event: AGIEvent) -> str:
         """Generate deduplication key for an event."""

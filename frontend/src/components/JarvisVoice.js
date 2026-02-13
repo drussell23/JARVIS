@@ -701,6 +701,8 @@ const JarvisVoice = () => {
   const [proactiveUnlockProgress, setProactiveUnlockProgress] = useState(null);
   // { stage, message, originalCommand, continuationIntent, progress, status }
   const proactiveUnlockTimeoutRef = useRef(null);
+  const backendListenWindowTimeoutRef = useRef(null);
+  const backendListenWindowIdRef = useRef(null);
 
   // ═══════════════════════════════════════════════════════════════════
   // v32.0: SURVEILLANCE PROGRESS STATE - Real-time God Mode tracking
@@ -1308,6 +1310,12 @@ const JarvisVoice = () => {
         continuousAudioBufferRef.current.stop();
         continuousAudioBufferRef.current = null;
       }
+
+      if (backendListenWindowTimeoutRef.current) {
+        clearTimeout(backendListenWindowTimeoutRef.current);
+        backendListenWindowTimeoutRef.current = null;
+      }
+      backendListenWindowIdRef.current = null;
       // Remove ML event listeners
       window.removeEventListener('audioIssuePredicted', handleAudioPrediction);
       window.removeEventListener('audioAnomaly', handleAudioAnomaly);
@@ -1793,6 +1801,87 @@ const JarvisVoice = () => {
           speakResponse(data.message, false);
         }
         break;
+
+      case 'voice_listen_window_open': {
+        const defaultTimeoutSeconds = Math.max(
+          1,
+          Math.round((voiceConfigRef.current?.commandTimeoutAfterWakeWord || 30000) / 1000)
+        );
+        const timeoutMs = Math.max(
+          1000,
+          Math.round((Number(data.timeout_seconds) || defaultTimeoutSeconds) * 1000)
+        );
+        const windowId = data.window_id || null;
+        backendListenWindowIdRef.current = windowId;
+
+        if (backendListenWindowTimeoutRef.current) {
+          clearTimeout(backendListenWindowTimeoutRef.current);
+          backendListenWindowTimeoutRef.current = null;
+        }
+
+        console.log(
+          `🎤 [VoiceLoop] Listening window opened (${windowId || 'no-id'}) reason=${data.reason || 'unknown'} timeout=${timeoutMs}ms`
+        );
+
+        if (!continuousListeningRef.current && jarvisStatus === 'online') {
+          enableContinuousListening();
+        }
+
+        setIsWaitingForCommand(true);
+        isWaitingForCommandRef.current = true;
+        setIsListening(true);
+        startVoiceAudioCapture();
+
+        backendListenWindowTimeoutRef.current = setTimeout(() => {
+          if (
+            backendListenWindowIdRef.current &&
+            windowId &&
+            backendListenWindowIdRef.current !== windowId
+          ) {
+            return;
+          }
+
+          console.log(`⏱️ [VoiceLoop] Listening window timeout (${windowId || 'no-id'})`);
+          setIsWaitingForCommand(false);
+          isWaitingForCommandRef.current = false;
+          backendListenWindowIdRef.current = null;
+          stopVoiceAudioCapture().catch((err) => {
+            console.debug('[VoiceLoop] stopVoiceAudioCapture timeout cleanup:', err?.message || err);
+          });
+        }, timeoutMs);
+        break;
+      }
+
+      case 'voice_listen_window_closed': {
+        const windowId = data.window_id || null;
+        if (
+          windowId &&
+          backendListenWindowIdRef.current &&
+          backendListenWindowIdRef.current !== windowId
+        ) {
+          console.debug(
+            `[VoiceLoop] Ignoring stale close for ${windowId}; active=${backendListenWindowIdRef.current}`
+          );
+          break;
+        }
+
+        if (backendListenWindowTimeoutRef.current) {
+          clearTimeout(backendListenWindowTimeoutRef.current);
+          backendListenWindowTimeoutRef.current = null;
+        }
+        backendListenWindowIdRef.current = null;
+
+        console.log(
+          `🎤 [VoiceLoop] Listening window closed (${windowId || 'no-id'}) reason=${data.close_reason || data.reason || 'unknown'}`
+        );
+
+        setIsWaitingForCommand(false);
+        isWaitingForCommandRef.current = false;
+        stopVoiceAudioCapture().catch((err) => {
+          console.debug('[VoiceLoop] stopVoiceAudioCapture close:', err?.message || err);
+        });
+        break;
+      }
 
       // NOTE: 'processing' case is handled later in the switch (line ~2132)
       // with more comprehensive logging, message display, and speech
@@ -5397,6 +5486,12 @@ const JarvisVoice = () => {
     setIsListening(false);
     setIsWaitingForCommand(false);
     isWaitingForCommandRef.current = false;
+
+    if (backendListenWindowTimeoutRef.current) {
+      clearTimeout(backendListenWindowTimeoutRef.current);
+      backendListenWindowTimeoutRef.current = null;
+    }
+    backendListenWindowIdRef.current = null;
 
     if (recognitionRef.current) {
       // Clear keep-alive interval
