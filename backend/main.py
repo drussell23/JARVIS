@@ -6209,13 +6209,25 @@ async def health_ai_loader():
         }
 
     try:
-        stats = app.state.ai_manager.get_stats()
+        # v251.6: get_stats() may perform synchronous I/O (model stat collection).
+        # Wrap in executor to prevent event loop stalls.
+        _loop = asyncio.get_running_loop()
+        stats = await asyncio.wait_for(
+            _loop.run_in_executor(None, app.state.ai_manager.get_stats),
+            timeout=float(os.getenv("JARVIS_HEALTH_AI_LOADER_TIMEOUT", "5.0")),
+        )
 
         return {
             "status": "ok",
             "models": stats.get("models", {}),
             "summary": stats.get("summary", {}),
             "config": stats.get("config", {}),
+            "timestamp": datetime.now().isoformat(),
+        }
+    except asyncio.TimeoutError:
+        return {
+            "status": "timeout",
+            "message": "AI loader stats collection timed out",
             "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:

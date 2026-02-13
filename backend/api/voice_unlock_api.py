@@ -969,17 +969,32 @@ async def get_voice_profile_health():
                 health["ready_for_unlock"] = True
                 health["profile_count"] = service.profile_count
                 
-                # Get detailed profile info
-                for name, profile in service.get_all_profiles().items():
-                    health["profiles"].append({
-                        "speaker_name": name,
-                        "is_primary_user": profile.is_primary_user,
-                        "embedding_dim": profile.embedding_dim,
-                        "recognition_confidence": round(profile.recognition_confidence, 3),
-                        "source": profile.source.value,
-                        "total_samples": profile.total_samples,
-                        "valid": profile.is_valid(),
-                    })
+                # v251.6: Profile iteration accesses sync properties per profile.
+                # Wrap in executor to prevent event loop stalls with many profiles.
+                def _collect_profiles():
+                    profiles = []
+                    for name, profile in service.get_all_profiles().items():
+                        profiles.append({
+                            "speaker_name": name,
+                            "is_primary_user": profile.is_primary_user,
+                            "embedding_dim": profile.embedding_dim,
+                            "recognition_confidence": round(profile.recognition_confidence, 3),
+                            "source": profile.source.value,
+                            "total_samples": profile.total_samples,
+                            "valid": profile.is_valid(),
+                        })
+                    return profiles
+
+                import asyncio as _asyncio
+                _loop = _asyncio.get_running_loop()
+                try:
+                    health["profiles"] = await _asyncio.wait_for(
+                        _loop.run_in_executor(None, _collect_profiles),
+                        timeout=float(os.getenv("JARVIS_HEALTH_PROFILES_TIMEOUT", "5.0")),
+                    )
+                except _asyncio.TimeoutError:
+                    health["profiles"] = []
+                    health["profile_collection_timeout"] = True
                 
                 # Get metrics
                 metrics = service.metrics

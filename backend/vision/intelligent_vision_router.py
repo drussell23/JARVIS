@@ -1021,9 +1021,11 @@ class IntelligentVisionRouter:
                     "Respond naturally as JARVIS."
                 )
 
-            # OptimizedClaudeVisionAnalyzer has built-in YOLO hybrid mode
-            result = await self.claude_vision_analyzer.analyze_with_yolo_hybrid(
-                screenshot=screenshot,
+            # v251.6: Fixed phantom method — analyze_with_yolo_hybrid doesn't exist.
+            # analyze_screenshot_fast() contains YOLO hybrid logic internally
+            # (checks self.use_yolo_hybrid at optimized_claude_vision.py:175).
+            result = await self.claude_vision_analyzer.analyze_screenshot_fast(
+                image=screenshot,
                 prompt=enhanced_prompt,
             )
 

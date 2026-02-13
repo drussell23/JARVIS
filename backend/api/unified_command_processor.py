@@ -1224,6 +1224,92 @@ class UnifiedCommandProcessor:
             logger.info("[UNIFIED] No audio data provided for this command")
 
         # =========================================================================
+        # v251.6: TIERED ROUTING — Workspace & Agent-Aware Command Dispatch
+        # =========================================================================
+        # ROOT FIX: "check my email" → QUERY → generic Claude (no agents)
+        # TieredCommandRouter detects workspace intent → GoogleWorkspaceAgent
+        # and agentic commands → Computer Use / Agent Runtime.
+        # Tier 0/1 fall through to existing specialized handlers below.
+        #
+        # SECURITY NOTE: VBIA auth is intentionally skipped for REST API commands.
+        # get_tiered_router() creates TieredCommandRouter with _vbia_callback=None.
+        # REST callers are physically authenticated (local machine access).
+        # Voice commands get VBIA via EnhancedSimpleContextHandler upstream.
+        # =========================================================================
+        try:
+            from core.tiered_command_router import get_tiered_router, CommandTier
+
+            _tiered_router = get_tiered_router()
+            _route_decision = await asyncio.wait_for(
+                _tiered_router.route(command_text),
+                timeout=float(os.getenv("JARVIS_TIERED_ROUTE_TIMEOUT", "3.0")),
+            )
+
+            # BLOCKED → immediate denial
+            if not _route_decision.execution_allowed:
+                logger.warning(
+                    f"[UNIFIED] TieredRouter BLOCKED: {_route_decision.denial_reason}"
+                )
+                return {
+                    "success": False,
+                    "response": _route_decision.denial_reason or "Command blocked.",
+                    "command_type": "blocked",
+                    "tier": _route_decision.tier.value,
+                }
+
+            # Workspace intent → GoogleWorkspaceAgent
+            _workspace_intent = _route_decision.metadata.get("workspace_intent")
+            if _workspace_intent and getattr(_workspace_intent, "is_workspace_command", False):
+                logger.info(
+                    f"[UNIFIED] 📧 Workspace command → TieredRouter "
+                    f"(intent: {_workspace_intent.intent.value})"
+                )
+                _ws_result = await asyncio.wait_for(
+                    _tiered_router.execute_tier2(
+                        command_text,
+                        context={"workspace_intent": _workspace_intent},
+                    ),
+                    timeout=float(os.getenv("JARVIS_WORKSPACE_EXEC_TIMEOUT", "30.0")),
+                )
+                return {
+                    **_ws_result,
+                    "success": _ws_result.get("success", False),
+                    "response": _ws_result.get("response") or _ws_result.get("error", "Workspace command failed"),
+                    "command_type": "workspace",
+                    "routed_via": "tiered_command_router",
+                }
+
+            # Tier 2 agentic (non-workspace) → Computer Use / Agent Runtime
+            if _route_decision.tier == CommandTier.TIER2_AGENTIC:
+                logger.info(
+                    f"[UNIFIED] 🤖 Agentic command → TieredRouter.execute_tier2()"
+                )
+                _ag_result = await asyncio.wait_for(
+                    _tiered_router.execute_tier2(command_text),
+                    timeout=float(os.getenv("JARVIS_AGENTIC_EXEC_TIMEOUT", "60.0")),
+                )
+                return {
+                    **_ag_result,
+                    "success": _ag_result.get("success", False),
+                    "response": _ag_result.get("response") or _ag_result.get("error", "Agentic command failed"),
+                    "command_type": "agentic",
+                    "routed_via": "tiered_command_router",
+                }
+
+            # Tier 0 / Tier 1 → fall through to existing handlers
+            logger.debug(
+                f"[UNIFIED] TieredRouter: {_route_decision.tier.value} "
+                f"→ existing classification pipeline"
+            )
+
+        except asyncio.TimeoutError:
+            logger.warning("[UNIFIED] TieredRouter timed out, falling through to standard pipeline")
+        except ImportError:
+            logger.debug("[UNIFIED] TieredCommandRouter not available, using standard pipeline")
+        except Exception as e:
+            logger.warning(f"[UNIFIED] TieredRouter error: {e}, falling through to standard pipeline")
+
+        # =========================================================================
         # CRITICAL FIX v2.0: Classify command FIRST before ANY initialization!
         # _classify_command is lightweight (no VBI/ECAPA) - safe to call early
         # =========================================================================
