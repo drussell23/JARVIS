@@ -768,3 +768,107 @@ class TestUnifiedAgentRuntime:
         assert runtime._think_timeout == 20.0
         assert runtime._act_timeout == 45.0
         assert runtime._enabled is True
+
+    async def test_graceful_restart_uses_boot_resume_review(self, monkeypatch, tmp_path):
+        """Graceful restart defers resumable goals and emits a resume-review notice."""
+        db_path = str(tmp_path / "cross_session_review.db")
+        monkeypatch.setenv("AGENT_RUNTIME_DB_PATH", db_path)
+        monkeypatch.setenv("AGENT_RUNTIME_CROSS_SESSION_RESUME_POLICY", "review")
+
+        # Session 1: runtime shuts down gracefully with an unfinished goal.
+        runtime1 = await _make_runtime(monkeypatch, tmp_path)
+        runtime1._checkpoint_store._db_path = Path(db_path)
+        await runtime1.start()
+
+        goal = Goal(
+            goal_id="graceful-review-goal",
+            description="Finish yesterday's research",
+            status=GoalStatus.ACTIVE,
+            priority=GoalPriority.HIGH,
+        )
+        goal.started_at = time.time()
+        runtime1._active_goals[goal.goal_id] = goal
+        await runtime1.stop()
+
+        # Session 2: same DB should require explicit resume review.
+        runtime2 = await _make_runtime(monkeypatch, tmp_path)
+        runtime2._checkpoint_store._db_path = Path(db_path)
+        await runtime2.start()
+
+        assert runtime2._last_startup_recovery_mode == "cross_session_review"
+        assert runtime2._goal_queue.qsize() == 0
+
+        deferred = await runtime2.get_deferred_resume_goals()
+        deferred_ids = {item["goal_id"] for item in deferred}
+        assert "graceful-review-goal" in deferred_ids
+
+        # Resume-review notice should be broadcast on boot.
+        broadcast_events = [
+            call.args[0]
+            for call in runtime2._broadcast_ws.await_args_list
+            if call.args
+        ]
+        assert any(
+            event.get("type") == "agent_runtime_notice"
+            and event.get("phase") == "resume_review_required"
+            for event in broadcast_events
+        )
+
+        # Explicit user choice can resume deferred goals.
+        async def complete_immediately(g):
+            g.status = GoalStatus.COMPLETED
+            g.completed_at = time.time()
+
+        runtime2._goal_runner = complete_immediately
+        result = await runtime2.resume_deferred_goals()
+        assert "graceful-review-goal" in result["resumed_goal_ids"]
+
+        await runtime2.stop()
+
+    async def test_unclean_restart_auto_recovers_goals(self, monkeypatch, tmp_path):
+        """Unclean previous shutdown auto-resumes goals even under review policy."""
+        db_path = str(tmp_path / "unclean_recovery.db")
+        monkeypatch.setenv("AGENT_RUNTIME_DB_PATH", db_path)
+        monkeypatch.setenv("AGENT_RUNTIME_CROSS_SESSION_RESUME_POLICY", "review")
+
+        # Session 1: mark runtime as started, save active goal, then "crash".
+        runtime1 = await _make_runtime(monkeypatch, tmp_path)
+        runtime1._checkpoint_store._db_path = Path(db_path)
+        await runtime1.start()
+
+        goal = Goal(
+            goal_id="unclean-recovery-goal",
+            description="Recover after crash",
+            status=GoalStatus.ACTIVE,
+            priority=GoalPriority.NORMAL,
+        )
+        await runtime1._checkpoint_store.save(goal)
+        await runtime1._checkpoint_store.close()  # Simulate abrupt process exit.
+
+        # Session 2: should auto-queue goal due unclean lifecycle marker.
+        runtime2 = await _make_runtime(monkeypatch, tmp_path)
+        runtime2._checkpoint_store._db_path = Path(db_path)
+        await runtime2.start()
+
+        assert runtime2._last_startup_recovery_mode == "unclean_auto_resume"
+        deferred = await runtime2.get_deferred_resume_goals()
+        assert deferred == []
+
+        queued_ids = []
+        while not runtime2._goal_queue.empty():
+            _, goal_id, _goal_obj = runtime2._goal_queue.get_nowait()
+            queued_ids.append(goal_id)
+        assert "unclean-recovery-goal" in queued_ids
+
+        broadcast_events = [
+            call.args[0]
+            for call in runtime2._broadcast_ws.await_args_list
+            if call.args
+        ]
+        assert any(
+            event.get("type") == "agent_runtime_notice"
+            and event.get("phase") == "recovered_after_unclean_shutdown"
+            for event in broadcast_events
+        )
+
+        await runtime2.stop()

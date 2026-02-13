@@ -26,6 +26,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from backend.autonomy.agent_runtime_models import (
     EscalationLevel,
@@ -102,6 +103,13 @@ class GoalCheckpointStore:
             CREATE INDEX IF NOT EXISTS idx_goals_status
             ON goals(status)
         """)
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at REAL
+            )
+        """)
         await self._db.commit()
 
         self._initialized = True
@@ -155,20 +163,58 @@ class GoalCheckpointStore:
             except Exception as e:
                 logger.warning("[CheckpointStore] Save failed: %s", e)
 
-    async def get_incomplete(self) -> List[Goal]:
+    async def get_goal(self, goal_id: str) -> Optional[Goal]:
+        """Load a single goal by ID."""
+        if not self._initialized:
+            return None
+
+        async with self._lock:
+            await self._ensure_connection()
+            if self._db is None:
+                return None
+            try:
+                cursor = await self._db.execute("""
+                    SELECT state_json, schema_version FROM goals
+                    WHERE goal_id = ?
+                """, (goal_id,))
+                row = await cursor.fetchone()
+            except Exception as e:
+                logger.warning("[CheckpointStore] get_goal(%s) failed: %s", goal_id, e)
+                return None
+
+        if not row:
+            return None
+
+        state_json, version = row
+        if version != self.CURRENT_SCHEMA_VERSION:
+            state_json = self._migrate(state_json, version)
+        try:
+            return Goal.from_json(state_json)
+        except Exception as e:
+            logger.warning("[CheckpointStore] Failed to restore goal %s: %s", goal_id, e)
+            return None
+
+    async def get_incomplete(self, max_age_seconds: Optional[float] = None) -> List[Goal]:
         """Load goals that aren't in terminal states (for crash recovery)."""
         if not self._initialized:
             return []
+
+        query = """
+            SELECT state_json, schema_version FROM goals
+            WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled')
+        """
+        params: List[Any] = []
+        if max_age_seconds is not None and max_age_seconds > 0:
+            cutoff = time.time() - max_age_seconds
+            query += " AND updated_at >= ?"
+            params.append(cutoff)
 
         async with self._lock:
             await self._ensure_connection()
             if self._db is None:
                 return []
             try:
-                cursor = await self._db.execute("""
-                    SELECT state_json, schema_version FROM goals
-                    WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled')
-                """)
+                cursor = await self._db.execute(query, tuple(params))
                 rows = await cursor.fetchall()
             except Exception as e:
                 logger.warning("[CheckpointStore] get_incomplete failed: %s", e)
@@ -224,6 +270,90 @@ class GoalCheckpointStore:
             except Exception as e:
                 logger.warning("[CheckpointStore] cleanup_old failed: %s", e)
 
+    async def _set_runtime_meta_locked(self, key: str, value: str):
+        """Set runtime metadata key. Caller must hold _lock."""
+        if self._db is None:
+            return
+        await self._db.execute("""
+            INSERT OR REPLACE INTO runtime_meta (key, value, updated_at)
+            VALUES (?, ?, ?)
+        """, (key, value, time.time()))
+
+    async def get_runtime_meta(self, key: str) -> Optional[str]:
+        """Get runtime metadata value by key."""
+        if not self._initialized:
+            return None
+
+        async with self._lock:
+            await self._ensure_connection()
+            if self._db is None:
+                return None
+            try:
+                cursor = await self._db.execute(
+                    "SELECT value FROM runtime_meta WHERE key = ?",
+                    (key,),
+                )
+                row = await cursor.fetchone()
+            except Exception as e:
+                logger.warning("[CheckpointStore] get_runtime_meta(%s) failed: %s", key, e)
+                return None
+        return row[0] if row else None
+
+    async def mark_runtime_started(self, session_id: str) -> Dict[str, Any]:
+        """Record runtime start and detect whether prior shutdown was unclean."""
+        if not self._initialized:
+            return {"unclean_shutdown": False, "previous_session_id": None}
+
+        async with self._lock:
+            await self._ensure_connection()
+            if self._db is None:
+                return {"unclean_shutdown": False, "previous_session_id": None}
+            try:
+                cursor = await self._db.execute(
+                    "SELECT value FROM runtime_meta WHERE key = ?",
+                    ("runtime_lifecycle_state",),
+                )
+                lifecycle_row = await cursor.fetchone()
+                cursor = await self._db.execute(
+                    "SELECT value FROM runtime_meta WHERE key = ?",
+                    ("runtime_session_id",),
+                )
+                session_row = await cursor.fetchone()
+                previous_state = lifecycle_row[0] if lifecycle_row else None
+                previous_session = session_row[0] if session_row else None
+
+                await self._set_runtime_meta_locked("runtime_lifecycle_state", "running")
+                await self._set_runtime_meta_locked("runtime_session_id", session_id)
+                await self._set_runtime_meta_locked("runtime_started_at", str(time.time()))
+                await self._set_runtime_meta_locked("runtime_pid", str(os.getpid()))
+                await self._db.commit()
+            except Exception as e:
+                logger.warning("[CheckpointStore] mark_runtime_started failed: %s", e)
+                return {"unclean_shutdown": False, "previous_session_id": None}
+
+        return {
+            "unclean_shutdown": previous_state == "running",
+            "previous_session_id": previous_session,
+        }
+
+    async def mark_runtime_stopped(self, session_id: str, reason: str = "graceful"):
+        """Record runtime stop metadata."""
+        if not self._initialized:
+            return
+
+        async with self._lock:
+            await self._ensure_connection()
+            if self._db is None:
+                return
+            try:
+                await self._set_runtime_meta_locked("runtime_lifecycle_state", "stopped")
+                await self._set_runtime_meta_locked("runtime_last_shutdown_reason", reason)
+                await self._set_runtime_meta_locked("runtime_last_shutdown_session_id", session_id)
+                await self._set_runtime_meta_locked("runtime_last_shutdown_at", str(time.time()))
+                await self._db.commit()
+            except Exception as e:
+                logger.warning("[CheckpointStore] mark_runtime_stopped failed: %s", e)
+
     def _migrate(self, state_json: str, from_version: int) -> str:
         """Migrate checkpoint from older schema version."""
         # Schema v1 is current — no migrations needed yet
@@ -261,6 +391,9 @@ class UnifiedAgentRuntime:
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._progress_callbacks: List[Callable] = []
+        self._session_id = str(uuid4())
+        self._deferred_resume_goals: Dict[str, Goal] = {}
+        self._last_startup_recovery_mode = "cold_start"
         # Promotion lock prevents concurrent promote calls from
         # submit_goal() and housekeeping_loop() exceeding _max_concurrent
         self._promotion_lock = asyncio.Lock()
@@ -285,6 +418,16 @@ class UnifiedAgentRuntime:
         self._goal_gen_threshold = _env_float("AGENT_RUNTIME_GOAL_GEN_THRESHOLD", 0.7)
         self._enabled = _env_bool("AGENT_RUNTIME_ENABLED", True)
         self._cleanup_age = _env_float("AGENT_RUNTIME_CLEANUP_AGE", 86400 * 7)
+        self._resume_max_age = _env_float(
+            "AGENT_RUNTIME_RESUME_MAX_AGE_SECONDS", 86400 * 2
+        )
+        raw_resume_policy = os.getenv(
+            "AGENT_RUNTIME_CROSS_SESSION_RESUME_POLICY", "review"
+        ).strip().lower()
+        self._resume_policy = (
+            raw_resume_policy if raw_resume_policy in {"auto", "review", "manual"}
+            else "review"
+        )
 
         # Escalation keywords for dynamic per-step assessment
         self._dangerous_actions = {
@@ -319,17 +462,27 @@ class UnifiedAgentRuntime:
         if not self._enabled:
             logger.info("[AgentRuntime] Disabled via AGENT_RUNTIME_ENABLED=false")
             return
+        if self._running:
+            logger.debug("[AgentRuntime] start() called while already running")
+            return
 
         # Wait for required dependencies
         await self._wait_for_dependencies(timeout=30.0)
 
         await self._checkpoint_store.initialize()
+        startup_state = await self._checkpoint_store.mark_runtime_started(self._session_id)
         self._llm_semaphore = asyncio.Semaphore(self._llm_concurrency)
-        await self._resume_incomplete_goals()
         self._running = True
+        self._shutdown_event.clear()
+        await self._resume_incomplete_goals(
+            previous_shutdown_was_unclean=bool(
+                startup_state.get("unclean_shutdown", False)
+            ),
+        )
         logger.info("[AgentRuntime] Started (max_concurrent=%d, max_iterations=%d, "
-                     "llm_concurrency=%d)",
-                     self._max_concurrent, self._max_iterations, self._llm_concurrency)
+                     "llm_concurrency=%d, resume_policy=%s)",
+                     self._max_concurrent, self._max_iterations,
+                     self._llm_concurrency, self._resume_policy)
 
     async def stop(self):
         """Graceful shutdown. Checkpoint all active goals."""
@@ -338,6 +491,14 @@ class UnifiedAgentRuntime:
 
         self._running = False
         self._shutdown_event.set()
+
+        # Mark non-terminal goals as paused before cancelling runners so
+        # runner finalizers persist the correct non-terminal state.
+        for goal in self._active_goals.values():
+            if goal.status not in TERMINAL_STATES:
+                goal.status = GoalStatus.PAUSED
+                self._mark_goal_paused(goal, reason="runtime_shutdown")
+                await self._checkpoint_store.save(goal)
 
         # Cancel all goal runners
         for goal_id, task in list(self._goal_runners.items()):
@@ -350,14 +511,11 @@ class UnifiedAgentRuntime:
                 return_exceptions=True
             )
 
-        # Checkpoint everything still active
-        for goal in self._active_goals.values():
-            if goal.status not in TERMINAL_STATES:
-                goal.status = GoalStatus.PAUSED
-                await self._checkpoint_store.save(goal)
-
         # Periodic cleanup of old checkpoints
         await self._checkpoint_store.cleanup_old(self._cleanup_age)
+        await self._checkpoint_store.mark_runtime_stopped(
+            self._session_id, reason="graceful"
+        )
         # Close persistent DB connection
         await self._checkpoint_store.close()
 
@@ -443,23 +601,300 @@ class UnifiedAgentRuntime:
             and getattr(self._agent, 'tool_orchestrator', None) is not None
         )
 
-    async def _resume_incomplete_goals(self):
-        """Restore goals from checkpoint store after crash recovery."""
-        goals = await self._checkpoint_store.get_incomplete()
+    def _goal_lifecycle_meta(self, goal: Goal) -> Dict[str, Any]:
+        """Get/create runtime lifecycle metadata for a goal."""
+        if not isinstance(goal.metadata, dict):
+            goal.metadata = {}
+        lifecycle = goal.metadata.get("runtime_lifecycle")
+        if not isinstance(lifecycle, dict):
+            lifecycle = {}
+            goal.metadata["runtime_lifecycle"] = lifecycle
+        return lifecycle
+
+    def _mark_goal_paused(self, goal: Goal, reason: str):
+        """Record why a goal is paused."""
+        lifecycle = self._goal_lifecycle_meta(goal)
+        lifecycle["pause_reason"] = reason
+        lifecycle["paused_at"] = time.time()
+        lifecycle["session_id"] = self._session_id
+        lifecycle.pop("resume_reason", None)
+        lifecycle.pop("resumed_at", None)
+
+    def _mark_goal_resumed(self, goal: Goal, reason: str):
+        """Record why a goal is resumed."""
+        lifecycle = self._goal_lifecycle_meta(goal)
+        lifecycle["resume_reason"] = reason
+        lifecycle["resumed_at"] = time.time()
+        lifecycle["session_id"] = self._session_id
+        lifecycle.pop("pause_reason", None)
+        lifecycle.pop("paused_at", None)
+
+    def _goal_pause_reason(self, goal: Goal) -> str:
+        """Return pause reason from goal metadata."""
+        lifecycle = goal.metadata.get("runtime_lifecycle") if isinstance(goal.metadata, dict) else {}
+        if isinstance(lifecycle, dict):
+            reason = lifecycle.get("pause_reason", "")
+            return reason if isinstance(reason, str) else ""
+        return ""
+
+    def _is_cross_session_resumable(self, goal: Goal) -> bool:
+        """Whether a goal should be considered resumable across sessions."""
+        if goal.status in TERMINAL_STATES:
+            return False
+        if goal.status in {GoalStatus.PENDING, GoalStatus.ACTIVE, GoalStatus.BLOCKED}:
+            return True
+        if goal.status != GoalStatus.PAUSED:
+            return False
+
+        pause_reason = self._goal_pause_reason(goal)
+        return pause_reason in {
+            "",
+            "runtime_shutdown",
+            "cross_session_review",
+            "restart_resume_pending",
+        }
+
+    def _resume_candidate_dict(self, goal: Goal) -> Dict[str, Any]:
+        """Serialize resumable goal metadata for boot-time review payloads."""
+        age_seconds = max(0.0, time.time() - float(goal.created_at or time.time()))
+        return {
+            "goal_id": goal.goal_id,
+            "description": goal.description,
+            "status": goal.status.value,
+            "priority": int(goal.priority.value),
+            "source": goal.source,
+            "pause_reason": self._goal_pause_reason(goal),
+            "age_seconds": age_seconds,
+            "created_at": goal.created_at,
+        }
+
+    async def _queue_goal_for_resume(
+        self,
+        goal: Goal,
+        reason: str,
+        emit_progress: bool = True,
+    ) -> bool:
+        """Queue a resumable goal for execution."""
+        if goal.goal_id in self._active_goals:
+            return False
+        if goal.status in TERMINAL_STATES:
+            return False
+        if not self._is_cross_session_resumable(goal):
+            return False
+
+        goal.status = GoalStatus.PENDING
+        self._mark_goal_resumed(goal, reason=reason)
+        await self._checkpoint_store.save(goal)
+        # Negate priority so CRITICAL(4) dequeues before BACKGROUND(1)
+        await self._goal_queue.put((-goal.priority.value, goal.goal_id, goal))
+        if emit_progress:
+            await self._emit_progress(
+                goal,
+                "resumed",
+                f"Goal resumed: {goal.description[:80]}",
+            )
+        return True
+
+    async def _resume_incomplete_goals(self, previous_shutdown_was_unclean: bool):
+        """Restore goals from checkpoint store with lifecycle-aware policy."""
+        goals = await self._checkpoint_store.get_incomplete(
+            max_age_seconds=self._resume_max_age
+        )
         if not goals:
+            self._last_startup_recovery_mode = "no_goals"
             return
 
-        logger.info("[AgentRuntime] Resuming %d incomplete goals from checkpoint", len(goals))
-        for goal in goals:
-            # Re-queue with their original priority
-            goal.status = GoalStatus.PENDING
-            try:
-                # Negate priority so CRITICAL(4) dequeues before BACKGROUND(1)
-                # PriorityQueue pops lowest value first
-                await self._goal_queue.put((-goal.priority.value, goal.goal_id, goal))
-            except Exception as e:
-                logger.warning("[AgentRuntime] Failed to re-queue goal %s: %s",
-                              goal.goal_id, e)
+        resumable_goals = [g for g in goals if self._is_cross_session_resumable(g)]
+        if not resumable_goals:
+            self._last_startup_recovery_mode = "no_resumable_goals"
+            return
+
+        # Unclean previous shutdown always resumes immediately.
+        if previous_shutdown_was_unclean:
+            resumed = 0
+            resumed_goal_ids: List[str] = []
+            for goal in resumable_goals:
+                try:
+                    if await self._queue_goal_for_resume(
+                        goal, reason="unclean_shutdown_recovery", emit_progress=False
+                    ):
+                        resumed += 1
+                        resumed_goal_ids.append(goal.goal_id)
+                except Exception as e:
+                    logger.warning(
+                        "[AgentRuntime] Failed to recover goal %s after unclean shutdown: %s",
+                        goal.goal_id, e,
+                    )
+            self._last_startup_recovery_mode = "unclean_auto_resume"
+            if resumed:
+                await self._emit_runtime_notice(
+                    phase="recovered_after_unclean_shutdown",
+                    detail=f"Recovered {resumed} incomplete goal(s) after unclean shutdown.",
+                    extra={
+                        "resumed_count": resumed,
+                        "resumed_goal_ids": resumed_goal_ids,
+                    },
+                )
+            return
+
+        # Graceful restart policy: auto, review, or manual.
+        if self._resume_policy == "auto":
+            resumed = 0
+            resumed_goal_ids: List[str] = []
+            for goal in resumable_goals:
+                try:
+                    if await self._queue_goal_for_resume(
+                        goal, reason="graceful_restart_auto_resume", emit_progress=False
+                    ):
+                        resumed += 1
+                        resumed_goal_ids.append(goal.goal_id)
+                except Exception as e:
+                    logger.warning(
+                        "[AgentRuntime] Failed to auto-resume goal %s: %s",
+                        goal.goal_id, e,
+                    )
+            self._last_startup_recovery_mode = "graceful_auto_resume"
+            if resumed:
+                await self._emit_runtime_notice(
+                    phase="resumed_after_graceful_restart",
+                    detail=f"Resumed {resumed} incomplete goal(s) from previous session.",
+                    extra={
+                        "resumed_count": resumed,
+                        "resumed_goal_ids": resumed_goal_ids,
+                    },
+                )
+            return
+
+        # review/manual: hold for explicit user decision.
+        self._deferred_resume_goals.clear()
+        for goal in resumable_goals:
+            self._mark_goal_paused(goal, reason="cross_session_review")
+            await self._checkpoint_store.save(goal)
+            self._deferred_resume_goals[goal.goal_id] = goal
+
+        mode = "cross_session_review" if self._resume_policy == "review" else "cross_session_manual"
+        self._last_startup_recovery_mode = mode
+        await self._emit_runtime_notice(
+            phase="resume_review_required",
+            detail=(
+                f"You had {len(self._deferred_resume_goals)} incomplete goals "
+                "from the previous session. Resume?"
+            ),
+            extra={
+                "deferred_count": len(self._deferred_resume_goals),
+                "resume_candidates": [
+                    self._resume_candidate_dict(g)
+                    for g in sorted(
+                        self._deferred_resume_goals.values(),
+                        key=lambda item: (item.priority.value, item.created_at),
+                        reverse=True,
+                    )
+                ],
+                "resume_policy": self._resume_policy,
+            },
+        )
+
+    async def get_deferred_resume_goals(self) -> List[Dict[str, Any]]:
+        """Get goals awaiting cross-session resume decision."""
+        goals = sorted(
+            self._deferred_resume_goals.values(),
+            key=lambda item: (item.priority.value, item.created_at),
+            reverse=True,
+        )
+        return [self._resume_candidate_dict(goal) for goal in goals]
+
+    async def resume_goal(self, goal_id: str, reason: str = "manual_resume") -> bool:
+        """Resume a specific goal by ID."""
+        goal = self._deferred_resume_goals.pop(goal_id, None)
+        if goal is None and goal_id in self._active_goals:
+            goal = self._active_goals[goal_id]
+
+        if goal is None:
+            goal = await self._checkpoint_store.get_goal(goal_id)
+        if goal is None:
+            return False
+
+        if goal.goal_id in self._active_goals and goal.status == GoalStatus.PAUSED:
+            goal.status = GoalStatus.ACTIVE
+            self._mark_goal_resumed(goal, reason=reason)
+            await self._checkpoint_store.save(goal)
+            if goal_id not in self._goal_runners or self._goal_runners[goal_id].done():
+                runner = asyncio.create_task(
+                    self._goal_runner(goal),
+                    name=f"goal-runner-{goal_id}",
+                )
+                runner.add_done_callback(
+                    lambda t, gid=goal_id: self._runner_done(gid, t)
+                )
+                self._goal_runners[goal_id] = runner
+            return True
+
+        queued = await self._queue_goal_for_resume(goal, reason=reason, emit_progress=True)
+        if queued and self._running:
+            await self._promote_pending_goals()
+        return queued
+
+    async def resume_deferred_goals(
+        self, goal_ids: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Resume deferred cross-session goals (all, or selected IDs)."""
+        target_ids = goal_ids or list(self._deferred_resume_goals.keys())
+        resumed_goal_ids: List[str] = []
+        skipped_goal_ids: List[str] = []
+
+        for goal_id in target_ids:
+            resumed = await self.resume_goal(goal_id, reason="cross_session_resume")
+            if resumed:
+                resumed_goal_ids.append(goal_id)
+            else:
+                skipped_goal_ids.append(goal_id)
+
+        await self._emit_runtime_notice(
+            phase="resume_review_resolved",
+            detail=f"Resumed {len(resumed_goal_ids)} goal(s) from previous session.",
+            extra={
+                "resumed_goal_ids": resumed_goal_ids,
+                "skipped_goal_ids": skipped_goal_ids,
+                "remaining_deferred": len(self._deferred_resume_goals),
+            },
+        )
+
+        return {
+            "resumed_goal_ids": resumed_goal_ids,
+            "skipped_goal_ids": skipped_goal_ids,
+            "remaining_deferred": len(self._deferred_resume_goals),
+        }
+
+    async def defer_deferred_goals(
+        self,
+        goal_ids: Optional[List[str]] = None,
+        reason: str = "resume_deferred_by_user",
+    ) -> Dict[str, Any]:
+        """Leave deferred goals paused and clear them from boot review queue."""
+        target_ids = goal_ids or list(self._deferred_resume_goals.keys())
+        deferred_goal_ids: List[str] = []
+
+        for goal_id in target_ids:
+            goal = self._deferred_resume_goals.pop(goal_id, None)
+            if goal is None:
+                continue
+            goal.status = GoalStatus.PAUSED
+            self._mark_goal_paused(goal, reason=reason)
+            await self._checkpoint_store.save(goal)
+            deferred_goal_ids.append(goal_id)
+
+        await self._emit_runtime_notice(
+            phase="resume_review_deferred",
+            detail=f"Deferred {len(deferred_goal_ids)} goal(s) for later.",
+            extra={
+                "deferred_goal_ids": deferred_goal_ids,
+                "remaining_deferred": len(self._deferred_resume_goals),
+            },
+        )
+        return {
+            "deferred_goal_ids": deferred_goal_ids,
+            "remaining_deferred": len(self._deferred_resume_goals),
+        }
 
     # ─────────────────────────────────────────────────────────
     # Goal Submission & Cancellation
@@ -491,6 +926,10 @@ class UnifiedAgentRuntime:
             needs_vision=needs_vision,
             metadata=context or {},
         )
+        lifecycle = self._goal_lifecycle_meta(goal)
+        lifecycle["session_id"] = self._session_id
+        lifecycle["submitted_at"] = time.time()
+        lifecycle["submission_reason"] = "new_goal"
 
         await self._checkpoint_store.save(goal)
         # Negate priority so CRITICAL(4) dequeues before BACKGROUND(1)
@@ -607,6 +1046,10 @@ class UnifiedAgentRuntime:
                 _, goal_id, goal = self._goal_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+            # Deduplicate if the same goal was enqueued multiple times.
+            if goal_id in self._active_goals:
+                continue
 
             self._active_goals[goal_id] = goal
             self._goal_locks[goal_id] = asyncio.Lock()
@@ -1543,6 +1986,8 @@ class UnifiedAgentRuntime:
 
     async def _escalate_to_human(self, goal: Goal, step: GoalStep):
         """Notify user that a goal needs approval."""
+        self._mark_goal_paused(goal, reason="human_approval")
+        await self._checkpoint_store.save(goal)
         event = {
             "type": "agent_escalation",
             "goal_id": goal.goal_id,
@@ -1567,6 +2012,8 @@ class UnifiedAgentRuntime:
 
         if approved:
             goal.status = GoalStatus.ACTIVE
+            self._mark_goal_resumed(goal, reason="human_approval_granted")
+            await self._checkpoint_store.save(goal)
             # Re-spawn runner if it was cancelled
             if goal_id not in self._goal_runners or self._goal_runners[goal_id].done():
                 runner = asyncio.create_task(
@@ -1620,6 +2067,35 @@ class UnifiedAgentRuntime:
     # Progress & WebSocket Broadcasting
     # ─────────────────────────────────────────────────────────
 
+    async def _emit_runtime_notice(
+        self,
+        phase: str,
+        detail: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
+        """Emit runtime-level events that are not tied to a single active goal."""
+        event: Dict[str, Any] = {
+            "type": "agent_runtime_notice",
+            "phase": phase,
+            "detail": detail,
+            "timestamp": time.time(),
+            "session_id": self._session_id,
+            "recovery_mode": self._last_startup_recovery_mode,
+        }
+        if extra:
+            event.update(extra)
+
+        for callback in self._progress_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(event)
+                else:
+                    callback(event)
+            except Exception:
+                pass
+
+        await self._broadcast_ws(event)
+
     async def _emit_progress(self, goal: Goal, phase: str, detail: str):
         """Emit real-time progress to frontend via WebSocket."""
         event = {
@@ -1666,17 +2142,23 @@ class UnifiedAgentRuntime:
     # ─────────────────────────────────────────────────────────
 
     async def _on_goal_complete(self, goal: Goal):
-        """Handle goal reaching a terminal state."""
+        """Handle goal runner shutdown (terminal or paused/checkpointed)."""
         await self._checkpoint_store.save(goal)
         await self._data_bus.clear_goal(goal.goal_id)
 
-        # Record trajectory for learning
-        await self._record_goal_trajectory(goal)
+        if goal.status in TERMINAL_STATES:
+            # Record trajectory for learning
+            await self._record_goal_trajectory(goal)
+            # Emit final status
+            await self._emit_progress(
+                goal, "terminal",
+                f"Goal {goal.status.value}: {goal.description[:60]}",
+            )
+            return
 
-        # Emit final status
         await self._emit_progress(
-            goal, "terminal",
-            f"Goal {goal.status.value}: {goal.description[:60]}",
+            goal, "checkpointed",
+            f"Goal checkpointed as {goal.status.value}: {goal.description[:60]}",
         )
 
     async def _record_goal_trajectory(self, goal: Goal):

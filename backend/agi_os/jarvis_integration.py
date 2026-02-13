@@ -252,6 +252,22 @@ class ScreenAnalyzerBridge:
         self._connected = False
         self._processing_lock = asyncio.Lock()
         self._vision_task: Optional[asyncio.Task] = None
+        self._callback_mapping: Dict[str, Callable[..., Coroutine[Any, Any, None]]] = {
+            # Core callbacks
+            'error_detected': self._on_error_detected,
+            'content_changed': self._on_content_changed,
+            'app_changed': self._on_app_changed,
+            'user_needs_help': self._on_user_needs_help,
+            'memory_warning': self._on_memory_warning,
+            # Extended callbacks
+            'notification_detected': self._on_notification_detected,
+            'meeting_detected': self._on_meeting_detected,
+            'security_concern': self._on_security_concern,
+            'screen_captured': self._on_screen_captured,
+        }
+        self._registered_callbacks: Dict[str, Callable[..., Coroutine[Any, Any, None]]] = {}
+        self._available_callback_types: Set[str] = set()
+        self._missing_callback_types: Set[str] = set()
 
         # Statistics
         self._stats = {
@@ -474,28 +490,57 @@ class ScreenAnalyzerBridge:
         if not self._analyzer:
             return
 
-        # Check if analyzer has event_callbacks attribute
-        if hasattr(self._analyzer, 'event_callbacks'):
-            callbacks = self._analyzer.event_callbacks
+        self._unregister_callbacks()
+        self._missing_callback_types.clear()
+        self._available_callback_types.clear()
 
-            # Core callbacks
-            callback_mapping = {
-                'error_detected': self._on_error_detected,
-                'content_changed': self._on_content_changed,
-                'app_changed': self._on_app_changed,
-                'user_needs_help': self._on_user_needs_help,
-                'memory_warning': self._on_memory_warning,
-                # Extended callbacks
-                'notification_detected': self._on_notification_detected,
-                'meeting_detected': self._on_meeting_detected,
-                'security_concern': self._on_security_concern,
-                'screen_captured': self._on_screen_captured,
-            }
+        callbacks_dict = getattr(self._analyzer, 'event_callbacks', None)
+        if isinstance(callbacks_dict, dict):
+            self._available_callback_types = set(callbacks_dict.keys())
 
-            for callback_name, handler in callback_mapping.items():
-                if callback_name in callbacks:
-                    callbacks[callback_name].add(handler)
-                    logger.debug("Registered callback: %s", callback_name)
+        for callback_name, handler in self._callback_mapping.items():
+            # If analyzer exposes callback surface, respect it strictly.
+            if self._available_callback_types and callback_name not in self._available_callback_types:
+                self._missing_callback_types.add(callback_name)
+                continue
+
+            try:
+                if hasattr(self._analyzer, 'register_callback'):
+                    self._analyzer.register_callback(callback_name, handler)
+                elif isinstance(callbacks_dict, dict) and callback_name in callbacks_dict:
+                    callbacks_dict[callback_name].add(handler)
+                else:
+                    self._missing_callback_types.add(callback_name)
+                    continue
+
+                self._registered_callbacks[callback_name] = handler
+                logger.debug("Registered callback: %s", callback_name)
+            except Exception as e:
+                self._missing_callback_types.add(callback_name)
+                logger.debug("Failed to register callback %s: %s", callback_name, e)
+
+        if self._missing_callback_types:
+            logger.warning(
+                "ScreenAnalyzerBridge missing callback coverage for: %s",
+                sorted(self._missing_callback_types),
+            )
+
+    def _unregister_callbacks(self) -> None:
+        """Unregister previously registered analyzer callbacks."""
+        if not self._analyzer or not self._registered_callbacks:
+            self._registered_callbacks.clear()
+            return
+
+        callbacks_dict = getattr(self._analyzer, 'event_callbacks', None)
+        for callback_name, handler in list(self._registered_callbacks.items()):
+            try:
+                if hasattr(self._analyzer, 'unregister_callback'):
+                    self._analyzer.unregister_callback(callback_name, handler)
+                elif isinstance(callbacks_dict, dict) and callback_name in callbacks_dict:
+                    callbacks_dict[callback_name].discard(handler)
+            except Exception as e:
+                logger.debug("Failed to unregister callback %s: %s", callback_name, e)
+        self._registered_callbacks.clear()
 
     async def disconnect(self) -> None:
         """Disconnect and cleanup."""
@@ -506,6 +551,7 @@ class ScreenAnalyzerBridge:
             except asyncio.CancelledError:
                 pass
 
+        self._unregister_callbacks()
         self._connected = False
         logger.info("Screen analyzer disconnected from AGI OS")
 
@@ -1289,6 +1335,13 @@ CONFIDENCE: <0.0-1.0 confidence score>
 
     def get_stats(self) -> Dict[str, Any]:
         """Get bridge statistics."""
+        analyzer_event_stats = {}
+        if self._analyzer and hasattr(self._analyzer, 'get_event_stats'):
+            try:
+                analyzer_event_stats = self._analyzer.get_event_stats()
+            except Exception:
+                analyzer_event_stats = {}
+
         return {
             **self._stats,
             'connected': self._connected,
@@ -1301,6 +1354,11 @@ CONFIDENCE: <0.0-1.0 confidence score>
             'current_app': self._current_app,
             'current_window': self._current_window,
             'last_activity': self._last_activity.isoformat() if self._last_activity else None,
+            'callback_expected_count': len(self._callback_mapping),
+            'callback_registered_count': len(self._registered_callbacks),
+            'callback_available_types': sorted(self._available_callback_types),
+            'callback_missing_types': sorted(self._missing_callback_types),
+            'analyzer_event_stats': analyzer_event_stats,
         }
 
 

@@ -6,11 +6,13 @@ Optimized for 16GB RAM macOS systems
 """
 
 import asyncio
+import hashlib
 import logging
 import time
 import os
 import gc
 import psutil
+from difflib import SequenceMatcher
 from typing import Dict, Any, Optional, Callable, List, Deque
 from datetime import datetime, timedelta
 from collections import deque
@@ -55,6 +57,27 @@ class MemoryAwareScreenAnalyzer:
             'dynamic_interval_enabled': os.getenv('VISION_DYNAMIC_INTERVAL', 'true').lower() == 'true',
             'min_interval_seconds': float(os.getenv('VISION_MIN_INTERVAL', '1.0')),
             'max_interval_seconds': float(os.getenv('VISION_MAX_INTERVAL', '10.0')),
+            'content_similarity_threshold': float(
+                os.getenv('VISION_CONTENT_SIMILARITY_THRESHOLD', '0.92')
+            ),
+            'event_dedup_window_seconds': float(
+                os.getenv('VISION_EVENT_DEDUP_WINDOW_SECONDS', '6.0')
+            ),
+            'app_change_cooldown_seconds': float(
+                os.getenv('VISION_APP_CHANGE_COOLDOWN_SECONDS', '1.0')
+            ),
+            'content_change_cooldown_seconds': float(
+                os.getenv('VISION_CONTENT_CHANGE_COOLDOWN_SECONDS', '2.0')
+            ),
+            'semantic_event_cooldown_seconds': float(
+                os.getenv('VISION_SEMANTIC_EVENT_COOLDOWN_SECONDS', '8.0')
+            ),
+            'capture_change_threshold': float(
+                os.getenv('VISION_CAPTURE_CHANGE_THRESHOLD', '0.10')
+            ),
+            'callback_timeout_seconds': float(
+                os.getenv('VISION_CALLBACK_TIMEOUT_SECONDS', '3.0')
+            ),
         }
         
         self.is_monitoring = False
@@ -72,7 +95,11 @@ class MemoryAwareScreenAnalyzer:
             'current_app': None,
             'visible_elements': [],
             'context': {},
-            'timestamp': None
+            'timestamp': None,
+            'quick_app': None,
+            'content_fingerprint': None,
+            'content_text': '',
+            'capture_signature': None,
         }
         
         # Callbacks with weak references to prevent memory leaks
@@ -100,6 +127,14 @@ class MemoryAwareScreenAnalyzer:
             'peak_usage_mb': 0,
             'captures_dropped': 0,
             'memory_warnings': 0
+        }
+
+        # Event dedup + observability
+        self._event_last_emitted: Dict[str, float] = {}
+        self._event_last_fingerprint: Dict[str, str] = {}
+        self._event_stats = {
+            'emitted': {event_name: 0 for event_name in self.event_callbacks},
+            'suppressed': {event_name: 0 for event_name in self.event_callbacks},
         }
         
         # Dynamic interval adjustment
@@ -307,30 +342,242 @@ class MemoryAwareScreenAnalyzer:
             capture_data = {
                 'timestamp': current_time,
                 'result': screenshot,
-                'size_bytes': self._estimate_capture_size(screenshot)
+                'size_bytes': self._estimate_capture_size(screenshot),
             }
             
             # Add to history (circular buffer handles removal)
             self.capture_history.append(capture_data)
+
+            capture_fingerprint = self._compute_capture_fingerprint(screenshot)
+            previous_capture_signature = self.current_screen_state.get('capture_signature')
+            capture_signature = self._compute_capture_signature(screenshot)
+            if capture_signature is not None:
+                self.current_screen_state['capture_signature'] = capture_signature
+
+            await self._trigger_event('screen_captured', {
+                'timestamp': current_time,
+                'capture_size_bytes': capture_data['size_bytes'],
+                'capture_fingerprint': capture_fingerprint,
+                '_event_fingerprint': capture_fingerprint,
+                '_event_cooldown_seconds': max(
+                    0.5, float(self.config['app_change_cooldown_seconds'])
+                ),
+            })
             
             # Quick analysis to detect changes
             quick_analysis = await self._quick_screen_analysis()
+            previous_quick_app = self.current_screen_state.get('quick_app')
+            current_quick_app = self._normalize_app_name(
+                quick_analysis.get('current_app')
+            )
+            if current_quick_app:
+                self.current_screen_state['quick_app'] = current_quick_app
+
+            if (
+                current_quick_app
+                and previous_quick_app
+                and current_quick_app != previous_quick_app
+            ):
+                await self._trigger_event('app_changed', {
+                    'app_name': current_quick_app,
+                    'previous_app': previous_quick_app,
+                    'window_title': self.current_screen_state.get('current_window', ''),
+                    'analysis_source': 'quick_analysis',
+                    '_event_fingerprint': f"{previous_quick_app}->{current_quick_app}",
+                    '_event_cooldown_seconds': float(
+                        self.config['app_change_cooldown_seconds']
+                    ),
+                })
             
             # Determine if we need full analysis
             needs_full_analysis = self._needs_full_analysis(quick_analysis)
+
+            # Lightweight frame-diff fallback for content changes between full analyses.
+            if (
+                not needs_full_analysis
+                and previous_capture_signature is not None
+                and capture_signature is not None
+            ):
+                capture_change_score = self._compute_capture_change_score(
+                    previous_capture_signature, capture_signature
+                )
+                if capture_change_score >= float(self.config['capture_change_threshold']):
+                    await self._trigger_event('content_changed', {
+                        'app': current_quick_app,
+                        'previous_app': previous_quick_app,
+                        'text': '',
+                        'visual_elements': [],
+                        'similarity': max(0.0, 1.0 - capture_change_score),
+                        'analysis_source': 'capture_signature_diff',
+                        'capture_change_score': capture_change_score,
+                        '_event_fingerprint': f"capture_diff:{current_quick_app or 'unknown'}",
+                        '_event_cooldown_seconds': float(
+                            self.config['content_change_cooldown_seconds']
+                        ),
+                    })
             
             if needs_full_analysis:
+                previous_content_text = self.current_screen_state.get('content_text', '')
+                previous_fingerprint = self.current_screen_state.get('content_fingerprint')
+                previous_app = (
+                    self.current_screen_state.get('current_app')
+                    or previous_quick_app
+                )
+
                 # Perform full Claude Vision analysis
                 analysis = await self._full_screen_analysis()
                 
                 # Update screen state
                 self._update_screen_state(analysis)
+
+                content_text = self.current_screen_state.get('content_text', '')
+                content_fingerprint = self.current_screen_state.get('content_fingerprint')
+                current_app = (
+                    self.current_screen_state.get('current_app')
+                    or self.current_screen_state.get('quick_app')
+                )
+                similarity = self._compare_text_similarity(
+                    previous_content_text, content_text
+                )
+                content_threshold = max(
+                    0.1,
+                    min(1.0, float(self.config['content_similarity_threshold']))
+                )
+                app_changed = bool(
+                    previous_app and current_app and previous_app != current_app
+                )
+                content_changed = (
+                    previous_fingerprint is None
+                    or content_fingerprint != previous_fingerprint
+                )
+
+                if content_changed and (app_changed or similarity < content_threshold):
+                    await self._trigger_event('content_changed', {
+                        'app': current_app,
+                        'previous_app': previous_app,
+                        'text': content_text,
+                        'visual_elements': self.current_screen_state.get(
+                            'visible_elements', []
+                        ),
+                        'similarity': similarity,
+                        'analysis': analysis,
+                        '_event_fingerprint': content_fingerprint or '',
+                        '_event_cooldown_seconds': float(
+                            self.config['content_change_cooldown_seconds']
+                        ),
+                    })
                 
                 # Trigger relevant callbacks
                 await self._process_screen_events(analysis)
             
         except Exception as e:
             logger.error(f"Error capturing/analyzing screen: {e}")
+
+    def _normalize_app_name(self, app_name: Any) -> str:
+        """Normalize app name from quick/full analyzers."""
+        if app_name is None:
+            return ''
+        value = str(app_name).strip()
+        if value.lower() in ('', 'unknown', 'none', 'null'):
+            return ''
+        return value
+
+    def _compute_capture_fingerprint(self, screenshot: Any) -> str:
+        """Compute a stable lightweight fingerprint for the captured frame."""
+        try:
+            if isinstance(screenshot, Image.Image):
+                sample = screenshot.convert('L').resize((32, 32))
+                return hashlib.sha1(sample.tobytes()).hexdigest()[:20]
+            if isinstance(screenshot, np.ndarray):
+                array = screenshot
+                if array.ndim == 3:
+                    array = np.mean(array, axis=2)
+                sample = Image.fromarray(array.astype(np.uint8)).resize((32, 32))
+                return hashlib.sha1(sample.tobytes()).hexdigest()[:20]
+            if hasattr(screenshot, 'tobytes'):
+                raw = screenshot.tobytes()
+                return hashlib.sha1(raw[:4096]).hexdigest()[:20]
+        except Exception:
+            pass
+        return hashlib.sha1(str(type(screenshot)).encode()).hexdigest()[:20]
+
+    def _compute_capture_signature(self, screenshot: Any) -> Optional[np.ndarray]:
+        """Build a normalized grayscale signature for frame-diff scoring."""
+        try:
+            if isinstance(screenshot, Image.Image):
+                sample = screenshot.convert('L').resize((24, 24))
+                return np.array(sample, dtype=np.float32) / 255.0
+            if isinstance(screenshot, np.ndarray):
+                array = screenshot
+                if array.ndim == 3:
+                    array = np.mean(array, axis=2)
+                sample = Image.fromarray(array.astype(np.uint8)).convert('L').resize((24, 24))
+                return np.array(sample, dtype=np.float32) / 255.0
+        except Exception:
+            return None
+        return None
+
+    def _compute_capture_change_score(
+        self,
+        previous_signature: np.ndarray,
+        current_signature: np.ndarray,
+    ) -> float:
+        """Compute normalized average pixel delta between two frame signatures."""
+        if previous_signature.shape != current_signature.shape:
+            return 1.0
+        delta = np.abs(previous_signature - current_signature)
+        return float(np.clip(np.mean(delta), 0.0, 1.0))
+
+    def _extract_analysis_text(self, analysis: Dict[str, Any]) -> str:
+        """Extract comparable text from a full analysis result."""
+        description = str(analysis.get('description', ''))
+        raw_data = analysis.get('raw_data', {})
+        text_chunks: List[str] = [description]
+
+        if isinstance(raw_data, dict):
+            for key in (
+                'text',
+                'ocr_text',
+                'summary',
+                'active_app',
+                'window_title',
+                'current_task',
+            ):
+                value = raw_data.get(key)
+                if value:
+                    text_chunks.append(str(value))
+            for key in ('notifications', 'errors', 'warnings', 'messages'):
+                value = raw_data.get(key)
+                if isinstance(value, list):
+                    text_chunks.extend(str(item) for item in value[:10])
+        elif raw_data:
+            text_chunks.append(str(raw_data))
+
+        merged = " ".join(" ".join(text_chunks).split())
+        return merged[:8000]
+
+    def _extract_visual_elements(self, analysis: Dict[str, Any]) -> List[Any]:
+        """Extract visual elements from analysis raw data if available."""
+        raw_data = analysis.get('raw_data', {})
+        if isinstance(raw_data, dict):
+            for key in ('visual_elements', 'elements', 'ui_elements'):
+                value = raw_data.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
+    def _fingerprint_text(self, value: str) -> str:
+        """Create deterministic fingerprint for textual content."""
+        normalized = " ".join((value or '').strip().lower().split())
+        return hashlib.sha1(normalized.encode()).hexdigest()[:20]
+
+    def _compare_text_similarity(self, old_text: str, new_text: str) -> float:
+        """Compare text bodies to estimate semantic change."""
+        if not old_text and not new_text:
+            return 1.0
+        if not old_text or not new_text:
+            return 0.0
+        return SequenceMatcher(None, old_text[:4000], new_text[:4000]).ratio()
     
     def _estimate_capture_size(self, capture_data: Any) -> int:
         """Estimate memory size of capture"""
@@ -518,7 +765,12 @@ Be concise but thorough.'''
             return True
         
         # Check if app changed
-        if quick_analysis.get('current_app') != self.current_screen_state.get('current_app'):
+        quick_app = self._normalize_app_name(quick_analysis.get('current_app'))
+        tracked_app = self._normalize_app_name(
+            self.current_screen_state.get('quick_app')
+            or self.current_screen_state.get('current_app')
+        )
+        if quick_app and tracked_app and quick_app != tracked_app:
             return True
         
         # Check if enough time has passed (configurable)
@@ -531,10 +783,16 @@ Be concise but thorough.'''
     
     def _update_screen_state(self, analysis: Dict[str, Any]):
         """Update internal screen state"""
+        content_text = self._extract_analysis_text(analysis)
+        current_app = self._normalize_app_name(self._extract_current_app(analysis))
         self.current_screen_state.update({
             'last_analysis': analysis.get('description', ''),
             'timestamp': analysis.get('timestamp', time.time()),
-            'current_app': self._extract_current_app(analysis)
+            'current_app': current_app,
+            'content_text': content_text,
+            'content_fingerprint': self._fingerprint_text(content_text),
+            'visible_elements': self._extract_visual_elements(analysis),
+            'context': analysis.get('raw_data', {}),
         })
     
     def _extract_current_app(self, analysis: Dict[str, Any]) -> Optional[str]:
@@ -573,21 +831,161 @@ Be concise but thorough.'''
     
     async def _process_screen_events(self, analysis: Dict[str, Any]):
         """Process screen events and trigger callbacks"""
-        description = analysis.get('description', '').lower()
+        content_text = self._extract_analysis_text(analysis)
+        description = content_text.lower()
+        semantic_cooldown = float(self.config['semantic_event_cooldown_seconds'])
         
         # Check for weather visibility
         if 'weather' in description and any(word in description for word in ['temperature', 'degrees', '°']):
             await self._trigger_event('weather_visible', {
                 'analysis': analysis,
-                'weather_info': self._extract_weather_info(description)
+                'weather_info': self._extract_weather_info(description),
+                '_event_fingerprint': self._fingerprint_text(description),
+                '_event_cooldown_seconds': semantic_cooldown,
             })
         
         # Check for errors
-        if any(word in description for word in ['error', 'failed', 'exception', 'crash']):
+        error_keywords = ['error', 'failed', 'exception', 'crash', 'not responding']
+        if any(word in description for word in error_keywords):
             await self._trigger_event('error_detected', {
                 'analysis': analysis,
-                'error_context': description
+                'error_context': description,
+                'error_type': self._extract_first_match(description, error_keywords),
+                '_event_fingerprint': self._fingerprint_text(f"error|{description}"),
+                '_event_cooldown_seconds': semantic_cooldown,
             })
+
+        notification_keywords = [
+            'notification',
+            'new message',
+            'unread',
+            'mentions you',
+            'badge',
+        ]
+        if any(word in description for word in notification_keywords):
+            await self._trigger_event('notification_detected', {
+                'type': 'visual_notification',
+                'source_app': self._infer_notification_source(description),
+                'title': '',
+                'content': content_text[:300],
+                '_event_fingerprint': self._fingerprint_text(
+                    f"notification|{content_text}"
+                ),
+                '_event_cooldown_seconds': semantic_cooldown,
+            })
+
+        meeting_keywords = [
+            'meeting',
+            'calendar',
+            'zoom',
+            'google meet',
+            'microsoft teams',
+            'starts in',
+        ]
+        if any(word in description for word in meeting_keywords):
+            minutes_until = self._extract_minutes_until(description)
+            await self._trigger_event('meeting_detected', {
+                'title': '',
+                'start_time': '',
+                'minutes_until': minutes_until if minutes_until is not None else 0,
+                'platform': self._infer_meeting_platform(description),
+                '_event_fingerprint': self._fingerprint_text(f"meeting|{content_text}"),
+                '_event_cooldown_seconds': semantic_cooldown,
+            })
+
+        security_keywords = [
+            'security',
+            'password',
+            'authenticate',
+            'verification code',
+            'malware',
+            'suspicious',
+            'permission',
+            'grant access',
+        ]
+        if any(word in description for word in security_keywords):
+            await self._trigger_event('security_concern', {
+                'type': 'security_prompt',
+                'description': content_text[:400],
+                'severity': self._infer_security_severity(description),
+                'recommended_action': 'review_before_confirming',
+                '_event_fingerprint': self._fingerprint_text(
+                    f"security|{content_text}"
+                ),
+                '_event_cooldown_seconds': semantic_cooldown,
+            })
+
+        help_keywords = [
+            'please wait',
+            'loading',
+            'stuck',
+            'not responding',
+            'try again',
+            'connection lost',
+        ]
+        if any(word in description for word in help_keywords):
+            await self._trigger_event('user_needs_help', {
+                'context': content_text[:300],
+                'reason': self._extract_first_match(description, help_keywords),
+                '_event_fingerprint': self._fingerprint_text(f"help|{content_text}"),
+                '_event_cooldown_seconds': semantic_cooldown,
+            })
+
+    def _extract_first_match(self, description: str, keywords: List[str]) -> str:
+        """Return first matching keyword in description."""
+        for keyword in keywords:
+            if keyword in description:
+                return keyword
+        return "unknown"
+
+    def _infer_notification_source(self, description: str) -> str:
+        """Best-effort source application inference for notifications."""
+        source_map = {
+            'slack': 'Slack',
+            'discord': 'Discord',
+            'teams': 'Teams',
+            'mail': 'Mail',
+            'messages': 'Messages',
+            'calendar': 'Calendar',
+        }
+        for token, source in source_map.items():
+            if token in description:
+                return source
+        return self.current_screen_state.get('quick_app') or 'unknown'
+
+    def _infer_meeting_platform(self, description: str) -> str:
+        """Best-effort meeting platform inference."""
+        platform_map = {
+            'zoom': 'Zoom',
+            'google meet': 'Google Meet',
+            'meet': 'Google Meet',
+            'teams': 'Teams',
+            'webex': 'Webex',
+        }
+        for token, platform in platform_map.items():
+            if token in description:
+                return platform
+        return 'unknown'
+
+    def _extract_minutes_until(self, description: str) -> Optional[int]:
+        """Extract 'meeting in X minutes' style hints."""
+        import re
+
+        match = re.search(r'(\d{1,3})\s*(minute|min)s?\b', description)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    def _infer_security_severity(self, description: str) -> str:
+        """Infer severity for detected security concerns."""
+        if any(token in description for token in ('malware', 'suspicious', 'breach')):
+            return 'high'
+        if any(token in description for token in ('password', 'authenticate', 'permission')):
+            return 'medium'
+        return 'low'
     
     def _extract_weather_info(self, description: str) -> Optional[str]:
         """Extract weather information from screen description"""
@@ -600,25 +998,94 @@ Be concise but thorough.'''
             # Fallback to simple extraction
             return description if 'weather' in description.lower() else None
     
-    async def _trigger_event(self, event_type: str, data: Dict[str, Any]):
-        """Trigger event callbacks using weak references"""
-        if event_type in self.event_callbacks:
-            # Convert WeakSet to list to iterate
-            callbacks = list(self.event_callbacks[event_type])
-            for callback in callbacks:
-                try:
-                    if asyncio.iscoroutinefunction(callback):
-                        await callback(data)
-                    else:
-                        callback(data)
-                except Exception as e:
-                    logger.error(f"Error in callback for {event_type}: {e}")
+    async def _trigger_event(self, event_type: str, data: Dict[str, Any]) -> bool:
+        """Trigger event callbacks using weak references with dedup suppression."""
+        if event_type not in self.event_callbacks:
+            return False
+
+        payload = dict(data)
+        dedup_fingerprint = str(
+            payload.pop('_event_fingerprint', '')
+        ) or self._fingerprint_text(f"{event_type}|{payload}")
+        cooldown_seconds = float(
+            payload.pop(
+                '_event_cooldown_seconds',
+                self.config['event_dedup_window_seconds'],
+            )
+        )
+
+        now = time.monotonic()
+        last_ts = self._event_last_emitted.get(event_type, 0.0)
+        last_fingerprint = self._event_last_fingerprint.get(event_type)
+        if (
+            last_fingerprint == dedup_fingerprint
+            and now - last_ts < max(0.0, cooldown_seconds)
+        ):
+            self._event_stats['suppressed'][event_type] += 1
+            return False
+
+        self._event_last_emitted[event_type] = now
+        self._event_last_fingerprint[event_type] = dedup_fingerprint
+        self._event_stats['emitted'][event_type] += 1
+
+        # Convert WeakSet to list to iterate safely while callbacks run
+        callbacks = list(self.event_callbacks[event_type])
+        async_tasks = []
+        for callback in callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    async_tasks.append(
+                        asyncio.create_task(
+                            self._invoke_async_callback(callback, payload, event_type)
+                        )
+                    )
+                else:
+                    callback(payload)
+            except Exception as e:
+                logger.error(f"Error in callback for {event_type}: {e}")
+
+        if async_tasks:
+            results = await asyncio.gather(*async_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error("Async callback error for %s: %s", event_type, result)
+        return True
+
+    async def _invoke_async_callback(
+        self,
+        callback: Callable[..., Any],
+        payload: Dict[str, Any],
+        event_type: str,
+    ) -> None:
+        """Invoke async callback with timeout isolation."""
+        timeout = max(0.1, float(self.config.get('callback_timeout_seconds', 3.0)))
+        try:
+            await asyncio.wait_for(callback(payload), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Callback timeout for %s after %.2fs", event_type, timeout
+            )
     
     def register_callback(self, event_type: str, callback: Callable):
         """Register a callback for specific events"""
         if event_type in self.event_callbacks:
             self.event_callbacks[event_type].add(callback)
             logger.info(f"Registered callback for {event_type}")
+            return
+        logger.warning("Unknown callback type requested: %s", event_type)
+
+    def unregister_callback(self, event_type: str, callback: Callable) -> None:
+        """Unregister a callback for specific events."""
+        if event_type in self.event_callbacks:
+            self.event_callbacks[event_type].discard(callback)
+
+    def get_event_stats(self) -> Dict[str, Any]:
+        """Get callback emission and suppression stats."""
+        return {
+            'emitted': self._event_stats['emitted'].copy(),
+            'suppressed': self._event_stats['suppressed'].copy(),
+            'last_emitted_monotonic': self._event_last_emitted.copy(),
+        }
     
     async def get_current_screen_context(self) -> Dict[str, Any]:
         """Get current screen context for queries"""
@@ -679,7 +1146,9 @@ Be concise but thorough.'''
             'captures_in_memory': len(self.capture_history),
             'cache_entries': len(self._analysis_cache),
             'current_interval': self.current_interval,
-            'available_system_mb': self._get_available_memory_mb()
+            'available_system_mb': self._get_available_memory_mb(),
+            'callback_types': sorted(self.event_callbacks.keys()),
+            'event_stats': self.get_event_stats(),
         }
 
 # Backward compatibility alias

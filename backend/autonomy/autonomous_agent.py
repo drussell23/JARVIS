@@ -867,6 +867,30 @@ class AutonomousAgent:
         if self._runtime is not None:
             await self._runtime.approve_escalation(goal_id, approved)
 
+    async def get_deferred_resume_goals(self) -> List[Dict[str, Any]]:
+        """Get cross-session goals awaiting resume review."""
+        if self._runtime is not None and hasattr(self._runtime, "get_deferred_resume_goals"):
+            return await self._runtime.get_deferred_resume_goals()
+        return []
+
+    async def resume_deferred_goals(
+        self, goal_ids: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Resume cross-session deferred goals."""
+        if self._runtime is not None and hasattr(self._runtime, "resume_deferred_goals"):
+            return await self._runtime.resume_deferred_goals(goal_ids=goal_ids)
+        return {"resumed_goal_ids": [], "skipped_goal_ids": [], "remaining_deferred": 0}
+
+    async def defer_deferred_goals(
+        self,
+        goal_ids: Optional[List[str]] = None,
+        reason: str = "resume_deferred_by_user",
+    ) -> Dict[str, Any]:
+        """Leave deferred goals paused and clear current boot review queue."""
+        if self._runtime is not None and hasattr(self._runtime, "defer_deferred_goals"):
+            return await self._runtime.defer_deferred_goals(goal_ids=goal_ids, reason=reason)
+        return {"deferred_goal_ids": [], "remaining_deferred": 0}
+
 
 # ============================================================================
 # Factory Functions
