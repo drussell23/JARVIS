@@ -14,9 +14,11 @@ v6.4: Initial implementation with all 6 design corrections.
 
 from __future__ import annotations
 
+import atexit
 import asyncio
 import logging
 import os
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
@@ -68,6 +70,7 @@ class BrowsingEngine:
         self._browser = None
         self._default_context = None
         self._pages: Dict[str, Any] = {}  # tab_id -> Page
+        self._page_access_times: Dict[str, float] = {}  # tab_id -> last access time
         self._lock: Optional[asyncio.Lock] = None
         self._initialized = False
 
@@ -179,17 +182,21 @@ class BrowsingEngine:
             return False
 
     async def new_page(self, url: Optional[str] = None, tab_id: Optional[str] = None) -> Optional[Any]:
-        """Open a new page. Enforces max_pages limit."""
+        """Open a new page. Enforces max_pages limit with LRU eviction."""
         if not self._initialized or not self._default_context:
             return None
 
         async with self._get_lock():
-            # Enforce max pages
+            # Enforce max pages — evict least-recently-used
             if len(self._pages) >= self._max_pages:
-                # Close oldest page
-                oldest_id = next(iter(self._pages))
-                await self._close_page_unlocked(oldest_id)
-                logger.debug(f"[BROWSE-ENGINE] Evicted oldest page {oldest_id}")
+                lru_id = min(
+                    self._page_access_times,
+                    key=self._page_access_times.get,  # type: ignore[arg-type]
+                    default=next(iter(self._pages), None),
+                )
+                if lru_id:
+                    await self._close_page_unlocked(lru_id)
+                    logger.debug(f"[BROWSE-ENGINE] Evicted LRU page {lru_id}")
 
             tab_id = tab_id or str(uuid.uuid4())[:8]
             try:
@@ -197,6 +204,7 @@ class BrowsingEngine:
                 if url:
                     await page.goto(url, wait_until="domcontentloaded")
                 self._pages[tab_id] = page
+                self._page_access_times[tab_id] = time.monotonic()
                 return page
             except Exception as e:
                 logger.warning(f"[BROWSE-ENGINE] Failed to create page: {e}")
@@ -233,11 +241,14 @@ class BrowsingEngine:
             return {"success": False, "error": str(e), "url": url}
 
     async def get_page(self, tab_id: Optional[str] = None) -> Optional[Any]:
-        """Get page by tab_id, or the most recent page."""
+        """Get page by tab_id, or the most recent page. Updates LRU timestamp."""
         if tab_id and tab_id in self._pages:
+            self._page_access_times[tab_id] = time.monotonic()
             return self._pages[tab_id]
         if self._pages:
-            return next(reversed(self._pages.values()))
+            last_id = next(reversed(self._pages))
+            self._page_access_times[last_id] = time.monotonic()
+            return self._pages[last_id]
         return None
 
     async def close_page(self, tab_id: str) -> None:
@@ -247,6 +258,7 @@ class BrowsingEngine:
 
     async def _close_page_unlocked(self, tab_id: str) -> None:
         page = self._pages.pop(tab_id, None)
+        self._page_access_times.pop(tab_id, None)
         if page:
             try:
                 await page.close()
@@ -301,30 +313,51 @@ class SearchHandler:
     - DuckDuckGo (free, no API key — default)
     - Brave, Bing, Google, SearXNG (API keys via env vars)
     - Built-in rate limiting, circuit breakers, caching
+
+    Uses exponential backoff for transient init failures (never permanently disabled).
     """
+
+    _BACKOFF_BASE = _env_float("BROWSE_SEARCH_BACKOFF_BASE", 5.0)
+    _BACKOFF_CAP = _env_float("BROWSE_SEARCH_BACKOFF_CAP", 300.0)  # 5 min max
 
     def __init__(self):
         self._extractor = None
-        self._init_attempted = False
+        self._init_failures: int = 0
+        self._next_retry_at: float = 0.0  # monotonic time
+        self._import_missing: bool = False  # permanent: module doesn't exist
 
     async def _get_extractor(self):
         if self._extractor is not None:
             return self._extractor
-        if self._init_attempted:
+        # ImportError is permanent — no point retrying
+        if self._import_missing:
+            return None
+        # Exponential backoff for transient failures
+        if self._init_failures > 0 and time.monotonic() < self._next_retry_at:
             return None
 
-        self._init_attempted = True
         try:
             from core.ouroboros.native_integration import get_web_search_extractor
             self._extractor = get_web_search_extractor()
             await self._extractor.initialize()
+            self._init_failures = 0  # reset on success
             logger.debug("[BROWSE-SEARCH] WebSearchExtractor initialized")
             return self._extractor
         except ImportError:
+            self._import_missing = True
             logger.debug("[BROWSE-SEARCH] ouroboros.native_integration not available")
             return None
         except Exception as e:
-            logger.warning(f"[BROWSE-SEARCH] Failed to init WebSearchExtractor: {e}")
+            self._init_failures += 1
+            backoff = min(
+                self._BACKOFF_BASE * (2 ** (self._init_failures - 1)),
+                self._BACKOFF_CAP,
+            )
+            self._next_retry_at = time.monotonic() + backoff
+            logger.warning(
+                f"[BROWSE-SEARCH] Init failed (attempt {self._init_failures}, "
+                f"retry in {backoff:.0f}s): {e}"
+            )
             return None
 
     async def search(self, query: str, max_results: int = 5) -> Dict[str, Any]:
@@ -505,7 +538,12 @@ class FormHandler:
 
     async def submit_form(self, page, selector: str = "form") -> bool:
         try:
-            await page.evaluate(f'document.querySelector("{selector}").submit()')
+            # Use safe Playwright API — never interpolate user selectors into JS
+            element = await page.query_selector(selector)
+            if element is None:
+                logger.debug(f"[BROWSE-FORM] submit_form: no element for '{selector}'")
+                return False
+            await element.evaluate("el => el.submit()")
             return True
         except Exception as e:
             logger.debug(f"[BROWSE-FORM] submit_form failed: {e}")
@@ -517,72 +555,81 @@ class FormHandler:
 # =============================================================================
 
 class ContentIntelligence:
-    """Optional LLM-powered content analysis via JARVIS-Prime."""
+    """Optional LLM-powered content analysis via JARVIS-Prime.
+
+    Caches the httpx client to reuse TCP connections across requests.
+    """
 
     def __init__(self):
         self._prime_url = os.getenv("JPRIME_URL", "http://localhost:8002")
         self._timeout = _env_float("BROWSE_INTELLIGENCE_TIMEOUT", 30.0)
+        self._client = None  # Lazy httpx.AsyncClient
+
+    async def _get_client(self):
+        if self._client is not None:
+            return self._client
+        try:
+            import httpx
+            self._client = httpx.AsyncClient(
+                timeout=self._timeout,
+                base_url=self._prime_url,
+            )
+            return self._client
+        except ImportError:
+            return None
+
+    async def _chat(self, system_msg: str, user_msg: str, max_tokens: int) -> Optional[str]:
+        """Send a chat completion request to J-Prime."""
+        client = await self._get_client()
+        if not client:
+            return None
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "local",
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "max_tokens": max_tokens,
+                },
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("choices", [{}])[0].get("message", {}).get("content")
+        except Exception as e:
+            logger.debug(f"[BROWSE-INTEL] J-Prime request failed: {e}")
+        return None
 
     async def summarize(self, content: str, query: Optional[str] = None) -> Optional[str]:
         """Summarize page content via J-Prime. Returns None if unavailable."""
-        try:
-            import httpx
-        except ImportError:
-            return None
-
-        prompt = f"Summarize the following web page content"
+        prompt = "Summarize the following web page content"
         if query:
             prompt += f" in the context of the query: '{query}'"
         prompt += f":\n\n{content[:5000]}"
-
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(
-                    f"{self._prime_url}/v1/chat/completions",
-                    json={
-                        "model": "local",
-                        "messages": [
-                            {"role": "system", "content": "You are a helpful assistant that summarizes web content concisely."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "max_tokens": 500,
-                    },
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    return data.get("choices", [{}])[0].get("message", {}).get("content")
-        except Exception as e:
-            logger.debug(f"[BROWSE-INTEL] J-Prime summarization failed: {e}")
-
-        return None
+        return await self._chat(
+            "You are a helpful assistant that summarizes web content concisely.",
+            prompt,
+            500,
+        )
 
     async def extract_answer(self, content: str, question: str) -> Optional[str]:
         """Extract specific answer from content. Returns None if unavailable."""
-        try:
-            import httpx
-        except ImportError:
-            return None
+        return await self._chat(
+            "Extract the answer to the question from the provided content. Be concise.",
+            f"Question: {question}\n\nContent:\n{content[:5000]}",
+            300,
+        )
 
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(
-                    f"{self._prime_url}/v1/chat/completions",
-                    json={
-                        "model": "local",
-                        "messages": [
-                            {"role": "system", "content": "Extract the answer to the question from the provided content. Be concise."},
-                            {"role": "user", "content": f"Question: {question}\n\nContent:\n{content[:5000]}"},
-                        ],
-                        "max_tokens": 300,
-                    },
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    return data.get("choices", [{}])[0].get("message", {}).get("content")
-        except Exception as e:
-            logger.debug(f"[BROWSE-INTEL] J-Prime answer extraction failed: {e}")
-
-        return None
+    async def close(self) -> None:
+        """Close the cached httpx client."""
+        if self._client:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
 
 
 # =============================================================================
@@ -590,24 +637,37 @@ class ContentIntelligence:
 # =============================================================================
 
 class BrowsingTelemetry:
-    """Emit browsing events to Reactor-Core for learning. Optional, never blocks."""
+    """Emit browsing events to Reactor-Core for learning. Optional, never blocks.
+
+    Uses exponential backoff — never permanently disabled by transient failures.
+    """
 
     def __init__(self):
         self._emitter = None
-        self._init_attempted = False
+        self._init_failures: int = 0
+        self._next_retry_at: float = 0.0
+        self._import_missing: bool = False
 
     async def _get_emitter(self):
         if self._emitter is not None:
             return self._emitter
-        if self._init_attempted:
+        if self._import_missing:
             return None
-        self._init_attempted = True
+        if self._init_failures > 0 and time.monotonic() < self._next_retry_at:
+            return None
         try:
             from core.telemetry_emitter import get_telemetry_emitter
             self._emitter = await get_telemetry_emitter()
-        except (ImportError, Exception):
-            pass
-        return self._emitter
+            self._init_failures = 0
+            return self._emitter
+        except ImportError:
+            self._import_missing = True
+            return None
+        except Exception:
+            self._init_failures += 1
+            backoff = min(5.0 * (2 ** (self._init_failures - 1)), 300.0)
+            self._next_retry_at = time.monotonic() + backoff
+            return None
 
     async def emit(self, event_type: str, data: Dict[str, Any]) -> None:
         try:
@@ -861,8 +921,9 @@ class BrowsingAgent:
         return {"success": True, "elements": elements, "count": len(elements)}
 
     async def shutdown(self) -> None:
-        """Clean shutdown."""
+        """Clean shutdown — closes Playwright browser + httpx client."""
         await self._engine.shutdown()
+        await self._intelligence.close()
 
 
 # =============================================================================
@@ -870,7 +931,36 @@ class BrowsingAgent:
 # =============================================================================
 
 _browsing_agent: Optional[BrowsingAgent] = None
-_browsing_lock: Optional[asyncio.Lock] = None
+# Thread-safe lock for singleton creation (avoids race in asyncio.Lock init)
+_browsing_init_lock = threading.Lock()
+_browsing_async_lock: Optional[asyncio.Lock] = None
+_atexit_registered = False
+
+
+def _get_async_lock() -> asyncio.Lock:
+    """Get or create the asyncio lock, thread-safely."""
+    global _browsing_async_lock
+    if _browsing_async_lock is None:
+        with _browsing_init_lock:
+            if _browsing_async_lock is None:
+                _browsing_async_lock = asyncio.Lock()
+    return _browsing_async_lock
+
+
+def _atexit_shutdown_browsing() -> None:
+    """Atexit handler: shut down Playwright to prevent orphaned Chromium processes."""
+    agent = _browsing_agent
+    if agent is None:
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Schedule shutdown on the running loop (best-effort)
+            loop.create_task(agent.shutdown())
+        else:
+            loop.run_until_complete(agent.shutdown())
+    except Exception:
+        pass  # atexit — can't raise
 
 
 async def get_browsing_agent() -> Optional[BrowsingAgent]:
@@ -881,14 +971,12 @@ async def get_browsing_agent() -> Optional[BrowsingAgent]:
     Playwright-dependent actions (navigate, extract, form) require
     pip install playwright && python -m playwright install chromium.
     """
-    global _browsing_agent, _browsing_lock
-    if _browsing_lock is None:
-        _browsing_lock = asyncio.Lock()
+    global _browsing_agent, _atexit_registered
 
     if _browsing_agent is not None:
         return _browsing_agent
 
-    async with _browsing_lock:
+    async with _get_async_lock():
         # Double-check under lock
         if _browsing_agent is not None:
             return _browsing_agent
@@ -901,6 +989,12 @@ async def get_browsing_agent() -> Optional[BrowsingAgent]:
         try:
             await agent.on_initialize()
             _browsing_agent = agent
+
+            # Register atexit cleanup (once) to prevent orphaned Chromium
+            if not _atexit_registered:
+                atexit.register(_atexit_shutdown_browsing)
+                _atexit_registered = True
+
             logger.info(
                 "[BROWSE] BrowsingAgent initialized "
                 f"(playwright={'yes' if agent._playwright_available else 'no'})"

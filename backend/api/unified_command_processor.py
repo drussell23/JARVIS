@@ -6413,19 +6413,23 @@ class UnifiedCommandProcessor:
         logger.info(f"[SEARCH] Web search for '{query}'")
 
         # Tier 1: Try BrowsingAgent (structured API search)
+        # Single timeout budget covers init + search (no stacking)
+        import time as _time
+        search_budget = float(os.environ.get("BROWSE_SEARCH_BUDGET", "10.0"))
         try:
             from browsing.browsing_agent import get_browsing_agent
 
-            agent = await asyncio.wait_for(get_browsing_agent(), timeout=5.0)
+            budget_start = _time.monotonic()
+            agent = await asyncio.wait_for(get_browsing_agent(), timeout=search_budget)
             if agent:
-                search_timeout = float(os.environ.get("BROWSE_SEARCH_TIMEOUT", "10.0"))
+                remaining = max(1.0, search_budget - (_time.monotonic() - budget_start))
                 result = await asyncio.wait_for(
                     agent.execute_task({
                         "action": "search",
                         "query": query,
                         "max_results": 5,
                     }),
-                    timeout=search_timeout,
+                    timeout=remaining,
                 )
                 if result.get("success") and result.get("results"):
                     formatted = self._format_search_results(result["results"])
@@ -6478,20 +6482,21 @@ class UnifiedCommandProcessor:
         return {"success": False, "response": f"Unable to search for '{query}'"}
 
     def _format_search_results(self, results: List[Dict[str, Any]]) -> str:
-        """Format structured search results for voice/text response."""
+        """Format structured search results for voice/text response.
+
+        Voice-friendly: titles + snippets only (no URLs — terrible for TTS).
+        URLs are still available in the structured_results dict for display.
+        """
         if not results:
             return "No results found."
 
-        lines = ["Here are the top results:"]
+        lines = [f"Here are the top {min(len(results), 5)} results:"]
         for i, r in enumerate(results[:5], 1):
             title = r.get("title", "Untitled")
             snippet = r.get("snippet", "")
-            url = r.get("url", "")
             lines.append(f"{i}. {title}")
             if snippet:
-                lines.append(f"   {snippet[:120]}")
-            if url:
-                lines.append(f"   {url}")
+                lines.append(f"   {snippet[:150]}")
         return "\n".join(lines)
 
     async def _try_browsing_navigate(self, url: str) -> Optional[Dict[str, Any]]:
