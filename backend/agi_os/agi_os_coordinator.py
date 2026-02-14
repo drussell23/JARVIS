@@ -701,7 +701,7 @@ class AGIOSCoordinator:
 
         # SAI (Self-Aware Intelligence) — sync import, no timeout needed
         try:
-            from core.hybrid_orchestrator import _get_sai
+            from core.hybrid_orchestrator import _get_sai, get_sai_loader_status
             self._sai_system = _get_sai()
             if self._sai_system:
                 self._component_status['sai'] = ComponentStatus(
@@ -709,6 +709,15 @@ class AGIOSCoordinator:
                     available=True
                 )
                 logger.info("SAI loaded")
+            else:
+                sai_status = get_sai_loader_status()
+                error = sai_status.get("error") or "SAI loader returned no instance"
+                self._component_status['sai'] = ComponentStatus(
+                    name='sai',
+                    available=False,
+                    error=str(error),
+                )
+                logger.warning("SAI unavailable: %s", error)
         except Exception as e:
             logger.warning("SAI not available: %s", e)
             self._component_status['sai'] = ComponentStatus(
@@ -720,7 +729,7 @@ class AGIOSCoordinator:
 
         # CAI (Context Awareness Intelligence) — sync import, no timeout needed
         try:
-            from core.hybrid_orchestrator import _get_cai
+            from core.hybrid_orchestrator import _get_cai, get_cai_loader_status
             self._cai_system = _get_cai()
             if self._cai_system:
                 self._component_status['cai'] = ComponentStatus(
@@ -728,6 +737,15 @@ class AGIOSCoordinator:
                     available=True
                 )
                 logger.info("CAI loaded")
+            else:
+                cai_status = get_cai_loader_status()
+                error = cai_status.get("error") or "CAI loader returned no instance"
+                self._component_status['cai'] = ComponentStatus(
+                    name='cai',
+                    available=False,
+                    error=str(error),
+                )
+                logger.warning("CAI unavailable: %s", error)
         except Exception as e:
             logger.warning("CAI not available: %s", e)
             self._component_status['cai'] = ComponentStatus(

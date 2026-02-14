@@ -418,16 +418,17 @@ class EnhancedSAI:
         else:
             final_state = await self._fallback(initial_state)
 
+        state_data = self._normalize_state(final_state)
         result = {
-            "reasoning_id": final_state.reasoning_id,
-            "stability_score": final_state.stability_score,
-            "change_significance": final_state.change_significance,
-            "affected_elements": final_state.affected_elements,
-            "recommended_actions": final_state.recommended_actions,
-            "predictions": final_state.predicted_changes,
-            "confidence": final_state.confidence,
-            "thought_count": len(final_state.thoughts),
-            "reasoning_trace": self._generate_trace(final_state)
+            "reasoning_id": state_data.get("reasoning_id"),
+            "stability_score": state_data.get("stability_score", 0.0),
+            "change_significance": state_data.get("change_significance", 0.0),
+            "affected_elements": state_data.get("affected_elements", []),
+            "recommended_actions": state_data.get("recommended_actions", []),
+            "predictions": state_data.get("predicted_changes", []),
+            "confidence": state_data.get("confidence", 0.0),
+            "thought_count": len(state_data.get("thoughts", [])),
+            "reasoning_trace": self._generate_trace(state_data),
         }
 
         self._reasoning_history.append(result)
@@ -443,10 +444,21 @@ class EnhancedSAI:
         state = await SAIResponsePlanningNode().process(state)
         return state
 
-    def _generate_trace(self, state: SAIGraphState) -> str:
+    def _normalize_state(self, state: Any) -> Dict[str, Any]:
+        """Normalize graph state to dictionary for robust access."""
+        if isinstance(state, dict):
+            return state
+        if hasattr(state, "model_dump"):
+            return state.model_dump()
+        if hasattr(state, "dict"):
+            return state.dict()
+        return dict(vars(state))
+
+    def _generate_trace(self, state: Any) -> str:
         """Generate reasoning trace."""
+        data = self._normalize_state(state)
         lines = ["=== SAI Reasoning Trace ==="]
-        for i, thought in enumerate(state.thoughts, 1):
+        for i, thought in enumerate(data.get("thoughts", []), 1):
             lines.append(f"{i}. [{thought['type']}] {thought['content']}")
         return "\n".join(lines)
 
@@ -927,19 +939,20 @@ class EnhancedCAI:
         else:
             final_state = await self._fallback(initial_state)
 
+        state_data = self._normalize_state(final_state)
         result = {
-            "reasoning_id": final_state.reasoning_id,
-            "emotional_state": final_state.emotional_state,
-            "emotional_confidence": final_state.emotional_confidence,
-            "cognitive_load": final_state.cognitive_load,
-            "work_context": final_state.work_context,
-            "insights": final_state.insights,
-            "recommendations": final_state.recommendations,
-            "personality_adjustments": final_state.personality_adjustments,
-            "communication_style": final_state.communication_style,
-            "confidence": final_state.confidence,
-            "thought_count": len(final_state.thoughts),
-            "reasoning_trace": self._generate_trace(final_state)
+            "reasoning_id": state_data.get("reasoning_id"),
+            "emotional_state": state_data.get("emotional_state", "neutral"),
+            "emotional_confidence": state_data.get("emotional_confidence", 0.5),
+            "cognitive_load": state_data.get("cognitive_load", "moderate"),
+            "work_context": state_data.get("work_context", "general"),
+            "insights": state_data.get("insights", []),
+            "recommendations": state_data.get("recommendations", []),
+            "personality_adjustments": state_data.get("personality_adjustments", {}),
+            "communication_style": state_data.get("communication_style", "balanced"),
+            "confidence": state_data.get("confidence", 0.0),
+            "thought_count": len(state_data.get("thoughts", [])),
+            "reasoning_trace": self._generate_trace(state_data),
         }
 
         self._reasoning_history.append(result)
@@ -955,10 +968,21 @@ class EnhancedCAI:
         state = await PersonalityAdaptationNode().process(state)
         return state
 
-    def _generate_trace(self, state: CAIGraphState) -> str:
+    def _normalize_state(self, state: Any) -> Dict[str, Any]:
+        """Normalize graph state to dictionary for robust access."""
+        if isinstance(state, dict):
+            return state
+        if hasattr(state, "model_dump"):
+            return state.model_dump()
+        if hasattr(state, "dict"):
+            return state.dict()
+        return dict(vars(state))
+
+    def _generate_trace(self, state: Any) -> str:
         """Generate reasoning trace."""
+        data = self._normalize_state(state)
         lines = ["=== CAI Reasoning Trace ==="]
-        for i, thought in enumerate(state.thoughts, 1):
+        for i, thought in enumerate(data.get("thoughts", []), 1):
             lines.append(f"{i}. [{thought['type']}] {thought['content']}")
         return "\n".join(lines)
 

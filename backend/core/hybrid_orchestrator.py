@@ -93,6 +93,8 @@ _uae_engine = None
 _sai_system = None
 _cai_system = None
 _learning_db = None
+_sai_load_error: Optional[str] = None
+_cai_load_error: Optional[str] = None
 
 # Enhanced Intelligence with LangGraph (lazy loaded)
 _enhanced_uae = None
@@ -143,16 +145,18 @@ def _get_sai():
     Returns:
         SelfAwareIntelligence or None: SAI instance if available, None otherwise
     """
-    global _sai_system, _sai_attempted
+    global _sai_system, _sai_attempted, _sai_load_error
     if _sai_system is None and not _sai_attempted:
         _sai_attempted = True
         try:
             from intelligence.self_aware_intelligence import SelfAwareIntelligence
 
             _sai_system = SelfAwareIntelligence()
-            logger.info("✅ SAI loaded")
+            _sai_load_error = None
+            logger.info("✅ SAI loaded (%s)", type(_sai_system).__name__)
         except Exception as e:
-            logger.info(f"SAI not available: {e}")
+            _sai_load_error = f"{type(e).__name__}: {e}"
+            logger.exception("SAI initialization failed")
     return _sai_system
 
 
@@ -165,18 +169,39 @@ def _get_cai():
     Returns:
         ContextAwarenessIntelligence or None: CAI instance if available, None otherwise
     """
-    global _cai_system, _cai_attempted
+    global _cai_system, _cai_attempted, _cai_load_error
     if _cai_system is None and not _cai_attempted:
         _cai_attempted = True
         try:
-            # CAI might be part of UAE or separate module
             from intelligence.context_awareness_intelligence import ContextAwarenessIntelligence
 
             _cai_system = ContextAwarenessIntelligence()
-            logger.info("✅ CAI loaded")
+            _cai_load_error = None
+            logger.info("✅ CAI loaded (%s)", type(_cai_system).__name__)
         except Exception as e:
-            logger.info(f"CAI not available: {e}")
+            _cai_load_error = f"{type(e).__name__}: {e}"
+            logger.exception("CAI initialization failed")
     return _cai_system
+
+
+def get_sai_loader_status() -> Dict[str, Any]:
+    """Get SAI lazy-loader status for deterministic health reporting."""
+    return {
+        "attempted": _sai_attempted,
+        "available": _sai_system is not None,
+        "error": _sai_load_error,
+        "implementation": type(_sai_system).__name__ if _sai_system is not None else None,
+    }
+
+
+def get_cai_loader_status() -> Dict[str, Any]:
+    """Get CAI lazy-loader status for deterministic health reporting."""
+    return {
+        "attempted": _cai_attempted,
+        "available": _cai_system is not None,
+        "error": _cai_load_error,
+        "implementation": type(_cai_system).__name__ if _cai_system is not None else None,
+    }
 
 
 async def _get_learning_db():
@@ -913,16 +938,17 @@ class HybridOrchestrator:
                 enhanced_cai = _get_enhanced_cai()
                 if enhanced_cai:
                     try:
-                        cai_result = await enhanced_cai.understand_with_reasoning(
-                            signals={"text": command, "command": command}
+                        cai_result = await enhanced_cai.analyze_user_state_with_reasoning(
+                            workspace_state={"command": command},
+                            activity_data={"text": command, "command": command},
                         )
                         context["cai"] = {
                             "emotional_state": cai_result.get("emotional_state"),
-                            "cognitive_state": cai_result.get("cognitive_state"),
+                            "cognitive_state": cai_result.get("cognitive_load"),
                             "confidence": cai_result.get("confidence", 0.0),
-                            "reasoning_chain": cai_result.get("reasoning_chain", []),
-                            "personality_adaptation": cai_result.get("personality_adaptation"),
-                            "predicted_intent": cai_result.get("intent_prediction"),
+                            "reasoning_chain": cai_result.get("reasoning_trace", ""),
+                            "personality_adaptation": cai_result.get("personality_adjustments"),
+                            "predicted_intent": None,
                         }
                         logger.debug(f"🎯 Enhanced CAI with chain-of-thought gathered")
                     except Exception as e:
@@ -933,15 +959,21 @@ class HybridOrchestrator:
                 enhanced_sai = _get_enhanced_sai()
                 if enhanced_sai:
                     try:
-                        sai_result = await enhanced_sai.analyze_with_reasoning(
-                            environment_data={"command": command}
+                        sai_result = await enhanced_sai.analyze_environment_with_reasoning(
+                            current_snapshot={"command": command},
+                            previous_snapshot=None,
+                            detected_changes=[],
                         )
                         context["sai"] = {
-                            "environment_state": sai_result.get("environment_state"),
-                            "detected_changes": sai_result.get("changes", []),
-                            "impact_assessment": sai_result.get("impact_assessment"),
+                            "environment_state": {"command": command},
+                            "detected_changes": sai_result.get("affected_elements", []),
+                            "impact_assessment": {
+                                "stability_score": sai_result.get("stability_score", 0.0),
+                                "change_significance": sai_result.get("change_significance", 0.0),
+                                "recommended_actions": sai_result.get("recommended_actions", []),
+                            },
                             "confidence": sai_result.get("confidence", 0.0),
-                            "reasoning_chain": sai_result.get("reasoning_chain", []),
+                            "reasoning_chain": sai_result.get("reasoning_trace", ""),
                             "predictions": sai_result.get("predictions", []),
                         }
                         logger.debug(f"🔍 Enhanced SAI with chain-of-thought gathered")

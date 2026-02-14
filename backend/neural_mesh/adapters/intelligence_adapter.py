@@ -59,8 +59,8 @@ logger = logging.getLogger(__name__)
 class IntelligenceEngineType(str, Enum):
     """Types of intelligence engines in JARVIS."""
     UAE = "uae"  # Unified Awareness Engine
-    SAI = "sai"  # Spatial Awareness Intelligence
-    CAI = "cai"  # Contextual Awareness Intelligence
+    SAI = "sai"  # Self-Aware Intelligence
+    CAI = "cai"  # Context Awareness Intelligence
     COT = "cot"  # Chain of Thought Engine
     RGE = "rge"  # Reasoning Graph Engine
     PIE = "pie"  # Proactive Intelligence Engine
@@ -112,12 +112,15 @@ ENGINE_CAPABILITIES: Dict[IntelligenceEngineType, IntelligenceCapabilities] = {
         goal_tracking=True,
     ),
     IntelligenceEngineType.SAI: IntelligenceCapabilities(
-        spatial_awareness=True,
+        contextual_understanding=True,
+        proactive_suggestions=True,
         workspace_learning=True,
+        goal_tracking=True,
     ),
     IntelligenceEngineType.CAI: IntelligenceCapabilities(
         contextual_understanding=True,
         proactive_suggestions=True,
+        natural_communication=True,
     ),
     IntelligenceEngineType.COT: IntelligenceCapabilities(
         chain_of_thought=True,
@@ -233,10 +236,7 @@ class IntelligenceEngineAdapter(BaseNeuralMeshAgent):
         self._task_handlers["get_insights"] = self._handle_get_insights
 
         # Engine-specific handlers
-        if self._engine_type in (
-            IntelligenceEngineType.UAE,
-            IntelligenceEngineType.SAI,
-        ):
+        if self._engine_type == IntelligenceEngineType.UAE:
             self._task_handlers["analyze_workspace"] = self._handle_analyze_workspace
             self._task_handlers["get_spatial_context"] = self._handle_spatial_context
             self._task_handlers["suggest_organization"] = self._handle_suggest_organization
@@ -245,6 +245,16 @@ class IntelligenceEngineAdapter(BaseNeuralMeshAgent):
             self._task_handlers["process_query"] = self._handle_process_query
             self._task_handlers["get_awareness_state"] = self._handle_awareness_state
             self._task_handlers["update_context"] = self._handle_update_context
+
+        if self._engine_type == IntelligenceEngineType.SAI:
+            self._task_handlers["get_cognitive_state"] = self._handle_get_cognitive_state
+            self._task_handlers["record_execution"] = self._handle_record_execution
+            self._task_handlers["attempt_self_heal"] = self._handle_attempt_self_heal
+
+        if self._engine_type == IntelligenceEngineType.CAI:
+            self._task_handlers["predict_intent"] = self._handle_predict_intent
+            self._task_handlers["analyze_context"] = self._handle_analyze_context
+            self._task_handlers["update_user_preference"] = self._handle_update_user_preference
 
         if self._engine_type in (
             IntelligenceEngineType.COT,
@@ -734,6 +744,99 @@ class IntelligenceEngineAdapter(BaseNeuralMeshAgent):
 
         return {"suggestions": []}
 
+    async def _handle_get_cognitive_state(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Get SAI cognitive state snapshot."""
+        if hasattr(self._engine, "get_cognitive_state"):
+            state = self._engine.get_cognitive_state()
+            if asyncio.iscoroutine(state):
+                state = await state
+            return state or {}
+
+        if hasattr(self._engine, "get_status"):
+            status = self._engine.get_status()
+            if asyncio.iscoroutine(status):
+                status = await status
+            return status or {}
+
+        return {}
+
+    async def _handle_record_execution(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Record execution feedback for SAI learning."""
+        if hasattr(self._engine, "learn_from_execution"):
+            result = self._engine.learn_from_execution(
+                command=input_data.get("command", ""),
+                success=bool(input_data.get("success", False)),
+                response_time=float(input_data.get("response_time", 0.0)),
+                metadata=input_data.get("metadata", {}),
+            )
+            if asyncio.iscoroutine(result):
+                await result
+            return {"success": True}
+        return {"success": False, "error": "learn_from_execution unavailable"}
+
+    async def _handle_attempt_self_heal(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Request deterministic self-heal planning from SAI."""
+        if hasattr(self._engine, "attempt_self_heal"):
+            result = self._engine.attempt_self_heal(
+                error=input_data.get("error", ""),
+                context=input_data.get("context", {}),
+            )
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result or {"healed": False}
+        return {"healed": False, "error": "attempt_self_heal unavailable"}
+
+    async def _handle_predict_intent(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Predict intent using CAI."""
+        text = input_data.get("text") or input_data.get("command", "")
+        if hasattr(self._engine, "predict_intent"):
+            result = self._engine.predict_intent(text)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result or {}
+        return {"intent": "unknown", "confidence": 0.0}
+
+    async def _handle_analyze_context(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Analyze context using CAI."""
+        if hasattr(self._engine, "analyze_context"):
+            result = self._engine.analyze_context(input_data)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result or {}
+        return {}
+
+    async def _handle_update_user_preference(
+        self,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Update persisted user preference through CAI."""
+        if hasattr(self._engine, "update_user_preference"):
+            result = self._engine.update_user_preference(
+                key=input_data.get("key", ""),
+                value=input_data.get("value"),
+                confidence=float(input_data.get("confidence", 0.7)),
+                source=input_data.get("source", "neural_mesh"),
+            )
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result or {}
+        return {"success": False, "error": "update_user_preference unavailable"}
+
     # =========================================================================
     # Wisdom Handlers (v237.1)
     # =========================================================================
@@ -885,7 +988,7 @@ async def create_sai_adapter(
     engine: Optional[Any] = None,
     agent_name: str = "sai_adapter",
 ) -> IntelligenceEngineAdapter:
-    """Create an adapter for the Spatial Awareness Intelligence.
+    """Create an adapter for the Self-Aware Intelligence.
 
     Args:
         engine: Existing SAI instance (creates new if None)
@@ -896,18 +999,22 @@ async def create_sai_adapter(
     """
     if engine is None:
         try:
-            from intelligence.yabai_spatial_intelligence import (
-                YabaiSpatialIntelligence,
-            )
-            engine = YabaiSpatialIntelligence()
+            from intelligence.self_aware_intelligence import SelfAwareIntelligence
+            engine = SelfAwareIntelligence()
         except ImportError:
-            logger.warning("Could not import YabaiSpatialIntelligence")
+            logger.warning("Could not import SelfAwareIntelligence")
             raise
 
     return IntelligenceEngineAdapter(
         engine=engine,
         engine_type=IntelligenceEngineType.SAI,
         agent_name=agent_name,
+        additional_capabilities={
+            "self_monitoring",
+            "confidence_calibration",
+            "capability_awareness",
+            "self_healing",
+        },
     )
 
 
@@ -1003,7 +1110,7 @@ async def create_cai_adapter(
     engine: Optional[Any] = None,
     agent_name: str = "cai_adapter",
 ) -> IntelligenceEngineAdapter:
-    """Create an adapter for the Contextual Awareness Intelligence.
+    """Create an adapter for the Context Awareness Intelligence.
 
     The CAI provides deep contextual understanding including:
     - Emotional intelligence and user mood detection
@@ -1020,25 +1127,24 @@ async def create_cai_adapter(
     """
     if engine is None:
         try:
-            # Try to import ContextualUnderstandingEngine
-            import os
-            from autonomy.contextual_understanding import (
-                ContextualUnderstandingEngine,
+            from intelligence.context_awareness_intelligence import (
+                ContextAwarenessIntelligence,
             )
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            if api_key:
-                engine = ContextualUnderstandingEngine(anthropic_api_key=api_key)
-            else:
-                logger.warning("ANTHROPIC_API_KEY not set for CAI")
-                raise ImportError("API key required for CAI")
+            engine = ContextAwarenessIntelligence()
         except ImportError as e:
-            logger.warning(f"Could not import ContextualUnderstandingEngine: {e}")
+            logger.warning(f"Could not import ContextAwarenessIntelligence: {e}")
             raise
 
     return IntelligenceEngineAdapter(
         engine=engine,
         engine_type=IntelligenceEngineType.CAI,
         agent_name=agent_name,
+        additional_capabilities={
+            "intent_prediction",
+            "user_modeling",
+            "preference_learning",
+            "context_reasoning",
+        },
     )
 
 
