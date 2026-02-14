@@ -64770,10 +64770,56 @@ class JarvisSystemKernel:
                         )
 
                     try:
-                        self._agi_os = await asyncio.wait_for(
-                            start_agi_os(progress_callback=_agi_os_progress),
-                            timeout=agi_os_init_timeout,
+                        # v253.2: Heartbeat-aware await for AGI OS startup.
+                        # If start_agi_os() blocks before emitting progress callbacks,
+                        # ProgressController can falsely classify startup as stalled
+                        # at 86%. Keep explicit activity heartbeats while preserving
+                        # a deterministic hard timeout.
+                        startup_heartbeat = _get_env_float(
+                            "JARVIS_AGI_OS_START_HEARTBEAT", 10.0
                         )
+                        startup_cancel_grace = _get_env_float(
+                            "JARVIS_AGI_OS_START_CANCEL_GRACE", 8.0
+                        )
+                        startup_task = asyncio.create_task(
+                            start_agi_os(progress_callback=_agi_os_progress),
+                            name="kernel_agi_os_startup",
+                        )
+                        startup_started = time.monotonic()
+                        startup_deadline = startup_started + agi_os_init_timeout
+
+                        while True:
+                            now = time.monotonic()
+                            remaining = startup_deadline - now
+                            if remaining <= 0:
+                                if not startup_task.done():
+                                    startup_task.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                                        await asyncio.wait_for(
+                                            startup_task, timeout=max(0.5, startup_cancel_grace)
+                                        )
+                                raise asyncio.TimeoutError()
+
+                            wait_slice = min(max(1.0, startup_heartbeat), remaining)
+                            done, _ = await asyncio.wait(
+                                {startup_task},
+                                timeout=wait_slice,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if startup_task in done:
+                                self._agi_os = startup_task.result()
+                                break
+
+                            elapsed = time.monotonic() - startup_started
+                            self._mark_startup_activity(
+                                "agi_os:startup_wait",
+                                stage="agi_os",
+                            )
+                            await self._broadcast_progress(
+                                86,
+                                "agi_os",
+                                f"Starting AGI OS Coordinator... ({elapsed:.0f}s elapsed)",
+                            )
                     except asyncio.TimeoutError:
                         self._agi_os_status["status"] = "timeout"
                         self._update_component_status(
@@ -77420,6 +77466,28 @@ async def async_main(args: argparse.Namespace) -> int:
                     await asyncio.to_thread(kernel._startup_lock.release)
                 except Exception as lock_err:
                     kernel.logger.error(f"[Kernel] Lock release error: {lock_err}")
+
+            # Step 2.5: Final async task drain (best-effort).
+            # Some subsystems may report "stopped" before their background loops
+            # fully settle. Drain pending tasks here to prevent loop-close noise
+            # ("Task was destroyed but it is pending!", "Event loop is closed").
+            try:
+                current_task = asyncio.current_task()
+                pending = [
+                    task for task in asyncio.all_tasks()
+                    if task is not current_task and not task.done()
+                ]
+                if pending:
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=float(os.environ.get("JARVIS_FINAL_TASK_DRAIN_TIMEOUT", "8.0")),
+                    )
+            except asyncio.TimeoutError:
+                kernel.logger.debug("[Kernel] Final task drain timed out")
+            except Exception as drain_err:
+                kernel.logger.debug(f"[Kernel] Final task drain error: {drain_err}")
 
             # Step 3: Final thread cleanup (import dynamically to avoid circular imports)
             try:

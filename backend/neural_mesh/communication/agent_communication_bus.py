@@ -588,6 +588,15 @@ class AgentCommunicationBus:
 
             except asyncio.CancelledError:
                 break
+            except GeneratorExit:
+                # Event loop teardown path: exit quietly.
+                break
+            except RuntimeError as e:
+                if "Event loop is closed" in str(e):
+                    # Late interpreter shutdown can surface from queue internals.
+                    break
+                logger.exception("Runtime error processing message: %s", e)
+                break
             except Exception as e:
                 logger.exception("Error processing message: %s", e)
 
