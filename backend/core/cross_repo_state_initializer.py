@@ -354,6 +354,7 @@ class CrossRepoStateInitializer:
         # Replaces in-memory asyncio.Lock with file-based locks that work across processes
         # Prevents deadlock scenarios where crashed processes leave locks hanging
         self._lock_manager: Optional[DistributedLockManager] = None
+        self._state_write_lock = asyncio.Lock()
 
         # Background tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -961,19 +962,20 @@ class CrossRepoStateInitializer:
         _serialized = json.dumps(asdict(self._jarvis_state), indent=2)
 
         # v6.5: Guard against None lock manager
-        if self._lock_manager is None:
-            logger.debug("[CrossRepoState] Writing state without lock (manager not initialized)")
+        # Serialize local writes to prevent same-process lock storms and timeouts.
+        async with self._state_write_lock:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._write_file_sync, str(state_file), _serialized)
-            return
-        # v6.4: Use RobustFileLock (fcntl.flock-based, fixes temp file race conditions)
-        async with RobustFileLock("vbia_state", source="jarvis") as acquired:
-            if not acquired:
-                logger.warning("Could not acquire vbia_state lock")
+            if self._lock_manager is None:
+                logger.debug("[CrossRepoState] Writing state without lock (manager not initialized)")
+                await loop.run_in_executor(None, self._write_file_sync, str(state_file), _serialized)
                 return
-            # v236.3: Synchronous write in executor — bypasses aiofiles thread pool
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._write_file_sync, str(state_file), _serialized)
+            # v6.4: Use RobustFileLock (fcntl.flock-based, fixes temp file race conditions)
+            async with RobustFileLock("vbia_state", source="jarvis") as acquired:
+                if not acquired:
+                    logger.warning("Could not acquire vbia_state lock")
+                    return
+                # v236.3: Synchronous write in executor — bypasses aiofiles thread pool
+                await loop.run_in_executor(None, self._write_file_sync, str(state_file), _serialized)
 
     async def update_jarvis_status(self, status: StateStatus, metrics: Optional[Dict[str, Any]] = None) -> None:
         """
@@ -1050,7 +1052,12 @@ class CrossRepoStateInitializer:
                 # v236.2: Env-var configurable TTL — 20s default gives 17s stall tolerance
                 # with 3s keepalive interval, while keeping crash recovery under 20s.
                 _cr_ttl = float(os.environ.get("JARVIS_CROSS_REPO_LOCK_TTL", "20.0"))
-                async with self._lock_manager.acquire("heartbeat", timeout=_hb_timeout, ttl=_cr_ttl) as acquired:
+                async with self._lock_manager.acquire(
+                    "heartbeat",
+                    timeout=_hb_timeout,
+                    ttl=_cr_ttl,
+                    enable_keepalive=False,
+                ) as acquired:
                     if not acquired:
                         logger.debug("Could not acquire heartbeat lock, skipping update")
                         continue
@@ -1398,7 +1405,12 @@ class CrossRepoStateInitializer:
             return
         # v6.4: Use distributed lock
         _cr_ttl = float(os.environ.get("JARVIS_CROSS_REPO_LOCK_TTL", "20.0"))
-        async with self._lock_manager.acquire("prime_state", timeout=5.0, ttl=_cr_ttl) as acquired:
+        async with self._lock_manager.acquire(
+            "prime_state",
+            timeout=5.0,
+            ttl=_cr_ttl,
+            enable_keepalive=False,
+        ) as acquired:
             if not acquired:
                 logger.warning("Could not acquire prime_state lock")
                 return
@@ -1420,7 +1432,12 @@ class CrossRepoStateInitializer:
             return
         # v6.4: Use distributed lock
         _cr_ttl = float(os.environ.get("JARVIS_CROSS_REPO_LOCK_TTL", "20.0"))
-        async with self._lock_manager.acquire("reactor_state", timeout=5.0, ttl=_cr_ttl) as acquired:
+        async with self._lock_manager.acquire(
+            "reactor_state",
+            timeout=5.0,
+            ttl=_cr_ttl,
+            enable_keepalive=False,
+        ) as acquired:
             if not acquired:
                 logger.warning("Could not acquire reactor_state lock")
                 return

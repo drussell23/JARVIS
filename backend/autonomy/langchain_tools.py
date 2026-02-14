@@ -20,6 +20,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import errno
 import functools
 import importlib
 import inspect
@@ -60,6 +61,8 @@ except ImportError:
         Field = lambda **kwargs: None
 
 from pydantic import BaseModel as PydanticBaseModel, Field as PydanticField, validator
+
+from backend.core.resilience.atomic_file_ops import get_atomic_file_ops
 
 logger = logging.getLogger(__name__)
 
@@ -906,6 +909,566 @@ def jarvis_tool(
 # Built-in Tools
 # ============================================================================
 
+@dataclass(frozen=True)
+class FileSystemAccessPolicy:
+    """Resolved filesystem access policy for the file-system tool."""
+
+    read_roots: Tuple[Path, ...]
+    write_roots: Tuple[Path, ...]
+    deny_roots: Tuple[Path, ...]
+
+    def as_dict(self) -> Dict[str, List[str]]:
+        return {
+            "read_roots": [str(path) for path in self.read_roots],
+            "write_roots": [str(path) for path in self.write_roots],
+            "deny_roots": [str(path) for path in self.deny_roots],
+        }
+
+
+class FileSystemAgentTool(JARVISTool):
+    """Secure, policy-driven file system operations with allowlist enforcement."""
+
+    READ_ALLOWLIST_ENV = "JARVIS_FS_READ_ALLOWLIST"
+    WRITE_ALLOWLIST_ENV = "JARVIS_FS_WRITE_ALLOWLIST"
+    DENYLIST_ENV = "JARVIS_FS_DENYLIST"
+    REPO_ROOTS_ENV = "JARVIS_REPO_ROOTS"
+    MAX_READ_BYTES_ENV = "JARVIS_FS_MAX_READ_BYTES"
+    MAX_LIST_RESULTS_ENV = "JARVIS_FS_MAX_LIST_RESULTS"
+    ALLOW_ROOT_PATHS_ENV = "JARVIS_FS_ALLOW_ROOT_PATHS"
+
+    REPO_ENV_KEYS: Tuple[str, ...] = (
+        "JARVIS_PATH",
+        "JARVIS_REPO_PATH",
+        "JARVIS_CORE_PATH",
+        "JARVIS_PRIME_PATH",
+        "JARVIS_PRIME_REPO_PATH",
+        "REACTOR_CORE_PATH",
+        "JARVIS_REACTOR_PATH",
+    )
+
+    SUPPORTED_OPERATIONS: Tuple[str, ...] = (
+        "read_text",
+        "read_json",
+        "write_text",
+        "write_json",
+        "list_files",
+        "stat",
+        "exists",
+        "mkdir",
+        "delete_file",
+        "delete_dir",
+        "copy_file",
+        "move_file",
+        "get_policy",
+        "get_metrics",
+    )
+
+    OPERATION_ALIASES: Dict[str, str] = {
+        "read_file": "read_text",
+        "write_file": "write_text",
+        "list": "list_files",
+        "ls": "list_files",
+        "policy": "get_policy",
+        "metrics": "get_metrics",
+        "copy": "copy_file",
+        "move": "move_file",
+        "remove_file": "delete_file",
+        "remove_dir": "delete_dir",
+    }
+
+    def __init__(self, permission_manager: Optional[Any] = None):
+        metadata = ToolMetadata(
+            name="filesystem_agent",
+            description=(
+                "Secure file system operations with scoped read/write permissions, "
+                "atomic writes, and policy-driven path controls"
+            ),
+            category=ToolCategory.FILE_SYSTEM,
+            risk_level=ToolRiskLevel.MEDIUM,
+            requires_permission=False,
+            timeout_seconds=60.0,
+            capabilities=[
+                "file_read",
+                "file_write",
+                "file_delete",
+                "file_listing",
+                "filesystem_metadata",
+                "secure_filesystem",
+            ],
+            tags=["filesystem", "allowlist", "atomic", "secure"],
+        )
+        super().__init__(metadata, permission_manager)
+        self._atomic_ops = get_atomic_file_ops()
+        self._policy_lock = asyncio.Lock()
+        self._policy_signature: Optional[Tuple[str, ...]] = None
+        self._policy = self._build_policy()
+        self._policy_signature = self._compute_policy_signature()
+        self._max_read_bytes = self._env_int(self.MAX_READ_BYTES_ENV, 1_000_000, minimum=1_024)
+        self._max_list_results = self._env_int(self.MAX_LIST_RESULTS_ENV, 1_000, minimum=1)
+
+    async def _execute(
+        self,
+        operation: str = "",
+        path: Optional[str] = None,
+        source: Optional[str] = None,
+        destination: Optional[str] = None,
+        content: Optional[Any] = None,
+        data: Optional[Any] = None,
+        pattern: str = "*",
+        recursive: bool = False,
+        encoding: str = "utf-8",
+        max_results: Optional[int] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Execute a secure file operation."""
+        await self._refresh_policy_if_changed()
+
+        op = (operation or kwargs.get("action") or kwargs.get("op") or "").strip().lower()
+        op = self.OPERATION_ALIASES.get(op, op)
+        if not op:
+            raise ValueError("Missing required parameter: operation")
+        if op not in self.SUPPORTED_OPERATIONS:
+            raise ValueError(
+                f"Unsupported operation '{op}'. Supported operations: {', '.join(self.SUPPORTED_OPERATIONS)}"
+            )
+
+        resolved_path = path or kwargs.get("file_path")
+        source_path = source or kwargs.get("source_path")
+        destination_path = destination or kwargs.get("destination_path")
+
+        if op == "read_text":
+            target = self._resolve_and_validate(resolved_path, access="read")
+            raw = await self._atomic_ops.read_bytes(target)
+            self._enforce_read_limit(raw, target)
+            return {
+                "operation": op,
+                "path": str(target),
+                "content": raw.decode(encoding),
+                "bytes_read": len(raw),
+            }
+
+        if op == "read_json":
+            target = self._resolve_and_validate(resolved_path, access="read")
+            raw = await self._atomic_ops.read_bytes(target)
+            self._enforce_read_limit(raw, target)
+            try:
+                parsed = json.loads(raw.decode(encoding))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"File is not valid JSON: {target}") from exc
+            return {
+                "operation": op,
+                "path": str(target),
+                "data": parsed,
+                "bytes_read": len(raw),
+            }
+
+        if op == "write_text":
+            target = self._resolve_and_validate(resolved_path, access="write")
+            text_content = self._resolve_text_payload(content=content, data=data, kwargs=kwargs)
+            create_parents = self._to_bool(kwargs.get("create_parents"), default=True)
+            if create_parents:
+                await self._ensure_directory(target.parent)
+            checksum = await self._atomic_ops.write_text(target, text_content, encoding=encoding)
+            return {
+                "operation": op,
+                "path": str(target),
+                "checksum": checksum,
+                "bytes_written": len(text_content.encode(encoding)),
+            }
+
+        if op == "write_json":
+            target = self._resolve_and_validate(resolved_path, access="write")
+            payload = self._resolve_json_payload(content=content, data=data, kwargs=kwargs)
+            create_parents = self._to_bool(kwargs.get("create_parents"), default=True)
+            if create_parents:
+                await self._ensure_directory(target.parent)
+            indent = self._coerce_int(kwargs.get("indent"), default=2, minimum=0)
+            checksum = await self._atomic_ops.write_json(target, payload, indent=indent)
+            return {
+                "operation": op,
+                "path": str(target),
+                "checksum": checksum,
+            }
+
+        if op == "list_files":
+            target = self._resolve_and_validate(resolved_path or ".", access="read")
+            recursive_flag = self._to_bool(kwargs.get("recursive", recursive), default=recursive)
+            listed = await self._atomic_ops.list_files(
+                directory=target,
+                pattern=pattern or kwargs.get("glob", "*"),
+                recursive=recursive_flag,
+            )
+            limit = self._coerce_int(
+                max_results if max_results is not None else kwargs.get("max_results"),
+                default=self._max_list_results,
+                minimum=1,
+            )
+            normalized_files = sorted(str(path) for path in listed)[:limit]
+            return {
+                "operation": op,
+                "directory": str(target),
+                "pattern": pattern or kwargs.get("glob", "*"),
+                "recursive": recursive_flag,
+                "count": len(normalized_files),
+                "files": normalized_files,
+            }
+
+        if op == "stat":
+            target = self._resolve_and_validate(resolved_path, access="read")
+            exists = await asyncio.to_thread(target.exists)
+            if not exists:
+                return {"operation": op, "path": str(target), "exists": False}
+            stat_result = await asyncio.to_thread(target.stat)
+            return {
+                "operation": op,
+                "path": str(target),
+                "exists": True,
+                "is_file": await asyncio.to_thread(target.is_file),
+                "is_dir": await asyncio.to_thread(target.is_dir),
+                "size_bytes": stat_result.st_size,
+                "modified_ts": stat_result.st_mtime,
+                "created_ts": stat_result.st_ctime,
+                "mode": stat_result.st_mode,
+            }
+
+        if op == "exists":
+            target = self._resolve_and_validate(resolved_path, access="read")
+            return {
+                "operation": op,
+                "path": str(target),
+                "exists": await asyncio.to_thread(target.exists),
+            }
+
+        if op == "mkdir":
+            target = self._resolve_and_validate(resolved_path, access="write")
+            parents = self._to_bool(kwargs.get("parents"), default=True)
+            exist_ok = self._to_bool(kwargs.get("exist_ok"), default=True)
+            await asyncio.to_thread(target.mkdir, parents=parents, exist_ok=exist_ok)
+            return {"operation": op, "path": str(target), "created": True}
+
+        if op == "delete_file":
+            target = self._resolve_and_validate(resolved_path, access="write")
+            missing_ok = self._to_bool(kwargs.get("missing_ok"), default=True)
+            deleted = await self._atomic_ops.delete(target, missing_ok=missing_ok)
+            return {"operation": op, "path": str(target), "deleted": deleted}
+
+        if op == "delete_dir":
+            target = self._resolve_and_validate(resolved_path, access="write")
+            recursive_flag = self._to_bool(kwargs.get("recursive", recursive), default=False)
+            missing_ok = self._to_bool(kwargs.get("missing_ok"), default=True)
+            deleted = await self._atomic_ops.delete_dir(
+                target,
+                recursive=recursive_flag,
+                missing_ok=missing_ok,
+            )
+            return {
+                "operation": op,
+                "path": str(target),
+                "deleted": deleted,
+                "recursive": recursive_flag,
+            }
+
+        if op == "copy_file":
+            src = self._resolve_and_validate(source_path or resolved_path, access="read")
+            dest = self._resolve_and_validate(destination_path, access="write")
+            overwrite = self._to_bool(kwargs.get("overwrite"), default=True)
+            create_parents = self._to_bool(kwargs.get("create_parents"), default=True)
+            await self._ensure_file_exists(src)
+            if create_parents:
+                await self._ensure_directory(dest.parent)
+            if not overwrite and await asyncio.to_thread(dest.exists):
+                raise FileExistsError(f"Destination already exists: {dest}")
+            data_bytes = await self._atomic_ops.read_bytes(src)
+            checksum = await self._atomic_ops.write_bytes(dest, data_bytes)
+            return {
+                "operation": op,
+                "source": str(src),
+                "destination": str(dest),
+                "checksum": checksum,
+                "bytes_copied": len(data_bytes),
+            }
+
+        if op == "move_file":
+            src = self._resolve_and_validate(source_path or resolved_path, access="write")
+            dest = self._resolve_and_validate(destination_path, access="write")
+            self._assert_access(src, "read")
+            overwrite = self._to_bool(kwargs.get("overwrite"), default=True)
+            create_parents = self._to_bool(kwargs.get("create_parents"), default=True)
+            await self._ensure_file_exists(src)
+            if create_parents:
+                await self._ensure_directory(dest.parent)
+            if src == dest:
+                return {
+                    "operation": op,
+                    "source": str(src),
+                    "destination": str(dest),
+                    "moved": True,
+                    "note": "source and destination are identical",
+                }
+            if not overwrite and await asyncio.to_thread(dest.exists):
+                raise FileExistsError(f"Destination already exists: {dest}")
+
+            moved_via_copy = False
+            try:
+                await asyncio.to_thread(os.replace, src, dest)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                moved_via_copy = True
+                data_bytes = await self._atomic_ops.read_bytes(src)
+                await self._atomic_ops.write_bytes(dest, data_bytes)
+                await self._atomic_ops.delete(src, missing_ok=False)
+
+            return {
+                "operation": op,
+                "source": str(src),
+                "destination": str(dest),
+                "moved": True,
+                "used_cross_device_fallback": moved_via_copy,
+            }
+
+        if op == "get_policy":
+            return {
+                "operation": op,
+                "policy": self._policy.as_dict(),
+                "max_read_bytes": self._max_read_bytes,
+                "max_list_results": self._max_list_results,
+            }
+
+        if op == "get_metrics":
+            return {"operation": op, "metrics": self._atomic_ops.get_metrics()}
+
+        # Should not be reachable due supported operation check
+        raise RuntimeError(f"Unhandled operation: {op}")
+
+    def _resolve_and_validate(self, raw_path: Optional[str], access: str) -> Path:
+        if not raw_path:
+            raise ValueError("Missing required parameter: path")
+        resolved = self._resolve_user_path(raw_path)
+        self._assert_access(resolved, access)
+        return resolved
+
+    async def _refresh_policy_if_changed(self) -> None:
+        signature = self._compute_policy_signature()
+        if signature == self._policy_signature:
+            return
+        async with self._policy_lock:
+            signature = self._compute_policy_signature()
+            if signature == self._policy_signature:
+                return
+            self._policy = self._build_policy()
+            self._policy_signature = signature
+
+    def _build_policy(self) -> FileSystemAccessPolicy:
+        read_roots = self._canonicalize_paths(self._parse_env_paths(self.READ_ALLOWLIST_ENV))
+        write_roots = self._canonicalize_paths(self._parse_env_paths(self.WRITE_ALLOWLIST_ENV))
+        deny_roots = self._canonicalize_paths(self._parse_env_paths(self.DENYLIST_ENV))
+
+        if not read_roots:
+            read_roots = self._default_read_roots()
+        if not write_roots:
+            write_roots = self._default_write_roots(read_roots)
+
+        if not read_roots:
+            cwd_root = self._resolve_user_path(str(Path.cwd()))
+            read_roots = (cwd_root,)
+        if not write_roots:
+            write_roots = tuple(path for path in read_roots if self._is_relative(path, Path.cwd()))
+            if not write_roots:
+                write_roots = (self._resolve_user_path(str(Path.cwd())),)
+
+        return FileSystemAccessPolicy(
+            read_roots=read_roots,
+            write_roots=write_roots,
+            deny_roots=deny_roots,
+        )
+
+    def _default_read_roots(self) -> Tuple[Path, ...]:
+        roots: List[Path] = []
+        roots.extend(self._parse_env_paths(self.REPO_ROOTS_ENV))
+        for key in self.REPO_ENV_KEYS:
+            value = os.getenv(key, "").strip()
+            if value:
+                roots.append(Path(value))
+        roots.append(Path(__file__).resolve().parents[2])
+        roots.append(Path.home() / ".jarvis")
+        return self._canonicalize_paths(roots)
+
+    def _default_write_roots(self, read_roots: Tuple[Path, ...]) -> Tuple[Path, ...]:
+        write_roots: List[Path] = [Path.home() / ".jarvis"]
+        for root in read_roots:
+            if any(self._is_relative(root, candidate) for candidate in write_roots):
+                continue
+            write_roots.append(root)
+        return self._canonicalize_paths(write_roots)
+
+    def _parse_env_paths(self, env_key: str) -> List[Path]:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return []
+
+        values: List[str] = []
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    values = [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                values = []
+        if not values:
+            values = [item.strip() for item in re.split(r"[,;\n]+", raw) if item.strip()]
+
+        return [Path(value).expanduser() for value in values]
+
+    def _canonicalize_paths(self, paths: Sequence[Path]) -> Tuple[Path, ...]:
+        allow_root_paths = self._to_bool(os.getenv(self.ALLOW_ROOT_PATHS_ENV), default=False)
+        normalized: List[Path] = []
+        for path in paths:
+            try:
+                resolved = self._resolve_user_path(str(path))
+                if not allow_root_paths and resolved == Path(resolved.anchor):
+                    self.logger.warning("Skipping filesystem allowlist root path for safety: %s", resolved)
+                    continue
+                normalized.append(resolved)
+            except Exception:
+                continue
+
+        unique: List[Path] = []
+        for path in sorted(set(normalized), key=lambda candidate: len(candidate.parts)):
+            if any(self._is_relative(path, existing) for existing in unique):
+                continue
+            unique.append(path)
+
+        return tuple(unique)
+
+    def _compute_policy_signature(self) -> Tuple[str, ...]:
+        values = [
+            os.getenv(self.READ_ALLOWLIST_ENV, ""),
+            os.getenv(self.WRITE_ALLOWLIST_ENV, ""),
+            os.getenv(self.DENYLIST_ENV, ""),
+            os.getenv(self.REPO_ROOTS_ENV, ""),
+        ]
+        values.extend(os.getenv(key, "") for key in self.REPO_ENV_KEYS)
+        return tuple(values)
+
+    @staticmethod
+    def _resolve_user_path(raw_path: str) -> Path:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+
+        missing_parts: List[str] = []
+        probe = candidate
+        while not probe.exists():
+            missing_parts.append(probe.name)
+            parent = probe.parent
+            if parent == probe:
+                break
+            probe = parent
+
+        resolved_base = probe.resolve()
+        for part in reversed(missing_parts):
+            resolved_base = resolved_base / part
+        return resolved_base
+
+    def _assert_access(self, path: Path, access: str) -> None:
+        normalized = self._resolve_user_path(str(path))
+
+        if any(self._is_relative(normalized, denied) for denied in self._policy.deny_roots):
+            raise PermissionError(f"Path is explicitly denied by filesystem policy: {normalized}")
+
+        allowed_roots = self._policy.read_roots if access == "read" else self._policy.write_roots
+        if not any(self._is_relative(normalized, root) for root in allowed_roots):
+            raise PermissionError(f"{access} access denied by filesystem policy: {normalized}")
+
+    @staticmethod
+    def _is_relative(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    async def _ensure_directory(self, directory: Path) -> None:
+        self._assert_access(directory, "write")
+        await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+
+    async def _ensure_file_exists(self, path: Path) -> None:
+        exists = await asyncio.to_thread(path.exists)
+        if not exists:
+            raise FileNotFoundError(f"Path does not exist: {path}")
+        is_file = await asyncio.to_thread(path.is_file)
+        if not is_file:
+            raise IsADirectoryError(f"Expected a file path, got: {path}")
+
+    def _enforce_read_limit(self, payload: bytes, path: Path) -> None:
+        if len(payload) > self._max_read_bytes:
+            raise ValueError(
+                f"Read aborted: {path} is {len(payload)} bytes, exceeding "
+                f"limit of {self._max_read_bytes} bytes"
+            )
+
+    def _resolve_text_payload(self, content: Any, data: Any, kwargs: Dict[str, Any]) -> str:
+        candidate = content if content is not None else data
+        if candidate is None:
+            candidate = kwargs.get("text")
+        if candidate is None:
+            raise ValueError("Missing text payload. Provide 'content', 'data', or 'text'.")
+        if isinstance(candidate, bytes):
+            return candidate.decode("utf-8")
+        if isinstance(candidate, str):
+            return candidate
+        return json.dumps(candidate, default=str, indent=2)
+
+    def _resolve_json_payload(self, content: Any, data: Any, kwargs: Dict[str, Any]) -> Any:
+        candidate = data if data is not None else kwargs.get("json_data")
+        if candidate is None:
+            candidate = content
+        if candidate is None:
+            raise ValueError("Missing JSON payload. Provide 'data', 'json_data', or 'content'.")
+        if isinstance(candidate, str):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                raise ValueError("String payload is not valid JSON") from exc
+        return candidate
+
+    @staticmethod
+    def _to_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int, minimum: int = 0) -> int:
+        if value is None:
+            return default
+        try:
+            coerced = int(value)
+            return max(coerced, minimum)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _env_int(cls, env_key: str, default: int, minimum: int = 0) -> int:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+            return max(value, minimum)
+        except ValueError:
+            return default
+
+
 class SystemInfoTool(JARVISTool):
     """Tool for getting system information."""
 
@@ -1198,7 +1761,8 @@ def register_builtin_tools(registry: Optional[ToolRegistry] = None) -> int:
     builtin_tools = [
         SystemInfoTool(),
         CalculatorTool(),
-        DateTimeTool()
+        DateTimeTool(),
+        FileSystemAgentTool(),
     ]
 
     for tool in builtin_tools:

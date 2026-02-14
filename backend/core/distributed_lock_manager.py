@@ -110,6 +110,7 @@ v3.0.0 CROSS-REPO UNIFICATION:
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -658,6 +659,24 @@ class DistributedLockManager:
             f"(owner: {self._owner_id}, backend: {self.config.backend.value})"
         )
 
+    async def _ensure_directory(self, directory: Path) -> None:
+        """Ensure a directory exists (self-healing against runtime cleanup races)."""
+        try:
+            await aiofiles.os.makedirs(directory, exist_ok=True)
+        except FileExistsError:
+            return
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                return
+            raise
+
+    async def _ensure_lock_storage_ready(self) -> None:
+        """Ensure lock storage paths exist before lock I/O operations."""
+        await self._ensure_directory(self.config.lock_dir)
+        counter_parent = self.config.fencing_counter_file.parent
+        if counter_parent != self.config.lock_dir:
+            await self._ensure_directory(counter_parent)
+
     # -----------------------------------------------------------------
     # v3.2: Keepalive exhaustion public API
     # -----------------------------------------------------------------
@@ -820,9 +839,9 @@ class DistributedLockManager:
             if self._initialized:
                 return
 
-            # Create lock directory
+            # Create/repair lock storage directories.
             try:
-                await aiofiles.os.makedirs(self.config.lock_dir, exist_ok=True)
+                await self._ensure_lock_storage_ready()
                 logger.info(f"Lock directory initialized: {self.config.lock_dir}")
             except Exception as e:
                 logger.error(f"Failed to create lock directory: {e}")
@@ -1020,7 +1039,8 @@ class DistributedLockManager:
         self,
         lock_name: str,
         timeout: Optional[float] = None,
-        ttl: Optional[float] = None
+        ttl: Optional[float] = None,
+        enable_keepalive: Optional[bool] = None,
     ) -> AsyncIterator[bool]:
         """
         Acquire distributed lock with automatic expiration and keepalive.
@@ -1032,6 +1052,8 @@ class DistributedLockManager:
             lock_name: Name of the lock (e.g., "vbia_events", "prime_state")
             timeout: Max time to wait for lock acquisition (seconds)
             ttl: Lock time-to-live - auto-expires after this duration (seconds)
+            enable_keepalive: Override keepalive behavior for this acquisition.
+                If None, uses DISTRIBUTED_LOCK_ACQUIRE_KEEPALIVE_DEFAULT.
 
         Yields:
             bool: True if lock acquired, False if timeout
@@ -1047,13 +1069,18 @@ class DistributedLockManager:
         """
         timeout = timeout or self.config.default_timeout_seconds
         ttl = ttl or self.config.default_ttl_seconds
+        if enable_keepalive is None:
+            enable_keepalive = os.environ.get(
+                "DISTRIBUTED_LOCK_ACQUIRE_KEEPALIVE_DEFAULT",
+                "true",
+            ).strip().lower() == "true"
 
         try:
             async with self.acquire_unified(
                 lock_name=lock_name,
                 timeout=timeout,
                 ttl=ttl,
-                enable_keepalive=True,
+                enable_keepalive=enable_keepalive,
             ) as (acquired, _metadata):
                 yield acquired
         except Exception as e:
@@ -1081,6 +1108,9 @@ class DistributedLockManager:
             True if lock acquired, False otherwise
         """
         try:
+            # Self-heal lock directory if another component cleaned it up.
+            await self._ensure_directory(lock_file.parent)
+
             # Check if lock file exists
             if await aiofiles.os.path.exists(lock_file):
                 # Read existing lock metadata
@@ -1326,12 +1356,9 @@ class DistributedLockManager:
                 temp_file = self._generate_temp_file_path(lock_file, metadata.token)
 
                 try:
-                    # Ensure directory exists (resilient to race conditions)
+                    # Ensure directory exists (resilient to runtime cleanup races).
                     lock_dir = lock_file.parent
-                    try:
-                        await aiofiles.os.makedirs(lock_dir, exist_ok=True)
-                    except FileExistsError:
-                        pass  # Another process created it - that's fine
+                    await self._ensure_directory(lock_dir)
 
                     # v96.1: Serialize the content first to catch any serialization errors
                     content = json.dumps(asdict(metadata), indent=2)
@@ -1403,9 +1430,23 @@ class DistributedLockManager:
                         base_delay = 0.01 * (2 ** attempt)  # 0.01, 0.02, 0.04
                         jitter = random.uniform(0, base_delay * 0.5)  # Up to 50% jitter
                         delay = base_delay + jitter
-                        logger.warning(
-                            f"Lock write attempt {attempt + 1} failed: {e}, retrying in {delay:.3f}s..."
+                        missing_path = (
+                            isinstance(e, FileNotFoundError)
+                            or (isinstance(e, OSError) and e.errno == errno.ENOENT)
                         )
+                        if missing_path:
+                            try:
+                                await self._ensure_directory(lock_file.parent)
+                            except Exception:
+                                pass
+                            logger.warning(
+                                f"Lock write attempt {attempt + 1} failed due to missing path for "
+                                f"{lock_file.name}; repaired directory and retrying in {delay:.3f}s..."
+                            )
+                        else:
+                            logger.warning(
+                                f"Lock write attempt {attempt + 1} failed: {e}, retrying in {delay:.3f}s..."
+                            )
                         await asyncio.sleep(delay)
                     continue
 

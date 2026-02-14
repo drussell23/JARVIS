@@ -27355,7 +27355,11 @@ class DistributedLockManager:
         waiters = self._lock_waiters.get(resource_id, [])
         for waiter in waiters:
             if not waiter.done():
-                waiter.set_result(True)
+                try:
+                    waiter.set_result(True)
+                except asyncio.InvalidStateError:
+                    # Waiter was resolved/cancelled between check and set.
+                    continue
 
     async def _heartbeat_loop(self) -> None:
         """Background loop to refresh held locks."""
@@ -32684,7 +32688,10 @@ class ConnectionPool:
                     # Notify waiters
                     for waiter in self._waiters:
                         if not waiter.done():
-                            waiter.set_result(True)
+                            try:
+                                waiter.set_result(True)
+                            except asyncio.InvalidStateError:
+                                continue
                             break
 
                     return
@@ -40699,7 +40706,11 @@ class IntegrationBusManager:
         # Subscribe to reply channel
         async def reply_handler(msg: IntegrationMessage) -> None:
             if msg.correlation_id == correlation_id:
-                reply_future.set_result(msg)
+                if not reply_future.done():
+                    try:
+                        reply_future.set_result(msg)
+                    except asyncio.InvalidStateError:
+                        pass
 
         self.subscribe(reply_channel, reply_handler)
 
@@ -41989,7 +42000,10 @@ class RequestCoalescer:
                 if key in self._pending:
                     request = self._pending[key]
                     if not request.future.done():
-                        request.future.set_result(result)
+                        try:
+                            request.future.set_result(result)
+                        except asyncio.InvalidStateError:
+                            pass
 
             return result
 
@@ -41999,7 +42013,10 @@ class RequestCoalescer:
                 if key in self._pending:
                     request = self._pending[key]
                     if not request.future.done():
-                        request.future.set_exception(e)
+                        try:
+                            request.future.set_exception(e)
+                        except asyncio.InvalidStateError:
+                            pass
 
             raise
 
