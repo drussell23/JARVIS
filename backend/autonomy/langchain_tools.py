@@ -28,6 +28,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1074,6 +1076,632 @@ class WebResearchTool(JARVISTool):
 
 
 @dataclass(frozen=True)
+class ShellExecutionPolicy:
+    """Resolved policy for shell command execution."""
+
+    allowed_cwd_roots: Tuple[Path, ...]
+    denied_cwd_roots: Tuple[Path, ...]
+    auto_approve_tiers: Tuple[str, ...]
+    allow_shell_features: bool
+    max_timeout_seconds: float
+    max_output_bytes: int
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "allowed_cwd_roots": [str(path) for path in self.allowed_cwd_roots],
+            "denied_cwd_roots": [str(path) for path in self.denied_cwd_roots],
+            "auto_approve_tiers": list(self.auto_approve_tiers),
+            "allow_shell_features": self.allow_shell_features,
+            "max_timeout_seconds": self.max_timeout_seconds,
+            "max_output_bytes": self.max_output_bytes,
+        }
+
+
+class ShellCommandTool(JARVISTool):
+    """Secure shell execution with command-tier safety and explicit policy controls."""
+
+    CWD_ALLOWLIST_ENV = "JARVIS_SHELL_CWD_ALLOWLIST"
+    CWD_DENYLIST_ENV = "JARVIS_SHELL_CWD_DENYLIST"
+    AUTO_APPROVE_TIERS_ENV = "JARVIS_SHELL_AUTO_APPROVE_TIERS"
+    MAX_TIMEOUT_ENV = "JARVIS_SHELL_MAX_TIMEOUT_SECONDS"
+    MAX_OUTPUT_ENV = "JARVIS_SHELL_MAX_OUTPUT_BYTES"
+    ALLOW_SHELL_FEATURES_ENV = "JARVIS_SHELL_ALLOW_SHELL_FEATURES"
+    REPO_ROOTS_ENV = "JARVIS_REPO_ROOTS"
+    ALLOW_ROOT_PATHS_ENV = "JARVIS_SHELL_ALLOW_ROOT_PATHS"
+    EMIT_EVENTS_ENV = "JARVIS_SHELL_EMIT_SAFETY_EVENTS"
+
+    REPO_ENV_KEYS: Tuple[str, ...] = (
+        "JARVIS_PATH",
+        "JARVIS_REPO_PATH",
+        "JARVIS_CORE_PATH",
+        "JARVIS_PRIME_PATH",
+        "JARVIS_PRIME_REPO_PATH",
+        "REACTOR_CORE_PATH",
+        "JARVIS_REACTOR_PATH",
+    )
+
+    SUPPORTED_OPERATIONS: Tuple[str, ...] = (
+        "execute",
+        "classify",
+        "get_policy",
+        "get_metrics",
+    )
+
+    OPERATION_ALIASES: Dict[str, str] = {
+        "run": "execute",
+        "shell": "execute",
+        "shell_execute": "execute",
+        "check": "classify",
+        "inspect": "classify",
+        "policy": "get_policy",
+        "metrics": "get_metrics",
+    }
+
+    COMPLEX_TOKENS: Set[str] = {"|", "||", "&&", ";", "`"}
+
+    def __init__(self, permission_manager: Optional[Any] = None):
+        metadata = ToolMetadata(
+            name="shell_agent",
+            description=(
+                "Execute terminal commands through policy-driven safety controls "
+                "(tier classification, confirmation gates, and cwd allowlists)"
+            ),
+            category=ToolCategory.SYSTEM,
+            risk_level=ToolRiskLevel.HIGH,
+            requires_permission=False,
+            timeout_seconds=90.0,
+            capabilities=[
+                "shell_execution",
+                "command_classification",
+                "package_management",
+                "git_operations",
+                "system_administration",
+            ],
+            tags=["shell", "terminal", "command", "safety", "policy"],
+        )
+        super().__init__(metadata, permission_manager)
+
+        self._policy_lock = asyncio.Lock()
+        self._policy_signature: Optional[Tuple[str, ...]] = None
+        self._policy = self._build_policy()
+        self._policy_signature = self._compute_policy_signature()
+
+        self._metrics: Dict[str, Any] = {
+            "total_requests": 0,
+            "executed": 0,
+            "classification_only": 0,
+            "blocked": 0,
+            "confirmation_required": 0,
+            "failed": 0,
+            "timed_out": 0,
+            "tier_counts": {},
+            "last_command_ts": None,
+        }
+
+        self._classifier = None
+        try:
+            from backend.system_control.command_safety import get_command_classifier
+
+            self._classifier = get_command_classifier()
+        except Exception as exc:
+            self.logger.warning("Shell safety classifier unavailable: %s", exc)
+
+    async def _execute(
+        self,
+        operation: str = "execute",
+        command: Optional[Union[str, Sequence[str]]] = None,
+        argv: Optional[Sequence[str]] = None,
+        cwd: Optional[str] = None,
+        timeout: Optional[float] = None,
+        approved: Optional[Any] = None,
+        require_confirmation: bool = True,
+        allow_destructive: bool = False,
+        safe_mode: bool = True,
+        dry_run: bool = False,
+        emit_events: Optional[bool] = None,
+        allow_shell_features: Optional[bool] = None,
+        env: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        await self._refresh_policy_if_changed()
+        self._metrics["total_requests"] += 1
+
+        op = (operation or kwargs.get("action") or kwargs.get("op") or "").strip().lower()
+        op = self.OPERATION_ALIASES.get(op, op)
+        if op not in self.SUPPORTED_OPERATIONS:
+            raise ValueError(
+                f"Unsupported operation '{op}'. Supported operations: {', '.join(self.SUPPORTED_OPERATIONS)}"
+            )
+
+        if op == "get_policy":
+            return {"operation": op, "policy": self._policy.as_dict()}
+
+        if op == "get_metrics":
+            return {"operation": op, "metrics": dict(self._metrics)}
+
+        command_value = command if command is not None else kwargs.get("cmd")
+        argv_value = argv if argv is not None else kwargs.get("args")
+        command_text, cmd_tokens = self._parse_command(command_value, argv_value)
+
+        classification = await self._classify_command(
+            command_text,
+            emit_events=self._to_bool(emit_events, default=self._env_bool(self.EMIT_EVENTS_ENV, True)),
+        )
+        tier = str(classification.get("tier", "yellow")).lower()
+        self._metrics["tier_counts"][tier] = self._metrics["tier_counts"].get(tier, 0) + 1
+
+        response_base = {
+            "operation": op,
+            "command": command_text,
+            "argv": cmd_tokens,
+            "classification": classification,
+        }
+
+        if op == "classify":
+            self._metrics["classification_only"] += 1
+            return response_base
+
+        resolved_cwd = self._resolve_and_validate_cwd(cwd or kwargs.get("working_directory") or ".")
+        response_base["cwd"] = str(resolved_cwd)
+
+        allow_complex = (
+            self._to_bool(allow_shell_features, default=self._policy.allow_shell_features)
+            or self._to_bool(kwargs.get("allow_complex"), default=False)
+        )
+        if self._contains_complex_shell_tokens(command_text, cmd_tokens) and not allow_complex:
+            self._metrics["blocked"] += 1
+            return {
+                **response_base,
+                "success": False,
+                "blocked": True,
+                "error": (
+                    "Complex shell syntax is disabled by policy. "
+                    "Pass a simple command/argv or enable allow_shell_features explicitly."
+                ),
+            }
+
+        explicit_approval = self._to_bool(approved, default=False)
+        requires_confirmation = bool(classification.get("requires_confirmation", True))
+        is_destructive = bool(classification.get("is_destructive", False))
+
+        if safe_mode:
+            if tier == "red" and (is_destructive or not allow_destructive):
+                if not explicit_approval or not allow_destructive:
+                    self._metrics["blocked"] += 1
+                    return {
+                        **response_base,
+                        "success": False,
+                        "blocked": True,
+                        "error": (
+                            "Red-tier/destructive command blocked. "
+                            "Set allow_destructive=true and approved=true to proceed."
+                        ),
+                    }
+
+            if requires_confirmation and require_confirmation:
+                approved_by_policy = await self._is_approved_by_policy(
+                    tier=tier,
+                    command_text=command_text,
+                    cwd=str(resolved_cwd),
+                    classification=classification,
+                    explicit_approval=explicit_approval,
+                )
+                if not approved_by_policy:
+                    self._metrics["confirmation_required"] += 1
+                    return {
+                        **response_base,
+                        "success": False,
+                        "requires_confirmation": True,
+                        "error": "Command requires explicit approval before execution.",
+                    }
+
+        if dry_run:
+            return {
+                **response_base,
+                "success": True,
+                "dry_run": True,
+                "would_execute": True,
+            }
+
+        exec_timeout = self._clamp_timeout(timeout)
+        result = await self._run_exec(
+            cmd_tokens=cmd_tokens,
+            cwd=resolved_cwd,
+            timeout_seconds=exec_timeout,
+            env_overrides=env if isinstance(env, dict) else None,
+        )
+
+        self._metrics["last_command_ts"] = time.time()
+        if result["timed_out"]:
+            self._metrics["timed_out"] += 1
+        elif result["success"]:
+            self._metrics["executed"] += 1
+        else:
+            self._metrics["failed"] += 1
+
+        return {**response_base, **result}
+
+    async def _is_approved_by_policy(
+        self,
+        tier: str,
+        command_text: str,
+        cwd: str,
+        classification: Dict[str, Any],
+        explicit_approval: bool,
+    ) -> bool:
+        if explicit_approval:
+            return True
+
+        if tier in self._policy.auto_approve_tiers:
+            return True
+
+        if self.permission_manager:
+            try:
+                return await self.permission_manager.check_permission(
+                    action_type="tool:shell_agent",
+                    target=command_text,
+                    context={
+                        "cwd": cwd,
+                        "classification": classification,
+                    },
+                    require_explicit=True,
+                )
+            except TypeError:
+                try:
+                    return await self.permission_manager.check_permission(
+                        action_type="tool:shell_agent",
+                        target=command_text,
+                        context={
+                            "cwd": cwd,
+                            "classification": classification,
+                        },
+                    )
+                except Exception as exc:
+                    self.logger.debug("Permission check failed: %s", exc)
+                    return False
+            except Exception as exc:
+                self.logger.debug("Permission check failed: %s", exc)
+                return False
+
+        return False
+
+    async def _classify_command(self, command: str, emit_events: bool) -> Dict[str, Any]:
+        if self._classifier is None:
+            return {
+                "command": command,
+                "tier": "yellow",
+                "risk_categories": ["system_modification"],
+                "requires_confirmation": True,
+                "is_destructive": False,
+                "confidence": 0.4,
+                "reasoning": "Safety classifier unavailable; defaulting to caution.",
+            }
+
+        try:
+            result = await self._classifier.classify_async(command, emit_events=emit_events)
+            if hasattr(result, "to_dict"):
+                return result.to_dict()
+            if isinstance(result, dict):
+                return result
+        except Exception as exc:
+            self.logger.warning("Command safety classification failed: %s", exc)
+
+        return {
+            "command": command,
+            "tier": "yellow",
+            "risk_categories": ["system_modification"],
+            "requires_confirmation": True,
+            "is_destructive": False,
+            "confidence": 0.3,
+            "reasoning": "Safety classifier failed; defaulting to caution.",
+        }
+
+    async def _run_exec(
+        self,
+        cmd_tokens: Sequence[str],
+        cwd: Path,
+        timeout_seconds: float,
+        env_overrides: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        started = time.time()
+
+        if not cmd_tokens:
+            raise ValueError("Command arguments cannot be empty")
+
+        executable = cmd_tokens[0]
+        resolved_exec = executable if Path(executable).is_absolute() else shutil.which(executable)
+        if not resolved_exec:
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"Executable not found: {executable}",
+                "timed_out": False,
+                "duration_ms": round((time.time() - started) * 1000.0, 2),
+            }
+
+        env_payload = None
+        if env_overrides:
+            env_payload = dict(os.environ)
+            for key, value in env_overrides.items():
+                if not isinstance(key, str) or not key:
+                    continue
+                env_payload[key] = str(value)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd_tokens,
+            cwd=str(cwd),
+            env=env_payload,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        timed_out = False
+        try:
+            stdout_raw, stderr_raw = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            process.kill()
+            await process.wait()
+            stdout_raw = b""
+            stderr_raw = b"Command timed out"
+
+        stdout_bytes = stdout_raw[: self._policy.max_output_bytes]
+        stderr_bytes = stderr_raw[: self._policy.max_output_bytes]
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+
+        if len(stdout_raw) > self._policy.max_output_bytes:
+            stdout_text += "\n[output truncated]"
+        if len(stderr_raw) > self._policy.max_output_bytes:
+            stderr_text += "\n[output truncated]"
+
+        return {
+            "success": (process.returncode == 0) and not timed_out,
+            "returncode": process.returncode if process.returncode is not None else -1,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "timed_out": timed_out,
+            "duration_ms": round((time.time() - started) * 1000.0, 2),
+            "timeout_seconds": timeout_seconds,
+        }
+
+    def _parse_command(
+        self,
+        command: Optional[Union[str, Sequence[str]]],
+        argv: Optional[Sequence[str]],
+    ) -> Tuple[str, List[str]]:
+        if argv:
+            tokens = [str(token) for token in argv if str(token)]
+            command_text = " ".join(shlex.quote(token) for token in tokens)
+            if not tokens:
+                raise ValueError("argv cannot be empty")
+            return command_text, tokens
+
+        if isinstance(command, (list, tuple)):
+            tokens = [str(token) for token in command if str(token)]
+            command_text = " ".join(shlex.quote(token) for token in tokens)
+            if not tokens:
+                raise ValueError("command list cannot be empty")
+            return command_text, tokens
+
+        command_text = str(command or "").strip()
+        if not command_text:
+            raise ValueError("Missing required parameter: command or argv")
+
+        if "\n" in command_text:
+            raise ValueError("Multiline commands are not allowed")
+
+        try:
+            tokens = shlex.split(command_text)
+        except ValueError as exc:
+            raise ValueError(f"Invalid command syntax: {exc}") from exc
+        if not tokens:
+            raise ValueError("Command resolved to no executable tokens")
+        return command_text, tokens
+
+    def _contains_complex_shell_tokens(self, command_text: str, tokens: Sequence[str]) -> bool:
+        if any(token in self.COMPLEX_TOKENS for token in tokens):
+            return True
+        return "$(" in command_text or "<<" in command_text or ">>" in command_text
+
+    async def _refresh_policy_if_changed(self) -> None:
+        signature = self._compute_policy_signature()
+        if signature == self._policy_signature:
+            return
+        async with self._policy_lock:
+            signature = self._compute_policy_signature()
+            if signature == self._policy_signature:
+                return
+            self._policy = self._build_policy()
+            self._policy_signature = signature
+
+    def _build_policy(self) -> ShellExecutionPolicy:
+        allowed_roots = self._canonicalize_paths(self._parse_env_paths(self.CWD_ALLOWLIST_ENV))
+        denied_roots = self._canonicalize_paths(self._parse_env_paths(self.CWD_DENYLIST_ENV))
+
+        if not allowed_roots:
+            defaults: List[Path] = []
+            defaults.extend(self._parse_env_paths(self.REPO_ROOTS_ENV))
+            for key in self.REPO_ENV_KEYS:
+                raw = os.getenv(key, "").strip()
+                if raw:
+                    defaults.append(Path(raw))
+            defaults.append(Path.cwd())
+            defaults.append(Path.home() / ".jarvis")
+            allowed_roots = self._canonicalize_paths(defaults)
+
+        if not allowed_roots:
+            allowed_roots = (self._resolve_user_path(str(Path.cwd())),)
+
+        auto_approve_raw = os.getenv(self.AUTO_APPROVE_TIERS_ENV, "green,yellow").strip()
+        auto_approve_tiers = tuple(
+            sorted(
+                {
+                    tier.strip().lower()
+                    for tier in re.split(r"[,;\s]+", auto_approve_raw)
+                    if tier.strip()
+                }
+            )
+        )
+
+        return ShellExecutionPolicy(
+            allowed_cwd_roots=allowed_roots,
+            denied_cwd_roots=denied_roots,
+            auto_approve_tiers=auto_approve_tiers,
+            allow_shell_features=self._env_bool(self.ALLOW_SHELL_FEATURES_ENV, False),
+            max_timeout_seconds=self._env_float(self.MAX_TIMEOUT_ENV, 120.0, minimum=1.0),
+            max_output_bytes=self._env_int(self.MAX_OUTPUT_ENV, 200_000, minimum=1_024),
+        )
+
+    def _resolve_and_validate_cwd(self, raw_cwd: str) -> Path:
+        resolved = self._resolve_user_path(raw_cwd)
+
+        if any(self._is_relative(resolved, denied) for denied in self._policy.denied_cwd_roots):
+            raise PermissionError(f"Working directory explicitly denied by policy: {resolved}")
+
+        if not any(self._is_relative(resolved, allowed) for allowed in self._policy.allowed_cwd_roots):
+            raise PermissionError(f"Working directory not in allowed roots: {resolved}")
+
+        if not resolved.exists():
+            raise FileNotFoundError(f"Working directory does not exist: {resolved}")
+        if not resolved.is_dir():
+            raise NotADirectoryError(f"Working directory is not a directory: {resolved}")
+        return resolved
+
+    def _compute_policy_signature(self) -> Tuple[str, ...]:
+        values = [
+            os.getenv(self.CWD_ALLOWLIST_ENV, ""),
+            os.getenv(self.CWD_DENYLIST_ENV, ""),
+            os.getenv(self.AUTO_APPROVE_TIERS_ENV, ""),
+            os.getenv(self.MAX_TIMEOUT_ENV, ""),
+            os.getenv(self.MAX_OUTPUT_ENV, ""),
+            os.getenv(self.ALLOW_SHELL_FEATURES_ENV, ""),
+            os.getenv(self.REPO_ROOTS_ENV, ""),
+            os.getenv(self.ALLOW_ROOT_PATHS_ENV, ""),
+            os.getenv(self.EMIT_EVENTS_ENV, ""),
+        ]
+        values.extend(os.getenv(key, "") for key in self.REPO_ENV_KEYS)
+        return tuple(values)
+
+    def _canonicalize_paths(self, paths: Sequence[Path]) -> Tuple[Path, ...]:
+        allow_root_paths = self._env_bool(self.ALLOW_ROOT_PATHS_ENV, False)
+        normalized: List[Path] = []
+        for path in paths:
+            try:
+                resolved = self._resolve_user_path(str(path))
+                if not allow_root_paths and resolved == Path(resolved.anchor):
+                    self.logger.warning("Skipping root path in shell policy for safety: %s", resolved)
+                    continue
+                normalized.append(resolved)
+            except Exception:
+                continue
+
+        unique: List[Path] = []
+        for path in sorted(set(normalized), key=lambda candidate: len(candidate.parts)):
+            if any(self._is_relative(path, existing) for existing in unique):
+                continue
+            unique.append(path)
+        return tuple(unique)
+
+    def _parse_env_paths(self, env_key: str) -> List[Path]:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return []
+
+        values: List[str] = []
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    values = [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                values = []
+        if not values:
+            values = [item.strip() for item in re.split(r"[,;\n]+", raw) if item.strip()]
+
+        return [Path(value).expanduser() for value in values]
+
+    @staticmethod
+    def _resolve_user_path(raw_path: str) -> Path:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+
+        missing_parts: List[str] = []
+        probe = candidate
+        while not probe.exists():
+            missing_parts.append(probe.name)
+            parent = probe.parent
+            if parent == probe:
+                break
+            probe = parent
+
+        resolved_base = probe.resolve()
+        for part in reversed(missing_parts):
+            resolved_base = resolved_base / part
+        return resolved_base
+
+    @staticmethod
+    def _is_relative(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _clamp_timeout(self, timeout: Optional[float]) -> float:
+        if timeout is None:
+            return self._policy.max_timeout_seconds
+        try:
+            value = float(timeout)
+        except (TypeError, ValueError):
+            return self._policy.max_timeout_seconds
+        return max(1.0, min(value, self._policy.max_timeout_seconds))
+
+    @staticmethod
+    def _to_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _env_bool(env_key: str, default: bool) -> bool:
+        return ShellCommandTool._to_bool(os.getenv(env_key), default=default)
+
+    @staticmethod
+    def _env_int(env_key: str, default: int, minimum: int = 0) -> int:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(int(raw), minimum)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_float(env_key: str, default: float, minimum: float = 0.0) -> float:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(float(raw), minimum)
+        except ValueError:
+            return default
+
+
+@dataclass(frozen=True)
 class FileSystemAccessPolicy:
     """Resolved filesystem access policy for the file-system tool."""
 
@@ -1909,12 +2537,16 @@ class ToolFactory:
 # Auto-Registration
 # ============================================================================
 
-def register_builtin_tools(registry: Optional[ToolRegistry] = None) -> int:
+def register_builtin_tools(
+    registry: Optional[ToolRegistry] = None,
+    permission_manager: Optional[Any] = None,
+) -> int:
     """
     Register built-in tools.
 
     Args:
         registry: Tool registry (uses singleton if not provided)
+        permission_manager: Permission manager passed to built-in tools
 
     Returns:
         Number of tools registered
@@ -1927,7 +2559,8 @@ def register_builtin_tools(registry: Optional[ToolRegistry] = None) -> int:
         CalculatorTool(),
         DateTimeTool(),
         WebResearchTool(),
-        FileSystemAgentTool(),
+        ShellCommandTool(permission_manager=permission_manager),
+        FileSystemAgentTool(permission_manager=permission_manager),
     ]
 
     for tool in builtin_tools:

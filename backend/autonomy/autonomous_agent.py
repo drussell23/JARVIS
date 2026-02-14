@@ -267,9 +267,20 @@ class AutonomousAgent:
         self.logger.info(f"Initializing {self.config.name} agent...")
 
         try:
+            # Initialize integration manager early so permission adapters can be injected
+            if self.integration_manager is None:
+                self.integration_manager = get_integration_manager()
+
             # Initialize tool registry
             self.tool_registry = ToolRegistry.get_instance()
-            register_builtin_tools(self.tool_registry)
+            register_builtin_tools(
+                self.tool_registry,
+                permission_manager=(
+                    self.integration_manager.permission_adapter
+                    if self.integration_manager
+                    else None
+                ),
+            )
 
             if self.config.enable_tool_discovery:
                 discovered = auto_discover_tools(registry=self.tool_registry)
@@ -278,13 +289,14 @@ class AutonomousAgent:
             # Initialize tool orchestrator
             self.tool_orchestrator = create_orchestrator(
                 tool_registry=self.tool_registry,
+                permission_manager=(
+                    self.integration_manager.permission_adapter
+                    if self.integration_manager
+                    else None
+                ),
                 max_concurrent=self.config.max_concurrent_tools,
                 default_timeout=self.config.tool_timeout_seconds
             )
-
-            # Initialize integration manager
-            if self.integration_manager is None:
-                self.integration_manager = get_integration_manager()
 
             # Initialize memory
             if self.config.enable_memory:

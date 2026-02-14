@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import logging
 import time
 import weakref
@@ -610,7 +611,11 @@ class ToolOrchestrator:
         )
 
         result = await self._execute_task(task, ExecutionContext())
-        return result.result if result.success else None
+        if result.success:
+            return result.result
+
+        error_message = result.error or f"Execution failed for tool: {action_type}"
+        raise RuntimeError(error_message)
 
     async def execute_batch(
         self,
@@ -856,6 +861,17 @@ class ToolOrchestrator:
                     started_at=started_at
                 )
 
+        if self.permission_manager:
+            is_allowed = await self._check_permission(task)
+            if not is_allowed:
+                return ExecutionResult(
+                    task_id=task.task_id,
+                    tool_name=task.tool_name,
+                    success=False,
+                    error=f"Permission denied for tool: {task.tool_name}",
+                    started_at=started_at
+                )
+
         # Get tool
         tool = None
         if self.tool_registry:
@@ -869,9 +885,15 @@ class ToolOrchestrator:
                     timeout=task.timeout_seconds
                 )
             else:
-                # Simulate execution for testing
-                await asyncio.sleep(0.01)
-                result = {"status": "simulated", "tool": task.tool_name}
+                if self.enable_circuit_breaker:
+                    breaker.record_failure()
+                return ExecutionResult(
+                    task_id=task.task_id,
+                    tool_name=task.tool_name,
+                    success=False,
+                    error=f"Tool not registered: {task.tool_name}",
+                    started_at=started_at
+                )
 
             duration_ms = (time.time() - start_time) * 1000
 
@@ -914,6 +936,38 @@ class ToolOrchestrator:
                 duration_ms=(time.time() - start_time) * 1000,
                 started_at=started_at
             )
+
+    async def _check_permission(self, task: ExecutionTask) -> bool:
+        """Check permission for a tool execution task."""
+        checker = getattr(self.permission_manager, "check_permission", None)
+        if checker is None:
+            return True
+
+        action_type = f"tool:{task.tool_name}"
+        target = str(task.arguments.get("target") or task.tool_name)
+        context = dict(task.arguments)
+
+        try:
+            result = checker(
+                action_type=action_type,
+                target=target,
+                context=context,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        except TypeError:
+            try:
+                result = checker(action_type, target, context)
+                if inspect.isawaitable(result):
+                    result = await result
+                return bool(result)
+            except Exception as exc:
+                self.logger.warning("Permission check failed for %s: %s", task.tool_name, exc)
+                return False
+        except Exception as exc:
+            self.logger.warning("Permission check failed for %s: %s", task.tool_name, exc)
+            return False
 
     async def cancel(self, context_id: str) -> bool:
         """Cancel an active execution context."""

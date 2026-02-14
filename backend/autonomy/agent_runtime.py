@@ -1698,7 +1698,8 @@ class UnifiedAgentRuntime:
         """Dispatch action to appropriate executor."""
         action_type = action.get("type", action.get("action_type", ""))
         tool_name = action.get("tool", action.get("tool_name", ""))
-        params = action.get("params", action.get("parameters", {}))
+        raw_params = action.get("params", action.get("parameters", {}))
+        params = raw_params if isinstance(raw_params, dict) else {}
 
         # v239.0: Direct registry dispatch (handles mesh + built-in tools)
         if tool_name:
@@ -1728,6 +1729,10 @@ class UnifiedAgentRuntime:
         if action_type in ("reason", "analyze", "plan"):
             return {"success": True, "message": f"Reasoning complete: {action_type}"}
 
+        # Shell action is mediated by policy-driven shell_agent
+        if action_type == "shell":
+            return await self._execute_shell_action(action=action, params=params)
+
         # Computer use action
         if action_type in ("click", "type", "scroll", "screenshot"):
             return await self._execute_computer_use(action)
@@ -1736,15 +1741,111 @@ class UnifiedAgentRuntime:
         if action_type in ("ghost_hands", "background_visual", "ghost_task"):
             return await self._execute_via_ghost_hands(action)
 
-        # Shell commands are NOT allowed — security risk (arbitrary command injection)
-        # Route through tool orchestrator instead which has proper sandboxing
-        if action_type == "shell":
-            logger.warning("[AgentRuntime] Shell execution blocked — use tool orchestrator")
-            return {"success": False, "error": "Direct shell execution not allowed. "
-                    "Use a registered tool instead."}
-
         # Default: pass through
         return {"success": True, "action_type": action_type, "action": action}
+
+    async def _execute_shell_action(self, action: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute shell actions through the `shell_agent` tool with explicit safety policy."""
+        try:
+            from backend.autonomy.langchain_tools import ToolRegistry
+        except ImportError as exc:
+            return {
+                "success": False,
+                "tool": "shell_agent",
+                "error": f"shell_agent unavailable: {exc}",
+            }
+
+        registry = ToolRegistry.get_instance()
+        shell_tool = registry.get("shell_agent")
+        if shell_tool is None:
+            return {
+                "success": False,
+                "tool": "shell_agent",
+                "error": "shell_agent is not registered",
+            }
+
+        # Accept both structured params and top-level action fields.
+        command = (
+            params.get("command")
+            or params.get("cmd")
+            or action.get("command")
+            or action.get("cmd")
+            or params.get("target")
+            or action.get("target")
+        )
+        argv = (
+            params.get("argv")
+            or params.get("args")
+            or action.get("argv")
+            or action.get("args")
+        )
+
+        if command is None and argv is None:
+            return {
+                "success": False,
+                "tool": "shell_agent",
+                "error": "Shell action requires `command` or `argv`.",
+            }
+
+        shell_params: Dict[str, Any] = {
+            "operation": (
+                params.get("operation")
+                or params.get("action")
+                or action.get("operation")
+                or "execute"
+            )
+        }
+        if command is not None:
+            shell_params["command"] = command
+        if argv is not None:
+            shell_params["argv"] = argv
+
+        def _copy_param(key: str, *aliases: str) -> None:
+            for candidate in (key, *aliases):
+                if candidate in params and params[candidate] is not None:
+                    shell_params[key] = params[candidate]
+                    return
+                if candidate in action and action[candidate] is not None:
+                    shell_params[key] = action[candidate]
+                    return
+
+        _copy_param("cwd", "working_directory")
+        _copy_param("timeout")
+        _copy_param("approved")
+        _copy_param("require_confirmation")
+        _copy_param("allow_destructive")
+        _copy_param("safe_mode")
+        _copy_param("dry_run")
+        _copy_param("emit_events")
+        _copy_param("allow_shell_features")
+        _copy_param("env")
+
+        try:
+            result = await shell_tool.run(**shell_params)
+        except Exception as exc:
+            logger.warning("[AgentRuntime] shell_agent execution failed: %s", exc)
+            return {
+                "success": False,
+                "tool": "shell_agent",
+                "error": str(exc),
+            }
+
+        shell_success = bool(result.get("success", False)) if isinstance(result, dict) else False
+        payload: Dict[str, Any] = {
+            "success": shell_success,
+            "tool": "shell_agent",
+            "result": result,
+        }
+
+        if isinstance(result, dict):
+            if result.get("blocked"):
+                payload["blocked"] = True
+            if result.get("requires_confirmation"):
+                payload["requires_confirmation"] = True
+            if result.get("error"):
+                payload["error"] = str(result.get("error"))
+
+        return payload
 
     async def _execute_computer_use(self, action: Dict) -> Dict:
         """Execute a computer use action via ComputerUseTool.
