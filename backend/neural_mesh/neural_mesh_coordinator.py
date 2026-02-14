@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -324,13 +325,19 @@ class NeuralMeshCoordinator:
         """
         Stop all Neural Mesh components gracefully.
         """
-        if not self._running:
+        if (
+            not self._running
+            and not self._initialized
+            and self._health_task is None
+        ):
             return
 
         logger.info("Stopping Neural Mesh system...")
 
         self._running = False
         self._system_health = HealthStatus.UNKNOWN
+        agent_stop_timeout = float(os.environ.get("NEURAL_MESH_AGENT_STOP_TIMEOUT", "5.0"))
+        component_stop_timeout = float(os.environ.get("NEURAL_MESH_COMPONENT_STOP_TIMEOUT", "8.0"))
 
         # Cancel health monitor
         if self._health_task:
@@ -339,27 +346,70 @@ class NeuralMeshCoordinator:
                 await self._health_task
             except asyncio.CancelledError:
                 pass
+            finally:
+                self._health_task = None
 
-        # Stop all agents
-        for agent in self._agents.values():
+        async def _stop_agent(agent: BaseNeuralMeshAgent) -> None:
             try:
-                await agent.stop()
+                await asyncio.wait_for(agent.stop(), timeout=agent_stop_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Agent stop timed out for %s after %.1fs (forcing task cancel)",
+                    agent.agent_name,
+                    agent_stop_timeout,
+                )
+                for task_attr in ("_heartbeat_task", "_message_handler_task"):
+                    task = getattr(agent, task_attr, None)
+                    if task and not task.done():
+                        task.cancel()
             except Exception as e:
                 logger.exception("Error stopping agent %s: %s", agent.agent_name, e)
 
+        # Stop all agents in parallel to keep shutdown bounded.
+        if self._agents:
+            await asyncio.gather(
+                *(_stop_agent(agent) for agent in self._agents.values()),
+                return_exceptions=True,
+            )
+
+        async def _stop_component(name: str, component: Any, stop_method: str) -> None:
+            if component is None or not hasattr(component, stop_method):
+                return
+            try:
+                await asyncio.wait_for(
+                    getattr(component, stop_method)(),
+                    timeout=component_stop_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "%s stop timed out after %.1fs",
+                    name,
+                    component_stop_timeout,
+                )
+            except Exception as e:
+                logger.exception("Error stopping %s: %s", name, e)
+
         # Stop components in reverse order
-        if self._orchestrator:
-            await self._orchestrator.stop()
-
-        if self._bus:
-            await self._bus.stop()
-
-        if self._registry:
-            await self._registry.stop()
+        await _stop_component("orchestrator", self._orchestrator, "stop")
+        await _stop_component("bus", self._bus, "stop")
+        await _stop_component("registry", self._registry, "stop")
 
         if self._knowledge:
-            await self._knowledge.close()
+            try:
+                await asyncio.wait_for(
+                    self._knowledge.close(),
+                    timeout=max(component_stop_timeout, 10.0),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "knowledge graph stop timed out after %.1fs",
+                    max(component_stop_timeout, 10.0),
+                )
+            except Exception as e:
+                logger.exception("Error stopping knowledge graph: %s", e)
 
+        self._started_at = None
+        self._initialized = False
         logger.info("Neural Mesh system stopped")
 
     async def register_agent(self, agent: BaseNeuralMeshAgent) -> None:
@@ -789,6 +839,7 @@ async def get_neural_mesh() -> NeuralMeshCoordinator:
 
     if _coordinator is None:
         _coordinator = NeuralMeshCoordinator()
+    if not _coordinator._initialized:
         await _coordinator.initialize()
 
     return _coordinator
@@ -814,3 +865,16 @@ async def stop_neural_mesh() -> None:
     if _coordinator is not None:
         await _coordinator.stop()
         _coordinator = None
+
+    # Also stop optional monitoring singletons if they were started.
+    try:
+        from .monitoring import (
+            shutdown_metrics_collector,
+            shutdown_health_monitor,
+            shutdown_trace_manager,
+        )
+        await shutdown_trace_manager()
+        await shutdown_health_monitor()
+        await shutdown_metrics_collector()
+    except Exception:
+        pass

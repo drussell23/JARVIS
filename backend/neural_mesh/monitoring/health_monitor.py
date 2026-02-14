@@ -699,3 +699,12 @@ async def get_health_monitor() -> HealthMonitor:
         await _global_monitor.start()
 
     return _global_monitor
+
+
+async def shutdown_health_monitor() -> None:
+    """Stop and clear the global health monitor singleton."""
+    global _global_monitor
+
+    if _global_monitor is not None:
+        await _global_monitor.stop()
+        _global_monitor = None

@@ -1706,41 +1706,78 @@ class ProgressAwareStartupController:
         self._last_progress_pct: float = 0.0
         self._last_progress_time: float = 0.0
         self._last_activity_time: float = 0.0  # v227.0: tracks subsystem activity
+        self._last_activity_source: str = "none"
+        self._last_diag_log_time: float = 0.0
         self._current_deadline: float = 0.0
         self._extensions_granted: int = 0
         self._start_time: float = 0.0
 
-    def _get_progress_state(self, get_state_func: Callable[[], Dict]) -> Tuple[float, float, bool, bool]:
+    def _get_progress_state(self, get_state_func: Callable[[], Dict]) -> Dict[str, Any]:
         """
-        v227.0: Extract progress information from the kernel's composite state.
+        Extract progress and liveness information from the kernel's composite state.
 
         Returns:
-            Tuple of (progress_pct, eta_seconds, is_active, has_active_subsystem)
-
-            has_active_subsystem: True when a long-running subsystem (model loading,
-            component startup) is actively working. Used to distinguish "phase hold"
-            (progress unchanged but work ongoing) from "phase stall" (genuinely stuck).
+            Dict with normalized keys:
+            - progress_pct: startup progress percentage
+            - eta_remaining: estimated remaining seconds (0 if unknown)
+            - is_active: startup process still active
+            - has_active_subsystem: active long-running subsystem signal
+            - activity_timestamp: last trusted activity timestamp (epoch seconds)
+            - activity_source: source label for the last trusted activity
+            - subsystem_reasons: list of active subsystem reasons
+            - stage: startup stage label
         """
+        default_state = {
+            "progress_pct": 0.0,
+            "eta_remaining": 0.0,
+            "is_active": False,
+            "has_active_subsystem": False,
+            "activity_timestamp": 0.0,
+            "activity_source": "none",
+            "subsystem_reasons": [],
+            "stage": "startup",
+        }
+
         try:
-            state = get_state_func()
-            progress_pct = state.get("progress_pct", 0.0)
-            eta_seconds = state.get("estimated_total_seconds", 0.0)
-            elapsed = state.get("elapsed_seconds", 0)
-            is_active = state.get("active", False)
-            has_active_subsystem = state.get("has_active_subsystem", False)
+            state = get_state_func() or {}
+            progress_pct = float(state.get("progress_pct", 0.0) or 0.0)
+            eta_seconds = float(state.get("estimated_total_seconds", 0.0) or 0.0)
+            elapsed = float(state.get("elapsed_seconds", 0.0) or 0.0)
+            is_active = bool(state.get("active", False))
+            has_active_subsystem = bool(state.get("has_active_subsystem", False))
+            activity_timestamp = float(state.get("activity_timestamp", 0.0) or 0.0)
+            activity_source = str(state.get("activity_source", "none") or "none")
+            subsystem_reasons = state.get("active_subsystem_reasons") or []
+            stage = str(state.get("stage", "startup") or "startup")
+
+            if not isinstance(subsystem_reasons, list):
+                subsystem_reasons = [str(subsystem_reasons)]
+            subsystem_reasons = [str(reason) for reason in subsystem_reasons if reason]
 
             # Calculate remaining time from eta if available
             if eta_seconds > 0 and elapsed > 0 and progress_pct > 0:
                 if progress_pct < 100:
-                    remaining = (eta_seconds - elapsed) if eta_seconds > elapsed else (100 - progress_pct) / max(progress_pct / elapsed, 0.001)
+                    if eta_seconds > elapsed:
+                        remaining = eta_seconds - elapsed
+                    else:
+                        remaining = (100 - progress_pct) / max(progress_pct / elapsed, 0.001)
                 else:
-                    remaining = 0
+                    remaining = 0.0
             else:
-                remaining = 0
+                remaining = 0.0
 
-            return progress_pct, remaining, is_active, has_active_subsystem
+            return {
+                "progress_pct": max(0.0, min(100.0, progress_pct)),
+                "eta_remaining": max(0.0, remaining),
+                "is_active": is_active,
+                "has_active_subsystem": has_active_subsystem,
+                "activity_timestamp": max(0.0, activity_timestamp),
+                "activity_source": activity_source,
+                "subsystem_reasons": subsystem_reasons,
+                "stage": stage,
+            }
         except Exception:
-            return 0.0, 0.0, False, False
+            return default_state
     
     async def run_with_progress_aware_timeout(
         self,
@@ -1770,6 +1807,8 @@ class ProgressAwareStartupController:
         self._current_deadline = self._start_time + self.base_timeout
         self._last_progress_time = self._start_time
         self._last_activity_time = self._start_time
+        self._last_activity_source = "startup"
+        self._last_diag_log_time = self._start_time
         self._last_progress_pct = 0.0
         self._extensions_granted = 0
 
@@ -1792,14 +1831,21 @@ class ProgressAwareStartupController:
                     return task.result()
 
                 # Check progress state
-                progress_pct, eta_remaining, is_active, has_active_subsystem = (
-                    self._get_progress_state(get_progress_func)
-                )
+                progress_state = self._get_progress_state(get_progress_func)
+                progress_pct = progress_state["progress_pct"]
+                eta_remaining = progress_state["eta_remaining"]
+                is_active = progress_state["is_active"]
+                has_active_subsystem = progress_state["has_active_subsystem"]
+                activity_timestamp = progress_state["activity_timestamp"]
+                activity_source = progress_state["activity_source"]
+                subsystem_reasons = progress_state["subsystem_reasons"]
+                stage = progress_state["stage"]
 
                 # RULE 1: Detect REAL progress advancement (phase changes)
                 if progress_pct > self._last_progress_pct:
                     self._last_progress_time = now
                     self._last_activity_time = now
+                    self._last_activity_source = "progress"
                     progress_delta = progress_pct - self._last_progress_pct
                     self._last_progress_pct = progress_pct
 
@@ -1808,16 +1854,30 @@ class ProgressAwareStartupController:
                         f"(+{progress_delta:.1f}%), elapsed: {elapsed:.0f}s"
                     )
 
-                # v227.0: Active subsystem resets activity timer but NOT progress timer.
-                # This lets us distinguish "phase hold" (work ongoing, extend deadline)
-                # from "phase stall" (nothing happening, trigger timeout).
-                if has_active_subsystem:
-                    self._last_activity_time = now
+                # Trusted activity marker from kernel/watchdog state.
+                # We intentionally avoid resetting activity on a bare boolean flag
+                # to prevent leaked "active" flags from masking true stalls.
+                if activity_timestamp > 0 and activity_timestamp > self._last_activity_time:
+                    self._last_activity_time = activity_timestamp
+                    self._last_activity_source = activity_source or "activity_marker"
 
                 # RULE 2: Extend deadline if progress/activity warrants it
                 time_since_progress = now - self._last_progress_time
                 time_since_activity = now - self._last_activity_time
                 time_until_deadline = self._current_deadline - now
+
+                # Structured periodic diagnostics for startup forensics.
+                if (now - self._last_diag_log_time) >= max(self.poll_interval * 2, 20.0):
+                    reasons = ", ".join(subsystem_reasons[:4]) if subsystem_reasons else "none"
+                    self.logger.debug(
+                        f"[ProgressController] Tick stage={stage} progress={progress_pct:.1f}% "
+                        f"active={is_active} subsystem={has_active_subsystem} reasons={reasons} "
+                        f"time_since_progress={time_since_progress:.0f}s "
+                        f"time_since_activity={time_since_activity:.0f}s "
+                        f"eta_remaining={eta_remaining:.0f}s deadline_in={time_until_deadline:.0f}s "
+                        f"activity_source={self._last_activity_source}"
+                    )
+                    self._last_diag_log_time = now
 
                 should_extend = False
                 extension_reason = ""
@@ -1896,13 +1956,15 @@ class ProgressAwareStartupController:
                 # actively working. Only kills when BOTH are inactive.
                 if time_since_progress > self.stall_threshold and is_active and progress_pct > 0:
                     if has_active_subsystem or eta_remaining > 0:
+                        reasons = ", ".join(subsystem_reasons[:4]) if subsystem_reasons else "n/a"
                         # Phase hold: progress flat but subsystem working — just log
                         if time_since_progress > self.stall_threshold * 2:
                             # Extended hold: warn but don't kill
                             self.logger.info(
                                 f"[ProgressController] Phase hold at {progress_pct:.1f}% "
                                 f"for {time_since_progress:.0f}s "
-                                f"(subsystem active, ETA: {eta_remaining:.0f}s)"
+                                f"(subsystem active, stage={stage}, reasons={reasons}, "
+                                f"ETA: {eta_remaining:.0f}s)"
                             )
 
                         # v242.4: Phase hold HARD CAP — prevents a leaked
@@ -1925,11 +1987,14 @@ class ProgressAwareStartupController:
                                 )
 
                     elif time_since_activity > self.stall_threshold:
+                        reasons = ", ".join(subsystem_reasons[:4]) if subsystem_reasons else "none"
                         # TRUE stall: no progress AND no subsystem activity
                         self.logger.warning(
                             f"[ProgressController] TRUE STALL at {progress_pct:.1f}% — "
+                            f"stage={stage}, reasons={reasons}, "
                             f"no progress for {time_since_progress:.0f}s, "
-                            f"no activity for {time_since_activity:.0f}s"
+                            f"no activity for {time_since_activity:.0f}s "
+                            f"(last_activity_source={self._last_activity_source})"
                         )
                         if progress_pct < 95:
                             task.cancel()
@@ -59303,7 +59368,7 @@ class JarvisSystemKernel:
                 self.logger.debug(f"[Kernel] Startup resilience cleanup error: {e}")
 
         # v237.0/v251.0: Stop AGI OS + Neural Mesh + agents (prevents dangling tasks)
-        agi_stop_timeout = max(1.0, _get_env_float("JARVIS_AGI_OS_STOP_TIMEOUT", 20.0))
+        agi_stop_timeout = max(1.0, _get_env_float("JARVIS_AGI_OS_STOP_TIMEOUT", 45.0))
         try:
             from agi_os import stop_agi_os
             await asyncio.wait_for(stop_agi_os(), timeout=agi_stop_timeout)
@@ -59312,8 +59377,37 @@ class JarvisSystemKernel:
             self.logger.warning(
                 f"[Kernel] AGI OS stop timed out after {agi_stop_timeout:.1f}s"
             )
+            # Fallback teardown path for partially stopped AGI systems.
+            try:
+                from neural_mesh import stop_jarvis_neural_mesh, stop_neural_mesh
+                fallback_timeout = max(5.0, min(20.0, agi_stop_timeout * 0.5))
+                try:
+                    await asyncio.wait_for(
+                        stop_jarvis_neural_mesh(),
+                        timeout=fallback_timeout,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        stop_neural_mesh(),
+                        timeout=fallback_timeout,
+                    )
+                except Exception:
+                    pass
+                self.logger.info("[Kernel] AGI fallback teardown attempted")
+            except Exception as fallback_err:
+                self.logger.debug(f"[Kernel] AGI fallback teardown error: {fallback_err}")
         except Exception as e:
             self.logger.debug(f"[Kernel] AGI OS cleanup error: {e}")
+
+        # Stop global hybrid orchestrator singleton if present.
+        try:
+            from core.hybrid_orchestrator import stop_orchestrator
+            await asyncio.wait_for(stop_orchestrator(), timeout=10.0)
+            self.logger.debug("[Kernel] Hybrid orchestrator stopped")
+        except Exception as e:
+            self.logger.debug(f"[Kernel] Hybrid orchestrator cleanup error: {e}")
 
         # Stop backend deterministically (in-process first, then subprocess fallback)
         if self._backend_server or self._backend_server_task:
@@ -59746,6 +59840,8 @@ class JarvisSystemKernel:
         # Between boundaries (e.g., 68% during 10-min Trinity), the subsystem flag
         # tells the controller that work is ongoing.
         def get_progress_state() -> Dict:
+            now = time.time()
+
             # Model loading state (for ETA and active subsystem detection)
             model_active = False
             model_eta = 0
@@ -59761,36 +59857,89 @@ class JarvisSystemKernel:
             except Exception:
                 pass
 
-            # v227.0: Trinity coordination detection — components actively starting
-            # During Trinity phase, progress stays at 68-79% for up to 10 minutes
-            # while Prime loads its model and Reactor connects. Without this flag,
-            # the controller would see a stall at 73% and kill the startup.
+            # Phase progress: honest value, no micro-increment
+            phase_progress = float(getattr(self, '_current_progress', 0) or 0)
+            started = self._started_at or _startup_entry_time
+            overall_elapsed = max(0, now - started) if started else 0
+            stage = getattr(self, '_current_startup_phase', 'startup')
+            in_startup_window = 0 < phase_progress < 100 and stage != "complete"
+
+            active_subsystem_reasons: List[str] = []
+            activity_source = "none"
+            activity_timestamp = 0.0
+
+            if model_active:
+                active_subsystem_reasons.append("model_loading")
+                activity_source = "model_loading"
+                activity_timestamp = now
+
+            # v255.0: Watchdog heartbeat is the authoritative startup liveness signal.
+            # If progress updates are still flowing into DMS for the current phase,
+            # treat startup as active even when coarse phase % is flat.
+            watchdog_recent_activity = False
+            try:
+                startup_watchdog = getattr(self, '_startup_watchdog', None)
+                if startup_watchdog:
+                    status = startup_watchdog.get_status() or {}
+                    watchdog_running = bool(status.get("running"))
+                    watchdog_phase = status.get("current_phase")
+                    stale_seconds = status.get("progress_stale_seconds")
+                    if watchdog_running and watchdog_phase and stale_seconds is not None:
+                        stale_seconds = max(0.0, float(stale_seconds))
+                        watchdog_activity_window = max(10.0, progress_controller.stall_threshold * 0.9)
+                        if stale_seconds <= watchdog_activity_window:
+                            watchdog_recent_activity = True
+                            active_subsystem_reasons.append(f"startup_watchdog:{watchdog_phase}")
+                            watchdog_activity_ts = now - stale_seconds
+                            if watchdog_activity_ts > activity_timestamp:
+                                activity_timestamp = watchdog_activity_ts
+                                activity_source = f"startup_watchdog:{watchdog_phase}"
+            except Exception:
+                pass
+
+            # v227.0+: Trinity coordination detection with liveness gating.
+            # During Trinity phase, readiness can remain false while components start.
+            # Require live startup activity to avoid leaked-ready-flag false positives.
             trinity_coordinating = False
             try:
                 kernel_state = getattr(self, '_state', None)
                 if kernel_state == KernelState.STARTING_TRINITY:
-                    # Check if any Trinity component is still incomplete
                     trinity_ready = getattr(self, '_trinity_ready', {})
-                    if not all(trinity_ready.values()):
+                    trinity_incomplete = not all(trinity_ready.values())
+                    if trinity_incomplete and (watchdog_recent_activity or model_active):
                         trinity_coordinating = True
+                        active_subsystem_reasons.append("trinity_components_starting")
+                        if activity_timestamp <= 0:
+                            activity_source = "trinity_components"
+                            activity_timestamp = now
             except Exception:
                 pass
 
-            # Phase progress: honest value, no micro-increment
-            phase_progress = float(getattr(self, '_current_progress', 0) or 0)
-            started = self._started_at or _startup_entry_time
-            overall_elapsed = max(0, time.time() - started) if started else 0
+            # Track background startup helpers that may run across phases.
+            try:
+                early_gcp_task = getattr(self, '_early_invincible_task', None)
+                if early_gcp_task is not None and not early_gcp_task.done():
+                    active_subsystem_reasons.append("gcp_prewarm_task")
+                    if activity_timestamp <= 0:
+                        activity_source = "gcp_prewarm_task"
+                        activity_timestamp = now
+            except Exception:
+                pass
 
-            # Composite active subsystem: model loading OR Trinity coordination
-            subsystem_active = model_active or trinity_coordinating
+            subsystem_active = False
+            if in_startup_window and active_subsystem_reasons:
+                subsystem_active = True
 
             return {
                 "active": (0 < phase_progress < 100) or subsystem_active,
                 "progress_pct": phase_progress,
                 "elapsed_seconds": model_elapsed if model_active else int(overall_elapsed),
                 "estimated_total_seconds": model_eta if model_active else 0,
-                "stage": getattr(self, '_current_startup_phase', 'startup'),
+                "stage": stage,
                 "has_active_subsystem": subsystem_active,
+                "active_subsystem_reasons": active_subsystem_reasons,
+                "activity_timestamp": activity_timestamp,
+                "activity_source": activity_source,
                 "start_time": started,
             }
         
@@ -70575,6 +70724,47 @@ class JarvisSystemKernel:
                     timeout=15.0,
                     force_cancel_on_timeout=True,
                 )
+
+            # Stop AGI OS + Neural Mesh before broad task cancellation so
+            # subsystem-owned loops can unwind in dependency order.
+            agi_stop_timeout = max(1.0, _get_env_float("JARVIS_AGI_OS_STOP_TIMEOUT", 45.0))
+            try:
+                from agi_os import stop_agi_os
+                await asyncio.wait_for(stop_agi_os(), timeout=agi_stop_timeout)
+                self.logger.info("[Kernel] AGI OS + Neural Mesh stopped")
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"[Kernel] AGI OS stop timed out after {agi_stop_timeout:.1f}s"
+                )
+                try:
+                    from neural_mesh import stop_jarvis_neural_mesh, stop_neural_mesh
+                    fallback_timeout = max(5.0, min(20.0, agi_stop_timeout * 0.5))
+                    try:
+                        await asyncio.wait_for(
+                            stop_jarvis_neural_mesh(),
+                            timeout=fallback_timeout,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(
+                            stop_neural_mesh(),
+                            timeout=fallback_timeout,
+                        )
+                    except Exception:
+                        pass
+                except Exception as agi_fallback_err:
+                    self.logger.debug(f"[Kernel] AGI fallback teardown error: {agi_fallback_err}")
+            except Exception as agi_err:
+                self.logger.debug(f"[Kernel] AGI OS cleanup error: {agi_err}")
+
+            # Stop global hybrid orchestrator singleton if present.
+            try:
+                from core.hybrid_orchestrator import stop_orchestrator
+                await asyncio.wait_for(stop_orchestrator(), timeout=10.0)
+                self.logger.debug("[Kernel] Hybrid orchestrator stopped")
+            except Exception as hy_err:
+                self.logger.debug(f"[Kernel] Hybrid orchestrator cleanup error: {hy_err}")
 
             # Cancel background tasks (backend serve task is managed separately)
             background_tasks = [

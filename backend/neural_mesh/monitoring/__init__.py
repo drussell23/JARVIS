@@ -19,6 +19,7 @@ from .metrics_collector import (
     TimeSeriesMetric,
     TimerContext,
     get_metrics_collector,
+    shutdown_metrics_collector,
 )
 
 from .health_monitor import (
@@ -30,6 +31,7 @@ from .health_monitor import (
     ComponentHealth,
     HealthAlert,
     get_health_monitor,
+    shutdown_health_monitor,
 )
 
 from .trace_manager import (
@@ -43,6 +45,7 @@ from .trace_manager import (
     SamplingStrategy,
     SamplerConfig,
     get_trace_manager,
+    shutdown_trace_manager,
 )
 
 __all__ = [
@@ -53,6 +56,7 @@ __all__ = [
     "TimeSeriesMetric",
     "TimerContext",
     "get_metrics_collector",
+    "shutdown_metrics_collector",
     # Health
     "HealthMonitor",
     "HealthCheck",
@@ -62,6 +66,7 @@ __all__ = [
     "ComponentHealth",
     "HealthAlert",
     "get_health_monitor",
+    "shutdown_health_monitor",
     # Tracing
     "TraceManager",
     "Span",
@@ -73,4 +78,5 @@ __all__ = [
     "SamplingStrategy",
     "SamplerConfig",
     "get_trace_manager",
+    "shutdown_trace_manager",
 ]

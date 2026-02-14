@@ -321,9 +321,21 @@ class AGIOSCoordinator:
         self._state = AGIOSState.SHUTTING_DOWN
         logger.info("Stopping AGI OS...")
 
-        stop_step_timeout = max(0.1, _env_float("AGI_OS_STOP_STEP_TIMEOUT", 3.0))
-        health_task_timeout = max(0.1, _env_float("AGI_OS_HEALTH_TASK_STOP_TIMEOUT", 1.5))
+        stop_step_timeout = max(0.1, _env_float("AGI_OS_STOP_STEP_TIMEOUT", 8.0))
+        health_task_timeout = max(0.1, _env_float("AGI_OS_HEALTH_TASK_STOP_TIMEOUT", 3.0))
         farewell_timeout = max(0.1, _env_float("AGI_OS_SHUTDOWN_ANNOUNCE_TIMEOUT", 2.5))
+        mesh_stop_timeout = max(
+            stop_step_timeout,
+            _env_float("AGI_OS_NEURAL_MESH_STOP_TIMEOUT", 20.0),
+        )
+        bridge_stop_timeout = max(
+            stop_step_timeout,
+            _env_float("AGI_OS_NEURAL_BRIDGE_STOP_TIMEOUT", 15.0),
+        )
+        hybrid_stop_timeout = max(
+            stop_step_timeout,
+            _env_float("AGI_OS_HYBRID_STOP_TIMEOUT", 12.0),
+        )
 
         async def _run_stop_step(
             name: str,
@@ -367,6 +379,14 @@ class AGIOSCoordinator:
             if self._voice:
                 await _run_stop_step("shutdown announcement", _announce_shutdown, timeout=farewell_timeout)
 
+            # Cancel fire-and-forget AGI tasks first to stop new work during teardown.
+            if self._background_tasks:
+                for task in list(self._background_tasks):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+                self._background_tasks.clear()
+
             # Cancel health monitor.
             if self._health_task:
                 self._health_task.cancel()
@@ -400,6 +420,22 @@ class AGIOSCoordinator:
             if runtime and hasattr(runtime, "stop"):
                 await _run_stop_step("agent runtime", runtime.stop)
 
+            # Stop hybrid orchestrator (closes backend client sessions and lifecycle manager).
+            if self._hybrid_orchestrator and hasattr(self._hybrid_orchestrator, "stop"):
+                await _run_stop_step(
+                    "Hybrid Orchestrator",
+                    self._hybrid_orchestrator.stop,
+                    timeout=hybrid_stop_timeout,
+                )
+
+            # Stop owner identity / voice verification services if present.
+            if self._owner_identity and hasattr(self._owner_identity, "shutdown"):
+                await _run_stop_step("Owner Identity Service", self._owner_identity.shutdown)
+            if self._speaker_verification and hasattr(self._speaker_verification, "shutdown"):
+                await _run_stop_step("Speaker Verification Service", self._speaker_verification.shutdown)
+            elif self._speaker_verification and hasattr(self._speaker_verification, "stop"):
+                await _run_stop_step("Speaker Verification Service", self._speaker_verification.stop)
+
             # v252.0: Stop notification bridge (prevents zombie notifications during teardown).
             async def _stop_notification_bridge():
                 try:
@@ -416,14 +452,29 @@ class AGIOSCoordinator:
 
             # v237.0: Stop JARVIS Bridge (stops adapter agents, cancels startup tasks).
             if self._jarvis_bridge:
-                await _run_stop_step("JARVIS Bridge", self._jarvis_bridge.stop)
+                await _run_stop_step(
+                    "JARVIS Bridge",
+                    self._jarvis_bridge.stop,
+                    timeout=bridge_stop_timeout,
+                )
 
             # Stop Neural Mesh (stops production agents, bus, registry, orchestrator).
             # Note: bridge.stop() above already calls coordinator.stop() internally.
             # This second call is a defensive no-op when already stopped.
             if self._neural_mesh:
-                await _run_stop_step("Neural Mesh", self._neural_mesh.stop)
+                await _run_stop_step(
+                    "Neural Mesh",
+                    self._neural_mesh.stop,
+                    timeout=mesh_stop_timeout,
+                )
         finally:
+            self._hybrid_orchestrator = None
+            self._jarvis_bridge = None
+            self._neural_mesh = None
+            self._event_bridge = None
+            self._screen_analyzer = None
+            self._ghost_hands = None
+            self._ghost_display = None
             self._state = AGIOSState.OFFLINE
             logger.info("AGI OS stopped")
 

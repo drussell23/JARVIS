@@ -818,3 +818,12 @@ async def get_trace_manager() -> TraceManager:
         await _global_trace_manager.start()
 
     return _global_trace_manager
+
+
+async def shutdown_trace_manager() -> None:
+    """Stop and clear the global trace manager singleton."""
+    global _global_trace_manager
+
+    if _global_trace_manager is not None:
+        await _global_trace_manager.stop()
+        _global_trace_manager = None

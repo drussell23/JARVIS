@@ -520,3 +520,12 @@ async def get_metrics_collector() -> MetricsCollector:
         await _global_collector.start()
 
     return _global_collector
+
+
+async def shutdown_metrics_collector() -> None:
+    """Stop and clear the global metrics collector singleton."""
+    global _global_collector
+
+    if _global_collector is not None:
+        await _global_collector.stop()
+        _global_collector = None

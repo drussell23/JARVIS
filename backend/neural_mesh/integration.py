@@ -254,6 +254,19 @@ async def shutdown_neural_mesh():
             await _neural_mesh_coordinator.stop()
             _neural_mesh_coordinator = None
 
+        # Stop monitoring singletons started by _setup_monitoring_integration().
+        try:
+            from neural_mesh.monitoring import (
+                shutdown_metrics_collector,
+                shutdown_health_monitor,
+                shutdown_trace_manager,
+            )
+            await shutdown_trace_manager()
+            await shutdown_health_monitor()
+            await shutdown_metrics_collector()
+        except Exception as monitor_err:
+            logger.debug("Neural Mesh monitoring shutdown warning: %s", monitor_err)
+
         _crew_manager = None
         _initialized = False
 

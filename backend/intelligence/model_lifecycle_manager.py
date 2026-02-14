@@ -156,12 +156,23 @@ class AdaptiveModelLifecycleManager:
         """Stop background tasks gracefully"""
         self.is_running = False
 
+        # Cancel all background loops first, then await in parallel.
         for task in self.background_tasks:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            if not task.done():
+                task.cancel()
+
+        if self.background_tasks:
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+            self.background_tasks.clear()
+
+        # Resolve any queued load futures so callers don't hang on shutdown.
+        try:
+            while not self.load_queue.empty():
+                req = self.load_queue.get_nowait()
+                if req.future and not req.future.done():
+                    req.future.cancel()
+        except Exception:
+            pass
 
         logger.info("Model Lifecycle Manager stopped")
 

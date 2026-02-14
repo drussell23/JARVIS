@@ -598,12 +598,32 @@ class HybridOrchestrator:
             logger.debug(f"[HybridOrchestrator] Capability registration skipped: {e}")
 
     async def stop(self) -> None:
-        """Stop the orchestrator and clean up resources."""
-        if not self.is_running:
-            return
+        """Stop the orchestrator and clean up resources.
 
+        v255.0: Always closes resources even when not ``is_running``.
+        The backend client creates an async HTTP client at construction time,
+        so skipping stop() leaks sessions during early-shutdown paths.
+        """
         logger.info("🛑 Stopping HybridOrchestrator...")
-        await self.client.stop()
+
+        # Stop lifecycle manager if it was initialized and is running.
+        # Do not call _get_lifecycle_manager() here to avoid creating
+        # a new singleton during shutdown.
+        global _lifecycle_manager
+        if _lifecycle_manager is not None:
+            try:
+                if getattr(_lifecycle_manager, "is_running", False):
+                    await _lifecycle_manager.stop()
+                    logger.info("✅ Model Lifecycle Manager stopped")
+            except Exception as e:
+                logger.warning(f"Model Lifecycle Manager stop error: {e}")
+
+        # Close backend client regardless of orchestrator running state.
+        try:
+            await self.client.stop()
+        except Exception as e:
+            logger.warning(f"HybridBackendClient stop error: {e}")
+
         self.is_running = False
         logger.info("✅ HybridOrchestrator stopped")
 
@@ -1768,6 +1788,15 @@ async def get_orchestrator_async() -> HybridOrchestrator:
     if not orchestrator.is_running:
         await orchestrator.start()
     return orchestrator
+
+
+async def stop_orchestrator() -> None:
+    """Stop and clear the global Hybrid Orchestrator singleton."""
+    global _global_orchestrator
+
+    if _global_orchestrator is not None:
+        await _global_orchestrator.stop()
+        _global_orchestrator = None
 
 
 # ============================================================================
