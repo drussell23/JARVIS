@@ -495,8 +495,11 @@ def _apply_pytorch_compat() -> bool:
     return True
 
 
-_apply_pytorch_compat()
-del _apply_pytorch_compat
+# v253.0: Deferred — no longer called at module level.
+# Previously `import torch` here added 20-40s to every startup.
+# Now called once in _startup_impl() before backend Phase 2.
+# _apply_pytorch_compat()  # DEFERRED
+# del _apply_pytorch_compat  # Keep for deferred call
 
 
 # =============================================================================
@@ -541,8 +544,11 @@ def _apply_transformers_security_bypass() -> bool:
         return False
 
 
-_apply_transformers_security_bypass()
-del _apply_transformers_security_bypass
+# v253.0: Deferred — no longer called at module level.
+# Previously `import transformers` here added 5-15s to every startup.
+# Now called once in _startup_impl() before backend Phase 2.
+# _apply_transformers_security_bypass()  # DEFERRED
+# del _apply_transformers_security_bypass  # Keep for deferred call
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
@@ -557,6 +563,12 @@ del _apply_transformers_security_bypass
 # ║   FOUNDATION - Imports, configuration, constants, type definitions            ║
 # ║                                                                               ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# v253.0: Capture process-level start time BEFORE heavy imports.
+# Used to report total startup time (module load + pre-boot + boot phases).
+import time as _early_time
+_PROCESS_START_TIME = _early_time.perf_counter()
+del _early_time
 
 # =============================================================================
 # STANDARD LIBRARY IMPORTS
@@ -54572,9 +54584,12 @@ class StartupWatchdog:
                     success = await self._restart_callback(phase)
                     if success:
                         self._logger.info(f"[DMS] ✅ Restart successful for phase '{phase}'")
-                        # Reset phase timer
+                        # Reset phase timer + stall cooldown (v253.1)
                         self._phase_start_time = time.time()
                         self._last_progress_time = time.time()
+                        self._last_stall_action_time.pop(phase, None)
+                        self._warnings_issued.pop(phase, None)
+                        self._diagnostics_dumped.pop(phase, None)
                     else:
                         self._logger.warning(f"[DMS] Restart failed for phase '{phase}'")
                 except Exception as e:
@@ -60999,6 +61014,18 @@ class JarvisSystemKernel:
                 }
             )
 
+            # v253.0: Apply deferred PyTorch/Transformers compatibility shims
+            # These were moved out of module-level execution to save 20-40s on startup.
+            # Must be applied before Phase 2 (Resources) which may import ML libraries.
+            try:
+                _apply_pytorch_compat()
+            except Exception:
+                pass
+            try:
+                _apply_transformers_security_bypass()
+            except Exception:
+                pass
+
             # Phase 2: Resources (Zone 3)
             self._current_startup_phase = "resources"
             self._current_startup_progress = 18
@@ -61831,6 +61858,15 @@ class JarvisSystemKernel:
 
             startup_duration = time.time() - self._started_at
 
+            # v253.0: Report total process time (includes module load + pre-boot)
+            _total_process_time = (time.perf_counter() - _PROCESS_START_TIME)
+            _pre_boot_time = _total_process_time - startup_duration
+            if _pre_boot_time > 30.0:
+                self.logger.info(
+                    f"[Kernel] Total process time: {_total_process_time:.1f}s "
+                    f"(pre-boot: {_pre_boot_time:.1f}s, phases: {startup_duration:.1f}s)"
+                )
+
             # v197.3/v204.0: Stop the startup progress heartbeat
             self._current_startup_phase = "complete"
             self._current_startup_progress = 100
@@ -61888,7 +61924,11 @@ class JarvisSystemKernel:
                 # Update all components to final healthy status
                 update_dashboard_memory()
 
-            self.logger.success(f"[Kernel] ✅ Startup complete in {startup_duration:.2f}s")
+            _total_s = time.perf_counter() - _PROCESS_START_TIME
+            self.logger.success(
+                f"[Kernel] ✅ Startup complete in {startup_duration:.1f}s "
+                f"(total process: {_total_s:.1f}s)"
+            )
 
             # v249.0: Emit startup complete event
             self._emit_event(
@@ -67906,7 +67946,13 @@ class JarvisSystemKernel:
                 if dlm_lock_dir.exists():
                     dlm_cleaned = 0
                     import time as _time
-                    for dlm_file in dlm_lock_dir.glob("*.dlm.lock"):
+                    _dlm_max_files = int(os.environ.get("JARVIS_DLM_CLEANUP_MAX_LOCK_FILES", "200"))
+                    for _dlm_idx, dlm_file in enumerate(dlm_lock_dir.glob("*.dlm.lock")):
+                        if _dlm_idx >= _dlm_max_files:
+                            self.logger.debug(
+                                f"[Clean Slate] DLM cleanup capped at {_dlm_max_files} files"
+                            )
+                            break
                         should_remove = False
                         if crash_confidence >= 0.8:
                             # Crash detected — owning process is dead, all locks are stale
@@ -67980,7 +68026,11 @@ class JarvisSystemKernel:
             # =================================================================
             if GRACEFUL_SHUTDOWN_AVAILABLE and cleanup_orphaned_semaphores:
                 try:
-                    semaphore_result = await cleanup_orphaned_semaphores()
+                    # v253.1: Timeout to prevent infinite stall
+                    _sem_timeout = float(os.environ.get("JARVIS_SEMAPHORE_CLEANUP_TIMEOUT", "10.0"))
+                    semaphore_result = await asyncio.wait_for(
+                        cleanup_orphaned_semaphores(), timeout=_sem_timeout,
+                    )
                     cleaned = semaphore_result.get("cleaned", 0)
                     if cleaned > 0:
                         self.logger.info(f"[Clean Slate] Cleaned {cleaned} orphaned semaphore(s)")
@@ -68048,15 +68098,12 @@ class JarvisSystemKernel:
             self.logger.warning(f"[Clean Slate] Recovery phase error (non-fatal): {e}")
 
         # =====================================================================
-        # v229.0: GCP ORPHAN CLEANUP — Prevent quota exhaustion and cost runaway
+        # v253.0: GCP ORPHAN CLEANUP — Background task (was blocking 20-60s)
         # =====================================================================
-        # On startup, scan GCP for orphaned VMs from previous sessions that
-        # weren't properly cleaned up (crash, force-quit, preemption).
-        # This prevents:
-        #   - CPU quota exhaustion (max 32 CPUs) blocking new VM creation
-        #   - Silent cost accumulation ($0.029/hr per VM × multiple orphans)
-        #   - The exact scenario where 7 VMs ran simultaneously
-        # Protected: jarvis-prime-node (Invincible Node) is never deleted.
+        # v229.0 originally ran this synchronously with a 60s timeout.
+        # v253.0: Moved to fire-and-forget background task. GCP orphan cleanup
+        # is important for quota/cost but NOT critical for startup. It runs
+        # concurrently with Phase 0+ instead of blocking clean slate.
         # =====================================================================
         try:
             _gcp_enabled = any([
@@ -68064,38 +68111,44 @@ class JarvisSystemKernel:
                 os.getenv("GCP_VM_ENABLED", "false").lower() == "true",
                 os.getenv("JARVIS_SPOT_VM_ENABLED", "false").lower() == "true",
             ])
-            
+
             if _gcp_enabled:
-                self.logger.info("[Clean Slate] 🧹 Scanning GCP for orphaned VMs...")
-                
-                try:
-                    from backend.core.gcp_vm_manager import get_gcp_vm_manager
-                    _gcp_mgr = await get_gcp_vm_manager()
-                    
-                    if _gcp_mgr and _gcp_mgr.initialized:
-                        _orphan_results = await asyncio.wait_for(
-                            _gcp_mgr.cleanup_orphaned_gcp_instances(max_age_hours=3.0),
-                            timeout=60.0,  # Don't let cleanup block startup > 60s
-                        )
-                        
-                        if _orphan_results.get("deleted", 0) > 0:
-                            self.logger.info(
-                                f"[Clean Slate] ✅ Cleaned {_orphan_results['deleted']} orphaned GCP VMs "
-                                f"(freed ~{_orphan_results['deleted'] * 4} CPU cores)"
+                async def _background_gcp_orphan_cleanup():
+                    """Background GCP orphan cleanup (v253.0)."""
+                    _logger = logging.getLogger("unified_supervisor")
+                    try:
+                        from backend.core.gcp_vm_manager import get_gcp_vm_manager
+                        _gcp_mgr = await get_gcp_vm_manager()
+
+                        if _gcp_mgr and _gcp_mgr.initialized:
+                            _gcp_timeout = float(os.environ.get(
+                                "JARVIS_GCP_ORPHAN_CLEANUP_TIMEOUT", "60.0"
+                            ))
+                            _orphan_results = await asyncio.wait_for(
+                                _gcp_mgr.cleanup_orphaned_gcp_instances(max_age_hours=3.0),
+                                timeout=_gcp_timeout,
                             )
-                            for detail in _orphan_results.get("details", []):
-                                self.logger.info(f"[Clean Slate] {detail}")
-                        else:
-                            self.logger.debug("[Clean Slate] No orphaned GCP VMs found")
-                    else:
-                        self.logger.debug("[Clean Slate] GCP manager not yet initialized — orphan cleanup deferred")
-                        
-                except asyncio.TimeoutError:
-                    self.logger.warning("[Clean Slate] GCP orphan scan timed out (60s) — will retry later")
-                except ImportError:
-                    self.logger.debug("[Clean Slate] GCP module not available — skipping orphan cleanup")
-                except Exception as gcp_cleanup_err:
-                    self.logger.debug(f"[Clean Slate] GCP orphan cleanup error (non-fatal): {gcp_cleanup_err}")
+                            deleted = _orphan_results.get("deleted", 0)
+                            if deleted > 0:
+                                _logger.info(
+                                    f"[Clean Slate] Cleaned {deleted} orphaned GCP VMs "
+                                    f"(freed ~{deleted * 4} CPU cores)"
+                                )
+                            else:
+                                _logger.debug("[Clean Slate] No orphaned GCP VMs found")
+                    except asyncio.TimeoutError:
+                        _logger.warning("[Clean Slate] GCP orphan scan timed out — will retry later")
+                    except ImportError:
+                        _logger.debug("[Clean Slate] GCP module not available")
+                    except Exception as e:
+                        _logger.debug(f"[Clean Slate] GCP orphan cleanup error: {e}")
+
+                self.logger.debug("[Clean Slate] GCP orphan cleanup scheduled (background)")
+                _gcp_task = create_safe_task(
+                    _background_gcp_orphan_cleanup(),
+                    name="gcp_orphan_cleanup",
+                )
+                self._background_tasks.append(_gcp_task)
         except Exception:
             pass  # Never let cleanup block startup
 
@@ -76796,8 +76849,10 @@ async def async_main(args: argparse.Namespace) -> int:
         await asyncio.sleep(0.5)
 
     # v201.3: Show dashboard before startup (unless --no-dashboard)
-    # This gives visibility into system state before kernel starts or dry-run
-    if not getattr(args, 'no_dashboard', False):
+    # v253.0: Skip pre-startup dashboard in force mode (old kernel is dead,
+    # its status is irrelevant). Saves 10-20s from docker/gcloud/GCP checks.
+    _force_mode = getattr(args, 'force', False) or getattr(args, 'takeover', False)
+    if not getattr(args, 'no_dashboard', False) and not _force_mode:
         print("\n" + "="*60)
         print("  JARVIS System Status (Pre-Startup)")
         print("="*60)

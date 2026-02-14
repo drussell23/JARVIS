@@ -4639,17 +4639,18 @@ class YabaiSpaceDetector:
 
         except json.JSONDecodeError as e:
             error_msg = f"Failed to parse Yabai output: {e}"
-            logger.error(f"[YABAI] {error_msg}")
+            # v253.0: DEBUG not ERROR — expected when yabai isn't installed
+            logger.debug(f"[YABAI] {error_msg}")
             self._health.record_failure(error_msg)
             return []
         except subprocess.TimeoutExpired:
             error_msg = "Yabai query timed out"
-            logger.error(f"[YABAI] {error_msg}")
+            logger.warning(f"[YABAI] {error_msg}")
             self._health.record_failure(error_msg)
             return []
         except Exception as e:
             error_msg = f"Error enumerating spaces: {e}"
-            logger.error(f"[YABAI] {error_msg}")
+            logger.debug(f"[YABAI] {error_msg}")
             self._health.record_failure(error_msg)
             return []
 
@@ -13182,13 +13183,14 @@ class YabaiSpaceDetector:
             return spaces
 
         except asyncio.TimeoutError:
-            logger.error("[YABAI] Async: Yabai query timed out")
+            logger.warning("[YABAI] Async: Yabai query timed out")
             return []
         except json.JSONDecodeError as e:
-            logger.error(f"[YABAI] Async: Failed to parse Yabai output: {e}")
+            # v253.0: DEBUG not ERROR — expected when yabai isn't installed
+            logger.debug(f"[YABAI] Async: Failed to parse Yabai output: {e}")
             return []
         except Exception as e:
-            logger.error(f"[YABAI] Async: Error enumerating spaces: {e}")
+            logger.debug(f"[YABAI] Async: Error enumerating spaces: {e}")
             return []
 
     async def get_workspace_summary_async(self) -> Dict[str, Any]:

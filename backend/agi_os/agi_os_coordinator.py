@@ -942,12 +942,16 @@ class AGIOSCoordinator:
             except Exception as agent_exc:
                 logger.warning("Production agent initialization failed (mesh still running): %s", agent_exc)
 
-            # Step 3: Wire system adapters (30% of budget, non-fatal)
+            # Step 3: Wire system adapters (ALL remaining budget, non-fatal)
+            # v253.0: Changed from fixed 30% to ALL remaining budget.
+            # The bridge is the last step — giving it a fixed percentage
+            # meant overruns in Steps 1-2 could starve it. Now it gets
+            # everything that's left (typically 40-50s after Steps 1-2).
             n_adapters = 0
             try:
                 from neural_mesh import start_jarvis_neural_mesh
                 bridge_timeout = min(
-                    _env_float("JARVIS_AGI_OS_NEURAL_BRIDGE_TIMEOUT", total_budget * 0.3),
+                    _env_float("JARVIS_AGI_OS_NEURAL_BRIDGE_TIMEOUT", _remaining()),
                     _remaining(),
                 )
                 self._jarvis_bridge = await self._run_timed_init_step(
