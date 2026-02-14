@@ -64451,23 +64451,34 @@ class JarvisSystemKernel:
 
                     # =====================================================================
                     # STEP 3: Verify voice communicator
+                    # v252.2: Fixed unawaited coroutine — get_voice_communicator() is async
                     # =====================================================================
                     try:
-                        voice_comm = get_voice_communicator()
+                        _verify_timeout = _get_env_float("JARVIS_AGI_OS_VERIFY_TIMEOUT", 5.0)
+                        voice_comm = await asyncio.wait_for(
+                            get_voice_communicator(), timeout=_verify_timeout,
+                        )
                         if voice_comm:
                             self._agi_os_status["voice_communicator"] = True
                             self.logger.success("[AGI-OS] ✓ RealTimeVoiceCommunicator ready")
+                    except asyncio.TimeoutError:
+                        self.logger.warning("[AGI-OS] Voice communicator verification timed out")
                     except Exception as e:
                         self.logger.warning(f"[AGI-OS] Voice communicator unavailable: {e}")
 
                     # =====================================================================
                     # STEP 4: Verify approval manager
+                    # v252.2: Fixed unawaited coroutine — get_approval_manager() is async
                     # =====================================================================
                     try:
-                        approval_mgr = get_approval_manager()
+                        approval_mgr = await asyncio.wait_for(
+                            get_approval_manager(), timeout=_verify_timeout,
+                        )
                         if approval_mgr:
                             self._agi_os_status["approval_manager"] = True
                             self.logger.success("[AGI-OS] ✓ VoiceApprovalManager ready")
+                    except asyncio.TimeoutError:
+                        self.logger.warning("[AGI-OS] Approval manager verification timed out")
                     except Exception as e:
                         self.logger.warning(f"[AGI-OS] Approval manager unavailable: {e}")
 
