@@ -1132,7 +1132,10 @@ class AGIOSCoordinator:
             return
 
         try:
-            from vision.claude_vision_analyzer_main import ClaudeVisionAnalyzer
+            from vision.claude_vision_analyzer_main import (
+                ClaudeVisionAnalyzer,
+                VisionConfig,
+            )
             from vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer
             from .jarvis_integration import connect_screen_analyzer
 
@@ -1148,13 +1151,101 @@ class AGIOSCoordinator:
                 )
                 return
 
-            vision_handler = ClaudeVisionAnalyzer(api_key=api_key)
+            await self._report_init_progress("screen_analyzer", "Screen analyzer preflight")
+
+            # Startup pressure guard: avoid initializing heavy continuous vision
+            # when system resources are already under stress.
+            degraded_mode = False
+            try:
+                import psutil
+
+                vm = psutil.virtual_memory()
+                process_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+                available_mb = vm.available / (1024 * 1024)
+                cpu_percent = psutil.cpu_percent(interval=0.0)
+
+                min_available_mb = _env_float(
+                    "JARVIS_AGI_OS_SCREEN_GUARD_MIN_AVAILABLE_MB", 2200.0
+                )
+                critical_available_mb = _env_float(
+                    "JARVIS_AGI_OS_SCREEN_GUARD_CRITICAL_AVAILABLE_MB", 1400.0
+                )
+                max_process_mb = _env_float(
+                    "JARVIS_AGI_OS_SCREEN_GUARD_MAX_PROCESS_MB", 1600.0
+                )
+                max_cpu_percent = _env_float(
+                    "JARVIS_AGI_OS_SCREEN_GUARD_MAX_CPU_PERCENT", 92.0
+                )
+
+                if available_mb <= critical_available_mb:
+                    logger.warning(
+                        "Screen analyzer deferred due to critical startup pressure "
+                        "(available=%.0fMB <= %.0fMB)",
+                        available_mb,
+                        critical_available_mb,
+                    )
+                    self._component_status['screen_analyzer'] = ComponentStatus(
+                        name='screen_analyzer',
+                        available=False,
+                        error=(
+                            "Deferred: critical startup memory pressure "
+                            f"({available_mb:.0f}MB available)"
+                        ),
+                    )
+                    return
+
+                degraded_mode = (
+                    available_mb < min_available_mb
+                    or process_mb > max_process_mb
+                    or cpu_percent > max_cpu_percent
+                )
+                if degraded_mode:
+                    logger.warning(
+                        "Screen analyzer startup in degraded mode "
+                        "(available=%.0fMB, process=%.0fMB, cpu=%.1f%%)",
+                        available_mb,
+                        process_mb,
+                        cpu_percent,
+                    )
+            except Exception as pressure_err:
+                logger.debug("Screen analyzer pressure preflight unavailable: %s", pressure_err)
+
+            await self._report_init_progress("screen_analyzer", "Building vision handler")
+            construct_timeout = _env_float("JARVIS_AGI_OS_SCREEN_CONSTRUCT_TIMEOUT", 20.0)
+
+            def _build_handler() -> Any:
+                if degraded_mode:
+                    # Degraded startup profile: prioritize stability over throughput.
+                    degraded_cfg = VisionConfig(
+                        enable_video_streaming=False,
+                        prefer_video_over_screenshots=False,
+                        max_concurrent_requests=int(
+                            _env_float(
+                                "JARVIS_AGI_OS_SCREEN_DEGRADED_MAX_CONCURRENCY", 2.0
+                            )
+                        ),
+                    )
+                    return ClaudeVisionAnalyzer(api_key=api_key, config=degraded_cfg)
+                return ClaudeVisionAnalyzer(api_key=api_key)
+
+            loop = asyncio.get_running_loop()
+            vision_handler = await asyncio.wait_for(
+                loop.run_in_executor(None, _build_handler),
+                timeout=construct_timeout,
+            )
 
             # v237.3: Permission pre-check — test capture before starting monitoring.
             # macOS requires Screen Recording permission for Quartz/CGDisplay capture.
             # Without it, capture returns None or unusably small images.
             try:
-                test_capture = await vision_handler.capture_screen()
+                await self._report_init_progress("screen_analyzer", "Capture probe")
+                capture_probe_timeout = _env_float(
+                    "JARVIS_AGI_OS_SCREEN_CAPTURE_PROBE_TIMEOUT", 12.0
+                )
+                test_capture = await asyncio.wait_for(
+                    vision_handler.capture_screen(),
+                    timeout=capture_probe_timeout,
+                )
                 capture_ok = test_capture is not None
                 # Check for permission-denied indicators (1x1 or tiny images)
                 if capture_ok and hasattr(test_capture, 'size'):
@@ -1180,13 +1271,25 @@ class AGIOSCoordinator:
                 )
                 return
 
+            await self._report_init_progress("screen_analyzer", "Starting monitor loop")
             self._screen_analyzer = MemoryAwareScreenAnalyzer(vision_handler)
-            await self._screen_analyzer.start_monitoring()
+            monitor_start_timeout = _env_float(
+                "JARVIS_AGI_OS_SCREEN_MONITOR_START_TIMEOUT", 15.0
+            )
+            await asyncio.wait_for(
+                self._screen_analyzer.start_monitoring(),
+                timeout=monitor_start_timeout,
+            )
 
             # Bridge to event stream for proactive detection
-            await connect_screen_analyzer(
-                self._screen_analyzer,
-                enable_claude_vision=True,
+            await self._report_init_progress("screen_analyzer", "Connecting AGI bridge")
+            bridge_timeout = _env_float("JARVIS_AGI_OS_SCREEN_BRIDGE_TIMEOUT", 15.0)
+            await asyncio.wait_for(
+                connect_screen_analyzer(
+                    self._screen_analyzer,
+                    enable_claude_vision=True,
+                ),
+                timeout=bridge_timeout,
             )
 
             self._component_status['screen_analyzer'] = ComponentStatus(

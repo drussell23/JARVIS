@@ -1228,6 +1228,7 @@ class EventDrivenCleanupTrigger:
         self._lock = threading.Lock()
         self._running = False
         self._monitor_thread: Optional[threading.Thread] = None
+        self._last_event_log_ts: Dict[CleanupEventType, float] = {}
 
         # Thresholds
         self.memory_pressure_threshold = 0.80
@@ -1251,7 +1252,21 @@ class EventDrivenCleanupTrigger:
             self._event_queue.append(event)
             handlers = self._handlers.get(event.event_type, [])
 
-        logger.info(f"📣 Cleanup event: {event.event_type.name} from {event.source}")
+        # Avoid high-frequency log noise for unhandled events (notably CPU_PRESSURE).
+        # Keep one periodic informational log for observability, but use debug in-between.
+        now = time.time()
+        log_interval = 30.0
+        last_log = self._last_event_log_ts.get(event.event_type, 0.0)
+        should_info_log = bool(handlers) or (now - last_log) >= log_interval
+        if should_info_log:
+            logger.info(f"📣 Cleanup event: {event.event_type.name} from {event.source}")
+            self._last_event_log_ts[event.event_type] = now
+        else:
+            logger.debug(
+                "Cleanup event (suppressed info log): %s from %s",
+                event.event_type.name,
+                event.source,
+            )
 
         for handler in handlers:
             try:

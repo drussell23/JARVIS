@@ -60,6 +60,9 @@ class MemoryAwareSwiftVisionIntegration:
         
         self.swift_processor = None
         self.enabled = False
+        self._cleanup_task = None
+        self._process_limit_warned = False
+        self._critical_memory_warned = False
         
         # Memory management
         self.result_cache: Deque[VisionProcessingResult] = deque(maxlen=self.config['max_cached_results'])
@@ -89,7 +92,8 @@ class MemoryAwareSwiftVisionIntegration:
         }
         
         # Try to initialize Swift processor with memory check
-        if self._check_memory_available() and SWIFT_PERFORMANCE_AVAILABLE:
+        memory_available = self._check_memory_available()
+        if memory_available and SWIFT_PERFORMANCE_AVAILABLE:
             try:
                 self.swift_processor = get_vision_processor()
                 if self.swift_processor:
@@ -100,13 +104,25 @@ class MemoryAwareSwiftVisionIntegration:
             except Exception as e:
                 logger.error(f"Failed to initialize Swift vision processor: {e}")
         else:
-            if not self._check_memory_available():
+            if not memory_available:
                 logger.warning("Insufficient memory for Swift vision - using Python fallback")
             else:
                 logger.info("Swift performance bridge not available - using Python fallback")
         
-        # Start cleanup task
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        # Start cleanup task only when an event loop is available.
+        # This class can be imported from sync startup contexts.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            self._cleanup_task = loop.create_task(
+                self._cleanup_loop(),
+                name="swift_vision_cleanup",
+            )
+        else:
+            logger.debug("No running loop; Swift vision cleanup loop disabled")
         
         logger.info(f"Memory-Aware Swift Vision Integration initialized with config: {self.config}")
     
@@ -177,13 +193,19 @@ class MemoryAwareSwiftVisionIntegration:
         
         # Check system memory
         if available_mb < self.config['critical_memory_mb']:
-            logger.warning(f"Critical system memory: {available_mb}MB")
+            if not self._critical_memory_warned:
+                logger.warning(f"Critical system memory: {available_mb}MB")
+                self._critical_memory_warned = True
             return False
+        self._critical_memory_warned = False
         
         # Check process memory
         if process_mb > self.config['max_memory_mb']:
-            logger.warning(f"Process memory {process_mb}MB exceeds limit")
+            if not self._process_limit_warned:
+                logger.warning(f"Process memory {process_mb}MB exceeds limit")
+                self._process_limit_warned = True
             return False
+        self._process_limit_warned = False
         
         return True
     
@@ -596,12 +618,13 @@ class MemoryAwareSwiftVisionIntegration:
     
     async def cleanup(self):
         """Cleanup resources"""
-        if hasattr(self, '_cleanup_task'):
+        if hasattr(self, '_cleanup_task') and self._cleanup_task is not None:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
+            self._cleanup_task = None
         
         # Clear caches
         self.result_cache.clear()
