@@ -20,6 +20,8 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import errno
 import functools
 import importlib
@@ -1702,6 +1704,1090 @@ class ShellCommandTool(JARVISTool):
 
 
 @dataclass(frozen=True)
+class MediaControlPolicy:
+    """Resolved policy for media control operations."""
+
+    allowed_players: Tuple[str, ...]
+    default_player: str
+    allow_autostart: bool
+    max_volume: int
+    command_timeout_seconds: float
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "allowed_players": list(self.allowed_players),
+            "default_player": self.default_player,
+            "allow_autostart": self.allow_autostart,
+            "max_volume": self.max_volume,
+            "command_timeout_seconds": self.command_timeout_seconds,
+        }
+
+
+class MediaControlTool(JARVISTool):
+    """Native media playback control for Spotify and Apple Music via AppleScript."""
+
+    ALLOWED_PLAYERS_ENV = "JARVIS_MEDIA_ALLOWED_PLAYERS"
+    DEFAULT_PLAYER_ENV = "JARVIS_MEDIA_DEFAULT_PLAYER"
+    ALLOW_AUTOSTART_ENV = "JARVIS_MEDIA_ALLOW_AUTOSTART"
+    MAX_VOLUME_ENV = "JARVIS_MEDIA_MAX_VOLUME"
+    COMMAND_TIMEOUT_ENV = "JARVIS_MEDIA_COMMAND_TIMEOUT_SECONDS"
+
+    SUPPORTED_PLAYERS: Tuple[str, ...] = ("spotify", "music")
+    PLAYER_ALIASES: Dict[str, str] = {
+        "spotify": "spotify",
+        "apple_music": "music",
+        "applemusic": "music",
+        "itunes": "music",
+        "music": "music",
+    }
+
+    SUPPORTED_OPERATIONS: Tuple[str, ...] = (
+        "play",
+        "pause",
+        "toggle",
+        "stop",
+        "next",
+        "previous",
+        "set_volume",
+        "get_status",
+        "list_players",
+        "get_policy",
+        "get_metrics",
+    )
+    OPERATION_ALIASES: Dict[str, str] = {
+        "resume": "play",
+        "play_music": "play",
+        "pause_music": "pause",
+        "stop_music": "stop",
+        "next_track": "next",
+        "previous_track": "previous",
+        "prev": "previous",
+        "volume": "set_volume",
+        "status": "get_status",
+        "players": "list_players",
+        "policy": "get_policy",
+        "metrics": "get_metrics",
+    }
+
+    def __init__(self, permission_manager: Optional[Any] = None):
+        metadata = ToolMetadata(
+            name="media_control_agent",
+            description=(
+                "Control Spotify and Apple Music playback with policy-scoped operations "
+                "(play, pause, skip, previous, stop, volume, status)."
+            ),
+            category=ToolCategory.COMMUNICATION,
+            risk_level=ToolRiskLevel.LOW,
+            requires_permission=False,
+            timeout_seconds=20.0,
+            capabilities=[
+                "media_playback_control",
+                "spotify_control",
+                "apple_music_control",
+            ],
+            tags=["media", "music", "spotify", "apple_music", "applescript"],
+        )
+        super().__init__(metadata, permission_manager)
+
+        self._policy_lock = asyncio.Lock()
+        self._policy_signature: Optional[Tuple[str, ...]] = None
+        self._policy = self._build_policy()
+        self._policy_signature = self._compute_policy_signature()
+        self._metrics: Dict[str, Any] = {
+            "total_requests": 0,
+            "successful": 0,
+            "failed": 0,
+            "operation_counts": {},
+            "player_counts": {},
+            "last_command_ts": None,
+        }
+
+    async def _execute(
+        self,
+        operation: str = "get_status",
+        player: Optional[str] = None,
+        playlist: Optional[str] = None,
+        playlist_uri: Optional[str] = None,
+        volume: Optional[int] = None,
+        auto_start: Optional[Any] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        await self._refresh_policy_if_changed()
+        self._metrics["total_requests"] += 1
+
+        op = (operation or kwargs.get("action") or kwargs.get("op") or "").strip().lower()
+        op = self.OPERATION_ALIASES.get(op, op)
+        if op not in self.SUPPORTED_OPERATIONS:
+            return {
+                "success": False,
+                "error": f"Unsupported operation '{op}'. Supported operations: {', '.join(self.SUPPORTED_OPERATIONS)}",
+            }
+
+        self._metrics["operation_counts"][op] = self._metrics["operation_counts"].get(op, 0) + 1
+
+        if op == "get_policy":
+            return {"operation": op, "policy": self._policy.as_dict(), "success": True}
+
+        if op == "get_metrics":
+            return {"operation": op, "metrics": dict(self._metrics), "success": True}
+
+        if op == "list_players":
+            statuses = await self._collect_player_status()
+            return {"operation": op, "success": True, "players": statuses}
+
+        requested_player = player or kwargs.get("target") or kwargs.get("app")
+        target_player = self._normalize_player_name(requested_player)
+
+        if op == "get_status":
+            if target_player and target_player != "auto":
+                if target_player not in self._policy.allowed_players:
+                    return {
+                        "operation": op,
+                        "success": False,
+                        "error": f"Player '{target_player}' not allowed by policy",
+                    }
+                status = await self._probe_player_status(target_player)
+                return {"operation": op, "success": True, "player": target_player, "status": status}
+            statuses = await self._collect_player_status()
+            return {"operation": op, "success": True, "players": statuses}
+
+        if op == "set_volume":
+            raw_volume = volume if volume is not None else kwargs.get("value")
+            if raw_volume is None:
+                return {"operation": op, "success": False, "error": "Missing required parameter: volume"}
+            try:
+                clamped_volume = self._clamp_volume(int(raw_volume))
+            except (TypeError, ValueError):
+                return {"operation": op, "success": False, "error": "Volume must be an integer"}
+        else:
+            clamped_volume = None
+
+        allow_autostart = self._to_bool(auto_start, default=self._policy.allow_autostart)
+        resolved_player = await self._resolve_target_player(target_player, prefer_running=True)
+        if not resolved_player:
+            return {
+                "operation": op,
+                "success": False,
+                "error": "No allowed media player available (Spotify/Music).",
+            }
+
+        if not allow_autostart and op in {"play", "pause", "toggle", "stop", "next", "previous", "set_volume"}:
+            status = await self._probe_player_status(resolved_player)
+            if not status.get("running", False):
+                return {
+                    "operation": op,
+                    "success": False,
+                    "player": resolved_player,
+                    "error": f"{resolved_player} is not running and autostart is disabled by policy.",
+                }
+
+        try:
+            result = await self._execute_player_operation(
+                player=resolved_player,
+                operation=op,
+                playlist=playlist or kwargs.get("playlist_name"),
+                playlist_uri=playlist_uri or kwargs.get("uri"),
+                volume=clamped_volume,
+                allow_autostart=allow_autostart,
+            )
+        except Exception as exc:
+            self._metrics["failed"] += 1
+            return {"operation": op, "success": False, "player": resolved_player, "error": str(exc)}
+
+        self._metrics["successful"] += 1
+        self._metrics["player_counts"][resolved_player] = self._metrics["player_counts"].get(resolved_player, 0) + 1
+        self._metrics["last_command_ts"] = time.time()
+        return result
+
+    async def _resolve_target_player(self, player: Optional[str], prefer_running: bool) -> Optional[str]:
+        normalized = self._normalize_player_name(player)
+        if normalized and normalized != "auto":
+            if normalized not in self._policy.allowed_players:
+                return None
+            return normalized
+
+        statuses = await self._collect_player_status()
+        if prefer_running:
+            for candidate in self._policy.allowed_players:
+                status = statuses.get(candidate, {})
+                if status.get("running") and str(status.get("state", "")).lower() == "playing":
+                    return candidate
+            for candidate in self._policy.allowed_players:
+                status = statuses.get(candidate, {})
+                if status.get("running"):
+                    return candidate
+
+        default_player = self._normalize_player_name(self._policy.default_player)
+        if default_player in self._policy.allowed_players:
+            return default_player
+
+        return self._policy.allowed_players[0] if self._policy.allowed_players else None
+
+    async def _collect_player_status(self) -> Dict[str, Dict[str, Any]]:
+        statuses: Dict[str, Dict[str, Any]] = {}
+        for player in self._policy.allowed_players:
+            statuses[player] = await self._probe_player_status(player)
+        return statuses
+
+    async def _probe_player_status(self, player: str) -> Dict[str, Any]:
+        app_name = self._player_app_name(player)
+        script = f'''
+set runningFlag to false
+tell application "System Events"
+    set runningFlag to (name of processes) contains "{app_name}"
+end tell
+if runningFlag then
+    tell application "{app_name}"
+        set stateText to "unknown"
+        try
+            set stateText to (player state as text)
+        end try
+        set trackName to ""
+        set artistName to ""
+        set albumName to ""
+        set volumeLevel to -1
+        try
+            set volumeLevel to sound volume
+        end try
+        try
+            set trackName to name of current track
+        end try
+        try
+            set artistName to artist of current track
+        end try
+        try
+            set albumName to album of current track
+        end try
+        return "running=true|state=" & stateText & "|track=" & trackName & "|artist=" & artistName & "|album=" & albumName & "|volume=" & (volumeLevel as text)
+    end tell
+else
+    return "running=false|state=stopped|track=|artist=|album=|volume="
+end if
+'''
+        result = await self._run_applescript(script, timeout_seconds=self._policy.command_timeout_seconds)
+        if not result["success"]:
+            return {
+                "running": False,
+                "state": "unavailable",
+                "error": result["error"],
+            }
+        parsed = self._parse_key_value_payload(result["stdout"])
+        parsed["running"] = self._to_bool(parsed.get("running"), default=False)
+        volume = str(parsed.get("volume", "")).strip()
+        parsed["volume"] = int(volume) if volume.isdigit() else None
+        return parsed
+
+    async def _execute_player_operation(
+        self,
+        player: str,
+        operation: str,
+        playlist: Optional[str],
+        playlist_uri: Optional[str],
+        volume: Optional[int],
+        allow_autostart: bool,
+    ) -> Dict[str, Any]:
+        app_name = self._player_app_name(player)
+        operation = self.OPERATION_ALIASES.get(operation, operation)
+
+        script = self._build_player_script(
+            player=player,
+            app_name=app_name,
+            operation=operation,
+            playlist=playlist,
+            playlist_uri=playlist_uri,
+            volume=volume,
+            allow_autostart=allow_autostart,
+        )
+        result = await self._run_applescript(script, timeout_seconds=self._policy.command_timeout_seconds)
+        if not result["success"]:
+            return {
+                "operation": operation,
+                "success": False,
+                "player": player,
+                "error": result["error"],
+            }
+
+        status = await self._probe_player_status(player)
+        return {
+            "operation": operation,
+            "success": True,
+            "player": player,
+            "status": status,
+            "message": result["stdout"] or f"{operation} executed",
+        }
+
+    def _build_player_script(
+        self,
+        player: str,
+        app_name: str,
+        operation: str,
+        playlist: Optional[str],
+        playlist_uri: Optional[str],
+        volume: Optional[int],
+        allow_autostart: bool,
+    ) -> str:
+        playlist_name = self._escape_applescript_string(playlist or "")
+        playlist_uri_resolved = self._normalize_spotify_playlist_uri(playlist_uri or playlist or "")
+        playlist_uri_escaped = self._escape_applescript_string(playlist_uri_resolved)
+        autostart_stmt = f'tell application "{app_name}" to activate' if allow_autostart else ""
+
+        if operation == "play":
+            if player == "spotify" and playlist_uri_resolved:
+                return f'''
+{autostart_stmt}
+tell application "{app_name}"
+    play track "{playlist_uri_escaped}"
+end tell
+return "ok"
+'''
+            if player == "spotify" and playlist and not playlist_uri_resolved:
+                raise RuntimeError(
+                    "Spotify playlist playback requires a URI/link (spotify:playlist:... or https://open.spotify.com/playlist/...)"
+                )
+            if player == "music" and playlist_name:
+                return f'''
+{autostart_stmt}
+tell application "{app_name}"
+    if exists playlist "{playlist_name}" then
+        play playlist "{playlist_name}"
+    else
+        error "playlist-not-found"
+    end if
+end tell
+return "ok"
+'''
+            return f'''
+{autostart_stmt}
+tell application "{app_name}"
+    play
+end tell
+return "ok"
+'''
+
+        if operation == "pause":
+            return f'''
+tell application "{app_name}"
+    pause
+end tell
+return "ok"
+'''
+
+        if operation == "toggle":
+            return f'''
+{autostart_stmt}
+tell application "{app_name}"
+    if (player state as text) is "playing" then
+        pause
+    else
+        play
+    end if
+end tell
+return "ok"
+'''
+
+        if operation == "stop":
+            if player == "spotify":
+                return f'''
+tell application "{app_name}"
+    pause
+end tell
+return "ok"
+'''
+            return f'''
+tell application "{app_name}"
+    stop
+end tell
+return "ok"
+'''
+
+        if operation == "next":
+            return f'''
+tell application "{app_name}"
+    next track
+end tell
+return "ok"
+'''
+
+        if operation == "previous":
+            return f'''
+tell application "{app_name}"
+    previous track
+end tell
+return "ok"
+'''
+
+        if operation == "set_volume":
+            if volume is None:
+                raise RuntimeError("Missing required volume for set_volume")
+            return f'''
+tell application "{app_name}"
+    set sound volume to {volume}
+end tell
+return "ok"
+'''
+
+        raise RuntimeError(f"Unsupported media operation: {operation}")
+
+    async def _run_applescript(self, script: str, timeout_seconds: float) -> Dict[str, Any]:
+        process = await asyncio.create_subprocess_exec(
+            "osascript",
+            "-e",
+            script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        timed_out = False
+        try:
+            stdout_raw, stderr_raw = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            timed_out = True
+            process.kill()
+            await process.wait()
+            stdout_raw = b""
+            stderr_raw = b"AppleScript command timed out"
+
+        stdout_text = (stdout_raw or b"").decode("utf-8", errors="replace").strip()
+        stderr_text = (stderr_raw or b"").decode("utf-8", errors="replace").strip()
+        success = bool(process.returncode == 0 and not timed_out)
+        return {
+            "success": success,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "error": stderr_text or "AppleScript execution failed",
+            "returncode": process.returncode if process.returncode is not None else -1,
+            "timed_out": timed_out,
+        }
+
+    async def _refresh_policy_if_changed(self) -> None:
+        signature = self._compute_policy_signature()
+        if signature == self._policy_signature:
+            return
+        async with self._policy_lock:
+            signature = self._compute_policy_signature()
+            if signature == self._policy_signature:
+                return
+            self._policy = self._build_policy()
+            self._policy_signature = signature
+
+    def _build_policy(self) -> MediaControlPolicy:
+        allowed_players_raw = os.getenv(self.ALLOWED_PLAYERS_ENV, "spotify,music")
+        allowed_players = tuple(
+            player
+            for player in self._parse_player_list(allowed_players_raw)
+            if player in self.SUPPORTED_PLAYERS
+        )
+        if not allowed_players:
+            allowed_players = ("spotify", "music")
+
+        default_player = self._normalize_player_name(
+            os.getenv(self.DEFAULT_PLAYER_ENV, "auto").strip().lower()
+        ) or "auto"
+        if default_player not in (*allowed_players, "auto"):
+            default_player = "auto"
+
+        return MediaControlPolicy(
+            allowed_players=allowed_players,
+            default_player=default_player,
+            allow_autostart=self._env_bool(self.ALLOW_AUTOSTART_ENV, True),
+            max_volume=self._env_int(self.MAX_VOLUME_ENV, 90, minimum=10),
+            command_timeout_seconds=self._env_float(self.COMMAND_TIMEOUT_ENV, 8.0, minimum=1.0),
+        )
+
+    def _compute_policy_signature(self) -> Tuple[str, ...]:
+        return (
+            os.getenv(self.ALLOWED_PLAYERS_ENV, ""),
+            os.getenv(self.DEFAULT_PLAYER_ENV, ""),
+            os.getenv(self.ALLOW_AUTOSTART_ENV, ""),
+            os.getenv(self.MAX_VOLUME_ENV, ""),
+            os.getenv(self.COMMAND_TIMEOUT_ENV, ""),
+        )
+
+    @classmethod
+    def _normalize_player_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower().replace(" ", "_")
+        if not normalized:
+            return None
+        if normalized in {"auto", "any"}:
+            return "auto"
+        return cls.PLAYER_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _parse_player_list(raw: str) -> List[str]:
+        return [
+            item.strip().lower().replace(" ", "_")
+            for item in re.split(r"[,;\s]+", raw or "")
+            if item.strip()
+        ]
+
+    @staticmethod
+    def _player_app_name(player: str) -> str:
+        return "Spotify" if player == "spotify" else "Music"
+
+    def _clamp_volume(self, volume: int) -> int:
+        return max(0, min(volume, self._policy.max_volume))
+
+    @staticmethod
+    def _escape_applescript_string(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _parse_key_value_payload(payload: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for part in payload.split("|"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            result[key.strip()] = value.strip()
+        return result
+
+    @staticmethod
+    def _normalize_spotify_playlist_uri(raw: str) -> str:
+        candidate = (raw or "").strip()
+        if not candidate:
+            return ""
+        if candidate.startswith("spotify:playlist:"):
+            return candidate
+        match = re.search(r"open\.spotify\.com/playlist/([a-zA-Z0-9]+)", candidate)
+        if match:
+            return f"spotify:playlist:{match.group(1)}"
+        return ""
+
+    @staticmethod
+    def _to_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    @staticmethod
+    def _env_bool(env_key: str, default: bool) -> bool:
+        return MediaControlTool._to_bool(os.getenv(env_key), default=default)
+
+    @staticmethod
+    def _env_int(env_key: str, default: int, minimum: int = 0) -> int:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(int(raw), minimum)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_float(env_key: str, default: float, minimum: float = 0.0) -> float:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(float(raw), minimum)
+        except ValueError:
+            return default
+
+
+@dataclass(frozen=True)
+class ImageGenerationPolicy:
+    """Resolved policy for image generation operations."""
+
+    output_root: Path
+    default_provider: str
+    openai_model: str
+    sd_webui_url: str
+    max_dimension: int
+    max_prompt_chars: int
+    timeout_seconds: float
+    allowed_formats: Tuple[str, ...]
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "output_root": str(self.output_root),
+            "default_provider": self.default_provider,
+            "openai_model": self.openai_model,
+            "sd_webui_url": self.sd_webui_url,
+            "max_dimension": self.max_dimension,
+            "max_prompt_chars": self.max_prompt_chars,
+            "timeout_seconds": self.timeout_seconds,
+            "allowed_formats": list(self.allowed_formats),
+        }
+
+
+class ImageGenerationTool(JARVISTool):
+    """Text-to-image generation with provider abstraction and output policy controls."""
+
+    OUTPUT_DIR_ENV = "JARVIS_IMAGE_OUTPUT_DIR"
+    PROVIDER_ENV = "JARVIS_IMAGE_PROVIDER"
+    OPENAI_MODEL_ENV = "JARVIS_IMAGE_OPENAI_MODEL"
+    SD_WEBUI_URL_ENV = "JARVIS_IMAGE_SD_WEBUI_URL"
+    MAX_DIMENSION_ENV = "JARVIS_IMAGE_MAX_DIMENSION"
+    MAX_PROMPT_CHARS_ENV = "JARVIS_IMAGE_MAX_PROMPT_CHARS"
+    TIMEOUT_ENV = "JARVIS_IMAGE_TIMEOUT_SECONDS"
+    FORMATS_ENV = "JARVIS_IMAGE_ALLOWED_FORMATS"
+
+    SUPPORTED_PROVIDERS: Tuple[str, ...] = ("openai", "sd_webui")
+    SUPPORTED_OPERATIONS: Tuple[str, ...] = ("generate", "get_policy", "get_metrics")
+    OPERATION_ALIASES: Dict[str, str] = {
+        "create": "generate",
+        "create_image": "generate",
+        "render": "generate",
+        "policy": "get_policy",
+        "metrics": "get_metrics",
+    }
+
+    def __init__(self, permission_manager: Optional[Any] = None):
+        metadata = ToolMetadata(
+            name="image_generation_agent",
+            description=(
+                "Generate images from prompts via configured providers (OpenAI or SD WebUI), "
+                "with bounded dimensions and policy-scoped output directories."
+            ),
+            category=ToolCategory.ANALYSIS,
+            risk_level=ToolRiskLevel.MEDIUM,
+            requires_permission=False,
+            timeout_seconds=120.0,
+            capabilities=["image_generation", "text_to_image", "diagram_rendering"],
+            tags=["image", "generation", "openai", "stable_diffusion"],
+        )
+        super().__init__(metadata, permission_manager)
+
+        self._atomic_ops = get_atomic_file_ops()
+        self._policy_lock = asyncio.Lock()
+        self._policy_signature: Optional[Tuple[str, ...]] = None
+        self._policy = self._build_policy()
+        self._policy_signature = self._compute_policy_signature()
+        self._metrics: Dict[str, Any] = {
+            "total_requests": 0,
+            "successful": 0,
+            "failed": 0,
+            "provider_counts": {},
+            "last_generation_ts": None,
+        }
+
+    async def _execute(
+        self,
+        operation: str = "generate",
+        prompt: Optional[str] = None,
+        provider: Optional[str] = None,
+        width: int = 1024,
+        height: int = 1024,
+        negative_prompt: Optional[str] = None,
+        output_name: Optional[str] = None,
+        image_format: Optional[str] = None,
+        style: Optional[str] = None,
+        quality: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        await self._refresh_policy_if_changed()
+        self._metrics["total_requests"] += 1
+
+        op = (operation or kwargs.get("action") or kwargs.get("op") or "").strip().lower()
+        op = self.OPERATION_ALIASES.get(op, op)
+        if op not in self.SUPPORTED_OPERATIONS:
+            return {
+                "success": False,
+                "error": f"Unsupported operation '{op}'. Supported operations: {', '.join(self.SUPPORTED_OPERATIONS)}",
+            }
+
+        if op == "get_policy":
+            return {"operation": op, "success": True, "policy": self._policy.as_dict()}
+
+        if op == "get_metrics":
+            return {"operation": op, "success": True, "metrics": dict(self._metrics)}
+
+        prompt_text = str(prompt or kwargs.get("text") or kwargs.get("description") or "").strip()
+        if not prompt_text:
+            return {"operation": op, "success": False, "error": "Missing required parameter: prompt"}
+        if len(prompt_text) > self._policy.max_prompt_chars:
+            return {
+                "operation": op,
+                "success": False,
+                "error": f"Prompt exceeds policy limit ({self._policy.max_prompt_chars} chars).",
+            }
+
+        resolved_provider = self._resolve_provider(provider)
+        if not resolved_provider:
+            return {
+                "operation": op,
+                "success": False,
+                "error": "No image provider available. Configure OPENAI_API_KEY or JARVIS_IMAGE_SD_WEBUI_URL.",
+            }
+
+        width_value = self._normalize_dimension(width)
+        height_value = self._normalize_dimension(height)
+        output_format = self._normalize_format(image_format or kwargs.get("format") or "png")
+        output_path = self._build_output_path(output_name=output_name, image_format=output_format)
+
+        try:
+            if resolved_provider == "openai":
+                generated = await self._generate_with_openai(
+                    prompt=prompt_text,
+                    width=width_value,
+                    height=height_value,
+                    quality=quality,
+                    style=style,
+                )
+            elif resolved_provider == "sd_webui":
+                generated = await self._generate_with_sd_webui(
+                    prompt=prompt_text,
+                    negative_prompt=negative_prompt or "",
+                    width=width_value,
+                    height=height_value,
+                    steps=self._safe_int(kwargs.get("steps"), default=28, minimum=5, maximum=80),
+                    cfg_scale=self._safe_float(kwargs.get("cfg_scale"), default=7.0, minimum=1.0, maximum=20.0),
+                )
+            else:
+                return {
+                    "operation": op,
+                    "success": False,
+                    "error": f"Unsupported provider: {resolved_provider}",
+                }
+        except Exception as exc:
+            self._metrics["failed"] += 1
+            return {
+                "operation": op,
+                "success": False,
+                "provider": resolved_provider,
+                "error": str(exc),
+            }
+
+        checksum = await self._atomic_ops.write_bytes(output_path, generated["bytes"], timeout=self._policy.timeout_seconds)
+        self._metrics["successful"] += 1
+        self._metrics["provider_counts"][resolved_provider] = self._metrics["provider_counts"].get(resolved_provider, 0) + 1
+        self._metrics["last_generation_ts"] = time.time()
+
+        return {
+            "operation": op,
+            "success": True,
+            "provider": resolved_provider,
+            "prompt": prompt_text,
+            "path": str(output_path),
+            "format": output_format,
+            "width": width_value,
+            "height": height_value,
+            "bytes": len(generated["bytes"]),
+            "checksum_sha256": checksum,
+            "meta": generated.get("meta", {}),
+        }
+
+    async def _generate_with_openai(
+        self,
+        prompt: str,
+        width: int,
+        height: int,
+        quality: Optional[str],
+        style: Optional[str],
+    ) -> Dict[str, Any]:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+
+        try:
+            from openai import AsyncOpenAI
+        except Exception as exc:
+            raise RuntimeError("openai package is not installed for OpenAI image generation") from exc
+
+        client = AsyncOpenAI(api_key=api_key)
+        request: Dict[str, Any] = {
+            "model": self._policy.openai_model,
+            "prompt": prompt,
+            "size": f"{width}x{height}",
+            "response_format": "b64_json",
+            "n": 1,
+        }
+        if quality:
+            request["quality"] = quality
+        if style:
+            request["style"] = style
+
+        response = await asyncio.wait_for(client.images.generate(**request), timeout=self._policy.timeout_seconds)
+        data_items = getattr(response, "data", None) or []
+        if not data_items:
+            raise RuntimeError("OpenAI images API returned no data")
+
+        first = data_items[0]
+        b64_payload = getattr(first, "b64_json", None)
+        url_payload = getattr(first, "url", None)
+        revised_prompt = getattr(first, "revised_prompt", None)
+
+        if isinstance(first, dict):
+            b64_payload = b64_payload or first.get("b64_json")
+            url_payload = url_payload or first.get("url")
+            revised_prompt = revised_prompt or first.get("revised_prompt")
+
+        if b64_payload:
+            try:
+                image_bytes = base64.b64decode(b64_payload, validate=False)
+            except (binascii.Error, ValueError) as exc:
+                raise RuntimeError("OpenAI returned invalid base64 image payload") from exc
+            return {"bytes": image_bytes, "meta": {"revised_prompt": revised_prompt}}
+
+        if url_payload:
+            image_bytes = await self._fetch_url_bytes(url_payload)
+            return {"bytes": image_bytes, "meta": {"url": url_payload, "revised_prompt": revised_prompt}}
+
+        raise RuntimeError("OpenAI images API response missing b64_json/url payload")
+
+    async def _generate_with_sd_webui(
+        self,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        steps: int,
+        cfg_scale: float,
+    ) -> Dict[str, Any]:
+        if not self._policy.sd_webui_url:
+            raise RuntimeError("JARVIS_IMAGE_SD_WEBUI_URL is not configured")
+
+        try:
+            import aiohttp
+        except Exception as exc:
+            raise RuntimeError("aiohttp is required for SD WebUI image generation") from exc
+
+        payload = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "cfg_scale": cfg_scale,
+        }
+
+        timeout = aiohttp.ClientTimeout(total=self._policy.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(self._policy.sd_webui_url, json=payload) as response:
+                body = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"SD WebUI request failed ({response.status}): {body[:300]}")
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("SD WebUI returned non-JSON response") from exc
+
+        images = data.get("images") if isinstance(data, dict) else None
+        if not images:
+            raise RuntimeError("SD WebUI response did not include image payload")
+
+        image_payload = str(images[0]).strip()
+        if image_payload.startswith("data:image/") and "," in image_payload:
+            image_payload = image_payload.split(",", 1)[1]
+
+        try:
+            image_bytes = base64.b64decode(image_payload, validate=False)
+        except (binascii.Error, ValueError) as exc:
+            raise RuntimeError("SD WebUI returned invalid base64 payload") from exc
+
+        return {"bytes": image_bytes, "meta": {"info": data.get("info"), "parameters": data.get("parameters")}}
+
+    async def _fetch_url_bytes(self, url: str) -> bytes:
+        try:
+            import aiohttp
+        except Exception as exc:
+            raise RuntimeError("aiohttp is required to fetch image URLs") from exc
+
+        timeout = aiohttp.ClientTimeout(total=self._policy.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status >= 400:
+                    body = await response.text()
+                    raise RuntimeError(f"Image download failed ({response.status}): {body[:200]}")
+                return await response.read()
+
+    async def _refresh_policy_if_changed(self) -> None:
+        signature = self._compute_policy_signature()
+        if signature == self._policy_signature:
+            return
+        async with self._policy_lock:
+            signature = self._compute_policy_signature()
+            if signature == self._policy_signature:
+                return
+            self._policy = self._build_policy()
+            self._policy_signature = signature
+
+    def _build_policy(self) -> ImageGenerationPolicy:
+        output_root_raw = os.getenv(
+            self.OUTPUT_DIR_ENV,
+            str(Path.home() / ".jarvis" / "generated_images"),
+        ).strip()
+        output_root = self._resolve_user_path(output_root_raw)
+
+        provider = (os.getenv(self.PROVIDER_ENV, "auto").strip().lower() or "auto")
+        if provider not in (*self.SUPPORTED_PROVIDERS, "auto"):
+            provider = "auto"
+
+        formats = self._parse_formats(os.getenv(self.FORMATS_ENV, "png,jpg,webp"))
+        if not formats:
+            formats = ("png",)
+
+        return ImageGenerationPolicy(
+            output_root=output_root,
+            default_provider=provider,
+            openai_model=os.getenv(self.OPENAI_MODEL_ENV, "gpt-image-1").strip() or "gpt-image-1",
+            sd_webui_url=os.getenv(self.SD_WEBUI_URL_ENV, "").strip(),
+            max_dimension=self._env_int(self.MAX_DIMENSION_ENV, 1536, minimum=256),
+            max_prompt_chars=self._env_int(self.MAX_PROMPT_CHARS_ENV, 2000, minimum=64),
+            timeout_seconds=self._env_float(self.TIMEOUT_ENV, 90.0, minimum=5.0),
+            allowed_formats=formats,
+        )
+
+    def _compute_policy_signature(self) -> Tuple[str, ...]:
+        return (
+            os.getenv(self.OUTPUT_DIR_ENV, ""),
+            os.getenv(self.PROVIDER_ENV, ""),
+            os.getenv(self.OPENAI_MODEL_ENV, ""),
+            os.getenv(self.SD_WEBUI_URL_ENV, ""),
+            os.getenv(self.MAX_DIMENSION_ENV, ""),
+            os.getenv(self.MAX_PROMPT_CHARS_ENV, ""),
+            os.getenv(self.TIMEOUT_ENV, ""),
+            os.getenv(self.FORMATS_ENV, ""),
+            os.getenv("OPENAI_API_KEY", ""),
+        )
+
+    def _resolve_provider(self, provider: Optional[str]) -> Optional[str]:
+        requested = str(provider or "").strip().lower()
+        if requested and requested != "auto":
+            if requested not in self.SUPPORTED_PROVIDERS:
+                return None
+            if requested == "openai" and not self._openai_available():
+                return None
+            if requested == "sd_webui" and not self._sd_webui_available():
+                return None
+            return requested
+
+        default_provider = self._policy.default_provider
+        if default_provider == "openai" and self._openai_available():
+            return "openai"
+        if default_provider == "sd_webui" and self._sd_webui_available():
+            return "sd_webui"
+
+        if self._openai_available():
+            return "openai"
+        if self._sd_webui_available():
+            return "sd_webui"
+        return None
+
+    def _openai_available(self) -> bool:
+        return bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+    def _sd_webui_available(self) -> bool:
+        return bool(self._policy.sd_webui_url)
+
+    def _normalize_dimension(self, value: Any) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = 1024
+        bounded = max(256, min(parsed, self._policy.max_dimension))
+        # Keep dimensions model-friendly.
+        return (bounded // 64) * 64
+
+    def _normalize_format(self, image_format: str) -> str:
+        fmt = str(image_format or "").strip().lower().replace(".", "")
+        if fmt == "jpeg":
+            fmt = "jpg"
+        if fmt not in self._policy.allowed_formats:
+            return self._policy.allowed_formats[0]
+        return fmt
+
+    def _build_output_path(self, output_name: Optional[str], image_format: str) -> Path:
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_name = self._sanitize_output_name(output_name or f"jarvis_image_{timestamp}")
+        if not safe_name.endswith(f".{image_format}"):
+            safe_name = f"{safe_name}.{image_format}"
+
+        output_root = self._policy.output_root
+        output_path = (output_root / safe_name).resolve()
+
+        try:
+            output_path.relative_to(output_root.resolve())
+        except ValueError as exc:
+            raise PermissionError(f"Output path escapes allowed image directory: {output_path}") from exc
+
+        return output_path
+
+    @staticmethod
+    def _sanitize_output_name(raw_name: str) -> str:
+        name = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(raw_name).strip())
+        name = name.strip("._")
+        return name or f"jarvis_image_{uuid4().hex[:10]}"
+
+    @staticmethod
+    def _parse_formats(raw: str) -> Tuple[str, ...]:
+        formats = []
+        for token in re.split(r"[,;\s]+", raw or ""):
+            fmt = token.strip().lower().replace(".", "")
+            if fmt == "jpeg":
+                fmt = "jpg"
+            if fmt in {"png", "jpg", "webp"} and fmt not in formats:
+                formats.append(fmt)
+        return tuple(formats)
+
+    @staticmethod
+    def _resolve_user_path(raw_path: str) -> Path:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+
+        missing_parts: List[str] = []
+        probe = candidate
+        while not probe.exists():
+            missing_parts.append(probe.name)
+            parent = probe.parent
+            if parent == probe:
+                break
+            probe = parent
+
+        resolved_base = probe.resolve()
+        for part in reversed(missing_parts):
+            resolved_base = resolved_base / part
+        return resolved_base
+
+    @staticmethod
+    def _safe_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(parsed, maximum))
+
+    @staticmethod
+    def _safe_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(parsed, maximum))
+
+    @staticmethod
+    def _env_int(env_key: str, default: int, minimum: int = 0) -> int:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(int(raw), minimum)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _env_float(env_key: str, default: float, minimum: float = 0.0) -> float:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(float(raw), minimum)
+        except ValueError:
+            return default
+
+
+@dataclass(frozen=True)
 class FileSystemAccessPolicy:
     """Resolved filesystem access policy for the file-system tool."""
 
@@ -2559,6 +3645,8 @@ def register_builtin_tools(
         CalculatorTool(),
         DateTimeTool(),
         WebResearchTool(),
+        MediaControlTool(permission_manager=permission_manager),
+        ImageGenerationTool(permission_manager=permission_manager),
         ShellCommandTool(permission_manager=permission_manager),
         FileSystemAgentTool(permission_manager=permission_manager),
     ]

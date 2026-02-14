@@ -1733,6 +1733,35 @@ class UnifiedAgentRuntime:
         if action_type == "shell":
             return await self._execute_shell_action(action=action, params=params)
 
+        media_action_types = {
+            "media",
+            "media_control",
+            "music",
+            "music_control",
+            "play_music",
+            "pause_music",
+            "stop_music",
+            "next_track",
+            "previous_track",
+            "set_media_volume",
+        }
+        if action_type in media_action_types:
+            return await self._execute_media_action(action=action, params=params, action_type=action_type)
+
+        image_action_types = {
+            "image_generation",
+            "generate_image",
+            "create_image",
+            "render_diagram",
+            "text_to_image",
+        }
+        if action_type in image_action_types:
+            return await self._execute_image_generation_action(
+                action=action,
+                params=params,
+                action_type=action_type,
+            )
+
         # Computer use action
         if action_type in ("click", "type", "scroll", "screenshot"):
             return await self._execute_computer_use(action)
@@ -1845,6 +1874,175 @@ class UnifiedAgentRuntime:
             if result.get("error"):
                 payload["error"] = str(result.get("error"))
 
+        return payload
+
+    async def _execute_media_action(
+        self,
+        action: Dict[str, Any],
+        params: Dict[str, Any],
+        action_type: str,
+    ) -> Dict[str, Any]:
+        """Execute media control actions through `media_control_agent`."""
+        try:
+            from backend.autonomy.langchain_tools import ToolRegistry
+        except ImportError as exc:
+            return {
+                "success": False,
+                "tool": "media_control_agent",
+                "error": f"media_control_agent unavailable: {exc}",
+            }
+
+        registry = ToolRegistry.get_instance()
+        media_tool = registry.get("media_control_agent")
+        if media_tool is None:
+            return {
+                "success": False,
+                "tool": "media_control_agent",
+                "error": "media_control_agent is not registered",
+            }
+
+        operation_map = {
+            "play_music": "play",
+            "pause_music": "pause",
+            "stop_music": "stop",
+            "next_track": "next",
+            "previous_track": "previous",
+            "set_media_volume": "set_volume",
+        }
+
+        tool_params: Dict[str, Any] = {
+            "operation": (
+                params.get("operation")
+                or params.get("action")
+                or action.get("operation")
+                or operation_map.get(action_type)
+                or "get_status"
+            )
+        }
+
+        def _copy_param(key: str, *aliases: str) -> None:
+            for candidate in (key, *aliases):
+                if candidate in params and params[candidate] is not None:
+                    tool_params[key] = params[candidate]
+                    return
+                if candidate in action and action[candidate] is not None:
+                    tool_params[key] = action[candidate]
+                    return
+
+        _copy_param("player", "app")
+        _copy_param("playlist", "playlist_name")
+        _copy_param("playlist_uri", "uri")
+        _copy_param("volume", "value")
+        _copy_param("auto_start")
+
+        if "target" in params and "player" not in tool_params:
+            tool_params["player"] = params.get("target")
+        elif "target" in action and "player" not in tool_params:
+            tool_params["player"] = action.get("target")
+
+        try:
+            result = await media_tool.run(**tool_params)
+        except Exception as exc:
+            logger.warning("[AgentRuntime] media_control_agent execution failed: %s", exc)
+            return {
+                "success": False,
+                "tool": "media_control_agent",
+                "error": str(exc),
+            }
+
+        success = bool(result.get("success", False)) if isinstance(result, dict) else False
+        payload: Dict[str, Any] = {
+            "success": success,
+            "tool": "media_control_agent",
+            "result": result,
+        }
+        if isinstance(result, dict) and result.get("error"):
+            payload["error"] = str(result.get("error"))
+        return payload
+
+    async def _execute_image_generation_action(
+        self,
+        action: Dict[str, Any],
+        params: Dict[str, Any],
+        action_type: str,
+    ) -> Dict[str, Any]:
+        """Execute image generation actions through `image_generation_agent`."""
+        try:
+            from backend.autonomy.langchain_tools import ToolRegistry
+        except ImportError as exc:
+            return {
+                "success": False,
+                "tool": "image_generation_agent",
+                "error": f"image_generation_agent unavailable: {exc}",
+            }
+
+        registry = ToolRegistry.get_instance()
+        image_tool = registry.get("image_generation_agent")
+        if image_tool is None:
+            return {
+                "success": False,
+                "tool": "image_generation_agent",
+                "error": "image_generation_agent is not registered",
+            }
+
+        operation = params.get("operation") or params.get("action") or action.get("operation") or "generate"
+        if action_type == "render_diagram" and "operation" not in params and "operation" not in action:
+            operation = "generate"
+
+        prompt = (
+            params.get("prompt")
+            or params.get("description")
+            or action.get("prompt")
+            or action.get("description")
+            or action.get("goal")
+            or params.get("target")
+            or action.get("target")
+        )
+
+        tool_params: Dict[str, Any] = {
+            "operation": operation,
+        }
+        if prompt is not None:
+            tool_params["prompt"] = prompt
+
+        def _copy_param(key: str, *aliases: str) -> None:
+            for candidate in (key, *aliases):
+                if candidate in params and params[candidate] is not None:
+                    tool_params[key] = params[candidate]
+                    return
+                if candidate in action and action[candidate] is not None:
+                    tool_params[key] = action[candidate]
+                    return
+
+        _copy_param("provider")
+        _copy_param("width")
+        _copy_param("height")
+        _copy_param("negative_prompt")
+        _copy_param("output_name", "filename")
+        _copy_param("image_format", "format")
+        _copy_param("quality")
+        _copy_param("style")
+        _copy_param("steps")
+        _copy_param("cfg_scale")
+
+        try:
+            result = await image_tool.run(**tool_params)
+        except Exception as exc:
+            logger.warning("[AgentRuntime] image_generation_agent execution failed: %s", exc)
+            return {
+                "success": False,
+                "tool": "image_generation_agent",
+                "error": str(exc),
+            }
+
+        success = bool(result.get("success", False)) if isinstance(result, dict) else False
+        payload: Dict[str, Any] = {
+            "success": success,
+            "tool": "image_generation_agent",
+            "result": result,
+        }
+        if isinstance(result, dict) and result.get("error"):
+            payload["error"] = str(result.get("error"))
         return payload
 
     async def _execute_computer_use(self, action: Dict) -> Dict:
