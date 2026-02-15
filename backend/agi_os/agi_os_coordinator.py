@@ -299,24 +299,34 @@ class AGIOSCoordinator:
         # v253.1: Top-level AGI startup phases now use explicit per-phase
         # bounded timeouts + heartbeat reporting. This prevents a single
         # hanging sub-phase from holding supervisor startup indefinitely.
+        # v253.6: Rebalanced phase defaults to reduce total from 305s→225s.
+        # Previous 305s total always triggered budget scaling on the default
+        # 110s budget, compressing neural_mesh from 90s to ~30s and causing
+        # agent/bridge timeouts. New defaults:
+        #   components:  45→30 (parallel init, doesn't need 45s)
+        #   intelligence: 60→45 (time-budgeted internally)
+        #   neural_mesh: 90 (kept — genuinely needs time for 18+ agents)
+        #   hybrid: 20→10 (just object construction)
+        #   screen_analyzer: 45→30 (fixed Py3.9 threading, faster now)
+        #   components_connected: 45→20 (lightweight wiring)
         phase_timeouts = {
             "agi_os_components": _env_float(
-                "JARVIS_AGI_OS_PHASE_COMPONENTS_TIMEOUT", 45.0
+                "JARVIS_AGI_OS_PHASE_COMPONENTS_TIMEOUT", 30.0
             ),
             "intelligence_systems": _env_float(
-                "JARVIS_AGI_OS_PHASE_INTELLIGENCE_TIMEOUT", 60.0
+                "JARVIS_AGI_OS_PHASE_INTELLIGENCE_TIMEOUT", 45.0
             ),
             "neural_mesh": _env_float(
                 "JARVIS_AGI_OS_PHASE_NEURAL_MESH_TIMEOUT", 90.0
             ),
             "hybrid_orchestrator": _env_float(
-                "JARVIS_AGI_OS_PHASE_HYBRID_TIMEOUT", 20.0
+                "JARVIS_AGI_OS_PHASE_HYBRID_TIMEOUT", 10.0
             ),
             "screen_analyzer": _env_float(
-                "JARVIS_AGI_OS_PHASE_SCREEN_TIMEOUT", 45.0
+                "JARVIS_AGI_OS_PHASE_SCREEN_TIMEOUT", 30.0
             ),
             "components_connected": _env_float(
-                "JARVIS_AGI_OS_PHASE_CONNECT_TIMEOUT", 45.0
+                "JARVIS_AGI_OS_PHASE_CONNECT_TIMEOUT", 20.0
             ),
         }
 

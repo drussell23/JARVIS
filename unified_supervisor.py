@@ -592,6 +592,7 @@ import socket
 import sqlite3
 import ssl
 import stat
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -601,7 +602,7 @@ import traceback
 import uuid
 import warnings
 from abc import ABC, abstractmethod
-from collections import defaultdict, OrderedDict
+from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
@@ -36616,10 +36617,7 @@ class SecurityPolicyEngine:
             "warnings": 0,
             "cache_hits": 0,
         }
-        self._logger = UnifiedLogger(
-            name="SecurityPolicyEngine",
-            config=config
-        )
+        self._logger = logging.getLogger("SecurityPolicyEngine")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -37022,10 +37020,7 @@ class ComplianceAuditor:
         self._evidence_store: Dict[str, List[Dict[str, Any]]] = {}
         self._audit_log: deque = deque(maxlen=50000)
         self._check_handlers: Dict[str, Callable] = {}
-        self._logger = UnifiedLogger(
-            name="ComplianceAuditor",
-            config=config
-        )
+        self._logger = logging.getLogger("ComplianceAuditor")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -37361,10 +37356,7 @@ class DataClassificationManager:
         self._classified_data: Dict[str, ClassifiedData] = {}
         self._lineage: Dict[str, List[str]] = {}  # parent -> children
         self._classifiers: List[Callable[[Any], Optional[str]]] = []
-        self._logger = UnifiedLogger(
-            name="DataClassificationManager",
-            config=config
-        )
+        self._logger = logging.getLogger("DataClassificationManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -37654,10 +37646,7 @@ class AccessControlManager:
         self._grants: Dict[str, AccessGrant] = {}
         self._subject_grants: Dict[str, List[str]] = {}  # subject_id -> grant_ids
         self._audit_log: deque = deque(maxlen=100000)
-        self._logger = UnifiedLogger(
-            name="AccessControlManager",
-            config=config
-        )
+        self._logger = logging.getLogger("AccessControlManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -38049,10 +38038,7 @@ class EncryptionServiceManager:
         self._current_key_id: Optional[str] = None
         self._key_history: Dict[str, List[str]] = {}  # purpose -> key_ids
         self._rotation_interval_days: int = 90
-        self._logger = UnifiedLogger(
-            name="EncryptionServiceManager",
-            config=config
-        )
+        self._logger = logging.getLogger("EncryptionServiceManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -38289,10 +38275,7 @@ class AnomalyDetector:
             "security": 0.75,
             "data": 0.80,
         }
-        self._logger = UnifiedLogger(
-            name="AnomalyDetector",
-            config=config
-        )
+        self._logger = logging.getLogger("AnomalyDetector")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -38517,10 +38500,7 @@ class IncidentResponseCoordinator:
         self._notification_handlers: List[Callable] = []
         self._auto_response_rules: List[Dict[str, Any]] = []
         self._escalation_policy: Dict[str, List[str]] = {}
-        self._logger = UnifiedLogger(
-            name="IncidentResponseCoordinator",
-            config=config
-        )
+        self._logger = logging.getLogger("IncidentResponseCoordinator")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -38909,10 +38889,7 @@ class ThreatIntelligenceManager:
         self._sources: Dict[str, Dict[str, Any]] = {}
         self._correlations: Dict[str, List[str]] = {}
         self._expiration_days: int = 90
-        self._logger = UnifiedLogger(
-            name="ThreatIntelligenceManager",
-            config=config
-        )
+        self._logger = logging.getLogger("ThreatIntelligenceManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -39215,10 +39192,7 @@ class ServiceRegistryManager:
         self._unhealthy_threshold: int = 3
         self._health_check_failures: Dict[str, int] = {}
         self._deregister_after_failures: int = 5
-        self._logger = UnifiedLogger(
-            name="ServiceRegistryManager",
-            config=config
-        )
+        self._logger = logging.getLogger("ServiceRegistryManager")
         self._health_check_task: Optional[asyncio.Task] = None
         self._initialized = False
 
@@ -39495,10 +39469,7 @@ class ConfigurationManager:
         self._change_handlers: List[Callable[[ConfigurationChangeEvent], Awaitable[None]]] = []
         self._history: deque = deque(maxlen=10000)
         self._source_priority = ["remote", "env", "file", "default"]
-        self._logger = UnifiedLogger(
-            name="ConfigurationManager",
-            config=config
-        )
+        self._logger = logging.getLogger("ConfigurationManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -39767,10 +39738,7 @@ class DependencyContainer:
         self._singletons: Dict[str, Any] = {}
         self._scopes: Dict[str, Dict[str, Any]] = {}
         self._resolving: Set[str] = set()
-        self._logger = UnifiedLogger(
-            name="DependencyContainer",
-            config=config
-        )
+        self._logger = logging.getLogger("DependencyContainer")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -39948,10 +39916,7 @@ class EventSourcingManager:
         self._projections: Dict[str, Callable[[Event], Awaitable[None]]] = {}
         self._event_handlers: Dict[str, List[Callable[[Event], Awaitable[None]]]] = {}
         self._snapshot_interval: int = 100
-        self._logger = UnifiedLogger(
-            name="EventSourcingManager",
-            config=config
-        )
+        self._logger = logging.getLogger("EventSourcingManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -40205,10 +40170,7 @@ class GraphDatabaseManager:
         self._edges: Dict[str, GraphEdge] = {}
         self._outgoing: Dict[str, List[str]] = {}  # node_id -> edge_ids
         self._incoming: Dict[str, List[str]] = {}  # node_id -> edge_ids
-        self._logger = UnifiedLogger(
-            name="GraphDatabaseManager",
-            config=config
-        )
+        self._logger = logging.getLogger("GraphDatabaseManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -40559,10 +40521,7 @@ class SearchEngineManager:
             "and", "but", "or", "nor", "so", "yet", "both", "either", "neither",
             "not", "only", "own", "same", "than", "too", "very"
         }
-        self._logger = UnifiedLogger(
-            name="SearchEngineManager",
-            config=config
-        )
+        self._logger = logging.getLogger("SearchEngineManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -40823,10 +40782,7 @@ class IntegrationBusManager:
         self._routers: List[Callable[[IntegrationMessage], Optional[str]]] = []
         self._dead_letter: deque = deque(maxlen=10000)
         self._message_log: deque = deque(maxlen=50000)
-        self._logger = UnifiedLogger(
-            name="IntegrationBusManager",
-            config=config
-        )
+        self._logger = logging.getLogger("IntegrationBusManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -41068,10 +41024,7 @@ class APIVersionManager:
         self._versions: Dict[str, APIVersion] = {}
         self._current_version: Optional[str] = None
         self._usage_stats: Dict[str, int] = {}
-        self._logger = UnifiedLogger(
-            name="APIVersionManager",
-            config=config
-        )
+        self._logger = logging.getLogger("APIVersionManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -41307,10 +41260,7 @@ class ResourceQuotaManager:
         self._alert_handlers: List[Callable[[str, ResourceUsage], Awaitable[None]]] = []
         self._alert_thresholds: Dict[str, float] = {}  # quota_id -> threshold percentage
         self._alerted_quotas: Set[str] = set()
-        self._logger = UnifiedLogger(
-            name="ResourceQuotaManager",
-            config=config
-        )
+        self._logger = logging.getLogger("ResourceQuotaManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -41612,10 +41562,7 @@ class TenantManager:
         self._tier_features: Dict[str, List[str]] = {}
         self._tier_quotas: Dict[str, Dict[str, float]] = {}
         self._tenant_metrics: Dict[str, Dict[str, Any]] = {}
-        self._logger = UnifiedLogger(
-            name="TenantManager",
-            config=config
-        )
+        self._logger = logging.getLogger("TenantManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -41903,10 +41850,7 @@ class RateLimiterManager:
         self._rules: Dict[str, RateLimitRule] = {}
         self._states: Dict[str, RateLimitState] = {}
         self._algorithm: str = "token_bucket"  # token_bucket, sliding_window, fixed_window
-        self._logger = UnifiedLogger(
-            name="RateLimiterManager",
-            config=config
-        )
+        self._logger = logging.getLogger("RateLimiterManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -42170,10 +42114,7 @@ class RequestCoalescer:
             "coalesced": 0,
             "executions": 0
         }
-        self._logger = UnifiedLogger(
-            name="RequestCoalescer",
-            config=config
-        )
+        self._logger = logging.getLogger("RequestCoalescer")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -42338,10 +42279,7 @@ class BackgroundJobManager:
         self._running_count: int = 0
         self._shutdown: bool = False
         self._job_history: deque = deque(maxlen=10000)
-        self._logger = UnifiedLogger(
-            name="BackgroundJobManager",
-            config=config
-        )
+        self._logger = logging.getLogger("BackgroundJobManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -42581,10 +42519,7 @@ class RetryPolicyManager:
         self.config = config
         self._policies: Dict[str, RetryPolicyDef] = {}
         self._metrics: Dict[str, Dict[str, int]] = {}
-        self._logger = UnifiedLogger(
-            name="RetryPolicyManager",
-            config=config
-        )
+        self._logger = logging.getLogger("RetryPolicyManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -42980,10 +42915,7 @@ class CostAccountingManager:
         self._budgets: Dict[str, float] = {}  # tenant_id -> budget
         self._alerts_sent: Set[str] = set()
         self._alert_handlers: List[Callable[[str, float, float], Awaitable[None]]] = []
-        self._logger = UnifiedLogger(
-            name="CostAccountingManager",
-            config=config
-        )
+        self._logger = logging.getLogger("CostAccountingManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -43241,10 +43173,7 @@ class AlertingManager:
         self._metric_values: Dict[str, deque] = {}
         self._last_alert_time: Dict[str, datetime] = {}
         self._notification_handlers: Dict[str, Callable[[Alert], Awaitable[None]]] = {}
-        self._logger = UnifiedLogger(
-            name="AlertingManager",
-            config=config
-        )
+        self._logger = logging.getLogger("AlertingManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -43536,10 +43465,7 @@ class PerformanceProfiler:
         self._active_profiles: Dict[str, ProfileEntry] = {}
         self._enabled: bool = True
         self._sample_rate: float = 1.0  # 100% sampling
-        self._logger = UnifiedLogger(
-            name="PerformanceProfiler",
-            config=config
-        )
+        self._logger = logging.getLogger("PerformanceProfiler")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -43732,10 +43658,7 @@ class ABTestingFramework:
         self._assignments: Dict[str, Dict[str, ExperimentAssignment]] = {}  # user_id -> exp_id -> assignment
         self._conversions: Dict[str, Dict[str, Dict[str, int]]] = {}  # exp_id -> metric -> variant -> count
         self._impressions: Dict[str, Dict[str, int]] = {}  # exp_id -> variant -> count
-        self._logger = UnifiedLogger(
-            name="ABTestingFramework",
-            config=config
-        )
+        self._logger = logging.getLogger("ABTestingFramework")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -44027,10 +43950,7 @@ class FeatureFlagManager:
         self._flags: Dict[str, FeatureFlag] = {}
         self._overrides: Dict[str, Dict[str, Any]] = {}  # user_id -> flag_id -> value
         self._audit_log: deque = deque(maxlen=10000)
-        self._logger = UnifiedLogger(
-            name="FeatureFlagManager",
-            config=config
-        )
+        self._logger = logging.getLogger("FeatureFlagManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -44271,10 +44191,7 @@ class RulesEngine:
         self._rule_groups: Dict[str, List[str]] = {}  # group -> rule_ids
         self._action_handlers: Dict[str, Callable[[Dict[str, Any], Dict[str, Any]], Any]] = {}
         self._execution_history: deque = deque(maxlen=10000)
-        self._logger = UnifiedLogger(
-            name="RulesEngine",
-            config=config
-        )
+        self._logger = logging.getLogger("RulesEngine")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -44513,10 +44430,7 @@ class DataValidationManager:
         self.config = config
         self._schemas: Dict[str, List[ValidationRule]] = {}
         self._custom_validators: Dict[str, Callable[[Any], Tuple[bool, str]]] = {}
-        self._logger = UnifiedLogger(
-            name="DataValidationManager",
-            config=config
-        )
+        self._logger = logging.getLogger("DataValidationManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -44735,10 +44649,7 @@ class TemplateEngine:
         self._templates: Dict[str, Template] = {}
         self._cache: Dict[str, str] = {}
         self._filters: Dict[str, Callable[[Any], Any]] = {}
-        self._logger = UnifiedLogger(
-            name="TemplateEngine",
-            config=config
-        )
+        self._logger = logging.getLogger("TemplateEngine")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -44958,10 +44869,7 @@ class ReportGenerator:
         self._templates: Dict[str, Dict[str, Any]] = {}
         self._generated_reports: Dict[str, Report] = {}
         self._data_sources: Dict[str, Callable[[], Awaitable[Dict[str, Any]]]] = {}
-        self._logger = UnifiedLogger(
-            name="ReportGenerator",
-            config=config
-        )
+        self._logger = logging.getLogger("ReportGenerator")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -45271,10 +45179,7 @@ class PluginManager:
         self._load_order: List[str] = []
         self._event_log: deque = deque(maxlen=10000)
         self._plugin_configs: Dict[str, Dict[str, Any]] = {}
-        self._logger = UnifiedLogger(
-            name="PluginManager",
-            config=config
-        )
+        self._logger = logging.getLogger("PluginManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -45535,10 +45440,7 @@ class LocalizationManager:
         self._current_locale: str = "en_US"
         self._fallback_locale: str = "en_US"
         self._missing_translations: Dict[str, Set[str]] = {}  # locale -> keys
-        self._logger = UnifiedLogger(
-            name="LocalizationManager",
-            config=config
-        )
+        self._logger = logging.getLogger("LocalizationManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -45819,10 +45721,7 @@ class AuditTrailManager:
         }
         self._retention_days: int = 365
         self._stream_handlers: List[Callable[[AuditEntry], Awaitable[None]]] = []
-        self._logger = UnifiedLogger(
-            name="AuditTrailManager",
-            config=config
-        )
+        self._logger = logging.getLogger("AuditTrailManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -46073,10 +45972,7 @@ class NetworkManager:
         self._dns_cache: Dict[str, Tuple[str, datetime]] = {}
         self._dns_cache_ttl: int = 300
         self._latency_history: Dict[str, deque] = {}
-        self._logger = UnifiedLogger(
-            name="NetworkManager",
-            config=config
-        )
+        self._logger = logging.getLogger("NetworkManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -46270,10 +46166,7 @@ class FileSystemManager:
         self._cache_timestamps: Dict[str, datetime] = {}
         self._temp_files: Set[str] = set()
         self._watchers: Dict[str, List[Callable[[str, str], Awaitable[None]]]] = {}
-        self._logger = UnifiedLogger(
-            name="FileSystemManager",
-            config=config
-        )
+        self._logger = logging.getLogger("FileSystemManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -46564,10 +46457,7 @@ class ExternalServiceRegistry:
         self._services: Dict[str, ExternalService] = {}
         self._circuit_breakers: Dict[str, bool] = {}  # service_id -> is_open
         self._request_log: deque = deque(maxlen=10000)
-        self._logger = UnifiedLogger(
-            name="ExternalServiceRegistry",
-            config=config
-        )
+        self._logger = logging.getLogger("ExternalServiceRegistry")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -46798,10 +46688,7 @@ class CalendarService:
         self._events: Dict[str, ScheduledEvent] = {}
         self._holidays: Dict[str, List[datetime]] = {}  # country -> dates
         self._timezone: str = "UTC"
-        self._logger = UnifiedLogger(
-            name="CalendarService",
-            config=config
-        )
+        self._logger = logging.getLogger("CalendarService")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -47060,10 +46947,7 @@ class CommandPatternManager:
         self._redo_stack: List[Command] = []
         self._macros: Dict[str, List[Command]] = {}
         self._recording_macro: Optional[str] = None
-        self._logger = UnifiedLogger(
-            name="CommandPatternManager",
-            config=config
-        )
+        self._logger = logging.getLogger("CommandPatternManager")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -77968,6 +77852,14 @@ def main() -> int:
 
     v119.0: Enterprise-grade exit handling with guaranteed process termination.
     """
+    # v253.8: Enable faulthandler for deadlock diagnosis.
+    # Send SIGUSR1 to dump all thread tracebacks: kill -SIGUSR1 <pid>
+    import faulthandler
+    import signal as _sig
+    faulthandler.enable()
+    if hasattr(_sig, "SIGUSR1"):
+        faulthandler.register(_sig.SIGUSR1, all_threads=True, chain=False)
+
     # Parse arguments
     parser = create_argument_parser()
     args = parser.parse_args()

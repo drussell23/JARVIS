@@ -653,7 +653,17 @@ async def initialize_coding_council_startup(
         log.info("=" * 60)
 
         # Run pre-flight diagnostics
-        preflight_passed = await _run_preflight_checks(log)
+        # v253.7: Added timeout to prevent preflight from stalling startup
+        _preflight_timeout = float(os.getenv("JARVIS_CC_PREFLIGHT_TIMEOUT", "30"))
+        try:
+            preflight_passed = await asyncio.wait_for(
+                _run_preflight_checks(log), timeout=_preflight_timeout
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                f"[CodingCouncilStartup] Pre-flight checks timed out after {_preflight_timeout}s"
+            )
+            preflight_passed = True  # Don't block startup
         if not preflight_passed:
             log.warning("[CodingCouncilStartup] Some pre-flight checks failed, continuing anyway")
 

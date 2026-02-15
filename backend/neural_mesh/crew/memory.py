@@ -193,7 +193,8 @@ class ChromaDBBackend(MemoryBackend):
                     settings=settings,
                 )
             else:
-                self._client = chromadb.Client(settings=settings)
+                # v253.6: chromadb.Client() deprecated in 1.x, use EphemeralClient
+                self._client = chromadb.EphemeralClient(settings=settings)
 
             self._collection = self._client.get_or_create_collection(
                 name=self._collection_name,

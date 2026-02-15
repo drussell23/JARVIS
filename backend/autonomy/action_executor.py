@@ -310,7 +310,7 @@ class ActionExecutor:
         Raises:
             Exception: If application focus or notification handling fails
         """
-        app = action.params['app']
+        app = action.params.get('app', action.target or 'unknown')
         count = action.params.get('count', 0)
         window_id = action.params.get('window_id')
         
@@ -458,9 +458,12 @@ class ActionExecutor:
         Raises:
             Exception: If security response actions fail
         """
-        app = action.params['app']
-        concern_type = action.params['concern_type']
-        
+        app = action.params.get('app', action.target or 'unknown')
+        concern_type = action.params.get(
+            'concern_type',
+            action.params.get('situation_type', 'general'),
+        )
+
         logger.warning(f"Security alert: {concern_type} in {app}")
         
         if self.dry_run:
@@ -474,12 +477,12 @@ class ActionExecutor:
         if concern_type == 'sensitive_content':
             # Hide the application immediately
             await self.macos_controller.hide_application(app)
-            
+
             # Take screenshot for audit
             screenshot_path = await self.macos_controller.take_screenshot(
                 f"security_alert_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
             )
-            
+
             return {
                 'success': True,
                 'action_taken': 'hid_application',
@@ -487,10 +490,18 @@ class ActionExecutor:
                 'rollback_available': True,
                 'rollback_data': {'app': app, 'was_visible': True}
             }
-        
+
+        # For other concern types (general, security_concern, etc.), log and
+        # acknowledge.  Returning success=True so proactive/orchestrated alerts
+        # don't cascade as failures when no specific handler matches.
+        logger.info(
+            f"Security alert acknowledged: concern_type={concern_type}, app={app}"
+        )
         return {
-            'success': False,
-            'error': f"Unknown concern type: {concern_type}",
+            'success': True,
+            'action_taken': 'logged_alert',
+            'concern_type': concern_type,
+            'app': app,
             'rollback_available': False
         }
     
@@ -674,7 +685,7 @@ class ActionExecutor:
         Raises:
             Exception: If application focusing or notification display fails
         """
-        app = action.params['app']
+        app = action.params.get('app', action.target or 'unknown')
         urgency_score = action.params.get('urgency_score', 0)
         title = action.params.get('title', '')
         

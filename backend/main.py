@@ -3736,7 +3736,17 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         logger.info("PROJECT TRINITY: Initializing JARVIS Body Connection")
         logger.info("=" * 60)
 
-        trinity_initialized = await initialize_trinity(app)
+        # v253.7: Added timeout to prevent Trinity init from stalling backend startup
+        _trinity_init_timeout = float(os.getenv("JARVIS_TRINITY_INIT_TIMEOUT", "45"))
+        try:
+            trinity_initialized = await asyncio.wait_for(
+                initialize_trinity(app), timeout=_trinity_init_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"⚠️ PROJECT TRINITY: Initialization timed out after {_trinity_init_timeout}s"
+            )
+            trinity_initialized = False
 
         if trinity_initialized:
             app.state.trinity_initialized = True

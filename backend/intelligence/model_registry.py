@@ -133,6 +133,16 @@ class ModelDefinition:
             return 10.0  # Partial load, estimate remaining
         return 0.0
 
+    def __eq__(self, other: object) -> bool:
+        """Two ModelDefinitions are equal if they have the same name"""
+        if not isinstance(other, ModelDefinition):
+            return NotImplemented
+        return self.name == other.name
+
+    def __hash__(self) -> int:
+        """Hash by name so ModelDefinition can be used in sets and as dict keys"""
+        return hash(self.name)
+
 
 class ModelRegistry:
     """

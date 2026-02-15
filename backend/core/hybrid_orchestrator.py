@@ -1359,9 +1359,20 @@ class HybridOrchestrator:
             return await self.execute_llm_inference(query, **kwargs)
 
         try:
+            # Extract text query for model selection when query is multimodal content (list)
+            # Vision callers pass a list of dicts (e.g. [{"type": "image", ...}, {"type": "text", "text": "..."}])
+            # The model selector needs a plain string for intent classification and complexity estimation
+            if isinstance(query, list):
+                selector_query = " ".join(
+                    item.get("text", "") for item in query
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ) or "multimodal query"
+            else:
+                selector_query = query
+
             # Select best model with fallback chain
             primary_model, fallbacks = await model_selector.select_with_fallback(
-                query=query,
+                query=selector_query,
                 intent=intent,
                 required_capabilities=required_capabilities,
                 context=context,

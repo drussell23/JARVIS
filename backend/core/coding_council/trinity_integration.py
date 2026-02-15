@@ -433,12 +433,18 @@ class CodingCouncilTrinityBridge:
     # =========================================================================
 
     async def _initialize_trinity_modules(self) -> None:
-        """Initialize all v77.0 Trinity modules."""
+        """Initialize all v77.0 Trinity modules.
+
+        v253.7: Added per-step timeouts to prevent startup stall. Each module
+        init is individually timed so a single hanging module doesn't block
+        the rest.
+        """
         if not TRINITY_MODULE_AVAILABLE:
             logger.info("[CodingCouncilTrinity] Trinity modules not available, using fallback mode")
             return
 
         logger.info("[CodingCouncilTrinity] Initializing v77.0 Trinity modules...")
+        _step_timeout = float(os.getenv("JARVIS_CC_TRINITY_STEP_TIMEOUT", "15"))
 
         try:
             # 1. Initialize Multi-Transport (Gap #1)
@@ -449,8 +455,11 @@ class CodingCouncilTrinityBridge:
                 websocket_url=os.getenv("TRINITY_WEBSOCKET_URL"),
                 file_base_dir=trinity_dir / "messages",  # v90.0: Fixed from file_transport_dir
             )
-            await self._multi_transport.start()
-            logger.info("[CodingCouncilTrinity] MultiTransport started")
+            try:
+                await asyncio.wait_for(self._multi_transport.start(), timeout=_step_timeout)
+                logger.info("[CodingCouncilTrinity] MultiTransport started")
+            except asyncio.TimeoutError:
+                logger.warning(f"[CodingCouncilTrinity] MultiTransport start timed out ({_step_timeout}s)")
 
             # 2. Initialize Message Queue (Gap #4)
             # v90.0: Fixed parameters to match PersistentMessageQueue.__init__ signature
@@ -459,8 +468,11 @@ class CodingCouncilTrinityBridge:
             self._message_queue = PersistentMessageQueue(
                 db_path=queue_db,
             )
-            await self._message_queue.start()
-            logger.info("[CodingCouncilTrinity] MessageQueue started")
+            try:
+                await asyncio.wait_for(self._message_queue.start(), timeout=_step_timeout)
+                logger.info("[CodingCouncilTrinity] MessageQueue started")
+            except asyncio.TimeoutError:
+                logger.warning(f"[CodingCouncilTrinity] MessageQueue start timed out ({_step_timeout}s)")
 
             # 3. Initialize Heartbeat Validator (Gaps #2, #3)
             # v90.0: Fixed parameter to match HeartbeatValidator.__init__ signature
@@ -469,28 +481,34 @@ class CodingCouncilTrinityBridge:
             self._heartbeat_validator = HeartbeatValidator(
                 heartbeat_dir=heartbeat_dir,
             )
-            await self._heartbeat_validator.start()
-            self._heartbeat_validator.on_staleness(self._on_component_stale)
-            logger.info("[CodingCouncilTrinity] HeartbeatValidator started")
+            try:
+                await asyncio.wait_for(self._heartbeat_validator.start(), timeout=_step_timeout)
+                self._heartbeat_validator.on_staleness(self._on_component_stale)
+                logger.info("[CodingCouncilTrinity] HeartbeatValidator started")
+            except asyncio.TimeoutError:
+                logger.warning(f"[CodingCouncilTrinity] HeartbeatValidator start timed out ({_step_timeout}s)")
 
             # 4. Initialize Cross-Repo Sync (Gaps #5, #6, #7)
             # v90.0: Fixed - CrossRepoSync.__init__ takes no parameters
             # It uses DEFAULT_PATHS and can be configured via environment variables
             if _is_cross_repo_enabled():
                 self._cross_repo_sync = CrossRepoSync()
-                
+
                 # Wire up sync events to Trinity network
                 self._cross_repo_sync.on_event(self._on_sync_event)
-                
-                await self._cross_repo_sync.start()
-                logger.info("[CodingCouncilTrinity] CrossRepoSync started")
+
+                _cross_repo_timeout = float(os.getenv("JARVIS_CC_CROSS_REPO_TIMEOUT", "35"))
+                try:
+                    await asyncio.wait_for(self._cross_repo_sync.start(), timeout=_cross_repo_timeout)
+                    logger.info("[CodingCouncilTrinity] CrossRepoSync started")
+                except asyncio.TimeoutError:
+                    logger.warning(f"[CodingCouncilTrinity] CrossRepoSync start timed out ({_cross_repo_timeout}s)")
 
             logger.info("[CodingCouncilTrinity] All Trinity modules initialized")
 
         except Exception as e:
             logger.error(f"[CodingCouncilTrinity] Trinity module init failed: {e}")
             # Graceful degradation - continue without failed modules
-            pass
 
     async def _on_sync_event(self, event: SyncEvent) -> None:
         """
@@ -1298,14 +1316,24 @@ async def initialize_coding_council_trinity(council: "UnifiedCodingCouncil") -> 
 
     This should be called after UnifiedCodingCouncil is initialized.
 
+    v253.7: Added overall timeout to prevent startup stall.
+
     Args:
         council: The initialized UnifiedCodingCouncil instance
 
     Returns:
         True if initialization succeeded
     """
+    _init_timeout = float(os.getenv("JARVIS_CC_TRINITY_INIT_TIMEOUT", "60"))
     bridge = await get_coding_council_bridge()
-    return await bridge.initialize(council)
+    try:
+        return await asyncio.wait_for(bridge.initialize(council), timeout=_init_timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[CodingCouncilTrinity] bridge.initialize() timed out after {_init_timeout}s "
+            "— continuing without full Trinity integration"
+        )
+        return False
 
 
 async def shutdown_coding_council_trinity() -> None:

@@ -413,8 +413,12 @@ class IntegrationOrchestrator:
         # Analyze with quadtree
         try:
             quadtree = self.components['quadtree']
-            regions = await quadtree.analyze_frame(frame)
-            
+
+            # Build quadtree from frame, then query for important regions
+            import hashlib as _hashlib
+            frame_id = _hashlib.sha256(frame.tobytes()[:4096]).hexdigest()[:16]
+            await quadtree.build_quadtree(frame, frame_id)
+
             # Filter by importance based on mode
             importance_threshold = {
                 SystemMode.NORMAL: 0.3,
@@ -422,13 +426,30 @@ class IntegrationOrchestrator:
                 SystemMode.CRITICAL: 0.7,
                 SystemMode.EMERGENCY: 0.9
             }[self.system_mode]
-            
-            important_regions = [r for r in regions if r['importance'] >= importance_threshold]
-            
+
+            query_result = await quadtree.query_regions(
+                frame_id,
+                importance_threshold=importance_threshold
+            )
+
+            # Convert QuadNode objects to dicts for downstream consumption
+            regions = [
+                {
+                    'x': node.x,
+                    'y': node.y,
+                    'width': node.width,
+                    'height': node.height,
+                    'importance': node.importance,
+                    'complexity': node.complexity,
+                    'area': node.area(),
+                }
+                for node in query_result.nodes
+            ]
+
             return {
-                'regions': important_regions,
-                'total_regions': len(regions),
-                'coverage_ratio': sum(r['area'] for r in important_regions) / (frame.shape[0] * frame.shape[1])
+                'regions': regions,
+                'total_regions': query_result.total_importance,
+                'coverage_ratio': query_result.coverage_ratio
             }
         except Exception as e:
             logger.error(f"Spatial analysis failed: {e}")
@@ -451,10 +472,12 @@ class IntegrationOrchestrator:
         
         try:
             vsms = self.components['vsms']
+            # VisualStateManager.process_visual_observation() accepts
+            # (screenshot, app_id) -- pass app_id from context if available.
+            app_id = context.get('app_id') if context else None
             state_result = await vsms.process_visual_observation(
                 screenshot=frame,
-                regions=spatial.get('regions', []),
-                context=context
+                app_id=app_id
             )
             
             return {

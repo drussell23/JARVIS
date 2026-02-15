@@ -121,7 +121,7 @@ class VisionConfig:
         default_factory=lambda: int(os.getenv("VISION_MAX_TOKENS", "1500"))
     )
     model_name: str = field(
-        default_factory=lambda: os.getenv("VISION_MODEL", "claude-3-5-sonnet-20241022")
+        default_factory=lambda: os.getenv("VISION_MODEL", "claude-sonnet-4-5-20250929")
     )
     max_concurrent_requests: int = field(
         default_factory=lambda: int(os.getenv("VISION_MAX_CONCURRENT", "10"))
@@ -3741,10 +3741,15 @@ class ClaudeVisionAnalyzer:
                 self.executor, self._resize_image, pil_image
             )
 
-        # Generate hash for caching
-        image_bytes = io.BytesIO()
-        pil_image.save(image_bytes, format="PNG")
-        image_hash = hashlib.md5(image_bytes.getvalue()).hexdigest()
+        # v253.8: Run CPU-intensive image serialization off the event loop
+        def _compute_hash(img):
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf, hashlib.md5(buf.getvalue()).hexdigest()
+
+        image_bytes, image_hash = await asyncio.get_event_loop().run_in_executor(
+            self.executor, _compute_hash, pil_image
+        )
 
         return pil_image, image_hash
 
@@ -5442,7 +5447,7 @@ Be concise. Format: Location: X, Temp: X°F, Condition: X, High/Low: X/X"""
             }
 
             data = {
-                "model": "claude-3-5-sonnet-20241022",
+                "model": "claude-sonnet-4-5-20250929",
                 "max_tokens": 200,
                 "temperature": 0.3,
                 "messages": [
@@ -5888,7 +5893,21 @@ Focus on what's visible in this specific region. Be concise but thorough."""
             # Gather multi-space data
             window_data = {}
             if self.multi_space_detector:
-                window_data = self.multi_space_detector.get_all_windows_across_spaces()
+                # v253.8: Use async version to avoid blocking event loop (was 8s sync)
+                if hasattr(self.multi_space_detector, 'get_all_windows_across_spaces_async'):
+                    try:
+                        _ms_timeout = float(os.getenv("JARVIS_MULTI_SPACE_TIMEOUT", "10"))
+                        window_data = await asyncio.wait_for(
+                            self.multi_space_detector.get_all_windows_across_spaces_async(),
+                            timeout=_ms_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("[SmartAnalyze] Multi-space detection timed out after %ss", _ms_timeout)
+                    except Exception as e:
+                        logger.debug("[SmartAnalyze] Async multi-space failed, using sync fallback: %s", e)
+                        window_data = self.multi_space_detector.get_all_windows_across_spaces()
+                else:
+                    window_data = self.multi_space_detector.get_all_windows_across_spaces()
 
             # Process with multi-space intelligence
             query_analysis = self.multi_space_extension.process_multi_space_query(

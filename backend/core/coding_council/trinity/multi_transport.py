@@ -214,12 +214,18 @@ class RedisTransport(BaseTransport):
 
         try:
             self._client = redis.from_url(self.url, decode_responses=True)
-            await self._client.ping()
+            # v253.7: Added timeout to ping() — can hang if Redis is partially reachable
+            _redis_timeout = float(os.getenv("JARVIS_CC_REDIS_CONNECT_TIMEOUT", "5"))
+            await asyncio.wait_for(self._client.ping(), timeout=_redis_timeout)
             self._pubsub = self._client.pubsub()
             self._connected = True
             self.status = TransportStatus.CONNECTED
             logger.info("[RedisTransport] Connected")
             return True
+        except asyncio.TimeoutError:
+            logger.info("[RedisTransport] Ping timed out (not available)")
+            self.status = TransportStatus.FAILED
+            return False
         except Exception as e:
             # v109.2: Connection failures during startup are expected
             logger.info(f"[RedisTransport] Not available: {e}")

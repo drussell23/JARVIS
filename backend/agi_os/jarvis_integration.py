@@ -437,13 +437,20 @@ class ScreenAnalyzerBridge:
         owner_identity: Optional[Any],
     ) -> None:
         """Initialize required components."""
+        # v253.8: Per-component timeouts to prevent event loop deadlock.
+        _component_timeout = float(os.getenv("JARVIS_SCREEN_BRIDGE_COMPONENT_TIMEOUT", "5"))
+
         # Event stream
         if event_stream:
             self._event_stream = event_stream
         else:
             try:
                 from .proactive_event_stream import get_event_stream
-                self._event_stream = await get_event_stream()
+                self._event_stream = await asyncio.wait_for(
+                    get_event_stream(), timeout=_component_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Event stream init timed out after %ss", _component_timeout)
             except Exception as e:
                 logger.warning("Could not get event stream: %s", e)
 
@@ -453,7 +460,11 @@ class ScreenAnalyzerBridge:
         else:
             try:
                 from .realtime_voice_communicator import get_voice_communicator
-                self._voice = await get_voice_communicator()
+                self._voice = await asyncio.wait_for(
+                    get_voice_communicator(), timeout=_component_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Voice communicator init timed out after %ss", _component_timeout)
             except Exception as e:
                 logger.warning("Could not get voice communicator: %s", e)
 
@@ -463,7 +474,11 @@ class ScreenAnalyzerBridge:
         else:
             try:
                 from .owner_identity_service import get_owner_identity
-                self._owner_identity = await get_owner_identity()
+                self._owner_identity = await asyncio.wait_for(
+                    get_owner_identity(), timeout=_component_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Owner identity init timed out after %ss", _component_timeout)
             except Exception as e:
                 logger.warning("Could not get owner identity service: %s", e)
 

@@ -1531,18 +1531,26 @@ class UnifiedCodingCouncil:
                 logger.warning(f"[CodingCouncil] Safety modules init failed: {e}")
 
         # Trinity (Gaps #1-7)
+        # v253.7: Added per-step timeouts — git subprocesses in CrossRepoSync
+        # can hang indefinitely, stalling the entire startup.
         if TRINITY_AVAILABLE:
+            _trinity_step_timeout = float(os.getenv("JARVIS_CC_TRINITY_STEP_TIMEOUT", "15"))
             try:
                 self._message_queue = PersistentMessageQueue()
-                await self._message_queue.start()
+                await asyncio.wait_for(self._message_queue.start(), timeout=_trinity_step_timeout)
 
                 self._heartbeat_validator = HeartbeatValidator()
-                await self._heartbeat_validator.start()
+                await asyncio.wait_for(self._heartbeat_validator.start(), timeout=_trinity_step_timeout)
 
                 self._cross_repo_sync = CrossRepoSync()
-                await self._cross_repo_sync.start()
+                await asyncio.wait_for(
+                    self._cross_repo_sync.start(),
+                    timeout=float(os.getenv("JARVIS_CC_CROSS_REPO_TIMEOUT", "35")),
+                )
 
                 logger.info("[CodingCouncil] Trinity modules initialized")
+            except asyncio.TimeoutError:
+                logger.warning("[CodingCouncil] Trinity modules init timed out — continuing without")
             except Exception as e:
                 logger.warning(f"[CodingCouncil] Trinity modules init failed: {e}")
 

@@ -1166,7 +1166,12 @@ class IntelligentActionOrchestrator:
                     dry_run=False
                 )
 
-                if result.success:
+                # ExecutionResult uses .status (ExecutionStatus enum),
+                # not .success (bool). Check against ExecutionStatus.SUCCESS.
+                from autonomy.action_executor import ExecutionStatus
+                _succeeded = (result.status == ExecutionStatus.SUCCESS)
+
+                if _succeeded:
                     self._stats['actions_executed'] += 1
 
                     # Emit completed event

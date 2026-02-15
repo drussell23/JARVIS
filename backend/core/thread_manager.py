@@ -848,9 +848,13 @@ class ManagedThreadPoolExecutor(ThreadPoolExecutor):
         future = super().submit(tracked_fn, *args, **kwargs)
 
         # Track future for potential cancellation
+        # v253.8: Register callback OUTSIDE lock to prevent re-entrancy deadlock.
+        # If the future completes immediately, add_done_callback calls the
+        # callback inline — _remove_future then re-acquires _futures_lock,
+        # deadlocking on the non-reentrant Lock.
         with self._futures_lock:
             self._pending_futures.add(future)
-            future.add_done_callback(lambda f: self._remove_future(f))
+        future.add_done_callback(lambda f: self._remove_future(f))
 
         return future
 

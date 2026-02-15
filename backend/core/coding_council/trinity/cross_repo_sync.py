@@ -133,14 +133,24 @@ class CrossRepoSync:
             )
 
     async def start(self) -> None:
-        """Start the sync manager."""
+        """Start the sync manager.
+
+        v253.7: Wrapped _discover_repos() in timeout to prevent startup stall.
+        """
         if self._running:
             return
 
         self._running = True
 
-        # Initial discovery
-        await self._discover_repos()
+        # Initial discovery (with timeout — git subprocesses can hang)
+        _discovery_timeout = float(os.getenv("JARVIS_CROSS_REPO_DISCOVERY_TIMEOUT", "30"))
+        try:
+            await asyncio.wait_for(self._discover_repos(), timeout=_discovery_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[CrossRepoSync] Repo discovery timed out after {_discovery_timeout}s "
+                "— continuing with partial state"
+            )
 
         # Start sync loop
         self._sync_task = asyncio.create_task(self._sync_loop())
@@ -314,7 +324,13 @@ class CrossRepoSync:
                 logger.warning(f"[CrossRepoSync] Repo not found: {repo_type.value}")
 
     async def _get_git_info(self, repo: RepoState) -> None:
-        """Get git information for a repository."""
+        """Get git information for a repository.
+
+        v253.7: Added per-command timeout to prevent startup stall if git hangs
+        (e.g., lock file contention, credential helper, slow filesystem).
+        """
+        _git_timeout = float(os.getenv("JARVIS_GIT_SUBPROCESS_TIMEOUT", "10"))
+
         try:
             # Get current branch
             proc = await asyncio.create_subprocess_exec(
@@ -323,9 +339,14 @@ class CrossRepoSync:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await proc.communicate()
-            if proc.returncode == 0:
-                repo.branch = stdout.decode().strip()
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_git_timeout)
+                if proc.returncode == 0:
+                    repo.branch = stdout.decode().strip()
+            except asyncio.TimeoutError:
+                logger.debug(f"[CrossRepoSync] git rev-parse timed out for {repo.repo_path}")
+                proc.kill()
+                await proc.wait()
 
             # Get commit hash
             proc = await asyncio.create_subprocess_exec(
@@ -334,9 +355,14 @@ class CrossRepoSync:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await proc.communicate()
-            if proc.returncode == 0:
-                repo.git_hash = stdout.decode().strip()
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_git_timeout)
+                if proc.returncode == 0:
+                    repo.git_hash = stdout.decode().strip()
+            except asyncio.TimeoutError:
+                logger.debug(f"[CrossRepoSync] git rev-parse --short timed out for {repo.repo_path}")
+                proc.kill()
+                await proc.wait()
 
             # Get pending changes count
             proc = await asyncio.create_subprocess_exec(
@@ -345,10 +371,15 @@ class CrossRepoSync:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, _ = await proc.communicate()
-            if proc.returncode == 0:
-                changes = [l for l in stdout.decode().strip().split("\n") if l]
-                repo.pending_changes = len(changes)
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_git_timeout)
+                if proc.returncode == 0:
+                    changes = [l for l in stdout.decode().strip().split("\n") if l]
+                    repo.pending_changes = len(changes)
+            except asyncio.TimeoutError:
+                logger.debug(f"[CrossRepoSync] git status timed out for {repo.repo_path}")
+                proc.kill()
+                await proc.wait()
 
         except Exception as e:
             logger.debug(f"[CrossRepoSync] Git info failed: {e}")
