@@ -1379,7 +1379,7 @@ class HybridOrchestrator:
             )
 
             if not primary_model:
-                logger.error("No suitable model found for query")
+                logger.warning("No suitable model found for query (selector may still be loading)")
                 return {"success": False, "error": "No suitable model found", "query": query}
 
             # Try primary model

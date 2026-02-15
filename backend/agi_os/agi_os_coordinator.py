@@ -303,25 +303,26 @@ class AGIOSCoordinator:
         # Previous 225s total always triggered budget scaling on the default
         # 110s budget (supervisor outer timeout was only 120s), compressing
         # neural_mesh from 90s to ~36s and causing agent/bridge timeouts.
-        # v254.0: Supervisor outer timeout raised to 260s (budget ~250s after
-        # reserve), so these defaults now fit without scaling.
-        # Reduced further for tighter fit with comfortable headroom:
-        #   components:  30→20 (parallel init, typical 8-14s observed)
+        # v254.0: Supervisor outer timeout raised to 300s (budget ~290s after
+        # reserve), so these defaults fit without scaling.
+        # v254.1: Observed timings from startup10:
+        #   components:  8 sub-components sequential, Ghost Hands alone ~5s,
+        #                ghost display ~13s → needs 25-30s. Set 35s.
         #   intelligence: 45 (kept — speaker verification loads ECAPA-TDNN)
-        #   neural_mesh: 90→75 (18+ agents register in parallel since v251.3)
-        #   hybrid: 10→5 (just object construction, <1s typical)
-        #   screen_analyzer: 30→25 (fixed Py3.9 threading, faster now)
-        #   components_connected: 20→10 (lightweight wiring, <5s typical)
-        # New total: 20+45+75+5+25+10 = 180s (fits 250s budget with 70s spare)
+        #   neural_mesh: bridge needs ~47s, agents ~22s → needs 80-90s. Set 100s.
+        #   hybrid: 5 (just object construction, <1s typical)
+        #   screen_analyzer: 25 (fixed Py3.9 threading, faster now)
+        #   components_connected: 10 (lightweight wiring, <5s typical)
+        # New total: 35+45+100+5+25+10 = 220s (fits 290s budget with 70s spare)
         phase_timeouts = {
             "agi_os_components": _env_float(
-                "JARVIS_AGI_OS_PHASE_COMPONENTS_TIMEOUT", 20.0
+                "JARVIS_AGI_OS_PHASE_COMPONENTS_TIMEOUT", 35.0
             ),
             "intelligence_systems": _env_float(
                 "JARVIS_AGI_OS_PHASE_INTELLIGENCE_TIMEOUT", 45.0
             ),
             "neural_mesh": _env_float(
-                "JARVIS_AGI_OS_PHASE_NEURAL_MESH_TIMEOUT", 75.0
+                "JARVIS_AGI_OS_PHASE_NEURAL_MESH_TIMEOUT", 100.0
             ),
             "hybrid_orchestrator": _env_float(
                 "JARVIS_AGI_OS_PHASE_HYBRID_TIMEOUT", 5.0
@@ -929,7 +930,7 @@ class AGIOSCoordinator:
         # tight startup_budget_seconds, the phase might be scaled from 45s
         # to as low as 15s. Per-component timeout must fit within this.
         _phase_budget = getattr(self, '_phase_budgets', {}).get(
-            "agi_os_components", 20.0
+            "agi_os_components", 35.0
         )
         # Leave 2s margin for gather() overhead and progress reporting
         _comp_timeout = min(_comp_timeout_base, max(3.0, _phase_budget - 2.0))
@@ -1292,9 +1293,9 @@ class AGIOSCoordinator:
             # Default 75s — capped to the phase timeout (also 75s by default).
             # v254.0: Supervisor outer timeout raised to 260s, so the phase
             # budget no longer gets squeezed.  Internal budget is min(env, phase-3).
-            _nm_env = _env_float("JARVIS_AGI_OS_NEURAL_MESH_BUDGET", 75.0)
+            _nm_env = _env_float("JARVIS_AGI_OS_NEURAL_MESH_BUDGET", 100.0)
             _nm_phase = getattr(self, '_phase_budgets', {}).get(
-                "neural_mesh", 75.0,
+                "neural_mesh", 100.0,
             )
             total_budget = min(_nm_env, max(10.0, _nm_phase - 3.0))
             budget_start = time.monotonic()

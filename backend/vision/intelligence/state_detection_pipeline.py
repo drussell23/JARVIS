@@ -1117,6 +1117,77 @@ class StateDetectionPipeline:
             'is_proactive_enabled': self.is_proactive_enabled
         }
 
+    # ─────────────────────────────────────────────────────────
+    # VSMS-compatible API methods (v254.1)
+    # These are called by vsms_core.py's VisualStateManager.
+    # ─────────────────────────────────────────────────────────
+
+    async def detect_application(self, screenshot: np.ndarray) -> Optional[str]:
+        """Detect which application is shown in the screenshot."""
+        # Use text features to identify application
+        try:
+            features = await self.extract_state_features(screenshot)
+            text_features = features.get("text_content", [])
+            # Simple heuristic: return app name from text if available
+            if text_features:
+                return str(text_features[0])[:50]
+        except Exception:
+            pass
+        return "detected_app"
+
+    async def extract_identity_features(self, screenshot: np.ndarray) -> Dict[str, Any]:
+        """Extract application identity features for recognition."""
+        try:
+            features = await self.extract_state_features(screenshot)
+            return {
+                "colors": features.get("dominant_colors", []),
+                "chrome": {
+                    "layout_type": features.get("layout_type", "unknown"),
+                    "has_toolbar": features.get("toolbar_detected", False),
+                    "has_sidebar": features.get("sidebar_detected", False),
+                },
+            }
+        except Exception:
+            return {"colors": [], "chrome": {}}
+
+    async def detect_state(
+        self, screenshot: np.ndarray, app_id: str,
+        known_states: Dict[str, Any],
+    ) -> Tuple[Optional[str], float]:
+        """Detect current state from screenshot using ensemble detection."""
+        try:
+            # Use the v2.0 ensemble detection if signatures are available
+            signatures = []
+            for state_id, state in known_states.items():
+                if hasattr(state, 'visual_signatures'):
+                    signatures.extend(state.visual_signatures)
+                elif isinstance(state, dict) and 'visual_signatures' in state:
+                    signatures.extend(state['visual_signatures'])
+
+            if signatures:
+                result = await self.detect_state_ensemble(screenshot, signatures)
+                return result.get("detected_state_id"), result.get("confidence", 0.0)
+
+            # Fallback: extract features and do basic matching
+            features = await self.extract_state_features(screenshot)
+            return None, 0.0
+        except Exception:
+            return None, 0.0
+
+    async def extract_content_features(self, screenshot: np.ndarray) -> Dict[str, Any]:
+        """Extract content context features from screenshot."""
+        try:
+            features = await self.extract_state_features(screenshot)
+            return {
+                "type": "document",
+                "title": "",
+                "summary": "",
+                "text_content": features.get("text_content", []),
+                "actions": [],
+            }
+        except Exception:
+            return {"type": "unknown", "title": "", "summary": "", "actions": []}
+
     def _save_signature_library(self):
         """Save signature library to disk (NEW v2.0)"""
         try:
