@@ -1701,7 +1701,11 @@ class ProgressAwareStartupController:
         self.extension_buffer = extension_buffer
         self.stall_threshold = stall_threshold
         self.logger = logger or logging.getLogger(__name__)
-        
+        self.post_complete_grace = max(
+            5.0,
+            float(os.environ.get("JARVIS_STARTUP_POST_COMPLETE_GRACE", "45.0")),
+        )
+
         # State tracking
         self._last_progress_pct: float = 0.0
         self._last_progress_time: float = 0.0
@@ -1711,6 +1715,7 @@ class ProgressAwareStartupController:
         self._current_deadline: float = 0.0
         self._extensions_granted: int = 0
         self._start_time: float = 0.0
+        self._completion_seen_at: float = 0.0
 
     def _get_progress_state(self, get_state_func: Callable[[], Dict]) -> Dict[str, Any]:
         """
@@ -1811,6 +1816,7 @@ class ProgressAwareStartupController:
         self._last_diag_log_time = self._start_time
         self._last_progress_pct = 0.0
         self._extensions_granted = 0
+        self._completion_seen_at = 0.0
 
         # Create the startup task
         task = asyncio.create_task(coro)
@@ -1860,6 +1866,37 @@ class ProgressAwareStartupController:
                 if activity_timestamp > 0 and activity_timestamp > self._last_activity_time:
                     self._last_activity_time = activity_timestamp
                     self._last_activity_source = activity_source or "activity_marker"
+
+                # RULE 1.5: Completion finalization watchdog.
+                # If startup has reported complete/100% but task is still running,
+                # bound finalization latency so we don't hang until global timeout.
+                completion_reported = stage == "complete" or progress_pct >= 100.0
+                if completion_reported:
+                    if self._completion_seen_at <= 0:
+                        self._completion_seen_at = now
+                        self.logger.info(
+                            "[ProgressController] Completion reported "
+                            "(stage=%s, progress=%.1f%%), allowing %.1fs finalization grace",
+                            stage,
+                            progress_pct,
+                            self.post_complete_grace,
+                        )
+                    elif (now - self._completion_seen_at) >= self.post_complete_grace:
+                        completion_wait = now - self._completion_seen_at
+                        self.logger.error(
+                            "[ProgressController] COMPLETION STALL at %.1f%% "
+                            "(stage=%s) for %.1fs after completion signal",
+                            progress_pct,
+                            stage,
+                            completion_wait,
+                        )
+                        task.cancel()
+                        raise asyncio.TimeoutError(
+                            f"Startup completion stalled for {completion_wait:.0f}s "
+                            f"after reaching {progress_pct:.1f}%"
+                        )
+                else:
+                    self._completion_seen_at = 0.0
 
                 # RULE 2: Extend deadline if progress/activity warrants it
                 time_since_progress = now - self._last_progress_time
