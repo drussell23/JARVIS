@@ -379,7 +379,17 @@ class NeuralMeshCoordinator:
                 for task_attr in ("_heartbeat_task", "_message_handler_task"):
                     task = getattr(agent, task_attr, None)
                     if task and not task.done():
-                        task.cancel()
+                        try:
+                            task.cancel()
+                        except RuntimeError as e:
+                            if "Event loop is closed" in str(e):
+                                logger.debug(
+                                    "Skipping %s task cancel for %s: event loop closed",
+                                    task_attr,
+                                    agent.agent_name,
+                                )
+                            else:
+                                raise
             except Exception as e:
                 logger.exception("Error stopping agent %s: %s", agent.agent_name, e)
 

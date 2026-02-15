@@ -64781,8 +64781,17 @@ class JarvisSystemKernel:
                         startup_cancel_grace = _get_env_float(
                             "JARVIS_AGI_OS_START_CANCEL_GRACE", 8.0
                         )
+                        startup_budget_reserve = _get_env_float(
+                            "JARVIS_AGI_OS_SUPERVISOR_RESERVE", 10.0
+                        )
+                        startup_budget_seconds = max(
+                            30.0, agi_os_init_timeout - startup_budget_reserve
+                        )
                         startup_task = asyncio.create_task(
-                            start_agi_os(progress_callback=_agi_os_progress),
+                            start_agi_os(
+                                progress_callback=_agi_os_progress,
+                                startup_budget_seconds=startup_budget_seconds,
+                            ),
                             name="kernel_agi_os_startup",
                         )
                         startup_started = time.monotonic()

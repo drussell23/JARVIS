@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import time
@@ -234,7 +235,7 @@ class AGIOSCoordinator:
         """Get component status dictionary."""
         return self._component_status
 
-    async def start(self, progress_callback=None) -> None:
+    async def start(self, progress_callback=None, startup_budget_seconds: Optional[float] = None) -> None:
         """
         Start the AGI OS.
 
@@ -246,6 +247,8 @@ class AGIOSCoordinator:
                 DMS watchdog doesn't trigger a stall during the 60-75s init
                 sequence. v250.0: Without this, progress 86→87 gap exceeds
                 the 60s stall threshold.
+            startup_budget_seconds: Optional total AGI startup budget. When
+                provided, per-phase timeouts are scaled to fit this budget.
         """
         if self._state == AGIOSState.ONLINE:
             logger.warning("AGI OS already online")
@@ -298,6 +301,55 @@ class AGIOSCoordinator:
                 "JARVIS_AGI_OS_PHASE_CONNECT_TIMEOUT", 45.0
             ),
         }
+
+        # Keep phase-level budgets aligned with the caller's startup envelope.
+        effective_budget = startup_budget_seconds
+        if effective_budget is None:
+            env_budget = _env_float("JARVIS_AGI_OS_PHASE_TOTAL_BUDGET", 0.0)
+            effective_budget = env_budget if env_budget > 0 else None
+
+        if effective_budget is not None:
+            phase_budget_reserve = max(
+                1.0, _env_float("JARVIS_AGI_OS_PHASE_BUDGET_RESERVE", 8.0)
+            )
+            phase_min_timeout = max(
+                0.5, _env_float("JARVIS_AGI_OS_PHASE_MIN_TIMEOUT", 5.0)
+            )
+            available_phase_budget = max(
+                len(phase_timeouts) * 0.5,
+                float(effective_budget) - phase_budget_reserve,
+            )
+            phase_total = sum(float(v) for v in phase_timeouts.values())
+
+            if phase_total > available_phase_budget:
+                keys = list(phase_timeouts.keys())
+                min_total = phase_min_timeout * len(keys)
+                scaled: Dict[str, float] = {}
+                if available_phase_budget <= min_total:
+                    even = max(0.5, available_phase_budget / max(1, len(keys)))
+                    for key in keys:
+                        scaled[key] = even
+                else:
+                    adjustable_total = sum(
+                        max(0.0, float(phase_timeouts[key]) - phase_min_timeout)
+                        for key in keys
+                    )
+                    remainder = available_phase_budget - min_total
+                    for key in keys:
+                        base = phase_min_timeout
+                        headroom = max(
+                            0.0, float(phase_timeouts[key]) - phase_min_timeout
+                        )
+                        if adjustable_total > 0:
+                            base += remainder * (headroom / adjustable_total)
+                        scaled[key] = max(0.5, base)
+                phase_timeouts.update(scaled)
+                logger.warning(
+                    "AGI startup phase timeouts scaled to fit budget %.1fs (original total %.1fs, scaled total %.1fs)",
+                    float(effective_budget),
+                    phase_total,
+                    sum(phase_timeouts.values()),
+                )
 
         async def _run_phase(
             step_key: str,
@@ -400,8 +452,43 @@ class AGIOSCoordinator:
                 logger.warning("Timed out stopping %s after %.1fs", name, step_timeout)
             except asyncio.CancelledError:
                 raise
+            except RuntimeError as e:
+                if "Event loop is closed" in str(e):
+                    logger.debug("Skipping %s stop: event loop already closed", name)
+                else:
+                    logger.warning("Error stopping %s: %s", name, e)
             except Exception as e:
                 logger.warning("Error stopping %s: %s", name, e)
+
+        def _resolve_stop_callable(
+            component: Any,
+            method_names: List[str],
+        ) -> tuple[Optional[Callable[[], Awaitable[Any]]], Optional[str]]:
+            """
+            Resolve a real stop-like method without triggering proxy __getattr__.
+            """
+            if component is None:
+                return None, None
+
+            for method_name in method_names:
+                try:
+                    inspect.getattr_static(component, method_name)
+                except AttributeError:
+                    continue
+
+                method = getattr(component, method_name, None)
+                if not callable(method):
+                    continue
+
+                async def _invoke(bound_method=method):
+                    result = bound_method()
+                    if inspect.isawaitable(result):
+                        await result
+                    return result
+
+                return _invoke, method_name
+
+            return None, None
 
         async def _announce_shutdown() -> None:
             if not self._voice:
@@ -440,10 +527,29 @@ class AGIOSCoordinator:
 
             # Cancel health monitor.
             if self._health_task:
-                self._health_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.wait_for(self._health_task, timeout=health_task_timeout)
+                health_task = self._health_task
                 self._health_task = None
+                task_loop_closed = False
+                with contextlib.suppress(Exception):
+                    task_loop_closed = health_task.get_loop().is_closed()
+                if task_loop_closed:
+                    logger.debug(
+                        "Skipping AGI OS health task cancellation: task loop already closed"
+                    )
+                elif not health_task.done():
+                    try:
+                        health_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await asyncio.wait_for(
+                                health_task, timeout=health_task_timeout
+                            )
+                    except RuntimeError as e:
+                        if "Event loop is closed" in str(e):
+                            logger.debug(
+                                "Skipping AGI OS health task await: event loop closed"
+                            )
+                        else:
+                            raise
 
             # v237.2: Stop event bridge first (unsubscribes from bus + event stream).
             if self._event_bridge:
@@ -461,7 +567,14 @@ class AGIOSCoordinator:
                 await _run_stop_step("Ghost Display", self._ghost_display.cleanup)
 
             if self._ghost_hands:
-                await _run_stop_step("Ghost Hands", self._ghost_hands.stop)
+                ghost_stop_step, ghost_stop_method = _resolve_stop_callable(
+                    self._ghost_hands, ["stop", "shutdown", "cleanup", "close"]
+                )
+                if ghost_stop_step:
+                    await _run_stop_step(
+                        f"Ghost Hands ({ghost_stop_method})",
+                        ghost_stop_step,
+                    )
 
             # v237.3: Stop screen analyzer before event stream shutdown.
             if self._screen_analyzer and hasattr(self._screen_analyzer, 'stop_monitoring'):
@@ -482,10 +595,15 @@ class AGIOSCoordinator:
             # Stop owner identity / voice verification services if present.
             if self._owner_identity and hasattr(self._owner_identity, "shutdown"):
                 await _run_stop_step("Owner Identity Service", self._owner_identity.shutdown)
-            if self._speaker_verification and hasattr(self._speaker_verification, "shutdown"):
-                await _run_stop_step("Speaker Verification Service", self._speaker_verification.shutdown)
-            elif self._speaker_verification and hasattr(self._speaker_verification, "stop"):
-                await _run_stop_step("Speaker Verification Service", self._speaker_verification.stop)
+            speaker_stop_step, speaker_stop_method = _resolve_stop_callable(
+                self._speaker_verification,
+                ["shutdown", "stop", "cleanup", "close"],
+            )
+            if speaker_stop_step:
+                await _run_stop_step(
+                    f"Speaker Verification Service ({speaker_stop_method})",
+                    speaker_stop_step,
+                )
 
             # v252.0: Stop notification bridge (prevents zombie notifications during teardown).
             async def _stop_notification_bridge():
@@ -1905,20 +2023,28 @@ async def get_agi_os() -> AGIOSCoordinator:
     return _agi_os
 
 
-async def start_agi_os(progress_callback=None) -> AGIOSCoordinator:
+async def start_agi_os(
+    progress_callback=None,
+    startup_budget_seconds: Optional[float] = None,
+) -> AGIOSCoordinator:
     """
     Get and start the global AGI OS coordinator.
 
     Args:
         progress_callback: Optional async callable(step: str, detail: str)
             forwarded to AGIOSCoordinator.start() for DMS progress reporting.
+        startup_budget_seconds: Optional total startup budget passed through to
+            AGIOSCoordinator.start().
 
     Returns:
         The started AGIOSCoordinator instance
     """
     agi = await get_agi_os()
     if agi._state == AGIOSState.OFFLINE:
-        await agi.start(progress_callback=progress_callback)
+        await agi.start(
+            progress_callback=progress_callback,
+            startup_budget_seconds=startup_budget_seconds,
+        )
     return agi
 
 

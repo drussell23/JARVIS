@@ -615,12 +615,22 @@ class HybridOrchestrator:
                 if getattr(_lifecycle_manager, "is_running", False):
                     await _lifecycle_manager.stop()
                     logger.info("✅ Model Lifecycle Manager stopped")
+            except RuntimeError as e:
+                if "Event loop is closed" in str(e):
+                    logger.debug("Skipping Model Lifecycle Manager stop: event loop closed")
+                else:
+                    logger.warning(f"Model Lifecycle Manager stop error: {e}")
             except Exception as e:
                 logger.warning(f"Model Lifecycle Manager stop error: {e}")
 
         # Close backend client regardless of orchestrator running state.
         try:
             await self.client.stop()
+        except RuntimeError as e:
+            if "Event loop is closed" in str(e):
+                logger.debug("Skipping HybridBackendClient stop: event loop closed")
+            else:
+                logger.warning(f"HybridBackendClient stop error: {e}")
         except Exception as e:
             logger.warning(f"HybridBackendClient stop error: {e}")
 

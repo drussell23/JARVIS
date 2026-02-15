@@ -783,6 +783,19 @@ class YabaiAwareActuator:
         )
         return yabai_ok or ax_ok
 
+    async def stop(self) -> None:
+        """Best-effort teardown for graceful shutdown and restart safety."""
+        try:
+            # Clear transient state so warm restarts don't inherit stale targets.
+            self.fallback = None
+            self.yabai._cache.clear()
+            self.yabai._cache_time = None
+            self.yabai._initialized = False
+            self.accessibility._initialized = False
+            logger.info("[CROSS-SPACE] Yabai-Aware Actuator stopped")
+        except Exception as e:
+            logger.debug("[CROSS-SPACE] Actuator stop cleanup warning: %s", e)
+
     async def click_in_window(
         self,
         window_id: int,
