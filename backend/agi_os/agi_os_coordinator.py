@@ -270,11 +270,24 @@ class AGIOSCoordinator:
         # intra-phase progress. Without this, _init_agi_os_components() runs
         # 90+ seconds with zero DMS heartbeats → stall → rollback.
         self._progress_callback = progress_callback
+        progress_callback_timeout = max(
+            0.1, _env_float("JARVIS_AGI_OS_PROGRESS_CALLBACK_TIMEOUT", 0.75)
+        )
+        self._progress_callback_timeout = progress_callback_timeout
 
         async def _report(step: str, detail: str) -> None:
             if progress_callback:
                 try:
-                    await progress_callback(step, detail)
+                    await asyncio.wait_for(
+                        progress_callback(step, detail),
+                        timeout=progress_callback_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        "Progress callback timed out after %.2fs for step=%s",
+                        progress_callback_timeout,
+                        step,
+                    )
                 except Exception as e:
                     logger.debug("Progress callback error (non-fatal): %s", e)
 
@@ -355,21 +368,62 @@ class AGIOSCoordinator:
             step_key: str,
             success_detail: str,
             operation: Callable[[], Awaitable[Any]],
-        ) -> None:
+            *,
+            critical: bool = False,
+        ) -> bool:
             timeout_seconds = max(1.0, float(phase_timeouts.get(step_key, 30.0)))
             await _report(step_key, f"Starting {step_key}")
-            await self._run_timed_init_step(
-                step_name=f"phase_{step_key}",
-                operation=operation,
-                timeout_seconds=timeout_seconds,
-            )
-            await _report(step_key, success_detail)
+            started = time.monotonic()
+            try:
+                await self._run_timed_init_step(
+                    step_name=f"phase_{step_key}",
+                    operation=operation,
+                    timeout_seconds=timeout_seconds,
+                )
+                elapsed = time.monotonic() - started
+                await _report(step_key, f"{success_detail} ({elapsed:.1f}s)")
+                return True
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "AGI OS phase '%s' timed out after %.1fs",
+                    step_key,
+                    timeout_seconds,
+                )
+                self._component_status[f"phase_{step_key}"] = ComponentStatus(
+                    name=f"phase_{step_key}",
+                    available=False,
+                    healthy=False,
+                    error=str(e),
+                )
+                if critical:
+                    raise
+                await _report(
+                    step_key,
+                    f"{step_key} timed out - continuing in degraded mode",
+                )
+                return False
+            except Exception as e:
+                logger.warning("AGI OS phase '%s' failed: %s", step_key, e)
+                self._component_status[f"phase_{step_key}"] = ComponentStatus(
+                    name=f"phase_{step_key}",
+                    available=False,
+                    healthy=False,
+                    error=str(e),
+                )
+                if critical:
+                    raise
+                await _report(
+                    step_key,
+                    f"{step_key} failed - continuing in degraded mode",
+                )
+                return False
 
         # Initialize components in deterministic order
         await _run_phase(
             "agi_os_components",
             "Core components initialized",
             self._init_agi_os_components,
+            critical=True,
         )
         await _run_phase(
             "intelligence_systems",
@@ -673,7 +727,20 @@ class AGIOSCoordinator:
         cb = getattr(self, '_progress_callback', None)
         if cb:
             try:
-                await cb(f"init_{component}", detail)
+                callback_timeout = max(
+                    0.1,
+                    float(getattr(self, "_progress_callback_timeout", 0.75)),
+                )
+                await asyncio.wait_for(
+                    cb(f"init_{component}", detail),
+                    timeout=callback_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "Init progress callback timed out after %.2fs (%s)",
+                    callback_timeout,
+                    component,
+                )
             except Exception as e:
                 logger.debug("Init progress callback error (non-fatal): %s", e)
 

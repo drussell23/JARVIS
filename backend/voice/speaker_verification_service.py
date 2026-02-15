@@ -7924,6 +7924,18 @@ class SpeakerVerificationService:
         logger.info(f"🎯 Calibration mode enabled{f' for {speaker_name}' if speaker_name else ''}")
         return {"status": "calibration_enabled", "speaker": speaker_name}
 
+    async def shutdown(self):
+        """Compatibility lifecycle alias used by orchestrators."""
+        await self.cleanup()
+
+    async def stop(self):
+        """Compatibility lifecycle alias used by managed component runners."""
+        await self.cleanup()
+
+    async def close(self):
+        """Compatibility lifecycle alias used by generic resource managers."""
+        await self.cleanup()
+
     async def cleanup(self):
         """Cleanup resources and terminate background threads"""
         logger.info("🧹 Cleaning up Speaker Verification Service...")

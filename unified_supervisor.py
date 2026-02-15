@@ -20760,6 +20760,15 @@ class PersistentConversationMemoryAgent:
         self._worker_count = max(1, int(os.getenv("JARVIS_MEMORY_WORKERS", "2")))
         self._drain_timeout = float(os.getenv("JARVIS_MEMORY_DRAIN_TIMEOUT", "20.0"))
         self._init_timeout = float(os.getenv("JARVIS_MEMORY_INIT_TIMEOUT", "25.0"))
+        self._boot_load_timeout = float(
+            os.getenv("JARVIS_MEMORY_BOOT_LOAD_TIMEOUT", "8.0")
+        )
+        self._boot_retry_attempts = max(
+            1, int(os.getenv("JARVIS_MEMORY_BOOT_RETRY_ATTEMPTS", "3"))
+        )
+        self._boot_retry_backoff = float(
+            os.getenv("JARVIS_MEMORY_BOOT_RETRY_BACKOFF", "2.0")
+        )
         self._boot_interaction_limit = max(
             10, int(os.getenv("JARVIS_MEMORY_BOOT_INTERACTIONS", "200"))
         )
@@ -20782,6 +20791,9 @@ class PersistentConversationMemoryAgent:
             maxsize=self._queue_maxsize
         )
         self._workers: List[asyncio.Task] = []
+        self._boot_load_task: Optional[asyncio.Task] = None
+        self._boot_context_loaded: bool = False
+        self._boot_load_error: Optional[str] = None
         self._boot_context: Dict[str, Any] = {
             "loaded_at": None,
             "interactions": [],
@@ -20807,16 +20819,30 @@ class PersistentConversationMemoryAgent:
         if self._running:
             return True
 
+        boot_timeout = max(1.0, min(self._boot_load_timeout, self._init_timeout))
+        boot_task = create_safe_task(
+            self._load_boot_context(),
+            name="memory-agent-boot-load-initial",
+        )
         try:
-            await asyncio.wait_for(self._load_boot_context(), timeout=self._init_timeout)
+            await asyncio.wait_for(asyncio.shield(boot_task), timeout=boot_timeout)
+            self._boot_context_loaded = True
+            self._boot_load_error = None
         except asyncio.TimeoutError:
-            self._logger.warning(
-                f"[MemoryAgent] Boot context load timed out ({self._init_timeout:.1f}s)"
+            self._boot_context_loaded = False
+            self._boot_load_error = (
+                f"boot context timeout after {boot_timeout:.1f}s (continuing in background)"
             )
-            return False
+            self._boot_load_task = boot_task
+            self._boot_load_task.add_done_callback(self._on_deferred_boot_load_done)
+            self._logger.warning(f"[MemoryAgent] {self._boot_load_error}")
         except Exception as e:
-            self._logger.warning(f"[MemoryAgent] Boot context load failed: {e}")
-            return False
+            self._boot_context_loaded = False
+            self._boot_load_error = f"boot context load failed: {e}"
+            self._logger.warning(
+                f"[MemoryAgent] {self._boot_load_error} (continuing in degraded mode)"
+            )
+            self._ensure_boot_context_background_load()
 
         self._running = True
         self._stats["started_at"] = datetime.now().isoformat()
@@ -20852,6 +20878,11 @@ class PersistentConversationMemoryAgent:
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+
+        if self._boot_load_task and not self._boot_load_task.done():
+            self._boot_load_task.cancel()
+            await asyncio.gather(self._boot_load_task, return_exceptions=True)
+        self._boot_load_task = None
 
         # Final state snapshot for cross-repo consumers.
         try:
@@ -21024,6 +21055,8 @@ class PersistentConversationMemoryAgent:
             "interactions_loaded": int(stats.get("interactions_loaded", 0)),
             "preferences_loaded": int(stats.get("preferences_loaded", 0)),
             "loaded_at": self._boot_context.get("loaded_at"),
+            "boot_context_loaded": self._boot_context_loaded,
+            "boot_load_error": self._boot_load_error,
         }
 
     def get_stats(self) -> Dict[str, Any]:
@@ -21031,7 +21064,63 @@ class PersistentConversationMemoryAgent:
         data["queue_size"] = self._queue.qsize()
         data["running"] = self._running
         data["session_id"] = self.session_id
+        data["boot_context_loaded"] = self._boot_context_loaded
+        data["boot_load_error"] = self._boot_load_error
         return data
+
+    def _on_deferred_boot_load_done(self, task: asyncio.Task) -> None:
+        """Finalize deferred initial boot-context loading after timeout."""
+        try:
+            task.result()
+            self._boot_context_loaded = True
+            self._boot_load_error = None
+            self._logger.info("[MemoryAgent] Boot context load completed in background")
+        except asyncio.CancelledError:
+            self._boot_context_loaded = False
+            self._boot_load_error = "boot context load cancelled"
+        except Exception as e:
+            self._boot_context_loaded = False
+            self._boot_load_error = f"boot context deferred load failed: {e}"
+            self._logger.warning(
+                f"[MemoryAgent] {self._boot_load_error}; activating retry loop"
+            )
+            self._ensure_boot_context_background_load()
+        finally:
+            if task is self._boot_load_task:
+                self._boot_load_task = None
+
+    def _ensure_boot_context_background_load(self) -> None:
+        """Schedule best-effort boot context loading retries."""
+        if self._boot_load_task and not self._boot_load_task.done():
+            return
+        self._boot_load_task = create_safe_task(
+            self._load_boot_context_with_retries(),
+            name="memory-agent-boot-load",
+        )
+
+    async def _load_boot_context_with_retries(self) -> None:
+        """Retry boot context load without blocking startup."""
+        for attempt in range(1, self._boot_retry_attempts + 1):
+            try:
+                await self._load_boot_context()
+                self._boot_context_loaded = True
+                self._boot_load_error = None
+                self._logger.info(
+                    f"[MemoryAgent] Boot context loaded in background (attempt {attempt})"
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._boot_context_loaded = False
+                self._boot_load_error = f"boot context retry {attempt} failed: {e}"
+                if attempt >= self._boot_retry_attempts:
+                    self._logger.warning(
+                        f"[MemoryAgent] Boot context retries exhausted: {e}"
+                    )
+                    return
+                delay = max(0.1, self._boot_retry_backoff * attempt)
+                await asyncio.sleep(delay)
 
     def _is_significant_interaction(
         self,
@@ -58597,6 +58686,7 @@ class JarvisSystemKernel:
 
         # v200.1: Voice Orchestrator for cross-repo TTS coordination
         self._voice_orchestrator: Optional["VoiceOrchestrator"] = None
+        self._ecapa_verification_task: Optional[asyncio.Task] = None
 
         # v186.0: Dead Man's Switch for startup phase monitoring
         self._startup_watchdog: Optional[StartupWatchdog] = None
@@ -58608,6 +58698,7 @@ class JarvisSystemKernel:
 
         # Persistent conversation memory (cross-session conversational learning)
         self._persistent_memory_agent: Optional[PersistentConversationMemoryAgent] = None
+        self._persistent_memory_retry_task: Optional[asyncio.Task] = None
 
         # =====================================================================
         # v200.0: Two-Tier Security (VBIA/PAVA) Components
@@ -61438,23 +61529,36 @@ class JarvisSystemKernel:
                     self._voice_orchestrator = None
 
             # v223.0: ECAPA verification pipeline (non-blocking smoke test)
-            # Runs after backend is up to validate voice biometric pipeline end-to-end
-            try:
-                ecapa_verify = await asyncio.wait_for(
-                    self._verify_ecapa_pipeline(), timeout=60.0
-                )
-                if ecapa_verify.get("verification_pipeline_ready"):
-                    self.logger.info("[Kernel] ECAPA pipeline verified and ready")
-                elif self.config.ecapa_enabled:
-                    issue_collector.add_warning(
-                        "ECAPA pipeline verification incomplete — voice unlock may be degraded",
-                        IssueCategory.INTELLIGENCE,
-                        suggestion="Check ECAPA model availability and ML engine registry",
+            # Runs after backend is up to validate voice biometric pipeline end-to-end.
+            # Root fix: launch as managed background task so startup phase transition
+            # cannot be held by voice-biometric smoke checks.
+            if self.config.ecapa_enabled:
+                async def _run_ecapa_verification_bg() -> None:
+                    try:
+                        ecapa_verify = await asyncio.wait_for(
+                            self._verify_ecapa_pipeline(), timeout=60.0
+                        )
+                        if ecapa_verify.get("verification_pipeline_ready"):
+                            self.logger.info("[Kernel] ECAPA pipeline verified and ready")
+                        else:
+                            issue_collector.add_warning(
+                                "ECAPA pipeline verification incomplete — voice unlock may be degraded",
+                                IssueCategory.INTELLIGENCE,
+                                suggestion="Check ECAPA model availability and ML engine registry",
+                            )
+                    except asyncio.TimeoutError:
+                        self.logger.warning("[Kernel] ECAPA verification timed out (60s) — skipping")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as ev_err:
+                        self.logger.debug(f"[Kernel] ECAPA verification skipped: {ev_err}")
+
+                if self._ecapa_verification_task is None or self._ecapa_verification_task.done():
+                    self._ecapa_verification_task = create_safe_task(
+                        _run_ecapa_verification_bg(),
+                        name="ecapa-verification",
                     )
-            except asyncio.TimeoutError:
-                self.logger.warning("[Kernel] ECAPA verification timed out (60s) — skipping")
-            except Exception as ev_err:
-                self.logger.debug(f"[Kernel] ECAPA verification skipped: {ev_err}")
+                    self._background_tasks.append(self._ecapa_verification_task)
 
             # Phase 4: Intelligence (Zone 4)
             self._current_startup_phase = "intelligence"
@@ -64094,31 +64198,124 @@ class JarvisSystemKernel:
 
             self._persistent_memory_agent = agent
             summary = agent.get_boot_summary()
+            interactions_loaded = int(summary.get("interactions_loaded", 0))
+            preferences_loaded = int(summary.get("preferences_loaded", 0))
+            boot_context_loaded = bool(summary.get("boot_context_loaded", False))
+            boot_load_error = summary.get("boot_load_error")
+            status_message = (
+                f"Loaded {interactions_loaded} interactions, "
+                f"{preferences_loaded} preferences"
+            )
+            if not boot_context_loaded:
+                status_message += " (boot context loading in background)"
+                if boot_load_error:
+                    self.logger.warning(
+                        f"[Kernel] Memory agent boot context deferred: {boot_load_error}"
+                    )
             self._update_component_status(
                 "conversation_memory",
                 "complete",
-                "Loaded "
-                f"{summary.get('interactions_loaded', 0)} interactions, "
-                f"{summary.get('preferences_loaded', 0)} preferences",
+                status_message,
             )
             return True
         except asyncio.TimeoutError:
             self._update_component_status(
                 "conversation_memory",
-                "error",
-                f"Initialization timed out after {init_timeout:.0f}s",
+                "degraded",
+                f"Initialization timed out after {init_timeout:.0f}s (retrying in background)",
             )
-            return False
+            self._schedule_persistent_memory_agent_retry()
+            return True
         except Exception as e:
             self._update_component_status(
                 "conversation_memory",
-                "error",
-                f"Error: {e}",
+                "degraded",
+                f"Initialization error (retrying in background): {e}",
             )
-            return False
+            self._schedule_persistent_memory_agent_retry()
+            return True
+
+    def _schedule_persistent_memory_agent_retry(self) -> None:
+        """Start deferred retry loop for persistent memory startup."""
+        if (
+            self._persistent_memory_retry_task
+            and not self._persistent_memory_retry_task.done()
+        ):
+            return
+        self._persistent_memory_retry_task = create_safe_task(
+            self._retry_initialize_persistent_memory_agent(),
+            name="persistent-memory-retry",
+        )
+        self._background_tasks.append(self._persistent_memory_retry_task)
+
+    async def _retry_initialize_persistent_memory_agent(self) -> None:
+        """Retry persistent memory initialization after startup proceeds."""
+        attempts = max(1, int(os.getenv("JARVIS_MEMORY_AGENT_RETRY_ATTEMPTS", "3")))
+        base_delay = float(os.getenv("JARVIS_MEMORY_AGENT_RETRY_BACKOFF", "4.0"))
+        init_timeout = float(os.getenv("JARVIS_MEMORY_AGENT_INIT_TIMEOUT", "30.0"))
+
+        for attempt in range(1, attempts + 1):
+            if self._persistent_memory_agent is not None:
+                return
+            try:
+                candidate = PersistentConversationMemoryAgent(
+                    kernel_id=self.config.kernel_id,
+                    repo_name="jarvis",
+                )
+                started = await asyncio.wait_for(
+                    candidate.start(),
+                    timeout=init_timeout,
+                )
+                if not started:
+                    raise RuntimeError("memory agent start returned False")
+
+                self._persistent_memory_agent = candidate
+                summary = candidate.get_boot_summary()
+                interactions_loaded = int(summary.get("interactions_loaded", 0))
+                preferences_loaded = int(summary.get("preferences_loaded", 0))
+                boot_context_loaded = bool(summary.get("boot_context_loaded", False))
+
+                status_message = (
+                    f"Loaded {interactions_loaded} interactions, "
+                    f"{preferences_loaded} preferences"
+                )
+                if not boot_context_loaded:
+                    status_message += " (boot context loading in background)"
+
+                self._update_component_status(
+                    "conversation_memory",
+                    "complete",
+                    status_message,
+                )
+                self.logger.info(
+                    f"[Kernel] Memory agent recovered on retry attempt {attempt}"
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.warning(
+                    f"[Kernel] Memory agent retry {attempt}/{attempts} failed: {e}"
+                )
+                if attempt >= attempts:
+                    self._update_component_status(
+                        "conversation_memory",
+                        "error",
+                        f"Initialization failed after {attempts} retry attempts: {e}",
+                    )
+                    return
+                await asyncio.sleep(max(0.5, base_delay * attempt))
 
     async def _shutdown_persistent_memory_agent(self) -> None:
         """Gracefully drain and stop durable conversational memory."""
+        if self._persistent_memory_retry_task and not self._persistent_memory_retry_task.done():
+            self._persistent_memory_retry_task.cancel()
+            await asyncio.gather(
+                self._persistent_memory_retry_task,
+                return_exceptions=True,
+            )
+        self._persistent_memory_retry_task = None
+
         if self._persistent_memory_agent is None:
             return
 
@@ -64755,6 +64952,12 @@ class JarvisSystemKernel:
 
                     # Sub-progress counter: 86.1 → 86.6 across coordinator phases
                     _agi_sub = {"n": 0}
+                    _agi_progress_broadcast_timeout = max(
+                        0.1,
+                        _get_env_float(
+                            "JARVIS_AGI_OS_PROGRESS_BROADCAST_TIMEOUT", 0.75
+                        ),
+                    )
 
                     async def _agi_os_progress(step: str, detail: str) -> None:
                         _agi_sub["n"] += 1
@@ -64765,9 +64968,20 @@ class JarvisSystemKernel:
                         )
                         # Broadcast sub-progress to keep DMS watchdog alive
                         # Progress stays within 86-87 range (allocated for agi_os)
-                        await self._broadcast_progress(
-                            86, "agi_os", f"AGI OS [{step}]: {detail}"
-                        )
+                        try:
+                            await asyncio.wait_for(
+                                self._broadcast_progress(
+                                    86, "agi_os", f"AGI OS [{step}]: {detail}"
+                                ),
+                                timeout=_agi_progress_broadcast_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            self.logger.debug(
+                                "[AGI-OS] Progress broadcast timeout after %.2fs "
+                                "(step=%s, non-fatal)",
+                                _agi_progress_broadcast_timeout,
+                                step,
+                            )
 
                     try:
                         # v253.2: Heartbeat-aware await for AGI OS startup.
@@ -64824,11 +65038,21 @@ class JarvisSystemKernel:
                                 "agi_os:startup_wait",
                                 stage="agi_os",
                             )
-                            await self._broadcast_progress(
-                                86,
-                                "agi_os",
-                                f"Starting AGI OS Coordinator... ({elapsed:.0f}s elapsed)",
-                            )
+                            try:
+                                await asyncio.wait_for(
+                                    self._broadcast_progress(
+                                        86,
+                                        "agi_os",
+                                        f"Starting AGI OS Coordinator... ({elapsed:.0f}s elapsed)",
+                                    ),
+                                    timeout=_agi_progress_broadcast_timeout,
+                                )
+                            except asyncio.TimeoutError:
+                                self.logger.debug(
+                                    "[AGI-OS] Startup wait broadcast timeout after %.2fs "
+                                    "(non-fatal)",
+                                    _agi_progress_broadcast_timeout,
+                                )
                     except asyncio.TimeoutError:
                         self._agi_os_status["status"] = "timeout"
                         self._update_component_status(
@@ -71997,6 +72221,8 @@ class JarvisSystemKernel:
             registry = get_ml_registry()
             result["ml_registry_tested"] = True
             self.logger.info("[ECAPA]   Step 1/6: ML Engine Registry ✓")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             result["errors"].append(f"ML Registry: {e}")
             self.logger.warning(f"[ECAPA]   Step 1/6: ML Engine Registry ✗ ({e})")
@@ -72020,6 +72246,8 @@ class JarvisSystemKernel:
                     f"[ECAPA]   Step 2/6: Cloud Run ECAPA "
                     f"{'✓' if result['cloud_ecapa_tested'] else '✗'}"
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 result["errors"].append(f"Cloud Run: {e}")
                 self.logger.info(f"[ECAPA]   Step 2/6: Cloud Run ECAPA ✗ ({e})")
@@ -72031,6 +72259,8 @@ class JarvisSystemKernel:
             await ensure_ecapa_available()
             result["local_ecapa_tested"] = True
             self.logger.info("[ECAPA]   Step 3/6: Local ECAPA ✓")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             result["errors"].append(f"Local ECAPA: {e}")
             self.logger.info(f"[ECAPA]   Step 3/6: Local ECAPA ✗ ({e})")
@@ -72062,6 +72292,8 @@ class JarvisSystemKernel:
                 )
             else:
                 self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (no result)")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             result["errors"].append(f"Embedding extraction: {e}")
             self.logger.info(f"[ECAPA]   Step 4/6: Embedding extraction ✗ ({e})")
@@ -72070,11 +72302,37 @@ class JarvisSystemKernel:
         try:
             from voice.speaker_verification_service import SpeakerVerificationService
             test_svc = SpeakerVerificationService()
-            await test_svc.initialize()
-            # Quick embedding extraction through the service
-            await test_svc._extract_speaker_embedding(audio_bytes)
-            await test_svc.shutdown()
+            try:
+                await test_svc.initialize()
+                # Quick embedding extraction through the service
+                await test_svc._extract_speaker_embedding(audio_bytes)
+            finally:
+                cleanup_exc: Optional[Exception] = None
+                cleanup_invoked = False
+                for method_name in ("cleanup", "shutdown", "stop", "close"):
+                    method = getattr(test_svc, method_name, None)
+                    if not callable(method):
+                        continue
+                    cleanup_invoked = True
+                    try:
+                        cleanup_result = method()
+                        if inspect.isawaitable(cleanup_result):
+                            await cleanup_result
+                    except Exception as e:
+                        cleanup_exc = e
+                    break
+
+                if cleanup_exc:
+                    self.logger.debug(
+                        f"[ECAPA] Step 5 cleanup warning: {cleanup_exc}"
+                    )
+                elif not cleanup_invoked:
+                    self.logger.debug(
+                        "[ECAPA] Step 5 cleanup skipped (no lifecycle method found)"
+                    )
             self.logger.info("[ECAPA]   Step 5/6: SpeakerVerificationService ✓")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             result["errors"].append(f"SpeakerVerification: {e}")
             self.logger.info(f"[ECAPA]   Step 5/6: SpeakerVerificationService ✗ ({e})")
