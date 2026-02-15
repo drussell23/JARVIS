@@ -65209,7 +65209,25 @@ class JarvisSystemKernel:
 
                     if self._agi_os:
                         self._agi_os_status["coordinator"] = True
-                        self.logger.success("[AGI-OS] ✓ AGIOSCoordinator started")
+
+                        # v253.3: Check actual AGI OS state — distinguishes
+                        # ONLINE (all components healthy) from DEGRADED
+                        # (some components failed but core is functional).
+                        # Previously treated any non-None coordinator as
+                        # "success", masking component failures in dashboard.
+                        _agi_state = getattr(self._agi_os, '_state', None)
+                        _agi_state_val = getattr(_agi_state, 'value', str(_agi_state))
+                        if _agi_state_val == "degraded":
+                            self._update_component_status(
+                                "agi_os",
+                                "degraded",
+                                f"AGI OS running in degraded mode ({_agi_state_val})",
+                            )
+                            self.logger.warning(
+                                "[AGI-OS] ⚠ AGIOSCoordinator started in DEGRADED state"
+                            )
+                        else:
+                            self.logger.success("[AGI-OS] ✓ AGIOSCoordinator started")
 
                         # v239.0: Connect agent runtime ↔ Neural Mesh
                         if hasattr(self, '_agent_runtime') and self._agent_runtime:

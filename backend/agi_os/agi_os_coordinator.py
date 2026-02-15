@@ -358,11 +358,17 @@ class AGIOSCoordinator:
                         scaled[key] = max(0.5, base)
                 phase_timeouts.update(scaled)
                 logger.warning(
-                    "AGI startup phase timeouts scaled to fit budget %.1fs (original total %.1fs, scaled total %.1fs)",
+                    "AGI startup phase timeouts scaled to fit budget %.1fs "
+                    "(original total %.1fs, scaled total %.1fs)",
                     float(effective_budget),
                     phase_total,
                     sum(phase_timeouts.values()),
                 )
+
+        # v253.3: Store scaled phase budgets so sub-methods
+        # (e.g. _init_agi_os_components) can read the allocated time
+        # and dynamically size per-component timeouts.
+        self._phase_budgets = dict(phase_timeouts)
 
         async def _run_phase(
             step_key: str,
@@ -418,12 +424,16 @@ class AGIOSCoordinator:
                 )
                 return False
 
-        # Initialize components in deterministic order
+        # v253.3: Changed from critical=True to critical=False.
+        # Each component already handles its own failure gracefully (try/except
+        # with ComponentStatus). The phase failing shouldn't kill the entire
+        # AGI OS — it should degrade. When budget scaling reduces the phase
+        # from 45s to ~15s, critical=True caused guaranteed AGI OS failure
+        # even though the individual components were fine.
         await _run_phase(
             "agi_os_components",
             "Core components initialized",
             self._init_agi_os_components,
-            critical=True,
         )
         await _run_phase(
             "intelligence_systems",
@@ -763,6 +773,13 @@ class AGIOSCoordinator:
         started = time.monotonic()
         task = asyncio.create_task(operation(), name=f"agi_os_init_{step_name}")
 
+        # v253.3: Store strong reference to prevent GC if this method
+        # raises (TimeoutError, CancelledError) while the task is still
+        # running. Without this, "Task was destroyed but it is pending!"
+        # warnings appear in logs during shutdown or tight-budget timeouts.
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
         async def _cancel_with_grace() -> None:
             if task.done():
                 return
@@ -813,172 +830,155 @@ class AGIOSCoordinator:
     async def _init_agi_os_components(self) -> None:
         """Initialize core AGI OS components.
 
-        v251.2: Each component is wrapped in ``asyncio.wait_for()`` with
-        a per-component timeout.  Previously these were unbounded awaits
-        — any single hanging getter could stall the entire init chain.
-        Timeout default: 15s, override: ``JARVIS_AGI_OS_COMPONENT_TIMEOUT``.
+        v253.3: Parallel initialization with budget-aware timeouts.
+
+        Previously (v251.2): Components were initialized sequentially, each
+        with a fixed 15s timeout. When budget scaling reduced the phase from
+        45s to ~15.5s, 8 sequential components couldn't fit — even 2s each
+        would total 16s. A single slow component (e.g. Ghost Hands or
+        NotificationMonitor) made the math impossible.
+
+        Now: All 8 components run in parallel via asyncio.gather(). The
+        per-component timeout is min(configured_timeout, phase_budget - margin).
+        Since components run concurrently, total time = max(component times)
+        instead of sum(component times). A 15.5s budget easily fits when the
+        slowest individual component takes <15s.
+
+        Each component's failure is isolated — one hanging getter doesn't
+        block the others. Progress is reported as each component finishes.
         """
-        _comp_timeout = _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT", 15.0)
+        _comp_timeout_base = _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT", 15.0)
 
-        # Voice communicator
+        # v253.3: Read the scaled phase budget. When the supervisor passes a
+        # tight startup_budget_seconds, the phase might be scaled from 45s
+        # to as low as 15s. Per-component timeout must fit within this.
+        _phase_budget = getattr(self, '_phase_budgets', {}).get(
+            "agi_os_components", 45.0
+        )
+        # Leave 2s margin for gather() overhead and progress reporting
+        _comp_timeout = min(_comp_timeout_base, max(3.0, _phase_budget - 2.0))
+        logger.info(
+            "Component init: phase_budget=%.1fs, per_component_timeout=%.1fs (parallel)",
+            _phase_budget, _comp_timeout,
+        )
+
+        async def _init_one(
+            name: str,
+            label: str,
+            factory,
+            *,
+            is_async: bool = True,
+        ):
+            """Initialize a single component with timeout and error isolation."""
+            try:
+                if is_async:
+                    result = await asyncio.wait_for(
+                        factory(), timeout=_comp_timeout,
+                    )
+                else:
+                    result = factory()
+                self._component_status[name] = ComponentStatus(
+                    name=name, available=True,
+                )
+                logger.info("%s initialized", label)
+                await self._report_init_progress(name, f"{label} done")
+                return (name, result)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "%s timed out after %.1fs", label, _comp_timeout,
+                )
+                self._component_status[name] = ComponentStatus(
+                    name=name,
+                    available=False,
+                    healthy=False,
+                    error=f"timeout ({_comp_timeout:.1f}s)",
+                )
+                await self._report_init_progress(name, f"{label} timed out")
+                return (name, None)
+            except Exception as e:
+                logger.warning("%s failed: %s", label, e)
+                self._component_status[name] = ComponentStatus(
+                    name=name,
+                    available=False,
+                    healthy=False,
+                    error=str(e),
+                )
+                await self._report_init_progress(name, f"{label} failed")
+                return (name, None)
+
+        # ── Build list of component init coroutines ──
+        coros = []
+
         if self._config['enable_voice']:
-            try:
-                self._voice = await asyncio.wait_for(
-                    get_voice_communicator(), timeout=_comp_timeout
-                )
-                self._component_status['voice'] = ComponentStatus(
-                    name='voice',
-                    available=True
-                )
-                logger.info("Voice communicator initialized")
-            except Exception as e:
-                logger.warning("Voice communicator failed: %s", e)
-                self._component_status['voice'] = ComponentStatus(
-                    name='voice',
-                    available=False,
-                    healthy=False,
-                    error=str(e)
-                )
-        await self._report_init_progress("voice", "Voice communicator done")
+            coros.append(_init_one("voice", "Voice communicator", get_voice_communicator))
 
-        # Approval manager
-        try:
-            self._approval_manager = await asyncio.wait_for(
-                get_approval_manager(), timeout=_comp_timeout
-            )
-            self._component_status['approval'] = ComponentStatus(
-                name='approval',
-                available=True
-            )
-            logger.info("Approval manager initialized")
-        except Exception as e:
-            logger.warning("Approval manager failed: %s", e)
-            self._component_status['approval'] = ComponentStatus(
-                name='approval',
-                available=False,
-                healthy=False,
-                error=str(e)
-            )
-        await self._report_init_progress("approval", "Approval manager done")
+        coros.append(_init_one("approval", "Approval manager", get_approval_manager))
+        coros.append(_init_one("events", "Event stream", get_event_stream))
 
-        # Event stream
-        try:
-            self._event_stream = await asyncio.wait_for(
-                get_event_stream(), timeout=_comp_timeout
-            )
-            self._component_status['events'] = ComponentStatus(
-                name='events',
-                available=True
-            )
-            logger.info("Event stream initialized")
-        except Exception as e:
-            logger.warning("Event stream failed: %s", e)
-            self._component_status['events'] = ComponentStatus(
-                name='events',
-                available=False,
-                healthy=False,
-                error=str(e)
-            )
-        await self._report_init_progress("events", "Event stream done")
-
-        # Action orchestrator
         if self._config['enable_autonomous_actions']:
-            try:
-                self._action_orchestrator = await asyncio.wait_for(
-                    start_action_orchestrator(), timeout=_comp_timeout
-                )
-                self._component_status['orchestrator'] = ComponentStatus(
-                    name='orchestrator',
-                    available=True
-                )
-                logger.info("Action orchestrator initialized")
-            except Exception as e:
-                logger.warning("Action orchestrator failed: %s", e)
-                self._component_status['orchestrator'] = ComponentStatus(
-                    name='orchestrator',
-                    available=False,
-                    healthy=False,
-                    error=str(e)
-                )
-        await self._report_init_progress("orchestrator", "Action orchestrator done")
+            coros.append(_init_one(
+                "orchestrator", "Action orchestrator", start_action_orchestrator,
+            ))
 
-        # v237.2: Start macOS notification monitor
-        try:
+        # Lazy-import components (import inside factory lambda)
+        async def _get_notification_monitor():
             from macos_helper.notification_monitor import get_notification_monitor
-            self._notification_monitor = await asyncio.wait_for(
-                get_notification_monitor(auto_start=True), timeout=_comp_timeout
-            )
-            self._component_status['notification_monitor'] = ComponentStatus(
-                name='notification_monitor',
-                available=True
-            )
-            logger.info("NotificationMonitor started")
-        except Exception as e:
-            logger.warning("NotificationMonitor not available: %s", e)
-            self._component_status['notification_monitor'] = ComponentStatus(
-                name='notification_monitor',
-                available=False,
-                error=str(e)
-            )
-        await self._report_init_progress("notification_monitor", "Notification monitor done")
+            return await get_notification_monitor(auto_start=True)
 
-        # v237.3: Start macOS system event monitor (app focus, idle, sleep/wake, spaces)
-        try:
+        async def _get_system_event_monitor():
             from macos_helper.system_event_monitor import get_system_event_monitor
-            self._system_event_monitor = await asyncio.wait_for(
-                get_system_event_monitor(auto_start=True), timeout=_comp_timeout
-            )
-            self._component_status['system_event_monitor'] = ComponentStatus(
-                name='system_event_monitor',
-                available=True
-            )
-            logger.info("SystemEventMonitor started")
-        except Exception as e:
-            logger.warning("SystemEventMonitor not available: %s", e)
-            self._component_status['system_event_monitor'] = ComponentStatus(
-                name='system_event_monitor',
-                available=False,
-                error=str(e)
-            )
-        await self._report_init_progress("system_event_monitor", "System event monitor done")
+            return await get_system_event_monitor(auto_start=True)
 
-        # v237.4: Start Ghost Hands orchestrator (background automation)
-        try:
+        async def _get_ghost_hands():
             from ghost_hands.orchestrator import get_ghost_hands
-            self._ghost_hands = await asyncio.wait_for(
-                get_ghost_hands(), timeout=_comp_timeout
-            )
-            self._component_status['ghost_hands'] = ComponentStatus(
-                name='ghost_hands',
-                available=True
-            )
-            logger.info("Ghost Hands orchestrator started")
-        except Exception as e:
-            logger.warning("Ghost Hands not available: %s", e)
-            self._component_status['ghost_hands'] = ComponentStatus(
-                name='ghost_hands',
-                available=False,
-                error=str(e)
-            )
-        await self._report_init_progress("ghost_hands", "Ghost Hands done")
+            return await get_ghost_hands()
 
-        # v237.4: Ghost Mode Display (virtual display management)
-        try:
+        coros.append(_init_one(
+            "notification_monitor", "NotificationMonitor", _get_notification_monitor,
+        ))
+        coros.append(_init_one(
+            "system_event_monitor", "SystemEventMonitor", _get_system_event_monitor,
+        ))
+        coros.append(_init_one(
+            "ghost_hands", "Ghost Hands", _get_ghost_hands,
+        ))
+
+        # Ghost Display is synchronous — wrap in _init_one with is_async=False
+        def _get_ghost_display():
             from vision.yabai_space_detector import get_ghost_manager
-            self._ghost_display = get_ghost_manager()
-            self._component_status['ghost_display'] = ComponentStatus(
-                name='ghost_display',
-                available=True
-            )
-            logger.info("Ghost Display Manager registered")
-        except Exception as e:
-            logger.warning("Ghost Display Manager not available: %s", e)
-            self._component_status['ghost_display'] = ComponentStatus(
-                name='ghost_display',
-                available=False,
-                error=str(e)
-            )
-        await self._report_init_progress("ghost_display", "Ghost Display done")
+            return get_ghost_manager()
+
+        coros.append(_init_one(
+            "ghost_display", "Ghost Display", _get_ghost_display, is_async=False,
+        ))
+
+        # ── Run ALL components in parallel ──
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+        # ── Map results to instance variables ──
+        result_map: Dict[str, Any] = {}
+        for r in results:
+            if isinstance(r, BaseException):
+                logger.warning("Component init raised unexpected error: %s", r)
+            elif r is not None:
+                name, value = r
+                result_map[name] = value
+
+        self._voice = result_map.get("voice")
+        self._approval_manager = result_map.get("approval")
+        self._event_stream = result_map.get("events")
+        self._action_orchestrator = result_map.get("orchestrator")
+        self._notification_monitor = result_map.get("notification_monitor")
+        self._system_event_monitor = result_map.get("system_event_monitor")
+        self._ghost_hands = result_map.get("ghost_hands")
+        self._ghost_display = result_map.get("ghost_display")
+
+        succeeded = sum(1 for v in result_map.values() if v is not None)
+        total = len(coros)
+        logger.info(
+            "Component init complete: %d/%d succeeded (parallel, %.1fs budget)",
+            succeeded, total, _phase_budget,
+        )
 
     async def _init_intelligence_systems(self) -> None:
         """Initialize intelligence systems (UAE, SAI, CAI, voice biometrics).
@@ -996,7 +996,15 @@ class AGIOSCoordinator:
         # Total budget for intelligence timed steps.
         # Default 45s — typical is 15-30s. The 3 sync imports (UAE/SAI/CAI)
         # run first and don't count against this budget.
-        intel_budget = _env_float("JARVIS_AGI_OS_INTEL_BUDGET", 45.0)
+        # v253.3: Cap intel_budget to the scaled phase timeout. When budget
+        # scaling reduces intelligence_systems from 60s to ~20s, the internal
+        # budget must match — otherwise _intel_remaining() returns time that
+        # the outer phase timeout will cancel before it's used.
+        _intel_env = _env_float("JARVIS_AGI_OS_INTEL_BUDGET", 45.0)
+        _intel_phase = getattr(self, '_phase_budgets', {}).get(
+            "intelligence_systems", 60.0,
+        )
+        intel_budget = min(_intel_env, max(5.0, _intel_phase - 3.0))
         intel_start = time.monotonic()
 
         def _intel_remaining() -> float:
@@ -1207,7 +1215,13 @@ class AGIOSCoordinator:
             # Total budget for all neural mesh init steps.
             # Default 75s fits comfortably within the supervisor's 90s outer timeout
             # (JARVIS_AGI_OS_INIT_TIMEOUT default = 60+30 = 90s).
-            total_budget = _env_float("JARVIS_AGI_OS_NEURAL_MESH_BUDGET", 75.0)
+            # v253.3: Cap to scaled phase timeout. When budget scaling reduces
+            # neural_mesh phase from 90s to ~30s, internal budget must match.
+            _nm_env = _env_float("JARVIS_AGI_OS_NEURAL_MESH_BUDGET", 75.0)
+            _nm_phase = getattr(self, '_phase_budgets', {}).get(
+                "neural_mesh", 90.0,
+            )
+            total_budget = min(_nm_env, max(10.0, _nm_phase - 3.0))
             budget_start = time.monotonic()
 
             def _remaining() -> float:
@@ -1396,7 +1410,25 @@ class AGIOSCoordinator:
                 logger.debug("Screen analyzer pressure preflight unavailable: %s", pressure_err)
 
             await self._report_init_progress("screen_analyzer", "Building vision handler")
-            construct_timeout = _env_float("JARVIS_AGI_OS_SCREEN_CONSTRUCT_TIMEOUT", 20.0)
+
+            # v253.3: Sub-timeouts must respect the scaled phase budget.
+            # Default sub-totals (20+12+15+15=62s) exceed the phase budget
+            # when scaling reduces screen_analyzer from 45s to ~10s.
+            # Use time-budget pattern with proportional allocation.
+            _sa_phase = getattr(self, '_phase_budgets', {}).get(
+                "screen_analyzer", 45.0,
+            )
+            _sa_budget = max(5.0, _sa_phase - 3.0)  # 3s margin for overhead
+            _sa_start = time.monotonic()
+
+            def _sa_remaining() -> float:
+                return max(1.0, _sa_budget - (time.monotonic() - _sa_start))
+
+            # Proportional allocation: construct 35%, capture 20%, monitor 25%, bridge 20%
+            construct_timeout = min(
+                _env_float("JARVIS_AGI_OS_SCREEN_CONSTRUCT_TIMEOUT", 20.0),
+                max(3.0, _sa_budget * 0.35),
+            )
 
             def _build_handler() -> Any:
                 if degraded_mode:
@@ -1424,8 +1456,9 @@ class AGIOSCoordinator:
             # Without it, capture returns None or unusably small images.
             try:
                 await self._report_init_progress("screen_analyzer", "Capture probe")
-                capture_probe_timeout = _env_float(
-                    "JARVIS_AGI_OS_SCREEN_CAPTURE_PROBE_TIMEOUT", 12.0
+                capture_probe_timeout = min(
+                    _env_float("JARVIS_AGI_OS_SCREEN_CAPTURE_PROBE_TIMEOUT", 12.0),
+                    max(2.0, _sa_remaining() * 0.4),  # v253.3: budget-aware
                 )
                 test_capture = await asyncio.wait_for(
                     vision_handler.capture_screen(),
@@ -1458,8 +1491,9 @@ class AGIOSCoordinator:
 
             await self._report_init_progress("screen_analyzer", "Starting monitor loop")
             self._screen_analyzer = MemoryAwareScreenAnalyzer(vision_handler)
-            monitor_start_timeout = _env_float(
-                "JARVIS_AGI_OS_SCREEN_MONITOR_START_TIMEOUT", 15.0
+            monitor_start_timeout = min(
+                _env_float("JARVIS_AGI_OS_SCREEN_MONITOR_START_TIMEOUT", 15.0),
+                max(2.0, _sa_remaining() * 0.55),  # v253.3: budget-aware
             )
             await asyncio.wait_for(
                 self._screen_analyzer.start_monitoring(),
@@ -1468,7 +1502,10 @@ class AGIOSCoordinator:
 
             # Bridge to event stream for proactive detection
             await self._report_init_progress("screen_analyzer", "Connecting AGI bridge")
-            bridge_timeout = _env_float("JARVIS_AGI_OS_SCREEN_BRIDGE_TIMEOUT", 15.0)
+            bridge_timeout = min(
+                _env_float("JARVIS_AGI_OS_SCREEN_BRIDGE_TIMEOUT", 15.0),
+                max(2.0, _sa_remaining()),  # v253.3: all remaining budget
+            )
             await asyncio.wait_for(
                 connect_screen_analyzer(
                     self._screen_analyzer,
