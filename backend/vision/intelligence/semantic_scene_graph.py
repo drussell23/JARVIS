@@ -154,7 +154,7 @@ class SceneNode:
 class ApplicationNode(SceneNode):
     """Node representing an application window"""
     def __init__(self, app_id: str, name: str, bounds: Bounds, **kwargs):
-        super().__init__(node_type=NodeType.APPLICATION, bounds=bounds, **kwargs)
+        super().__init__(node_type=NodeType.APPLICATION, bounds=bounds)
         self.properties.update({
             'app_id': app_id,
             'name': name,
@@ -169,7 +169,7 @@ class ApplicationNode(SceneNode):
 class ContentNode(SceneNode):
     """Node representing content within an application"""
     def __init__(self, content_type: str, bounds: Optional[Bounds] = None, **kwargs):
-        super().__init__(node_type=NodeType.CONTENT, bounds=bounds, **kwargs)
+        super().__init__(node_type=NodeType.CONTENT, bounds=bounds)
         self.properties.update({
             'content_type': content_type,
             'value': kwargs.get('value'),
@@ -183,7 +183,7 @@ class ContentNode(SceneNode):
 class UIElementNode(SceneNode):
     """Node representing a UI element"""
     def __init__(self, element_type: str, bounds: Bounds, **kwargs):
-        super().__init__(node_type=NodeType.UI_ELEMENT, bounds=bounds, **kwargs)
+        super().__init__(node_type=NodeType.UI_ELEMENT, bounds=bounds)
         self.properties.update({
             'element_type': element_type,
             'is_interactive': kwargs.get('is_interactive', True),
@@ -199,7 +199,7 @@ class UIElementNode(SceneNode):
 class InformationNode(SceneNode):
     """Node representing information/text"""
     def __init__(self, text: str, bounds: Optional[Bounds] = None, **kwargs):
-        super().__init__(node_type=NodeType.INFORMATION, bounds=bounds, **kwargs)
+        super().__init__(node_type=NodeType.INFORMATION, bounds=bounds)
         self.properties.update({
             'text': text,
             'format': kwargs.get('format', 'plain'),

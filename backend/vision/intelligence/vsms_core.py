@@ -430,9 +430,10 @@ class VisualStateManager:
         self.activity_engine = get_activity_engine()
 
         # Goal Inference System
-        from .goal_inference_system import get_goal_inference_engine
+        from .goal_inference_system import get_goal_inference_engine, GoalLevel
 
         self.goal_inference = get_goal_inference_engine()
+        self._goal_level = GoalLevel  # module-level enum, not engine attribute
 
         # Memory monitoring
         self.memory_usage = {
@@ -692,7 +693,7 @@ class VisualStateManager:
                         "description": g.description,
                         "confidence": g.confidence,
                     }
-                    for g in inferred_goals.get(self.goal_inference.GoalLevel.HIGH_LEVEL, [])
+                    for g in inferred_goals.get(self._goal_level.HIGH_LEVEL, [])
                 ],
                 "intermediate": [
                     {
@@ -701,7 +702,7 @@ class VisualStateManager:
                         "description": g.description,
                         "confidence": g.confidence,
                     }
-                    for g in inferred_goals.get(self.goal_inference.GoalLevel.INTERMEDIATE, [])
+                    for g in inferred_goals.get(self._goal_level.INTERMEDIATE, [])
                 ],
                 "immediate": [
                     {
@@ -710,7 +711,7 @@ class VisualStateManager:
                         "description": g.description,
                         "confidence": g.confidence,
                     }
-                    for g in inferred_goals.get(self.goal_inference.GoalLevel.IMMEDIATE, [])
+                    for g in inferred_goals.get(self._goal_level.IMMEDIATE, [])
                 ],
             }
 
