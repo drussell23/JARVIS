@@ -12450,11 +12450,18 @@ class AsyncVoiceNarrator:
             # Priority interrupt: kill lower priority speech
             if self._speaking and priority.value < self._current_priority.value:
                 if self._process and self._process.returncode is None:
-                    self._process.terminate()
                     try:
-                        await asyncio.wait_for(self._process.wait(), timeout=0.5)
-                    except asyncio.TimeoutError:
-                        self._process.kill()
+                        self._process.terminate()
+                    except ProcessLookupError:
+                        pass  # v253.2: Process already exited
+                    else:
+                        try:
+                            await asyncio.wait_for(self._process.wait(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            try:
+                                self._process.kill()
+                            except ProcessLookupError:
+                                pass  # v253.2: Exited between terminate and kill
                     self._messages_skipped += 1
 
             self._speaking = True
@@ -12481,7 +12488,10 @@ class AsyncVoiceNarrator:
 
         except asyncio.TimeoutError:
             if self._process:
-                self._process.terminate()
+                try:
+                    self._process.terminate()
+                except ProcessLookupError:
+                    pass  # v253.2: Process already exited
             self._messages_skipped += 1
         except Exception as e:
             _unified_logger.debug(f"Voice error: {e}")
@@ -12497,7 +12507,10 @@ class AsyncVoiceNarrator:
                 await asyncio.wait_for(self._process.communicate(), timeout=30.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             if self._process and self._process.returncode is None:
-                self._process.terminate()
+                try:
+                    self._process.terminate()
+                except ProcessLookupError:
+                    pass  # v253.2: Process already exited
         finally:
             self._speaking = False
 
@@ -12803,7 +12816,10 @@ class AsyncVoiceNarrator:
         except asyncio.CancelledError:
             # Gracefully handle cancellation
             if self._process and self._process.returncode is None:
-                self._process.terminate()
+                try:
+                    self._process.terminate()
+                except ProcessLookupError:
+                    pass  # v253.2: Process already exited
             return False
         except Exception as e:
             _unified_logger.debug(f"[Narrator] Safe narrate failed: {e}")
@@ -12851,11 +12867,18 @@ class AsyncVoiceNarrator:
 
         # Terminate current speech
         if self._process and self._process.returncode is None:
-            self._process.terminate()
             try:
-                await asyncio.wait_for(self._process.communicate(), timeout=2.0)
-            except asyncio.TimeoutError:
-                self._process.kill()
+                self._process.terminate()
+            except ProcessLookupError:
+                pass  # v253.2: Process already exited
+            else:
+                try:
+                    await asyncio.wait_for(self._process.communicate(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    try:
+                        self._process.kill()
+                    except ProcessLookupError:
+                        pass  # v253.2: Exited between terminate and kill
 
 
 # Global narrator instance (lazy initialization)
@@ -53083,8 +53106,12 @@ class ProcessStateManager:
                 await asyncio.wait_for(process.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 self.logger.warning(f"[Kernel] Process '{name}' didn't stop gracefully, force killing...")
-                process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5.0)
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass  # v253.2: Exited between terminate and kill
+                else:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
 
             await self.update_state(name, ProcessState.STOPPED)
             return True
@@ -57279,7 +57306,12 @@ class TrinityIntegrator:
                     await asyncio.wait_for(component.process.wait(), timeout=10.0)
                     self.logger.info(f"[Trinity] Stopped {component.name}")
                 except asyncio.TimeoutError:
-                    component.process.kill()
+                    try:
+                        component.process.kill()
+                    except ProcessLookupError:
+                        pass  # v253.2: Exited between terminate and kill
+                except ProcessLookupError:
+                    self.logger.debug(f"[Trinity] {component.name} already exited")
                 except Exception as e:
                     self.logger.debug(f"[Trinity] Error stopping {component.name}: {e}")
 
@@ -57390,9 +57422,12 @@ class TrinityIntegrator:
             except asyncio.TimeoutError:
                 # Force kill if graceful shutdown failed
                 self.logger.warning(f"[Trinity] {name} didn't stop gracefully, sending SIGKILL...")
-                component.process.kill()
-                await asyncio.wait_for(component.process.wait(), timeout=5.0)
-                self.logger.info(f"[Trinity] {name} killed forcefully")
+                try:
+                    component.process.kill()
+                    await asyncio.wait_for(component.process.wait(), timeout=5.0)
+                    self.logger.info(f"[Trinity] {name} killed forcefully")
+                except ProcessLookupError:
+                    self.logger.debug(f"[Trinity] {name} exited before SIGKILL")
 
             component.state = "stopped"
             component.process = None
@@ -59609,14 +59644,17 @@ class JarvisSystemKernel:
                 timeout=5.0,
                 force_cancel_on_timeout=True,
             )
-        if self._backend_process:
-            self._backend_process.kill()
-
-        # Kill frontend/loading server
-        if self._frontend_process:
-            self._frontend_process.kill()
-        if self._loading_server_process:
-            self._loading_server_process.kill()
+        # v253.2: Guard all .kill() calls against ProcessLookupError
+        for _proc_name, _proc_ref in [
+            ("backend", self._backend_process),
+            ("frontend", self._frontend_process),
+            ("loading_server", self._loading_server_process),
+        ]:
+            if _proc_ref:
+                try:
+                    _proc_ref.kill()
+                except ProcessLookupError:
+                    self.logger.debug(f"[Kernel] {_proc_name} already exited")
 
         # v250.0: Visual Pipeline teardown (N-Optic → Ghost Hands order)
         try:
@@ -69858,8 +69896,14 @@ class JarvisSystemKernel:
                         import signal
                         os.killpg(os.getpgid(self._frontend_process.pid), signal.SIGKILL)
                     except (ProcessLookupError, PermissionError, OSError):
-                        self._frontend_process.kill()
-                    await self._frontend_process.wait()
+                        try:
+                            self._frontend_process.kill()
+                        except ProcessLookupError:
+                            pass  # v253.2: Already exited
+                    try:
+                        await asyncio.wait_for(self._frontend_process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass  # v253.2: Bounded wait
                 self.logger.info("[Frontend] Stopped")
             self._frontend_process = None
         
@@ -71362,11 +71406,18 @@ class JarvisSystemKernel:
 
             # Stop backend subprocess (in-process backend already handled above)
             if self._backend_process:
-                self._backend_process.terminate()
                 try:
-                    await asyncio.wait_for(self._backend_process.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    self._backend_process.kill()
+                    self._backend_process.terminate()
+                except ProcessLookupError:
+                    pass  # v253.2: Already exited
+                else:
+                    try:
+                        await asyncio.wait_for(self._backend_process.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        try:
+                            self._backend_process.kill()
+                        except ProcessLookupError:
+                            pass  # v253.2: Exited between terminate and kill
                 self.logger.info("[Kernel] Backend process stopped")
 
             # Stop process manager
