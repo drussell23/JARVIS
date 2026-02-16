@@ -337,12 +337,11 @@ async def process_vision_command(request: VisionCommand) -> Dict[str, Any]:
             # Capture screen for Claude analysis
             region = request.region
             screenshot = await vision_system.capture_screen(region)
-            
-            # Get Claude's analysis
-            claude_result = await claude_analyzer.understand_user_activity(screenshot)
-            
-            # Combine responses
-            response = f"{response} Additionally, {claude_result.get('description', '')}"
+
+            # v257.0: Skip Claude enrichment if capture failed (don't crash, still return base response)
+            if screenshot is not None:
+                claude_result = await claude_analyzer.understand_user_activity(screenshot)
+                response = f"{response} Additionally, {claude_result.get('description', '')}"
         
         return {
             "success": True,
@@ -360,7 +359,10 @@ async def analyze_screen(request: ScreenAnalysisRequest) -> Dict[str, Any]:
     try:
         region = request.region
         screenshot = await vision_system.capture_screen(region)
-        
+        # v257.0: Early return if capture failed
+        if screenshot is None:
+            return {"success": False, "error": "Screen capture failed", "timestamp": datetime.now().isoformat()}
+
         result = {}
         
         if request.analysis_type == "updates":
@@ -514,8 +516,10 @@ async def capture_screenshot() -> Dict[str, Any]:
         # If Claude is available, get more detailed analysis
         if claude_analyzer:
             screenshot = await vision_system.capture_screen()
-            claude_result = await claude_analyzer.understand_user_activity(screenshot)
-            description += f" {claude_result.get('description', '')}"
+            # v257.0: Skip enrichment if capture failed
+            if screenshot is not None:
+                claude_result = await claude_analyzer.understand_user_activity(screenshot)
+                description += f" {claude_result.get('description', '')}"
         
         return {
             "success": True,

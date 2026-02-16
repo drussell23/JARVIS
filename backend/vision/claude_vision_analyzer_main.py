@@ -1102,9 +1102,62 @@ class ClaudeVisionAnalyzer:
         # Initialize enhanced memory-optimized components
         self._init_enhanced_components()
 
+        # v257.0: Capture circuit breaker state — prevents log spam + wasted API calls
+        # when screen recording permission is denied or capture is persistently broken.
+        # Scope: Only protects ClaudeVisionAnalyzer.capture_screen() (background/autonomous).
+        # API endpoints use ScreenVisionSystem.capture_screen() (separate class, unprotected).
+        self._capture_consecutive_failures: int = 0
+        self._capture_circuit_open: bool = False
+        self._capture_circuit_open_since: float = 0.0
+        self._capture_last_permission_check: float = 0.0
+        self._capture_permission_denied: bool = False
+        self._CAPTURE_CIRCUIT_THRESHOLD = int(os.environ.get("JARVIS_CAPTURE_CIRCUIT_THRESHOLD", "5"))
+        self._CAPTURE_CIRCUIT_PROBE_INTERVAL = float(os.environ.get("JARVIS_CAPTURE_CIRCUIT_PROBE_SECONDS", "60.0"))
+        self._CAPTURE_PERMISSION_CHECK_TTL = float(os.environ.get("JARVIS_CAPTURE_PERMISSION_TTL", "30.0"))
+
         logger.info(
             f"Initialized ClaudeVisionAnalyzer with config: {self.config.to_dict()}"
         )
+
+    async def _check_screen_recording_permission_cached(self) -> bool:
+        """
+        v257.0: Cached TCC screen recording permission check.
+        Inlines the CGWindowListCreateImage probe — avoids instantiating
+        MacOSVideoCaptureAdvanced which requires __init__.
+        """
+        now = time.time()
+        if now - self._capture_last_permission_check < self._CAPTURE_PERMISSION_CHECK_TTL:
+            return not self._capture_permission_denied
+
+        self._capture_last_permission_check = now
+
+        if platform.system() != "Darwin":
+            self._capture_permission_denied = False
+            return True
+
+        try:
+            import Quartz
+            test_image = Quartz.CGWindowListCreateImage(
+                Quartz.CGRectMake(0, 0, 1, 1),
+                Quartz.kCGWindowListOptionOnScreenOnly,
+                Quartz.kCGNullWindowID,
+                Quartz.kCGWindowImageDefault,
+            )
+            granted = test_image is not None
+            self._capture_permission_denied = not granted
+            if not granted:
+                logger.warning(
+                    "[v257.0] Screen recording permission DENIED by macOS TCC. "
+                    "Grant in System Settings > Privacy & Security > Screen Recording."
+                )
+            return granted
+        except ImportError:
+            self._capture_permission_denied = False
+            return True
+        except Exception as e:
+            logger.debug(f"[v257.0] TCC check failed: {e}")
+            self._capture_permission_denied = False
+            return True
 
     def _is_screen_sharing_enabled(self) -> bool:
         """Safely determine whether screen sharing is enabled."""
@@ -2424,6 +2477,23 @@ class ClaudeVisionAnalyzer:
         """
         metrics = AnalysisMetrics()
         start_time = time.time()
+
+        # v257.0: Graceful None handling — capture may have failed
+        if image is None:
+            metrics.total_time = time.time() - start_time
+            logger.warning(
+                "[analyze_screenshot] Image is None — capture likely failed. "
+                "Check screen recording permissions."
+            )
+            return (
+                {
+                    "success": False,
+                    "description": "",
+                    "error": "screenshot_capture_failed",
+                    "error_detail": "Screenshot image is None — capture likely failed.",
+                },
+                metrics,
+            )
 
         # Apply custom config for this request if provided
         if custom_config:
@@ -6233,7 +6303,11 @@ For this query, provide a helpful response that leverages the multi-space inform
             return await simplified.check_for_notifications()
         else:
             # Fallback to standard analysis
-            return await self.analyze_with_template(None, "action")
+            # v257.0: Capture screen first — don't pass None to analyze_with_template
+            screenshot = await self.capture_screen()
+            if screenshot is None:
+                return {"success": False, "error": "Unable to capture screen for notification check"}
+            return await self.analyze_with_template(screenshot, "action")
 
     async def check_for_errors(self) -> Dict[str, Any]:
         """Check for errors on screen"""
@@ -6242,7 +6316,11 @@ For this query, provide a helpful response that leverages the multi-space inform
             return await simplified.check_for_errors()
         else:
             # Fallback to standard analysis
-            return await self.analyze_with_template(None, "error")
+            # v257.0: Capture screen first — don't pass None to analyze_with_template
+            screenshot = await self.capture_screen()
+            if screenshot is None:
+                return {"success": False, "error": "Unable to capture screen for error check"}
+            return await self.analyze_with_template(screenshot, "error")
 
     async def find_ui_element(self, element_description: str) -> Dict[str, Any]:
         """Find specific UI element"""
@@ -6251,8 +6329,12 @@ For this query, provide a helpful response that leverages the multi-space inform
             return await simplified.find_element(element_description)
         else:
             # Fallback to standard analysis
+            # v257.0: Capture screen first — don't pass None to analyze_screenshot
+            screenshot = await self.capture_screen()
+            if screenshot is None:
+                return {"success": False, "error": "Unable to capture screen for UI element search"}
             prompt = f"Locate the following element: {element_description}"
-            result, _ = await self.analyze_screenshot(None, prompt)
+            result, _ = await self.analyze_screenshot(screenshot, prompt)
             return {"success": True, "analysis": result.get("description", "")}
 
     async def cleanup_all_components(self):
@@ -6312,7 +6394,7 @@ For this query, provide a helpful response that leverages the multi-space inform
 
         logger.info("All enhanced components cleaned up")
 
-    async def capture_screen(self, multi_space=False, space_number=None) -> Any:
+    async def capture_screen(self, multi_space=False, space_number=None, *, force: bool = False) -> Any:
         """
         Capture screen using the best available method with robust error handling
         Enhanced with multi-space support per PRD requirements
@@ -6320,6 +6402,7 @@ For this query, provide a helpful response that leverages the multi-space inform
         Args:
             multi_space: If True, capture all desktop spaces
             space_number: If provided, capture specific space
+            force: If True, bypass circuit breaker (for user-initiated captures)
 
         Returns:
             Single screenshot or Dict[int, screenshot] for multi-space
@@ -6327,6 +6410,33 @@ For this query, provide a helpful response that leverages the multi-space inform
         logger.info(
             f"[CAPTURE SCREEN] Starting screen capture (multi_space={multi_space}, space={space_number})"
         )
+
+        # v257.0: Circuit breaker — skip doomed capture attempts
+        # force=True bypasses circuit breaker (for user-initiated captures)
+        if not force and self._capture_circuit_open:
+            now = time.time()
+            elapsed = now - self._capture_circuit_open_since
+            if elapsed < self._CAPTURE_CIRCUIT_PROBE_INTERVAL:
+                logger.debug(
+                    f"[CAPTURE] Circuit open — skipping "
+                    f"({elapsed:.0f}s / {self._CAPTURE_CIRCUIT_PROBE_INTERVAL:.0f}s until probe)"
+                )
+                return None
+            else:
+                logger.info("[CAPTURE] Circuit half-open — probing screen capture...")
+
+        # v257.0: Permission pre-flight — only when there have been failures
+        # (avoids unnecessary overhead on every call during normal operation)
+        if self._capture_consecutive_failures > 0 or self._capture_circuit_open:
+            if not await self._check_screen_recording_permission_cached():
+                if not force:
+                    self._capture_circuit_open = True
+                    self._capture_circuit_open_since = time.time()
+                    self._capture_consecutive_failures = self._CAPTURE_CIRCUIT_THRESHOLD
+                    return None
+                # force=True: attempt anyway, invalidate cache
+                logger.info("[CAPTURE] Permission check failed but force=True — attempting anyway")
+                self._capture_last_permission_check = 0.0
 
         # Multi-space capture using the capture engine
         if multi_space or space_number is not None:
@@ -6350,8 +6460,13 @@ For this query, provide a helpful response that leverages the multi-space inform
         # Method 3: PIL ImageGrab
         capture_methods.append(("pil_imagegrab", self._capture_pil_imagegrab))
 
+        # v257.0: Track validation vs capture failures for circuit breaker
+        _validation_failures = 0
+        _methods_attempted = 0
+
         # Try each method in order
         for method_name, method_func in capture_methods:
+            _methods_attempted += 1
             try:
                 logger.info(f"[CAPTURE SCREEN] Trying method: {method_name}")
                 result = await method_func()
@@ -6359,11 +6474,22 @@ For this query, provide a helpful response that leverages the multi-space inform
                     logger.info(f"[CAPTURE SCREEN] Success with {method_name}")
                     # Validate the captured image
                     if self._validate_captured_image(result):
+                        # v257.0: Success — reset circuit breaker
+                        if self._capture_consecutive_failures > 0 or self._capture_circuit_open:
+                            if self._capture_circuit_open:
+                                logger.info("[CAPTURE] Circuit CLOSED — capture recovered")
+                            self._capture_consecutive_failures = 0
+                            self._capture_circuit_open = False
+                            self._capture_permission_denied = False
+                            self._capture_last_permission_check = 0.0
                         return result
                     else:
+                        _validation_failures += 1
                         logger.warning(
                             f"[CAPTURE SCREEN] {method_name} returned invalid image"
                         )
+            except asyncio.CancelledError:
+                raise  # Not a capture failure — don't increment circuit breaker
             except Exception as e:
                 logger.warning(
                     f"[CAPTURE SCREEN] {method_name} failed: {type(e).__name__}: {e}"
@@ -6371,7 +6497,32 @@ For this query, provide a helpful response that leverages the multi-space inform
                 continue
 
         # All methods failed
-        logger.error("[CAPTURE SCREEN] All capture methods failed")
+        # v257.0: Distinguish capture failures from validation failures.
+        # Invalid images (display/config issue) should NOT open the circuit breaker.
+        if _validation_failures > 0 and _validation_failures == _methods_attempted:
+            logger.warning(
+                f"[CAPTURE] All {_validation_failures} captures returned invalid images "
+                "— check display config (not a capture/permission issue)"
+            )
+            return None
+
+        self._capture_consecutive_failures += 1
+        if self._capture_consecutive_failures >= self._CAPTURE_CIRCUIT_THRESHOLD:
+            if not self._capture_circuit_open:
+                self._capture_circuit_open = True
+                self._capture_circuit_open_since = time.time()
+                logger.warning(
+                    f"[CAPTURE] Circuit OPEN after {self._capture_consecutive_failures} "
+                    f"consecutive failures — probing every {self._CAPTURE_CIRCUIT_PROBE_INTERVAL:.0f}s"
+                )
+            else:
+                self._capture_circuit_open_since = time.time()
+                logger.info("[CAPTURE] Probe failed — circuit remains open")
+        else:
+            logger.warning(
+                f"[CAPTURE] All methods failed "
+                f"({self._capture_consecutive_failures}/{self._CAPTURE_CIRCUIT_THRESHOLD} toward circuit open)"
+            )
         return None
 
     async def _capture_from_video_stream(self) -> Optional[Image.Image]:
@@ -7327,6 +7478,8 @@ For this query, provide a helpful response that leverages the multi-space inform
                         "behavior": behavior_type,
                         "content": result,
                     }
+                # v257.0: Explicit capture-failure return (was falling through to "Unknown behavior type")
+                return {"success": False, "behavior": behavior_type, "error": "Screen capture failed"}
 
             elif behavior_type == "handle_error":
                 # Analyze error details
@@ -7345,6 +7498,8 @@ For this query, provide a helpful response that leverages the multi-space inform
                         "behavior": behavior_type,
                         "error_details": result,
                     }
+                # v257.0: Explicit capture-failure return
+                return {"success": False, "behavior": behavior_type, "error": "Screen capture failed"}
 
             elif behavior_type == "handle_dialog":
                 # Analyze dialog options
@@ -7363,6 +7518,8 @@ For this query, provide a helpful response that leverages the multi-space inform
                         "behavior": behavior_type,
                         "dialog_info": result,
                     }
+                # v257.0: Explicit capture-failure return
+                return {"success": False, "behavior": behavior_type, "error": "Screen capture failed"}
 
             return {
                 "success": False,
@@ -7666,13 +7823,35 @@ For this query, provide a helpful response that leverages the multi-space inform
 
     async def _proactive_monitoring_loop(self):
         """Main proactive monitoring loop - continuously analyze screen for changes"""
+        # v257.0: Failure tracking + adaptive backoff for persistent capture failures
+        _monitor_capture_failures = 0
+        _MONITOR_MAX_CAPTURE_FAILURES = int(os.environ.get("JARVIS_MONITOR_MAX_CAPTURE_FAILURES", "10"))
+        _MONITOR_FAILURE_CAP = 100  # Prevent unbounded counter
+
         while self._proactive_monitoring_active:
             try:
                 # Capture current screen
                 screenshot = await self.capture_screen()
                 if not screenshot:
-                    await asyncio.sleep(self._proactive_config["analysis_interval"])
+                    _monitor_capture_failures = min(_monitor_capture_failures + 1, _MONITOR_FAILURE_CAP)
+                    if _monitor_capture_failures == 1:
+                        logger.warning("[ProactiveMonitor] Screen capture failed — will retry")
+                    elif _monitor_capture_failures >= _MONITOR_MAX_CAPTURE_FAILURES:
+                        if _monitor_capture_failures == _MONITOR_MAX_CAPTURE_FAILURES:
+                            logger.error(
+                                f"[ProactiveMonitor] Screen capture failed {_monitor_capture_failures}x "
+                                "consecutively — entering backoff. Check screen recording permissions."
+                            )
+                        _exp = min(_monitor_capture_failures - _MONITOR_MAX_CAPTURE_FAILURES, 4)
+                        _backoff = min(300.0, 30.0 * (2 ** _exp))
+                        await asyncio.sleep(_backoff)
+                    else:
+                        await asyncio.sleep(self._proactive_config["analysis_interval"])
                     continue
+
+                if _monitor_capture_failures > 0:
+                    logger.info(f"[ProactiveMonitor] Screen capture recovered after {_monitor_capture_failures} failures")
+                    _monitor_capture_failures = 0
 
                 # Analyze for changes
                 changes = await self._analyze_proactive_changes(screenshot)
@@ -7688,6 +7867,8 @@ For this query, provide a helpful response that leverages the multi-space inform
                 interval = self._calculate_adaptive_interval()
                 await asyncio.sleep(interval)
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error in proactive monitoring loop: {e}")
                 await asyncio.sleep(self._proactive_config["analysis_interval"])

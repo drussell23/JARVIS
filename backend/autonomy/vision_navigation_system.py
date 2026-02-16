@@ -202,7 +202,13 @@ class VisionNavigationSystem:
         """Create a complete map of the current workspace"""
         # Capture full screen
         screen_capture = self.screen_capture.capture_screen()
-        
+        # v257.0: Guard against None capture (sync call — no force parameter)
+        if screen_capture is None:
+            return WorkspaceMap(
+                windows=[], elements=[], active_window=None,
+                screen_bounds=self._get_screen_bounds()
+            )
+
         # Get all windows
         windows = self.window_detector.get_all_windows()
         

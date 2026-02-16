@@ -61591,11 +61591,15 @@ class JarvisSystemKernel:
                         if ecapa_verify.get("verification_pipeline_ready"):
                             self.logger.info("[Kernel] ECAPA pipeline verified and ready")
                         else:
-                            issue_collector.add_warning(
-                                "ECAPA pipeline verification incomplete — voice unlock may be degraded",
-                                IssueCategory.INTELLIGENCE,
-                                suggestion="Check ECAPA model availability and ML engine registry",
-                            )
+                            # v256.1: Guard against post-startup collector state
+                            try:
+                                issue_collector.add_warning(
+                                    "ECAPA pipeline verification incomplete — voice unlock may be degraded",
+                                    IssueCategory.INTELLIGENCE,
+                                    suggestion="Check ECAPA model availability and ML engine registry",
+                                )
+                            except Exception:
+                                self.logger.warning("[Kernel] ECAPA verification incomplete (post-startup)")
                     except asyncio.TimeoutError:
                         self.logger.warning(f"[Kernel] ECAPA verification timed out ({_ecapa_bg_timeout:.0f}s) — skipping")
                     except asyncio.CancelledError:
@@ -61726,6 +61730,11 @@ class JarvisSystemKernel:
                     IssueCategory.INTELLIGENCE,
                     suggestion="Increase JARVIS_TWO_TIER_INIT_TIMEOUT or check component health"
                 )
+
+            # v256.1: Reset two_tier stall timer by advancing progress (R3-#3).
+            # Don't transition to trinity yet — that happens at line ~61905.
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase("two_tier", 65)
 
             await self._broadcast_startup_progress(
                 stage="two_tier",
@@ -64594,6 +64603,11 @@ class JarvisSystemKernel:
                         }
                         self.logger.success("[TwoTier] ✓ Agentic Watchdog active")
 
+                    except asyncio.CancelledError:
+                        # v256.1: Outer timeout cancelled us — ensure clean state
+                        self._agentic_watchdog = None
+                        self._two_tier_status["watchdog"]["status"] = "cancelled"
+                        raise
                     except ImportError as e:
                         self.logger.warning(f"[TwoTier] Watchdog module not available: {e}")
                         self._two_tier_status["watchdog"]["status"] = "unavailable"
@@ -64624,6 +64638,11 @@ class JarvisSystemKernel:
                             f"(T1:{self.config.vbia_tier1_threshold:.0%}, T2:{self.config.vbia_tier2_threshold:.0%})"
                         )
 
+                    except asyncio.CancelledError:
+                        # v256.1: Outer timeout cancelled us — ensure clean state
+                        self._vbia_adapter = None
+                        self._two_tier_status["vbia_adapter"]["status"] = "cancelled"
+                        raise
                     except ImportError as e:
                         self.logger.warning(f"[TwoTier] VBIA module not available: {e}")
                         self._two_tier_status["vbia_adapter"]["status"] = "unavailable"
@@ -64656,6 +64675,11 @@ class JarvisSystemKernel:
                         else:
                             self.logger.warning("[TwoTier] ⚠ Cross-Repo State failed to initialize")
 
+                    except asyncio.CancelledError:
+                        # v256.1: Outer timeout cancelled us — ensure clean state
+                        self._cross_repo_initialized = False
+                        self._two_tier_status["cross_repo"]["status"] = "cancelled"
+                        raise
                     except asyncio.TimeoutError:
                         self.logger.warning(
                             f"[TwoTier] Cross-Repo init timed out ({_cross_repo_timeout}s) — "
@@ -64755,12 +64779,26 @@ class JarvisSystemKernel:
                 # --- v256.0: Parallel execution ---
                 # time = max(Step1, Step2+Step4, Step3) instead of Step1+Step2+Step3+Step4
                 await self._broadcast_progress(56, "two_tier_parallel", "Initializing Two-Tier components (parallel)...")
-                await asyncio.gather(
+                # v256.1: Inspect gather results for unexpected exceptions (R1-#1, R2-#7)
+                _gather_results = await asyncio.gather(
                     _init_watchdog(),           # Step 1 (independent)
                     _chain_vbia_then_router(),  # Step 2 → Step 4 (dependency chain)
                     _init_cross_repo(),         # Step 3 (independent)
                     return_exceptions=True,
                 )
+                for _i, _res in enumerate(_gather_results):
+                    if isinstance(_res, BaseException):
+                        _step_names = ["watchdog", "vbia+router", "cross_repo"]
+                        # v256.1: CancelledError is BaseException in 3.9+, Exception in 3.8
+                        if isinstance(_res, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                            raise _res
+                        elif not isinstance(_res, Exception):
+                            raise _res  # Unknown BaseException subclass — re-raise
+                        else:
+                            self.logger.warning(
+                                f"[TwoTier] Unexpected exception in {_step_names[_i]}: "
+                                f"{type(_res).__name__}: {_res}"
+                            )
 
                 # =====================================================================
                 # STEP 5: Wire execute_tier2 to AgenticTaskRunner
@@ -72576,17 +72614,21 @@ class JarvisSystemKernel:
                     _phase3_wait = _get_env_float("JARVIS_VOICE_BIO_ECAPA_WAIT", 30.0)
                     self.logger.info(f"[VoiceBio] Phase 3 ECAPA task still running — waiting up to {_phase3_wait:.0f}s...")
                     try:
-                        await asyncio.wait_for(
-                            asyncio.shield(self._ecapa_verification_task),
-                            timeout=_phase3_wait,
-                        )
-                        try:
-                            _ecapa_result = self._ecapa_verification_task.result()
-                            if isinstance(_ecapa_result, dict) and _ecapa_result.get("verification_pipeline_ready"):
-                                _ecapa_already_loaded = True
-                                self.logger.info("[VoiceBio] ECAPA loaded by Phase 3 (awaited)")
-                        except Exception:
-                            self.logger.info("[VoiceBio] Phase 3 ECAPA task completed with error — retrying")
+                        # v256.1: Check cancelled() first — shield on cancelled task is pointless
+                        if self._ecapa_verification_task.cancelled():
+                            self.logger.info("[VoiceBio] Phase 3 ECAPA task was cancelled — proceeding with own init")
+                        else:
+                            await asyncio.wait_for(
+                                asyncio.shield(self._ecapa_verification_task),
+                                timeout=_phase3_wait,
+                            )
+                            try:
+                                _ecapa_result = self._ecapa_verification_task.result()
+                                if isinstance(_ecapa_result, dict) and _ecapa_result.get("verification_pipeline_ready"):
+                                    _ecapa_already_loaded = True
+                                    self.logger.info("[VoiceBio] ECAPA loaded by Phase 3 (awaited)")
+                            except Exception:
+                                self.logger.info("[VoiceBio] Phase 3 ECAPA task completed with error — retrying")
                     except asyncio.TimeoutError:
                         self.logger.warning(
                             f"[VoiceBio] Phase 3 ECAPA still loading after {_phase3_wait:.0f}s — "

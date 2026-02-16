@@ -215,6 +215,19 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# v256.1: Safe env var float parser with fallback
+# =============================================================================
+def _get_env_float(name: str, default: float) -> float:
+    """v256.1: Safe env var float parser with fallback."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        logger.warning(f"[v256.1] Invalid env var {name}={os.environ.get(name)!r} — using default {default}")
+        return default
+
+
 # =============================================================================
 # v148.1: LOG SEVERITY BRIDGE - Criticality-aware logging for component failures
 # =============================================================================
@@ -7916,24 +7929,34 @@ class ProcessOrchestrator:
             # 2. Re-enforce hardware environment
             # v256.0: Added timeout — asyncio.to_thread(assess_hardware_profile) can block
             # indefinitely under CPU pressure (96-98%). 15s default is generous for psutil calls.
-            _hw_timeout = float(os.environ.get("JARVIS_HW_ASSESS_TIMEOUT", "15.0"))
+            _hw_timeout = _get_env_float("JARVIS_HW_ASSESS_TIMEOUT", 15.0)
             try:
                 await asyncio.wait_for(self._enforce_hardware_environment(), timeout=_hw_timeout)
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"[v256.0] Hardware assessment timed out ({_hw_timeout:.0f}s) — using defaults"
+                    f"[v256.0] Hardware assessment timed out ({_hw_timeout:.0f}s) — using defaults. "
+                    "NOTE: GCP prewarm decision based on default hardware profile — "
+                    "cloud offloading may be incorrectly disabled if real hardware is CAPABLE."
                 )
             logger.info(f"[v256.0] Orchestrator step 2/4: hardware assessed ({time.time() - _ctx_start:.1f}s)")
 
             # 3. GCP pre-warm (if enabled based on hardware assessment)
+            # v256.1: Added timeout — GCP SDK init can block under network issues
             if self._gcp_prewarm_enabled:
-                await self._start_gcp_prewarm()
+                _gcp_prewarm_timeout = _get_env_float("JARVIS_GCP_PREWARM_TIMEOUT", 15.0)
+                try:
+                    await asyncio.wait_for(self._start_gcp_prewarm(), timeout=_gcp_prewarm_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[v256.1] GCP prewarm start timed out ({_gcp_prewarm_timeout:.0f}s) — "
+                        "skipping. GCP offloading may be delayed."
+                    )
             logger.info(f"[v256.0] Orchestrator step 3/4: GCP prewarm checked ({time.time() - _ctx_start:.1f}s)")
 
             # 4. Initialize cross_repo state (respects spawn_processes flag)
             # v256.0: Added timeout — _initialize_cross_repo_state() calls DLM operations
             # and file I/O that can hang with stale locks. 30s covers normal operation.
-            _cross_repo_timeout = float(os.environ.get("JARVIS_ORCH_CROSS_REPO_TIMEOUT", "30.0"))
+            _cross_repo_timeout = _get_env_float("JARVIS_ORCH_CROSS_REPO_TIMEOUT", 30.0)
             try:
                 await asyncio.wait_for(
                     self._initialize_cross_repo_state(spawn_processes=spawn_processes),
@@ -7943,6 +7966,16 @@ class ProcessOrchestrator:
                 logger.warning(
                     f"[v256.0] Cross-repo state init timed out ({_cross_repo_timeout:.0f}s) — continuing"
                 )
+                # v256.1: Cleanup any DLM locks orphaned by the cancelled task.
+                try:
+                    from backend.core.distributed_lock_manager import get_lock_manager
+                    _dlm = await get_lock_manager()
+                    # v256.1: Using private API — _cleanup_stale_locks() is the only
+                    # cleanup mechanism available. If DLM gains a public cleanup API, migrate.
+                    await asyncio.wait_for(_dlm._cleanup_stale_locks(), timeout=5.0)
+                    logger.info("[v256.1] Post-timeout DLM stale lock cleanup completed")
+                except Exception as _dlm_err:
+                    logger.debug(f"[v256.1] DLM cleanup after timeout: {_dlm_err}")
             logger.info(f"[v256.0] Orchestrator step 4/4: cross-repo state initialized ({time.time() - _ctx_start:.1f}s)")
 
             yield self
