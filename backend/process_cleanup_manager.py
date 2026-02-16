@@ -1237,8 +1237,28 @@ class EventDrivenCleanupTrigger:
 
         # Thresholds
         self.memory_pressure_threshold = 0.80
-        self.cpu_pressure_threshold = 0.90
+        self.cpu_pressure_threshold = float(
+            os.getenv("JARVIS_CPU_PRESSURE_MONITOR_THRESHOLD", "0.95")
+        )
         self.check_interval = 5.0  # seconds
+
+        # v259.0: CPU pressure hysteresis/state (prevents spike-driven thrash).
+        self._cpu_pressure_min_samples = max(
+            1, int(os.getenv("JARVIS_CPU_PRESSURE_MIN_SAMPLES", "2"))
+        )
+        self._cpu_pressure_recovery_samples = max(
+            1, int(os.getenv("JARVIS_CPU_PRESSURE_RECOVERY_SAMPLES", "2"))
+        )
+        self._cpu_pressure_recovery_hysteresis_pct = float(
+            os.getenv("JARVIS_CPU_PRESSURE_RECOVERY_HYSTERESIS_PCT", "3.0")
+        )
+        self._cpu_pressure_emit_cooldown = float(
+            os.getenv("JARVIS_CPU_PRESSURE_EVENT_COOLDOWN", "60.0")
+        )
+        self._cpu_pressure_consecutive = 0
+        self._cpu_recovery_consecutive = 0
+        self._cpu_pressure_active = False
+        self._last_cpu_pressure_emit_ts = 0.0
 
     def register_handler(
         self,
@@ -1391,7 +1411,13 @@ class EventDrivenCleanupTrigger:
             logger.debug(f"Memory pressure check error: {e}")
 
     def _check_cpu_pressure(self) -> None:
-        """Check for CPU pressure."""
+        """Check for CPU pressure with sustained/hysteresis gating.
+
+        v259.0:
+        - Requires sustained high samples before emitting CPU_PRESSURE.
+        - Uses hysteresis below threshold for recovery to avoid flapping.
+        - Applies event cooldown while pressure remains active.
+        """
         try:
             # v258.0: Non-blocking via shared metrics service
             try:
@@ -1399,13 +1425,58 @@ class EventDrivenCleanupTrigger:
                 cpu = get_cpu_percent_cached()
             except ImportError:
                 cpu = psutil.cpu_percent(interval=0.1)
-            if cpu / 100.0 >= self.cpu_pressure_threshold:
-                self.emit_event(CleanupEvent(
-                    event_type=CleanupEventType.CPU_PRESSURE,
-                    priority=6,
-                    source="system_monitor",
-                    data={'cpu_percent': cpu}
-                ))
+
+            threshold_pct = self.cpu_pressure_threshold * 100.0
+            recovery_floor = max(
+                0.0, threshold_pct - self._cpu_pressure_recovery_hysteresis_pct
+            )
+            now = time.time()
+
+            if cpu >= threshold_pct:
+                self._cpu_pressure_consecutive += 1
+                self._cpu_recovery_consecutive = 0
+
+                should_emit = False
+                if not self._cpu_pressure_active:
+                    if self._cpu_pressure_consecutive >= self._cpu_pressure_min_samples:
+                        self._cpu_pressure_active = True
+                        should_emit = True
+                elif (now - self._last_cpu_pressure_emit_ts) >= self._cpu_pressure_emit_cooldown:
+                    should_emit = True
+
+                if should_emit:
+                    self._last_cpu_pressure_emit_ts = now
+                    self.emit_event(
+                        CleanupEvent(
+                            event_type=CleanupEventType.CPU_PRESSURE,
+                            priority=6,
+                            source="system_monitor",
+                            data={
+                                "cpu_percent": cpu,
+                                "sustained_samples": self._cpu_pressure_consecutive,
+                                "threshold_percent": threshold_pct,
+                                "active": self._cpu_pressure_active,
+                            },
+                        )
+                    )
+            elif cpu <= recovery_floor:
+                self._cpu_pressure_consecutive = 0
+                self._cpu_recovery_consecutive += 1
+                if (
+                    self._cpu_pressure_active
+                    and self._cpu_recovery_consecutive >= self._cpu_pressure_recovery_samples
+                ):
+                    self._cpu_pressure_active = False
+                    self._cpu_recovery_consecutive = 0
+                    self._last_cpu_pressure_emit_ts = 0.0
+                    logger.info(
+                        "CPU pressure recovered: %.1f%% (threshold %.1f%%)",
+                        cpu,
+                        threshold_pct,
+                    )
+            else:
+                # Within hysteresis band: keep current active state to avoid flapping.
+                self._cpu_recovery_consecutive = 0
         except Exception:
             pass
 

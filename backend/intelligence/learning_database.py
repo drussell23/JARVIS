@@ -10,6 +10,7 @@ import asyncio
 import calendar
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -60,6 +61,13 @@ except ImportError:
     logging.warning("ChromaDB not available - install with: pip install chromadb")
 
 from backend.core.async_safety import LazyAsyncLock, LazyAsyncEvent
+
+try:
+    from backend.core.robust_file_lock import RobustFileLock
+    ROBUST_FILE_LOCK_AVAILABLE = True
+except Exception:
+    RobustFileLock = None  # type: ignore[assignment]
+    ROBUST_FILE_LOCK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -3643,12 +3651,86 @@ class JARVISLearningDatabase:
             except (ImportError, AttributeError):
                 pass  # Telemetry module not available or already disabled
 
+            chroma_tenant = (
+                os.environ.get("JARVIS_CHROMADB_TENANT", "default_tenant").strip()
+                or "default_tenant"
+            )
+            chroma_database = (
+                os.environ.get("JARVIS_CHROMADB_DATABASE", "default_database").strip()
+                or "default_database"
+            )
+
+            def _build_chroma_settings(chroma_path: Path):
+                """
+                Build Settings with version-compatible persistence fields.
+                """
+                base_kwargs: Dict[str, Any] = {
+                    "anonymized_telemetry": False,
+                    "allow_reset": True,
+                }
+                try:
+                    return Settings(
+                        **base_kwargs,
+                        is_persistent=True,
+                        persist_directory=str(chroma_path),
+                    )
+                except TypeError:
+                    return Settings(**base_kwargs)
+
+            def _ensure_chroma_namespace_sync(
+                chroma_path: Path,
+                tenant: str,
+                database: str,
+            ) -> None:
+                """
+                Ensure tenant/database exist before opening PersistentClient.
+
+                ChromaDB 1.x requires tenant/database metadata in sysdb. Older
+                stores or interrupted upgrades can miss these rows and trigger
+                "Could not connect to tenant default_tenant" errors.
+                """
+                admin_cls = getattr(chromadb, "AdminClient", None)
+                if admin_cls is None:
+                    return
+
+                admin_settings = _build_chroma_settings(chroma_path)
+                admin = admin_cls(settings=admin_settings)
+
+                try:
+                    admin.get_tenant(name=tenant)
+                except Exception:
+                    admin.create_tenant(name=tenant)
+
+                try:
+                    admin.get_database(name=database, tenant=tenant)
+                except Exception:
+                    admin.create_database(name=database, tenant=tenant)
+
+            def _persistent_client_supports_namespace() -> Tuple[bool, bool]:
+                try:
+                    params = inspect.signature(chromadb.PersistentClient).parameters
+                    return "tenant" in params, "database" in params
+                except Exception:
+                    return False, False
+
             # v121.0: Run synchronous ChromaDB init in thread to not block event loop
-            def _init_chromadb_sync(chroma_path: Path):
+            def _init_chromadb_sync(chroma_path: Path, tenant: str, database: str):
                 """Synchronous ChromaDB initialization - runs in executor thread."""
+                settings = _build_chroma_settings(chroma_path)
+                _ensure_chroma_namespace_sync(chroma_path, tenant, database)
+
+                client_kwargs: Dict[str, Any] = {
+                    "path": str(chroma_path),
+                    "settings": settings,
+                }
+                supports_tenant, supports_database = _persistent_client_supports_namespace()
+                if supports_tenant:
+                    client_kwargs["tenant"] = tenant
+                if supports_database:
+                    client_kwargs["database"] = database
+
                 client = chromadb.PersistentClient(
-                    path=str(chroma_path),
-                    settings=Settings(anonymized_telemetry=False, allow_reset=True),
+                    **client_kwargs,
                 )
                 goal_coll = client.get_or_create_collection(
                     name="goal_embeddings",
@@ -3673,45 +3755,103 @@ class JARVISLearningDatabase:
                 )
                 return client, goal_coll, pattern_coll, context_coll
 
-            # Initialize ChromaDB client with persistent storage - OFF THE EVENT LOOP
-            try:
-                (
-                    self.chroma_client,
-                    self.goal_collection,
-                    self.pattern_collection,
-                    self.context_collection,
-                ) = await asyncio.to_thread(_init_chromadb_sync, self.chroma_path)
-                # Collections already created by _init_chromadb_sync
+            async def _initialize_chromadb_with_recovery() -> None:
+                # Initialize ChromaDB client with persistent storage - OFF THE EVENT LOOP
+                try:
+                    (
+                        self.chroma_client,
+                        self.goal_collection,
+                        self.pattern_collection,
+                        self.context_collection,
+                    ) = await asyncio.to_thread(
+                        _init_chromadb_sync,
+                        self.chroma_path,
+                        chroma_tenant,
+                        chroma_database,
+                    )
+                    # Collections already created by _init_chromadb_sync
 
-            except Exception as chroma_error:
-                # Check if it's a schema or tenant corruption error
-                _err_str = str(chroma_error).lower()
-                if "no such column" in _err_str or "tenant" in _err_str:
-                    logger.warning(f"ChromaDB schema/tenant mismatch detected: {chroma_error}")
-                    logger.info("Resetting ChromaDB to fix schema issue...")
+                except Exception as chroma_error:
+                    # Check if it's a schema or tenant corruption error
+                    _err_str = str(chroma_error).lower()
+                    if "no such column" in _err_str or "tenant" in _err_str:
+                        logger.warning(f"ChromaDB schema/tenant mismatch detected: {chroma_error}")
+                        logger.info(
+                            "Resetting ChromaDB to repair namespace/schema "
+                            "(tenant=%s, database=%s)...",
+                            chroma_tenant,
+                            chroma_database,
+                        )
 
-                    # v121.0: Reset and recreate using thread to avoid blocking
-                    def _reset_chromadb_sync(chroma_path: Path):
-                        """Synchronous ChromaDB reset - runs in executor thread."""
-                        import shutil
-                        if chroma_path.exists():
-                            backup_path = chroma_path.parent / f"chroma_embeddings_backup_{int(time.time())}"
-                            shutil.move(str(chroma_path), str(backup_path))
-                        return _init_chromadb_sync(chroma_path)
+                        # v121.0: Reset and recreate using thread to avoid blocking
+                        def _reset_chromadb_sync(
+                            chroma_path: Path,
+                            tenant: str,
+                            database: str,
+                        ):
+                            """Synchronous ChromaDB reset - runs in executor thread."""
+                            import shutil
+                            if chroma_path.exists():
+                                backup_path = (
+                                    chroma_path.parent
+                                    / f"chroma_embeddings_backup_{int(time.time())}_{os.getpid()}"
+                                )
+                                shutil.move(str(chroma_path), str(backup_path))
+                            return _init_chromadb_sync(chroma_path, tenant, database)
 
-                    try:
-                        (
-                            self.chroma_client,
-                            self.goal_collection,
-                            self.pattern_collection,
-                            self.context_collection,
-                        ) = await asyncio.to_thread(_reset_chromadb_sync, self.chroma_path)
-                        logger.info("ChromaDB reset complete - fresh database created")
-                    except Exception as reset_error:
-                        logger.error(f"Failed to reset ChromaDB: {reset_error}")
-                        self.chroma_client = None
-                else:
-                    raise chroma_error
+                        try:
+                            (
+                                self.chroma_client,
+                                self.goal_collection,
+                                self.pattern_collection,
+                                self.context_collection,
+                            ) = await asyncio.to_thread(
+                                _reset_chromadb_sync,
+                                self.chroma_path,
+                                chroma_tenant,
+                                chroma_database,
+                            )
+                            logger.info(
+                                "ChromaDB reset complete - fresh database created "
+                                "(tenant=%s, database=%s)",
+                                chroma_tenant,
+                                chroma_database,
+                            )
+                        except Exception as reset_error:
+                            logger.error(f"Failed to reset ChromaDB: {reset_error}")
+                            self.chroma_client = None
+                    else:
+                        raise chroma_error
+
+            if ROBUST_FILE_LOCK_AVAILABLE:
+                lock_name = os.environ.get(
+                    "JARVIS_CHROMADB_INIT_LOCK_NAME",
+                    "learning_chromadb_init",
+                )
+                lock_timeout = float(
+                    os.environ.get("JARVIS_CHROMADB_INIT_LOCK_TIMEOUT", "30.0")
+                )
+                lock_source = os.environ.get(
+                    "JARVIS_CHROMADB_LOCK_SOURCE",
+                    "learning_database",
+                )
+                chroma_lock = RobustFileLock(lock_name, source=lock_source)
+                acquired = await chroma_lock.acquire(timeout_s=lock_timeout)
+                if not acquired:
+                    logger.warning(
+                        "Could not acquire ChromaDB init lock '%s' within %.1fs; "
+                        "continuing without lock (best effort)",
+                        lock_name,
+                        lock_timeout,
+                    )
+                    await _initialize_chromadb_with_recovery()
+                    return
+                try:
+                    await _initialize_chromadb_with_recovery()
+                finally:
+                    await chroma_lock.release()
+            else:
+                await _initialize_chromadb_with_recovery()
 
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB: {e}")
