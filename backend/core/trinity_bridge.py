@@ -1245,7 +1245,12 @@ class TrinityBridge:
         # Adjust for system load
         try:
             import psutil
-            cpu_percent = psutil.cpu_percent(interval=0.1)
+            # v258.0: Non-blocking via shared metrics service
+            try:
+                from core.async_system_metrics import get_cpu_percent_cached
+                cpu_percent = get_cpu_percent_cached()
+            except ImportError:
+                cpu_percent = psutil.cpu_percent(interval=0.1)
             memory_percent = psutil.virtual_memory().percent
 
             # Increase timeout under high load

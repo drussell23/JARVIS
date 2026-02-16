@@ -920,7 +920,12 @@ class HealthMonitor:
     def _check_cpu(self) -> Tuple[bool, str]:
         """Check CPU usage health."""
         try:
-            cpu = psutil.cpu_percent(interval=0.1)
+            # v258.0: Non-blocking via shared metrics service
+            try:
+                from core.async_system_metrics import get_cpu_percent_cached
+                cpu = get_cpu_percent_cached()
+            except ImportError:
+                cpu = psutil.cpu_percent(interval=0.1)
             self.metrics.current_cpu_usage_percent = cpu / 100.0
 
             if cpu >= self.cpu_critical_threshold * 100:
@@ -1388,7 +1393,12 @@ class EventDrivenCleanupTrigger:
     def _check_cpu_pressure(self) -> None:
         """Check for CPU pressure."""
         try:
-            cpu = psutil.cpu_percent(interval=0.1)
+            # v258.0: Non-blocking via shared metrics service
+            try:
+                from core.async_system_metrics import get_cpu_percent_cached
+                cpu = get_cpu_percent_cached()
+            except ImportError:
+                cpu = psutil.cpu_percent(interval=0.1)
             if cpu / 100.0 >= self.cpu_pressure_threshold:
                 self.emit_event(CleanupEvent(
                     event_type=CleanupEventType.CPU_PRESSURE,
@@ -2998,23 +3008,34 @@ class ProcessCleanupManager:
             cpu_percent, _compound, _gcp_recommended,
         )
 
-        # Write signal file for cross-repo coordination
+        # v258.0: CPU-targeted relief (always, not just compound)
+        self._schedule_cpu_relief(cpu_percent)
+
+        # Write signal file for cross-repo coordination (R2-#3: atomic write)
         _signal_dir = os.path.expanduser(
             os.getenv("JARVIS_SIGNAL_DIR", "~/.jarvis/signals")
         )
         try:
             os.makedirs(_signal_dir, exist_ok=True)
             import json
+            import tempfile
             signal_path = os.path.join(_signal_dir, "cpu_pressure.json")
-            with open(signal_path, 'w') as f:
-                json.dump({
-                    "type": "cpu_pressure",
-                    "cpu_percent": cpu_percent,
-                    "memory_percent": _memory_percent,
-                    "compound": _compound,
-                    "gcp_recommended": _gcp_recommended,
-                    "timestamp": _now,
-                }, f)
+            # v258.0 R2-#3: Atomic write via tempfile + os.replace (POSIX atomic)
+            signal_data = {
+                "type": "cpu_pressure",
+                "cpu_percent": cpu_percent,
+                "memory_percent": _memory_percent,
+                "compound": _compound,
+                "gcp_recommended": _gcp_recommended,
+                "timestamp": _now,
+                "expires_at": _now + float(os.getenv("JARVIS_CPU_THROTTLE_DURATION", "60.0")),
+            }
+            with tempfile.NamedTemporaryFile(
+                mode='w', dir=_signal_dir, suffix='.tmp', delete=False
+            ) as f:
+                json.dump(signal_data, f)
+                tmp_path = f.name
+            os.replace(tmp_path, signal_path)  # Atomic on POSIX
         except Exception:
             pass  # Non-fatal — signal file is advisory
 
@@ -3025,6 +3046,48 @@ class ProcessCleanupManager:
                 cpu_percent, _memory_percent,
             )
             self._schedule_memory_relief(_memory_percent)
+
+    def _schedule_cpu_relief(self, cpu_percent: float) -> None:
+        """v258.0: CPU-targeted relief with tiered throttle factors.
+
+        Dispatched from _handle_cpu_pressure (sync monitoring thread — R2-#7).
+        Sets sys attribute (intra-process, GIL-atomic) as primary signal.
+
+        Tiers:
+          Tier 1 (>=95%): throttle_factor=4.0, duration 60s
+          Tier 2 (>=98%): throttle_factor=8.0, duration 120s
+          Tier 3 (>=99.5%): throttle_factor=16.0, duration 240s
+        """
+        import sys as _sys
+
+        _tier1 = float(os.getenv("JARVIS_CPU_RELIEF_TIER1", "95.0"))
+        _tier2 = float(os.getenv("JARVIS_CPU_RELIEF_TIER2", "98.0"))
+        _tier3 = float(os.getenv("JARVIS_CPU_RELIEF_TIER3", "99.5"))
+        _base_factor = float(os.getenv("JARVIS_CPU_THROTTLE_FACTOR", "4.0"))
+        _base_duration = float(os.getenv("JARVIS_CPU_THROTTLE_DURATION", "60.0"))
+
+        if cpu_percent >= _tier3:
+            level, throttle_factor, duration = "emergency", _base_factor * 4, _base_duration * 4
+        elif cpu_percent >= _tier2:
+            level, throttle_factor, duration = "aggressive", _base_factor * 2, _base_duration * 2
+        elif cpu_percent >= _tier1:
+            level, throttle_factor, duration = "moderate", _base_factor, _base_duration
+        else:
+            return  # Below all tiers
+
+        logger.info(
+            "CPU relief: tier=%s, throttle_factor=%.1f, duration=%.0fs (cpu=%.1f%%)",
+            level, throttle_factor, duration, cpu_percent,
+        )
+
+        # Primary signal: sys attribute (intra-process, GIL-atomic, zero I/O — R2-#3)
+        setattr(_sys, '_jarvis_cpu_throttle', {
+            "level": level,
+            "throttle_factor": throttle_factor,
+            "expires_at": time.time() + duration,
+            "timestamp": time.time(),
+            "cpu_percent": cpu_percent,
+        })
 
     def _schedule_memory_relief(self, memory_percent: float) -> None:
         """

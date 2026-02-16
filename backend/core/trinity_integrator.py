@@ -1890,7 +1890,12 @@ class ResourceCoordinator:
     def get_system_resources(self) -> Dict[str, Any]:
         """Get current system resource usage."""
         memory = psutil.virtual_memory()
-        cpu_percent = psutil.cpu_percent(interval=0.1)
+        # v258.0: Non-blocking via shared metrics service
+        try:
+            from core.async_system_metrics import get_cpu_percent_cached
+            cpu_percent = get_cpu_percent_cached()
+        except ImportError:
+            cpu_percent = psutil.cpu_percent(interval=0.1)
 
         return {
             "memory": {

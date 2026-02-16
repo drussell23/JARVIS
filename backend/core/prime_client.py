@@ -195,7 +195,7 @@ class PrimeClientConfig:
 
     # Health check settings
     health_check_interval: float = field(default_factory=lambda: _get_env_float("PRIME_HEALTH_CHECK_INTERVAL", 10.0))
-    health_check_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_HEALTH_CHECK_TIMEOUT", 5.0))
+    health_check_timeout: float = field(default_factory=lambda: _get_env_float("PRIME_HEALTH_CHECK_TIMEOUT", 15.0))
 
     # Fallback settings
     enable_cloud_fallback: bool = field(default_factory=lambda: _get_env_bool("PRIME_ENABLE_CLOUD_FALLBACK", True))
@@ -510,6 +510,12 @@ class PrimeClient:
         self._consecutive_gcp_failures: int = 0
         # v242.1: Model ID from last streaming response (extracted from X-Model-Id header)
         self._last_stream_model_id: str = "jarvis-prime"
+        # v258.0: Health check backoff state
+        self._health_consecutive_failures: int = 0
+        self._health_backoff_interval: float = self._config.health_check_interval
+        self._health_max_backoff: float = _get_env_float("PRIME_HEALTH_MAX_BACKOFF", 300.0)
+        self._health_backoff_factor: float = _get_env_float("PRIME_HEALTH_BACKOFF_FACTOR", 2.0)
+        self._health_failure_logged: bool = False
 
     async def initialize(self) -> None:
         """Initialize the client and start health monitoring."""
@@ -680,12 +686,26 @@ class PrimeClient:
             iteration += 1
 
             try:
-                await asyncio.sleep(self._config.health_check_interval)
+                # v258.0: Use backoff interval instead of fixed interval
+                await asyncio.sleep(self._health_backoff_interval)
                 # Add timeout protection for health check
                 await asyncio.wait_for(
                     self._check_health(),
                     timeout=self._config.health_check_timeout
                 )
+
+                # v258.0: Reset backoff on successful health check
+                if self._health_consecutive_failures > 0:
+                    logger.info(
+                        "[PrimeClient] Health recovered after %d failures, "
+                        "interval %.0fs -> %.0fs",
+                        self._health_consecutive_failures,
+                        self._health_backoff_interval,
+                        self._config.health_check_interval,
+                    )
+                    self._health_consecutive_failures = 0
+                    self._health_backoff_interval = self._config.health_check_interval
+                    self._health_failure_logged = False
 
                 # v232.0: Auto-demote GCP endpoint after consecutive failures
                 if (
@@ -729,12 +749,47 @@ class PrimeClient:
                     await self.demote_to_fallback()
 
             except asyncio.TimeoutError:
-                logger.warning(f"[PrimeClient] Health check timed out after {self._config.health_check_timeout}s")
+                # v258.0: Backoff + log dedup on timeout
+                self._health_consecutive_failures += 1
+                self._health_backoff_interval = min(
+                    self._config.health_check_interval * (
+                        self._health_backoff_factor ** self._health_consecutive_failures
+                    ),
+                    self._health_max_backoff,
+                )
+                if not self._health_failure_logged:
+                    logger.warning(
+                        "[PrimeClient] Health check timed out after %.0fs "
+                        "(failure #%d, next in %.0fs)",
+                        self._config.health_check_timeout,
+                        self._health_consecutive_failures,
+                        self._health_backoff_interval,
+                    )
+                    self._health_failure_logged = True
+                else:
+                    logger.debug(
+                        "[PrimeClient] Health timeout #%d (backoff %.0fs)",
+                        self._health_consecutive_failures,
+                        self._health_backoff_interval,
+                    )
             except asyncio.CancelledError:
                 logger.info("[PrimeClient] Health monitor cancelled")
                 break
             except Exception as e:
-                logger.debug(f"[PrimeClient] Health check error: {e}")
+                # v258.0: Same backoff for general errors
+                self._health_consecutive_failures += 1
+                self._health_backoff_interval = min(
+                    self._config.health_check_interval * (
+                        self._health_backoff_factor ** self._health_consecutive_failures
+                    ),
+                    self._health_max_backoff,
+                )
+                logger.debug(
+                    "[PrimeClient] Health check error #%d (backoff %.0fs): %s",
+                    self._health_consecutive_failures,
+                    self._health_backoff_interval,
+                    e,
+                )
 
     async def _check_health(self) -> PrimeStatus:
         """Check Prime health status."""

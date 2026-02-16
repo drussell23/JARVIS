@@ -69,6 +69,13 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
         self._startup_grace_seconds = float(os.getenv("HEALTH_MONITOR_STARTUP_GRACE", "90.0"))
         # v251.3: Log deduplication — only re-log when issue set changes
         self._last_logged_issues: Optional[frozenset] = None
+        # v258.0: Sustained CPU tracking + throttle state
+        self._cpu_high_consecutive: int = 0
+        self._cpu_high_threshold = float(os.getenv("HEALTH_MONITOR_CPU_HIGH_THRESHOLD", "90.0"))
+        self._cpu_high_sustained_checks = int(os.getenv("HEALTH_MONITOR_CPU_SUSTAINED_CHECKS", "3"))
+        self._cpu_relief_emitted: bool = False
+        self._throttle_cache_time: float = 0.0
+        self._throttle_factor: float = 1.0
 
     async def on_initialize(self) -> None:
         logger.info("Initializing HealthMonitorAgent")
@@ -120,7 +127,12 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
 
         # Check system resources
         try:
-            cpu = psutil.cpu_percent(interval=0.1)
+            # v258.0: Non-blocking CPU via shared metrics service
+            try:
+                from backend.core.async_system_metrics import get_cpu_percent
+                cpu = await get_cpu_percent()
+            except ImportError:
+                cpu = psutil.cpu_percent(interval=None)  # instant fallback
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage("/")
 
@@ -132,8 +144,20 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
                 "disk_free_gb": disk.free / (1024**3),
             }
 
-            if cpu > 90:
+            # v258.0: Track sustained CPU pressure + emit relief
+            if cpu > self._cpu_high_threshold:
                 health["issues"].append("High CPU usage")
+                self._cpu_high_consecutive += 1
+                if (self._cpu_high_consecutive >= self._cpu_high_sustained_checks
+                        and not self._cpu_relief_emitted):
+                    await self._emit_cpu_relief_request(cpu)
+                    self._cpu_relief_emitted = True
+            else:
+                if self._cpu_high_consecutive > 0:
+                    self._cpu_high_consecutive = 0
+                    if self._cpu_relief_emitted:
+                        await self._emit_cpu_recovery(cpu)
+                        self._cpu_relief_emitted = False
             if memory.percent > 90:
                 health["issues"].append("High memory usage")
             if disk.percent > 90:
@@ -219,12 +243,16 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
         }
 
         try:
-            # System metrics
-            metrics["cpu_percent"] = psutil.cpu_percent(interval=0.1)
+            # v258.0: Non-blocking CPU via shared metrics service
+            try:
+                from backend.core.async_system_metrics import get_cpu_percent
+                metrics["cpu_percent"] = await get_cpu_percent()
+            except ImportError:
+                metrics["cpu_percent"] = psutil.cpu_percent(interval=None)
             metrics["memory_percent"] = psutil.virtual_memory().percent
             metrics["disk_percent"] = psutil.disk_usage("/").percent
 
-            # Process metrics
+            # Process metrics (R2-#6: per-process cpu_percent() is non-blocking — NOT migrated)
             process = psutil.Process()
             metrics["process"] = {
                 "cpu_percent": process.cpu_percent(),
@@ -302,9 +330,22 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
         start = time.monotonic()
         cancelled = False
 
+        import sys as _sys  # v258.0: for CPU throttle signal
+
         while time.monotonic() - start < max_runtime:
             try:
-                await asyncio.sleep(self._check_interval)
+                # v258.0: Self-throttle under CPU pressure — read sys attr (R2-#9: no file I/O)
+                effective_interval = self._check_interval
+                now = time.time()
+                if now - self._throttle_cache_time > 60.0:  # check at most once per minute
+                    self._throttle_cache_time = now
+                    throttle = getattr(_sys, '_jarvis_cpu_throttle', None)
+                    if throttle and throttle.get("expires_at", 0) > now:
+                        self._throttle_factor = throttle.get("throttle_factor", 1.0)
+                    else:
+                        self._throttle_factor = 1.0
+                effective_interval = self._check_interval * self._throttle_factor
+                await asyncio.sleep(effective_interval)
 
                 health = await asyncio.wait_for(
                     self._check_health(),
@@ -353,3 +394,76 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
             logger.info("Health monitoring loop cancelled (shutdown)")
         else:
             logger.info("Health monitoring loop reached max runtime, exiting")
+
+    # v258.0: CPU relief signaling methods
+
+    async def _emit_cpu_relief_request(self, cpu: float) -> None:
+        """Emit CPU relief request via sys attribute + neural mesh broadcast."""
+        import sys as _sys
+
+        logger.warning(
+            "Sustained CPU pressure: %.1f%% for %d consecutive checks — emitting relief",
+            cpu, self._cpu_high_consecutive,
+        )
+
+        # Determine tier
+        if cpu >= 99.5:
+            level, throttle_factor, duration = "emergency", 16.0, 240.0
+        elif cpu >= 98.0:
+            level, throttle_factor, duration = "aggressive", 8.0, 120.0
+        else:
+            level, throttle_factor, duration = "moderate", 4.0, 60.0
+
+        # Primary signal: sys attribute (intra-process, GIL-atomic, zero I/O)
+        setattr(_sys, '_jarvis_cpu_throttle', {
+            "level": level,
+            "throttle_factor": throttle_factor,
+            "expires_at": time.time() + duration,
+            "timestamp": time.time(),
+            "cpu_percent": cpu,
+        })
+
+        # Broadcast via neural mesh if available
+        try:
+            if self.coordinator:
+                await self.coordinator.broadcast(AgentMessage(
+                    from_agent=self.name,
+                    to_agent="*",
+                    message_type=MessageType.EVENT,
+                    priority=MessagePriority.HIGH,
+                    payload={
+                        "event": "cpu_relief_request",
+                        "cpu_percent": cpu,
+                        "level": level,
+                        "throttle_factor": throttle_factor,
+                        "duration": duration,
+                    },
+                ))
+        except Exception as e:
+            logger.debug("Could not broadcast CPU relief: %s", e)
+
+    async def _emit_cpu_recovery(self, cpu: float) -> None:
+        """Clear CPU relief signal on recovery."""
+        import sys as _sys
+
+        logger.info("CPU pressure recovered: %.1f%% — clearing relief signal", cpu)
+
+        # Clear sys attribute
+        if hasattr(_sys, '_jarvis_cpu_throttle'):
+            delattr(_sys, '_jarvis_cpu_throttle')
+
+        # Broadcast recovery
+        try:
+            if self.coordinator:
+                await self.coordinator.broadcast(AgentMessage(
+                    from_agent=self.name,
+                    to_agent="*",
+                    message_type=MessageType.EVENT,
+                    priority=MessagePriority.NORMAL,
+                    payload={
+                        "event": "cpu_recovery",
+                        "cpu_percent": cpu,
+                    },
+                ))
+        except Exception as e:
+            logger.debug("Could not broadcast CPU recovery: %s", e)

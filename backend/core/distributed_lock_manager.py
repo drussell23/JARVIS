@@ -116,6 +116,7 @@ import logging
 import os
 import random
 import socket
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -2339,18 +2340,48 @@ class DistributedLockManager:
 
 _lock_manager_instance: Optional[DistributedLockManager] = None
 
+# v258.0: Cross-namespace init lock — prevents two concurrent get_lock_manager()
+# calls from creating two DLM instances. Stored on sys to share across namespaces.
+# threading.Lock protects asyncio.Lock creation itself (safe from any thread).
+_dlm_init_threading_lock = threading.Lock()
+
 
 async def get_lock_manager(config: Optional[LockConfig] = None) -> DistributedLockManager:
-    """
-    Get or create global lock manager instance.
+    """Get or create global lock manager instance.
 
-    v3.0: Supports optional config for cross-repo initialization.
+    v258.0: Cross-namespace singleton via sys attribute + asyncio.Lock.
+    Prevents dual-module aliasing from creating two DLM instances.
+    Removed env-var guard (R2-#8: leaks to child processes via subprocess).
     """
     global _lock_manager_instance
 
-    if _lock_manager_instance is None:
+    _cross_ns_attr = "_jarvis_lock_manager_instance"
+    _lock_attr = "_jarvis_dlm_init_lock"
+
+    # Fast path: already initialized (most calls hit this)
+    existing = getattr(sys, _cross_ns_attr, None)
+    if existing is not None:
+        _lock_manager_instance = existing
+        return existing
+
+    # R2-#1: Serialize initialization with cross-namespace asyncio.Lock.
+    # The threading.Lock protects asyncio.Lock creation (which needs event loop context).
+    with _dlm_init_threading_lock:
+        _async_lock = getattr(sys, _lock_attr, None)
+        if _async_lock is None:
+            _async_lock = asyncio.Lock()
+            setattr(sys, _lock_attr, _async_lock)
+
+    async with _async_lock:
+        # Re-check under lock (double-checked locking)
+        existing = getattr(sys, _cross_ns_attr, None)
+        if existing is not None:
+            _lock_manager_instance = existing
+            return existing
+
         _lock_manager_instance = DistributedLockManager(config)
         await _lock_manager_instance.initialize()
+        setattr(sys, _cross_ns_attr, _lock_manager_instance)
 
     return _lock_manager_instance
 
@@ -2359,9 +2390,14 @@ async def shutdown_lock_manager() -> None:
     """Shutdown global lock manager instance."""
     global _lock_manager_instance
 
-    if _lock_manager_instance:
-        await _lock_manager_instance.shutdown()
+    _cross_ns_attr = "_jarvis_lock_manager_instance"
+    instance = _lock_manager_instance or getattr(sys, _cross_ns_attr, None)
+
+    if instance:
+        await instance.shutdown()
         _lock_manager_instance = None
+        if hasattr(sys, _cross_ns_attr):
+            delattr(sys, _cross_ns_attr)
 
 
 # =============================================================================

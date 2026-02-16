@@ -1984,7 +1984,12 @@ class HealthDashboard:
         async def check_cpu() -> HealthCheck:
             start = time.time()
             try:
-                cpu_percent = psutil.cpu_percent(interval=0.1)
+                # v258.0: Non-blocking via shared metrics service
+                try:
+                    from core.async_system_metrics import get_cpu_percent
+                    cpu_percent = await get_cpu_percent()
+                except ImportError:
+                    cpu_percent = psutil.cpu_percent(interval=None)
                 status = HealthStatus.HEALTHY
                 if cpu_percent > 95:
                     status = HealthStatus.UNHEALTHY
@@ -2963,7 +2968,12 @@ class ResourceMonitor:
     async def collect_snapshot(self) -> ResourceSnapshot:
         """Collect current resource snapshot."""
         try:
-            cpu = psutil.cpu_percent(interval=0.1)
+            # v258.0: Non-blocking via shared metrics service
+            try:
+                from core.async_system_metrics import get_cpu_percent
+                cpu = await get_cpu_percent()
+            except ImportError:
+                cpu = psutil.cpu_percent(interval=None)
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage("/")
             network = psutil.net_io_counters()

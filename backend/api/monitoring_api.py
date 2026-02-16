@@ -27,8 +27,12 @@ _start_time = datetime.now()
 def _get_system_metrics() -> Dict[str, Any]:
     """Get current system metrics"""
     try:
-        # CPU metrics
-        cpu_percent = psutil.cpu_percent(interval=0.1)
+        # CPU metrics (v258.0: non-blocking via shared metrics service)
+        try:
+            from core.async_system_metrics import get_cpu_percent_cached
+            cpu_percent = get_cpu_percent_cached()
+        except ImportError:
+            cpu_percent = psutil.cpu_percent(interval=0.1)
         cpu_count = psutil.cpu_count()
 
         # Memory metrics

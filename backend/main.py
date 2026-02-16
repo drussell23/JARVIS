@@ -1879,6 +1879,35 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         logger.debug(f"Could not attach progress bridge: {e}")
 
     # =================================================================
+    # v258.0: Shared async system metrics (non-blocking CPU/memory)
+    # =================================================================
+    try:
+        from core.async_system_metrics import start_metrics_service
+        await start_metrics_service()
+        logger.info("[v258.0] Async system metrics service started")
+    except Exception as e:
+        logger.debug(f"Async system metrics not available: {e}")
+
+    # v258.0 R2-#3: Clean stale signal files from previous crash
+    try:
+        _signal_dir = os.path.expanduser(os.getenv("JARVIS_SIGNAL_DIR", "~/.jarvis/signals"))
+        if os.path.isdir(_signal_dir):
+            import json as _json
+            _now = time.time()
+            for _fname in os.listdir(_signal_dir):
+                if _fname.endswith('.json'):
+                    _fpath = os.path.join(_signal_dir, _fname)
+                    try:
+                        with open(_fpath) as _f:
+                            _sig = _json.load(_f)
+                        if _sig.get("expires_at", 0) < _now:
+                            os.remove(_fpath)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # =================================================================
     # v95.3: READINESS STATE MANAGER - Proper liveness/readiness/startup probes
     # =================================================================
     # This fixes the ROOT CAUSE of /health/ready returning 503:
@@ -3931,6 +3960,15 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
 
     # Cleanup
     logger.info("🛑 Shutting down JARVIS backend...")
+
+    # =================================================================
+    # v258.0: Stop shared async system metrics
+    # =================================================================
+    try:
+        from core.async_system_metrics import stop_metrics_service
+        await stop_metrics_service()
+    except Exception:
+        pass
 
     # =================================================================
     # v211.0: PARENT DEATH WATCHER - Stop monitoring during graceful shutdown
