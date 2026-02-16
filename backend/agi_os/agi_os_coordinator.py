@@ -1697,7 +1697,9 @@ class AGIOSCoordinator:
             )
             logger.info("Screen analyzer initialized and monitoring")
         except Exception as e:
-            logger.warning("Screen analyzer not available: %s", e)
+            # Keep full traceback for startup diagnostics; this path is critical
+            # and abbreviated messages hide root causes (e.g., local var shadows).
+            logger.exception("Screen analyzer not available: %s", e)
             self._component_status['screen_analyzer'] = ComponentStatus(
                 name='screen_analyzer',
                 available=False,

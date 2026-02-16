@@ -1058,7 +1058,6 @@ class ClaudeVisionAnalyzer:
                 if not self.ocr_strategy_manager:
                     # v109.2: Fixed API - use anthropic_api_key instead of api_client
                     # Get API key from environment or existing client
-                    import os
                     api_key = os.getenv("ANTHROPIC_API_KEY", "")
                     if not api_key and hasattr(self, 'client') and self.client:
                         api_key = getattr(self.client, 'api_key', None) or ""
@@ -9641,8 +9640,6 @@ def get_claude_vision_analyzer(api_key: Optional[str] = None) -> ClaudeVisionAna
     """
     global _claude_vision_analyzer_instance
     if _claude_vision_analyzer_instance is None:
-        import os
-
         # Get API key from parameter or environment
         if api_key is None:
             api_key = os.getenv("ANTHROPIC_API_KEY")

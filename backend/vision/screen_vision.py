@@ -110,7 +110,6 @@ class ScreenVisionSystem:
         if OCR_STRATEGY_AVAILABLE and self.claude_analyzer:
             try:
                 # v109.2: Fixed API - use anthropic_api_key instead of api_client
-                import os
                 api_key = os.getenv("ANTHROPIC_API_KEY", "")
                 if not api_key:
                     # Try to get from analyzer's client
