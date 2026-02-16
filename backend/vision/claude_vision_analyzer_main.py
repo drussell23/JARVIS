@@ -737,6 +737,12 @@ class MemorySafetyStatus:
     warnings: List[str] = field(default_factory=list)
     rejected_count: int = 0
     last_check: datetime = field(default_factory=datetime.now)
+    # v255.1: GCP cloud-aware fields (populated by check_memory_safety_async)
+    gcp_recommendation: Optional[str] = None       # MemoryDecision value string
+    gcp_can_proceed_locally: Optional[bool] = None  # OOM bridge local proceed flag
+    gcp_vm_ready: bool = False                      # Whether GCP VM is spun up
+    gcp_vm_ip: Optional[str] = None                 # GCP VM IP for offload
+    degradation_tier: Optional[str] = None          # DegradationTier value string
 
 
 class MemorySafetyMonitor:
@@ -819,6 +825,57 @@ class MemorySafetyMonitor:
                 system_min_gb=self.config.min_system_available_gb,
                 warnings=[f"Memory check error: {e}"],
             )
+
+    async def check_memory_safety_async(self) -> MemorySafetyStatus:
+        """Async memory safety check with OOM bridge consultation.
+
+        v255.1: Enhances local psutil check with cloud-aware decision from
+        the GCP OOM Prevention Bridge. Callers can inspect gcp_recommendation
+        and gcp_vm_ip fields for routing decisions.
+        """
+        # Start with existing local check
+        status = self.check_memory_safety()
+
+        # Consult OOM bridge for cloud-aware decision
+        _oom_timeout = float(os.getenv("JARVIS_VISION_OOM_CHECK_TIMEOUT", "2.0"))
+        try:
+            from core.gcp_oom_prevention_bridge import check_memory_before_heavy_init
+            oom_result = await asyncio.wait_for(
+                check_memory_before_heavy_init(
+                    component="vision_system",
+                    estimated_mb=int(self.config.process_memory_limit_mb),
+                    auto_offload=False,
+                ),
+                timeout=_oom_timeout,
+            )
+
+            # Enrich status with cloud-aware context
+            status.gcp_recommendation = oom_result.decision.value
+            status.gcp_can_proceed_locally = oom_result.can_proceed_locally
+            status.gcp_vm_ready = oom_result.gcp_vm_ready
+            status.gcp_vm_ip = getattr(oom_result, 'gcp_vm_ip', None)
+            status.degradation_tier = str(
+                getattr(oom_result, 'degradation_tier', '')
+            )
+
+            # Bridge has broader system view — override if it says can't proceed
+            if not oom_result.can_proceed_locally and status.is_safe:
+                status.is_safe = False
+                status.warnings.append(
+                    f"OOM Bridge: {oom_result.decision.value} "
+                    f"(system-wide pressure, tier={status.degradation_tier})"
+                )
+                if not self._emergency_mode:
+                    self._emergency_mode = True
+                    logger.warning(
+                        "Entering emergency mode — OOM Bridge: %s (avail=%.1fGB)",
+                        oom_result.decision.value,
+                        oom_result.available_ram_gb,
+                    )
+        except (ImportError, asyncio.TimeoutError, Exception) as e:
+            logger.debug("OOM bridge unavailable for vision safety: %s", e)
+
+        return status
 
     def estimate_memory_usage(
         self, width: int, height: int, concurrent_count: int = 1

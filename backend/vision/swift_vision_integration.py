@@ -181,7 +181,23 @@ class MemoryAwareSwiftVisionIntegration:
         }
     
     def _check_memory_available(self) -> bool:
-        """Check if enough memory is available for Swift/Metal processing"""
+        """Check if enough memory is available for Swift/Metal processing.
+
+        v255.1: Respects JARVIS_STARTUP_MEMORY_MODE set by OOM bridge pre-flight.
+        Under severe pressure modes (minimal/cloud_only/cloud_first), Swift/Metal
+        is skipped immediately — the decision was already made at startup.
+        """
+        # v255.1: Respect startup memory mode from OOM bridge (set in unified_supervisor.py)
+        _mem_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
+        if _mem_mode in ("minimal", "cloud_only", "cloud_first"):
+            if not self._critical_memory_warned:
+                logger.warning(
+                    "Swift vision deferred: startup memory_mode=%s (OOM bridge decision)",
+                    _mem_mode,
+                )
+                self._critical_memory_warned = True
+            return False
+
         available_mb = psutil.virtual_memory().available / 1024 / 1024
         process_mb = psutil.Process().memory_info().rss / 1024 / 1024
         

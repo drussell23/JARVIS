@@ -185,8 +185,8 @@ class MemoryAwareScreenAnalyzer:
         """Main monitoring loop with dynamic interval adjustment"""
         while self.is_monitoring:
             try:
-                # Check memory before capture
-                if not self._check_memory_available():
+                # Check memory before capture (v255.1: async OOM bridge check)
+                if not await self._check_memory_available_async():
                     logger.warning("Skipping capture due to low memory")
                     await asyncio.sleep(self.current_interval * 2)  # Wait longer
                     continue
@@ -280,7 +280,47 @@ class MemoryAwareScreenAnalyzer:
             self._memory_warned = False
         
         return True
-    
+
+    async def _check_memory_available_async(self) -> bool:
+        """Async memory check with OOM bridge consultation.
+
+        v255.1: Runtime check consults OOM Prevention Bridge for cloud-aware
+        decision with 6-tier graceful degradation. Falls back to sync psutil
+        check if bridge unavailable.
+        """
+        _oom_timeout = float(os.getenv("JARVIS_VISION_OOM_CHECK_TIMEOUT", "2.0"))
+        try:
+            from core.gcp_oom_prevention_bridge import check_memory_before_heavy_init
+            result = await asyncio.wait_for(
+                check_memory_before_heavy_init(
+                    component="vision_system",
+                    estimated_mb=int(self.config.get('memory_limit_mb', 500)),
+                    auto_offload=False,
+                ),
+                timeout=_oom_timeout,
+            )
+
+            if result.can_proceed_locally:
+                # Reset warning flag on recovery
+                if getattr(self, '_memory_warned', False):
+                    self._memory_warned = False
+                return True
+
+            # Log with cloud-aware context (rate-limited by _memory_warned flag)
+            if not getattr(self, '_memory_warned', False):
+                logger.warning(
+                    "OOM Bridge: vision %s (avail=%.1fGB, tier=%s)",
+                    result.decision.value,
+                    result.available_ram_gb,
+                    getattr(result, 'degradation_tier', 'unknown'),
+                )
+                self._memory_warned = True
+            return False
+
+        except (ImportError, asyncio.TimeoutError, Exception) as e:
+            logger.debug("OOM bridge unavailable: %s — falling back to psutil", e)
+            return self._check_memory_available()
+
     def _get_available_memory_mb(self) -> float:
         """Get available system memory in MB"""
         return psutil.virtual_memory().available / 1024 / 1024

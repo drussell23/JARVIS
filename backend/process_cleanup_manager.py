@@ -2906,20 +2906,82 @@ class ProcessCleanupManager:
             logger.debug(f"Could not report relief completion: {e}")
 
     def _handle_cpu_pressure(self, event: CleanupEvent) -> None:
-        """Handle CPU pressure event — v255.0 observation stub.
+        """Handle CPU pressure with GCP cloud awareness.
 
-        Previously emitted but unhandled. Logs metrics and updates
-        health monitor. Future v255.1 will connect to GCP offload.
+        v255.1: Upgraded from observation stub. Detects compound CPU+memory
+        pressure, triggers memory relief, consults PlatformMemoryMonitor for
+        GCP recommendation, and writes signal file for cross-repo coordination.
+        Signal writes are rate-limited to the same cadence as log warnings.
         """
         cpu_percent = event.data.get('cpu_percent', 0)
         _threshold = float(os.getenv("JARVIS_CPU_PRESSURE_OFFLOAD_THRESHOLD", "95.0"))
+        _compound_threshold = float(os.getenv("JARVIS_CPU_COMPOUND_MEMORY_THRESHOLD", "80.0"))
 
-        if cpu_percent >= _threshold:
-            logger.warning("CPU pressure: %.1f%% — GCP offload recommended", cpu_percent)
-        else:
-            logger.info("CPU pressure: %.1f%% — monitoring", cpu_percent)
-
+        # Always update metrics
         self.health_monitor.metrics.current_cpu_usage_percent = cpu_percent / 100
+
+        if cpu_percent < _threshold:
+            logger.info("CPU pressure: %.1f%% — monitoring", cpu_percent)
+            return
+
+        # Check for compound CPU+memory pressure
+        _memory_percent = 0.0
+        _gcp_recommended = False
+        try:
+            import psutil
+            _memory_percent = psutil.virtual_memory().percent
+        except Exception:
+            pass
+
+        _compound = _memory_percent >= _compound_threshold
+
+        # Consult platform memory monitor for GCP recommendation
+        try:
+            from core.platform_memory_monitor import get_memory_monitor
+            snapshot = get_memory_monitor().capture_snapshot()
+            _gcp_recommended = snapshot.gcp_shift_recommended or snapshot.gcp_shift_urgent
+        except (ImportError, Exception) as e:
+            logger.debug("Platform memory monitor unavailable: %s", e)
+
+        # Rate-limited logging + signal file write
+        _now = time.time()
+        _cooldown = float(os.getenv("JARVIS_CPU_PRESSURE_LOG_COOLDOWN", "30.0"))
+        _last_warn = getattr(self, '_last_cpu_pressure_warn', 0.0)
+        if _now - _last_warn >= _cooldown:
+            logger.warning(
+                "CPU pressure: %.1f%% (compound_memory=%s, gcp_recommended=%s)",
+                cpu_percent, _compound, _gcp_recommended,
+            )
+            self._last_cpu_pressure_warn = _now
+
+            # Write signal file for cross-repo coordination (rate-limited with log)
+            _signal_dir = os.path.expanduser(
+                os.getenv("JARVIS_SIGNAL_DIR", "~/.jarvis/signals")
+            )
+            try:
+                os.makedirs(_signal_dir, exist_ok=True)
+                import json
+                signal_path = os.path.join(_signal_dir, "cpu_pressure.json")
+                with open(signal_path, 'w') as f:
+                    json.dump({
+                        "type": "cpu_pressure",
+                        "cpu_percent": cpu_percent,
+                        "memory_percent": _memory_percent,
+                        "compound": _compound,
+                        "gcp_recommended": _gcp_recommended,
+                        "timestamp": _now,
+                    }, f)
+            except Exception:
+                pass  # Non-fatal — signal file is advisory
+
+        # Compound stress: CPU >= threshold AND memory >= compound threshold
+        # Trigger memory relief (cache clearing, GC, progressive strategies)
+        if _compound:
+            logger.warning(
+                "Compound CPU+memory pressure (CPU=%.1f%%, mem=%.1f%%) — triggering relief",
+                cpu_percent, _memory_percent,
+            )
+            self._schedule_memory_relief(_memory_percent)
 
     def _schedule_memory_relief(self, memory_percent: float) -> None:
         """
