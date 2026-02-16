@@ -54008,7 +54008,8 @@ class StartupWatchdog:
         "backend": PhaseConfig("Backend", 360.0, 45, 55, "diagnostic"),
         "intelligence": PhaseConfig("Intelligence", 120.0, 55, 65, "diagnostic"),  # v192.0: Increased
         # v210.0: Two-Tier Security phase (VBIA Adapter + Agentic Watchdog)
-        "two_tier": PhaseConfig("Two-Tier Security", 60.0, 55, 65, "diagnostic"),
+        # v256.0: Increased from 60→120 to cover outer init timeout (80s) + 30s DMS buffer.
+        "two_tier": PhaseConfig("Two-Tier Security", 120.0, 55, 65, "diagnostic"),
         # v193.0: Trinity timeout increased to cover GCP VM startup (300s) + fallback (120s) + buffer (60s)
         # This prevents false DMS timeouts when GCP VM health check fails and fallback triggers
         "trinity": PhaseConfig("Trinity", 480.0, 65, 85, "restart"),
@@ -61582,8 +61583,10 @@ class JarvisSystemKernel:
             if self.config.ecapa_enabled:
                 async def _run_ecapa_verification_bg() -> None:
                     try:
+                        # v256.0: Configurable timeout — 60s was too tight under CPU pressure (96-98%)
+                        _ecapa_bg_timeout = _get_env_float("JARVIS_ECAPA_BG_TIMEOUT", 90.0)
                         ecapa_verify = await asyncio.wait_for(
-                            self._verify_ecapa_pipeline(), timeout=60.0
+                            self._verify_ecapa_pipeline(), timeout=_ecapa_bg_timeout
                         )
                         if ecapa_verify.get("verification_pipeline_ready"):
                             self.logger.info("[Kernel] ECAPA pipeline verified and ready")
@@ -61594,7 +61597,7 @@ class JarvisSystemKernel:
                                 suggestion="Check ECAPA model availability and ML engine registry",
                             )
                     except asyncio.TimeoutError:
-                        self.logger.warning("[Kernel] ECAPA verification timed out (60s) — skipping")
+                        self.logger.warning(f"[Kernel] ECAPA verification timed out ({_ecapa_bg_timeout:.0f}s) — skipping")
                     except asyncio.CancelledError:
                         raise
                     except Exception as ev_err:
@@ -61697,12 +61700,31 @@ class JarvisSystemKernel:
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase("two_tier", 55, operational_timeout=two_tier_timeout)
 
-            if not await self._initialize_two_tier_security():
-                # Non-fatal - continue without Two-Tier Security
+            # v256.0: Outer timeout on Two-Tier init — prevents unbounded accumulation
+            # of sequential step timeouts (cross-repo 30s + AgenticRunner 60s = 90s min).
+            _two_tier_init_timeout = _get_env_float("JARVIS_TWO_TIER_INIT_TIMEOUT", 80.0)
+            try:
+                _two_tier_ok = await asyncio.wait_for(
+                    self._initialize_two_tier_security(),
+                    timeout=_two_tier_init_timeout,
+                )
+                if not _two_tier_ok:
+                    # Non-fatal - continue without Two-Tier Security
+                    issue_collector.add_warning(
+                        "Two-Tier Security failed - continuing without VBIA/Watchdog",
+                        IssueCategory.INTELLIGENCE,
+                        suggestion="Check VBIA adapter and watchdog modules"
+                    )
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"[TwoTier] Init timed out ({_two_tier_init_timeout:.0f}s) — "
+                    "continuing without Two-Tier Security"
+                )
+                self._update_component_status("two_tier", "degraded", "Timed out")
                 issue_collector.add_warning(
-                    "Two-Tier Security failed - continuing without VBIA/Watchdog",
+                    f"Two-Tier Security timed out ({_two_tier_init_timeout:.0f}s)",
                     IssueCategory.INTELLIGENCE,
-                    suggestion="Check VBIA adapter and watchdog modules"
+                    suggestion="Increase JARVIS_TWO_TIER_INIT_TIMEOUT or check component health"
                 )
 
             await self._broadcast_startup_progress(
@@ -64534,213 +64556,211 @@ class JarvisSystemKernel:
 
         with self.logger.section_start(LogSection.BOOT, "Zone 4.5 | Two-Tier Security (VBIA/PAVA)"):
             try:
-                # =====================================================================
-                # STEP 1: Initialize Agentic Watchdog
-                # =====================================================================
-                await self._broadcast_progress(56, "two_tier_watchdog", "Starting Agentic Watchdog...")
+                # =============================================================
+                # v256.0: Steps 1-4 run in parallel where possible.
+                # Dependency graph: Step 4 (Router) depends on Step 2 (VBIA)
+                # because it reads self._vbia_adapter. Steps 1 & 3 are
+                # independent. Strategy: chain Step 2→4, gather with 1 & 3.
+                # time = max(Step1, Step2+Step4, Step3) + Step5
+                # =============================================================
 
-                try:
-                    from core.agentic_watchdog import (
-                        start_watchdog,
-                        WatchdogConfig,
-                        AgenticMode,
-                        get_watchdog,
-                    )
+                # --- Step 1 closure: Agentic Watchdog (independent) ---
+                async def _init_watchdog() -> None:
+                    await self._broadcast_progress(56, "two_tier_watchdog", "Starting Agentic Watchdog...")
+                    try:
+                        from core.agentic_watchdog import (
+                            start_watchdog,
+                            WatchdogConfig,
+                            AgenticMode,
+                            get_watchdog,
+                        )
 
-                    # Create TTS callback for watchdog voice announcements
-                    async def watchdog_tts(text: str) -> None:
-                        """TTS callback for watchdog safety announcements."""
-                        if self._narrator and self.config.voice_enabled:
-                            try:
-                                await self._narrator.speak(text, wait=False)
-                            except Exception as e:
-                                self.logger.debug(f"[TwoTier/Watchdog] TTS error: {e}")
-
-                    # Start watchdog with TTS callback
-                    watchdog_config = WatchdogConfig()
-                    self._agentic_watchdog = await start_watchdog(
-                        config=watchdog_config,
-                        tts_callback=watchdog_tts if self.config.voice_enabled else None,
-                    )
-
-                    self._two_tier_status["watchdog"] = {
-                        "status": "active",
-                        "mode": self._agentic_watchdog.mode.value if self._agentic_watchdog else None,
-                    }
-                    self.logger.success("[TwoTier] ✓ Agentic Watchdog active")
-
-                except ImportError as e:
-                    self.logger.warning(f"[TwoTier] Watchdog module not available: {e}")
-                    self._two_tier_status["watchdog"]["status"] = "unavailable"
-                except Exception as e:
-                    self.logger.warning(f"[TwoTier] Watchdog init failed: {e}")
-                    self._two_tier_status["watchdog"]["status"] = "error"
-
-                # =====================================================================
-                # STEP 2: Initialize Tiered VBIA Adapter
-                # =====================================================================
-                await self._broadcast_progress(57, "two_tier_vbia", "Initializing VBIA Adapter...")
-
-                try:
-                    from core.tiered_vbia_adapter import (
-                        TieredVBIAAdapter,
-                        TieredVBIAConfig,
-                        get_tiered_vbia_adapter,
-                    )
-
-                    # Get or create the VBIA adapter (singleton)
-                    self._vbia_adapter = await get_tiered_vbia_adapter()
-
-                    self._two_tier_status["vbia_adapter"] = {
-                        "status": "active",
-                        "initialized": True,
-                        "tier1_threshold": self.config.vbia_tier1_threshold,
-                        "tier2_threshold": self.config.vbia_tier2_threshold,
-                    }
-                    self.logger.success(
-                        f"[TwoTier] ✓ VBIA Adapter ready "
-                        f"(T1:{self.config.vbia_tier1_threshold:.0%}, T2:{self.config.vbia_tier2_threshold:.0%})"
-                    )
-
-                except ImportError as e:
-                    self.logger.warning(f"[TwoTier] VBIA module not available: {e}")
-                    self._two_tier_status["vbia_adapter"]["status"] = "unavailable"
-                except Exception as e:
-                    self.logger.warning(f"[TwoTier] VBIA init failed: {e}")
-                    self._two_tier_status["vbia_adapter"]["status"] = "error"
-
-                # =====================================================================
-                # STEP 3: Initialize Cross-Repo State
-                # =====================================================================
-                await self._broadcast_progress(58, "cross_repo_init", "Initializing Cross-Repo State...")
-
-                try:
-                    from core.cross_repo_state_initializer import (
-                        initialize_cross_repo_state,
-                        CrossRepoStateConfig,
-                        get_cross_repo_initializer,
-                    )
-
-                    # v242.3: Initialize cross-repo communication with timeout.
-                    # This is file I/O + DLM initialization — should complete in <5s.
-                    # Without a timeout, a stale DLM lock or hung filesystem blocks
-                    # startup indefinitely at 58% (the ProgressController can't help if
-                    # has_active_subsystem is True due to the model loading state leak).
-                    _cross_repo_timeout = float(os.environ.get("JARVIS_CROSS_REPO_INIT_TIMEOUT", "30.0"))
-                    self._cross_repo_initialized = await asyncio.wait_for(
-                        initialize_cross_repo_state(),
-                        timeout=_cross_repo_timeout,
-                    )
-
-                    self._two_tier_status["cross_repo"] = {
-                        "status": "active" if self._cross_repo_initialized else "failed",
-                        "initialized": self._cross_repo_initialized,
-                    }
-                    if self._cross_repo_initialized:
-                        self.logger.success("[TwoTier] ✓ Cross-Repo State initialized")
-                    else:
-                        self.logger.warning("[TwoTier] ⚠ Cross-Repo State failed to initialize")
-
-                except asyncio.TimeoutError:
-                    self.logger.warning(
-                        f"[TwoTier] Cross-Repo init timed out ({_cross_repo_timeout}s) — "
-                        "possible stale DLM lock or hung filesystem. Continuing without cross-repo."
-                    )
-                    self._two_tier_status["cross_repo"] = {
-                        "status": "timeout",
-                        "initialized": False,
-                    }
-                except ImportError as e:
-                    self.logger.warning(f"[TwoTier] Cross-Repo module not available: {e}")
-                    self._two_tier_status["cross_repo"]["status"] = "unavailable"
-                except Exception as e:
-                    self.logger.warning(f"[TwoTier] Cross-Repo init failed: {e}")
-                    self._two_tier_status["cross_repo"]["status"] = "error"
-
-                # =====================================================================
-                # STEP 4: Initialize Tiered Command Router
-                # =====================================================================
-                # v1.0.0: Enhanced with better error handling, fallback to existing
-                # router instance, and detailed diagnostic logging.
-                # =====================================================================
-                await self._broadcast_progress(59, "two_tier_router", "Initializing Tiered Command Router...")
-
-                try:
-                    from core.tiered_command_router import (
-                        TieredCommandRouter,
-                        TieredRouterConfig,
-                        set_tiered_router,
-                        get_tiered_router,
-                    )
-
-                    # v1.0.0: Check if router already exists (e.g., from previous init)
-                    existing_router = get_tiered_router()
-                    if existing_router is not None:
-                        self._tiered_router = existing_router
-                        self._two_tier_status["router"] = {
-                            "status": "active",
-                            "initialized": True,
-                            "source": "existing_singleton",
-                        }
-                        self.logger.info("[TwoTier] Using existing TieredCommandRouter instance")
-                    else:
-                        # Create TTS callback for router voice announcements
-                        async def router_tts(text: str) -> None:
-                            """TTS callback for router announcements."""
+                        async def watchdog_tts(text: str) -> None:
                             if self._narrator and self.config.voice_enabled:
                                 try:
                                     await self._narrator.speak(text, wait=False)
                                 except Exception as e:
-                                    self.logger.debug(f"[TwoTier/Router] TTS error: {e}")
+                                    self.logger.debug(f"[TwoTier/Watchdog] TTS error: {e}")
 
-                        # Create router config
-                        router_config = TieredRouterConfig(
-                            tier1_vbia_threshold=self.config.vbia_tier1_threshold,
-                            tier2_vbia_threshold=self.config.vbia_tier2_threshold,
-                            tier2_require_liveness=self.config.tier2_require_liveness,
+                        watchdog_config = WatchdogConfig()
+                        self._agentic_watchdog = await start_watchdog(
+                            config=watchdog_config,
+                            tts_callback=watchdog_tts if self.config.voice_enabled else None,
                         )
 
-                        # Create router with VBIA callbacks
-                        vbia_callback = None
-                        liveness_callback = None
-                        if self._vbia_adapter:
-                            vbia_callback = self._vbia_adapter.verify_speaker
-                            liveness_callback = self._vbia_adapter.verify_liveness
+                        self._two_tier_status["watchdog"] = {
+                            "status": "active",
+                            "mode": self._agentic_watchdog.mode.value if self._agentic_watchdog else None,
+                        }
+                        self.logger.success("[TwoTier] ✓ Agentic Watchdog active")
 
-                        self._tiered_router = TieredCommandRouter(
-                            config=router_config,
-                            vbia_callback=vbia_callback,
-                            liveness_callback=liveness_callback,
-                            tts_callback=router_tts if self.config.voice_enabled else None,
+                    except ImportError as e:
+                        self.logger.warning(f"[TwoTier] Watchdog module not available: {e}")
+                        self._two_tier_status["watchdog"]["status"] = "unavailable"
+                    except Exception as e:
+                        self.logger.warning(f"[TwoTier] Watchdog init failed: {e}")
+                        self._two_tier_status["watchdog"]["status"] = "error"
+
+                # --- Step 2 closure: VBIA Adapter (must finish before Step 4) ---
+                async def _init_vbia() -> None:
+                    await self._broadcast_progress(57, "two_tier_vbia", "Initializing VBIA Adapter...")
+                    try:
+                        from core.tiered_vbia_adapter import (
+                            TieredVBIAAdapter,
+                            TieredVBIAConfig,
+                            get_tiered_vbia_adapter,
                         )
 
-                        # Register as global singleton
-                        set_tiered_router(self._tiered_router)
+                        self._vbia_adapter = await get_tiered_vbia_adapter()
 
-                        self._two_tier_status["router"] = {
+                        self._two_tier_status["vbia_adapter"] = {
                             "status": "active",
                             "initialized": True,
-                            "vbia_connected": vbia_callback is not None,
-                            "source": "new_instance",
+                            "tier1_threshold": self.config.vbia_tier1_threshold,
+                            "tier2_threshold": self.config.vbia_tier2_threshold,
                         }
-                        self.logger.success("[TwoTier] ✓ Tiered Command Router ready")
+                        self.logger.success(
+                            f"[TwoTier] ✓ VBIA Adapter ready "
+                            f"(T1:{self.config.vbia_tier1_threshold:.0%}, T2:{self.config.vbia_tier2_threshold:.0%})"
+                        )
 
-                except ImportError as e:
-                    self.logger.warning(f"[TwoTier] Router module not available: {e}")
-                    self._two_tier_status["router"] = {
-                        "status": "unavailable",
-                        "error": str(e),
-                        "error_type": "ImportError",
-                    }
-                except Exception as e:
-                    self.logger.warning(f"[TwoTier] Router init failed: {e}")
-                    import traceback
-                    self.logger.debug(f"[TwoTier] Router traceback: {traceback.format_exc()}")
-                    self._two_tier_status["router"] = {
-                        "status": "error",
-                        "error": str(e),
-                        "error_type": type(e).__name__,
-                    }
+                    except ImportError as e:
+                        self.logger.warning(f"[TwoTier] VBIA module not available: {e}")
+                        self._two_tier_status["vbia_adapter"]["status"] = "unavailable"
+                    except Exception as e:
+                        self.logger.warning(f"[TwoTier] VBIA init failed: {e}")
+                        self._two_tier_status["vbia_adapter"]["status"] = "error"
+
+                # --- Step 3 closure: Cross-Repo State (independent) ---
+                async def _init_cross_repo() -> None:
+                    await self._broadcast_progress(58, "cross_repo_init", "Initializing Cross-Repo State...")
+                    try:
+                        from core.cross_repo_state_initializer import (
+                            initialize_cross_repo_state,
+                            CrossRepoStateConfig,
+                            get_cross_repo_initializer,
+                        )
+
+                        _cross_repo_timeout = float(os.environ.get("JARVIS_CROSS_REPO_INIT_TIMEOUT", "30.0"))
+                        self._cross_repo_initialized = await asyncio.wait_for(
+                            initialize_cross_repo_state(),
+                            timeout=_cross_repo_timeout,
+                        )
+
+                        self._two_tier_status["cross_repo"] = {
+                            "status": "active" if self._cross_repo_initialized else "failed",
+                            "initialized": self._cross_repo_initialized,
+                        }
+                        if self._cross_repo_initialized:
+                            self.logger.success("[TwoTier] ✓ Cross-Repo State initialized")
+                        else:
+                            self.logger.warning("[TwoTier] ⚠ Cross-Repo State failed to initialize")
+
+                    except asyncio.TimeoutError:
+                        self.logger.warning(
+                            f"[TwoTier] Cross-Repo init timed out ({_cross_repo_timeout}s) — "
+                            "possible stale DLM lock or hung filesystem. Continuing without cross-repo."
+                        )
+                        self._two_tier_status["cross_repo"] = {
+                            "status": "timeout",
+                            "initialized": False,
+                        }
+                    except ImportError as e:
+                        self.logger.warning(f"[TwoTier] Cross-Repo module not available: {e}")
+                        self._two_tier_status["cross_repo"]["status"] = "unavailable"
+                    except Exception as e:
+                        self.logger.warning(f"[TwoTier] Cross-Repo init failed: {e}")
+                        self._two_tier_status["cross_repo"]["status"] = "error"
+
+                # --- Step 4 closure: Tiered Command Router (depends on Step 2) ---
+                async def _init_router() -> None:
+                    await self._broadcast_progress(59, "two_tier_router", "Initializing Tiered Command Router...")
+                    try:
+                        from core.tiered_command_router import (
+                            TieredCommandRouter,
+                            TieredRouterConfig,
+                            set_tiered_router,
+                            get_tiered_router,
+                        )
+
+                        existing_router = get_tiered_router()
+                        if existing_router is not None:
+                            self._tiered_router = existing_router
+                            self._two_tier_status["router"] = {
+                                "status": "active",
+                                "initialized": True,
+                                "source": "existing_singleton",
+                            }
+                            self.logger.info("[TwoTier] Using existing TieredCommandRouter instance")
+                        else:
+                            async def router_tts(text: str) -> None:
+                                if self._narrator and self.config.voice_enabled:
+                                    try:
+                                        await self._narrator.speak(text, wait=False)
+                                    except Exception as e:
+                                        self.logger.debug(f"[TwoTier/Router] TTS error: {e}")
+
+                            router_config = TieredRouterConfig(
+                                tier1_vbia_threshold=self.config.vbia_tier1_threshold,
+                                tier2_vbia_threshold=self.config.vbia_tier2_threshold,
+                                tier2_require_liveness=self.config.tier2_require_liveness,
+                            )
+
+                            # Reads self._vbia_adapter — guaranteed set by Step 2 (chained)
+                            vbia_callback = None
+                            liveness_callback = None
+                            if self._vbia_adapter:
+                                vbia_callback = self._vbia_adapter.verify_speaker
+                                liveness_callback = self._vbia_adapter.verify_liveness
+
+                            self._tiered_router = TieredCommandRouter(
+                                config=router_config,
+                                vbia_callback=vbia_callback,
+                                liveness_callback=liveness_callback,
+                                tts_callback=router_tts if self.config.voice_enabled else None,
+                            )
+
+                            set_tiered_router(self._tiered_router)
+
+                            self._two_tier_status["router"] = {
+                                "status": "active",
+                                "initialized": True,
+                                "vbia_connected": vbia_callback is not None,
+                                "source": "new_instance",
+                            }
+                            self.logger.success("[TwoTier] ✓ Tiered Command Router ready")
+
+                    except ImportError as e:
+                        self.logger.warning(f"[TwoTier] Router module not available: {e}")
+                        self._two_tier_status["router"] = {
+                            "status": "unavailable",
+                            "error": str(e),
+                            "error_type": "ImportError",
+                        }
+                    except Exception as e:
+                        self.logger.warning(f"[TwoTier] Router init failed: {e}")
+                        import traceback
+                        self.logger.debug(f"[TwoTier] Router traceback: {traceback.format_exc()}")
+                        self._two_tier_status["router"] = {
+                            "status": "error",
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                        }
+
+                # --- v256.0: Chain Step 2 → Step 4 (dependency: router needs VBIA adapter) ---
+                async def _chain_vbia_then_router() -> None:
+                    await _init_vbia()    # Step 2 first (sets self._vbia_adapter or None)
+                    await _init_router()  # Step 4 after (uses self._vbia_adapter if available)
+
+                # --- v256.0: Parallel execution ---
+                # time = max(Step1, Step2+Step4, Step3) instead of Step1+Step2+Step3+Step4
+                await self._broadcast_progress(56, "two_tier_parallel", "Initializing Two-Tier components (parallel)...")
+                await asyncio.gather(
+                    _init_watchdog(),           # Step 1 (independent)
+                    _chain_vbia_then_router(),  # Step 2 → Step 4 (dependency chain)
+                    _init_cross_repo(),         # Step 3 (independent)
+                    return_exceptions=True,
+                )
 
                 # =====================================================================
                 # STEP 5: Wire execute_tier2 to AgenticTaskRunner
@@ -64790,7 +64810,7 @@ class JarvisSystemKernel:
                                     tts_callback=runner_tts if self.config.voice_enabled else None,
                                     watchdog=self._agentic_watchdog,
                                 ),
-                                timeout=60.0,  # v2.0.0: 60s to allow component timeouts
+                                timeout=_get_env_float("JARVIS_AGENTIC_RUNNER_TIMEOUT", 60.0),
                             )
                             
                             if self._agentic_runner:
@@ -64999,9 +65019,11 @@ class JarvisSystemKernel:
                 # screen_analyzer 25 + connect 10 + reserves ~18 + overhead).
                 # 300s gives ~280s budget after supervisor reserves, yielding
                 # 60s headroom above the 220s phase total.
+                # v256.0: Default 300→270 to align with PHASE_HOLD_HARD_CAP (300-30=270).
+                # Eliminates "Clamping" warning. 270s is sufficient (phases need ≤220s).
                 agi_os_init_timeout = _get_env_float(
                     "JARVIS_AGI_OS_INIT_TIMEOUT",
-                    300.0,
+                    270.0,
                 )
                 # Keep AGI init bounded below the phase-hold hard cap to avoid
                 # "active but no progress" false-stall loops when env values are
@@ -72533,6 +72555,49 @@ class JarvisSystemKernel:
             backend_dir = self.config.backend_dir
             if str(backend_dir) not in sys.path:
                 sys.path.insert(0, str(backend_dir))
+
+            # === v256.0: ECAPA Phase 3 coordination ===
+            # Phase 3's background ECAPA task may have already loaded the model,
+            # be still running, or have failed. Coordinate instead of duplicating.
+            _ecapa_already_loaded = False
+
+            if hasattr(self, '_ecapa_verification_task') and self._ecapa_verification_task is not None:
+                if self._ecapa_verification_task.done():
+                    # Phase 3 finished — check result
+                    try:
+                        _ecapa_result = self._ecapa_verification_task.result()
+                        if isinstance(_ecapa_result, dict) and _ecapa_result.get("verification_pipeline_ready"):
+                            _ecapa_already_loaded = True
+                            self.logger.info("[VoiceBio] ECAPA already verified by Phase 3 background task")
+                    except Exception:
+                        self.logger.info("[VoiceBio] Phase 3 ECAPA task failed — will retry in voice_biometrics")
+                else:
+                    # Phase 3 still running — await it with a budget-aware timeout
+                    _phase3_wait = _get_env_float("JARVIS_VOICE_BIO_ECAPA_WAIT", 30.0)
+                    self.logger.info(f"[VoiceBio] Phase 3 ECAPA task still running — waiting up to {_phase3_wait:.0f}s...")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(self._ecapa_verification_task),
+                            timeout=_phase3_wait,
+                        )
+                        try:
+                            _ecapa_result = self._ecapa_verification_task.result()
+                            if isinstance(_ecapa_result, dict) and _ecapa_result.get("verification_pipeline_ready"):
+                                _ecapa_already_loaded = True
+                                self.logger.info("[VoiceBio] ECAPA loaded by Phase 3 (awaited)")
+                        except Exception:
+                            self.logger.info("[VoiceBio] Phase 3 ECAPA task completed with error — retrying")
+                    except asyncio.TimeoutError:
+                        self.logger.warning(
+                            f"[VoiceBio] Phase 3 ECAPA still loading after {_phase3_wait:.0f}s — "
+                            "proceeding with own initialization"
+                        )
+
+            # If Phase 3 already loaded ECAPA, the ml_engine_registry has it cached.
+            # SpeakerVerificationService.initialize_fast() will find it immediately
+            # via ensure_ecapa_available() → registry.get_wrapper("ecapa_tdnn").is_loaded.
+            if _ecapa_already_loaded:
+                self.logger.info("[VoiceBio] ECAPA pre-loaded — initialize_fast() should be instant")
 
             # Initialize learning database (fast mode for parallel initialization)
             self.logger.info("[VoiceBio] Loading learning database (fast mode)...")
