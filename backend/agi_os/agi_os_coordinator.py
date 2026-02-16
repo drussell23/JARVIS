@@ -1925,22 +1925,55 @@ class AGIOSCoordinator:
           all available + core OK  → ONLINE
           some missing  + core OK  → DEGRADED (can still serve commands)
           core components down     → OFFLINE  (cannot serve commands)
+
+        v258.2: (1) Exclude intentionally skipped components from available/total
+        count — memory-pressure-skipped components should not cause DEGRADED.
+        (2) Added diagnostic logging of WHICH components are unavailable.
+        (3) Added 'approval' to core check (always-required, was missing).
         """
-        available = sum(1 for s in self._component_status.values() if s.available)
-        total = len(self._component_status)
+        # v258.2: Partition components into active vs intentionally skipped.
+        # Skipped components (error starts with "Skipped:") are excluded from
+        # the health calculation — they were never expected to be available.
+        _skipped = []
+        _active = []
+        for s in self._component_status.values():
+            if not s.available and s.error and str(s.error).startswith("Skipped:"):
+                _skipped.append(s)
+            else:
+                _active.append(s)
+
+        available = sum(1 for s in _active if s.available)
+        total = len(_active)
 
         # Core components that must be available for useful operation
+        # v258.2: Added 'approval' — always initialized, was missing from check
+        _core_names = ['voice', 'events', 'orchestrator', 'approval']
         core_available = all(
             self._component_status.get(name, ComponentStatus(name=name, available=False)).available
-            for name in ['voice', 'events', 'orchestrator']
+            for name in _core_names
         )
 
         if available == total and core_available:
-            return AGIOSState.ONLINE
+            state = AGIOSState.ONLINE
         elif core_available:
-            return AGIOSState.DEGRADED
+            state = AGIOSState.DEGRADED
         else:
-            return AGIOSState.OFFLINE
+            state = AGIOSState.OFFLINE
+
+        # v258.2: Log which components are unavailable (actionable diagnostics)
+        if state != AGIOSState.ONLINE:
+            _unavail = [s.name for s in _active if not s.available]
+            if _unavail:
+                logger.warning(
+                    "AGI OS health: %s — %d/%d active components available, "
+                    "unavailable: %s%s",
+                    state.value, available, total,
+                    ", ".join(_unavail),
+                    f" (skipped {len(_skipped)}: {', '.join(s.name for s in _skipped)})"
+                    if _skipped else "",
+                )
+
+        return state
 
     async def _health_monitor_loop(self) -> None:
         """Background task for health monitoring."""

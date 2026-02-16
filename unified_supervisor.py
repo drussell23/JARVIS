@@ -65265,13 +65265,21 @@ class JarvisSystemKernel:
                         _agi_state = getattr(self._agi_os, '_state', None)
                         _agi_state_val = getattr(_agi_state, 'value', str(_agi_state))
                         if _agi_state_val == "degraded":
+                            # v258.2: Include unavailable component names for diagnostics
+                            _comp_status = getattr(self._agi_os, '_component_status', {})
+                            _unavail = [
+                                n for n, s in _comp_status.items()
+                                if not s.available and not (s.error and str(s.error).startswith("Skipped:"))
+                            ]
+                            _detail = f" (unavailable: {', '.join(_unavail)})" if _unavail else ""
                             self._update_component_status(
                                 "agi_os",
                                 "degraded",
-                                f"AGI OS running in degraded mode ({_agi_state_val})",
+                                f"AGI OS running in degraded mode{_detail}",
                             )
                             self.logger.warning(
-                                "[AGI-OS] ⚠ AGIOSCoordinator started in DEGRADED state"
+                                "[AGI-OS] ⚠ AGIOSCoordinator started in DEGRADED state%s",
+                                _detail,
                             )
                         else:
                             self.logger.success("[AGI-OS] ✓ AGIOSCoordinator started")
@@ -69585,8 +69593,11 @@ class JarvisSystemKernel:
             return
 
         loading_port = self.config.loading_server_port
-        shutdown_url = f"http://localhost:{loading_port}/api/shutdown/graceful"
-        status_url = f"http://localhost:{loading_port}/api/shutdown/status"
+        # v258.2: Fixed endpoint mismatch — loading_server.py only handles
+        # POST /api/shutdown (not /api/shutdown/graceful or /api/shutdown/status).
+        # Wrong paths caused silent 404 → HTTP shutdown always failed → fallback
+        # to signal-based kill → "[LoadingServer] Force killed (timeout)".
+        shutdown_url = f"http://localhost:{loading_port}/api/shutdown"
 
         # v205.0: Send final 100% progress before stopping
         # This allows the loading page to show completion before being terminated
@@ -69616,7 +69627,7 @@ class JarvisSystemKernel:
                 async with aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=http_timeout)
                 ) as session:
-                    # Step 1: Request graceful shutdown
+                    # Step 1: Request graceful shutdown via POST /api/shutdown
                     self.logger.info("[LoadingServer] Requesting graceful shutdown...")
                     try:
                         async with session.post(
@@ -69626,16 +69637,10 @@ class JarvisSystemKernel:
                             if resp.status == 200:
                                 result = await resp.json()
                                 status = result.get("status", "unknown")
-                                connections = result.get("connections", 0)
 
-                                if status == "immediate_shutdown":
-                                    self.logger.info(
-                                        "[LoadingServer] Shutting down immediately (no active connections)"
-                                    )
-                                elif status == "pending_disconnect":
-                                    self.logger.info(
-                                        f"[LoadingServer] Waiting for {connections} connection(s) to close..."
-                                    )
+                                # v258.2: loading_server.py returns {"status": "shutdown_initiated"}
+                                if status == "shutdown_initiated":
+                                    self.logger.info("[LoadingServer] Shutdown initiated")
                                 elif status == "already_shutting_down":
                                     self.logger.debug("[LoadingServer] Already shutting down")
                                 else:
@@ -69643,13 +69648,16 @@ class JarvisSystemKernel:
 
                                 http_shutdown_success = True
                             else:
-                                self.logger.debug(
-                                    f"[LoadingServer] Shutdown request returned {resp.status}"
+                                self.logger.warning(
+                                    f"[LoadingServer] Shutdown request returned HTTP {resp.status}"
                                 )
                     except aiohttp.ClientError as e:
                         self.logger.debug(f"[LoadingServer] HTTP shutdown request failed: {e}")
 
                     # Step 2: Wait for loading server to actually shutdown
+                    # v258.2: Simplified — loading_server.py has no /api/shutdown/status
+                    # endpoint. After POST /api/shutdown sets _shutdown_requested=True,
+                    # the server exits on its own. Just poll process exit.
                     if http_shutdown_success:
                         start_time = time.time()
                         while (time.time() - start_time) < max_wait:
@@ -69659,23 +69667,6 @@ class JarvisSystemKernel:
                                 self._cleanup_loading_server_log()
                                 self._loading_server_process = None
                                 return
-
-                            # Check shutdown status
-                            try:
-                                async with session.get(status_url) as resp:
-                                    if resp.status == 200:
-                                        status_data = await resp.json()
-                                        if status_data.get("shutdown_initiated"):
-                                            self.logger.debug(
-                                                "[LoadingServer] Shutdown initiated, waiting for process exit..."
-                                            )
-                                    else:
-                                        # Server may have already died
-                                        break
-                            except aiohttp.ClientError:
-                                # Server not responding, likely already shutdown
-                                self.logger.debug("[LoadingServer] No longer responding")
-                                break
 
                             await asyncio.sleep(poll_interval)
 
