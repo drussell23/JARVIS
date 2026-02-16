@@ -55,7 +55,7 @@ nltk==3.8.1
 aiofiles==23.2.1
 
 # Model training dependencies
-wandb==0.16.2
+wandb==0.25.0
 tensorboard==2.20.0
 datasets==2.16.1
 evaluate==0.4.1
