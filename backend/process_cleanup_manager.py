@@ -1240,10 +1240,36 @@ class EventDrivenCleanupTrigger:
         event_type: CleanupEventType,
         handler: Callable[[CleanupEvent], None]
     ) -> None:
-        """Register a handler for an event type."""
+        """Register a handler for an event type.
+
+        v255.1: Name-based dedup prevents double registration when multiple
+        ProcessCleanupManager instances are created (e.g., supervisor + main.py
+        + lifecycle_manager). Uses __qualname__ of the underlying function so
+        bound methods from different instances of the same class are recognized
+        as duplicates.
+        """
         with self._lock:
             if event_type not in self._handlers:
                 self._handlers[event_type] = []
+
+            # v255.1: Dedup by handler qualname — prevents double execution
+            # from multiple ProcessCleanupManager instances sharing the global
+            # event trigger. Bound methods from different instances of the same
+            # class share the same __func__.__qualname__.
+            _handler_id = getattr(
+                getattr(handler, '__func__', handler), '__qualname__', str(handler)
+            )
+            _existing_ids = {
+                getattr(getattr(h, '__func__', h), '__qualname__', str(h))
+                for h in self._handlers[event_type]
+            }
+            if _handler_id in _existing_ids:
+                logger.debug(
+                    "Handler %s already registered for %s — skipping duplicate",
+                    _handler_id, event_type.value,
+                )
+                return
+
             self._handlers[event_type].append(handler)
 
     def emit_event(self, event: CleanupEvent) -> None:
@@ -2911,7 +2937,12 @@ class ProcessCleanupManager:
         v255.1: Upgraded from observation stub. Detects compound CPU+memory
         pressure, triggers memory relief, consults PlatformMemoryMonitor for
         GCP recommendation, and writes signal file for cross-repo coordination.
-        Signal writes are rate-limited to the same cadence as log warnings.
+
+        v255.1.1: All actions (logging, signal write, compound relief) are
+        rate-limited by the same cooldown to prevent spam under sustained
+        pressure. GCP recommendation derived from compound stress when the
+        platform monitor doesn't trigger it (macOS reports "normal" pressure
+        even at 83% usage because it measures actual swapping, not percentage).
         """
         cpu_percent = event.data.get('cpu_percent', 0)
         _threshold = float(os.getenv("JARVIS_CPU_PRESSURE_OFFLOAD_THRESHOLD", "95.0"))
@@ -2926,7 +2957,6 @@ class ProcessCleanupManager:
 
         # Check for compound CPU+memory pressure
         _memory_percent = 0.0
-        _gcp_recommended = False
         try:
             import psutil
             _memory_percent = psutil.virtual_memory().percent
@@ -2936,6 +2966,7 @@ class ProcessCleanupManager:
         _compound = _memory_percent >= _compound_threshold
 
         # Consult platform memory monitor for GCP recommendation
+        _gcp_recommended = False
         try:
             from core.platform_memory_monitor import get_memory_monitor
             snapshot = get_memory_monitor().capture_snapshot()
@@ -2943,39 +2974,51 @@ class ProcessCleanupManager:
         except (ImportError, Exception) as e:
             logger.debug("Platform memory monitor unavailable: %s", e)
 
-        # Rate-limited logging + signal file write
+        # v255.1.1: Derive GCP recommendation from compound stress when platform
+        # monitor doesn't trigger it. macOS `memory_pressure` command returns
+        # "normal" at 80-85% usage because it measures actual swapping pressure,
+        # not percentage — but CPU >=95% + memory >=80% IS compound stress that
+        # warrants GCP offload recommendation.
+        if _compound and not _gcp_recommended:
+            _gcp_recommended = True
+
+        # Rate-limit ALL actions (log + signal + compound relief) under one cooldown.
+        # Without this, sustained pressure (CPU stuck at 98% for 5 minutes) would
+        # spam warnings and trigger overlapping relief operations every 5s check cycle.
         _now = time.time()
         _cooldown = float(os.getenv("JARVIS_CPU_PRESSURE_LOG_COOLDOWN", "30.0"))
         _last_warn = getattr(self, '_last_cpu_pressure_warn', 0.0)
-        if _now - _last_warn >= _cooldown:
-            logger.warning(
-                "CPU pressure: %.1f%% (compound_memory=%s, gcp_recommended=%s)",
-                cpu_percent, _compound, _gcp_recommended,
-            )
-            self._last_cpu_pressure_warn = _now
+        if _now - _last_warn < _cooldown:
+            return  # Within cooldown — skip all actions
 
-            # Write signal file for cross-repo coordination (rate-limited with log)
-            _signal_dir = os.path.expanduser(
-                os.getenv("JARVIS_SIGNAL_DIR", "~/.jarvis/signals")
-            )
-            try:
-                os.makedirs(_signal_dir, exist_ok=True)
-                import json
-                signal_path = os.path.join(_signal_dir, "cpu_pressure.json")
-                with open(signal_path, 'w') as f:
-                    json.dump({
-                        "type": "cpu_pressure",
-                        "cpu_percent": cpu_percent,
-                        "memory_percent": _memory_percent,
-                        "compound": _compound,
-                        "gcp_recommended": _gcp_recommended,
-                        "timestamp": _now,
-                    }, f)
-            except Exception:
-                pass  # Non-fatal — signal file is advisory
+        self._last_cpu_pressure_warn = _now
 
-        # Compound stress: CPU >= threshold AND memory >= compound threshold
-        # Trigger memory relief (cache clearing, GC, progressive strategies)
+        logger.warning(
+            "CPU pressure: %.1f%% (compound_memory=%s, gcp_recommended=%s)",
+            cpu_percent, _compound, _gcp_recommended,
+        )
+
+        # Write signal file for cross-repo coordination
+        _signal_dir = os.path.expanduser(
+            os.getenv("JARVIS_SIGNAL_DIR", "~/.jarvis/signals")
+        )
+        try:
+            os.makedirs(_signal_dir, exist_ok=True)
+            import json
+            signal_path = os.path.join(_signal_dir, "cpu_pressure.json")
+            with open(signal_path, 'w') as f:
+                json.dump({
+                    "type": "cpu_pressure",
+                    "cpu_percent": cpu_percent,
+                    "memory_percent": _memory_percent,
+                    "compound": _compound,
+                    "gcp_recommended": _gcp_recommended,
+                    "timestamp": _now,
+                }, f)
+        except Exception:
+            pass  # Non-fatal — signal file is advisory
+
+        # Compound stress: trigger memory relief (cache clearing, GC, progressive)
         if _compound:
             logger.warning(
                 "Compound CPU+memory pressure (CPU=%.1f%%, mem=%.1f%%) — triggering relief",
