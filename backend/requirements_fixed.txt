@@ -29,7 +29,7 @@ audioread==3.0.1
 resampy==0.4.2
 
 # Automation dependencies
-icalendar==5.0.11
+icalendar==7.0.0
 pytz==2025.2
 apscheduler==3.10.4
 aiohttp==3.9.1
