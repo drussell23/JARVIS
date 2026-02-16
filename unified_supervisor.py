@@ -61582,9 +61582,28 @@ class JarvisSystemKernel:
             # cannot be held by voice-biometric smoke checks.
             if self.config.ecapa_enabled:
                 async def _run_ecapa_verification_bg() -> None:
+                    # v258.1 R2-#3: Initialize before try to avoid UnboundLocalError
+                    cpu = 0.0
+                    _ecapa_base_timeout = _get_env_float("JARVIS_ECAPA_BG_TIMEOUT", 90.0)
+                    _ecapa_max_timeout = _get_env_float("JARVIS_ECAPA_MAX_TIMEOUT", 180.0)
+                    _ecapa_bg_timeout = _ecapa_base_timeout
+
                     try:
-                        # v256.0: Configurable timeout — 60s was too tight under CPU pressure (96-98%)
-                        _ecapa_bg_timeout = _get_env_float("JARVIS_ECAPA_BG_TIMEOUT", 90.0)
+                        # v258.1: CPU-aware dynamic timeout
+                        try:
+                            from backend.core.async_system_metrics import get_cpu_percent
+                            cpu = await get_cpu_percent()
+                        except Exception:
+                            pass  # cpu stays 0.0
+
+                        # v258.1 R2-#8: Simple threshold — 2x when CPU > 90%
+                        if cpu > 90.0:
+                            _ecapa_bg_timeout = _ecapa_max_timeout
+                            self.logger.info(
+                                f"[Kernel] ECAPA timeout extended to {_ecapa_bg_timeout:.0f}s "
+                                f"(CPU: {cpu:.0f}%, base: {_ecapa_base_timeout:.0f}s)"
+                            )
+
                         ecapa_verify = await asyncio.wait_for(
                             self._verify_ecapa_pipeline(), timeout=_ecapa_bg_timeout
                         )
@@ -61601,7 +61620,10 @@ class JarvisSystemKernel:
                             except Exception:
                                 self.logger.warning("[Kernel] ECAPA verification incomplete (post-startup)")
                     except asyncio.TimeoutError:
-                        self.logger.warning(f"[Kernel] ECAPA verification timed out ({_ecapa_bg_timeout:.0f}s) — skipping")
+                        self.logger.warning(
+                            f"[Kernel] ECAPA verification timed out ({_ecapa_bg_timeout:.0f}s, "
+                            f"CPU: {cpu:.0f}%) — skipping"
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as ev_err:
@@ -72612,6 +72634,15 @@ class JarvisSystemKernel:
                 else:
                     # Phase 3 still running — await it with a budget-aware timeout
                     _phase3_wait = _get_env_float("JARVIS_VOICE_BIO_ECAPA_WAIT", 30.0)
+                    # v258.1: Extend Phase 6 wait budget under CPU pressure
+                    try:
+                        from backend.core.async_system_metrics import get_cpu_percent
+                        _cpu = await get_cpu_percent()
+                        if _cpu > 90.0:
+                            _phase3_wait = min(_phase3_wait * 2.0, 90.0)
+                            self.logger.info(f"[VoiceBio] Extended Phase 3 ECAPA wait to {_phase3_wait:.0f}s (CPU: {_cpu:.0f}%)")
+                    except Exception:
+                        pass
                     self.logger.info(f"[VoiceBio] Phase 3 ECAPA task still running — waiting up to {_phase3_wait:.0f}s...")
                     try:
                         # v256.1: Check cancelled() first — shield on cancelled task is pointless

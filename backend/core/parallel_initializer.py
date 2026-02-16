@@ -176,6 +176,7 @@ class ComponentInit:
     # v2.0: Circuit breaker fields
     is_interactive: bool = False  # True for components needed for user interaction
     stale_threshold_seconds: float = 30.0  # Mark as stale after this duration in RUNNING
+    _stale_warned: bool = field(default=False, repr=False)  # v258.1: watchdog early warning flag
 
     @property
     def duration_ms(self) -> Optional[float]:
@@ -310,7 +311,7 @@ class ParallelInitializer:
             self._add_component("gcp_vm_manager", priority=20, stale_threshold=30.0)
         self._add_component("cloud_ml_router", priority=20, stale_threshold=20.0)
         if enable_cloud_ml or enable_spot_vm:
-            self._add_component("cloud_ecapa_client", priority=20, stale_threshold=30.0)
+            self._add_component("cloud_ecapa_client", priority=20, stale_threshold=90.0)
         # VBI runs in background - doesn't block anything
         if enable_vbi_prewarm:
             self._add_component("vbi_prewarm", priority=21, stale_threshold=45.0)
@@ -353,6 +354,16 @@ class ParallelInitializer:
         stale_threshold: float = 30.0
     ):
         """Add a component to track with circuit breaker support"""
+        # v258.1: Allow per-component stale threshold override via env var
+        # e.g. JARVIS_STALE_THRESHOLD_CLOUD_ECAPA_CLIENT=90
+        env_key = f"JARVIS_STALE_THRESHOLD_{name.upper()}"
+        env_val = os.environ.get(env_key)
+        if env_val:
+            try:
+                stale_threshold = float(env_val)
+            except (ValueError, TypeError):
+                pass
+
         self.components[name] = ComponentInit(
             name=name,
             priority=priority,
@@ -751,6 +762,20 @@ class ParallelInitializer:
                 if elapsed > max_runtime:
                     logger.info("🐕 Watchdog completed (max runtime reached)")
                     break
+
+                # v258.1 R2-#4: Early warning scan (BEFORE stale detection)
+                # Must be separate from stale_components loop since is_stale = already exceeded
+                for name, comp in self.components.items():
+                    if comp.phase == InitPhase.RUNNING and comp.start_time:
+                        _elapsed = comp.running_seconds
+                        _warn_at = comp.stale_threshold_seconds * 0.8
+                        if _elapsed >= _warn_at and _elapsed < comp.stale_threshold_seconds:
+                            if not comp._stale_warned:
+                                logger.warning(
+                                    f"Watchdog: {name} approaching stale threshold "
+                                    f"({_elapsed:.0f}s / {comp.stale_threshold_seconds:.0f}s)"
+                                )
+                                comp._stale_warned = True
 
                 # Check for stale components
                 stale_components = []

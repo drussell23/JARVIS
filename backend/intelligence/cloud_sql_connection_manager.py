@@ -3677,6 +3677,7 @@ class ConnectionConfig:
 
         # Timeouts
         self.connection_timeout = get_env_float('JARVIS_DB_CONNECTION_TIMEOUT', self.connection_timeout)
+        self.startup_connection_timeout = get_env_float('JARVIS_DB_STARTUP_CONNECTION_TIMEOUT', self.startup_connection_timeout)
         self.query_timeout = get_env_float('JARVIS_DB_QUERY_TIMEOUT', self.query_timeout)
         self.pool_creation_timeout = get_env_float('JARVIS_DB_POOL_CREATION_TIMEOUT', self.pool_creation_timeout)
 
@@ -3707,6 +3708,7 @@ class ConnectionConfig:
 
     # Timeouts (seconds)
     connection_timeout: float = 5.0
+    startup_connection_timeout: float = 15.0  # v258.1: longer during startup
     query_timeout: float = 30.0
     pool_creation_timeout: float = 15.0
 
@@ -4316,7 +4318,7 @@ class CloudSQLConnectionManager:
         database: str = "jarvis_learning",
         user: str = "jarvis",
         password: Optional[str] = None,
-        max_connections: int = 3,
+        max_connections: Optional[int] = None,  # v258.1 R2-#1: None = use config default
         force_reinit: bool = False,
         config: Optional[ConnectionConfig] = None,
         auto_resolve_credentials: bool = True,
@@ -4389,7 +4391,11 @@ class CloudSQLConnectionManager:
                 # Reload from environment
                 self._conn_config.reload_from_env()
 
-            self._conn_config.max_connections = max_connections
+            # v258.1 R2-#1: Only override config if caller explicitly provides max_connections
+            if max_connections is not None:
+                self._conn_config.max_connections = max_connections
+            # R3-#1: Use config value for all downstream references (avoid None)
+            effective_max_connections = self._conn_config.max_connections
 
             # Store DB config
             self.db_config = {
@@ -4398,7 +4404,7 @@ class CloudSQLConnectionManager:
                 "database": database,
                 "user": user,
                 "password": password,
-                "max_connections": max_connections
+                "max_connections": effective_max_connections
             }
 
             # v4.0: Initialize circuit breaker (use enterprise version if available)
@@ -4486,7 +4492,7 @@ class CloudSQLConnectionManager:
                             initial_min_size = 1 if attempt == 0 else self._conn_config.min_connections
 
                             logger.info(f"   [v16.0] Creating pool (attempt {attempt + 1}/{max_retries}, "
-                                        f"min={initial_min_size}, max={max_connections})")
+                                        f"min={initial_min_size}, max={effective_max_connections})")
 
                             # Create pool with serialized init
                             pool = await asyncpg.create_pool(
@@ -4496,8 +4502,8 @@ class CloudSQLConnectionManager:
                                 user=user,
                                 password=password,
                                 min_size=initial_min_size,
-                                max_size=max_connections,
-                                timeout=self._conn_config.connection_timeout,
+                                max_size=effective_max_connections,
+                                timeout=300.0,  # v258.1 R2-#2: delegate to outer wait_for for dynamic control
                                 command_timeout=self._conn_config.query_timeout,
                                 max_queries=self._conn_config.max_queries_per_connection,
                                 max_inactive_connection_lifetime=self._conn_config.max_idle_time_seconds,
@@ -4850,11 +4856,12 @@ class CloudSQLConnectionManager:
 
                 if self.pool:
                     try:
-                        async with self.pool.acquire() as conn:
-                            await asyncio.wait_for(
-                                conn.fetchval("SELECT 1"),
-                                timeout=5.0
-                            )
+                        # v258.1 R3-#2: Outer timeout on acquire+query
+                        # Pool timeout=300s is delegation-only; health check must fail fast
+                        async def _health_check_query():
+                            async with self.pool.acquire() as conn:
+                                await conn.fetchval("SELECT 1")
+                        await asyncio.wait_for(_health_check_query(), timeout=10.0)
                         self.metrics.healthy_connections += 1
                     except Exception as e:
                         self.metrics.unhealthy_connections += 1
@@ -4997,11 +5004,17 @@ class CloudSQLConnectionManager:
         conn = None
         checkout_id = None
 
+        # v258.1 R2-#9: Use grace period timer, not just _startup_mode flag
+        # (proxy_ready can turn off _startup_mode while callers still contend)
+        effective_timeout = self._conn_config.connection_timeout
+        if self._startup_mode or (time.time() - self._start_time < self._startup_grace_period):
+            effective_timeout = self._conn_config.startup_connection_timeout
+
         try:
             # Acquire connection
             conn = await asyncio.wait_for(
                 self.pool.acquire(),
-                timeout=self._conn_config.connection_timeout
+                timeout=effective_timeout
             )
 
             # Track checkout
@@ -5034,7 +5047,15 @@ class CloudSQLConnectionManager:
         except asyncio.TimeoutError:
             # Suppress timeout errors during startup mode (before proxy is ready)
             if not self._should_suppress_error():
-                logger.error("⏱️ Connection timeout - pool exhausted")
+                # v258.1: Include pool state in error for diagnostics
+                _pool_size = self.pool.get_size() if self.pool else 0
+                _pool_free = self.pool.get_idle_size() if self.pool else 0
+                _pool_max = self._conn_config.max_connections
+                logger.error(
+                    f"⏱️ Connection timeout - pool exhausted "
+                    f"(size={_pool_size}/{_pool_max}, free={_pool_free}, "
+                    f"timeout={effective_timeout:.0f}s, startup={self._startup_mode})"
+                )
             else:
                 logger.debug("⏱️ Connection timeout during startup (proxy not ready yet)")
             self.error_count += 1
