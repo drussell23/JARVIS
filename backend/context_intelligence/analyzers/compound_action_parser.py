@@ -566,15 +566,15 @@ class CompoundActionParser:
         plan_parts = []
         for action in sorted(actions, key=lambda a: a.order):
             if action.type == ActionType.OPEN_APP:
-                plan_parts.append(f"Open {action.params['app_name']}")
+                plan_parts.append(f"Open {action.params.get('app_name', 'unknown')}")
             elif action.type == ActionType.CLOSE_APP:
-                plan_parts.append(f"Close {action.params['app_name']}")
+                plan_parts.append(f"Close {action.params.get('app_name', 'unknown')}")
             elif action.type == ActionType.SEARCH_WEB:
-                plan_parts.append(f"Search for '{action.params['query']}'")
+                plan_parts.append(f"Search for '{action.params.get('query', '')}'")
             elif action.type == ActionType.NAVIGATE_URL:
-                plan_parts.append(f"Navigate to {action.params['url']}")
+                plan_parts.append(f"Navigate to {action.params.get('url', 'unknown')}")
             elif action.type == ActionType.CREATE_DOCUMENT:
-                plan_parts.append(f"Create document: {action.params['content']}")
+                plan_parts.append(f"Create document: {action.params.get('content', '')}")
 
         return " → ".join(plan_parts)
 

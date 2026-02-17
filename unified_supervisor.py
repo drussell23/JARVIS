@@ -72686,8 +72686,11 @@ class JarvisSystemKernel:
             try:
                 import resource
                 soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-                # Count current open files
-                current_fds = len(psutil.Process().open_files()) + len(psutil.Process().net_connections())
+                # Count current open files (v259.0: cache handle + offload to thread)
+                def _count_fds():
+                    _proc = psutil.Process()
+                    return len(_proc.open_files()) + len(_proc.net_connections())
+                current_fds = await asyncio.to_thread(_count_fds)
                 fd_quota_percent = 80  # Use at most 80% of soft limit
                 fd_quota = int(soft_limit * fd_quota_percent / 100)
 

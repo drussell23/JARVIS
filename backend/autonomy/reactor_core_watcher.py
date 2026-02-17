@@ -127,6 +127,11 @@ class ReactorCoreConfig:
         )
     )
 
+    # v239.0: Subprocess smoke test before deployment
+    smoke_test_enabled: bool = field(
+        default_factory=lambda: os.getenv("REACTOR_CORE_SMOKE_TEST", "true").lower() == "true"
+    )
+
 
 @dataclass
 class DeploymentResult:
@@ -140,6 +145,7 @@ class DeploymentResult:
     gcs_uploaded: bool = False
     gcs_path: Optional[str] = None
     hot_swap_notified: bool = False
+    health_verified: bool = False  # v239.0
     error: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
@@ -362,6 +368,20 @@ class ReactorCoreWatcher:
             f"({size_mb:.1f}MB, checksum: {checksum})"
         )
 
+        deploy_start = time.monotonic()  # v239.0: track deployment latency
+
+        # v239.0: Smoke test in subprocess (avoids OOM on 16GB Mac)
+        if self.config.smoke_test_enabled:
+            smoke_ok, smoke_err = await self._smoke_test(model_path)
+            if not smoke_ok:
+                logger.warning(f"[ReactorCoreWatcher] Smoke test FAILED: {smoke_err}")
+                return DeploymentResult(
+                    success=False, model_name=model_path.name,
+                    model_path=str(model_path), model_size_mb=size_mb,
+                    checksum=checksum, error=f"Smoke test failed: {smoke_err}",
+                )
+            logger.info("[ReactorCoreWatcher] Smoke test passed")
+
         result = DeploymentResult(
             success=True,
             model_name=model_path.name,
@@ -399,6 +419,13 @@ class ReactorCoreWatcher:
                 result.hot_swap_notified = hot_swap_ok
             except Exception as e:
                 logger.warning(f"[ReactorCoreWatcher] Hot-swap notification failed: {e}")
+
+        # v239.0: Deployment feedback — verify health + write structured feedback
+        if result.hot_swap_notified:
+            await asyncio.sleep(10.0)  # Let J-Prime load new model
+            feedback_ok = await self._check_deployment_health()
+            result.health_verified = feedback_ok
+            await self._write_deployment_feedback(result, deploy_start)
 
         result.success = result.local_deployed or result.gcs_uploaded
         return result
@@ -480,6 +507,91 @@ class ReactorCoreWatcher:
                 logger.debug(f"[ReactorCoreWatcher] Cloud Run notification failed: {e}")
 
         return notified
+
+    async def _smoke_test(self, model_path: Path) -> tuple:
+        """v239.0: Load model in subprocess, run test inference, verify output.
+
+        Subprocess isolates memory — when it exits, OS reclaims all RAM.
+        No risk of OOM leak in the main supervisor process.
+        Model path is passed as sys.argv[1] to avoid shell injection.
+        """
+        import sys
+        test_script = (
+            "import sys; "
+            "from llama_cpp import Llama; "
+            "m = Llama(model_path=sys.argv[1], n_ctx=512, verbose=False); "
+            "r = m('Hello, how are you?', max_tokens=20); "
+            "t = r['choices'][0]['text'].strip(); "
+            "print(t); "
+            "sys.exit(0 if len(t) >= 3 else 1)"
+        )
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", test_script, str(model_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=120.0
+            )
+            if proc.returncode != 0:
+                err = stderr.decode()[:200] if stderr else "Unknown error"
+                return False, err
+            text = stdout.decode().strip()
+            if len(text) < 3:
+                return False, f"Output too short: '{text}'"
+            return True, ""
+        except asyncio.TimeoutError:
+            # Kill the subprocess to reclaim its memory immediately
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            return False, "Smoke test timed out (120s)"
+        except Exception as e:
+            return False, str(e)
+
+    async def _check_deployment_health(self) -> bool:
+        """v239.0: Check J-Prime health after model swap."""
+        client = await self._get_http_client()
+        if client is None:
+            return False
+        try:
+            resp = await client.get(f"{self.config.jarvis_prime_local_url}/health")
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("ready_for_inference", False) or data.get("status") == "healthy"
+        except Exception:
+            pass
+        return False
+
+    async def _write_deployment_feedback(self, result: DeploymentResult, start_time: float) -> None:
+        """v239.0: Write structured deployment feedback for Reactor Core."""
+        import json
+        feedback_dir = Path.home() / ".jarvis" / "reactor" / "feedback"
+        feedback_dir.mkdir(parents=True, exist_ok=True)
+
+        feedback = {
+            "schema_version": "1.0",
+            "model_name": result.model_name,
+            "model_path": result.model_path,
+            "model_size_mb": result.model_size_mb,
+            "checksum": result.checksum,
+            "deployed_at": datetime.utcnow().isoformat() + "Z",
+            "smoke_test_passed": True,
+            "local_deployed": result.local_deployed,
+            "gcs_uploaded": result.gcs_uploaded,
+            "hot_swap_notified": result.hot_swap_notified,
+            "health_verified": result.health_verified,
+            "deployment_latency_ms": int((time.monotonic() - start_time) * 1000),
+        }
+
+        filename = f"deploy_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{result.model_name}.json"
+        (feedback_dir / filename).write_text(json.dumps(feedback, indent=2))
+        logger.info(f"[v239.0] Deployment feedback written: {filename}")
 
     async def manual_deploy(self, model_path: str) -> DeploymentResult:
         """Manually trigger deployment of a model."""

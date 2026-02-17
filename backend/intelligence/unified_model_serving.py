@@ -836,71 +836,91 @@ class PrimeLocalClient(ModelClient):
         return response
 
     async def generate_stream(self, request: ModelRequest) -> AsyncIterator[str]:
-        """Generate a streaming response.
+        """v239.0: Streaming with cancellation token + adaptive timeout.
 
-        v234.1: Routes streaming inference through self._inference_executor
+        Routes streaming inference through self._inference_executor
         (single-worker ThreadPoolExecutor) to serialize with non-streaming
-        generate() calls. Uses asyncio.Queue as a thread-safe bridge between
-        the synchronous llama-cpp iterator and the async generator.
+        generate() calls. Uses asyncio.Queue as a thread-safe bridge.
 
-        Without this, a concurrent streaming + non-streaming request could
-        run two inferences in parallel, causing OOM on 16GB Mac.
+        Adaptive timeout: 90s for first chunk (cold start), 30s thereafter.
+        Cancellation token stops the inference thread on timeout/disconnect.
         """
         if not self._loaded or self._model is None:
             if not await self.load_model():
                 yield "[Error: Model not loaded]"
                 return
 
+        import threading
+        prompt = self._build_prompt(request.messages, request.system_prompt)
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        _sentinel = object()
+        _cancel = threading.Event()  # v239.0: cancellation signal
+        fut = None
+
+        def _stream_in_thread() -> None:
+            try:
+                for chunk in self._model(
+                    prompt,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    stop=["</s>", "Human:", "User:"],
+                    stream=True,
+                ):
+                    if _cancel.is_set():
+                        break
+                    text = chunk["choices"][0]["text"]
+                    if text:
+                        loop.call_soon_threadsafe(queue.put_nowait, text)
+                loop.call_soon_threadsafe(queue.put_nowait, _sentinel)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+
         try:
-            prompt = self._build_prompt(request.messages, request.system_prompt)
-            loop = asyncio.get_event_loop()
-            queue: asyncio.Queue = asyncio.Queue()
-            _sentinel = object()  # Marks end of stream
+            fut = loop.run_in_executor(self._inference_executor, _stream_in_thread)
 
-            def _stream_in_thread() -> None:
-                """Run synchronous streaming inference inside the executor.
+            # v239.0: Adaptive per-chunk timeout
+            _first_chunk_timeout = float(os.environ.get(
+                "JARVIS_STREAM_FIRST_CHUNK_TIMEOUT", "90"
+            ))
+            _chunk_timeout = float(os.environ.get(
+                "JARVIS_STREAM_CHUNK_TIMEOUT", "30"
+            ))
+            _current_timeout = _first_chunk_timeout
 
-                Puts each text chunk into the async queue via
-                call_soon_threadsafe, ensuring the event loop is never
-                blocked by the LLM inference.
-                """
-                try:
-                    for chunk in self._model(
-                        prompt,
-                        max_tokens=request.max_tokens,
-                        temperature=request.temperature,
-                        stop=["</s>", "Human:", "User:"],
-                        stream=True,
-                    ):
-                        text = chunk["choices"][0]["text"]
-                        if text:
-                            loop.call_soon_threadsafe(queue.put_nowait, text)
-                    loop.call_soon_threadsafe(queue.put_nowait, _sentinel)
-                except Exception as exc:
-                    loop.call_soon_threadsafe(queue.put_nowait, exc)
-
-            # Submit to single-worker executor — serialized with generate()
-            fut = loop.run_in_executor(
-                self._inference_executor, _stream_in_thread
-            )
-
-            # Consume chunks from the queue as they arrive
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_current_timeout)
+                except asyncio.TimeoutError:
+                    _cancel.set()
+                    self.logger.warning(
+                        f"[v239.0] Stream chunk timeout ({_current_timeout:.0f}s)"
+                    )
+                    raise TimeoutError(
+                        f"Stream timeout ({_current_timeout:.0f}s) — model stopped responding"
+                    )
+
                 if item is _sentinel:
                     break
                 if isinstance(item, BaseException):
                     self.logger.error(f"Prime streaming error: {item}")
-                    yield f"[Error: {item}]"
-                    break
+                    raise item
                 yield item
+                _current_timeout = _chunk_timeout
 
-            # Ensure the executor thread has fully completed
             await fut
 
         except Exception as e:
+            # v239.0: Signal cancellation and wait for executor thread to finish
+            # so it doesn't block the next inference on the single-worker executor.
+            _cancel.set()
+            if fut is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(fut), timeout=5.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
             self.logger.error(f"Prime streaming error: {e}")
-            yield f"[Error: {e}]"
+            raise  # Re-raise so UnifiedModelServing.generate_stream can failover
 
     def _build_prompt(
         self,
@@ -1577,6 +1597,14 @@ class ModelRouter:
             TaskType.EMBEDDING: [ModelProvider.PRIME_API, ModelProvider.PRIME_LOCAL, ModelProvider.PRIME_CLOUD_RUN],
         }
 
+        # v239.0: Relative cost efficiency per provider (higher = cheaper)
+        self._PROVIDER_COST_EFFICIENCY: Dict[ModelProvider, float] = {
+            ModelProvider.PRIME_LOCAL: 1.0,      # Free (already-running machine)
+            ModelProvider.PRIME_API: 0.9,        # GCP VM (~$0.02/hr amortized)
+            ModelProvider.PRIME_CLOUD_RUN: 0.7,  # Cloud Run per-request pricing
+            ModelProvider.CLAUDE: 0.3,           # $3/M input + $15/M output tokens
+        }
+
         # v100.2: Performance-based preference weighting (adaptive routing)
         self._provider_performance: Dict[ModelProvider, Dict[str, float]] = {
             provider: {
@@ -1650,8 +1678,21 @@ class ModelRouter:
             # Decay over 1 hour (3600 seconds)
             recency_score = max(0.0, 1.0 - (age_seconds / 3600.0))
 
-        # Weighted combination
-        return 0.6 * success_score + 0.2 * latency_score + 0.2 * recency_score
+        # v239.0: Cost-aware scoring with protected success floor
+        _cost_weight = max(0.0, min(0.50, float(os.environ.get("JARVIS_ROUTING_COST_WEIGHT", "0.10"))))
+        _success_weight = max(0.50, 0.6 * (1.0 - _cost_weight))
+        _remaining = 1.0 - _success_weight - _cost_weight
+        _latency_weight = _remaining * 0.5
+        _recency_weight = _remaining * 0.5
+
+        cost_score = self._PROVIDER_COST_EFFICIENCY.get(provider, 0.5)
+
+        return (
+            _success_weight * success_score +
+            _latency_weight * latency_score +
+            _recency_weight * recency_score +
+            _cost_weight * cost_score
+        )
 
     def get_preferred_providers(
         self,
@@ -1670,6 +1711,23 @@ class ModelRouter:
 
         # Filter to available providers
         result = [p for p in preferred if p in available_providers]
+
+        # v239.0: When GCP boot is in progress and PRIME_LOCAL has no model loaded,
+        # promote CLAUDE ahead of PRIME_LOCAL to avoid triggering an expensive
+        # local model load that'll be unloaded seconds later when GCP arrives.
+        if os.environ.get("JARVIS_INVINCIBLE_NODE_BOOTING") == "true":
+            _local_client = None
+            if _model_serving is not None:
+                _local_client = _model_serving._clients.get(ModelProvider.PRIME_LOCAL)
+            _local_loaded = _local_client and getattr(_local_client, '_loaded', False)
+
+            if not _local_loaded and ModelProvider.CLAUDE in result:
+                result = [p for p in result if p != ModelProvider.CLAUDE]
+                _local_idx = next(
+                    (i for i, p in enumerate(result) if p == ModelProvider.PRIME_LOCAL),
+                    len(result)
+                )
+                result.insert(_local_idx, ModelProvider.CLAUDE)
 
         # v100.2: Apply adaptive scoring within preference tiers
         # Providers with significantly better scores can be promoted
@@ -2062,7 +2120,16 @@ class UnifiedModelServing:
         self,
         request: ModelRequest
     ) -> AsyncIterator[str]:
-        """Generate a streaming response."""
+        """Generate a streaming response with mid-stream failover (v239.0).
+
+        If a provider fails mid-stream, captures the error, records circuit
+        breaker failure, and retries with the next tier using the original prompt.
+
+        Known behavior: On failover after partial output, the consumer sees
+        the beginning of the response twice (partial from tier 1 + full from
+        tier 2). A [Stream interrupted] marker separates them so UIs can
+        detect and clean up the display.
+        """
         available = list(self._clients.keys())
         providers = self._router.get_preferred_providers(request, available)
 
@@ -2070,6 +2137,7 @@ class UnifiedModelServing:
             yield "[Error: No suitable model providers available]"
             return
 
+        last_error = None
         for provider in providers:
             if not self._circuit_breaker.can_execute(provider.value):
                 continue
@@ -2079,15 +2147,27 @@ class UnifiedModelServing:
                 continue
 
             try:
+                chunks_yielded = 0
                 async for chunk in client.generate_stream(request):
                     yield chunk
+                    chunks_yielded += 1
+                # Stream completed successfully
+                self._circuit_breaker.record_success(provider.value)
                 return
             except Exception as e:
-                self.logger.error(f"Streaming error from {provider.value}: {e}")
+                self.logger.warning(
+                    f"[v239.0] Stream failed from {provider.value} after "
+                    f"{chunks_yielded} chunks: {e}"
+                )
                 self._circuit_breaker.record_failure(provider.value)
+                last_error = str(e)
+
+                if chunks_yielded > 0:
+                    yield "\n\n[Stream interrupted — retrying with backup...]\n\n"
                 continue
 
-        yield "[Error: All providers failed for streaming]"
+        if last_error:
+            yield f"[Error: All providers failed. Last: {last_error}]"
 
     async def chat(
         self,
@@ -2557,6 +2637,12 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
             ModelProvider.PRIME_API.value
         )
         logger.info(f"[v234.0] GCP endpoint hot-swapped: {old_url} → {url}")
+        # v239.0: Free RAM by unloading local model now that GCP is primary
+        try:
+            await _model_serving._unload_local_model()
+            logger.info("[v239.0] Local model unloaded — GCP is now primary tier")
+        except Exception as e:
+            logger.warning(f"[v239.0] Local model unload failed (non-fatal): {e}")
         return True
     else:
         # No PrimeAPIClient yet — create one pointing at GCP
@@ -2567,6 +2653,12 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
                 ModelProvider.PRIME_API.value
             )
             logger.info(f"[v234.0] GCP endpoint activated: {url}")
+            # v239.0: Free RAM by unloading local model now that GCP is primary
+            try:
+                await _model_serving._unload_local_model()
+                logger.info("[v239.0] Local model unloaded — GCP is now primary tier")
+            except Exception as e:
+                logger.warning(f"[v239.0] Local model unload failed (non-fatal): {e}")
             return True
         else:
             logger.warning(f"[v234.0] GCP endpoint not ready: {url}")
