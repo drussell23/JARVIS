@@ -59852,9 +59852,12 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.debug(f"[Kernel] Agent Runtime cleanup error: {e}")
 
-        # Cancel all background tasks (backend serve task is managed separately)
+        # v262.0: Cancel background tasks AND await them so finally blocks execute.
+        # Previously only cancelled with 2s timeout — aiohttp sessions, file handles, etc. leaked.
+        # R3: Added configurable timeout to prevent hung finally blocks from stalling shutdown.
         background_tasks = [
-            task for task in self._background_tasks if task is not self._backend_server_task
+            task for task in self._background_tasks
+            if task is not self._backend_server_task and not task.done()
         ]
         for task in background_tasks:
             task.cancel()
@@ -59869,15 +59872,21 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.debug(f"[Kernel] Heartbeat task cleanup error: {e}")
 
-        # Wait briefly for task cancellation
+        # v262.0: Give tasks time to run their finally blocks (e.g., await session.close()).
+        # Timeout prevents a hung finally block from stalling the entire shutdown.
         if background_tasks:
+            _bg_cleanup_timeout = _get_env_float("JARVIS_BACKGROUND_TASK_CLEANUP_TIMEOUT", 10.0)
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*background_tasks, return_exceptions=True),
-                    timeout=2.0
+                    timeout=_bg_cleanup_timeout,
                 )
             except asyncio.TimeoutError:
-                pass
+                _still_pending = sum(1 for t in background_tasks if not t.done())
+                self.logger.warning(
+                    f"[Kernel] v262.0: Background task cleanup timed out after "
+                    f"{_bg_cleanup_timeout:.0f}s — {_still_pending} tasks still pending"
+                )
 
         # v223.0: Stop Node.js WebSocket Router (prevents orphaned Node processes)
         if hasattr(self, '_ws_router_process') and self._ws_router_process:
@@ -61630,7 +61639,9 @@ class JarvisSystemKernel:
                     self._watch_jprime_readiness(),
                     name="jprime-readiness-watcher",
                 )
-                self._background_tasks.append(self._jprime_watcher_task)
+                # v262.0: Guard against double-append (also appended in Trinity path)
+                if self._jprime_watcher_task not in self._background_tasks:
+                    self._background_tasks.append(self._jprime_watcher_task)
 
         # =============================================================
         # v233.4: EARLY GCP PRE-WARM — Start Invincible Node Before Phase 0
@@ -62728,11 +62739,54 @@ class JarvisSystemKernel:
             self._current_startup_progress = 86
             issue_collector.set_current_phase("Phase 6.7: AGI OS")
             issue_collector.set_current_zone("Zone 6.7")
-            agi_os_timeout = float(os.environ.get("JARVIS_AGI_OS_TIMEOUT", "90.0"))
+            # v262.0: Outer defense-in-depth timeout on _initialize_agi_os().
+            # The internal 270s timeout (while-loop + deadline) handles the normal case
+            # with clean cleanup via stop_agi_os(). This outer guard catches:
+            # - Post-startup Steps 3-5 hanging indefinitely
+            # - stop_agi_os() cleanup itself hanging
+            # - Event loop blockage preventing internal timeout from firing
+            _agi_os_init_timeout_val = _get_env_float("JARVIS_AGI_OS_INIT_TIMEOUT", 270.0)
+            _agi_os_outer_timeout = _get_env_float(
+                "JARVIS_AGI_OS_OUTER_TIMEOUT",
+                _agi_os_init_timeout_val + 30.0,  # internal + grace for cleanup
+            )
             if self._startup_watchdog:
-                self._startup_watchdog.update_phase("agi_os", 86, operational_timeout=agi_os_timeout)
+                # v262.0: Register correct DMS timeout from the start (was 90s, overwritten to 270s inside method)
+                _agi_os_timeout_cap = max(60.0, TRINITY_PHASE_HOLD_HARD_CAP - 30.0)
+                _agi_os_dms_timeout = min(_agi_os_init_timeout_val, _agi_os_timeout_cap)
+                self._startup_watchdog.register_phase_timeout("agi_os", _agi_os_dms_timeout)
+                self._startup_watchdog.update_phase("agi_os", 86)
 
-            if not await self._initialize_agi_os():
+            try:
+                _agi_os_ok = await asyncio.wait_for(
+                    self._initialize_agi_os(), timeout=_agi_os_outer_timeout
+                )
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    f"[Kernel] v262.0: _initialize_agi_os() OUTER timeout after "
+                    f"{_agi_os_outer_timeout:.0f}s"
+                )
+                _agi_os_ok = False
+                self._update_component_status(
+                    "agi_os", "error",
+                    f"Outer timeout ({_agi_os_outer_timeout:.0f}s)",
+                )
+                # Attempt cleanup since the internal handler was interrupted.
+                # R3: Guard import — if _agi_os is set, the import at line 65884 succeeded
+                # and the module is fully loaded. If _agi_os is None, the import may have
+                # been interrupted (partially-loaded module in sys.modules) — skip cleanup.
+                if self._agi_os:
+                    with contextlib.suppress(Exception):
+                        try:
+                            from agi_os import stop_agi_os
+                            await asyncio.wait_for(stop_agi_os(), timeout=15.0)
+                        except (asyncio.TimeoutError, ImportError):
+                            pass
+            except asyncio.CancelledError:
+                self.logger.error("[Kernel] v262.0: _initialize_agi_os() cancelled")
+                _agi_os_ok = False
+                raise  # Re-raise to let caller handle shutdown
+            if not _agi_os_ok:
                 # Non-fatal - continue without AGI OS
                 issue_collector.add_warning(
                     "AGI OS failed to initialize - continuing without autonomous features",
@@ -62782,7 +62836,31 @@ class JarvisSystemKernel:
                     "visual_pipeline", 90, operational_timeout=visual_pipeline_timeout
                 )
 
-            if not await self._initialize_visual_pipeline():
+            # v262.0: Outer timeout for Visual Pipeline (derived from internal timeout + grace)
+            _vp_inner_timeout = visual_pipeline_timeout
+            _vp_outer_timeout = _get_env_float(
+                "JARVIS_VISUAL_PIPELINE_OUTER_TIMEOUT",
+                _vp_inner_timeout + 15.0,
+            )
+            try:
+                _vp_ok = await asyncio.wait_for(
+                    self._initialize_visual_pipeline(), timeout=_vp_outer_timeout
+                )
+            except asyncio.TimeoutError:
+                self.logger.error(
+                    f"[Kernel] v262.0: _initialize_visual_pipeline() OUTER timeout "
+                    f"after {_vp_outer_timeout:.0f}s"
+                )
+                _vp_ok = False
+                self._update_component_status(
+                    "visual_pipeline", "error",
+                    f"Outer timeout ({_vp_outer_timeout:.0f}s)",
+                )
+            except asyncio.CancelledError:
+                self.logger.error("[Kernel] v262.0: _initialize_visual_pipeline() cancelled")
+                _vp_ok = False
+                raise
+            if not _vp_ok:
                 # Non-fatal — continue without Visual Pipeline
                 issue_collector.add_warning(
                     "Visual Pipeline failed to initialize — continuing without visual processing",
@@ -65870,12 +65948,16 @@ class JarvisSystemKernel:
                         "agi_os", agi_os_init_timeout
                     )
 
-                # Voice announcement
+                # v262.0: Timeout wrap narrator to prevent blocking before heartbeat loop starts
                 if self._narrator and self.config.voice_enabled:
-                    await self._narrator.speak(
-                        "Initializing AGI Operating System... Neural Mesh active.",
-                        wait=False,
-                    )
+                    with contextlib.suppress(asyncio.TimeoutError, Exception):
+                        await asyncio.wait_for(
+                            self._narrator.speak(
+                                "Initializing AGI Operating System... Neural Mesh active.",
+                                wait=False,
+                            ),
+                            timeout=_get_env_float("JARVIS_AGI_OS_NARRATOR_TIMEOUT", 5.0),
+                        )
 
                 # =====================================================================
                 # STEP 1: Import AGI OS components
@@ -66047,6 +66129,13 @@ class JarvisSystemKernel:
                         return False
 
                     if self._agi_os:
+                        # v262.0: DMS heartbeat + activity marker after startup_task completes.
+                        # Must use progress > 88 (heartbeat loop's max) to avoid regression warning
+                        # and to refresh _last_progress_value_change_time (Path B).
+                        if self._startup_watchdog:
+                            self._startup_watchdog.update_phase("agi_os", 89)
+                        self._mark_startup_activity("agi_os:coordinator_started", stage="agi_os")
+
                         self._agi_os_status["coordinator"] = True
 
                         # v253.3: Check actual AGI OS state — distinguishes
@@ -66093,6 +66182,12 @@ class JarvisSystemKernel:
                     # STEP 3: Verify voice communicator
                     # v252.2: Fixed unawaited coroutine — get_voice_communicator() is async
                     # =====================================================================
+                    # v262.0: DMS heartbeat for Step 3 — value 89 (same as above) refreshes
+                    # _last_progress_time but NOT _last_progress_value_change_time (Path B).
+                    # Path A (_mark_startup_activity) is the primary liveness signal here.
+                    if self._startup_watchdog:
+                        self._startup_watchdog.update_phase("agi_os", 89)
+                    self._mark_startup_activity("agi_os:verify_voice_pre", stage="agi_os")
                     try:
                         _verify_timeout = _get_env_float("JARVIS_AGI_OS_VERIFY_TIMEOUT", 5.0)
                         voice_comm = await asyncio.wait_for(
@@ -66111,6 +66206,10 @@ class JarvisSystemKernel:
                     # STEP 4: Verify approval manager
                     # v252.2: Fixed unawaited coroutine — get_approval_manager() is async
                     # =====================================================================
+                    # v262.0: DMS heartbeat for Step 4 — same value (89), same rationale.
+                    if self._startup_watchdog:
+                        self._startup_watchdog.update_phase("agi_os", 89)
+                    self._mark_startup_activity("agi_os:verify_approval_pre", stage="agi_os")
                     try:
                         approval_mgr = await asyncio.wait_for(
                             get_approval_manager(), timeout=_verify_timeout,
@@ -66128,6 +66227,11 @@ class JarvisSystemKernel:
                     # STEP 5: Complete
                     # =====================================================================
                     await self._broadcast_progress(87, "agi_os", "AGI OS active")
+
+                    # v262.0: Final DMS heartbeat — value changes (89→90), resetting Path B.
+                    if self._startup_watchdog:
+                        self._startup_watchdog.update_phase("agi_os", 90)
+                    self._mark_startup_activity("agi_os:complete", stage="agi_os")
 
                     if self._agi_os_status["coordinator"]:
                         self._agi_os_status["status"] = "active"
@@ -66484,6 +66588,11 @@ class JarvisSystemKernel:
         self._update_component_status("visual_pipeline", "running", "Initializing Visual Pipeline...")
         ferrari_available = False
 
+        # v262.0: DMS heartbeat at Visual Pipeline start
+        if self._startup_watchdog:
+            self._startup_watchdog.update_phase("visual_pipeline", 91)
+        self._mark_startup_activity("visual_pipeline:start", stage="visual_pipeline")
+
         try:
             # Step 2: Initialize Ghost Hands Orchestrator
             get_ghost_hands = None
@@ -66520,6 +66629,11 @@ class JarvisSystemKernel:
             else:
                 self.logger.info("[VisualPipeline] Ghost Hands module not available — skipping")
 
+            # v262.0: DMS heartbeat after Ghost Hands
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase("visual_pipeline", 91)
+            self._mark_startup_activity("visual_pipeline:ghost_hands_done", stage="visual_pipeline")
+
             # Step 3: Verify N-Optic Nerve
             NOpticNerve = None
             try:
@@ -66550,6 +66664,11 @@ class JarvisSystemKernel:
             else:
                 self.logger.info("[VisualPipeline] N-Optic Nerve module not available — skipping")
 
+            # v262.0: DMS heartbeat after N-Optic Nerve
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase("visual_pipeline", 92)
+            self._mark_startup_activity("visual_pipeline:n_optic_done", stage="visual_pipeline")
+
             # Step 4: Verify Ferrari Engine (stateless C++ extension)
             try:
                 FastCaptureEngine = None
@@ -66578,6 +66697,11 @@ class JarvisSystemKernel:
                 self.logger.warning("[VisualPipeline] Ferrari Engine verify timed out — continuing")
             except Exception as e:
                 self.logger.warning(f"[VisualPipeline] Ferrari Engine error: {e}")
+
+            # v262.0: DMS heartbeat after Ferrari Engine
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase("visual_pipeline", 92)
+            self._mark_startup_activity("visual_pipeline:ferrari_done", stage="visual_pipeline")
 
             # Step 5: Publish readiness signal file
             try:
@@ -66608,13 +66732,20 @@ class JarvisSystemKernel:
             # Step 6: Publish initial state + start health monitor
             await self._publish_visual_pipeline_state(ferrari_available=ferrari_available)
 
+            # v262.0: DMS heartbeat after state publication
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase("visual_pipeline", 93)
+            self._mark_startup_activity("visual_pipeline:state_published", stage="visual_pipeline")
+
             # v250.1: create_safe_task is always available (imported or fallback)
+            # v262.0 R3: Register in _background_tasks immediately after creation
+            # to close the orphan window between create_safe_task() and append().
             task = create_safe_task(
                 self._visual_pipeline_health_loop(ferrari_available=ferrari_available),
                 name="visual-pipeline-health",
             )
+            self._background_tasks.append(task)  # register FIRST
             self._visual_pipeline_health_task = task
-            self._background_tasks.append(task)
 
             self._visual_pipeline_initialized = True
             self._update_component_status("visual_pipeline", "complete", "Visual Pipeline ready")
@@ -68877,7 +69008,9 @@ class JarvisSystemKernel:
                                 self._watch_jprime_readiness(),
                                 name="jprime-readiness-watcher-trinity",
                             )
-                            self._background_tasks.append(self._jprime_watcher_task)
+                            # v262.0: Guard against double-append (also appended in Early Prime path)
+                            if self._jprime_watcher_task not in self._background_tasks:
+                                self._background_tasks.append(self._jprime_watcher_task)
                             self.logger.info("[v261.0] J-Prime readiness watcher started (Trinity path)")
 
                 elif total_count == 0 and not _trinity_startup_timed_out:
