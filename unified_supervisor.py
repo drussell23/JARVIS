@@ -52244,8 +52244,9 @@ class UnifiedSignalHandler:
     - 2nd signal: Faster shutdown (shorter timeouts)
     - 3rd signal: Immediate exit (os._exit)
 
-    Thread-safe: Uses threading.Lock for signal counting since signals
-    can arrive from any thread context.
+    Thread-safe: Signal handlers are lock-free (v240.0) — GIL guarantees
+    atomicity for simple attribute assignments. threading.Lock retained
+    only for reset().
 
     Features:
     - Async-first with sync fallback for Windows
@@ -52257,7 +52258,13 @@ class UnifiedSignalHandler:
     """
 
     def __init__(self) -> None:
-        self._shutdown_event: Optional[asyncio.Event] = None
+        # v240.0: Pre-create shutdown event to eliminate TOCTOU race in signal handlers.
+        # Python 3.10+ creates Events without a running loop. Python 3.9 may raise
+        # RuntimeError if no loop is running yet — fallback preserves lazy creation.
+        try:
+            self._shutdown_event: asyncio.Event = asyncio.Event()
+        except RuntimeError:
+            self._shutdown_event: Optional[asyncio.Event] = None
         self._shutdown_requested: bool = False
         self._shutdown_count: int = 0
         self._lock = threading.Lock()
@@ -52268,7 +52275,7 @@ class UnifiedSignalHandler:
         self._first_signal_time: Optional[float] = None
 
     def _get_event(self) -> asyncio.Event:
-        """Lazily create shutdown event (needs running event loop)."""
+        """Return the shutdown event (pre-created in __init__, fallback lazy for Python 3.9)."""
         if self._shutdown_event is None:
             self._shutdown_event = asyncio.Event()
         return self._shutdown_event
@@ -52354,60 +52361,66 @@ class UnifiedSignalHandler:
 
     def _sync_handle_signal(self, sig: int) -> None:
         """
-        Synchronous signal handler (for Windows compatibility and fallback).
+        Synchronous signal handler — lock-free (v240.0).
 
         This handles signals when async handling is not possible.
+
+        v240.0: Removed self._lock to prevent deadlock. Signal handlers run in
+        the main thread between bytecodes — if main thread holds self._lock,
+        acquiring it here deadlocks (threading.Lock is NOT reentrant). GIL
+        guarantees atomicity for simple attribute assignments.
         """
-        with self._lock:
-            self._shutdown_count += 1
-            count = self._shutdown_count
-            self._shutdown_requested = True
+        self._shutdown_count += 1
+        count = self._shutdown_count
+        self._shutdown_requested = True
 
-            if self._first_signal_time is None:
-                self._first_signal_time = time.time()
+        if self._first_signal_time is None:
+            self._first_signal_time = time.time()
 
-            try:
-                sig_name = signal.Signals(sig).name
-            except (ValueError, AttributeError):
-                sig_name = f"signal_{sig}"
+        try:
+            sig_name = signal.Signals(sig).name
+        except (ValueError, AttributeError):
+            sig_name = f"signal_{sig}"
 
-            self._shutdown_reason = sig_name
+        self._shutdown_reason = sig_name
 
-            if count == 1:
-                print(f"\n[Kernel] Received {sig_name} - initiating graceful shutdown...")
-            elif count == 2:
-                print(f"[Kernel] Received second {sig_name} - forcing faster shutdown...")
-            else:
-                print(f"[Kernel] Received third {sig_name} - forcing immediate exit!")
-                os._exit(128 + sig)
+        if count == 1:
+            print(f"\n[Kernel] Received {sig_name} - initiating graceful shutdown...")
+        elif count == 2:
+            print(f"[Kernel] Received second {sig_name} - forcing faster shutdown...")
+        else:
+            print(f"[Kernel] Received third {sig_name} - forcing immediate exit!")
+            os._exit(128 + sig)
 
-            # Try to set the shutdown event if available
-            if self._shutdown_event is not None:
-                try:
-                    if self._loop is not None and self._loop.is_running():
-                        self._loop.call_soon_threadsafe(self._shutdown_event.set)
-                    else:
-                        # Direct set as fallback
-                        self._shutdown_event.set()
-                except Exception:
-                    pass  # Best effort
+        # v240.0: Event is pre-created in __init__, no TOCTOU risk
+        try:
+            if self._loop is not None and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._shutdown_event.set)
+            elif self._shutdown_event is not None:
+                self._shutdown_event.set()
+        except Exception:
+            pass  # Best effort
 
     async def _handle_signal(self, sig: signal.Signals) -> None:
         """
-        Handle incoming signal asynchronously.
+        Handle incoming signal asynchronously — lock-free (v240.0).
 
         Provides escalating shutdown behavior based on signal count.
-        """
-        with self._lock:
-            self._shutdown_count += 1
-            count = self._shutdown_count
 
-            if self._first_signal_time is None:
-                self._first_signal_time = time.time()
+        v240.0: Removed self._lock for consistency with _sync_handle_signal.
+        Both handlers set the same state and must use the same concurrency
+        model. GIL guarantees atomicity for simple attribute assignments.
+        All state (_shutdown_reason, _shutdown_requested) set inline.
+        """
+        self._shutdown_count += 1
+        count = self._shutdown_count
+        self._shutdown_requested = True
+
+        if self._first_signal_time is None:
+            self._first_signal_time = time.time()
 
         sig_name = sig.name
         self._shutdown_reason = sig_name
-        self._shutdown_requested = True
 
         if count == 1:
             print(f"\n[Kernel] Received {sig_name} - initiating graceful shutdown...")
@@ -52417,7 +52430,10 @@ class UnifiedSignalHandler:
             self._get_event().set()
         else:
             print(f"[Kernel] Received third {sig_name} - forcing immediate exit!")
-            os._exit(128 + sig.value)
+            self._get_event().set()
+            # v240.0: Schedule hard exit after 2s grace for cleanup instead of
+            # immediate os._exit() from async context (which bypasses all cleanup)
+            asyncio.get_event_loop().call_later(2.0, os._exit, 128 + sig.value)
 
     async def run_callbacks(self) -> None:
         """Run all registered shutdown callbacks."""

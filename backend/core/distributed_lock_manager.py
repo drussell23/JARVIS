@@ -648,6 +648,8 @@ class DistributedLockManager:
         self._on_keepalive_failed: List[Callable[[str, str], None]] = []
         self._expired_locks: set = set()
         self._lock_events: Dict[str, asyncio.Event] = {}
+        # v240.0: Protect lazy Event creation from TOCTOU race
+        self._event_lock = asyncio.Lock()
 
         # v3.4: Keepalive stopping flag — set synchronously BEFORE any yield in
         # the finally block of acquire_unified(). The keepalive loop checks this
@@ -697,15 +699,19 @@ class DistributedLockManager:
         """
         return lock_name in self._expired_locks
 
-    def get_lock_expired_event(self, lock_name: str) -> asyncio.Event:
-        """v3.2: Get an asyncio.Event that is set when a lock's keepalive fails.
+    async def get_lock_expired_event(self, lock_name: str) -> asyncio.Event:
+        """v3.2/v240.0: Get an asyncio.Event that is set when a lock's keepalive fails.
 
         Callers can ``await event.wait()`` or check ``event.is_set()``
         to detect keepalive exhaustion without polling.
+
+        v240.0: Protected by _event_lock to prevent TOCTOU race where two
+        concurrent callers both create Events and the second overwrites the first.
         """
-        if lock_name not in self._lock_events:
-            self._lock_events[lock_name] = asyncio.Event()
-        return self._lock_events[lock_name]
+        async with self._event_lock:
+            if lock_name not in self._lock_events:
+                self._lock_events[lock_name] = asyncio.Event()
+            return self._lock_events[lock_name]
 
     async def _handle_keepalive_exhaustion(
         self,

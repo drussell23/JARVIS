@@ -52,6 +52,7 @@ import os
 import time
 import uuid
 from abc import ABC, abstractmethod
+import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -850,7 +851,6 @@ class PrimeLocalClient(ModelClient):
                 yield "[Error: Model not loaded]"
                 return
 
-        import threading
         prompt = self._build_prompt(request.messages, request.system_prompt)
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue()
@@ -1529,53 +1529,70 @@ class CircuitBreaker:
         self.logger = logging.getLogger("CircuitBreaker")
 
         self._states: Dict[str, CircuitBreakerState] = {}
+        # v240.0: Thread-safe lock for all state mutations.
+        # Prevents race conditions between concurrent async tasks that
+        # interleave at await points between can_execute() and record_failure().
+        self._lock = threading.Lock()
 
     def get_state(self, provider: str) -> CircuitBreakerState:
         """Get circuit state for a provider."""
-        if provider not in self._states:
-            self._states[provider] = CircuitBreakerState()
-        return self._states[provider]
+        with self._lock:
+            if provider not in self._states:
+                self._states[provider] = CircuitBreakerState()
+            return self._states[provider]
 
     def can_execute(self, provider: str) -> bool:
         """Check if requests can be made to this provider."""
-        state = self.get_state(provider)
-
-        if state.state == CircuitState.CLOSED:
-            return True
-
-        if state.state == CircuitState.OPEN:
-            # Check if recovery period has passed
-            if time.time() - state.last_failure_time >= self.recovery_seconds:
-                state.state = CircuitState.HALF_OPEN
-                self.logger.info(f"Circuit for {provider} entering half-open state")
+        with self._lock:
+            state = self._states.get(provider)
+            if state is None:
+                self._states[provider] = CircuitBreakerState()
                 return True
-            return False
 
-        # Half-open: allow one request to test
-        return True
+            if state.state == CircuitState.CLOSED:
+                return True
+
+            if state.state == CircuitState.OPEN:
+                # Check if recovery period has passed
+                if time.time() - state.last_failure_time >= self.recovery_seconds:
+                    state.state = CircuitState.HALF_OPEN
+                    self.logger.info(f"Circuit for {provider} entering half-open state")
+                    return True
+                return False
+
+            # Half-open: allow one request to test
+            return True
 
     def record_success(self, provider: str) -> None:
         """Record a successful request."""
-        state = self.get_state(provider)
-        state.failure_count = 0
-        state.last_success_time = time.time()
-        state.total_successes += 1
+        with self._lock:
+            state = self._states.get(provider)
+            if state is None:
+                self._states[provider] = CircuitBreakerState()
+                return
+            state.failure_count = 0
+            state.last_success_time = time.time()
+            state.total_successes += 1
 
-        if state.state == CircuitState.HALF_OPEN:
-            state.state = CircuitState.CLOSED
-            self.logger.info(f"Circuit for {provider} closed (recovered)")
+            if state.state == CircuitState.HALF_OPEN:
+                state.state = CircuitState.CLOSED
+                self.logger.info(f"Circuit for {provider} closed (recovered)")
 
     def record_failure(self, provider: str) -> None:
         """Record a failed request."""
-        state = self.get_state(provider)
-        state.failure_count += 1
-        state.last_failure_time = time.time()
-        state.total_failures += 1
+        with self._lock:
+            state = self._states.get(provider)
+            if state is None:
+                self._states[provider] = CircuitBreakerState()
+                state = self._states[provider]
+            state.failure_count += 1
+            state.last_failure_time = time.time()
+            state.total_failures += 1
 
-        if state.failure_count >= self.failure_threshold:
-            if state.state != CircuitState.OPEN:
-                state.state = CircuitState.OPEN
-                self.logger.warning(f"Circuit for {provider} opened (too many failures)")
+            if state.failure_count >= self.failure_threshold:
+                if state.state != CircuitState.OPEN:
+                    state.state = CircuitState.OPEN
+                    self.logger.warning(f"Circuit for {provider} opened (too many failures)")
 
 
 class ModelRouter:
