@@ -576,7 +576,7 @@ class ReactorCoreClient:
                 "trigger_time": datetime.now().isoformat(),
             }
 
-            data = await self._request("POST", "/api/training/trigger", json=payload)
+            data = await self._request("POST", "/api/v1/train", json=payload)
 
             if data and "job_id" in data:
                 job = TrainingJob(
@@ -625,7 +625,7 @@ class ReactorCoreClient:
             return False
 
         try:
-            data = await self._request("POST", f"/api/training/cancel/{job_id}")
+            data = await self._request("POST", f"/api/v1/jobs/{job_id}/cancel")
             return data.get("cancelled", False) if data else False
         except Exception as e:
             logger.error(f"[ReactorClient] Cancel training error: {e}")
@@ -645,7 +645,7 @@ class ReactorCoreClient:
             return None
 
         try:
-            data = await self._request("GET", f"/api/training/job/{job_id}")
+            data = await self._request("GET", f"/api/v1/jobs/{job_id}")
             if data:
                 return TrainingJob.from_dict(data)
             return None
@@ -676,7 +676,7 @@ class ReactorCoreClient:
             if status_filter:
                 params["status"] = status_filter
 
-            data = await self._request("GET", "/api/training/history", params=params)
+            data = await self._request("GET", "/api/v1/jobs", params=params)
             if data and isinstance(data, list):
                 return [TrainingJob.from_dict(job) for job in data]
             return []
@@ -711,7 +711,7 @@ class ReactorCoreClient:
                 "source": "jarvis_agent",
             }
 
-            data = await self._request("POST", "/api/experiences/stream", json=payload)
+            data = await self._request("POST", "/api/v1/experiences/stream", json=payload)
             return data.get("accepted", False) if data else False
 
         except Exception as e:
@@ -729,7 +729,7 @@ class ReactorCoreClient:
             return 0
 
         try:
-            data = await self._request("GET", "/api/experiences/count")
+            data = await self._request("GET", "/api/v1/experiences/count")
             return data.get("count", 0) if data else 0
         except Exception as e:
             logger.warning(f"[ReactorClient] Get experience count error: {e}")
