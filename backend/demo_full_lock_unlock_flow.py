@@ -129,8 +129,8 @@ async def demo_complete_flow():
     print("🔒 Locking screen in 3 seconds...")
     for i in range(3, 0, -1):
         print(f"   {i}...")
-        time.sleep(1)
-    
+        await asyncio.sleep(1)
+
     # Lock command
     lock_cmd = """osascript -e 'tell app "System Events" to key code 12 using {control down, command down}'"""
     subprocess.run(lock_cmd, shell=True)

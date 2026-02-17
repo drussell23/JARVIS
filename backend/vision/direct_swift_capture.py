@@ -68,8 +68,7 @@ class DirectSwiftCapture:
             self.is_capturing = True
             
             # Give Swift a moment to start
-            import time
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
             
             # Check if process started successfully
             if self.capture_process.poll() is None:

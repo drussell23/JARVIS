@@ -8,7 +8,6 @@ Demonstrates JARVIS speaking the lock detection feedback
 
 import asyncio
 import subprocess
-import time
 import sys
 import os
 
@@ -71,7 +70,7 @@ async def run_voice_demo():
     print("\n⏳ Starting in 3 seconds...")
     for i in range(3, 0, -1):
         print(f"   {i}...")
-        time.sleep(1)
+        await asyncio.sleep(1)
     
     # Step 1: Lock screen
     print("\n" + "-"*50)

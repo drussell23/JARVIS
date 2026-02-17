@@ -7,7 +7,6 @@ Shows step-by-step what happens with visual indicators
 """
 
 import asyncio
-import time
 import subprocess
 from datetime import datetime
 import sys
@@ -69,7 +68,7 @@ async def visual_demo():
     
     for i in range(5, 0, -1):
         print(f"   {i}...", end='\r')
-        time.sleep(1)
+        await asyncio.sleep(1)
     
     print("\n\n🎬 STARTING DEMO")
     print("="*60)

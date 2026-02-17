@@ -6,7 +6,6 @@ Automated Voice Demo - No Input Required
 
 import asyncio
 import subprocess
-import time
 import sys
 import os
 
@@ -67,7 +66,7 @@ async def run_demo():
     
     for i in range(5, 0, -1):
         print(f"   {i}...", end='\r')
-        time.sleep(1)
+        await asyncio.sleep(1)
     
     # Lock screen
     print("\n\n🔒 Locking screen...")

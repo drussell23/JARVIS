@@ -1219,103 +1219,6 @@ Source: jarvis-prime-node at 34.45.154.209 (GCP Invincible Node golden image)
 
 ---
 
-### v239.0 — Reactor Core Pipeline Activation (Feb 2026, 18 Tasks, 3 Repos)
-
-**The Problem:** The Reactor Core training pipeline was 95% built but 0% connected. All three repos had matching schemas (v1.0 canonical `ExperienceEvent`), implemented ingestion endpoints, training pipelines, and deployment watchers — but zero training jobs had ever run. `~/.jarvis/reactor_state/jobs.json` was empty. A cross-repo audit identified **6 specific disconnects** preventing the pipeline from operating.
-
-**Root Cause Analysis — 6 Disconnects:**
-
-1. **DataFlywheelManager bypasses ReactorCoreClient** (`unified_supervisor.py:22779-22788`) — Raw HTTP POST instead of the client's `trigger_training()`. Ignored configurable thresholds, min interval, and priority.
-2. **Health monitor ignores training readiness** (`reactor_core_client.py:344-468`) — Only checked HTTP 200. Reactor-Core returns `training_ready`, `phase`, `trinity_connected` — all ignored.
-3. **`get_experience_count()` never called** (`reactor_core_client.py:721-736`) — Fully implemented, never invoked. Auto-trigger used hardcoded `batch_size * 10`.
-4. **Training jobs triggered but never polled** (`reactor_core_client.py:634-654`) — `get_training_job()` exists. No code called it after triggering.
-5. **No deployment feedback** (`jarvis_prime/docker/reactor_core_watcher.py`) — Deployed GGUF but never wrote success/failure back.
-6. **Endpoint path mismatches** (`reactor_core_client.py` vs `reactor_core/api/server.py`) — 10 incorrect paths: `/api/` prefix instead of `/api/v1/`, `/training/trigger` instead of `/train`, etc.
-
-**Architecture — Supervisor-Driven Activation:**
-
-The unified supervisor already discovers Reactor-Core, monitors health, and has `ReactorCoreClient` with auto-trigger logic. We made the supervisor the active coordinator driving the entire loop, leveraging existing patterns:
-
-```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                    REACTOR CORE TRAINING PIPELINE (v239.0)                         │
-├──────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                    │
-│  EXPERIENCE COLLECTION                                                             │
-│  ─────────────────────                                                             │
-│  TelemetryEmitter → JSONL → ReactorCoreClient.stream_experience()                 │
-│    → ExperienceScorer (7-tier quality weights)                                    │
-│    → WeightedExperienceTracker (MD5 dedup, bloom filter)                          │
-│    → Auto-trigger when weighted_score >= 100                                      │
-│                                                                                    │
-│  TRAINING GATE                                                                     │
-│  ─────────────                                                                     │
-│  MemoryQuantizer tier check → CircuitBreaker.can_execute()                        │
-│    → ABUNDANT/OPTIMAL: full training                                              │
-│    → ELEVATED: reduced batch (50%), cap 5000 experiences                          │
-│    → CONSTRAINED: defer to Night Shift                                            │
-│    → CRITICAL/EMERGENCY: abort                                                    │
-│                                                                                    │
-│  TRAINING EXECUTION (Reactor-Core)                                                │
-│  ──────────────────────────────────                                                │
-│  LoRA SFT → GGUF export → DeploymentGate                                         │
-│    → Magic bytes (0x46475547) + version + file size + inference check             │
-│    → APPROVED / REJECTED / PENDING_REVIEW                                         │
-│                                                                                    │
-│  DEPLOYMENT (J-Prime)                                                              │
-│  ─────────────────────                                                             │
-│  HotSwapManager loads GGUF → ProbationMonitor (30 min)                            │
-│    → Probes every 60s: latency, error rate, correction rate                       │
-│    → health_score >= 0.8 → COMMITTED                                              │
-│    → health_score < 0.5 → ROLLING_BACK (restore previous GGUF)                   │
-│    → error_rate > 5x baseline → emergency rollback at any probe                  │
-│                                                                                    │
-│  OBSERVABILITY                                                                     │
-│  ─────────────                                                                     │
-│  TrinityEventBus: experience.ingested → training.started → training.completed     │
-│    → gate.evaluated → model.deployed → probation.started                          │
-│    → probation.committed | probation.rollback                                     │
-│  All events share correlation_id. causation_id tracks causal chains.              │
-│  Model lineage: lineage.jsonl records parent model, dataset hash,                 │
-│    eval scores, gate decision, probation result per training run.                 │
-│                                                                                    │
-│  PERSISTENCE                                                                       │
-│  ───────────                                                                       │
-│  Jobs: ~/.jarvis/reactor_state/jobs.json (atomic writes, survives restart)         │
-│  Snapshots: ~/.jarvis/reactor/training_data/snapshot_{job_id}.jsonl               │
-│  Lineage: ~/.jarvis/reactor/models/lineage.jsonl                                  │
-│  Feedback: ~/.jarvis/cross_repo/deployment_status.json                            │
-│  Events: ~/.jarvis/reactor/events/pipeline_events.jsonl (all repos)               │
-│                                                                                    │
-└──────────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Files Changed (22 commits across 3 repos):**
-
-| Repo | File | Changes |
-|------|------|---------|
-| JARVIS | `backend/clients/reactor_core_client.py` | Fixed 10 endpoint paths, enriched health monitor, added auto-trigger with weighted scoring, job polling, training circuit breaker, resource-aware gate, TrinityEventBus integration |
-| JARVIS | `backend/clients/experience_scorer.py` (new, 233 lines) | `ExperienceScorer` (7-tier quality weights), `WeightedExperienceTracker` (MD5 dedup, bloom persistence) |
-| JARVIS | `backend/core/telemetry_emitter.py` | Added `correlation_id` to `TelemetryEvent` |
-| JARVIS | `unified_supervisor.py` | Replaced DataFlywheelManager raw HTTP with `check_and_trigger_training()` |
-| Reactor-Core | `reactor_core/api/server.py` | `TrainingJobManager` with persistence, `drain_experience_buffer()`, `write_experience_snapshot()`, pipeline event logger |
-| Reactor-Core | `reactor_core/deployment/gate.py` (new, 479 lines) | `DeploymentGate` with GGUF header/size/inference validation |
-| Reactor-Core | `reactor_core/data/lineage.py` (new, 240 lines) | `LineageRecord`, `write_lineage_record()`, `read_lineage_records()`, `update_lineage_record()` |
-| Reactor-Core | `reactor_core/training/unified_pipeline.py` | Gate integration, lineage tracking, `VALIDATING`/`GATE_REJECTED` states |
-| J-Prime | `jarvis_prime/docker/reactor_core_watcher.py` | `write_deployment_feedback()`, `ProbationMonitor` (30-min monitoring, commit/rollback), pipeline event logger |
-
-**Key Design Decisions:**
-
-1. **Quality-weighted triggers over raw count** — A single user correction (10x weight) is worth more than 10 normal interactions. Prevents wasting compute on low-value training data.
-2. **Resource-aware gating with MemoryQuantizer** — Training defers or aborts based on real-time memory pressure, protecting the 16GB Mac from OOM during model serving.
-3. **Training circuit breaker** — 3 consecutive failures (job fail, gate reject, post-deploy rollback) opens the circuit for 1 hour, doubling on each re-failure up to 24h. Prevents thrashing on persistent issues.
-4. **DeploymentGate validates GGUF before deployment** — Catches corrupted exports (wrong magic bytes, truncated files, non-generating models) before they reach production.
-5. **ProbationMonitor with auto-rollback** — 30-minute monitoring window after deployment catches quality regressions that static validation misses.
-6. **Atomic file operations everywhere** — tempfile + fsync + os.replace pattern for all persistent state (jobs, snapshots, lineage, feedback, events). Zero corruption risk from crashes.
-7. **Cross-repo event tracing via TrinityEventBus** — Direct bus integration in JARVIS, JSONL loggers with matching schema in Reactor-Core and J-Prime. All events share `correlation_id` for end-to-end traceability.
-
----
-
 ### v241.0/v241.1 — Multi-Model GCP Golden Image + Task-Type Routing (11 Models, 8 Routable)
 
 **The Problem:** Prior to v241, the GCP golden image contained a single model — Mistral-7B-Instruct-v0.2. Every query, regardless of type, went to this one generalist model. Math queries produced hallucinated answers (e.g., `5x+3=18` → `x=11`). Code queries went to a model not trained on code. Simple factual queries ("what is the capital of France?") waited 8.6 seconds for a 7B model when a 2.2 GB model could answer in 3 seconds.
@@ -1606,73 +1509,44 @@ Add two 14B-class models for significantly stronger reasoning and code generatio
 - [ ] Update `gcp_vm_manager.py` builder script with 3 new model entries
 - [ ] Disk impact: +24.3 GB → total ~64.7 GB on 80 GB SSD (~15.3 GB headroom)
 
-#### v239.0 — Reactor Core Pipeline Activation (Completed, Feb 2026)
+#### v239.0 — Architectural Hardening + Pipeline Activation (In Progress)
 
-**18 tasks completed across 5 phases, 3 repos, 194 tests, 22 commits.** The Reactor Core training pipeline — previously 95% built but 0% connected — is now fully wired end-to-end. All 6 root-cause disconnects identified in the cross-repo audit have been fixed.
+Five verified architectural issues are being fixed with ~210 lines of surgical changes across 4 files, zero new Python files. Simultaneously, the Reactor Core training pipeline is being activated.
 
-**The 6 Disconnects Fixed:**
-
-| # | Disconnect | Fix | Files |
-|---|-----------|-----|-------|
-| 1 | DataFlywheelManager bypasses ReactorCoreClient (raw HTTP POST) | Replaced raw HTTP with `check_and_trigger_training()` | `unified_supervisor.py` |
-| 2 | Health monitor ignores training readiness | Parse `training_ready`, `phase`, `trinity_connected` from `/health` JSON | `reactor_core_client.py` |
-| 3 | `get_experience_count()` never called | Wired into auto-trigger with weighted scoring threshold | `reactor_core_client.py` |
-| 4 | Training jobs triggered but never polled | Added `_poll_active_job()` in health monitor loop | `reactor_core_client.py` |
-| 5 | No deployment feedback (Prime to Reactor) | `write_deployment_feedback()` + `ProbationMonitor` | `reactor_core_watcher.py` (Prime) |
-| 6 | Endpoint path mismatches (10 wrong paths) | Fixed all 10: `/api/` → `/api/v1/`, `/training/trigger` → `/train` | `reactor_core_client.py` |
-
-**New Components Built (JARVIS-side):**
-
-| Component | File | Purpose |
-|-----------|------|---------|
-| `ExperienceScorer` | `backend/clients/experience_scorer.py` (233 lines) | 7-tier quality-weighted scoring (CORRECTION=10x, FEEDBACK_NEG=5x, ERROR=3x, NOVEL=3x, LOW_CONF=2x, NORMAL=1x, DUPLICATE=0.1x) |
-| `WeightedExperienceTracker` | `backend/clients/experience_scorer.py` | MD5 dedup, configurable threshold (default 100), bloom persistence |
-| Training Circuit Breaker | `reactor_core_client.py` | 3 consecutive failures → OPEN, 1h recovery (doubles on re-failure, max 24h), HALF_OPEN test jobs |
-| Resource-Aware Training Gate | `reactor_core_client.py` | MemoryQuantizer integration: ABUNDANT/OPTIMAL=full, ELEVATED=reduced, CONSTRAINED=defer, CRITICAL/EMERGENCY=abort |
-| TrinityEventBus Integration | `reactor_core_client.py` | Events emitted: `training.started`, `training.completed`, `training.failed`, `gate.evaluated` with correlation/causation IDs |
-| Correlation ID Tracking | `backend/core/telemetry_emitter.py` | `correlation_id` field added to `TelemetryEvent` for end-to-end pipeline tracing |
-
-**Full Pipeline (now active):**
-```
-User talks to JARVIS
-  → TelemetryEmitter captures interaction + model_id + task_type + correlation_id
-    → JSONL to ~/.jarvis/telemetry/
-      → ReactorCoreClient streams experiences to Reactor Core API
-        → ExperienceScorer quality-weights each event (7-tier scoring)
-          → Auto-trigger when weighted_score >= threshold (default 100)
-            → Resource gate checks MemoryQuantizer tier before proceeding
-              → Circuit breaker validates training circuit is CLOSED/HALF_OPEN
-                → Reactor Core: LoRA SFT → GGUF export
-                  → DeploymentGate validates GGUF (magic bytes, version, size, inference)
-                    → Deploy to J-Prime → ProbationMonitor (30 min)
-                      → health_score >= 0.8 → COMMITTED
-                      → health_score < 0.5 → ROLLING_BACK (restore previous GGUF)
-                        → Deployment feedback written to ~/.jarvis/cross_repo/
-                          → Model lineage appended to lineage.jsonl
-                            → TrinityEventBus traces entire pipeline via correlation_id
-```
-
-**Test Coverage:** 194 tests across 3 repos
-- JARVIS: 76 tests (43 client + 30 scorer + 3 integration)
-- Reactor-Core: 67 tests (24 gate + 8 persistence + 16 lineage + 13 snapshots + 6 events)
-- J-Prime: 51 tests (12 feedback + 32 probation + 7 events)
-
-**Remaining v239.0 Architectural Fixes (not yet started):**
+**Verified Fixes (from three-way cross-repo audit, Feb 2026):**
 
 | # | Fix | File | Lines | Risk |
 |---|-----|------|-------|------|
-| 1 | **RAM Race** — Unload local model when GCP becomes available | `unified_model_serving.py` | ~20 | LOW |
-| 2 | **Mid-Stream Failover** — Buffer prompt and retry on next tier | `unified_model_serving.py` | ~40 | MEDIUM |
-| 3 | **Supervisor Self-Watchdog** — macOS `launchd` plist auto-restart | `com.jarvis.supervisor.plist` (new) | ~30 | LOW |
-| 4 | **Cost-Aware Routing** — Cost efficiency factor in adaptive scoring | `unified_model_serving.py` | ~20 | LOW |
+| 1 | **RAM Race** — Unload local model when GCP becomes available. `_unload_local_model()` exists but is never called from `notify_gcp_endpoint_ready()`. | `unified_model_serving.py` | ~20 | LOW |
+| 2 | **Mid-Stream Failover** — When a streaming provider fails mid-response, buffer the prompt and retry on the next tier with a `[Stream interrupted — retrying...]` marker. | `unified_model_serving.py` | ~40 | MEDIUM |
+| 3 | **Supervisor Self-Watchdog** — macOS `launchd` plist that auto-restarts `unified_supervisor.py` on crash. Nothing currently watches the supervisor itself. | `com.jarvis.supervisor.plist` (new) | ~30 | LOW |
+| 4 | **Cost-Aware Routing** — Add cost efficiency factor (15% weight) to adaptive provider scoring. Prevents Claude API ($3/M tokens) from serving trivial greetings. | `unified_model_serving.py` | ~20 | LOW |
+| 5 | **Reactor Core Pipeline Activation** — Call `initialize_reactor_core()` and `start_reactor_core_watcher()` during Phase 5 startup. Add smoke test gate and deployment feedback loop. | `unified_supervisor.py` + `reactor_core_watcher.py` | ~100 | LOW |
 
-**Known Follow-Up Items (tracked for next version):**
-- `experience.emitted` event not yet emitted (no emission point exists)
-- Event subscriptions not wired (events published, no consumers yet)
-- `previous_model_path=None` in probation wiring (rollback can't restore previous model)
-- Zero-baseline emergency rollback gap (5x * 0 = 0, could false-trigger)
-- JSONL event files grow unbounded (rotation not yet implemented)
-- `datetime.utcnow()` deprecated in Python 3.12+ (should use `datetime.now(timezone.utc)`)
+**Pipeline Activation (corrected status from Feb 2026 audit):**
+
+The training pipeline is **~95% built, never activated** — not "broken" as previously reported:
+- [x] `TelemetryEmitter` writes JSONL — telemetry files confirmed present in `~/.jarvis/telemetry/`
+- [x] `TelemetryIngestor` schemas **verified byte-identical** to emitter output (v1.0 canonical)
+- [x] `ReactorCoreBridge.upload_training_data()` **fully implemented** (992 LOC, v242.0) — ~~previously reported as "not implemented"~~
+- [x] `ExperienceEvent` is the **single canonical schema** with 5 legacy adapters — ~~previously reported as "three different schemas"~~
+- [x] `RequestDeduplicator` exists and is **wired into the request path** — ~~previously reported as "missing"~~
+- [ ] `initialize_reactor_core()` exists but **never called** from supervisor startup → v239.0 wires it
+- [ ] `start_reactor_core_watcher()` exists but **never called** from supervisor startup → v239.0 wires it
+- [ ] **Zero training jobs** have ever run (`jobs.json` is empty) → v239.0 triggers the first run
+
+**Pipeline when active:**
+```
+User talks to JARVIS
+  → TelemetryEmitter captures interaction + model_id + task_type
+    → JSONL to ~/.jarvis/telemetry/
+      → Reactor Core TelemetryIngestor reads files
+        → Experience accumulation → auto-trigger at threshold
+          → LoRA SFT fine-tuning (DPO in v242.0)
+            → GGUF export → Smoke test gate (subprocess)
+              → Deploy to J-Prime → Feedback file
+                → Models improve at being JARVIS, automatically
+```
 
 #### v242.0 — DPO Training from Multi-Model Telemetry (Planned)
 

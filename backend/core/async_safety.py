@@ -686,7 +686,7 @@ class PersistentCircuitBreaker:
             return CircuitBreakerState()
 
     def _save_state(self) -> None:
-        """Persist state to disk."""
+        """Persist state to disk (sync — safe in executor or small writes)."""
         if not self.persist:
             return
 
@@ -695,6 +695,17 @@ class PersistentCircuitBreaker:
             self._state_file.write_text(json.dumps(self._state.to_dict(), indent=2))
         except Exception as e:
             logger.warning(f"CircuitBreaker[{self.name}] failed to save state: {e}")
+
+    async def _save_state_async(self) -> None:
+        """Persist state to disk without blocking the event loop."""
+        if not self.persist:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._save_state)
+        except RuntimeError:
+            # No running loop — fall back to sync
+            self._save_state()
 
     @property
     def state(self) -> CircuitState:
@@ -783,8 +794,10 @@ class PersistentCircuitBreaker:
         try:
             yield
             self.record_success()
+            await self._save_state_async()
         except Exception as e:
             self.record_failure(e)
+            await self._save_state_async()
             raise
 
 

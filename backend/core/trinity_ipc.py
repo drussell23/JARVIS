@@ -383,6 +383,88 @@ class CommandResponse:
 
 
 # =============================================================================
+# IPC CONTRACT VERSIONING
+# =============================================================================
+
+# Contract version — increment when IPC message format changes
+IPC_CONTRACT_VERSION: int = int(os.getenv("TRINITY_IPC_CONTRACT_VERSION", "1"))
+
+# Deduplication window (seconds) — messages older than this are discarded
+_DEDUP_WINDOW: float = float(os.getenv("TRINITY_IPC_DEDUP_WINDOW", "60.0"))
+
+# Recent message IDs for deduplication (bounded set)
+_seen_msg_ids: Dict[str, float] = {}
+_seen_lock = asyncio.Lock() if False else None  # initialized lazily
+
+
+def stamp_ipc_message(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Add IPC contract fields to an outgoing message.
+
+    Fields added:
+        _v:      Contract version (int) for forward/backward compat
+        _msg_id: UUID for idempotent deduplication by receiver
+        _ts:     Timestamp (float) for ordering and staleness detection
+    """
+    data["_v"] = IPC_CONTRACT_VERSION
+    data["_msg_id"] = uuid.uuid4().hex[:12]
+    data["_ts"] = time.time()
+    return data
+
+
+def validate_ipc_message(
+    data: Dict[str, Any],
+    *,
+    max_age: Optional[float] = None,
+    deduplicate: bool = False,
+) -> bool:
+    """
+    Validate incoming IPC message contract fields.
+
+    Args:
+        data: The message dict
+        max_age: Reject messages older than this (seconds). None = no check.
+        deduplicate: If True, reject already-seen _msg_id values.
+
+    Returns:
+        True if the message is valid and should be processed.
+    """
+    # Version check — accept current version and below for backward compat
+    msg_version = data.get("_v")
+    if msg_version is not None and msg_version > IPC_CONTRACT_VERSION:
+        logger.warning(
+            f"[IPC] Message version {msg_version} > contract {IPC_CONTRACT_VERSION}, "
+            f"accepting but fields may be unknown"
+        )
+
+    # Staleness check
+    if max_age is not None:
+        msg_ts = data.get("_ts")
+        if msg_ts is not None:
+            age = time.time() - msg_ts
+            if age > max_age:
+                logger.debug(f"[IPC] Stale message (age={age:.1f}s > {max_age}s)")
+                return False
+
+    # Deduplication
+    if deduplicate:
+        msg_id = data.get("_msg_id")
+        if msg_id:
+            now = time.time()
+            if msg_id in _seen_msg_ids:
+                logger.debug(f"[IPC] Duplicate message {msg_id}")
+                return False
+            _seen_msg_ids[msg_id] = now
+            # Prune old entries
+            cutoff = now - _DEDUP_WINDOW
+            stale = [k for k, v in _seen_msg_ids.items() if v < cutoff]
+            for k in stale:
+                _seen_msg_ids.pop(k, None)
+
+    return True
+
+
+# =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 
@@ -759,7 +841,7 @@ class TrinityIPCBus:
 
         ipc_file = self._heartbeat_files.get(component)
         if ipc_file:
-            await ipc_file.write_atomic(heartbeat.to_dict())
+            await ipc_file.write_atomic(stamp_ipc_message(heartbeat.to_dict()))
             logger.debug(f"[TrinityIPC] Published heartbeat for {component.value}: {status}")
 
     async def read_heartbeat(
@@ -888,8 +970,8 @@ class TrinityIPCBus:
                     f"[TrinityIPC] Cleaned up {expired_count} expired commands from queue"
                 )
 
-            # Add the new command
-            active_queue.append(command.to_dict())
+            # Add the new command with IPC contract stamp
+            active_queue.append(stamp_ipc_message(command.to_dict()))
 
             # Sort by priority (lower value = higher priority)
             active_queue.sort(key=lambda x: x.get("priority", 2))
@@ -1014,7 +1096,7 @@ class TrinityIPCBus:
             self._config.responses_dir / f"{response.command_id}.json",
             self._config,
         )
-        await response_file.write_atomic(response.to_dict())
+        await response_file.write_atomic(stamp_ipc_message(response.to_dict()))
         logger.debug(f"[TrinityIPC] Sent response for {response.command_id}")
 
     async def wait_for_response(

@@ -7,7 +7,6 @@ A simple demo that just shows the lock detection and feedback working
 """
 
 import asyncio
-import time
 import subprocess
 
 # Direct test of the context handler
@@ -56,7 +55,7 @@ async def simple_demo():
         print("   Locking in 3 seconds...")
         for i in range(3, 0, -1):
             print(f"   {i}...")
-            time.sleep(1)
+            await asyncio.sleep(1)
             
         # Lock screen
         lock_cmd = """osascript -e 'tell app "System Events" to key code 12 using {control down, command down}'"""

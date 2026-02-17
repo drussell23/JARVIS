@@ -83,7 +83,7 @@ async def run_prd_scenario():
     print("\n⏳ Starting demo in 3 seconds...")
     for i in range(3, 0, -1):
         print(f"   {i}...", end='\r')
-        time.sleep(1)
+        await asyncio.sleep(1)
     
     # Step 1: Lock the screen
     print("\n\n[SETUP] Locking screen...")
