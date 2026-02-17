@@ -67471,8 +67471,9 @@ class JarvisSystemKernel:
                         # v227.1: Phase ceiling guard — don't exceed the current phase
                         # milestone + buffer. Prevents poisoning if _current_progress was
                         # set high by a rogue broadcast before this fix.
+                        # v260.1: Reduced from +14 to +5 (consistent with broadcast guard)
                         phase_ceiling = getattr(self, '_current_startup_progress', 100) or 100
-                        capped = min(new_progress, phase_ceiling + 14)
+                        capped = min(new_progress, phase_ceiling + 5)
                         current = getattr(self, '_current_progress', 0) or 0
                         if capped > current:
                             self._current_progress = capped
@@ -69918,16 +69919,25 @@ class JarvisSystemKernel:
         frontend_started = False
         frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
 
+        # v260.1: Frontend phase progress milestones (93→99)
+        # Previously the entire frontend phase ran at 93% with no updates,
+        # causing the ProgressController to detect stalls under memory pressure
+        # (webpack compilation can take 60-120s on 16GB macOS with swap pressure).
+        # Milestones: 93=start, 94=warmup checked, 95=frontend launching,
+        #             96=frontend started, 97=Trinity wait, 98=loading server shutdown
+
         # v211.0: Step 1: Check if frontend warmup task already started the frontend
         # This happens when frontend started in parallel with Trinity
         warmup_task = getattr(self, '_frontend_warmup_task', None)
-        
+
         if warmup_task is not None:
             self.logger.info("[Kernel] Checking frontend warmup task (started during Trinity)...")
             self._update_component_status("frontend", "running", "Waiting for frontend warmup...")
-            await self._broadcast_component_update(
-                stage="frontend",
-                message="Frontend warming up (started in parallel)..."
+            # v260.2: Use _broadcast_progress instead of _broadcast_component_update
+            # to avoid _calculate_dynamic_progress() returning 99-100 during frontend phase
+            await self._broadcast_progress(
+                self._current_startup_progress, "frontend",
+                "Frontend warming up (started in parallel)..."
             )
             
             try:
@@ -69945,19 +69955,23 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.warning(f"[Kernel] Frontend warmup error: {e}")
         
+        # v260.1: Advance progress after warmup check
+        self._current_startup_progress = 94
+        await self._broadcast_progress(94, "frontend", "Warmup check complete — launching frontend...")
+
         # Step 2: If warmup didn't start frontend, start it now
         if not frontend_started:
             try:
+                self._current_startup_progress = 95
                 self._update_component_status("frontend", "running", "Starting React frontend...")
-                await self._broadcast_component_update(
-                    stage="frontend",
-                    message="Starting React frontend..."
-                )
+                await self._broadcast_progress(95, "frontend", "Starting React frontend...")
 
                 frontend_started = await self._start_frontend()
                 if frontend_started:
+                    self._current_startup_progress = 96
                     self.logger.success(f"[Kernel] React frontend ready on port {frontend_port}")
                     self._update_component_status("frontend", "complete", f"React frontend ready on port {frontend_port}")
+                    await self._broadcast_progress(96, "frontend", "React frontend ready")
                 else:
                     self.logger.info("[Kernel] Frontend not started (directory not found or failed)")
                     self._update_component_status("frontend", "skipped", "Frontend not started")
@@ -69968,6 +69982,8 @@ class JarvisSystemKernel:
         # v182.0: Step 2: Wait for Trinity components to be ready BEFORE redirecting
         # This ensures the loading page doesn't transition until ALL systems are operational
         if self.config.trinity_enabled:
+            # v260.1: Advance progress for Trinity wait step
+            self._current_startup_progress = 97
             self.logger.info("[Kernel] Waiting for Trinity components to complete...")
             trinity_wait_timeout = float(os.environ.get("JARVIS_TRINITY_WAIT_TIMEOUT", "30.0"))
             trinity_wait_start = time.time()
@@ -69980,22 +69996,25 @@ class JarvisSystemKernel:
                     )
                     break
 
-                # Broadcast waiting status
-                await self._broadcast_component_update(
-                    stage="frontend",
-                    message=f"Waiting for Trinity components ({int(elapsed)}s)..."
+                # v260.1: Use _broadcast_progress instead of _broadcast_component_update
+                # to avoid _calculate_dynamic_progress() returning 99-100 and poisoning
+                # _current_progress. The dynamic calculation counts completed components
+                # which can overshoot the current phase milestone.
+                await self._broadcast_progress(
+                    97, "frontend",
+                    f"Waiting for Trinity components ({int(elapsed)}s)..."
                 )
 
                 await asyncio.sleep(1.0)
 
             if self._is_trinity_ready():
                 self.logger.success("[Kernel] All Trinity components ready")
-                await self._broadcast_component_update(
-                    stage="complete",
-                    message="All systems operational - JARVIS ready"
-                )
             else:
                 self.logger.info("[Kernel] Proceeding with partial Trinity (some components may still be loading)")
+
+        # v260.1: Advance progress for loading server transition
+        self._current_startup_progress = 98
+        await self._broadcast_progress(98, "frontend", "Transitioning to main UI...")
 
         # Step 3: Mark startup as complete (before redirect)
         # This signals the loading server to allow graceful Chrome disconnect
@@ -70687,6 +70706,8 @@ class JarvisSystemKernel:
             # Wait for frontend to be ready using non-blocking socket check
             deadline = time.time() + 120.0  # 2 minute timeout
             check_interval = 2.0  # Check every 2 seconds
+            _last_heartbeat = time.time()  # v260.1: Track DMS heartbeat timing
+            _heartbeat_interval = 15.0  # Emit activity every 15s to prevent DMS stall
 
             while time.time() < deadline:
                 try:
@@ -70725,6 +70746,23 @@ class JarvisSystemKernel:
 
                 except Exception:
                     pass
+
+                # v260.1: Emit DMS heartbeat during port-check loop to prevent
+                # stall detection. Under 16GB macOS memory pressure, webpack
+                # compilation can take 60-120s. Without heartbeats, the DMS sees
+                # no activity for the entire duration → FALSE stall detection.
+                _now = time.time()
+                if _now - _last_heartbeat >= _heartbeat_interval:
+                    _last_heartbeat = _now
+                    _elapsed = _now - (deadline - 120.0)
+                    if self._startup_watchdog:
+                        self._startup_watchdog.update_phase(
+                            "frontend", self._current_startup_progress,
+                            operational_timeout=120.0,
+                        )
+                    self.logger.debug(
+                        f"[Frontend] Waiting for port {frontend_port} ({_elapsed:.0f}s elapsed)"
+                    )
 
                 # Check if process died
                 if self._frontend_process.returncode is not None:
@@ -71641,9 +71679,17 @@ class JarvisSystemKernel:
         if stage in _STARTUP_STAGES or is_heartbeat:
             # Startup phase or heartbeat: monotonic guard prevents regression
             # Also cap at the phase ceiling (_current_startup_progress + buffer)
-            # to prevent heartbeat overshoot from poisoning the value
+            # to prevent dynamic progress overshoot from poisoning the value.
+            # v260.1: Reduced buffer from +14 to +5. The +14 was for Trinity
+            # heartbeat drift (phase_progress=68, heartbeat increments up to 82)
+            # but was too permissive for the frontend phase where
+            # _current_startup_progress=93. _calculate_dynamic_progress()
+            # returned 99 during frontend (all components complete) and
+            # min(99, 93+14=107)=99 passed right through → 99% stall.
+            # With +5: min(99, 93+5=98)=98 — still allows small increments
+            # but prevents the dynamic progress from reaching 99-100.
             phase_ceiling = getattr(self, '_current_startup_progress', 100) or 100
-            capped_progress = min(progress, phase_ceiling + 14)  # +14 = max heartbeat drift
+            capped_progress = min(progress, phase_ceiling + 5)  # +5 max drift
             self._current_progress = max(current, capped_progress)
         elif stage == "complete" and progress == 100:
             # v253.2: Only finalize _current_progress=100 when
@@ -74287,27 +74333,52 @@ class JarvisSystemKernel:
         async def check_backend() -> Dict[str, Any]:
             port = self.config.backend_port
             status: Dict[str, Any] = {"healthy": False, "name": "backend"}
-            try:
-                # Non-blocking socket check
-                port_open = await _async_port_check("localhost", port, timeout=5.0)
 
-                if port_open:
-                    # HTTP health check
-                    if AIOHTTP_AVAILABLE and aiohttp is not None:
-                        async with aiohttp.ClientSession() as session:
-                            url = f"http://localhost:{port}/health"
-                            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    status["healthy"] = True
-                                    status["response"] = data
+            # v260.2: Env-var configurable timeouts with memory-pressure awareness
+            _base_timeout = _get_env_float("JARVIS_VERIFY_BACKEND_TIMEOUT", 5.0)
+            _max_retries = int(_get_env_float("JARVIS_VERIFY_BACKEND_RETRIES", 2.0))
+            _check_timeout = _base_timeout
+
+            # v260.2: Extend timeout under memory pressure (swap-heavy 16GB systems)
+            try:
+                mem = psutil.virtual_memory()
+                if mem.percent > 85.0:
+                    _check_timeout = min(_base_timeout * 2.0, 15.0)
+                    status["memory_pressure"] = True
+            except Exception:
+                pass
+
+            for _attempt in range(_max_retries):
+                try:
+                    # Non-blocking socket check
+                    port_open = await _async_port_check("localhost", port, timeout=_check_timeout)
+
+                    if port_open:
+                        # HTTP health check
+                        if AIOHTTP_AVAILABLE and aiohttp is not None:
+                            async with aiohttp.ClientSession() as session:
+                                url = f"http://localhost:{port}/health"
+                                async with session.get(url, timeout=aiohttp.ClientTimeout(total=_check_timeout)) as resp:
+                                    if resp.status == 200:
+                                        data = await resp.json()
+                                        status["healthy"] = True
+                                        status["response"] = data
+                                        if _attempt > 0:
+                                            status["retries"] = _attempt
+                                        return status
+                        else:
+                            status["healthy"] = True
+                            status["note"] = "Port open (no HTTP check)"
+                            return status
                     else:
-                        status["healthy"] = True
-                        status["note"] = "Port open (no HTTP check)"
-                else:
-                    status["error"] = f"Port {port} not open"
-            except Exception as e:
-                status["error"] = str(e)
+                        status["error"] = f"Port {port} not open"
+                except Exception as e:
+                    status["error"] = str(e)
+
+                # v260.2: Retry with backoff if not last attempt
+                if _attempt < _max_retries - 1:
+                    await asyncio.sleep(1.0 * (_attempt + 1))
+
             return status
 
         async def check_websocket() -> Dict[str, Any]:
@@ -74320,9 +74391,11 @@ class JarvisSystemKernel:
             if port == 0:
                 status["note"] = "WebSocket port not configured"
                 return status
+            # v260.2: Env-var configurable timeout
+            _ws_timeout = _get_env_float("JARVIS_VERIFY_WEBSOCKET_TIMEOUT", 5.0)
             try:
                 # Non-blocking socket check
-                port_open = await _async_port_check("localhost", port, timeout=5.0)
+                port_open = await _async_port_check("localhost", port, timeout=_ws_timeout)
                 status["healthy"] = port_open
                 if not status["healthy"]:
                     status["error"] = f"Port {port} not open"
@@ -74336,9 +74409,11 @@ class JarvisSystemKernel:
                 status["note"] = "Prime not enabled"
                 return status
             port = self.config.prime_api_port
+            # v260.2: Env-var configurable timeout
+            _prime_timeout = _get_env_float("JARVIS_VERIFY_PRIME_TIMEOUT", 5.0)
             try:
                 # Non-blocking socket check
-                port_open = await _async_port_check("localhost", port, timeout=5.0)
+                port_open = await _async_port_check("localhost", port, timeout=_prime_timeout)
                 status["healthy"] = port_open
                 if not status["healthy"]:
                     status["note"] = f"Prime not responding on port {port}"
@@ -74352,9 +74427,11 @@ class JarvisSystemKernel:
                 status["note"] = "Reactor not enabled"
                 return status
             port = self.config.reactor_api_port
+            # v260.2: Env-var configurable timeout
+            _reactor_timeout = _get_env_float("JARVIS_VERIFY_REACTOR_TIMEOUT", 5.0)
             try:
                 # Non-blocking socket check
-                port_open = await _async_port_check("localhost", port, timeout=5.0)
+                port_open = await _async_port_check("localhost", port, timeout=_reactor_timeout)
                 status["healthy"] = port_open
                 if not status["healthy"]:
                     status["note"] = f"Reactor not responding on port {port}"
