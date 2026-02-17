@@ -57,6 +57,65 @@ from backend.core.async_safety import LazyAsyncLock
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+# v241.0: DEADLINE PROPAGATION
+# =============================================================================
+# Monotonic deadline flows from WebSocket through all layers.
+# Each layer computes remaining = deadline - monotonic() and caps its timeout.
+# Inner layers self-terminate before the outer deadline, preventing destructive
+# asyncio.wait_for() cancellations.
+
+_LAYER_HEADROOM_S = 0.5  # v241.0: 0.5s per layer (prevents headroom compounding across 5 layers)
+
+
+def compute_remaining(deadline: Optional[float], own_timeout: float) -> float:
+    """Effective timeout = min(own_timeout, deadline_remaining - headroom).
+    Returns >= 0.5 to prevent instant-timeout."""
+    if deadline is None:
+        return own_timeout
+    remaining = deadline - time.monotonic() - _LAYER_HEADROOM_S
+    return max(min(own_timeout, remaining), 0.5)
+
+
+class _LocalCircuitBreaker:
+    """v241.0: Prevents routing to dead local tier. Cold-starts with 5s probe."""
+    PROBE_TIMEOUT_S = 5.0  # Short timeout for first probe to unknown backend
+
+    def __init__(self, threshold: int = 2, recovery_s: float = 30.0):
+        self._failures = 0
+        self._threshold = threshold
+        self._recovery_s = recovery_s
+        self._last_failure = 0.0
+        self._state = "cold"  # cold | closed | open | half_open
+
+    def can_execute(self) -> bool:
+        if self._state in ("closed", "cold"):
+            return True
+        if self._state == "open":
+            if time.monotonic() - self._last_failure >= self._recovery_s:
+                self._state = "half_open"
+                return True
+            return False
+        return True  # half_open
+
+    def get_timeout_override(self, default_timeout: float) -> float:
+        """Return short probe timeout in cold/half_open state."""
+        if self._state in ("cold", "half_open"):
+            return min(self.PROBE_TIMEOUT_S, default_timeout)
+        return default_timeout
+
+    def record_success(self):
+        self._failures = 0
+        self._state = "closed"
+
+    def record_failure(self):
+        self._failures += 1
+        self._last_failure = time.monotonic()
+        if self._state == "cold" or self._failures >= self._threshold:
+            self._state = "open"
+            logger.info(f"[PrimeRouter] v241.0 Local circuit OPEN after {self._failures} failures")
+
+
+# =============================================================================
 # v88.0: ULTRA COORDINATOR INTEGRATION
 # =============================================================================
 
@@ -204,6 +263,8 @@ class PrimeRouter:
         self._gcp_promoted = False
         self._gcp_host: Optional[str] = None
         self._gcp_port: Optional[int] = None
+        # v241.0: Local circuit breaker (cold-start with 5s probe)
+        self._local_circuit = _LocalCircuitBreaker()
 
     async def initialize(self) -> None:
         """Initialize the router and its clients."""
@@ -269,9 +330,12 @@ class PrimeRouter:
             self._prime_client.is_available
         )
 
-        if self._config.prefer_local and prime_available:
+        # v241.0: Check local circuit breaker before routing to hybrid/local
+        local_circuit_ok = self._local_circuit.can_execute()
+
+        if self._config.prefer_local and prime_available and local_circuit_ok:
             return RoutingDecision.HYBRID  # Try local first, fallback to cloud
-        elif prime_available:
+        elif prime_available and local_circuit_ok:
             # v232.0: Distinguish GCP from local for metrics/logging
             if self._gcp_promoted:
                 return RoutingDecision.GCP_PRIME
@@ -342,6 +406,7 @@ class PrimeRouter:
         context: Optional[List[Dict[str, str]]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        deadline: Optional[float] = None,
         **kwargs
     ) -> RouterResponse:
         """
@@ -360,6 +425,7 @@ class PrimeRouter:
             context: Conversation history
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            deadline: v241.0 monotonic clock deadline (None = no deadline)
             **kwargs: Additional parameters
 
         Returns:
@@ -376,11 +442,13 @@ class PrimeRouter:
         # v88.0: Use ultra coordinator protection if available
         ultra_coord = await _get_ultra_coordinator()
         if ultra_coord:
-            timeout = float(os.getenv("PRIME_ROUTER_TIMEOUT", "90.0"))
+            # v241.0: Cap timeout to remaining deadline budget
+            timeout = compute_remaining(deadline, float(os.getenv("PRIME_ROUTER_TIMEOUT", "90.0")))
             success, result, metadata = await ultra_coord.execute_with_protection(
                 component="prime_router",
                 operation=lambda: self._generate_internal(
-                    prompt, system_prompt, context, max_tokens, temperature, **kwargs
+                    prompt, system_prompt, context, max_tokens, temperature,
+                    deadline=deadline, **kwargs
                 ),
                 timeout=timeout,
             )
@@ -403,7 +471,8 @@ class PrimeRouter:
 
         # Fallback: direct execution without protection
         return await self._generate_internal(
-            prompt, system_prompt, context, max_tokens, temperature, **kwargs
+            prompt, system_prompt, context, max_tokens, temperature,
+            deadline=deadline, **kwargs
         )
 
     async def _generate_internal(
@@ -413,6 +482,7 @@ class PrimeRouter:
         context: Optional[List[Dict[str, str]]],
         max_tokens: int,
         temperature: float,
+        deadline: Optional[float] = None,
         **kwargs
     ) -> RouterResponse:
         """
@@ -430,7 +500,8 @@ class PrimeRouter:
             if routing == RoutingDecision.HYBRID:
                 # Try local/GCP first, then cloud
                 response = await self._generate_hybrid(
-                    prompt, system_prompt, context, max_tokens, temperature, **kwargs
+                    prompt, system_prompt, context, max_tokens, temperature,
+                    deadline=deadline, **kwargs
                 )
             elif routing in (RoutingDecision.LOCAL_PRIME, RoutingDecision.GCP_PRIME):
                 # v235.4: GCP_PRIME uses same PrimeClient (URL already points to GCP VM).
@@ -482,34 +553,43 @@ class PrimeRouter:
         context: Optional[List[Dict[str, str]]],
         max_tokens: int,
         temperature: float,
+        deadline: Optional[float] = None,
         **kwargs
     ) -> RouterResponse:
         """Try local Prime first, fall back to cloud on failure."""
         try:
             # v235.4: Use GCP timeout when routed to GCP VM (CPU inference ~25-35s).
-            # Default local_timeout (30s) always times out for CPU-based models.
-            # Check both _gcp_promoted flag AND env var (handles dual-module aliasing
-            # where the promoted instance differs from the request-handling instance).
             is_gcp = self._gcp_promoted or bool(os.environ.get("JARVIS_INVINCIBLE_NODE_IP"))
-            timeout = (
+            base_timeout = (
                 self._config.gcp_timeout if is_gcp
                 else self._config.local_timeout
             )
+            # v241.0: Circuit breaker probe uses short timeout; then cap to deadline
+            probed_timeout = self._local_circuit.get_timeout_override(base_timeout)
+            effective_timeout = compute_remaining(deadline, probed_timeout)
+
             response = await asyncio.wait_for(
                 self._generate_local(
                     prompt, system_prompt, context, max_tokens, temperature, **kwargs
                 ),
-                timeout=timeout,
+                timeout=effective_timeout,
             )
+            self._local_circuit.record_success()
             return response
         except Exception as e:
+            self._local_circuit.record_failure()
             logger.warning(f"[PrimeRouter] Local generation failed, falling back to cloud: {e}")
 
             if not self._config.enable_cloud_fallback:
                 raise
 
-            response = await self._generate_cloud(
-                prompt, system_prompt, context, max_tokens, temperature, **kwargs
+            # v241.0: Cloud fallback also respects deadline
+            effective_cloud = compute_remaining(deadline, self._config.cloud_timeout)
+            response = await asyncio.wait_for(
+                self._generate_cloud(
+                    prompt, system_prompt, context, max_tokens, temperature, **kwargs
+                ),
+                timeout=effective_cloud,
             )
             response.fallback_used = True
             response.metadata["fallback_reason"] = str(e)
@@ -591,9 +671,13 @@ class PrimeRouter:
         if stop_seqs:
             create_kwargs["stop_sequences"] = stop_seqs
 
+        # v241.0: deadline-aware cloud timeout
+        _cloud_timeout = compute_remaining(
+            kwargs.get("deadline"), self._config.cloud_timeout
+        ) if "deadline" in kwargs else self._config.cloud_timeout
         response = await asyncio.wait_for(
             client.messages.create(**create_kwargs),
-            timeout=self._config.cloud_timeout,
+            timeout=_cloud_timeout,
         )
 
         latency_ms = (time.time() - start_time) * 1000

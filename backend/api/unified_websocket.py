@@ -1148,6 +1148,9 @@ class UnifiedWebSocketManager:
 
                 # Create properly typed command object
                 command_obj = JARVISCommand(text=command_text, audio_data=audio_data)
+                # v241.0: Set deadline for legacy handler
+                import time as _time_ws_legacy
+                command_obj.deadline = _time_ws_legacy.monotonic() + 45.0
 
                 result = await jarvis_api.process_command(command_obj)
 
@@ -1744,6 +1747,7 @@ class UnifiedWebSocketManager:
                     if result is None:
                         try:
                             from .jarvis_voice_api import JARVISCommand, jarvis_api
+                            import time as _time_ws
 
                             command_obj = JARVISCommand(text=command_text, audio_data=audio_data_received)
 
@@ -1783,6 +1787,10 @@ class UnifiedWebSocketManager:
                             else:
                                 # Standard commands use shorter timeout
                                 base_timeout = float(os.getenv("WS_COMMAND_TIMEOUT", "45.0"))
+
+                            # v241.0: Set monotonic deadline on the command object.
+                            # Inner layers read this and self-terminate cooperatively.
+                            command_obj.deadline = _time_ws.monotonic() + base_timeout
                             
                             # ===========================================================
                             # PROGRESS CALLBACK SYSTEM - Real-time frontend updates
@@ -1968,9 +1976,11 @@ class UnifiedWebSocketManager:
                             # v32.0: PROCESS COMMAND WITH DYNAMIC TIMEOUT
                             # ===========================================================
                             try:
+                                # v241.0: Inner layers use command_obj.deadline to self-terminate.
+                                # This wait_for is a safety net 3s past the deadline, not the primary timeout.
                                 jarvis_result = await asyncio.wait_for(
                                     jarvis_api.process_command(command_obj),
-                                    timeout=base_timeout
+                                    timeout=base_timeout + 3.0
                                 )
                             except asyncio.TimeoutError:
                                 timeout_msg = (

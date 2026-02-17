@@ -464,6 +464,7 @@ class JARVISCommand(BaseModel):
 
     text: str
     audio_data: Optional[str] = None  # Base64 encoded audio
+    deadline: Optional[float] = None  # v241.0: monotonic clock deadline for timeout propagation
 
 
 class AudioTranscriptionRequest(BaseModel):
@@ -1743,6 +1744,8 @@ class JARVISVoiceAPI:
     @graceful_endpoint
     async def process_command(self, command: JARVISCommand) -> Dict:
         """Process a JARVIS command"""
+        # v241.0: Extract deadline from command for timeout propagation
+        deadline = command.deadline
 
         # =====================================================================
         # 🔒 PROACTIVE CAI (Context Awareness Intelligence) - SCREEN LOCK CHECK
@@ -3463,12 +3466,15 @@ class JARVISVoiceAPI:
                             # CRITICAL: Without timeout, blocking operations could hang forever
                             # Timeout budget: unlock (15s) + pause (1.5s) + command (30s) = 46.5s
                             try:
+                                # v241.0: Cap to deadline if available
+                                from core.prime_router import compute_remaining
+                                _ctx_timeout = compute_remaining(deadline, 50.0) if deadline else 50.0
                                 result = await asyncio.wait_for(
                                     context_handler.process_with_context(
                                         command_text, websocket,
                                         speaker_name=self.last_speaker_name,
                                     ),
-                                    timeout=50.0  # 50s: unlock (15s) + command (30s) + margin
+                                    timeout=_ctx_timeout
                                 )
                             except asyncio.TimeoutError:
                                 logger.error(f"[JARVIS WS] ❌ Context processing timed out for: '{command_text}'")

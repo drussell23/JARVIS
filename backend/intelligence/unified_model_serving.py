@@ -1854,6 +1854,7 @@ class UnifiedModelServing:
         # State
         self._running = False
         self._lock = asyncio.Lock()
+        self._prime_api_source: Optional[str] = None  # v261.0: "gcp" | "local_jprime" | None
 
         # v100.1: Model registry for Trinity Loop hot-swap
         self._registered_models: Dict[str, RegisteredModel] = {}
@@ -1897,18 +1898,21 @@ class UnifiedModelServing:
         prime_available = False
 
         # v17.0: Try J-Prime API first (primary model serving pathway)
+        # v261.0: Quick probe with dedicated client — don't block startup for 15s
         if PRIME_API_ENABLED:
             self.logger.info("  🔄 Checking J-Prime API availability...")
-            client = PrimeAPIClient()
-            if await client.wait_for_ready():
-                self._clients[ModelProvider.PRIME_API] = client
-                self.logger.info(f"  ✓ J-Prime API ready ({len(client._available_models)} models)")
+            _quick_timeout = float(os.getenv("JARVIS_PRIME_API_QUICK_TIMEOUT", "2.0"))
+            probe_client = PrimeAPIClient(wait_timeout=_quick_timeout)
+            if await probe_client.wait_for_ready():
+                # J-Prime already available — register immediately
+                self._clients[ModelProvider.PRIME_API] = probe_client
+                self._prime_api_source = "local_jprime"
+                self.logger.info(f"  ✓ J-Prime API ready ({len(probe_client._available_models)} models)")
                 prime_available = True
             else:
-                self.logger.info("  ⚠️ J-Prime API not available")
+                await probe_client._close_session()
                 self.logger.info(
-                    "     → J-Prime server not running. Start jarvis-prime repo or "
-                    "set JARVIS_PRIME_API_ENABLED=false to skip"
+                    "  ⏳ J-Prime API not ready yet — will hot-swap when available"
                 )
 
         # v234.0: PRIME_LOCAL as Tier 2 — register even if PRIME_API available
@@ -2654,6 +2658,7 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
             ModelProvider.PRIME_API.value
         )
         logger.info(f"[v234.0] GCP endpoint hot-swapped: {old_url} → {url}")
+        _model_serving._prime_api_source = "gcp"  # v261.0: GCP wins priority
         # v239.0: Free RAM by unloading local model now that GCP is primary
         try:
             await _model_serving._unload_local_model()
@@ -2669,6 +2674,7 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
             _model_serving._circuit_breaker.record_success(
                 ModelProvider.PRIME_API.value
             )
+            _model_serving._prime_api_source = "gcp"  # v261.0: GCP wins priority
             logger.info(f"[v234.0] GCP endpoint activated: {url}")
             # v239.0: Free RAM by unloading local model now that GCP is primary
             try:
@@ -2681,6 +2687,99 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
             logger.warning(f"[v234.0] GCP endpoint not ready: {url}")
             await new_client._close_session()
             return False
+
+
+# =============================================================================
+# v261.0: J-Prime API Deferred Registration (called by unified_supervisor.py)
+# =============================================================================
+
+async def notify_jprime_api_ready(url: str) -> bool:
+    """
+    v261.0: Notify UnifiedModelServing that local J-Prime API is ready.
+
+    Called by unified_supervisor when Early Prime prewarm or Trinity
+    detects J-Prime is healthy. Hot-swaps or creates PrimeAPIClient.
+
+    Priority: GCP > local J-Prime. If GCP is already active as the
+    PRIME_API source, this function refuses to downgrade.
+
+    Mirrors the notify_gcp_endpoint_ready() pattern.
+
+    Args:
+        url: Full URL of J-Prime (e.g., "http://localhost:8000")
+
+    Returns:
+        True if J-Prime API client was activated successfully
+    """
+    global _model_serving, PRIME_API_URL
+
+    url = url.rstrip("/")
+    logger = logging.getLogger("UnifiedModelServing")
+
+    if not PRIME_API_ENABLED:
+        logger.debug("[v261.0] PRIME_API disabled, ignoring J-Prime ready notification")
+        return False
+
+    if _model_serving is None:
+        # Pre-register: update module-level URL for when singleton initializes
+        PRIME_API_URL = url
+        logger.info(f"[v261.0] J-Prime URL pre-registered ({url})")
+        return False
+
+    # v261.0 R2-#1: Priority check — GCP > local J-Prime
+    if _model_serving._prime_api_source == "gcp":
+        logger.info(
+            f"[v261.0] J-Prime local ready at {url}, but GCP is active — "
+            f"keeping GCP as primary (higher priority)"
+        )
+        return False
+
+    # Check if already registered at this URL
+    existing = _model_serving._clients.get(ModelProvider.PRIME_API)
+    if (existing and isinstance(existing, PrimeAPIClient)
+            and existing.base_url == url
+            and _model_serving._prime_api_source == "local_jprime"):
+        logger.debug("[v261.0] J-Prime API already registered at this URL")
+        return True
+
+    # Validate endpoint before registering
+    test_client = PrimeAPIClient(
+        base_url=url,
+        wait_timeout=float(os.getenv("JARVIS_JPRIME_VALIDATION_TIMEOUT", "10.0")),
+    )
+    if not await test_client.wait_for_ready():
+        logger.warning(f"[v261.0] J-Prime endpoint validation failed ({url})")
+        await test_client._close_session()
+        return False
+
+    # Register the validated client
+    if existing and isinstance(existing, PrimeAPIClient):
+        # Hot-swap existing client
+        old_url = existing.base_url
+        existing.base_url = url
+        # v261.0 R2-#2: Use _ready = False (matches GCP pattern) — forces re-validation
+        # on next generate() call. Prevents racing with in-flight requests on stale session.
+        existing._ready = False
+        existing._available_models = test_client._available_models
+        await existing._close_session()  # Close old connection pool
+        await test_client._close_session()
+        _model_serving._circuit_breaker.record_success(ModelProvider.PRIME_API.value)
+        _model_serving._prime_api_source = "local_jprime"
+        logger.info(f"[v261.0] J-Prime API hot-swapped: {old_url} → {url}")
+    else:
+        # New registration — use the test_client directly (already validated)
+        test_client._ready = False  # R2-#2: Force re-validation on first use
+        _model_serving._clients[ModelProvider.PRIME_API] = test_client
+        _model_serving._circuit_breaker.record_success(ModelProvider.PRIME_API.value)
+        _model_serving._prime_api_source = "local_jprime"
+        logger.info(
+            f"[v261.0] J-Prime API activated: {url} "
+            f"({len(test_client._available_models)} models)"
+        )
+
+    # Update module-level URL for any future clients
+    PRIME_API_URL = url
+    return True
 
 
 async def notify_gcp_endpoint_unhealthy() -> None:

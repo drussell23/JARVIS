@@ -58866,6 +58866,8 @@ class JarvisSystemKernel:
         self._early_invincible_task: Optional[asyncio.Task] = None  # v233.4: Early GCP pre-warm
         self._model_serving = None  # v234.0: UnifiedModelServing instance
         self._pending_gcp_endpoint: Optional[str] = None  # v236.0: Deferred GCP URL
+        self._pending_jprime_api_url: Optional[str] = None  # v261.0: Deferred J-Prime URL
+        self._jprime_watcher_task: Optional[asyncio.Task] = None  # v261.0: Background watcher
 
         # v207.0: Startup Resilience Coordinator
         # Provides non-blocking health checks and background auto-recovery for:
@@ -61621,6 +61623,14 @@ class JarvisSystemKernel:
                 name="early-prime-prewarm"
             )
             self._background_tasks.append(self._early_prime_task)
+
+            # v261.0: Start background J-Prime readiness watcher
+            if self._jprime_watcher_task is None or self._jprime_watcher_task.done():
+                self._jprime_watcher_task = create_safe_task(
+                    self._watch_jprime_readiness(),
+                    name="jprime-readiness-watcher",
+                )
+                self._background_tasks.append(self._jprime_watcher_task)
 
         # =============================================================
         # v233.4: EARLY GCP PRE-WARM — Start Invincible Node Before Phase 0
@@ -64924,6 +64934,27 @@ class JarvisSystemKernel:
                                 f"[Kernel] v236.0: Deferred GCP apply failed: {_gcp_err}"
                             )
 
+                    # v261.0: Apply deferred J-Prime API endpoint (same pattern as GCP)
+                    if self._pending_jprime_api_url and self._model_serving:
+                        try:
+                            from backend.intelligence.unified_model_serving import (
+                                notify_jprime_api_ready as _notify_jprime,
+                            )
+                            _jprime_ok = await _notify_jprime(self._pending_jprime_api_url)
+                            if _jprime_ok:
+                                self.logger.info(
+                                    f"[Kernel] v261.0: Deferred J-Prime endpoint applied: "
+                                    f"{self._pending_jprime_api_url}"
+                                )
+                            else:
+                                self.logger.warning(
+                                    f"[Kernel] v261.0: Deferred J-Prime endpoint validation "
+                                    f"failed: {self._pending_jprime_api_url}"
+                                )
+                            self._pending_jprime_api_url = None
+                        except Exception as e:
+                            self.logger.warning(f"[Kernel] v261.0: J-Prime deferred apply error: {e}")
+
                 except asyncio.TimeoutError:
                     self.logger.warning(
                         "[Kernel] v234.0: UnifiedModelServing init timed out "
@@ -67399,6 +67430,131 @@ class JarvisSystemKernel:
                     pass
             return {}, True, f"Wrapper error: {e}"
 
+    # =================================================================
+    # v261.0: Background J-Prime Readiness Watcher
+    # =================================================================
+
+    async def _watch_jprime_readiness(self) -> None:
+        """
+        v261.0: Background task that watches for J-Prime to become ready.
+
+        Polls Early Prime's health endpoint with exponential backoff.
+        When J-Prime reports ready, notifies UnifiedModelServing to
+        hot-swap PRIME_API client — same pattern as GCP endpoint.
+
+        Self-terminates after: success, GCP takeover, or max_wait timeout.
+        """
+        _base_interval = _get_env_float("JARVIS_JPRIME_WATCH_INTERVAL", 5.0)
+        _max_interval = _get_env_float("JARVIS_JPRIME_WATCH_MAX_INTERVAL", 30.0)
+        _max_wait = _get_env_float("JARVIS_JPRIME_WATCH_MAX_WAIT", 900.0)  # 15 min
+        _port = int(os.environ.get("JARVIS_EARLY_PRIME_PORT",
+                                   os.environ.get("TRINITY_JPRIME_PORT", "8000")))
+        _url = f"http://localhost:{_port}"
+
+        start_time = time.time()
+        interval = _base_interval
+        attempt = 0
+
+        # v261.0 R2-#5: Single session for watcher lifetime (not per-poll)
+        import aiohttp
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5.0)
+        )
+
+        try:
+            while time.time() - start_time < _max_wait:
+                attempt += 1
+
+                # v261.0 R2-#7: Check if GCP has taken over — self-terminate
+                try:
+                    from backend.intelligence.unified_model_serving import (
+                        _model_serving as _ms_singleton,
+                    )
+                    if (_ms_singleton is not None
+                            and getattr(_ms_singleton, '_prime_api_source', None) == "gcp"):
+                        self.logger.info(
+                            "[v261.0] GCP has taken over PRIME_API — "
+                            "J-Prime watcher self-terminating"
+                        )
+                        return
+                except ImportError:
+                    pass
+
+                try:
+                    async with session.get(f"{_url}/health") as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            phase = data.get("phase", "")
+                            if phase == "ready" or data.get("ready_for_inference"):
+                                # J-Prime is ready — notify model serving
+                                _elapsed = time.time() - start_time
+                                self.logger.info(
+                                    f"[v261.0] J-Prime ready after {_elapsed:.0f}s "
+                                    f"(attempt {attempt})"
+                                )
+
+                                # R2-#3: Check module-level singleton, not self._model_serving
+                                try:
+                                    from backend.intelligence.unified_model_serving import (
+                                        _model_serving as _ms,
+                                        notify_jprime_api_ready,
+                                    )
+                                except ImportError:
+                                    _ms = None
+
+                                if _ms is not None:
+                                    try:
+                                        success = await notify_jprime_api_ready(_url)
+                                        if success:
+                                            self.logger.success(
+                                                "[v261.0] J-Prime API hot-swapped into "
+                                                "model serving layer"
+                                            )
+                                            self._pending_jprime_api_url = None
+                                            return
+                                        else:
+                                            # Priority check may have blocked it (GCP active)
+                                            self.logger.info(
+                                                "[v261.0] J-Prime ready but registration "
+                                                "deferred or blocked by priority"
+                                            )
+                                            return  # Don't keep polling
+                                    except Exception as e:
+                                        self.logger.warning(
+                                            f"[v261.0] J-Prime notification error: {e}"
+                                        )
+                                else:
+                                    # Model serving not initialized yet — store as pending
+                                    self._pending_jprime_api_url = _url
+                                    self.logger.info(
+                                        f"[v261.0] J-Prime URL stored as pending: {_url}"
+                                    )
+                                    return
+                            else:
+                                if attempt % 10 == 1:
+                                    _elapsed = time.time() - start_time
+                                    self.logger.debug(
+                                        f"[v261.0] J-Prime phase: {phase} "
+                                        f"(waiting for ready, {_elapsed:.0f}s)"
+                                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass  # Connection refused, timeout, etc. — expected during startup
+
+                await asyncio.sleep(interval)
+                interval = min(interval * 1.5, _max_interval)
+
+            self.logger.info(
+                f"[v261.0] J-Prime watcher timed out after {_max_wait:.0f}s — "
+                f"J-Prime may not be running"
+            )
+        except asyncio.CancelledError:
+            self.logger.debug("[v261.0] J-Prime watcher cancelled")
+            raise
+        finally:
+            await session.close()  # R2-#5: Clean up the single session
+
     async def _phase_trinity(self) -> bool:
         """
         Phase 5: Initialize Trinity cross-repo integration.
@@ -68700,6 +68856,29 @@ class JarvisSystemKernel:
                         )
                         self._background_tasks.append(watchdog_task)
                         self.logger.info("[Trinity] 🐕 Auto-restart watchdog active")
+
+                    # v261.0: If J-Prime was started (by prewarm or Trinity), ensure watcher is running
+                    _jprime_started = any(
+                        "prime" in k.lower() and v for k, v in results.items()
+                    )
+                    if (_jprime_started and
+                            (self._jprime_watcher_task is None or self._jprime_watcher_task.done())):
+                        # Check if PRIME_API is already registered
+                        _needs_watcher = True
+                        if self._model_serving is not None:
+                            try:
+                                from backend.intelligence.unified_model_serving import ModelProvider
+                                if ModelProvider.PRIME_API in (self._model_serving._clients or {}):
+                                    _needs_watcher = False
+                            except ImportError:
+                                pass
+                        if _needs_watcher:
+                            self._jprime_watcher_task = create_safe_task(
+                                self._watch_jprime_readiness(),
+                                name="jprime-readiness-watcher-trinity",
+                            )
+                            self._background_tasks.append(self._jprime_watcher_task)
+                            self.logger.info("[v261.0] J-Prime readiness watcher started (Trinity path)")
 
                 elif total_count == 0 and not _trinity_startup_timed_out:
                     # v222.0: Only mark as "skipped" if Trinity was NOT attempted
