@@ -1509,27 +1509,53 @@ Add two 14B-class models for significantly stronger reasoning and code generatio
 - [ ] Update `gcp_vm_manager.py` builder script with 3 new model entries
 - [ ] Disk impact: +24.3 GB → total ~64.7 GB on 80 GB SSD (~15.3 GB headroom)
 
-#### v242.0 — Training Data Pipeline Activation (Planned)
+#### v239.0 — Architectural Hardening + Pipeline Activation (In Progress)
 
-Activate the telemetry → Reactor Core → fine-tuning → deployment loop. Infrastructure is ~80% built; key connection points need wiring:
+Five verified architectural issues are being fixed with ~210 lines of surgical changes across 4 files, zero new Python files. Simultaneously, the Reactor Core training pipeline is being activated.
 
-- [ ] **Fix A: TelemetryEmitter JSONL output** — Ensure `backend/core/telemetry_emitter.py` writes interaction logs to `~/.jarvis/telemetry/*.jsonl` in the format Reactor Core's `TelemetryIngestor` expects (event_type, properties.user_input, properties.output, metrics.model_id, metrics.latency_ms)
-- [ ] **Fix B: v241.1 model metadata in telemetry** — Include `X-Model-Id` (which specialist model answered) in every telemetry event, enabling per-model DPO pair generation
-- [ ] **Fix C: Verify Reactor Core ingestion** — Confirm `TrinityExperienceReceiver` picks up JSONL files from `~/.jarvis/telemetry/` and feeds them to `UnifiedTrainingPipeline`
-- [ ] **Automatic DPO pair generation** — When the same query gets different answers from different specialist models (e.g., Mistral-7B says x=11, Qwen-Math-7B says x=3), automatically generate preference pairs: `{chosen: "x=3", rejected: "x=11"}`
-- [ ] Multi-model architecture becomes a **training data goldmine** — each model swap produces implicit quality comparisons
+**Verified Fixes (from three-way cross-repo audit, Feb 2026):**
+
+| # | Fix | File | Lines | Risk |
+|---|-----|------|-------|------|
+| 1 | **RAM Race** — Unload local model when GCP becomes available. `_unload_local_model()` exists but is never called from `notify_gcp_endpoint_ready()`. | `unified_model_serving.py` | ~20 | LOW |
+| 2 | **Mid-Stream Failover** — When a streaming provider fails mid-response, buffer the prompt and retry on the next tier with a `[Stream interrupted — retrying...]` marker. | `unified_model_serving.py` | ~40 | MEDIUM |
+| 3 | **Supervisor Self-Watchdog** — macOS `launchd` plist that auto-restarts `unified_supervisor.py` on crash. Nothing currently watches the supervisor itself. | `com.jarvis.supervisor.plist` (new) | ~30 | LOW |
+| 4 | **Cost-Aware Routing** — Add cost efficiency factor (15% weight) to adaptive provider scoring. Prevents Claude API ($3/M tokens) from serving trivial greetings. | `unified_model_serving.py` | ~20 | LOW |
+| 5 | **Reactor Core Pipeline Activation** — Call `initialize_reactor_core()` and `start_reactor_core_watcher()` during Phase 5 startup. Add smoke test gate and deployment feedback loop. | `unified_supervisor.py` + `reactor_core_watcher.py` | ~100 | LOW |
+
+**Pipeline Activation (corrected status from Feb 2026 audit):**
+
+The training pipeline is **~95% built, never activated** — not "broken" as previously reported:
+- [x] `TelemetryEmitter` writes JSONL — telemetry files confirmed present in `~/.jarvis/telemetry/`
+- [x] `TelemetryIngestor` schemas **verified byte-identical** to emitter output (v1.0 canonical)
+- [x] `ReactorCoreBridge.upload_training_data()` **fully implemented** (992 LOC, v242.0) — ~~previously reported as "not implemented"~~
+- [x] `ExperienceEvent` is the **single canonical schema** with 5 legacy adapters — ~~previously reported as "three different schemas"~~
+- [x] `RequestDeduplicator` exists and is **wired into the request path** — ~~previously reported as "missing"~~
+- [ ] `initialize_reactor_core()` exists but **never called** from supervisor startup → v239.0 wires it
+- [ ] `start_reactor_core_watcher()` exists but **never called** from supervisor startup → v239.0 wires it
+- [ ] **Zero training jobs** have ever run (`jobs.json` is empty) → v239.0 triggers the first run
 
 **Pipeline when active:**
 ```
 User talks to JARVIS
-  → TelemetryEmitter captures interaction + model_id
+  → TelemetryEmitter captures interaction + model_id + task_type
     → JSONL to ~/.jarvis/telemetry/
       → Reactor Core TelemetryIngestor reads files
-        → UnifiedTrainingPipeline generates DPO pairs
-          → LoRA/QLoRA fine-tuning on preference data
-            → GGUF export → deploy to golden image
-              → Models get better at being JARVIS, automatically
+        → Experience accumulation → auto-trigger at threshold
+          → LoRA SFT fine-tuning (DPO in v242.0)
+            → GGUF export → Smoke test gate (subprocess)
+              → Deploy to J-Prime → Feedback file
+                → Models improve at being JARVIS, automatically
 ```
+
+#### v242.0 — DPO Training from Multi-Model Telemetry (Planned)
+
+Build on v239.0 with DPO preference training:
+
+- [ ] **Automatic DPO pair generation** — When different specialist models answer the same query type with different quality, generate preference pairs without human labeling
+- [ ] **Ground truth diversity** — User corrections, Claude-as-judge, objective metrics (code compilation, math verification) — not just self-assessment
+- [ ] **Per-model telemetry attribution** — Include `X-Model-Id` in every telemetry event for per-model DPO pair generation
+- [ ] Multi-model architecture becomes a **training data goldmine** — each model swap produces implicit quality comparisons
 
 #### v243.0 — Ouroboros: JARVIS Self-Programming (Planned)
 
@@ -3983,6 +4009,31 @@ Learning Signal: Sent to Reactor Core (success logged)
 ---
 
 ## ⚠️ Critical Gaps, Edge Cases, and Nuances
+
+### February 2026 Three-Way Audit: Corrections
+
+A comprehensive three-way architectural audit was conducted with independent analyses cross-verified against actual code. Several previously reported gaps were found to already be resolved:
+
+| Previously Reported Gap | Corrected Status |
+|---|---|
+| "No request deduplication" | **RESOLVED:** `RequestDeduplicator` exists in `trinity_base_client.py`, active by default. `distributed_dedup.py` provides Redis+Bloom filter backup. |
+| "Schema between Body and Reactor is unverified" | **RESOLVED:** Schemas verified byte-identical across all three repos (v1.0 canonical `ExperienceEvent`). |
+| "`ReactorCoreBridge.upload_training_data()` not implemented" | **RESOLVED:** Fully implemented (992 LOC, v242.0) with batch upload, fallback, job tracking. |
+| "Three different experience schemas" | **RESOLVED:** One canonical `ExperienceEvent` dataclass with 5 legacy adapters. |
+| "No env var validation" | **RESOLVED:** `trinity_bootstrap_validator.py` has `EnvironmentValidator` with `REQUIRED_ENV_VARS`. |
+| "File-based IPC has no ordering" | **RESOLVED:** `EventSequencer` exists with sequence numbers, vector clocks, gap detection, duplicate detection. |
+| "Circuit breaker state doesn't survive restarts" | **PARTIALLY RESOLVED:** `TrinityCircuitBreaker` persists to `~/.jarvis/state/circuit_breakers/` and `PersistentCircuitBreaker` in `async_safety.py` persists. `circuit_breaker.py` in kernel does NOT persist (inconsistency). |
+| "DMS vs SmartWatchdog conflict" | **NOT A CONFLICT:** DMS monitors startup phases, SmartWatchdog monitors GCP VM component health — different scopes. |
+
+**Verified remaining gaps (real, confirmed by code inspection):**
+- RAM race between Phase 2 GCP boot and Phase 3 local model loading → v239.0
+- Mid-stream failure recovery missing → v239.0
+- No external supervisor self-watchdog → v239.0 (launchd plist)
+- Training pipeline never activated (zero jobs run) → v239.0
+- Deployment feedback loop one-way blind → v239.0
+- Cost not wired to routing decisions → v239.0
+
+---
 
 ### 🔴 Known Gaps (Red Flags - Need Addressing)
 
