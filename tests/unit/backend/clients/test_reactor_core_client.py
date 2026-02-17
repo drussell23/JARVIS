@@ -697,3 +697,186 @@ class TestResourceAwareTrainingGate:
                 metadata = call_kwargs.kwargs.get("metadata")
                 assert metadata is not None
                 assert metadata.get("reduced_batch") is True
+
+
+# =========================================================================
+# Tests -- TrinityEventBus Integration (v2.4)
+# =========================================================================
+
+class TestTrinityEventBusIntegration:
+    """Verify TrinityEventBus events are emitted at pipeline stages."""
+
+    async def test_trigger_training_emits_bus_event(self, client):
+        """trigger_training should publish training.started on TrinityEventBus."""
+        client._request = AsyncMock(return_value={"job_id": "bus-job-1", "status": "queued"})
+        client._emit_event = AsyncMock()
+        client._write_bridge_event = AsyncMock()
+
+        mock_bus = AsyncMock()
+        mock_bus.publish = AsyncMock(return_value="evt-id-1")
+
+        with patch(
+            "backend.clients.reactor_core_client._get_event_bus",
+            return_value=mock_bus,
+        ):
+            job = await client.trigger_training(
+                experience_count=100,
+                priority=TrainingPriority.NORMAL,
+                force=True,
+            )
+
+        assert job is not None
+        mock_bus.publish.assert_called_once()
+        event = mock_bus.publish.call_args[0][0]
+        assert event.topic == "training.started"
+        assert "bus-job-1" in str(event.payload.get("job_id", ""))
+
+    async def test_poll_completed_emits_bus_event(self, client):
+        """_poll_active_job should publish training.completed on TrinityEventBus."""
+        client._active_job_id = "bus-job-2"
+
+        mock_job = MagicMock()
+        mock_job.status = "completed"
+        mock_job.metrics = {"loss": 0.3}
+        mock_job.to_dict.return_value = {
+            "job_id": "bus-job-2",
+            "status": "completed",
+            "metrics": {"loss": 0.3},
+        }
+
+        mock_bus = AsyncMock()
+        mock_bus.publish = AsyncMock(return_value="evt-id-2")
+
+        with patch.object(client, "get_training_job", new_callable=AsyncMock, return_value=mock_job):
+            with patch.object(client, "_emit_event", new_callable=AsyncMock):
+                with patch.object(client, "_write_bridge_event", new_callable=AsyncMock):
+                    with patch(
+                        "backend.clients.reactor_core_client._get_event_bus",
+                        return_value=mock_bus,
+                    ):
+                        await client._poll_active_job()
+
+        mock_bus.publish.assert_called_once()
+        event = mock_bus.publish.call_args[0][0]
+        assert event.topic == "training.completed"
+
+    async def test_poll_failed_emits_bus_event(self, client):
+        """_poll_active_job should publish training.failed on TrinityEventBus."""
+        client._active_job_id = "bus-job-3"
+
+        mock_job = MagicMock()
+        mock_job.status = "failed"
+        mock_job.error = "OOM"
+        mock_job.to_dict.return_value = {
+            "job_id": "bus-job-3",
+            "status": "failed",
+            "error": "OOM",
+        }
+
+        mock_bus = AsyncMock()
+        mock_bus.publish = AsyncMock(return_value="evt-id-3")
+
+        with patch.object(client, "get_training_job", new_callable=AsyncMock, return_value=mock_job):
+            with patch.object(client, "_emit_event", new_callable=AsyncMock):
+                with patch.object(client, "_write_bridge_event", new_callable=AsyncMock):
+                    with patch(
+                        "backend.clients.reactor_core_client._get_event_bus",
+                        return_value=mock_bus,
+                    ):
+                        await client._poll_active_job()
+
+        mock_bus.publish.assert_called_once()
+        event = mock_bus.publish.call_args[0][0]
+        assert event.topic == "training.failed"
+
+    async def test_bus_unavailable_does_not_crash(self, client):
+        """If TrinityEventBus is unavailable, event emission should be silently skipped."""
+        client._request = AsyncMock(return_value={"job_id": "bus-job-4", "status": "queued"})
+        client._emit_event = AsyncMock()
+        client._write_bridge_event = AsyncMock()
+
+        with patch(
+            "backend.clients.reactor_core_client._get_event_bus",
+            return_value=None,
+        ):
+            job = await client.trigger_training(
+                experience_count=50,
+                priority=TrainingPriority.NORMAL,
+                force=True,
+            )
+
+        # Should succeed even without bus
+        assert job is not None
+        assert job.job_id == "bus-job-4"
+
+    async def test_bus_publish_error_does_not_crash(self, client):
+        """If bus.publish raises, trigger_training should still succeed."""
+        client._request = AsyncMock(return_value={"job_id": "bus-job-5", "status": "queued"})
+        client._emit_event = AsyncMock()
+        client._write_bridge_event = AsyncMock()
+
+        mock_bus = AsyncMock()
+        mock_bus.publish = AsyncMock(side_effect=RuntimeError("bus down"))
+
+        with patch(
+            "backend.clients.reactor_core_client._get_event_bus",
+            return_value=mock_bus,
+        ):
+            job = await client.trigger_training(
+                experience_count=50,
+                priority=TrainingPriority.NORMAL,
+                force=True,
+            )
+
+        # Should succeed despite bus error
+        assert job is not None
+
+    async def test_event_has_correlation_id(self, client):
+        """Events should carry the job_id as correlation_id."""
+        client._request = AsyncMock(return_value={"job_id": "corr-job", "status": "queued"})
+        client._emit_event = AsyncMock()
+        client._write_bridge_event = AsyncMock()
+
+        mock_bus = AsyncMock()
+        mock_bus.publish = AsyncMock(return_value="evt-id")
+
+        with patch(
+            "backend.clients.reactor_core_client._get_event_bus",
+            return_value=mock_bus,
+        ):
+            await client.trigger_training(
+                experience_count=100,
+                priority=TrainingPriority.NORMAL,
+                force=True,
+            )
+
+        event = mock_bus.publish.call_args[0][0]
+        assert event.correlation_id == "corr-job"
+
+    async def test_completed_event_has_causation_id(self, client):
+        """training.completed causation_id should reference the training.started event."""
+        client._active_job_id = "caus-job"
+        # Simulate that trigger_training stored the start event id
+        client._job_start_event_ids = {"caus-job": "start-evt-abc"}
+
+        mock_job = MagicMock()
+        mock_job.status = "completed"
+        mock_job.metrics = {}
+        mock_job.to_dict.return_value = {"job_id": "caus-job", "status": "completed"}
+
+        mock_bus = AsyncMock()
+        mock_bus.publish = AsyncMock(return_value="evt-id")
+
+        with patch.object(client, "get_training_job", new_callable=AsyncMock, return_value=mock_job):
+            with patch.object(client, "_emit_event", new_callable=AsyncMock):
+                with patch.object(client, "_write_bridge_event", new_callable=AsyncMock):
+                    with patch(
+                        "backend.clients.reactor_core_client._get_event_bus",
+                        return_value=mock_bus,
+                    ):
+                        await client._poll_active_job()
+
+        event = mock_bus.publish.call_args[0][0]
+        assert event.correlation_id == "caus-job"
+        # causation_id should reference the start event
+        assert event.causation_id == "start-evt-abc"
