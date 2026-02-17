@@ -149,6 +149,21 @@ from pathlib import Path
 import random
 
 
+# v260.4: Safe env var parsing helper — prevents ValueError from killing coroutines
+def _get_env_float_safe(key: str, default: float) -> float:
+    """Parse env var as float with safe fallback.
+
+    If the env var is unset, empty, or unparseable, returns `default` silently.
+    This prevents a misconfigured env var from crashing long-lived coroutines
+    (e.g. _recheck_loop) before the while loop even starts.
+    """
+    try:
+        val = os.environ.get(key, "")
+        return float(val) if val else default
+    except (ValueError, TypeError):
+        return default
+
+
 # =============================================================================
 # PROXY READINESS GATE v1.0 - Production-Grade Implementation
 # =============================================================================
@@ -2659,9 +2674,17 @@ class ProxyReadinessGate:
 
         Edge Case #10: Don't clear ready event until UNAVAILABLE confirmed.
         Edge Case #19: Idempotent via check_lock.
+
+        v260.4: Added retry logic — a single transient failure no longer
+        immediately transitions to UNAVAILABLE. Matches the patience of
+        _recheck_loop() periodic checks.
         """
         await self._ensure_locks()
         assert self._check_lock is not None  # Guaranteed by _ensure_locks
+
+        # v260.4 (Fix 3 + Fix 7): Retry before declaring UNAVAILABLE
+        _max_retries = int(_get_env_float_safe("JARVIS_RECHECK_RETRIES", 2))
+        _retry_delay = _get_env_float_safe("JARVIS_RECHECK_RETRY_DELAY", 5.0)
 
         async with self._check_lock:
             if self._state != ReadinessState.READY:
@@ -2670,18 +2693,32 @@ class ProxyReadinessGate:
             # Edge Case #10: Don't clear ready event yet - only on confirmed failure
             self._state = ReadinessState.CHECKING
 
-            # Run single check (not full retry loop for re-check)
             success, reason = await self._check_db_level()
 
             if success:
                 self._state = ReadinessState.READY
-                # Events already set
-            else:
-                await self._set_state(
-                    ReadinessState.UNAVAILABLE,
-                    reason,
-                    "Connection failed during operation"
+                return
+
+            # v260.4: Retry before declaring UNAVAILABLE (was single-shot)
+            for _retry in range(_max_retries):
+                if self._shutting_down:
+                    break
+                logger.debug(
+                    f"[ReadinessGate v260.4] Trigger recheck failed ({reason}), "
+                    f"retry {_retry + 1}/{_max_retries} in {_retry_delay * (_retry + 1)}s"
                 )
+                await asyncio.sleep(_retry_delay * (_retry + 1))
+                success, reason = await self._check_db_level()
+                if success:
+                    self._state = ReadinessState.READY
+                    return
+
+            # All retries exhausted
+            await self._set_state(
+                ReadinessState.UNAVAILABLE,
+                reason,
+                "Connection failed during operation"
+            )
 
     def _start_periodic_recheck(self) -> None:
         """Start periodic recheck task if configured."""
@@ -2693,64 +2730,105 @@ class ProxyReadinessGate:
             return
 
         async def _recheck_loop():
-            # v260.3: Retry with backoff before declaring UNAVAILABLE.
-            # A single transient GCP network hiccup should NOT trigger a full
-            # state transition + cascade (AgentRegistry, cache warming, port kill).
-            _max_retries = int(float(os.environ.get(
-                "JARVIS_RECHECK_RETRIES", "2"
-            )))
-            _retry_delay = float(os.environ.get(
-                "JARVIS_RECHECK_RETRY_DELAY", "5.0"
-            ))
-            # v260.3: Recovery probe interval when UNAVAILABLE (default 60s)
-            _recovery_interval = float(os.environ.get(
-                "JARVIS_RECHECK_RECOVERY_INTERVAL", "60.0"
-            ))
-            while not self._shutting_down:
-                # v260.3: When UNAVAILABLE, probe for recovery instead of sleeping forever.
-                # The old code only ran when state==READY, so once UNAVAILABLE the loop
-                # did nothing — CloudSQL stayed permanently down until process restart.
-                if self._state == ReadinessState.UNAVAILABLE:
-                    await asyncio.sleep(_recovery_interval)
-                    if self._shutting_down:
-                        break
-                    success, reason = await self._check_db_level()
-                    if success:
-                        logger.info(
-                            "[ReadinessGate v260.3] CloudSQL recovered — "
-                            "transitioning back to READY"
-                        )
-                        await self._set_state(
-                            ReadinessState.READY,
-                            None,
-                            "Recovery probe succeeded"
-                        )
-                    continue
+            # v260.4 (Fix 7): Safe env var parsing — bad values won't kill the loop
+            _max_retries = int(_get_env_float_safe("JARVIS_RECHECK_RETRIES", 2))
+            _retry_delay = _get_env_float_safe("JARVIS_RECHECK_RETRY_DELAY", 5.0)
 
-                await asyncio.sleep(interval)
-                if self._shutting_down:
-                    break
-                if self._state == ReadinessState.READY:
-                    success, reason = await self._check_db_level()
-                    if not success:
-                        # v260.3: Retry before declaring UNAVAILABLE
-                        for _retry in range(_max_retries):
-                            if self._shutting_down:
-                                break
-                            logger.debug(
-                                f"[ReadinessGate] Periodic check failed ({reason}), "
-                                f"retry {_retry + 1}/{_max_retries} in {_retry_delay}s"
-                            )
-                            await asyncio.sleep(_retry_delay * (_retry + 1))
+            # v260.4 (Fix 5): Exponential backoff for recovery probes
+            # Starts at _recovery_base, doubles each attempt, caps at _recovery_max.
+            # Fast initial probe (10s) when CloudSQL comes back quickly,
+            # backs off to 120s to reduce log noise during prolonged outages.
+            _recovery_base = _get_env_float_safe("JARVIS_RECHECK_RECOVERY_BASE", 10.0)
+            _recovery_max = _get_env_float_safe("JARVIS_RECHECK_RECOVERY_MAX", 120.0)
+            _recovery_attempt = 0
+
+            # v260.4 (Fix 6): CancelledError handler — clean shutdown logging
+            try:
+                while not self._shutting_down:
+                    # v260.3: When UNAVAILABLE, probe for recovery instead of
+                    # sleeping forever. The old code only ran when state==READY,
+                    # so once UNAVAILABLE the loop did nothing.
+                    if self._state == ReadinessState.UNAVAILABLE:
+                        # v260.4 (Fix 5): Exponential backoff instead of flat 60s
+                        _recovery_sleep = min(
+                            _recovery_base * (2 ** _recovery_attempt),
+                            _recovery_max
+                        )
+                        await asyncio.sleep(_recovery_sleep)
+                        if self._shutting_down:
+                            break
+
+                        # v260.4 (Fix 1): Acquire _check_lock to serialize
+                        # with _trigger_recheck(). Without this, a concurrent
+                        # _trigger_recheck can interleave state transitions
+                        # (recovery READY then trigger UNAVAILABLE — events
+                        # fire out of order).
+                        await self._ensure_locks()
+                        assert self._check_lock is not None
+                        async with self._check_lock:
+                            # Re-check state under lock — may have changed
+                            # during sleep or been resolved by _trigger_recheck
+                            if self._state != ReadinessState.UNAVAILABLE:
+                                _recovery_attempt = 0
+                                continue
                             success, reason = await self._check_db_level()
                             if success:
-                                break
-                        if not success:
-                            await self._set_state(
-                                ReadinessState.UNAVAILABLE,
-                                reason,
-                                "Periodic health check failed"
-                            )
+                                _recovery_attempt = 0
+                                logger.info(
+                                    "[ReadinessGate v260.4] CloudSQL recovered — "
+                                    "transitioning to READY"
+                                )
+                                await self._set_state(
+                                    ReadinessState.READY,
+                                    None,
+                                    "Recovery probe succeeded"
+                                )
+                            else:
+                                _recovery_attempt += 1
+                        continue
+
+                    await asyncio.sleep(interval)
+                    if self._shutting_down:
+                        break
+
+                    if self._state == ReadinessState.READY:
+                        # v260.4 (Fix 1): Acquire _check_lock to serialize
+                        # periodic checks with _trigger_recheck().
+                        await self._ensure_locks()
+                        assert self._check_lock is not None
+                        async with self._check_lock:
+                            # Re-check state under lock
+                            if self._state != ReadinessState.READY:
+                                continue
+                            success, reason = await self._check_db_level()
+                            if not success:
+                                # v260.3: Retry before declaring UNAVAILABLE
+                                for _retry in range(_max_retries):
+                                    if self._shutting_down:
+                                        break
+                                    logger.debug(
+                                        f"[ReadinessGate v260.4] Periodic check failed "
+                                        f"({reason}), retry {_retry + 1}/{_max_retries} "
+                                        f"in {_retry_delay * (_retry + 1)}s"
+                                    )
+                                    await asyncio.sleep(_retry_delay * (_retry + 1))
+                                    success, reason = await self._check_db_level()
+                                    if success:
+                                        break
+                                if not success:
+                                    await self._set_state(
+                                        ReadinessState.UNAVAILABLE,
+                                        reason,
+                                        "Periodic health check failed"
+                                    )
+
+            except asyncio.CancelledError:
+                logger.debug("[ReadinessGate v260.4] Periodic recheck loop cancelled")
+            except Exception as e:
+                logger.error(
+                    f"[ReadinessGate v260.4] Recheck loop crashed: {e}",
+                    exc_info=True,
+                )
 
         try:
             self._recheck_task = asyncio.create_task(_recheck_loop())

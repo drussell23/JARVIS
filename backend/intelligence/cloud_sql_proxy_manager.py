@@ -1964,17 +1964,28 @@ class CloudSQLProxyManager:
         db_level_check: bool = True
     ):
         """
-        Monitor proxy health and auto-recover if needed.
+        Monitor proxy PROCESS health and auto-recover if needed.
+
+        v260.4 Architecture (Fix 2 — split-brain elimination):
+        Responsibility split between monitor() and ReadinessGate._recheck_loop():
+        - monitor() owns: proxy PROCESS liveness (TCP-level). Restarts only
+          when the proxy process is dead/zombie.
+        - ReadinessGate._recheck_loop() owns: DB-level health (SELECT 1).
+          Controls READY/UNAVAILABLE state machine with retries + recovery probes.
+
+        Previously, both independently ran DB-level checks and made restart/state
+        decisions — a split-brain that caused contradictory state transitions,
+        unnecessary restarts (proxy alive but DB unreachable), and cascading
+        failures (restart kills healthy proxy during transient GCP hiccup).
 
         v86.0 Enhancements:
-        - Optional DB-level health checks via ProxyReadinessGate
         - Enhanced zombie detection before recovery attempts
         - Notification to ProxyReadinessGate on failures
 
         Args:
             check_interval: Seconds between health checks
             max_recovery_attempts: Maximum consecutive recovery attempts before giving up
-            db_level_check: If True, use DB-level verification (SELECT 1) instead of TCP-only
+            db_level_check: If True AND ReadinessGate available, gate handles DB-level health
         """
         logger.info(f"🔍 Starting proxy health monitor (interval: {check_interval}s, db_level={db_level_check})")
 
@@ -1982,14 +1993,17 @@ class CloudSQLProxyManager:
         last_check_time = time.time()
         readiness_gate = None
 
-        # Try to get ProxyReadinessGate for DB-level checks and failure notification
+        # Try to get ProxyReadinessGate for DB-level health delegation
         if db_level_check:
             try:
                 from intelligence.cloud_sql_connection_manager import get_readiness_gate
                 readiness_gate = get_readiness_gate()
-                logger.info("   Using ProxyReadinessGate for DB-level verification")
+                logger.info(
+                    "   [v260.4] ProxyReadinessGate available — monitor() handles "
+                    "process liveness, gate handles DB-level health"
+                )
             except ImportError:
-                logger.debug("   ProxyReadinessGate not available - using TCP-level checks")
+                logger.debug("   ProxyReadinessGate not available - using TCP-level checks only")
                 db_level_check = False
 
         health_check_timeout = float(os.getenv("TIMEOUT_PROXY_HEALTH_CHECK", "30.0"))
@@ -1997,48 +2011,38 @@ class CloudSQLProxyManager:
             try:
                 await asyncio.sleep(check_interval)
 
-                # Health check with timeout
-                is_healthy = False
+                # v260.4 (Fix 2): ALWAYS check TCP-level process health.
+                # When ReadinessGate is available, it owns DB-level decisions.
+                # monitor() only restarts when the proxy PROCESS is dead.
+                is_process_alive = False
                 try:
-                    if db_level_check and readiness_gate:
-                        # v86.0: Use DB-level verification
-                        is_healthy = await asyncio.wait_for(
-                            self.is_running_db_level(),
-                            timeout=health_check_timeout
-                        )
-                    else:
-                        # TCP-level only
-                        is_healthy = await asyncio.wait_for(
-                            asyncio.get_event_loop().run_in_executor(None, self.is_running),
-                            timeout=health_check_timeout
-                        )
+                    is_process_alive = await asyncio.wait_for(
+                        asyncio.to_thread(self.is_running),
+                        timeout=health_check_timeout
+                    )
                 except asyncio.TimeoutError:
-                    logger.warning("[CloudSQL] Health check timed out")
-                    is_healthy = False
+                    logger.warning("[CloudSQL] TCP health check timed out")
 
                 current_time = time.time()
                 elapsed = current_time - last_check_time
                 last_check_time = current_time
 
-                if not is_healthy:
+                if not is_process_alive:
+                    # Proxy PROCESS is dead — this is monitor()'s domain
                     consecutive_failures += 1
                     logger.warning(
-                        f"⚠️  Cloud SQL proxy unhealthy "
+                        f"⚠️  Cloud SQL proxy process not running "
                         f"(consecutive failures: {consecutive_failures}/{max_recovery_attempts})"
                     )
 
-                    # v86.0: Notify ProxyReadinessGate of failure
+                    # Notify ReadinessGate that proxy process is down
                     if readiness_gate:
                         try:
                             readiness_gate.notify_connection_failed()
                         except Exception as e:
                             logger.debug(f"[CloudSQL] Failed to notify gate: {e}")
 
-                    # v260.3: Only run zombie detection + port conflict resolution
-                    # AFTER reaching the recovery threshold. Running it on every
-                    # failure kills a slow-but-alive proxy on the first health check
-                    # failure — turning a transient GCP latency spike into a
-                    # permanent outage. The proxy may just need time to respond.
+                    # v260.3: Only run zombie detection after reaching threshold
                     if consecutive_failures >= max_recovery_attempts:
                         port = self.config["cloud_sql"]["port"]
                         zombie_state = await self.detect_zombie_state_async()
@@ -2053,44 +2057,53 @@ class CloudSQLProxyManager:
                                     f"[CloudSQL] Port conflict resolved → port {effective_port}"
                                 )
 
+                    # Restart the proxy process
                     if consecutive_failures <= max_recovery_attempts:
-                        logger.info(f"🔄 Attempting automatic recovery (attempt {consecutive_failures})...")
+                        logger.info(f"🔄 Attempting proxy restart (attempt {consecutive_failures})...")
                         success = await self.start(force_restart=True)
 
                         if success:
-                            logger.info("✅ Proxy recovered successfully")
-                            consecutive_failures = 0  # Reset counter on success
+                            logger.info("✅ Proxy process recovered successfully")
+                            consecutive_failures = 0
 
-                            # v86.0: Trigger gate re-verification
+                            # Trigger gate re-verification after process restart
                             if readiness_gate:
                                 try:
                                     await readiness_gate.wait_for_ready(timeout=10.0)
                                 except Exception as e:
                                     logger.debug(f"[CloudSQL] Gate re-verification after recovery: {e}")
                         else:
-                            logger.error(f"❌ Proxy recovery attempt {consecutive_failures} failed")
+                            logger.error(f"❌ Proxy restart attempt {consecutive_failures} failed")
 
-                            # If max attempts reached, alert and wait longer
                             if consecutive_failures >= max_recovery_attempts:
                                 logger.error(
-                                    f"❌ Proxy recovery failed after {max_recovery_attempts} attempts"
+                                    f"❌ Proxy restart failed after {max_recovery_attempts} attempts"
                                 )
-                                logger.error("   Voice authentication will be unavailable")
                                 logger.error("   Will continue monitoring and retry in 5 minutes...")
-                                await asyncio.sleep(300)  # Wait 5 minutes before trying again
-                                consecutive_failures = 0  # Reset to try again
+                                await asyncio.sleep(300)
+                                consecutive_failures = 0
                     else:
                         logger.error("❌ Max recovery attempts exceeded, waiting before retry...")
                 else:
-                    # Proxy is healthy
+                    # Proxy process is alive
                     if consecutive_failures > 0:
-                        logger.info("✅ Proxy health restored")
+                        logger.info("✅ Proxy process health restored")
                         consecutive_failures = 0
 
-                    # Log periodic health status
-                    if int(current_time) % 300 == 0:  # Every 5 minutes
-                        check_type = "DB-level" if db_level_check else "TCP-level"
-                        logger.debug(f"✅ Cloud SQL proxy healthy ({check_type}, uptime: {elapsed:.0f}s)")
+                    # v260.4 (Fix 2): When gate is available, log gate state for
+                    # observability. DB-level health is the gate's responsibility —
+                    # monitor() does NOT restart the proxy for DB-level failures.
+                    if readiness_gate and int(current_time) % 300 == 0:
+                        try:
+                            gate_state = readiness_gate.state
+                            gate_state_name = gate_state.name if hasattr(gate_state, 'name') else str(gate_state)
+                            logger.debug(
+                                f"✅ Proxy process alive, ReadinessGate state: {gate_state_name}"
+                            )
+                        except Exception:
+                            logger.debug("✅ Proxy process alive (gate state unavailable)")
+                    elif not readiness_gate and int(current_time) % 300 == 0:
+                        logger.debug(f"✅ Cloud SQL proxy healthy (TCP-level, uptime: {elapsed:.0f}s)")
 
             except asyncio.CancelledError:
                 logger.info("Health monitor stopped")
