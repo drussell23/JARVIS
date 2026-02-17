@@ -383,3 +383,70 @@ class TestJobPolling:
         """Poll should do nothing when no active job."""
         client._active_job_id = None
         await client._poll_active_job()  # Should not raise
+
+
+# =========================================================================
+# Tests -- Training Circuit Breaker (v2.1)
+# =========================================================================
+
+class TestTrainingCircuitBreaker:
+    """Verify circuit breaker protects training triggers."""
+
+    async def test_auto_trigger_skipped_when_circuit_open(self, client):
+        """Circuit breaker should prevent auto-trigger when open."""
+        client._training_ready = True
+        client._is_online = True
+        client._training_circuit_breaker = AsyncMock()
+        client._training_circuit_breaker.can_execute = AsyncMock(return_value=False)
+
+        with patch.object(client, 'get_experience_count', new_callable=AsyncMock) as mock_count:
+            await client._check_and_auto_trigger()
+            mock_count.assert_not_called()  # Should skip entirely
+
+    async def test_auto_trigger_allowed_when_circuit_closed(self, client):
+        """Circuit breaker should allow auto-trigger when closed."""
+        client._training_ready = True
+        client._is_online = True
+        client._training_circuit_breaker = AsyncMock()
+        client._training_circuit_breaker.can_execute = AsyncMock(return_value=True)
+
+        with patch.object(client, 'get_experience_count', new_callable=AsyncMock) as mock_count:
+            mock_count.return_value = 50  # Below threshold
+            await client._check_and_auto_trigger()
+            mock_count.assert_called_once()  # Circuit allowed, continued to count check
+
+    async def test_job_failure_records_circuit_failure(self, client):
+        """Failed training job should record circuit breaker failure."""
+        client._active_job_id = "failing-job"
+        mock_cb = AsyncMock()
+        client._training_circuit_breaker = mock_cb
+
+        mock_job = MagicMock()
+        mock_job.status = "failed"
+        mock_job.error = "OOM"
+        mock_job.to_dict.return_value = {"status": "failed", "error": "OOM"}
+
+        with patch.object(client, 'get_training_job', new_callable=AsyncMock, return_value=mock_job):
+            with patch.object(client, '_emit_event', new_callable=AsyncMock):
+                with patch.object(client, '_write_bridge_event', new_callable=AsyncMock):
+                    await client._poll_active_job()
+
+        mock_cb.record_failure.assert_called_once()
+
+    async def test_job_completion_records_circuit_success(self, client):
+        """Completed training job should record circuit breaker success."""
+        client._active_job_id = "good-job"
+        mock_cb = AsyncMock()
+        client._training_circuit_breaker = mock_cb
+
+        mock_job = MagicMock()
+        mock_job.status = "completed"
+        mock_job.metrics = {"loss": 0.3}
+        mock_job.to_dict.return_value = {"status": "completed", "metrics": {"loss": 0.3}}
+
+        with patch.object(client, 'get_training_job', new_callable=AsyncMock, return_value=mock_job):
+            with patch.object(client, '_emit_event', new_callable=AsyncMock):
+                with patch.object(client, '_write_bridge_event', new_callable=AsyncMock):
+                    await client._poll_active_job()
+
+        mock_cb.record_success.assert_called_once()

@@ -269,6 +269,23 @@ class ReactorCoreClient:
         self._trinity_connected: bool = False
         self._active_job_id: Optional[str] = None
 
+        # v2.1: Training circuit breaker - prevents repeated triggers after failures
+        try:
+            from backend.kernel.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+            training_cb_config = CircuitBreakerConfig(
+                failure_threshold=int(os.getenv("REACTOR_CB_FAILURE_THRESHOLD", "3")),
+                recovery_timeout_seconds=float(os.getenv("REACTOR_CB_RECOVERY_TIMEOUT", "3600")),
+                half_open_max_requests=1,
+                success_threshold=1,
+                name="reactor_training",
+            )
+            self._training_circuit_breaker: Optional[Any] = CircuitBreaker(
+                name="reactor_training", config=training_cb_config
+            )
+        except ImportError:
+            logger.warning("[ReactorClient] CircuitBreaker not available, training CB disabled")
+            self._training_circuit_breaker = None
+
     async def initialize(self) -> bool:
         """
         Initialize the client and establish connection.
@@ -1041,6 +1058,10 @@ class ReactorCoreClient:
         - Experience count must meet threshold
         - Minimum interval enforced by trigger_training()
         """
+        # v2.1: Circuit breaker guard - skip if open after repeated failures
+        if self._training_circuit_breaker and not await self._training_circuit_breaker.can_execute():
+            return
+
         if not self.config.auto_trigger_enabled:
             return
         if not self.is_training_ready:
@@ -1090,6 +1111,9 @@ class ReactorCoreClient:
                 )
                 await self._emit_event("training_completed", job_data)
                 await self._write_bridge_event("training_completed", job_data)
+                # v2.1: Record success in circuit breaker
+                if self._training_circuit_breaker:
+                    await self._training_circuit_breaker.record_success()
                 self._active_job_id = None
 
             elif status == "failed":
@@ -1099,6 +1123,11 @@ class ReactorCoreClient:
                 )
                 await self._emit_event("training_failed", job_data)
                 await self._write_bridge_event("training_failed", job_data)
+                # v2.1: Record failure in circuit breaker
+                if self._training_circuit_breaker:
+                    await self._training_circuit_breaker.record_failure(
+                        f"Training job failed: {job.error}"
+                    )
                 self._active_job_id = None
 
             elif status == "running":
