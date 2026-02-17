@@ -356,10 +356,20 @@ class IntelligentActionOrchestrator:
 
     async def _init_components(self) -> None:
         """Initialize all components."""
-        # Core AGI OS components
-        self._event_stream = await get_event_stream()
-        self._approval_manager = await get_approval_manager()
-        self._voice = await get_voice_communicator()
+        # Core AGI OS components (v259.0: timeout to prevent indefinite hang)
+        _getter_timeout = float(os.environ.get("JARVIS_AGI_GETTER_TIMEOUT", "15"))
+        try:
+            self._event_stream = await asyncio.wait_for(get_event_stream(), timeout=_getter_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("get_event_stream() timed out after %.0fs", _getter_timeout)
+        try:
+            self._approval_manager = await asyncio.wait_for(get_approval_manager(), timeout=_getter_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("get_approval_manager() timed out after %.0fs", _getter_timeout)
+        try:
+            self._voice = await asyncio.wait_for(get_voice_communicator(), timeout=_getter_timeout)
+        except asyncio.TimeoutError:
+            logger.warning("get_voice_communicator() timed out after %.0fs", _getter_timeout)
 
         # Existing JARVIS components (lazy load to avoid circular imports)
         try:

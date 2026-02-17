@@ -150,10 +150,18 @@ class UnifiedRustService:
             'error_rates': {},
             'service_health': {}
         }
-        
+
+        # Background task tracking to prevent GC collection
+        self._background_tasks: set = set()
+
         # Initialize services
-        asyncio.create_task(self._initialize_services())
-        
+        _task = asyncio.create_task(
+            self._initialize_services(),
+            name="rust-service-init",
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
         logger.info("UnifiedRustService initialized")
     
     async def _initialize_services(self):
@@ -195,7 +203,12 @@ class UnifiedRustService:
                     logger.warning("Phase 3 system not available")
             
             # Start health monitoring
-            asyncio.create_task(self._monitor_health())
+            _task = asyncio.create_task(
+                self._monitor_health(),
+                name="rust-service-health-monitor",
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
             
         except Exception as e:
             logger.error(f"Error initializing services: {e}")

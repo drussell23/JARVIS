@@ -65,6 +65,9 @@ class SpeakerRecognitionEngine:
         # Owner profile (loaded from database)
         self.owner_profile: Optional[VoiceProfile] = None
 
+        # Background task tracking to prevent GC collection
+        self._background_tasks: set = set()
+
     async def initialize(self):
         """
         Initialize speaker recognition engine with FULLY ASYNC model loading.
@@ -392,9 +395,12 @@ class SpeakerRecognitionEngine:
                 )
 
                 # Update profile with new sample (continuous learning)
-                asyncio.create_task(
-                    self._update_profile_with_sample(best_match, embedding, audio_data)
+                _task = asyncio.create_task(
+                    self._update_profile_with_sample(best_match, embedding, audio_data),
+                    name="speaker-recog-update-profile",
                 )
+                self._background_tasks.add(_task)
+                _task.add_done_callback(self._background_tasks.discard)
 
                 return best_match, best_similarity
             else:

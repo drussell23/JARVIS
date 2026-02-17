@@ -11778,8 +11778,10 @@ class AsyncSystemManager:
                         db_config = json.load(f)
 
                     # Actual database connection and inspection
+                    # v259.0: Move blocking psycopg2.connect() to thread
                     import psycopg2
-                    conn = psycopg2.connect(
+                    conn = await asyncio.to_thread(
+                        psycopg2.connect,
                         host='127.0.0.1',
                         port=db_config['cloud_sql']['port'],
                         database=db_config['cloud_sql'].get('database', 'postgres'),
@@ -12201,8 +12203,9 @@ class AsyncSystemManager:
 
                     cloud_sql = config.get("cloud_sql", {})
 
-                    # Test connection
-                    proxy_conn = psycopg2.connect(
+                    # Test connection (v259.0: non-blocking)
+                    proxy_conn = await asyncio.to_thread(
+                        psycopg2.connect,
                         host=cloud_sql.get("host", "127.0.0.1"),
                         port=cloud_sql.get("port", 5432),
                         database=cloud_sql.get("database", "jarvis_learning"),

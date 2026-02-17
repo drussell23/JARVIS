@@ -3685,11 +3685,14 @@ class IntelligentKernelTakeover:
                 info.status = KernelHealthStatus.ZOMBIE
                 return info
 
-            # Get process info
+            # Get process info (v259.0: move blocking calls to executor)
             try:
-                info.cmdline = " ".join(proc.cmdline())
-                info.memory_mb = proc.memory_info().rss / (1024 * 1024)
-                info.cpu_percent = proc.cpu_percent(interval=0.1)
+                info.cmdline = " ".join(
+                    await asyncio.to_thread(proc.cmdline)
+                )
+                mem_info = await asyncio.to_thread(proc.memory_info)
+                info.memory_mb = mem_info.rss / (1024 * 1024)
+                info.cpu_percent = await asyncio.to_thread(proc.cpu_percent, 0.1)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
@@ -3710,9 +3713,9 @@ class IntelligentKernelTakeover:
             else:
                 # IPC failed - check if process is still doing something
                 try:
-                    # Give it a moment and check CPU
+                    # Give it a moment and check CPU (v259.0: non-blocking)
                     await asyncio.sleep(0.2)
-                    cpu = proc.cpu_percent(interval=0.2)
+                    cpu = await asyncio.to_thread(proc.cpu_percent, 0.2)
                     if cpu > 0:
                         # Process is doing something but IPC failed
                         info.status = KernelHealthStatus.DEGRADED
@@ -23325,7 +23328,7 @@ class GracefulDegradationManager:
             import psutil
 
             memory = psutil.virtual_memory()
-            cpu = psutil.cpu_percent(interval=0.1)
+            cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
 
             # Determine degradation level
             new_level = 0
@@ -42888,10 +42891,7 @@ class ResourcePoolManager:
         self._in_use: Dict[str, PooledResource] = {}
         self._all_resources: Dict[str, PooledResource] = {}
         self._maintenance_task: Optional[asyncio.Task] = None
-        self._logger = UnifiedLogger(
-            name=f"ResourcePool[{name}]",
-            config=config
-        )
+        self._logger = logging.getLogger(f"ResourcePool[{name}]")
         self._initialized = False
 
     async def initialize(self) -> bool:
@@ -72413,8 +72413,8 @@ class JarvisSystemKernel:
         try:
             import psutil
 
-            # Quick CPU and memory check (non-blocking)
-            cpu_percent = psutil.cpu_percent(interval=0.05)
+            # Quick CPU and memory check (v259.0: moved to executor)
+            cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.05)
             memory = psutil.virtual_memory()
 
             # Calculate load multiplier
@@ -72474,7 +72474,7 @@ class JarvisSystemKernel:
 
             diagnostics["system"] = {
                 "cpu_count": psutil.cpu_count(),
-                "cpu_percent": psutil.cpu_percent(interval=0.1),
+                "cpu_percent": await asyncio.to_thread(psutil.cpu_percent, 0.1),
                 "memory_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
                 "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
                 "memory_percent": psutil.virtual_memory().percent,
@@ -72619,7 +72619,7 @@ class JarvisSystemKernel:
 
             # CPU quota (informational)
             cpu_quota_percent = float(os.environ.get("JARVIS_CPU_QUOTA_PERCENT", "90"))
-            cpu_current = psutil.cpu_percent(interval=0.1)
+            cpu_current = await asyncio.to_thread(psutil.cpu_percent, 0.1)
             result["quotas"]["cpu"] = {
                 "current_percent": cpu_current,
                 "quota_percent": cpu_quota_percent,
@@ -74276,7 +74276,7 @@ class JarvisSystemKernel:
 
             # CPU check
             cpu_count = psutil.cpu_count()
-            cpu_percent = psutil.cpu_percent(interval=0.1)
+            cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.1)
 
             result["cpu"] = {
                 "count": cpu_count,

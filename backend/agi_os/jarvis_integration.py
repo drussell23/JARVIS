@@ -1523,8 +1523,8 @@ class DecisionEngineBridge:
         else:
             try:
                 from .voice_approval_manager import get_approval_manager
-                self._approval_manager = await get_approval_manager()
-            except Exception as e:
+                self._approval_manager = await asyncio.wait_for(get_approval_manager(), timeout=15.0)
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Could not get approval manager: %s", e)
 
         # Get or fetch event stream
@@ -1533,8 +1533,8 @@ class DecisionEngineBridge:
         else:
             try:
                 from .proactive_event_stream import get_event_stream
-                self._event_stream = await get_event_stream()
-            except Exception as e:
+                self._event_stream = await asyncio.wait_for(get_event_stream(), timeout=15.0)
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Could not get event stream: %s", e)
 
         # Get or fetch owner identity
@@ -1543,8 +1543,8 @@ class DecisionEngineBridge:
         else:
             try:
                 from .owner_identity_service import get_owner_identity
-                self._owner_identity = await get_owner_identity()
-            except Exception as e:
+                self._owner_identity = await asyncio.wait_for(get_owner_identity(), timeout=15.0)
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Could not get owner identity: %s", e)
 
         # Register decision handler
@@ -1608,8 +1608,8 @@ class VoiceSystemBridge:
         else:
             try:
                 from .realtime_voice_communicator import get_voice_communicator
-                self._voice = await get_voice_communicator()
-            except Exception as e:
+                self._voice = await asyncio.wait_for(get_voice_communicator(), timeout=15.0)
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Could not get voice communicator: %s", e)
                 return
 
@@ -1689,8 +1689,8 @@ class PermissionSystemBridge:
         else:
             try:
                 from .voice_approval_manager import get_approval_manager
-                self._approval_manager = await get_approval_manager()
-            except Exception as e:
+                self._approval_manager = await asyncio.wait_for(get_approval_manager(), timeout=15.0)
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Could not get approval manager: %s", e)
                 return
 
@@ -1793,8 +1793,8 @@ class NeuralMeshBridge:
         else:
             try:
                 from .proactive_event_stream import get_event_stream
-                self._event_stream = await get_event_stream()
-            except Exception as e:
+                self._event_stream = await asyncio.wait_for(get_event_stream(), timeout=15.0)
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Could not get event stream: %s", e)
                 return
 
@@ -1804,8 +1804,8 @@ class NeuralMeshBridge:
         else:
             try:
                 from .owner_identity_service import get_owner_identity
-                self._owner_identity = await get_owner_identity()
-            except Exception as e:
+                self._owner_identity = await asyncio.wait_for(get_owner_identity(), timeout=15.0)
+            except (asyncio.TimeoutError, Exception) as e:
                 logger.warning("Could not get owner identity: %s", e)
 
         # Get bus from coordinator for bidirectional bridging

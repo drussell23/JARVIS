@@ -31,6 +31,9 @@ class FastAppLauncher:
             "music": "Music",
             "photos": "Photos"
         }
+
+        # Background task tracking to prevent GC collection
+        self._background_tasks: set = set()
         
     async def quick_open_app(self, app_name: str) -> Tuple[bool, str]:
         """Quickly open app using direct system call"""
@@ -83,7 +86,12 @@ class FastAppLauncher:
             )
             
             # Don't wait for completion - just fire and forget
-            asyncio.create_task(self._wait_for_process(process))
+            _task = asyncio.create_task(
+                self._wait_for_process(process),
+                name="fast-launcher-wait-process",
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
             
             return True, f"Opening {app_name}"
             

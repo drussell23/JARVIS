@@ -111,6 +111,7 @@ class SelfHealingRestartManager:
     _last_health_check: float = field(init=False, default=0.0)
     _consecutive_failures: int = field(init=False, default=0)
     _shutdown_requested: bool = field(init=False, default=False)
+    _background_tasks: set = field(init=False, default_factory=set)
 
     async def start_watchdog(self) -> None:
         """Start the watchdog monitoring task."""
@@ -319,7 +320,12 @@ class SelfHealingRestartManager:
         Args:
             reason: Reason for the restart
         """
-        asyncio.create_task(self._handle_restart(reason))
+        _task = asyncio.create_task(
+            self._handle_restart(reason),
+            name="self-healing-handle-restart",
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
 
     def get_stats(self) -> Dict[str, Any]:
         """

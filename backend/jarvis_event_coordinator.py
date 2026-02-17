@@ -92,7 +92,10 @@ class JARVISEventCoordinator:
             
         # Workflow management
         self.active_workflows: Dict[str, WorkflowContext] = {}
-        
+
+        # Background task tracking to prevent GC collection
+        self._background_tasks: set = set()
+
         # Setup core event subscriptions
         self._setup_core_subscriptions()
         
@@ -309,12 +312,15 @@ class JARVISEventCoordinator:
         """Prepare systems for user interaction"""
         # Capture current screen for context
         if self.vision_system:
-            asyncio.create_task(
+            _task = asyncio.create_task(
                 self.vision_system.capture_and_analyze_with_events(
                     "Capture current screen context for conversation",
                     context={"session_start": True}
-                )
+                ),
+                name="coordinator-capture-screen-context",
             )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
             
     async def _process_command(self, command: str, confidence: float):
         """Process a voice command and coordinate response"""

@@ -998,10 +998,20 @@ class AdvancedAsyncPipeline:
                 EventPriority,
             )
 
-            # Get AGI OS components
-            self._agi_event_stream = await get_event_stream()
-            self._agi_voice = await get_voice_communicator()
-            self._agi_owner_service = await get_owner_identity()
+            # Get AGI OS components (v259.0: timeout to prevent indefinite hang)
+            _getter_timeout = float(os.environ.get("JARVIS_AGI_GETTER_TIMEOUT", "15"))
+            try:
+                self._agi_event_stream = await asyncio.wait_for(get_event_stream(), timeout=_getter_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("get_event_stream() timed out after %.0fs", _getter_timeout)
+            try:
+                self._agi_voice = await asyncio.wait_for(get_voice_communicator(), timeout=_getter_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("get_voice_communicator() timed out after %.0fs", _getter_timeout)
+            try:
+                self._agi_owner_service = await asyncio.wait_for(get_owner_identity(), timeout=_getter_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("get_owner_identity() timed out after %.0fs", _getter_timeout)
 
             # Subscribe to pipeline events from AGI OS
             async def handle_agi_event(event):

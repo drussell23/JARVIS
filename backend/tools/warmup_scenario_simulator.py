@@ -20,6 +20,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Module-level set to prevent GC of fire-and-forget background tasks
+_background_tasks: set = set()
+
 
 @dataclass
 class ScenarioResult:
@@ -382,7 +385,12 @@ class WarmupScenarioSimulator:
         start = time.time()
 
         # Wait for critical components only
-        asyncio.create_task(warmup.warmup_all())
+        _task = asyncio.create_task(
+            warmup.warmup_all(),
+            name="warmup-scenario-warmup-all",
+        )
+        _background_tasks.add(_task)
+        _task.add_done_callback(_background_tasks.discard)
         await warmup.wait_for_critical(timeout=5.0)
 
         critical_duration = time.time() - start

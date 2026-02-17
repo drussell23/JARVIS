@@ -2553,7 +2553,12 @@ class JARVISLearningDatabase:
         # Phase 3: Background enhancement (non-blocking)
         # Cloud SQL adapter starts in background - doesn't block startup
         if self._cloud_adapter_enabled and CLOUD_ADAPTER_AVAILABLE:
-            asyncio.create_task(self._background_cloud_sql_upgrade())
+            _task = asyncio.create_task(
+                self._background_cloud_sql_upgrade(),
+                name="learning-db-cloud-sql-upgrade",
+            )
+            self._background_tasks.append(_task)
+            _task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
         # Phase 4: Start background maintenance tasks
         flush_task = asyncio.create_task(self._auto_flush_batches())
@@ -4156,6 +4161,13 @@ class JARVISLearningDatabase:
 
         await self.db.commit()
 
+    # ==================== Database Helpers ====================
+
+    @property
+    def _is_cloud_db(self) -> bool:
+        """v259.0: Check if using Cloud SQL (PostgreSQL) backend."""
+        return isinstance(self.db, DatabaseConnectionWrapper) and self.db.is_cloud
+
     # ==================== Conversation History & Learning ====================
 
     async def record_interaction(
@@ -4260,15 +4272,18 @@ class JARVISLearningDatabase:
 
                 # Generate embeddings asynchronously (non-blocking)
                 if self.enable_ml:
-                    asyncio.create_task(
+                    _task = asyncio.create_task(
                         self._generate_conversation_embeddings(
                             interaction_id, embedding_id, user_query, jarvis_response
-                        )
+                        ),
+                        name="learning-db-gen-embeddings",
                     )
+                    self._background_tasks.append(_task)
+                    _task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
                 # v100.0: Forward experience to ContinuousLearningOrchestrator (non-blocking)
                 if self._orchestrator_enabled:
-                    asyncio.create_task(
+                    _task = asyncio.create_task(
                         self._forward_to_learning_orchestrator(
                             user_query=user_query,
                             jarvis_response=jarvis_response,
@@ -4276,8 +4291,11 @@ class JARVISLearningDatabase:
                             confidence_score=confidence_score,
                             success=success,
                             session_id=session_id,
-                        )
+                        ),
+                        name="learning-db-forward-orchestrator",
                     )
+                    self._background_tasks.append(_task)
+                    _task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
                 logger.debug(
                     f"Recorded interaction {interaction_id}: '{user_query[:50]}...' -> '{jarvis_response[:50]}...'"
@@ -4387,23 +4405,45 @@ class JARVISLearningDatabase:
 
                 original_response = row["jarvis_response"]
 
-                # Insert correction
-                await cursor.execute(
-                    """
-                    INSERT INTO interaction_corrections
-                    (interaction_id, original_response, corrected_response,
-                     correction_type, user_explanation, applied_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                    (
-                        interaction_id,
-                        original_response,
-                        corrected_response,
-                        correction_type,
-                        user_explanation,
-                        datetime.now(),
-                    ),
-                )
+                # v259.0: Insert correction — capture ID before UPDATE clobbers lastrowid
+                if self._is_cloud_db:
+                    await cursor.execute(
+                        """
+                        INSERT INTO interaction_corrections
+                        (interaction_id, original_response, corrected_response,
+                         correction_type, user_explanation, applied_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        RETURNING correction_id
+                    """,
+                        (
+                            interaction_id,
+                            original_response,
+                            corrected_response,
+                            correction_type,
+                            user_explanation,
+                            datetime.now(),
+                        ),
+                    )
+                    row = await cursor.fetchone()
+                    correction_id = row[0] if row else None
+                else:
+                    await cursor.execute(
+                        """
+                        INSERT INTO interaction_corrections
+                        (interaction_id, original_response, corrected_response,
+                         correction_type, user_explanation, applied_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            interaction_id,
+                            original_response,
+                            corrected_response,
+                            correction_type,
+                            user_explanation,
+                            datetime.now(),
+                        ),
+                    )
+                    correction_id = cursor.lastrowid
 
                 # Mark the original interaction as corrected
                 await cursor.execute(
@@ -4417,15 +4457,18 @@ class JARVISLearningDatabase:
 
                 await self.db.commit()
 
-                correction_id = cursor.lastrowid
-
                 logger.info(
                     f"Recorded correction {correction_id} for interaction {interaction_id}: "
                     f"{correction_type}"
                 )
 
                 # Extract learning pattern from correction (ML task)
-                asyncio.create_task(self._extract_correction_pattern(correction_id))
+                _task = asyncio.create_task(
+                    self._extract_correction_pattern(correction_id),
+                    name="learning-db-extract-correction",
+                )
+                self._background_tasks.append(_task)
+                _task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
                 return correction_id
 
@@ -4645,26 +4688,48 @@ class JARVISLearningDatabase:
 
             audio_hash = hashlib.sha256(audio_data).hexdigest()[:16]
 
+            # v259.0: Use RETURNING for PostgreSQL, lastrowid for SQLite
             async with self.db.cursor() as cursor:
-                await cursor.execute(
-                    """
-                    INSERT INTO voice_transcriptions
-                    (interaction_id, raw_audio_hash, transcribed_text, confidence_score,
-                     audio_duration_ms, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                    (
-                        interaction_id,
-                        audio_hash,
-                        transcribed_text,
-                        confidence_score,
-                        audio_duration_ms,
-                        datetime.now(),
-                    ),
-                )
+                if self._is_cloud_db:
+                    await cursor.execute(
+                        """
+                        INSERT INTO voice_transcriptions
+                        (interaction_id, raw_audio_hash, transcribed_text, confidence_score,
+                         audio_duration_ms, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        RETURNING transcription_id
+                    """,
+                        (
+                            interaction_id,
+                            audio_hash,
+                            transcribed_text,
+                            confidence_score,
+                            audio_duration_ms,
+                            datetime.now(),
+                        ),
+                    )
+                    row = await cursor.fetchone()
+                    transcription_id = row[0] if row else None
+                else:
+                    await cursor.execute(
+                        """
+                        INSERT INTO voice_transcriptions
+                        (interaction_id, raw_audio_hash, transcribed_text, confidence_score,
+                         audio_duration_ms, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            interaction_id,
+                            audio_hash,
+                            transcribed_text,
+                            confidence_score,
+                            audio_duration_ms,
+                            datetime.now(),
+                        ),
+                    )
+                    transcription_id = cursor.lastrowid
 
                 await self.db.commit()
-                transcription_id = cursor.lastrowid
 
                 logger.debug(
                     f"🎤 Recorded voice transcription {transcription_id}: '{transcribed_text[:50]}...'"
@@ -4704,33 +4769,59 @@ class JARVISLearningDatabase:
                     what_jarvis_heard, what_user_meant
                 )
 
-                # Insert misheard record
-                await cursor.execute(
-                    """
-                    INSERT INTO misheard_queries
-                    (transcription_id, what_jarvis_heard, what_user_meant,
-                     correction_method, phonetic_distance, occurred_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                    (
-                        transcription_id,
-                        what_jarvis_heard,
-                        what_user_meant,
-                        correction_method,
-                        phonetic_distance,
-                        datetime.now(),
-                    ),
-                )
+                # v259.0: Insert misheard record — use RETURNING for PostgreSQL
+                if self._is_cloud_db:
+                    await cursor.execute(
+                        """
+                        INSERT INTO misheard_queries
+                        (transcription_id, what_jarvis_heard, what_user_meant,
+                         correction_method, phonetic_distance, occurred_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        RETURNING misheard_id
+                    """,
+                        (
+                            transcription_id,
+                            what_jarvis_heard,
+                            what_user_meant,
+                            correction_method,
+                            phonetic_distance,
+                            datetime.now(),
+                        ),
+                    )
+                    row = await cursor.fetchone()
+                    misheard_id = row[0] if row else None
+                else:
+                    await cursor.execute(
+                        """
+                        INSERT INTO misheard_queries
+                        (transcription_id, what_jarvis_heard, what_user_meant,
+                         correction_method, phonetic_distance, occurred_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            transcription_id,
+                            what_jarvis_heard,
+                            what_user_meant,
+                            correction_method,
+                            phonetic_distance,
+                            datetime.now(),
+                        ),
+                    )
+                    misheard_id = cursor.lastrowid
 
                 await self.db.commit()
-                misheard_id = cursor.lastrowid
 
                 logger.info(
                     f"🎤 MISHEARD: Heard '{what_jarvis_heard}' but user meant '{what_user_meant}' (distance={phonetic_distance})"
                 )
 
                 # Trigger acoustic adaptation learning
-                asyncio.create_task(self._learn_acoustic_pattern(misheard_id))
+                _task = asyncio.create_task(
+                    self._learn_acoustic_pattern(misheard_id),
+                    name="learning-db-acoustic-pattern",
+                )
+                self._background_tasks.append(_task)
+                _task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
                 return misheard_id
 
@@ -5246,25 +5337,45 @@ class JARVISLearningDatabase:
                     (original_transcription_id, retry_transcription_id),
                 )
 
-                # Insert retry record
-                await cursor.execute(
-                    """
-                    INSERT INTO query_retries
-                    (original_transcription_id, retry_transcription_id, retry_number,
-                     time_between_retries_ms, timestamp)
-                    VALUES (?, ?, ?, ?, ?)
-                """,
-                    (
-                        original_transcription_id,
-                        retry_transcription_id,
-                        retry_number,
-                        time_between_ms,
-                        datetime.now(),
-                    ),
-                )
+                # v259.0: Insert retry record — use RETURNING for PostgreSQL
+                if self._is_cloud_db:
+                    await cursor.execute(
+                        """
+                        INSERT INTO query_retries
+                        (original_transcription_id, retry_transcription_id, retry_number,
+                         time_between_retries_ms, timestamp)
+                        VALUES (?, ?, ?, ?, ?)
+                        RETURNING retry_id
+                    """,
+                        (
+                            original_transcription_id,
+                            retry_transcription_id,
+                            retry_number,
+                            time_between_ms,
+                            datetime.now(),
+                        ),
+                    )
+                    row = await cursor.fetchone()
+                    retry_id = row[0] if row else None
+                else:
+                    await cursor.execute(
+                        """
+                        INSERT INTO query_retries
+                        (original_transcription_id, retry_transcription_id, retry_number,
+                         time_between_retries_ms, timestamp)
+                        VALUES (?, ?, ?, ?, ?)
+                    """,
+                        (
+                            original_transcription_id,
+                            retry_transcription_id,
+                            retry_number,
+                            time_between_ms,
+                            datetime.now(),
+                        ),
+                    )
+                    retry_id = cursor.lastrowid
 
                 await self.db.commit()
-                retry_id = cursor.lastrowid
 
                 logger.warning(f"🔁 Query retry #{retry_number} detected (gap={time_between_ms}ms)")
 
@@ -6530,14 +6641,18 @@ class JARVISLearningDatabase:
         now = datetime.now()
 
         try:
-            async with self.db.execute(
-                """
+            # v259.0: Use RETURNING for PostgreSQL, lastrowid for SQLite
+            _sql = """
                 INSERT INTO workspace_usage (
                     space_id, space_label, app_name, window_title,
                     window_position, focus_duration_seconds, timestamp,
                     day_of_week, hour_of_day, is_fullscreen, metadata
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            """
+            if self._is_cloud_db:
+                _sql += " RETURNING usage_id"
+            async with self.db.execute(
+                _sql,
                 (
                     space_id,
                     None,  # space_label can be updated separately
@@ -6553,6 +6668,9 @@ class JARVISLearningDatabase:
                 ),
             ) as cursor:
                 await self.db.commit()
+                if self._is_cloud_db:
+                    row = await cursor.fetchone()
+                    return row[0] if row else None
                 return cursor.lastrowid
 
         except Exception as e:
@@ -6724,15 +6842,19 @@ class JARVISLearningDatabase:
 
             else:
                 # Create new workflow
-                async with self.db.execute(
-                    """
+                # v259.0: Use RETURNING for PostgreSQL, lastrowid for SQLite
+                _wf_sql = """
                     INSERT INTO user_workflows (
                         workflow_name, action_sequence, space_sequence,
                         app_sequence, frequency, avg_duration, success_rate,
                         first_seen, last_seen, time_of_day_pattern,
                         confidence, metadata
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """
+                if self._is_cloud_db:
+                    _wf_sql += " RETURNING workflow_id"
+                async with self.db.execute(
+                    _wf_sql,
                     (
                         workflow_name,
                         json.dumps(action_sequence),
@@ -6749,6 +6871,9 @@ class JARVISLearningDatabase:
                     ),
                 ) as cursor:
                     await self.db.commit()
+                    if self._is_cloud_db:
+                        row = await cursor.fetchone()
+                        return row[0] if row else None
                     return cursor.lastrowid
 
         except Exception as e:
@@ -6901,15 +7026,19 @@ class JARVISLearningDatabase:
                     return beh_id
                 else:
                     # Create new
-                    async with self.db.execute(
-                        """
+                    # v259.0: Use RETURNING for PostgreSQL, lastrowid for SQLite
+                    _bp_sql = """
                         INSERT INTO behavioral_patterns (
                             behavior_type, behavior_description, pattern_data,
                             frequency, confidence, temporal_pattern,
                             contextual_triggers, first_observed, last_observed,
                             prediction_accuracy, metadata
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+                    """
+                    if self._is_cloud_db:
+                        _bp_sql += " RETURNING behavior_id"
+                    async with self.db.execute(
+                        _bp_sql,
                         (
                             behavior_type,
                             description,
@@ -6925,6 +7054,9 @@ class JARVISLearningDatabase:
                         ),
                     ) as cursor:
                         await self.db.commit()
+                        if self._is_cloud_db:
+                            row = await cursor.fetchone()
+                            return row[0] if row else None
                         return cursor.lastrowid
 
         except Exception as e:
@@ -7057,15 +7189,19 @@ class JARVISLearningDatabase:
         try:
             # CRITICAL FIX: Use _db_lock to prevent concurrent database access
             async with self._db_lock:
-                async with self.db.execute(
-                    """
+                # v259.0: Use RETURNING for PostgreSQL, lastrowid for SQLite
+                _ps_sql = """
                     INSERT INTO proactive_suggestions (
                         suggestion_type, suggestion_text, trigger_pattern_id,
                         confidence, times_suggested, times_accepted,
                         times_rejected, acceptance_rate, created_at,
                         last_suggested, metadata
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """
+                if self._is_cloud_db:
+                    _ps_sql += " RETURNING suggestion_id"
+                async with self.db.execute(
+                    _ps_sql,
                     (
                         suggestion_type,
                         suggestion_text,
@@ -7081,6 +7217,9 @@ class JARVISLearningDatabase:
                     ),
                 ) as cursor:
                     await self.db.commit()
+                    if self._is_cloud_db:
+                        row = await cursor.fetchone()
+                        return row[0] if row else None
                     return cursor.lastrowid
 
         except Exception as e:
@@ -7726,7 +7865,12 @@ class JARVISLearningDatabase:
             # v83.0: Sync profiles with acoustic features to SQLite cache
             # This ensures SQLite has the latest data when Cloud SQL becomes unavailable
             if profiles and isinstance(self.db, DatabaseConnectionWrapper):
-                asyncio.create_task(self._sync_profiles_to_sqlite_cache(profiles))
+                _task = asyncio.create_task(
+                    self._sync_profiles_to_sqlite_cache(profiles),
+                    name="learning-db-sync-profiles-cache",
+                )
+                self._background_tasks.append(_task)
+                _task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
             return profiles
 
@@ -7928,15 +8072,19 @@ class JARVISLearningDatabase:
                         await conn.commit()
 
             # Local SQLite storage
-            async with self.db.execute(
-                """
+            # v259.0: Use RETURNING for PostgreSQL, lastrowid for SQLite
+            _vs_sql = """
                 INSERT INTO voice_samples (
                     speaker_name, audio_data, embedding,
                     verification_confidence, verification_result,
                     command, transcription, environment_type,
                     quality_score, metadata
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+            """
+            if self._is_cloud_db:
+                _vs_sql += " RETURNING sample_id"
+            async with self.db.execute(
+                _vs_sql,
                 (
                     speaker_name, audio_data, embedding_bytes,
                     confidence, verified, command, transcription,
@@ -7945,7 +8093,11 @@ class JARVISLearningDatabase:
                 )
             ) as cursor:
                 await self.db.commit()
-                local_sample_id = cursor.lastrowid
+                if self._is_cloud_db:
+                    row = await cursor.fetchone()
+                    local_sample_id = row[0] if row else None
+                else:
+                    local_sample_id = cursor.lastrowid
 
             logger.info(f"✅ Stored voice sample for {speaker_name} (confidence: {confidence:.2%}, verified: {verified})")
 
