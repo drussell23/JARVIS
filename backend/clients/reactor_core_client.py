@@ -1065,6 +1065,51 @@ class ReactorCoreClient:
         except Exception as e:
             logger.warning(f"[ReactorClient] Auto-trigger check error: {e}")
 
+    async def _poll_active_job(self) -> None:
+        """
+        v2.1: Poll the active training job for completion/failure.
+
+        Called from health monitor loop. Updates _active_job_id state
+        and emits events on job completion or failure.
+        """
+        if not self._active_job_id:
+            return
+
+        try:
+            job = await self.get_training_job(self._active_job_id)
+            if not job:
+                return
+
+            status = job.status
+
+            if status == "completed":
+                job_data = job.to_dict()
+                logger.info(
+                    f"[ReactorClient] Training job {self._active_job_id} completed: "
+                    f"metrics={job.metrics}"
+                )
+                await self._emit_event("training_completed", job_data)
+                await self._write_bridge_event("training_completed", job_data)
+                self._active_job_id = None
+
+            elif status == "failed":
+                job_data = job.to_dict()
+                logger.error(
+                    f"[ReactorClient] Training job {self._active_job_id} failed: {job.error}"
+                )
+                await self._emit_event("training_failed", job_data)
+                await self._write_bridge_event("training_failed", job_data)
+                self._active_job_id = None
+
+            elif status == "running":
+                stage = job.stage.value if hasattr(job.stage, 'value') else str(job.stage)
+                logger.debug(
+                    f"[ReactorClient] Training job {self._active_job_id}: {status}/{stage}"
+                )
+
+        except Exception as e:
+            logger.warning(f"[ReactorClient] Job poll error: {e}")
+
     async def _health_monitor_loop(self) -> None:
         """
         v2.0: Adaptive background health monitoring loop.
@@ -1088,6 +1133,9 @@ class ReactorCoreClient:
                 if healthy:
                     # v2.1: Check experience count and auto-trigger training
                     await self._check_and_auto_trigger()
+
+                # v2.1: Poll active training job
+                await self._poll_active_job()
 
                 if not healthy:
                     # v2.0: Increase interval on failures (back off)

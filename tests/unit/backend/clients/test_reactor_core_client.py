@@ -324,3 +324,62 @@ class TestHealthMonitorAutoTrigger:
         with patch.object(client, 'get_experience_count', new_callable=AsyncMock) as mock_count:
             await client._check_and_auto_trigger()
             mock_count.assert_not_called()
+
+
+# =========================================================================
+# Tests -- Training Job Polling (v2.1)
+# =========================================================================
+
+class TestJobPolling:
+    """Verify health monitor polls active training jobs."""
+
+    async def test_poll_detects_completed_job(self, client):
+        """Poll should clear active_job_id when job completes."""
+        client._active_job_id = "test-job-123"
+
+        mock_job = MagicMock()
+        mock_job.status = "completed"
+        mock_job.metrics = {"loss": 0.5}
+        mock_job.to_dict.return_value = {"job_id": "test-job-123", "status": "completed", "metrics": {"loss": 0.5}}
+
+        with patch.object(client, 'get_training_job', new_callable=AsyncMock, return_value=mock_job):
+            with patch.object(client, '_emit_event', new_callable=AsyncMock) as mock_emit:
+                with patch.object(client, '_write_bridge_event', new_callable=AsyncMock) as mock_bridge:
+                    await client._poll_active_job()
+                    mock_emit.assert_called_once_with("training_completed", mock_job.to_dict())
+                    mock_bridge.assert_called_once_with("training_completed", mock_job.to_dict())
+        assert client._active_job_id is None
+
+    async def test_poll_detects_failed_job(self, client):
+        """Poll should clear active_job_id and log error when job fails."""
+        client._active_job_id = "test-job-456"
+
+        mock_job = MagicMock()
+        mock_job.status = "failed"
+        mock_job.error = "OOM"
+        mock_job.to_dict.return_value = {"job_id": "test-job-456", "status": "failed", "error": "OOM"}
+
+        with patch.object(client, 'get_training_job', new_callable=AsyncMock, return_value=mock_job):
+            with patch.object(client, '_emit_event', new_callable=AsyncMock) as mock_emit:
+                with patch.object(client, '_write_bridge_event', new_callable=AsyncMock) as mock_bridge:
+                    await client._poll_active_job()
+                    mock_emit.assert_called_once_with("training_failed", mock_job.to_dict())
+                    mock_bridge.assert_called_once_with("training_failed", mock_job.to_dict())
+        assert client._active_job_id is None
+
+    async def test_poll_keeps_running_job(self, client):
+        """Poll should keep active_job_id for running jobs."""
+        client._active_job_id = "test-job-789"
+
+        mock_job = MagicMock()
+        mock_job.status = "running"
+        mock_job.stage = MagicMock(value="training")
+
+        with patch.object(client, 'get_training_job', new_callable=AsyncMock, return_value=mock_job):
+            await client._poll_active_job()
+            assert client._active_job_id == "test-job-789"
+
+    async def test_poll_noop_when_no_active_job(self, client):
+        """Poll should do nothing when no active job."""
+        client._active_job_id = None
+        await client._poll_active_job()  # Should not raise
