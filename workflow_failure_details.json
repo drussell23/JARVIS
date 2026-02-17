@@ -1,0 +1,65 @@
+{
+  "workflow_name": "Secret Scanning",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/21553947817",
+  "branch": "feature/unified-kernel",
+  "commit_sha": "294eb7d",
+  "run_number": 1928,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/secret-scanning-run1928-20260201-010745",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Secret Scanning (Run #1928)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2026-02-01T01:06:42.4265928Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 76,
+              "content": "2026-02-01T01:06:42.0676234Z ##[warning]\ud83d\uded1 Leaks detected, see job summary for details",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 82,
+              "content": "2026-02-01T01:06:42.0772960Z   if-no-files-found: warn",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 87,
+              "content": "2026-02-01T01:06:42.2813991Z ##[warning]No files were found with the provided path: gitleaks-report.json. No artifacts will be uploaded.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2026-02-01T01:06:42.4265928Z ##[warning]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 4
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2026-02-01T01:07:45.895294"
+}
