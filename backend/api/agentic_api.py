@@ -43,6 +43,8 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from backend.core.secure_logging import sanitize_for_log
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agentic", tags=["agentic"])
@@ -327,7 +329,7 @@ async def execute_goal(request: Request, body: ExecuteGoalRequest) -> ExecuteGoa
     task_id = str(uuid4())
     start_time = time.time()
 
-    logger.info(f"[AgenticAPI] Execute goal: {body.goal[:50]}...")
+    logger.info(f"[AgenticAPI] Execute goal: {sanitize_for_log(body.goal, 50)}...")
 
     runner = get_agentic_runner(request)
     vbia = get_vbia_adapter(request)
@@ -415,7 +417,7 @@ async def route_command(request: Request, body: RouteCommandRequest) -> RouteCom
     This parses wake words, classifies intent, performs VBIA authentication,
     and optionally executes the command via the appropriate backend.
     """
-    logger.info(f"[AgenticAPI] Route command: {body.command[:50]}...")
+    logger.info(f"[AgenticAPI] Route command: {sanitize_for_log(body.command, 50)}...")
 
     router_obj = get_tiered_router(request)
     vbia = get_vbia_adapter(request)

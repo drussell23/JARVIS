@@ -35,6 +35,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from backend.core.secure_logging import sanitize_for_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -161,7 +163,7 @@ class BroadcastConnectionManager:
         )
         
         success_count = sum(1 for r in results if r is True)
-        logger.info(f"📡 Broadcast to {success_count}/{len(connections)} clients: {message.get('type', 'unknown')}")
+        logger.info(f"📡 Broadcast to {success_count}/{len(connections)} clients: {sanitize_for_log(message.get('type', 'unknown'), 64)}")
         
         return success_count
     

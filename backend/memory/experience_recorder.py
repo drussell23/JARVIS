@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.core.secure_logging import sanitize_for_log
 
 try:
     import aiofiles
@@ -324,7 +325,7 @@ class ExperienceRecorder:
 
             logger.debug(
                 f"[EXPERIENCE-RECORDER] Linked outcome to pending record "
-                f"{record_id[:8]}... ({outcome.signal.value})"
+                f"{sanitize_for_log(record_id, 8)}... ({sanitize_for_log(outcome.signal.value, 30)})"
             )
             return True
 
@@ -339,8 +340,8 @@ class ExperienceRecorder:
         self._metrics.late_outcomes += 1
 
         logger.debug(
-            f"[EXPERIENCE-RECORDER] Late outcome update for {record_id[:8]}... "
-            f"({outcome.signal.value})"
+            f"[EXPERIENCE-RECORDER] Late outcome update for {sanitize_for_log(record_id, 8)}... "
+            f"({sanitize_for_log(outcome.signal.value, 30)})"
         )
         return True
 

@@ -91,6 +91,7 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.core.secure_logging import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -564,7 +565,7 @@ class UnifiedVoiceOrchestrator:
             return False
 
         if not self.config.enabled:
-            logger.debug(f"🔇 Voice disabled, skipping: {text[:50]}...")
+            logger.debug(f"🔇 Voice disabled, skipping: {sanitize_for_log(text, 50)}")
             return False
         
         # v2.0: Infer topic if not provided
@@ -584,7 +585,7 @@ class UnifiedVoiceOrchestrator:
 
         # Check deduplication (exact match)
         if self.config.dedup_enabled and self._is_duplicate(message):
-            logger.debug(f"🔇 Deduplicated (exact): {text[:50]}...")
+            logger.debug(f"🔇 Deduplicated (exact): {sanitize_for_log(text, 50)}")
             self._metrics.messages_deduplicated += 1
             if completion_event:
                 completion_event.set()  # Don't leave caller waiting
@@ -595,7 +596,7 @@ class UnifiedVoiceOrchestrator:
             similarity = self._context.get_semantic_similarity(message)
             if similarity > self.config.semantic_similarity_threshold:
                 logger.debug(
-                    f"🔇 Deduplicated (semantic, {similarity:.2f}): {text[:50]}..."
+                    f"🔇 Deduplicated (semantic, {similarity:.2f}): {sanitize_for_log(text, 50)}"
                 )
                 self._metrics.messages_deduplicated += 1
                 if completion_event:
@@ -608,7 +609,7 @@ class UnifiedVoiceOrchestrator:
                 inferred_topic, self.config.topic_cooldown_seconds
             ):
                 logger.debug(
-                    f"🔇 Topic on cooldown ({inferred_topic.value}): {text[:50]}..."
+                    f"🔇 Topic on cooldown ({inferred_topic.value}): {sanitize_for_log(text, 50)}"
                 )
                 self._metrics.messages_skipped += 1
                 if completion_event:
@@ -621,7 +622,7 @@ class UnifiedVoiceOrchestrator:
             and priority == VoicePriority.LOW
             and self._queue.qsize() > self.config.max_queue_size // 2
         ):
-            logger.debug(f"🔇 Queue busy, skipping low priority: {text[:50]}...")
+            logger.debug(f"🔇 Queue busy, skipping low priority: {sanitize_for_log(text, 50)}")
             self._metrics.messages_skipped += 1
             if completion_event:
                 completion_event.set()
@@ -639,7 +640,7 @@ class UnifiedVoiceOrchestrator:
 
             logger.debug(
                 f"🔊 Queued ({priority.name}, {source.value}, {inferred_topic.value}): "
-                f"{text[:50]}... (queue size: {self._queue.qsize()})"
+                f"{sanitize_for_log(text, 50)} (queue size: {self._queue.qsize()})"
             )
 
             # Handle critical interrupt
@@ -701,7 +702,7 @@ class UnifiedVoiceOrchestrator:
         Use for optional announcements that shouldn't interrupt.
         """
         if self.is_speaking() or self._queue.qsize() > 0:
-            logger.debug(f"🔇 Busy, skipping optional: {text[:50]}...")
+            logger.debug(f"🔇 Busy, skipping optional: {sanitize_for_log(text, 50)}")
             return False
         return await self.speak(text, priority, source, topic=topic)
     

@@ -468,6 +468,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
+# v242.2: Centralized log sanitization for CWE-117 (log injection) prevention
+try:
+    from backend.core.secure_logging import sanitize_for_log
+except ImportError:
+    # Minimal inline fallback so the module still loads
+    import re as _re_sfl
+    def sanitize_for_log(val, max_len: int = 200) -> str:
+        return _re_sfl.sub(r'[\x00-\x1f\x7f]', '', str(val))[:max_len]
+
 # v210.0: Import safe task wrapper to prevent "Future exception was never retrieved"
 try:
     from backend.core.async_safety import create_safe_task
@@ -2743,7 +2752,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                     jarvis_api = voice.get("jarvis_api")
                     if jarvis_api:
                         await jarvis_api.speak({"text": text})
-                        logger.debug(f"[PROACTIVE-VOICE] Spoke: {text}")
+                        logger.debug(f"[PROACTIVE-VOICE] Spoke: {sanitize_for_log(text, 100)}")
                     else:
                         logger.warning("[PROACTIVE-VOICE] JARVIS API not available")
                 except Exception as e:
@@ -2754,7 +2763,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
                 """Notification callback for proactive suggestions"""
                 try:
                     # Log notification (can be extended to use macOS notifications)
-                    logger.info(f"[PROACTIVE-NOTIFY] [{priority.upper()}] {title}: {message}")
+                    logger.info(f"[PROACTIVE-NOTIFY] [{sanitize_for_log(priority, 20).upper()}] {sanitize_for_log(title, 80)}: {sanitize_for_log(message, 200)}")
                     # Future: Can integrate with macOS notification center
                     # osascript -e 'display notification "message" with title "title"'
                 except Exception as e:
@@ -3504,7 +3513,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         # Define activation callback that sends to WebSocket clients
         async def wake_word_activation_callback(data):
             """Handle wake word activation"""
-            logger.info(f"Wake word activated: {data}")
+            logger.info(f"Wake word activated: {sanitize_for_log(data)}")
             # This will be sent through WebSocket to connected clients
             # The frontend will handle the actual response
 
@@ -7593,10 +7602,11 @@ async def process_command(request: dict):
 
     if is_lock_command:
         logger.info(f"[MAIN] 🔒 LOCK command detected - DIRECT EXECUTION")
-        logger.info(f"[MAIN]    Original: '{command}'")
-        logger.info(f"[MAIN]    Cleaned:  '{cleaned_command}'")
+        logger.info(f"[MAIN]    Original: '{sanitize_for_log(command, 100)}'")
+        logger.info(f"[MAIN]    Cleaned:  '{sanitize_for_log(cleaned_command, 100)}'")
         if wake_phrase_detected:
-            logger.info(f"[MAIN]    Wake phrase removed: '{wake_phrase_detected}'")
+            logger.info(f"[MAIN]    Wake phrase removed: '{sanitize_for_log(wake_phrase_detected, 50)}'")
+
 
         try:
             from api.unified_command_processor import UnifiedCommandProcessor
@@ -7631,7 +7641,7 @@ async def process_command(request: dict):
             try:
                 # Predict and preload next 1-3 components in background
                 create_safe_task(mgr.predict_and_preload(command, steps_ahead=3))
-                logger.debug(f"🔮 Advanced preloading triggered for: '{command[:50]}'")
+                logger.debug(f"🔮 Advanced preloading triggered for: '{sanitize_for_log(command, 50)}'")
             except Exception as e:
                 logger.debug(f"Advanced preloading failed: {e}")
 
@@ -8934,7 +8944,7 @@ async def ensure_uae_loaded(app_state):
                 jarvis_api = voice.get("jarvis_api")
                 if jarvis_api:
                     await jarvis_api.speak({"text": text})
-                    logger.debug(f"[PROACTIVE-VOICE] Spoke: {text}")
+                    logger.debug(f"[PROACTIVE-VOICE] Spoke: {sanitize_for_log(text, 100)}")
             except Exception as e:
                 logger.error(f"[PROACTIVE-VOICE] Error: {e}")
 
@@ -8942,7 +8952,7 @@ async def ensure_uae_loaded(app_state):
         async def notification_callback(title: str, message: str, priority: str = "low"):
             """Notification callback for proactive suggestions"""
             try:
-                logger.info(f"[PROACTIVE-NOTIFY] [{priority.upper()}] {title}: {message}")
+                logger.info(f"[PROACTIVE-NOTIFY] [{sanitize_for_log(priority, 20).upper()}] {sanitize_for_log(title, 80)}: {sanitize_for_log(message, 200)}")
             except Exception as e:
                 logger.error(f"[PROACTIVE-NOTIFY] Error: {e}")
 

@@ -76,6 +76,7 @@ from typing import (
 )
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.core.secure_logging import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -2435,7 +2436,7 @@ def create_coding_council_router():
             )
 
             task_id = evo_request.id
-            logger.info(f"🧬 [Evolution] Task {task_id} created: {request.description[:50]}...")
+            logger.info(f"🧬 [Evolution] Task {task_id} created: {sanitize_for_log(request.description, 50)}...")
 
             # ═══════════════════════════════════════════════════════════════════
             # Define the comprehensive evolution pipeline
@@ -3153,7 +3154,7 @@ def create_coding_council_router():
                 # Keep connection alive and handle incoming messages
                 data = await websocket.receive_text()
                 # Could handle commands via WebSocket here
-                logger.debug(f"[WS] Received: {data}")
+                logger.debug(f"[WS] Received: {sanitize_for_log(data)}")
 
         except WebSocketDisconnect:
             await broadcaster.unregister_client(websocket)

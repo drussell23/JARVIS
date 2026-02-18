@@ -47,6 +47,8 @@ from pydantic import BaseModel, Field
 import numpy as np
 import psutil
 
+from backend.core.secure_logging import sanitize_for_log
+
 logger = logging.getLogger(__name__)
 
 # Try to import ML dependencies
@@ -1134,7 +1136,7 @@ async def handle_audio_error(request: AudioErrorRequest):
             # Fall through to fallback handler
     
     # Enhanced fallback error handler with self-healing
-    logger.info(f"Audio error (fallback): {request.error_code} from {request.browser}")
+    logger.info(f"Audio error (fallback): {sanitize_for_log(request.error_code, 64)} from {sanitize_for_log(request.browser, 64)}")
     
     # Apply self-healing
     healing_result = await self_healer.heal(request.error_code, request.dict())
@@ -1445,7 +1447,7 @@ async def predict_audio_issue(data: AudioPrediction, request: Request):
 @router.post("/telemetry")
 async def receive_telemetry(request: AudioTelemetryRequest):
     """Receive telemetry data from client"""
-    logger.info(f"Audio telemetry: {request.event} - {request.data}")
+    logger.info(f"Audio telemetry: {sanitize_for_log(request.event, 64)} - {sanitize_for_log(str(request.data), 100)}")
     
     if ML_AVAILABLE:
         try:

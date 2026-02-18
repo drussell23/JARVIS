@@ -15,6 +15,8 @@ import platform
 from datetime import datetime
 import random
 
+from backend.core.secure_logging import sanitize_for_log
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/network", tags=["Network Recovery"])
@@ -53,7 +55,7 @@ class NetworkRecoveryAPI:
         
     async def diagnose_network(self, request: NetworkDiagnosisRequest) -> Dict:
         """Diagnose network issues and attempt recovery"""
-        logger.info(f"Network diagnosis requested for error: {request.error}")
+        logger.info(f"Network diagnosis requested for error: {sanitize_for_log(request.error, 100)}")
         
         diagnosis = {
             "recovered": False,

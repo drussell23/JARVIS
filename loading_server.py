@@ -141,6 +141,8 @@ import signal
 import aiohttp
 from aiohttp import web, WSCloseCode
 
+from backend.core.secure_logging import sanitize_for_log
+
 # Configure logging with structured format
 logging.basicConfig(
     level=logging.INFO,
@@ -1982,10 +1984,10 @@ class DynamicPathResolver:
             full_path = base / filename
             if full_path.exists() and full_path.is_file():
                 self._cache[filename] = full_path
-                logger.debug(f"[PathResolver] Resolved {filename} -> {full_path}")
+                logger.debug(f"[PathResolver] Resolved {sanitize_for_log(filename, 200)} -> {full_path}")
                 return full_path
 
-        logger.warning(f"[PathResolver] Could not resolve: {filename}")
+        logger.warning(f"[PathResolver] Could not resolve: {sanitize_for_log(filename, 200)}")
         logger.debug(f"[PathResolver] Searched paths: {self._base_paths}")
         return None
 
@@ -3745,7 +3747,7 @@ class GracefulShutdownManager:
             return
 
         self._shutdown_initiated = True
-        logger.info(f"[GracefulShutdown] Initiating shutdown (reason={reason})")
+        logger.info(f"[GracefulShutdown] Initiating shutdown (reason={sanitize_for_log(reason, 64)})")
 
         # Signal the shutdown event
         self._shutdown_event.set()
@@ -4293,7 +4295,7 @@ async def update_progress_endpoint(request: web.Request) -> web.Response:
 
         # Log significant changes
         if changed:
-            logger.info(f"[Progress] {progress_state.progress:.0f}% - {stage}: {message}")
+            logger.info(f"[Progress] {progress_state.progress:.0f}% - {sanitize_for_log(stage, 32)}: {sanitize_for_log(message, 100)}")
 
         # Notify shutdown manager when startup completes
         # This enables intelligent auto-shutdown when browser disconnects
@@ -4412,7 +4414,7 @@ async def force_shutdown_endpoint(request: web.Request) -> web.Response:
         except (json.JSONDecodeError, ValueError):
             reason = 'force_requested'
 
-        logger.warning(f"[Shutdown] Force shutdown requested: {reason}")
+        logger.warning(f"[Shutdown] Force shutdown requested: {sanitize_for_log(reason, 64)}")
 
         # Directly initiate shutdown without waiting
         await shutdown_manager._initiate_shutdown(f"force_{reason}")
@@ -4498,7 +4500,7 @@ async def update_zero_touch_status(request: web.Request) -> web.Response:
         }
         await connection_manager.broadcast(broadcast_data)
         
-        logger.info(f"[Zero-Touch] {event_type}: {progress_state.zero_touch.message}")
+        logger.info(f"[Zero-Touch] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(progress_state.zero_touch.message, 100)}")
         
         return web.json_response({
             "status": "ok",
@@ -4562,7 +4564,7 @@ async def update_dms_status(request: web.Request) -> web.Response:
         await connection_manager.broadcast(broadcast_data)
         
         if event_type != 'dms_heartbeat':
-            logger.info(f"[DMS] {event_type}: {data.get('message', '')}")
+            logger.info(f"[DMS] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(data.get('message', ''), 100)}")
         
         return web.json_response({
             "status": "ok",
@@ -4681,7 +4683,7 @@ async def update_two_tier_status(request: web.Request) -> web.Response:
         }
         await connection_manager.broadcast(broadcast_data)
 
-        logger.info(f"[Two-Tier] {event_type}: {progress_state.two_tier.message}")
+        logger.info(f"[Two-Tier] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(progress_state.two_tier.message, 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -4782,7 +4784,7 @@ async def update_flywheel_status(request: web.Request) -> web.Response:
             "flywheel": progress_state.flywheel.to_dict(),
         })
 
-        logger.info(f"[Flywheel] {event_type}: {progress_state.flywheel.message}")
+        logger.info(f"[Flywheel] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(progress_state.flywheel.message, 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -4939,7 +4941,7 @@ async def update_jarvis_prime_status(request: web.Request) -> web.Response:
             "jarvis_prime": progress_state.jarvis_prime.to_dict(),
         })
 
-        logger.info(f"[JARVIS-Prime] {event_type}: {progress_state.jarvis_prime.message}")
+        logger.info(f"[JARVIS-Prime] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(progress_state.jarvis_prime.message, 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -5027,7 +5029,7 @@ async def update_reactor_core_status(request: web.Request) -> web.Response:
             "reactor_core": progress_state.reactor_core.to_dict(),
         })
 
-        logger.info(f"[Reactor-Core] {event_type}: {progress_state.reactor_core.message}")
+        logger.info(f"[Reactor-Core] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(progress_state.reactor_core.message, 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -5155,7 +5157,7 @@ async def update_training_status(request: web.Request) -> web.Response:
             "training": progress_state.training.to_dict(),
         })
 
-        logger.info(f"[Training] {status}: {progress_state.training.message or 'Status update'}")
+        logger.info(f"[Training] {sanitize_for_log(status, 32)}: {sanitize_for_log(progress_state.training.message or 'Status update', 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -5470,8 +5472,8 @@ async def update_model_status(request: web.Request) -> web.Response:
         # Log significant updates
         if data.get("status") == "ready" and model_manager_state.model_name:
             logger.info(
-                f"Model Manager: {model_manager_state.model_name} ready "
-                f"({model_manager_state.model_source})"
+                f"Model Manager: {sanitize_for_log(model_manager_state.model_name, 64)} ready "
+                f"({sanitize_for_log(model_manager_state.model_source, 32)})"
             )
 
         # Broadcast to WebSocket clients
@@ -5785,7 +5787,7 @@ async def update_voice_biometrics_status(request: web.Request) -> web.Response:
 
         elif event_type == 'voice_bio_error':
             progress_state.voice_biometrics.status = 'error'
-            logger.error(f"[VoiceBio] Error: {data.get('message', 'Unknown error')}")
+            logger.error(f"[VoiceBio] Error: {sanitize_for_log(data.get('message', 'Unknown error'), 100)}")
 
         # Broadcast to WebSocket clients
         await connection_manager.broadcast({
@@ -5794,7 +5796,7 @@ async def update_voice_biometrics_status(request: web.Request) -> web.Response:
             "voice_biometrics": progress_state.voice_biometrics.to_dict(),
         })
 
-        logger.info(f"[VoiceBio] {event_type}: {data.get('message', '')}")
+        logger.info(f"[VoiceBio] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(data.get('message', ''), 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -5981,7 +5983,7 @@ async def update_narrator_status(request: web.Request) -> web.Response:
         })
 
         if event_type not in ['narrator_announcement']:  # Don't spam logs with every announcement
-            logger.info(f"[Narrator] {event_type}: {data.get('message', '')}")
+            logger.info(f"[Narrator] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(data.get('message', ''), 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -6080,7 +6082,7 @@ async def update_cost_optimization_status(request: web.Request) -> web.Response:
             "cost_optimization": progress_state.cost_optimization.to_dict(),
         })
 
-        logger.info(f"[CostOpt] {event_type}: {data.get('message', '')}")
+        logger.info(f"[CostOpt] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(data.get('message', ''), 100)}")
 
         return web.json_response({
             "status": "ok",
@@ -6190,7 +6192,7 @@ async def update_cross_repo_status(request: web.Request) -> web.Response:
             "cross_repo": progress_state.cross_repo.to_dict(),
         })
 
-        logger.info(f"[CrossRepo] {event_type}: {data.get('message', '')}")
+        logger.info(f"[CrossRepo] {sanitize_for_log(event_type, 32)}: {sanitize_for_log(data.get('message', ''), 100)}")
 
         return web.json_response({
             "status": "ok",

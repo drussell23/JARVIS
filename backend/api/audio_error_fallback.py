@@ -11,6 +11,8 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 import logging
 
+from backend.core.secure_logging import sanitize_for_log
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/audio/ml", tags=["Audio Fallback"])
@@ -27,7 +29,7 @@ async def handle_audio_error(error: AudioError) -> Dict[str, Any]:
     """
     Fallback handler for audio errors when ML backend is not available
     """
-    logger.warning(f"Audio error reported: {error.error_type} - {error.message}")
+    logger.warning(f"Audio error reported: {sanitize_for_log(error.error_type, 64)} - {sanitize_for_log(error.message, 100)}")
     
     # Simple fallback response
     fallback_response = {
