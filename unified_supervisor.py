@@ -59005,6 +59005,14 @@ class JarvisSystemKernel:
         self._visual_pipeline_health_task: Optional[asyncio.Task] = None
         self._visual_pipeline_initialized: bool = False
 
+        # v264.0: Screen Recording Permission + Real-Time Observation (Phase 6.4)
+        self._permission_manager = None
+        self._screen_recording_granted: bool = False
+        self._screen_recording_check_task: Optional[asyncio.Task] = None
+        self._screen_analyzer = None
+        self._narration_engine = None
+        self._screen_narration_bridge = None  # Strong ref to prevent WeakSet GC
+
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
 
@@ -59967,6 +59975,34 @@ class JarvisSystemKernel:
                     _proc_ref.kill()
                 except ProcessLookupError:
                     self.logger.debug(f"[Kernel] {_proc_name} already exited")
+
+        # v264.0: Screen Observation + Narration teardown (before Visual Pipeline)
+        try:
+            if self._screen_analyzer and getattr(self._screen_analyzer, 'is_monitoring', False):
+                await asyncio.wait_for(self._screen_analyzer.stop_monitoring(), timeout=5.0)
+                self.logger.info("[Kernel] Screen Analyzer stopped")
+        except (asyncio.TimeoutError, Exception) as e:
+            self.logger.debug(f"[Kernel] Screen Analyzer stop error: {e}")
+
+        try:
+            if self._narration_engine and getattr(self._narration_engine, '_is_running', False):
+                await asyncio.wait_for(self._narration_engine.stop(), timeout=5.0)
+                self.logger.info("[Kernel] Narration Engine stopped")
+        except (asyncio.TimeoutError, Exception) as e:
+            self.logger.debug(f"[Kernel] Narration Engine stop error: {e}")
+
+        try:
+            if self._permission_manager and getattr(self._permission_manager, '_monitoring', False):
+                await asyncio.wait_for(self._permission_manager.stop_monitoring(), timeout=3.0)
+                self.logger.info("[Kernel] Permission Manager monitoring stopped")
+        except (asyncio.TimeoutError, Exception) as e:
+            self.logger.debug(f"[Kernel] Permission Manager stop error: {e}")
+
+        if self._screen_recording_check_task and not self._screen_recording_check_task.done():
+            self._screen_recording_check_task.cancel()
+            self.logger.debug("[Kernel] Permission recheck task cancelled")
+
+        self._screen_narration_bridge = None  # Release bridge ref
 
         # v250.0: Visual Pipeline teardown (N-Optic → Ghost Hands order)
         try:
@@ -62895,6 +62931,52 @@ class JarvisSystemKernel:
                         "agi_os": {"status": "pending"},
                         "frontend": {"status": "pending"},
                     }
+                }
+            )
+
+            # =================================================================
+            # PHASE 6.4: SCREEN RECORDING PERMISSION CHECK (v264.0)
+            # =================================================================
+            # Check macOS Screen Recording permission (TCC) before visual pipeline.
+            # If DENIED, trigger OS dialog + start background re-check loop.
+            # Visual Pipeline (Phase 6.8) gates on this result.
+            # =================================================================
+            self._current_startup_phase = "permissions"
+            self._current_startup_progress = 84
+            issue_collector.set_current_phase("Phase 6.4: Permissions")
+            issue_collector.set_current_zone("Zone 6.4")
+            perm_check_timeout = _get_env_float("JARVIS_PERMISSION_CHECK_TIMEOUT", 10.0)
+            if self._startup_watchdog:
+                self._startup_watchdog.update_phase(
+                    "permissions", 84, operational_timeout=perm_check_timeout
+                )
+
+            if _ssm: await _ssm.start_component("permissions")
+            try:
+                await asyncio.wait_for(
+                    self._check_startup_permissions(), timeout=perm_check_timeout
+                )
+                if _ssm: await _ssm.complete_component("permissions")
+            except asyncio.TimeoutError:
+                self.logger.warning("[Permissions] Startup permission check timed out — continuing")
+                if _ssm: await _ssm.complete_component("permissions", error="Timed out")
+                issue_collector.add_warning(
+                    "Permission check timed out — screen observation may be unavailable",
+                    IssueCategory.SYSTEM,
+                    suggestion="Check Screen Recording permission in System Settings"
+                )
+            except Exception as e:
+                self.logger.warning(f"[Permissions] Startup permission check error: {e}")
+                if _ssm: await _ssm.complete_component("permissions", error=str(e))
+
+            await self._broadcast_startup_progress(
+                stage="permissions",
+                message="Permissions checked — initializing Ghost Display...",
+                progress=85,
+                metadata={
+                    "icon": "lock",
+                    "phase": 6.4,
+                    "screen_recording_granted": self._screen_recording_granted,
                 }
             )
 
@@ -66833,6 +66915,355 @@ class JarvisSystemKernel:
                 self.logger.debug(f"[GhostDisplay] Health loop error: {e}")
 
     # =========================================================================
+    # =========================================================================
+    # v264.0: SCREEN RECORDING PERMISSION + REAL-TIME OBSERVATION (Phase 6.4)
+    # =========================================================================
+    # Checks macOS TCC Screen Recording permission during startup.
+    # If denied, triggers OS dialog and starts background re-check loop.
+    # When granted (either immediately or after re-check), activates the
+    # real-time screen observation pipeline (MemoryAwareScreenAnalyzer +
+    # NarrationEngine bridge).
+    # =========================================================================
+
+    async def _check_startup_permissions(self) -> None:
+        """
+        v264.0: Check macOS Screen Recording permission during startup.
+
+        Uses PermissionManager singleton (3-tier check: CGPreflight → CGWindowList → screencapture).
+        If denied, triggers OS dialog + starts background re-check loop.
+        Announces result via voice.
+        """
+        get_pm = None
+        PermType = None
+        PermStatus = None
+
+        try:
+            from backend.macos_helper.permission_manager import (
+                get_permission_manager as get_pm,
+                PermissionType as PermType,
+                PermissionStatus as PermStatus,
+            )
+        except ImportError:
+            try:
+                from macos_helper.permission_manager import (
+                    get_permission_manager as get_pm,
+                    PermissionType as PermType,
+                    PermissionStatus as PermStatus,
+                )
+            except ImportError:
+                self.logger.warning("[Permissions] permission_manager module not available — skipping")
+                return
+
+        try:
+            self._permission_manager = await get_pm()
+            result = await self._permission_manager.check_permission(
+                PermType.SCREEN_RECORDING, use_cache=False
+            )
+            status = result.status if hasattr(result, 'status') else result
+
+            if status == PermStatus.GRANTED:
+                self._screen_recording_granted = True
+                self.logger.info("[Permissions] Screen Recording permission: GRANTED")
+                try:
+                    await self._speak_internal(
+                        "I can see your screen. Vision systems are coming online.",
+                        priority=VoicePriority.LOW,
+                    )
+                except Exception:
+                    pass
+            else:
+                self.logger.warning(f"[Permissions] Screen Recording permission: {status}")
+                try:
+                    await self._speak_internal(
+                        "I need Screen Recording permission to see your screen. "
+                        "A system dialog should appear — please grant access.",
+                        priority=VoicePriority.MEDIUM,
+                    )
+                except Exception:
+                    pass
+
+                # Trigger OS dialog
+                try:
+                    await self._permission_manager.request_screen_recording_permission()
+                except Exception as e:
+                    self.logger.debug(f"[Permissions] Request dialog error: {e}")
+
+                # Start background re-check loop
+                recheck_enabled = _get_env_bool("JARVIS_SCREEN_OBSERVATION_ENABLED", True)
+                if recheck_enabled:
+                    self._screen_recording_check_task = create_safe_task(
+                        self._permission_recheck_loop(),
+                        name="permission-recheck",
+                    )
+                    self._background_tasks.append(self._screen_recording_check_task)
+
+        except Exception as e:
+            self.logger.warning(f"[Permissions] Permission check failed: {e}")
+
+    async def _permission_recheck_loop(self) -> None:
+        """
+        v264.0: Background loop that polls Screen Recording permission until granted.
+
+        Env vars:
+            JARVIS_PERMISSION_RECHECK_INTERVAL: Poll interval (default: 10.0s)
+            JARVIS_PERMISSION_RECHECK_MAX: Max attempts (default: 60)
+        """
+        interval = _get_env_float("JARVIS_PERMISSION_RECHECK_INTERVAL", 10.0)
+        max_attempts = int(os.environ.get("JARVIS_PERMISSION_RECHECK_MAX", "60"))
+
+        PermType = None
+        PermStatus = None
+        try:
+            from backend.macos_helper.permission_manager import (
+                PermissionType as PermType,
+                PermissionStatus as PermStatus,
+            )
+        except ImportError:
+            try:
+                from macos_helper.permission_manager import (
+                    PermissionType as PermType,
+                    PermissionStatus as PermStatus,
+                )
+            except ImportError:
+                self.logger.warning("[Permissions] Cannot import for recheck — aborting loop")
+                return
+
+        restart_hinted = False
+        for attempt in range(1, max_attempts + 1):
+            # Respect shutdown
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=interval
+                )
+                # If we get here, shutdown was signaled
+                self.logger.debug("[Permissions] Recheck loop: shutdown signaled")
+                return
+            except asyncio.TimeoutError:
+                pass  # Normal — interval elapsed, time to re-check
+
+            if self._screen_recording_granted:
+                return  # Already granted by some other path
+
+            if not self._permission_manager:
+                continue
+
+            try:
+                result = await self._permission_manager.check_permission(
+                    PermType.SCREEN_RECORDING, use_cache=False
+                )
+                status = result.status if hasattr(result, 'status') else result
+
+                if status == PermStatus.GRANTED:
+                    self._screen_recording_granted = True
+                    self.logger.info(
+                        f"[Permissions] Screen Recording GRANTED on recheck attempt {attempt}"
+                    )
+                    try:
+                        await self._speak_internal(
+                            "Screen Recording permission granted. Activating vision systems.",
+                            priority=VoicePriority.MEDIUM,
+                        )
+                    except Exception:
+                        pass
+
+                    # Activate screen observation now
+                    try:
+                        obs_timeout = _get_env_float("JARVIS_SCREEN_OBSERVATION_TIMEOUT", 10.0)
+                        await asyncio.wait_for(
+                            self._activate_screen_observation(), timeout=obs_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        self.logger.warning("[ScreenObservation] Activation timed out during recheck")
+                    except Exception as e:
+                        self.logger.warning(f"[ScreenObservation] Activation error during recheck: {e}")
+
+                    # Republish visual pipeline state with updated permission
+                    try:
+                        await self._publish_visual_pipeline_state()
+                    except Exception:
+                        pass
+                    return
+
+                # After 60s of re-checks, hint about restart
+                if attempt * interval >= 60.0 and not restart_hinted:
+                    restart_hinted = True
+                    try:
+                        await self._speak_internal(
+                            "If you've granted the permission, you may need to restart "
+                            "the terminal for it to take effect.",
+                            priority=VoicePriority.LOW,
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                self.logger.debug(f"[Permissions] Recheck attempt {attempt} error: {e}")
+
+        self.logger.info(
+            f"[Permissions] Recheck loop exhausted ({max_attempts} attempts) — "
+            f"screen observation will not be available this session"
+        )
+
+    async def _activate_screen_observation(self) -> None:
+        """
+        v264.0: Activate the real-time screen observation pipeline.
+
+        Creates and starts the MemoryAwareScreenAnalyzer, connects it to the
+        NarrationEngine via ScreenNarrationBridge, and stores strong references
+        to prevent GC (analyzer uses WeakSet for callbacks).
+
+        Safe to call multiple times — returns immediately if already running.
+        """
+        # Guard: already running
+        if self._screen_analyzer and getattr(self._screen_analyzer, 'is_monitoring', False):
+            self.logger.debug("[ScreenObservation] Already active — skipping")
+            return
+
+        if not _get_env_bool("JARVIS_SCREEN_OBSERVATION_ENABLED", True):
+            self.logger.info("[ScreenObservation] Disabled via JARVIS_SCREEN_OBSERVATION_ENABLED")
+            return
+
+        # Import MemoryAwareScreenAnalyzer
+        ScreenAnalyzer = None
+        try:
+            from backend.vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer as ScreenAnalyzer
+        except ImportError:
+            try:
+                from vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer as ScreenAnalyzer
+            except ImportError:
+                pass
+
+        if ScreenAnalyzer is None:
+            self.logger.warning("[ScreenObservation] MemoryAwareScreenAnalyzer not available — skipping")
+            return
+
+        # Import VisionCommandHandler for screen analysis
+        VisionHandler = None
+        try:
+            from backend.api.vision_command_handler import VisionCommandHandler as VisionHandler
+        except ImportError:
+            try:
+                from api.vision_command_handler import VisionCommandHandler as VisionHandler
+            except ImportError:
+                pass
+
+        if VisionHandler is None:
+            self.logger.warning("[ScreenObservation] VisionCommandHandler not available — skipping")
+            return
+
+        try:
+            vision_handler = VisionHandler()
+            self._screen_analyzer = ScreenAnalyzer(vision_handler)
+            await self._screen_analyzer.start_monitoring()
+            self.logger.info("[ScreenObservation] Real-time screen monitoring activated")
+
+            # Connect narration bridge
+            await self._connect_screen_narration(self._screen_analyzer)
+
+        except Exception as e:
+            self.logger.warning(f"[ScreenObservation] Activation failed: {e}")
+            self._screen_analyzer = None
+
+    async def _connect_screen_narration(self, analyzer) -> None:
+        """
+        v264.0: Connect screen analyzer events to voice narration.
+
+        Creates a ScreenNarrationBridge that translates analyzer callbacks into
+        narration calls. The bridge is stored as self._screen_narration_bridge
+        (strong reference) to prevent GC — the analyzer uses WeakSet for callbacks.
+
+        Event mappings:
+            app_changed → narrate_perception("You switched to {app}")
+            error_detected → narrate_perception("An error appeared: {context}") [throttled 1/30s]
+            notification_detected → narrate_perception("Notification from {source}")
+            security_concern → narrate_warning("Security prompt: {description}")
+        """
+        get_narration = None
+        try:
+            from backend.ghost_hands.narration_engine import get_narration_engine as get_narration
+        except ImportError:
+            try:
+                from ghost_hands.narration_engine import get_narration_engine as get_narration
+            except ImportError:
+                pass
+
+        if get_narration is None:
+            self.logger.info("[ScreenNarration] NarrationEngine not available — events not narrated")
+            return
+
+        try:
+            self._narration_engine = await get_narration()
+
+            # Build the bridge as an inner class to keep it self-contained
+            class ScreenNarrationBridge:
+                """Translates screen analyzer events → narration engine calls."""
+
+                def __init__(self, narration_eng, sup_logger):
+                    self._engine = narration_eng
+                    self._logger = sup_logger
+                    self._last_error_time: float = 0.0
+                    self._error_throttle_seconds = _get_env_float(
+                        "JARVIS_SCREEN_ERROR_THROTTLE", 30.0
+                    )
+
+                async def on_app_changed(self, payload: dict) -> None:
+                    app_name = payload.get("app", "unknown app")
+                    try:
+                        await self._engine.narrate_perception(
+                            f"You switched to {app_name}"
+                        )
+                    except Exception as e:
+                        self._logger.debug(f"[ScreenNarration] app_changed narration error: {e}")
+
+                async def on_error_detected(self, payload: dict) -> None:
+                    now = time.time()
+                    if now - self._last_error_time < self._error_throttle_seconds:
+                        return
+                    self._last_error_time = now
+                    context = payload.get("text", payload.get("analysis", "something unexpected"))
+                    if isinstance(context, dict):
+                        context = context.get("description", str(context)[:100])
+                    try:
+                        await self._engine.narrate_perception(
+                            f"An error appeared: {str(context)[:150]}"
+                        )
+                    except Exception as e:
+                        self._logger.debug(f"[ScreenNarration] error_detected narration error: {e}")
+
+                async def on_notification_detected(self, payload: dict) -> None:
+                    source = payload.get("app", payload.get("source", "an app"))
+                    try:
+                        await self._engine.narrate_perception(
+                            f"Notification from {source}"
+                        )
+                    except Exception as e:
+                        self._logger.debug(f"[ScreenNarration] notification narration error: {e}")
+
+                async def on_security_concern(self, payload: dict) -> None:
+                    desc = payload.get("text", payload.get("description", "a security prompt"))
+                    if isinstance(desc, dict):
+                        desc = desc.get("description", str(desc)[:100])
+                    try:
+                        await self._engine.narrate_warning(
+                            f"Security prompt detected: {str(desc)[:150]}"
+                        )
+                    except Exception as e:
+                        self._logger.debug(f"[ScreenNarration] security narration error: {e}")
+
+            bridge = ScreenNarrationBridge(self._narration_engine, self.logger)
+            self._screen_narration_bridge = bridge  # Strong ref prevents GC
+
+            # Register callbacks on analyzer
+            analyzer.register_callback("app_changed", bridge.on_app_changed)
+            analyzer.register_callback("error_detected", bridge.on_error_detected)
+            analyzer.register_callback("notification_detected", bridge.on_notification_detected)
+            analyzer.register_callback("security_concern", bridge.on_security_concern)
+
+            self.logger.info("[ScreenNarration] Screen events connected to voice narration")
+
+        except Exception as e:
+            self.logger.warning(f"[ScreenNarration] Bridge setup failed: {e}")
+
     # v250.0: VISUAL PIPELINE MANAGEMENT (Phase 6.8)
     # =========================================================================
     # Lifecycle management for the visual processing software pipeline:
@@ -66873,6 +67304,14 @@ class JarvisSystemKernel:
             )
             self._update_component_status("visual_pipeline", "skipped", "Ghost Display not ready")
             return True
+
+        # v264.0: Permission gate — visual pipeline init proceeds but screen observation
+        # is deferred until permission is granted (background re-check handles activation).
+        if not self._screen_recording_granted:
+            self.logger.info(
+                "[VisualPipeline] Screen Recording permission not yet granted "
+                "— pipeline will initialize but screen observation deferred"
+            )
 
         self._update_component_status("visual_pipeline", "running", "Initializing Visual Pipeline...")
         ferrari_available = False
@@ -67036,6 +67475,24 @@ class JarvisSystemKernel:
             self._background_tasks.append(task)  # register FIRST
             self._visual_pipeline_health_task = task
 
+            # v264.0 Step 7: Activate real-time screen observation (if permission granted)
+            if self._screen_recording_granted:
+                try:
+                    obs_timeout = _get_env_float("JARVIS_SCREEN_OBSERVATION_TIMEOUT", 10.0)
+                    await asyncio.wait_for(
+                        self._activate_screen_observation(), timeout=obs_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "[ScreenObservation] Activation timed out — continuing without"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"[ScreenObservation] Activation error: {e}")
+            else:
+                self.logger.info(
+                    "[ScreenObservation] Deferred — waiting for Screen Recording permission"
+                )
+
             self._visual_pipeline_initialized = True
             self._update_component_status("visual_pipeline", "complete", "Visual Pipeline ready")
             return True
@@ -67099,8 +67556,18 @@ class JarvisSystemKernel:
                 except Exception:
                     pass
 
+            # v264.0: Screen observation stats
+            screen_obs_active = (
+                self._screen_analyzer is not None
+                and getattr(self._screen_analyzer, 'is_monitoring', False)
+            )
+            narration_active = (
+                self._narration_engine is not None
+                and getattr(self._narration_engine, '_is_running', False)
+            )
+
             state = {
-                "schema_version": 1,
+                "schema_version": 2,  # v264.0: bumped for new fields
                 "timestamp": time.time(),
                 "is_ready": self._visual_pipeline_initialized,
                 "components": {
@@ -67108,6 +67575,9 @@ class JarvisSystemKernel:
                     "n_optic_nerve": n_optic_data,
                     "ferrari_engine": {"available": ferrari_available},
                 },
+                "screen_recording_permission": self._screen_recording_granted,
+                "screen_observation_active": screen_obs_active,
+                "narration_active": narration_active,
                 "component_status": self._component_status.get(
                     "visual_pipeline", {}
                 ).get("status", "unknown"),

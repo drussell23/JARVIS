@@ -509,10 +509,76 @@ class PermissionManager:
                 return PermissionStatus.UNKNOWN
 
     async def _check_screen_recording(self) -> PermissionStatus:
-        """Check Screen Recording permission."""
+        """
+        Check Screen Recording permission using the most reliable method available.
+
+        v264.0: Replaced screencapture-based check (which can produce blank-but-non-zero
+        files giving false positives) with a 3-tier approach:
+          1. CGPreflightScreenCaptureAccess (macOS 10.15+, most reliable)
+          2. CGWindowListCreateImage probe (older macOS fallback)
+          3. screencapture command (last resort)
+        """
+        # Method 1: CGPreflightScreenCaptureAccess (macOS 10.15+, most reliable)
         try:
-            # Try to take a screenshot - will fail if not permitted
-            # Use screencapture with -x (silent) and -t (type)
+            import ctypes
+            import ctypes.util
+            cg_path = ctypes.util.find_library("CoreGraphics")
+            if cg_path:
+                cg = ctypes.cdll.LoadLibrary(cg_path)
+                # CGPreflightScreenCaptureAccess() returns bool (true = granted)
+                cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+                granted = cg.CGPreflightScreenCaptureAccess()
+                logger.debug(f"CGPreflightScreenCaptureAccess returned: {granted}")
+                return PermissionStatus.GRANTED if granted else PermissionStatus.DENIED
+        except (OSError, AttributeError) as e:
+            logger.debug(f"CGPreflightScreenCaptureAccess not available: {e}")
+
+        # Method 2: CGWindowListCreateImage probe (older macOS)
+        try:
+            import ctypes
+            import ctypes.util
+            cg_path = ctypes.util.find_library("CoreGraphics")
+            if cg_path:
+                cg = ctypes.cdll.LoadLibrary(cg_path)
+                # CGWindowListCreateImage with a 1x1 rect — returns NULL if denied
+                # CGRectMake(0, 0, 1, 1) as struct
+                class CGRect(ctypes.Structure):
+                    class CGPoint(ctypes.Structure):
+                        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+                    class CGSize(ctypes.Structure):
+                        _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+                    _fields_ = [("origin", CGPoint), ("size", CGSize)]
+
+                cg.CGWindowListCreateImage.restype = ctypes.c_void_p
+                cg.CGWindowListCreateImage.argtypes = [
+                    CGRect,              # screenBounds
+                    ctypes.c_uint32,     # listOption
+                    ctypes.c_uint32,     # windowID
+                    ctypes.c_uint32,     # imageOption
+                ]
+                rect = CGRect()
+                rect.origin.x = 0.0
+                rect.origin.y = 0.0
+                rect.size.width = 1.0
+                rect.size.height = 1.0
+                # kCGWindowListOptionOnScreenOnly=1, kCGNullWindowID=0, kCGWindowImageDefault=0
+                img_ref = cg.CGWindowListCreateImage(rect, 1, 0, 0)
+                if img_ref:
+                    # Release the image ref
+                    cf_path = ctypes.util.find_library("CoreFoundation")
+                    if cf_path:
+                        cf = ctypes.cdll.LoadLibrary(cf_path)
+                        cf.CFRelease(ctypes.c_void_p(img_ref))
+                    logger.debug("CGWindowListCreateImage probe: GRANTED")
+                    return PermissionStatus.GRANTED
+                else:
+                    logger.debug("CGWindowListCreateImage returned NULL: DENIED")
+                    return PermissionStatus.DENIED
+        except (OSError, AttributeError) as e:
+            logger.debug(f"CGWindowListCreateImage probe failed: {e}")
+
+        # Method 3: screencapture command (last resort — can give false positives)
+        try:
             import tempfile
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                 temp_path = f.name
@@ -524,7 +590,6 @@ class PermissionManager:
             )
             await result.communicate()
 
-            # Check if file was created and has content
             if os.path.exists(temp_path):
                 size = os.path.getsize(temp_path)
                 os.unlink(temp_path)
@@ -532,10 +597,36 @@ class PermissionManager:
                     return PermissionStatus.GRANTED
 
             return PermissionStatus.DENIED
-
         except Exception as e:
             logger.debug(f"Screen recording check error: {e}")
             return PermissionStatus.UNKNOWN
+
+    async def request_screen_recording_permission(self) -> bool:
+        """
+        v264.0: Request Screen Recording permission from the OS.
+
+        Calls CGRequestScreenCaptureAccess() to trigger the native dialog.
+        Falls back to opening System Settings if the API is unavailable.
+
+        Returns:
+            True if the request was triggered successfully (NOT whether permission was granted).
+        """
+        # Try CGRequestScreenCaptureAccess (macOS 10.15+)
+        try:
+            import ctypes
+            import ctypes.util
+            cg_path = ctypes.util.find_library("CoreGraphics")
+            if cg_path:
+                cg = ctypes.cdll.LoadLibrary(cg_path)
+                cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+                result = cg.CGRequestScreenCaptureAccess()
+                logger.info(f"[Permissions] CGRequestScreenCaptureAccess triggered (returned: {result})")
+                return True
+        except (OSError, AttributeError) as e:
+            logger.debug(f"CGRequestScreenCaptureAccess not available: {e}")
+
+        # Fallback: open System Settings
+        return await self.open_permission_settings(PermissionType.SCREEN_RECORDING)
 
     async def _check_microphone(self) -> PermissionStatus:
         """Check Microphone permission."""
