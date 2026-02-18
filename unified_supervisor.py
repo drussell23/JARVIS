@@ -21077,7 +21077,9 @@ class PersistentConversationMemoryAgent:
             _cpu = await get_cpu_percent()
         except Exception:
             _cpu = 0.0
-        if _cpu > 90.0:
+        # v263.2: Lowered from 90% → 80% — at 86% CPU startup contention
+        # is already severe enough to need the extended timeout.
+        if _cpu > 80.0:
             _boot_max = float(os.getenv("JARVIS_MEMORY_BOOT_MAX_TIMEOUT", "16.0"))
             boot_timeout = min(_boot_max, self._init_timeout)
             self._logger.info(
@@ -21507,7 +21509,12 @@ class PersistentConversationMemoryAgent:
             from backend.intelligence.learning_database import get_learning_database
         except Exception:
             from intelligence.learning_database import get_learning_database
-        return await get_learning_database(config={"enable_ml_features": False})
+        # v263.2: fast_mode=True skips CloudSQL/Redis/ChromaDB sync at boot,
+        # reducing init from 30s+ to ~5s. Full sync happens in background.
+        return await get_learning_database(
+            config={"enable_ml_features": False},
+            fast_mode=True,
+        )
 
     async def _load_boot_context(self) -> None:
         """Load historical conversational context + preferences on startup.
@@ -62333,8 +62340,9 @@ class JarvisSystemKernel:
                         except Exception:
                             pass  # cpu stays 0.0
 
-                        # v258.1 R2-#8: Simple threshold — 2x when CPU > 90%
-                        if cpu > 90.0:
+                        # v263.2: Lowered from 90% → 80%. At 86% CPU, Phase 4
+                        # Intelligence init starves ECAPA model loading.
+                        if cpu > 80.0:
                             _ecapa_bg_timeout = _ecapa_max_timeout
                             self.logger.info(
                                 f"[Kernel] ECAPA timeout extended to {_ecapa_bg_timeout:.0f}s "

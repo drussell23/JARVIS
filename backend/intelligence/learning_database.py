@@ -9217,7 +9217,10 @@ async def _singleton_instance_has_healthy_connection(db_instance: "JARVISLearnin
             return True
 
 
-async def get_learning_database(config: Optional[Dict] = None) -> JARVISLearningDatabase:
+async def get_learning_database(
+    config: Optional[Dict] = None,
+    fast_mode: bool = False,
+) -> JARVISLearningDatabase:
     """Get or create the global async learning database.
 
     v226.0: Self-healing singleton. If a previous initialization failed
@@ -9264,7 +9267,7 @@ async def get_learning_database(config: Optional[Dict] = None) -> JARVISLearning
         _db_instance = JARVISLearningDatabase(config=config)
         _db_instance._singleton_managed = True
         try:
-            await _db_instance.initialize()
+            await _db_instance.initialize(fast_mode=fast_mode)  # v263.2
         except BaseException:
             # v226.1: Must catch BaseException, not just Exception.
             # In Python 3.9, asyncio.CancelledError is a BaseException subclass.

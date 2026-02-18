@@ -847,8 +847,8 @@ class ScreenAnalyzerBridge:
             # Build the analysis prompt
             prompt = self._build_vision_prompt(context, focus_area)
 
-            # Encode image
-            image_base64 = base64.b64encode(screenshot).decode('utf-8')
+            # v263.2: Resize and compress image to stay under Claude's 5MB limit
+            image_base64, media_type = await self._prepare_image_for_api(screenshot)
 
             # Call Claude Vision
             response = await self._claude_client.messages.create(
@@ -862,7 +862,7 @@ class ScreenAnalyzerBridge:
                                 "type": "image",
                                 "source": {
                                     "type": "base64",
-                                    "media_type": "image/png",
+                                    "media_type": media_type,
                                     "data": image_base64,
                                 },
                             },
@@ -1049,6 +1049,71 @@ CONFIDENCE: <0.0-1.0 confidence score>
                     result.ai_confidence = 0.5
 
         return result
+
+    async def _prepare_image_for_api(
+        self, screenshot: bytes
+    ) -> Tuple[str, str]:
+        """v263.2: Resize and compress screenshot to stay under Claude's 5MB API limit.
+
+        Converts PNG to JPEG with configurable quality and max dimension.
+        Returns (base64_data, media_type).
+        """
+        _max_dim = int(os.getenv("JARVIS_VISION_MAX_DIM", "1536"))
+        _jpeg_quality = int(os.getenv("JARVIS_VISION_JPEG_QUALITY", "85"))
+        _max_bytes = 5 * 1024 * 1024  # 5MB API limit
+
+        raw_size = len(screenshot)
+
+        # Fast path: if raw PNG is already under limit, encode directly
+        if raw_size <= _max_bytes:
+            return base64.b64encode(screenshot).decode("utf-8"), "image/png"
+
+        # Slow path: resize + JPEG compress via PIL (run in thread to avoid blocking)
+        def _compress() -> Tuple[bytes, str]:
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(screenshot))
+
+            # Convert RGBA → RGB (JPEG doesn't support alpha)
+            if img.mode in ("RGBA", "P"):
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "RGBA":
+                    background.paste(img, mask=img.split()[3])
+                else:
+                    background.paste(img)
+                img = background
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            # Resize maintaining aspect ratio
+            img.thumbnail((_max_dim, _max_dim), Image.Resampling.LANCZOS)
+
+            # Encode as JPEG
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=_jpeg_quality, optimize=True)
+            jpeg_bytes = buf.getvalue()
+
+            # If still over limit, reduce quality progressively
+            quality = _jpeg_quality
+            while len(jpeg_bytes) > _max_bytes and quality > 30:
+                quality -= 10
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                jpeg_bytes = buf.getvalue()
+
+            return jpeg_bytes, "image/jpeg"
+
+        jpeg_bytes, media_type = await asyncio.to_thread(_compress)
+
+        encoded = base64.b64encode(jpeg_bytes).decode("utf-8")
+        logger.debug(
+            "[Vision] Image compressed: %dKB → %dKB (%s, q=%d)",
+            raw_size // 1024,
+            len(jpeg_bytes) // 1024,
+            media_type,
+            _jpeg_quality,
+        )
+        return encoded, media_type
 
     async def _capture_screen(self) -> Optional[bytes]:
         """Capture current screen."""
