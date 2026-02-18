@@ -830,7 +830,21 @@ class MultiSpaceCaptureEngine:
 
             if return_code != 0:
                 error_msg = stderr.decode("utf-8", errors="ignore") if stderr else ""
-                logger.error(f"Screencapture failed with code {return_code}: {error_msg}")
+                # v241.0: Exit code 1 with empty stderr almost always means missing
+                # Screen Recording permission on macOS. Provide actionable diagnostic.
+                if return_code == 1 and not error_msg.strip():
+                    logger.error(
+                        "Screencapture failed with code 1 (no stderr). This usually "
+                        "means Screen Recording permission is not granted. Grant it "
+                        "in System Settings → Privacy & Security → Screen Recording, "
+                        "then restart JARVIS."
+                    )
+                else:
+                    logger.error(
+                        "Screencapture failed with code %d: %s",
+                        return_code,
+                        error_msg or "(no stderr)",
+                    )
                 return None
 
             # Check if capture succeeded

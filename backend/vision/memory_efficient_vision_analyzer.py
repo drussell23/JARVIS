@@ -35,6 +35,62 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+# v241.0: Claude API measures base64 string size, not raw binary.
+# Base64 inflates by ~33%, so the effective raw limit is API_limit * 3/4.
+_API_MAX_BYTES = 5 * 1024 * 1024  # 5MB API limit on base64 string
+_RAW_MAX_BYTES = _API_MAX_BYTES * 3 // 4  # ~3.75MB raw threshold
+_DEFAULT_MAX_DIM = int(os.getenv("JARVIS_VISION_MAX_DIM", "1536"))
+_DEFAULT_JPEG_QUALITY = int(os.getenv("JARVIS_VISION_JPEG_QUALITY", "85"))
+
+
+def ensure_image_under_api_limit(
+    image_data: bytes, media_type: str = "image/png"
+) -> Tuple[str, str]:
+    """Encode image to base64, compressing if necessary to stay under Claude's 5MB limit.
+
+    v241.0: Shared utility for all vision analyzers. Accounts for base64
+    expansion (~33%) when checking against the API's 5MB limit.
+
+    Returns:
+        Tuple of (base64_encoded_string, media_type)
+    """
+    if len(image_data) <= _RAW_MAX_BYTES:
+        return base64.b64encode(image_data).decode(), media_type
+
+    # Compress: resize + JPEG quality reduction
+    img = Image.open(io.BytesIO(image_data))
+    if img.mode in ("RGBA", "P"):
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "RGBA":
+            background.paste(img, mask=img.split()[3])
+        else:
+            background.paste(img)
+        img = background
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    img.thumbnail((_DEFAULT_MAX_DIM, _DEFAULT_MAX_DIM), Image.Resampling.LANCZOS)
+
+    quality = _DEFAULT_JPEG_QUALITY
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    jpeg_bytes = buf.getvalue()
+
+    while len(jpeg_bytes) > _RAW_MAX_BYTES and quality > 30:
+        quality -= 10
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        jpeg_bytes = buf.getvalue()
+
+    logger.debug(
+        "Image compressed for API: %dKB → %dKB (JPEG q=%d)",
+        len(image_data) // 1024,
+        len(jpeg_bytes) // 1024,
+        quality,
+    )
+    return base64.b64encode(jpeg_bytes).decode(), "image/jpeg"
+
+
 @dataclass
 class CachedResult:
     """Cached vision analysis result with metadata"""
@@ -360,9 +416,9 @@ class MemoryEfficientVisionAnalyzer:
                 image_data = buffer.getvalue()
                 self.metrics["total_bytes_processed"] += len(image_data)
 
-            # Convert to base64
-            image_base64 = base64.b64encode(image_data).decode()
-            media_type = "image/png" if analysis_type == "text" else "image/jpeg"
+            # v241.0: Encode with API size validation
+            orig_media = "image/png" if analysis_type == "text" else "image/jpeg"
+            image_base64, media_type = ensure_image_under_api_limit(image_data, orig_media)
 
             # Build multimodal content
             multimodal_content = [
@@ -504,7 +560,8 @@ class MemoryEfficientVisionAnalyzer:
         
         # Fallback: Make direct API call
         logger.info("Using direct Claude API for vision analysis")
-        image_base64 = base64.b64encode(image_data).decode()
+        orig_media = "image/jpeg" if analysis_type != "text" else "image/png"
+        image_base64, api_media_type = ensure_image_under_api_limit(image_data, orig_media)
 
         try:
             self.metrics["api_calls"] += 1
@@ -518,7 +575,7 @@ class MemoryEfficientVisionAnalyzer:
                             "type": "image",
                             "source": {
                                 "type": "base64",
-                                "media_type": "image/jpeg" if analysis_type != "text" else "image/png",
+                                "media_type": api_media_type,
                                 "data": image_base64
                             }
                         },
@@ -705,9 +762,9 @@ class MemoryEfficientVisionAnalyzer:
                     compressed_image.save(buffer, format="JPEG", quality=85)
                 image_data = buffer.getvalue()
 
-                # Convert to base64
-                image_base64 = base64.b64encode(image_data).decode()
-                media_type = "image/png" if analysis_type == "text" else "image/jpeg"
+                # v241.0: Encode with API size validation
+                orig_media = "image/png" if analysis_type == "text" else "image/jpeg"
+                image_base64, media_type = ensure_image_under_api_limit(image_data, orig_media)
 
                 # Build context for this region
                 context = {
@@ -877,8 +934,8 @@ class MemoryEfficientVisionAnalyzer:
             compressed_image.save(buffer, format="JPEG", quality=85)
             image_data = buffer.getvalue()
 
-            # Convert to base64
-            image_base64 = base64.b64encode(image_data).decode()
+            # v241.0: Encode with API size validation
+            image_base64, _media = ensure_image_under_api_limit(image_data, "image/jpeg")
 
             # Build rich context
             context = {

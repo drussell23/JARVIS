@@ -1053,19 +1053,24 @@ CONFIDENCE: <0.0-1.0 confidence score>
     async def _prepare_image_for_api(
         self, screenshot: bytes
     ) -> Tuple[str, str]:
-        """v263.2: Resize and compress screenshot to stay under Claude's 5MB API limit.
+        """v263.2/v241.0: Resize and compress screenshot for Claude's 5MB API limit.
 
-        Converts PNG to JPEG with configurable quality and max dimension.
+        v241.0 fix: The API measures BASE64 string size, not raw binary.
+        Base64 inflates by ~33%, so a 4.2MB raw PNG becomes 5.6MB base64
+        and gets rejected. The fast-path threshold now accounts for this.
+
         Returns (base64_data, media_type).
         """
         _max_dim = int(os.getenv("JARVIS_VISION_MAX_DIM", "1536"))
         _jpeg_quality = int(os.getenv("JARVIS_VISION_JPEG_QUALITY", "85"))
-        _max_bytes = 5 * 1024 * 1024  # 5MB API limit
+        _api_max_bytes = 5 * 1024 * 1024  # 5MB API limit (on base64 string)
+        # Base64 expands by 4/3; raw threshold = API limit * 3/4
+        _raw_max_bytes = _api_max_bytes * 3 // 4  # ~3.75MB
 
         raw_size = len(screenshot)
 
-        # Fast path: if raw PNG is already under limit, encode directly
-        if raw_size <= _max_bytes:
+        # Fast path: only if raw bytes are small enough that base64 stays under 5MB
+        if raw_size <= _raw_max_bytes:
             return base64.b64encode(screenshot).decode("utf-8"), "image/png"
 
         # Slow path: resize + JPEG compress via PIL (run in thread to avoid blocking)
@@ -1093,9 +1098,9 @@ CONFIDENCE: <0.0-1.0 confidence score>
             img.save(buf, format="JPEG", quality=_jpeg_quality, optimize=True)
             jpeg_bytes = buf.getvalue()
 
-            # If still over limit, reduce quality progressively
+            # v241.0: Check against raw threshold (accounts for base64 expansion)
             quality = _jpeg_quality
-            while len(jpeg_bytes) > _max_bytes and quality > 30:
+            while len(jpeg_bytes) > _raw_max_bytes and quality > 30:
                 quality -= 10
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=quality, optimize=True)

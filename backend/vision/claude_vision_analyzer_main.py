@@ -3922,11 +3922,17 @@ class ClaudeVisionAnalyzer:
         return encoded, buffer.tell()
 
     def _encode_image(self, image: Image.Image) -> str:
-        """Simple image encoding without compression"""
+        """Encode image for Claude API with size validation.
+
+        v241.0: Ensures base64 output stays under Claude's 5MB limit.
+        Base64 inflates by ~33%, so raw JPEG must be under ~3.75MB.
+        """
+        _api_max = 5 * 1024 * 1024
+        _raw_max = _api_max * 3 // 4  # ~3.75MB accounting for base64
+
         buffer = io.BytesIO()
         # Convert RGBA to RGB if needed for JPEG
         if image.mode in ("RGBA", "LA", "P"):
-            # Create RGB image with white background
             rgb_image = Image.new("RGB", image.size, (255, 255, 255))
             if image.mode == "P":
                 image = image.convert("RGBA")
@@ -3934,8 +3940,28 @@ class ClaudeVisionAnalyzer:
                 image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None
             )
             image = rgb_image
-        image.save(buffer, format="JPEG", quality=self.config.jpeg_quality)
-        return base64.b64encode(buffer.getvalue()).decode()
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+
+        quality = self.config.jpeg_quality
+        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        jpeg_bytes = buffer.getvalue()
+
+        # v241.0: Progressive compression if over API limit
+        _max_dim = int(os.getenv("JARVIS_VISION_MAX_DIM", "1536"))
+        if len(jpeg_bytes) > _raw_max:
+            image.thumbnail((_max_dim, _max_dim), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality, optimize=True)
+            jpeg_bytes = buffer.getvalue()
+
+        while len(jpeg_bytes) > _raw_max and quality > 30:
+            quality -= 10
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality, optimize=True)
+            jpeg_bytes = buffer.getvalue()
+
+        return base64.b64encode(jpeg_bytes).decode()
 
     async def _create_region_composite(
         self,
