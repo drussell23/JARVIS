@@ -61877,13 +61877,18 @@ class JarvisSystemKernel:
 
             # v261.0: Start background J-Prime readiness watcher
             if self._jprime_watcher_task is None or self._jprime_watcher_task.done():
+                # v262.0 R3.1: Remove OLD done task from _background_tasks before creating new.
+                # Prevents accumulating done task references across warm restarts.
+                if self._jprime_watcher_task is not None:
+                    try:
+                        self._background_tasks.remove(self._jprime_watcher_task)
+                    except ValueError:
+                        pass  # Not in list — harmless
                 self._jprime_watcher_task = create_safe_task(
                     self._watch_jprime_readiness(),
                     name="jprime-readiness-watcher",
                 )
-                # v262.0: Guard against double-append (also appended in Trinity path)
-                if self._jprime_watcher_task not in self._background_tasks:
-                    self._background_tasks.append(self._jprime_watcher_task)
+                self._background_tasks.append(self._jprime_watcher_task)
 
         # =============================================================
         # v233.4: EARLY GCP PRE-WARM — Start Invincible Node Before Phase 0
@@ -63086,9 +63091,16 @@ class JarvisSystemKernel:
             # - stop_agi_os() cleanup itself hanging
             # - Event loop blockage preventing internal timeout from firing
             _agi_os_init_timeout_val = _get_env_float("JARVIS_AGI_OS_INIT_TIMEOUT", 270.0)
+            # v262.0 R3.1: Cap outer timeout BELOW PHASE_HOLD_HARD_CAP to avoid race.
+            # Default: min(270+30, 300-15) = min(300, 285) = 285s.
+            # This ensures outer timeout fires 15s BEFORE ProgressController's hard cap,
+            # preventing conflicting error handling (both trying to recover simultaneously).
             _agi_os_outer_timeout = _get_env_float(
                 "JARVIS_AGI_OS_OUTER_TIMEOUT",
-                _agi_os_init_timeout_val + 30.0,  # internal + grace for cleanup
+                min(
+                    _agi_os_init_timeout_val + 30.0,
+                    max(60.0, TRINITY_PHASE_HOLD_HARD_CAP - 15.0),
+                ),
             )
             if self._startup_watchdog:
                 # v262.0: Register correct DMS timeout from the start (was 90s, overwritten to 270s inside method)
@@ -63117,7 +63129,11 @@ class JarvisSystemKernel:
                 # and the module is fully loaded. If _agi_os is None, the import may have
                 # been interrupted (partially-loaded module in sys.modules) — skip cleanup.
                 if self._agi_os:
-                    with contextlib.suppress(Exception):
+                    # v262.0 R3.1: Use BaseException (not Exception) to suppress
+                    # CancelledError during cleanup. In Python 3.9+, CancelledError
+                    # is a BaseException — suppress(Exception) would let it propagate
+                    # uncaught through this except handler and crash the caller.
+                    with contextlib.suppress(BaseException):
                         try:
                             from agi_os import stop_agi_os
                             await asyncio.wait_for(stop_agi_os(), timeout=15.0)
@@ -69833,13 +69849,17 @@ class JarvisSystemKernel:
                             except ImportError:
                                 pass
                         if _needs_watcher:
+                            # v262.0 R3.1: Remove OLD done task before creating new
+                            if self._jprime_watcher_task is not None:
+                                try:
+                                    self._background_tasks.remove(self._jprime_watcher_task)
+                                except ValueError:
+                                    pass
                             self._jprime_watcher_task = create_safe_task(
                                 self._watch_jprime_readiness(),
                                 name="jprime-readiness-watcher-trinity",
                             )
-                            # v262.0: Guard against double-append (also appended in Early Prime path)
-                            if self._jprime_watcher_task not in self._background_tasks:
-                                self._background_tasks.append(self._jprime_watcher_task)
+                            self._background_tasks.append(self._jprime_watcher_task)
                             self.logger.info("[v261.0] J-Prime readiness watcher started (Trinity path)")
 
                 elif total_count == 0 and not _trinity_startup_timed_out:
