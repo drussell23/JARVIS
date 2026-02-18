@@ -59011,7 +59011,9 @@ class JarvisSystemKernel:
         self._screen_recording_check_task: Optional[asyncio.Task] = None
         self._screen_analyzer = None
         self._narration_engine = None
-        self._screen_narration_bridge = None  # Strong ref to prevent WeakSet GC
+        self._narration_engine_started_by_us: bool = False  # Track ownership
+        self._screen_narration_bridge = None  # Strong ref to prevent WeakMethod GC
+        self._screen_observation_lock = asyncio.Lock()  # Serializes activation
 
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
@@ -59981,21 +59983,26 @@ class JarvisSystemKernel:
             if self._screen_analyzer and getattr(self._screen_analyzer, 'is_monitoring', False):
                 await asyncio.wait_for(self._screen_analyzer.stop_monitoring(), timeout=5.0)
                 self.logger.info("[Kernel] Screen Analyzer stopped")
-        except (asyncio.TimeoutError, Exception) as e:
+        except Exception as e:
             self.logger.debug(f"[Kernel] Screen Analyzer stop error: {e}")
 
         try:
-            if self._narration_engine and getattr(self._narration_engine, '_is_running', False):
+            # Only stop the narration engine if WE started it (it's a singleton shared
+            # by Ghost Hands, VisualMonitorAgent, etc.). Stopping a shared singleton
+            # would break other components still shutting down.
+            if (self._narration_engine
+                    and self._narration_engine_started_by_us
+                    and getattr(self._narration_engine, '_is_running', False)):
                 await asyncio.wait_for(self._narration_engine.stop(), timeout=5.0)
-                self.logger.info("[Kernel] Narration Engine stopped")
-        except (asyncio.TimeoutError, Exception) as e:
+                self.logger.info("[Kernel] Narration Engine stopped (started by us)")
+        except Exception as e:
             self.logger.debug(f"[Kernel] Narration Engine stop error: {e}")
 
         try:
             if self._permission_manager and getattr(self._permission_manager, '_monitoring', False):
                 await asyncio.wait_for(self._permission_manager.stop_monitoring(), timeout=3.0)
                 self.logger.info("[Kernel] Permission Manager monitoring stopped")
-        except (asyncio.TimeoutError, Exception) as e:
+        except Exception as e:
             self.logger.debug(f"[Kernel] Permission Manager stop error: {e}")
 
         if self._screen_recording_check_task and not self._screen_recording_check_task.done():
@@ -62942,13 +62949,13 @@ class JarvisSystemKernel:
             # Visual Pipeline (Phase 6.8) gates on this result.
             # =================================================================
             self._current_startup_phase = "permissions"
-            self._current_startup_progress = 84
+            self._current_startup_progress = 85
             issue_collector.set_current_phase("Phase 6.4: Permissions")
             issue_collector.set_current_zone("Zone 6.4")
             perm_check_timeout = _get_env_float("JARVIS_PERMISSION_CHECK_TIMEOUT", 10.0)
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase(
-                    "permissions", 84, operational_timeout=perm_check_timeout
+                    "permissions", 85, operational_timeout=perm_check_timeout
                 )
 
             if _ssm: await _ssm.start_component("permissions")
@@ -66915,7 +66922,6 @@ class JarvisSystemKernel:
                 self.logger.debug(f"[GhostDisplay] Health loop error: {e}")
 
     # =========================================================================
-    # =========================================================================
     # v264.0: SCREEN RECORDING PERMISSION + REAL-TIME OBSERVATION (Phase 6.4)
     # =========================================================================
     # Checks macOS TCC Screen Recording permission during startup.
@@ -66932,7 +66938,14 @@ class JarvisSystemKernel:
         Uses PermissionManager singleton (3-tier check: CGPreflight → CGWindowList → screencapture).
         If denied, triggers OS dialog + starts background re-check loop.
         Announces result via voice.
+
+        Only runs on macOS (darwin). On other platforms, skips silently.
         """
+        import sys as _sys
+        if _sys.platform != "darwin":
+            self.logger.debug("[Permissions] Not macOS — skipping Screen Recording check")
+            return
+
         get_pm = None
         PermType = None
         PermStatus = None
@@ -67038,6 +67051,9 @@ class JarvisSystemKernel:
                 # If we get here, shutdown was signaled
                 self.logger.debug("[Permissions] Recheck loop: shutdown signaled")
                 return
+            except asyncio.CancelledError:
+                self.logger.debug("[Permissions] Recheck loop: cancelled")
+                return
             except asyncio.TimeoutError:
                 pass  # Normal — interval elapsed, time to re-check
 
@@ -67110,59 +67126,73 @@ class JarvisSystemKernel:
 
         Creates and starts the MemoryAwareScreenAnalyzer, connects it to the
         NarrationEngine via ScreenNarrationBridge, and stores strong references
-        to prevent GC (analyzer uses WeakSet for callbacks).
+        to prevent GC (analyzer uses WeakMethod internally for callbacks).
 
-        Safe to call multiple times — returns immediately if already running.
+        Safe to call from multiple concurrent paths (recheck loop + visual pipeline)
+        — serialized via self._screen_observation_lock.
         """
-        # Guard: already running
-        if self._screen_analyzer and getattr(self._screen_analyzer, 'is_monitoring', False):
-            self.logger.debug("[ScreenObservation] Already active — skipping")
-            return
+        async with self._screen_observation_lock:
+            # Guard: already running (checked inside lock to prevent TOCTOU)
+            if self._screen_analyzer and getattr(self._screen_analyzer, 'is_monitoring', False):
+                self.logger.debug("[ScreenObservation] Already active — skipping")
+                return
 
-        if not _get_env_bool("JARVIS_SCREEN_OBSERVATION_ENABLED", True):
-            self.logger.info("[ScreenObservation] Disabled via JARVIS_SCREEN_OBSERVATION_ENABLED")
-            return
+            if not _get_env_bool("JARVIS_SCREEN_OBSERVATION_ENABLED", True):
+                self.logger.info("[ScreenObservation] Disabled via JARVIS_SCREEN_OBSERVATION_ENABLED")
+                return
 
-        # Import MemoryAwareScreenAnalyzer
-        ScreenAnalyzer = None
-        try:
-            from backend.vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer as ScreenAnalyzer
-        except ImportError:
+            # Import MemoryAwareScreenAnalyzer
+            ScreenAnalyzer = None
             try:
-                from vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer as ScreenAnalyzer
+                from backend.vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer as ScreenAnalyzer
             except ImportError:
+                try:
+                    from vision.continuous_screen_analyzer import MemoryAwareScreenAnalyzer as ScreenAnalyzer
+                except ImportError:
+                    pass
+
+            if ScreenAnalyzer is None:
+                self.logger.warning("[ScreenObservation] MemoryAwareScreenAnalyzer not available — skipping")
+                return
+
+            # Get or create VisionCommandHandler — prefer existing backend instance
+            vision_handler = None
+            try:
+                # Check if the backend already has a vision handler we can reuse
+                if hasattr(self, '_backend_app') and self._backend_app:
+                    vh = getattr(self._backend_app, 'vision_handler', None)
+                    if vh is not None:
+                        vision_handler = vh
+                        self.logger.debug("[ScreenObservation] Reusing backend VisionCommandHandler")
+            except Exception:
                 pass
 
-        if ScreenAnalyzer is None:
-            self.logger.warning("[ScreenObservation] MemoryAwareScreenAnalyzer not available — skipping")
-            return
+            if vision_handler is None:
+                VisionHandler = None
+                try:
+                    from backend.api.vision_command_handler import VisionCommandHandler as VisionHandler
+                except ImportError:
+                    try:
+                        from api.vision_command_handler import VisionCommandHandler as VisionHandler
+                    except ImportError:
+                        pass
 
-        # Import VisionCommandHandler for screen analysis
-        VisionHandler = None
-        try:
-            from backend.api.vision_command_handler import VisionCommandHandler as VisionHandler
-        except ImportError:
+                if VisionHandler is None:
+                    self.logger.warning("[ScreenObservation] VisionCommandHandler not available — skipping")
+                    return
+                vision_handler = VisionHandler()
+
             try:
-                from api.vision_command_handler import VisionCommandHandler as VisionHandler
-            except ImportError:
-                pass
+                self._screen_analyzer = ScreenAnalyzer(vision_handler)
+                await self._screen_analyzer.start_monitoring()
+                self.logger.info("[ScreenObservation] Real-time screen monitoring activated")
 
-        if VisionHandler is None:
-            self.logger.warning("[ScreenObservation] VisionCommandHandler not available — skipping")
-            return
+                # Connect narration bridge
+                await self._connect_screen_narration(self._screen_analyzer)
 
-        try:
-            vision_handler = VisionHandler()
-            self._screen_analyzer = ScreenAnalyzer(vision_handler)
-            await self._screen_analyzer.start_monitoring()
-            self.logger.info("[ScreenObservation] Real-time screen monitoring activated")
-
-            # Connect narration bridge
-            await self._connect_screen_narration(self._screen_analyzer)
-
-        except Exception as e:
-            self.logger.warning(f"[ScreenObservation] Activation failed: {e}")
-            self._screen_analyzer = None
+            except Exception as e:
+                self.logger.warning(f"[ScreenObservation] Activation failed: {e}")
+                self._screen_analyzer = None
 
     async def _connect_screen_narration(self, analyzer) -> None:
         """
@@ -67170,7 +67200,7 @@ class JarvisSystemKernel:
 
         Creates a ScreenNarrationBridge that translates analyzer callbacks into
         narration calls. The bridge is stored as self._screen_narration_bridge
-        (strong reference) to prevent GC — the analyzer uses WeakSet for callbacks.
+        (strong reference) to prevent GC — the analyzer uses _CallbackSet/WeakMethod for callbacks.
 
         Event mappings:
             app_changed → narrate_perception("You switched to {app}")
@@ -67192,7 +67222,25 @@ class JarvisSystemKernel:
             return
 
         try:
+            # get_narration_engine() auto-starts the singleton. Track whether it
+            # was already running so we don't stop a shared singleton during shutdown.
+            NarrationEngineClass = None
+            try:
+                from backend.ghost_hands.narration_engine import NarrationEngine as NarrationEngineClass
+            except ImportError:
+                try:
+                    from ghost_hands.narration_engine import NarrationEngine as NarrationEngineClass
+                except ImportError:
+                    pass
+
+            was_running = False
+            if NarrationEngineClass is not None:
+                existing = NarrationEngineClass.get_instance()
+                if existing and getattr(existing, '_is_running', False):
+                    was_running = True
+
             self._narration_engine = await get_narration()
+            self._narration_engine_started_by_us = not was_running
 
             # Build the bridge as an inner class to keep it self-contained
             class ScreenNarrationBridge:
@@ -67567,7 +67615,7 @@ class JarvisSystemKernel:
             )
 
             state = {
-                "schema_version": 2,  # v264.0: bumped for new fields
+                "schema_version": 1,  # Additive-only: new fields don't break consumers
                 "timestamp": time.time(),
                 "is_ready": self._visual_pipeline_initialized,
                 "components": {

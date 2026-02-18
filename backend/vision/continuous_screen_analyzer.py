@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 from typing import Dict, Any, Optional, Callable, List, Deque
 from datetime import datetime, timedelta
 from collections import deque
+import types
 import weakref
 import numpy as np
 from PIL import Image
@@ -23,6 +24,91 @@ import io
 import base64
 
 logger = logging.getLogger(__name__)
+
+
+class _CallbackSet:
+    """
+    v264.0: Drop-in replacement for weakref.WeakSet that supports bound methods.
+
+    Python's weakref.WeakSet cannot hold bound methods (types.MethodType) because
+    they don't support __weakref__. Calling WeakSet.add(obj.method) silently fails
+    with TypeError, making callback registration appear to succeed while actually
+    doing nothing.
+
+    This class uses:
+    - weakref.WeakMethod for bound methods (Python 3.4+)
+    - weakref.ref for regular callables (functions, objects with __weakref__)
+    - Strong reference fallback for C functions / callables without __weakref__
+
+    Dead references are cleaned lazily during iteration and explicitly via _sweep().
+    """
+
+    __slots__ = ('_refs',)
+
+    def __init__(self):
+        self._refs: list = []
+
+    @staticmethod
+    def _callbacks_equal(a, b) -> bool:
+        """Compare callbacks correctly. Bound methods need == (compares __self__ + __func__),
+        regular callables use identity."""
+        if isinstance(a, types.MethodType) or isinstance(b, types.MethodType):
+            return a == b
+        return a is b
+
+    def _make_ref(self, callback):
+        """Create the appropriate weak/strong reference for a callback."""
+        if isinstance(callback, types.MethodType):
+            return weakref.WeakMethod(callback)
+        try:
+            return weakref.ref(callback)
+        except TypeError:
+            # C extension functions, slots, etc. can't be weakly referenced.
+            # Wrap in a closure that always returns the object.
+            obj = callback
+            return lambda: obj
+
+    def add(self, callback) -> None:
+        """Add a callback. Idempotent — won't double-register the same live callback."""
+        # Sweep dead refs first to prevent unbounded growth
+        self._sweep()
+        # Check for duplicates by resolving existing refs
+        for ref in self._refs:
+            existing = ref()
+            if existing is not None and self._callbacks_equal(existing, callback):
+                return
+        self._refs.append(self._make_ref(callback))
+
+    def discard(self, callback) -> None:
+        """Remove a callback if present."""
+        new_refs = []
+        for ref in self._refs:
+            obj = ref()
+            if obj is not None and not self._callbacks_equal(obj, callback):
+                new_refs.append(ref)
+        self._refs = new_refs
+
+    def _sweep(self) -> None:
+        """Remove dead references."""
+        self._refs = [r for r in self._refs if r() is not None]
+
+    def __iter__(self):
+        """Yield live callbacks, sweeping dead refs."""
+        live_refs = []
+        for ref in self._refs:
+            obj = ref()
+            if obj is not None:
+                live_refs.append(ref)
+                yield obj
+        self._refs = live_refs
+
+    def __len__(self) -> int:
+        self._sweep()
+        return len(self._refs)
+
+    def __bool__(self) -> bool:
+        self._sweep()
+        return bool(self._refs)
 
 class MemoryAwareScreenAnalyzer:
     """
@@ -102,19 +188,20 @@ class MemoryAwareScreenAnalyzer:
             'capture_signature': None,
         }
         
-        # Callbacks with weak references to prevent memory leaks
+        # v264.0: Callbacks via _CallbackSet (supports bound methods via WeakMethod).
+        # Previous weakref.WeakSet silently dropped bound methods (TypeError on add).
         self.event_callbacks = {
-            'app_changed': weakref.WeakSet(),
-            'content_changed': weakref.WeakSet(),
-            'weather_visible': weakref.WeakSet(),
-            'error_detected': weakref.WeakSet(),
-            'user_needs_help': weakref.WeakSet(),
-            'memory_warning': weakref.WeakSet(),
+            'app_changed': _CallbackSet(),
+            'content_changed': _CallbackSet(),
+            'weather_visible': _CallbackSet(),
+            'error_detected': _CallbackSet(),
+            'user_needs_help': _CallbackSet(),
+            'memory_warning': _CallbackSet(),
             # v241.0: Extended callback types for ScreenAnalyzerBridge integration
-            'notification_detected': weakref.WeakSet(),
-            'meeting_detected': weakref.WeakSet(),
-            'security_concern': weakref.WeakSet(),
-            'screen_captured': weakref.WeakSet(),
+            'notification_detected': _CallbackSet(),
+            'meeting_detected': _CallbackSet(),
+            'security_concern': _CallbackSet(),
+            'screen_captured': _CallbackSet(),
         }
         
         # Performance optimization with size limits
@@ -1173,7 +1260,7 @@ Be concise but thorough.'''
         self._event_last_fingerprint[event_type] = dedup_fingerprint
         self._event_stats['emitted'][event_type] += 1
 
-        # Convert WeakSet to list to iterate safely while callbacks run
+        # Resolve live callbacks from _CallbackSet to iterate safely
         callbacks = list(self.event_callbacks[event_type])
         async_tasks = []
         for callback in callbacks:

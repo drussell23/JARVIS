@@ -31,9 +31,12 @@ Required Permissions:
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import ctypes.util
 import logging
 import subprocess
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -41,6 +44,44 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# v264.0: Cached CoreGraphics Library Handle + CGRect Struct
+# =============================================================================
+# CoreGraphics is loaded once at module level (macOS only) to avoid repeated
+# ctypes.util.find_library() filesystem traversal on every permission check.
+# The recheck loop calls check_permission(use_cache=False) every 10s — without
+# caching, find_library() would run 6x/min doing otool/subprocess calls.
+# =============================================================================
+
+_cg_lib = None  # Cached CoreGraphics ctypes handle
+_cf_lib = None  # Cached CoreFoundation ctypes handle
+
+if sys.platform == "darwin":
+    try:
+        _cg_path = ctypes.util.find_library("CoreGraphics")
+        if _cg_path:
+            _cg_lib = ctypes.cdll.LoadLibrary(_cg_path)
+        _cf_path = ctypes.util.find_library("CoreFoundation")
+        if _cf_path:
+            _cf_lib = ctypes.cdll.LoadLibrary(_cf_path)
+    except (OSError, AttributeError) as _e:
+        logger.debug(f"CoreGraphics/CoreFoundation ctypes load failed: {_e}")
+
+
+class _CGPoint(ctypes.Structure):
+    """CoreGraphics CGPoint struct for ctypes interop."""
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    """CoreGraphics CGSize struct for ctypes interop."""
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class _CGRect(ctypes.Structure):
+    """CoreGraphics CGRect struct for ctypes interop."""
+    _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
 
 
 # =============================================================================
@@ -519,56 +560,37 @@ class PermissionManager:
           3. screencapture command (last resort)
         """
         # Method 1: CGPreflightScreenCaptureAccess (macOS 10.15+, most reliable)
+        # Uses module-level cached _cg_lib handle to avoid repeated find_library() calls.
         try:
-            import ctypes
-            import ctypes.util
-            cg_path = ctypes.util.find_library("CoreGraphics")
-            if cg_path:
-                cg = ctypes.cdll.LoadLibrary(cg_path)
-                # CGPreflightScreenCaptureAccess() returns bool (true = granted)
-                cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
-                granted = cg.CGPreflightScreenCaptureAccess()
+            if _cg_lib is not None:
+                _cg_lib.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+                granted = _cg_lib.CGPreflightScreenCaptureAccess()
                 logger.debug(f"CGPreflightScreenCaptureAccess returned: {granted}")
                 return PermissionStatus.GRANTED if granted else PermissionStatus.DENIED
         except (OSError, AttributeError) as e:
             logger.debug(f"CGPreflightScreenCaptureAccess not available: {e}")
 
         # Method 2: CGWindowListCreateImage probe (older macOS)
+        # Uses module-level cached _cg_lib + _cf_lib handles and _CGRect struct.
         try:
-            import ctypes
-            import ctypes.util
-            cg_path = ctypes.util.find_library("CoreGraphics")
-            if cg_path:
-                cg = ctypes.cdll.LoadLibrary(cg_path)
-                # CGWindowListCreateImage with a 1x1 rect — returns NULL if denied
-                # CGRectMake(0, 0, 1, 1) as struct
-                class CGRect(ctypes.Structure):
-                    class CGPoint(ctypes.Structure):
-                        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
-                    class CGSize(ctypes.Structure):
-                        _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
-                    _fields_ = [("origin", CGPoint), ("size", CGSize)]
-
-                cg.CGWindowListCreateImage.restype = ctypes.c_void_p
-                cg.CGWindowListCreateImage.argtypes = [
-                    CGRect,              # screenBounds
+            if _cg_lib is not None:
+                _cg_lib.CGWindowListCreateImage.restype = ctypes.c_void_p
+                _cg_lib.CGWindowListCreateImage.argtypes = [
+                    _CGRect,             # screenBounds
                     ctypes.c_uint32,     # listOption
                     ctypes.c_uint32,     # windowID
                     ctypes.c_uint32,     # imageOption
                 ]
-                rect = CGRect()
+                rect = _CGRect()
                 rect.origin.x = 0.0
                 rect.origin.y = 0.0
                 rect.size.width = 1.0
                 rect.size.height = 1.0
                 # kCGWindowListOptionOnScreenOnly=1, kCGNullWindowID=0, kCGWindowImageDefault=0
-                img_ref = cg.CGWindowListCreateImage(rect, 1, 0, 0)
+                img_ref = _cg_lib.CGWindowListCreateImage(rect, 1, 0, 0)
                 if img_ref:
-                    # Release the image ref
-                    cf_path = ctypes.util.find_library("CoreFoundation")
-                    if cf_path:
-                        cf = ctypes.cdll.LoadLibrary(cf_path)
-                        cf.CFRelease(ctypes.c_void_p(img_ref))
+                    if _cf_lib is not None:
+                        _cf_lib.CFRelease(ctypes.c_void_p(img_ref))
                     logger.debug("CGWindowListCreateImage probe: GRANTED")
                     return PermissionStatus.GRANTED
                 else:
@@ -611,15 +633,11 @@ class PermissionManager:
         Returns:
             True if the request was triggered successfully (NOT whether permission was granted).
         """
-        # Try CGRequestScreenCaptureAccess (macOS 10.15+)
+        # Try CGRequestScreenCaptureAccess (macOS 10.15+) — uses cached handle
         try:
-            import ctypes
-            import ctypes.util
-            cg_path = ctypes.util.find_library("CoreGraphics")
-            if cg_path:
-                cg = ctypes.cdll.LoadLibrary(cg_path)
-                cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
-                result = cg.CGRequestScreenCaptureAccess()
+            if _cg_lib is not None:
+                _cg_lib.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+                result = _cg_lib.CGRequestScreenCaptureAccess()
                 logger.info(f"[Permissions] CGRequestScreenCaptureAccess triggered (returned: {result})")
                 return True
         except (OSError, AttributeError) as e:
