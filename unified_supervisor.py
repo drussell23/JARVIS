@@ -60090,6 +60090,27 @@ class JarvisSystemKernel:
         except Exception:
             pass
 
+        # v263.2: Explicitly stop known singleton health-loop owners that
+        # may have been skipped when AGI OS stop times out.
+        try:
+            from neural_mesh.registry.agent_registry import AgentRegistry as _AR
+            _ar_inst = _AR._instance if hasattr(_AR, '_instance') else None
+            if _ar_inst and getattr(_ar_inst, '_running', False):
+                await asyncio.wait_for(_ar_inst.stop(), timeout=3.0)
+                self.logger.debug("[Kernel] AgentRegistry stopped (orphan cleanup)")
+        except Exception:
+            pass
+
+        try:
+            from core.hybrid_orchestrator import _global_orchestrator as _go
+            if _go and hasattr(_go, 'client') and _go.client:
+                _hbc = _go.client
+                if getattr(_hbc, 'health_check_task', None) and not _hbc.health_check_task.done():
+                    await asyncio.wait_for(_hbc.stop(), timeout=3.0)
+                    self.logger.debug("[Kernel] HybridBackendClient stopped (orphan cleanup)")
+        except Exception:
+            pass
+
         # v251.0: Deterministic final task drain before loop teardown.
         # This prevents "Task was destroyed but it is pending" and leaked
         # fire-and-forget tasks from surviving into interpreter shutdown.
@@ -60112,10 +60133,12 @@ class JarvisSystemKernel:
                 for task in remaining_tasks:
                     task.cancel()
 
+                # v263.2: Increased from 2.0s to 5.0s — cancelled health loops
+                # need time to run CancelledError handlers and flush state.
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*remaining_tasks, return_exceptions=True),
-                        timeout=2.0,
+                        timeout=5.0,
                     )
                 except asyncio.TimeoutError:
                     still_running = [

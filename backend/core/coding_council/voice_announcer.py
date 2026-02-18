@@ -2453,8 +2453,13 @@ class CodingCouncilVoiceAnnouncer:
         message = self._composer.compose_complete_message(ctx, success, error_message)
         priority = "medium" if success else "high"
 
+        # v263.2: Use wait=False — completion announcements are informational,
+        # no caller needs to block until TTS physically finishes speaking.
+        # With wait=True, the spawn timeout (15s) had to cover queueing +
+        # all prior TTS messages + this message's TTS — easily exceeded
+        # during startup when the voice queue is backed up.
         result = await self._task_registry.spawn(
-            self._speak(message, priority=priority, wait=True, timeout=0),
+            self._speak(message, priority=priority, wait=False, timeout=0),
             task_id=f"complete_{task_id}",
             timeout=self.config.voice_timeout
         )
