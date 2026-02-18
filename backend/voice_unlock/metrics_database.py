@@ -551,6 +551,27 @@ class MetricsDatabase:
         self._batch_writer = BatchWriter(self._executor)
         logger.info(f"✅ Metrics database pool initialized (size: {_metrics_config.pool_size})")
 
+    @contextmanager
+    def _safe_sqlite(self):
+        """Context manager that guarantees SQLite connection cleanup.
+
+        v241.1: Architectural fix for 31 methods that leaked SQLite connections
+        on exception paths. Previously each method had:
+            conn = sqlite3.connect(self.sqlite_path)
+            ...  # no finally → conn leaked on exception
+        Now:
+            with self._safe_sqlite() as conn:
+                ...  # conn.close() guaranteed by __exit__
+        """
+        conn = sqlite3.connect(str(self.sqlite_path))
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _init_sqlite(self):
         """Initialize SQLite database with schema"""
         conn = sqlite3.connect(self.sqlite_path)
@@ -1642,97 +1663,96 @@ class MetricsDatabase:
     ) -> Optional[int]:
         """Synchronous SQLite storage - called via asyncio.to_thread()"""
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Extract data from entry
-            bio = entry['biometrics']
-            perf = entry['performance']
-            qual = entry['quality_indicators']
-            stage_sum = entry['stage_summary']
-            sys_info = entry['system_info']
-            meta = entry['metadata']
+                # Extract data from entry
+                bio = entry['biometrics']
+                perf = entry['performance']
+                qual = entry['quality_indicators']
+                stage_sum = entry['stage_summary']
+                sys_info = entry['system_info']
+                meta = entry['metadata']
 
-            # Insert main attempt
-            cursor.execute("""
-                INSERT INTO unlock_attempts (
-                    timestamp, date, time, day_of_week, unix_timestamp,
-                    success, speaker_name, transcribed_text, error,
-                    speaker_confidence, stt_confidence, threshold, above_threshold,
-                    confidence_margin, margin_percentage,
-                    avg_last_10, avg_last_30, trend_direction, volatility,
-                    best_ever, worst_ever, percentile_rank,
-                    total_duration_ms, slowest_stage, fastest_stage,
-                    audio_quality, voice_match_quality, overall_confidence,
-                    total_stages, successful_stages, failed_stages, all_stages_passed,
-                    platform, platform_version, python_version, stt_engine, speaker_engine,
-                    session_id, logger_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                entry['timestamp'], entry['date'], entry['time'], entry['day_of_week'],
-                entry['unix_timestamp'], entry['success'], entry['speaker_name'],
-                entry['transcribed_text'], entry.get('error'),
-                bio['speaker_confidence'], bio['stt_confidence'], bio['threshold'],
-                bio['above_threshold'], bio['confidence_margin'],
-                bio['confidence_vs_threshold']['margin_percentage'],
-                bio['confidence_trends'].get('avg_last_10'),
-                bio['confidence_trends'].get('avg_last_30'),
-                bio['confidence_trends'].get('trend_direction'),
-                bio['confidence_trends'].get('volatility'),
-                bio['confidence_trends'].get('best_ever'),
-                bio['confidence_trends'].get('worst_ever'),
-                bio['confidence_trends'].get('current_rank_percentile'),
-                perf['total_duration_ms'], perf.get('slowest_stage'),
-                perf.get('fastest_stage'), qual['audio_quality'],
-                qual['voice_match_quality'], qual['overall_confidence'],
-                stage_sum['total_stages'], stage_sum['successful_stages'],
-                stage_sum['failed_stages'], stage_sum['all_stages_passed'],
-                sys_info.get('platform'), sys_info.get('platform_version'),
-                sys_info.get('python_version'), sys_info.get('stt_engine'),
-                sys_info.get('speaker_engine'), meta['session_id'],
-                meta['logger_version']
-            ))
-
-            attempt_id = cursor.lastrowid
-
-            # Insert processing stages
-            for stage in stages:
+                # Insert main attempt
                 cursor.execute("""
-                    INSERT INTO processing_stages (
-                        attempt_id, stage_name, started_at, ended_at, duration_ms,
-                        percentage_of_total, success, algorithm_used, module_path,
-                        function_name, input_size_bytes, output_size_bytes,
-                        confidence_score, threshold, above_threshold, error_message,
-                        metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO unlock_attempts (
+                        timestamp, date, time, day_of_week, unix_timestamp,
+                        success, speaker_name, transcribed_text, error,
+                        speaker_confidence, stt_confidence, threshold, above_threshold,
+                        confidence_margin, margin_percentage,
+                        avg_last_10, avg_last_30, trend_direction, volatility,
+                        best_ever, worst_ever, percentile_rank,
+                        total_duration_ms, slowest_stage, fastest_stage,
+                        audio_quality, voice_match_quality, overall_confidence,
+                        total_stages, successful_stages, failed_stages, all_stages_passed,
+                        platform, platform_version, python_version, stt_engine, speaker_engine,
+                        session_id, logger_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    attempt_id, stage['stage_name'], stage['started_at'],
-                    stage['ended_at'], stage['duration_ms'],
-                    stage['percentage_of_total'], stage['success'],
-                    stage.get('algorithm_used'), stage.get('module_path'),
-                    stage.get('function_name'), stage.get('input_size_bytes'),
-                    stage.get('output_size_bytes'), stage.get('confidence_score'),
-                    stage.get('threshold'), stage.get('above_threshold'),
-                    stage.get('error_message'),
-                    json.dumps(stage.get('metadata', {}))
+                    entry['timestamp'], entry['date'], entry['time'], entry['day_of_week'],
+                    entry['unix_timestamp'], entry['success'], entry['speaker_name'],
+                    entry['transcribed_text'], entry.get('error'),
+                    bio['speaker_confidence'], bio['stt_confidence'], bio['threshold'],
+                    bio['above_threshold'], bio['confidence_margin'],
+                    bio['confidence_vs_threshold']['margin_percentage'],
+                    bio['confidence_trends'].get('avg_last_10'),
+                    bio['confidence_trends'].get('avg_last_30'),
+                    bio['confidence_trends'].get('trend_direction'),
+                    bio['confidence_trends'].get('volatility'),
+                    bio['confidence_trends'].get('best_ever'),
+                    bio['confidence_trends'].get('worst_ever'),
+                    bio['confidence_trends'].get('current_rank_percentile'),
+                    perf['total_duration_ms'], perf.get('slowest_stage'),
+                    perf.get('fastest_stage'), qual['audio_quality'],
+                    qual['voice_match_quality'], qual['overall_confidence'],
+                    stage_sum['total_stages'], stage_sum['successful_stages'],
+                    stage_sum['failed_stages'], stage_sum['all_stages_passed'],
+                    sys_info.get('platform'), sys_info.get('platform_version'),
+                    sys_info.get('python_version'), sys_info.get('stt_engine'),
+                    sys_info.get('speaker_engine'), meta['session_id'],
+                    meta['logger_version']
                 ))
 
-            # Insert stage breakdown
-            for stage_name, stage_data in perf.get('stages_breakdown', {}).items():
-                cursor.execute("""
-                    INSERT INTO stage_breakdown (
-                        attempt_id, stage_name, duration_ms, percentage
-                    ) VALUES (?, ?, ?, ?)
-                """, (
-                    attempt_id, stage_name, stage_data['duration_ms'],
-                    stage_data['percentage']
-                ))
+                attempt_id = cursor.lastrowid
 
-            conn.commit()
-            conn.close()
+                # Insert processing stages
+                for stage in stages:
+                    cursor.execute("""
+                        INSERT INTO processing_stages (
+                            attempt_id, stage_name, started_at, ended_at, duration_ms,
+                            percentage_of_total, success, algorithm_used, module_path,
+                            function_name, input_size_bytes, output_size_bytes,
+                            confidence_score, threshold, above_threshold, error_message,
+                            metadata_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        attempt_id, stage['stage_name'], stage['started_at'],
+                        stage['ended_at'], stage['duration_ms'],
+                        stage['percentage_of_total'], stage['success'],
+                        stage.get('algorithm_used'), stage.get('module_path'),
+                        stage.get('function_name'), stage.get('input_size_bytes'),
+                        stage.get('output_size_bytes'), stage.get('confidence_score'),
+                        stage.get('threshold'), stage.get('above_threshold'),
+                        stage.get('error_message'),
+                        json.dumps(stage.get('metadata', {}))
+                    ))
 
-            logger.debug(f"✅ Stored unlock attempt in SQLite (ID: {attempt_id})")
-            return attempt_id
+                # Insert stage breakdown
+                for stage_name, stage_data in perf.get('stages_breakdown', {}).items():
+                    cursor.execute("""
+                        INSERT INTO stage_breakdown (
+                            attempt_id, stage_name, duration_ms, percentage
+                        ) VALUES (?, ?, ?, ?)
+                    """, (
+                        attempt_id, stage_name, stage_data['duration_ms'],
+                        stage_data['percentage']
+                    ))
+
+                conn.commit()
+
+                logger.debug(f"✅ Stored unlock attempt in SQLite (ID: {attempt_id})")
+                return attempt_id
 
         except Exception as e:
             logger.error(f"Failed to store in SQLite: {e}", exc_info=True)
@@ -1803,13 +1823,12 @@ class MetricsDatabase:
 
     def _query_attempts_sync(self, query: str, params: tuple) -> List[Dict[str, Any]]:
         """Synchronous fallback for query_attempts."""
-        conn = sqlite3.connect(self.sqlite_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        results = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return results
+        with self._safe_sqlite() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            results = [dict(row) for row in cursor.fetchall()]
+            return results
 
     async def health_check(self) -> Dict[str, Any]:
         """
@@ -2005,94 +2024,93 @@ class MetricsDatabase:
         Synchronous method to store typing session (runs in executor).
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Insert typing session
-            cursor.execute("""
-                INSERT INTO password_typing_sessions (
-                    attempt_id, timestamp, success,
-                    total_characters, characters_typed, typing_method, fallback_used,
-                    total_typing_duration_ms, avg_char_duration_ms,
-                    min_char_duration_ms, max_char_duration_ms,
-                    system_load, memory_pressure, screen_locked,
-                    inter_char_delay_avg_ms, inter_char_delay_std_ms,
-                    shift_press_duration_avg_ms, shift_release_delay_avg_ms,
-                    failed_at_character, retry_count,
-                    time_of_day, day_of_week
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                attempt_id,
-                session_data.get('timestamp'),
-                1 if session_data.get('success') else 0,
-                session_data.get('total_characters'),
-                session_data.get('characters_typed'),
-                session_data.get('typing_method', 'core_graphics'),
-                1 if session_data.get('fallback_used') else 0,
-                session_data.get('total_typing_duration_ms'),
-                session_data.get('avg_char_duration_ms'),
-                session_data.get('min_char_duration_ms'),
-                session_data.get('max_char_duration_ms'),
-                session_data.get('system_load'),
-                session_data.get('memory_pressure'),
-                1 if session_data.get('screen_locked') else 0,
-                session_data.get('inter_char_delay_avg_ms'),
-                session_data.get('inter_char_delay_std_ms'),
-                session_data.get('shift_press_duration_avg_ms'),
-                session_data.get('shift_release_delay_avg_ms'),
-                session_data.get('failed_at_character'),
-                session_data.get('retry_count', 0),
-                session_data.get('time_of_day'),
-                session_data.get('day_of_week')
-            ))
-
-            session_id = cursor.lastrowid
-
-            # Insert character metrics
-            for char_metric in character_metrics:
+                # Insert typing session
                 cursor.execute("""
-                    INSERT INTO character_typing_metrics (
-                        session_id, attempt_id,
-                        char_position, char_type, char_case, requires_shift, keycode,
-                        char_start_time_ms, char_end_time_ms, total_duration_ms,
-                        shift_down_duration_ms, shift_registered_delay_ms, shift_up_delay_ms,
-                        key_down_created, key_down_posted, key_press_duration_ms,
-                        key_up_created, key_up_posted,
-                        success, error_type, error_message, retry_attempted,
-                        inter_char_delay_ms, system_load_at_char
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO password_typing_sessions (
+                        attempt_id, timestamp, success,
+                        total_characters, characters_typed, typing_method, fallback_used,
+                        total_typing_duration_ms, avg_char_duration_ms,
+                        min_char_duration_ms, max_char_duration_ms,
+                        system_load, memory_pressure, screen_locked,
+                        inter_char_delay_avg_ms, inter_char_delay_std_ms,
+                        shift_press_duration_avg_ms, shift_release_delay_avg_ms,
+                        failed_at_character, retry_count,
+                        time_of_day, day_of_week
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    session_id,
                     attempt_id,
-                    char_metric.get('char_position'),
-                    char_metric.get('char_type'),
-                    char_metric.get('char_case'),
-                    1 if char_metric.get('requires_shift') else 0,
-                    char_metric.get('keycode'),
-                    char_metric.get('char_start_time_ms'),
-                    char_metric.get('char_end_time_ms'),
-                    char_metric.get('total_duration_ms'),
-                    char_metric.get('shift_down_duration_ms'),
-                    char_metric.get('shift_registered_delay_ms'),
-                    char_metric.get('shift_up_delay_ms'),
-                    1 if char_metric.get('key_down_created') else 0,
-                    1 if char_metric.get('key_down_posted') else 0,
-                    char_metric.get('key_press_duration_ms'),
-                    1 if char_metric.get('key_up_created') else 0,
-                    1 if char_metric.get('key_up_posted') else 0,
-                    1 if char_metric.get('success') else 0,
-                    char_metric.get('error_type'),
-                    char_metric.get('error_message'),
-                    1 if char_metric.get('retry_attempted') else 0,
-                    char_metric.get('inter_char_delay_ms'),
-                    char_metric.get('system_load_at_char')
+                    session_data.get('timestamp'),
+                    1 if session_data.get('success') else 0,
+                    session_data.get('total_characters'),
+                    session_data.get('characters_typed'),
+                    session_data.get('typing_method', 'core_graphics'),
+                    1 if session_data.get('fallback_used') else 0,
+                    session_data.get('total_typing_duration_ms'),
+                    session_data.get('avg_char_duration_ms'),
+                    session_data.get('min_char_duration_ms'),
+                    session_data.get('max_char_duration_ms'),
+                    session_data.get('system_load'),
+                    session_data.get('memory_pressure'),
+                    1 if session_data.get('screen_locked') else 0,
+                    session_data.get('inter_char_delay_avg_ms'),
+                    session_data.get('inter_char_delay_std_ms'),
+                    session_data.get('shift_press_duration_avg_ms'),
+                    session_data.get('shift_release_delay_avg_ms'),
+                    session_data.get('failed_at_character'),
+                    session_data.get('retry_count', 0),
+                    session_data.get('time_of_day'),
+                    session_data.get('day_of_week')
                 ))
 
-            conn.commit()
-            conn.close()
+                session_id = cursor.lastrowid
 
-            logger.info(f"✅ Stored typing session with {len(character_metrics)} character metrics (Session ID: {session_id})")
-            return session_id
+                # Insert character metrics
+                for char_metric in character_metrics:
+                    cursor.execute("""
+                        INSERT INTO character_typing_metrics (
+                            session_id, attempt_id,
+                            char_position, char_type, char_case, requires_shift, keycode,
+                            char_start_time_ms, char_end_time_ms, total_duration_ms,
+                            shift_down_duration_ms, shift_registered_delay_ms, shift_up_delay_ms,
+                            key_down_created, key_down_posted, key_press_duration_ms,
+                            key_up_created, key_up_posted,
+                            success, error_type, error_message, retry_attempted,
+                            inter_char_delay_ms, system_load_at_char
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        session_id,
+                        attempt_id,
+                        char_metric.get('char_position'),
+                        char_metric.get('char_type'),
+                        char_metric.get('char_case'),
+                        1 if char_metric.get('requires_shift') else 0,
+                        char_metric.get('keycode'),
+                        char_metric.get('char_start_time_ms'),
+                        char_metric.get('char_end_time_ms'),
+                        char_metric.get('total_duration_ms'),
+                        char_metric.get('shift_down_duration_ms'),
+                        char_metric.get('shift_registered_delay_ms'),
+                        char_metric.get('shift_up_delay_ms'),
+                        1 if char_metric.get('key_down_created') else 0,
+                        1 if char_metric.get('key_down_posted') else 0,
+                        char_metric.get('key_press_duration_ms'),
+                        1 if char_metric.get('key_up_created') else 0,
+                        1 if char_metric.get('key_up_posted') else 0,
+                        1 if char_metric.get('success') else 0,
+                        char_metric.get('error_type'),
+                        char_metric.get('error_message'),
+                        1 if char_metric.get('retry_attempted') else 0,
+                        char_metric.get('inter_char_delay_ms'),
+                        char_metric.get('system_load_at_char')
+                    ))
+
+                conn.commit()
+
+                logger.info(f"✅ Stored typing session with {len(character_metrics)} character metrics (Session ID: {session_id})")
+                return session_id
 
         except Exception as e:
             logger.error(f"Failed to store typing session: {e}", exc_info=True)
@@ -2117,145 +2135,144 @@ class MetricsDatabase:
             Attempt ID if successful, None otherwise
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Ensure table exists with ENHANCED schema for continuous learning
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS vbi_unlock_attempts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    attempt_id INTEGER UNIQUE,
-                    speaker_name TEXT,
+                # Ensure table exists with ENHANCED schema for continuous learning
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS vbi_unlock_attempts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        attempt_id INTEGER UNIQUE,
+                        speaker_name TEXT,
 
-                    -- Confidence metrics (for ML/continuous learning)
-                    confidence REAL,
-                    confidence_pct REAL,  -- Confidence as percentage (0-100)
-                    threshold REAL DEFAULT 0.85,
-                    above_threshold INTEGER,
+                        -- Confidence metrics (for ML/continuous learning)
+                        confidence REAL,
+                        confidence_pct REAL,  -- Confidence as percentage (0-100)
+                        threshold REAL DEFAULT 0.85,
+                        above_threshold INTEGER,
 
-                    -- Success/failure
-                    success INTEGER,
-                    error_reason TEXT,
+                        -- Success/failure
+                        success INTEGER,
+                        error_reason TEXT,
 
-                    -- Timing metrics
-                    duration_ms REAL,
-                    verification_time_ms REAL,
-                    unlock_time_ms REAL,
+                        -- Timing metrics
+                        duration_ms REAL,
+                        verification_time_ms REAL,
+                        unlock_time_ms REAL,
 
-                    -- Date/Time fields (for DB Browser SQLite viewing)
-                    timestamp TEXT,
-                    date TEXT,            -- YYYY-MM-DD format
-                    time TEXT,            -- HH:MM:SS format
-                    day_of_week TEXT,     -- Monday, Tuesday, etc.
-                    hour_of_day INTEGER,  -- 0-23
+                        -- Date/Time fields (for DB Browser SQLite viewing)
+                        timestamp TEXT,
+                        date TEXT,            -- YYYY-MM-DD format
+                        time TEXT,            -- HH:MM:SS format
+                        day_of_week TEXT,     -- Monday, Tuesday, etc.
+                        hour_of_day INTEGER,  -- 0-23
 
-                    -- Method and handler info
-                    method TEXT,
-                    handler TEXT,
+                        -- Method and handler info
+                        method TEXT,
+                        handler TEXT,
 
-                    -- Audio/Embedding data for continuous learning
-                    audio_duration_sec REAL,
-                    audio_quality TEXT,   -- 'excellent', 'good', 'fair', 'poor'
-                    embedding_json TEXT,  -- 192-dim ECAPA embedding as JSON
+                        -- Audio/Embedding data for continuous learning
+                        audio_duration_sec REAL,
+                        audio_quality TEXT,   -- 'excellent', 'good', 'fair', 'poor'
+                        embedding_json TEXT,  -- 192-dim ECAPA embedding as JSON
 
-                    -- Environment context
-                    environment TEXT,     -- 'quiet', 'noisy', 'unknown'
-                    microphone TEXT,
+                        -- Environment context
+                        environment TEXT,     -- 'quiet', 'noisy', 'unknown'
+                        microphone TEXT,
 
-                    -- ML Learning flags
-                    used_for_training INTEGER DEFAULT 0,
-                    learning_quality_score REAL,
+                        -- ML Learning flags
+                        used_for_training INTEGER DEFAULT 0,
+                        learning_quality_score REAL,
 
-                    -- System timestamps
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+                        -- System timestamps
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
 
-            # Create indexes for fast queries
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_date ON vbi_unlock_attempts(date)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_speaker ON vbi_unlock_attempts(speaker_name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_success ON vbi_unlock_attempts(success)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_confidence ON vbi_unlock_attempts(confidence_pct)")
+                # Create indexes for fast queries
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_date ON vbi_unlock_attempts(date)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_speaker ON vbi_unlock_attempts(speaker_name)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_success ON vbi_unlock_attempts(success)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_confidence ON vbi_unlock_attempts(confidence_pct)")
 
-            # Parse timestamp to extract date/time components
-            from datetime import datetime
-            now = datetime.now()
-            timestamp_str = attempt_data.get('timestamp') or now.isoformat()
+                # Parse timestamp to extract date/time components
+                from datetime import datetime
+                now = datetime.now()
+                timestamp_str = attempt_data.get('timestamp') or now.isoformat()
 
-            try:
-                if isinstance(timestamp_str, str):
-                    # Handle various timestamp formats
-                    for fmt in ['%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S']:
-                        try:
-                            parsed_dt = datetime.strptime(timestamp_str.split('+')[0], fmt)
-                            break
-                        except ValueError:
-                            parsed_dt = now
-                else:
+                try:
+                    if isinstance(timestamp_str, str):
+                        # Handle various timestamp formats
+                        for fmt in ['%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S']:
+                            try:
+                                parsed_dt = datetime.strptime(timestamp_str.split('+')[0], fmt)
+                                break
+                            except ValueError:
+                                parsed_dt = now
+                    else:
+                        parsed_dt = now
+                except Exception:
                     parsed_dt = now
-            except Exception:
-                parsed_dt = now
 
-            date_str = parsed_dt.strftime('%Y-%m-%d')
-            time_str = parsed_dt.strftime('%H:%M:%S')
-            day_of_week = parsed_dt.strftime('%A')
-            hour_of_day = parsed_dt.hour
+                date_str = parsed_dt.strftime('%Y-%m-%d')
+                time_str = parsed_dt.strftime('%H:%M:%S')
+                day_of_week = parsed_dt.strftime('%A')
+                hour_of_day = parsed_dt.hour
 
-            # Calculate confidence percentage
-            confidence_raw = attempt_data.get('confidence', 0.0) or 0.0
-            confidence_pct = round(confidence_raw * 100, 2)
-            threshold = attempt_data.get('threshold', 0.85)
-            above_threshold = 1 if confidence_raw >= threshold else 0
+                # Calculate confidence percentage
+                confidence_raw = attempt_data.get('confidence', 0.0) or 0.0
+                confidence_pct = round(confidence_raw * 100, 2)
+                threshold = attempt_data.get('threshold', 0.85)
+                above_threshold = 1 if confidence_raw >= threshold else 0
 
-            # Insert attempt record with enhanced fields
-            cursor.execute("""
-                INSERT OR REPLACE INTO vbi_unlock_attempts (
-                    attempt_id, speaker_name,
-                    confidence, confidence_pct, threshold, above_threshold,
-                    success, error_reason,
-                    duration_ms, verification_time_ms, unlock_time_ms,
-                    timestamp, date, time, day_of_week, hour_of_day,
-                    method, handler,
-                    audio_duration_sec, audio_quality, embedding_json,
-                    environment, microphone,
-                    used_for_training, learning_quality_score,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                attempt_data.get('attempt_id'),
-                attempt_data.get('speaker_name'),
-                confidence_raw,
-                confidence_pct,
-                threshold,
-                above_threshold,
-                1 if attempt_data.get('success') else 0,
-                attempt_data.get('error_reason'),
-                attempt_data.get('duration_ms'),
-                attempt_data.get('verification_time_ms'),
-                attempt_data.get('unlock_time_ms'),
-                timestamp_str,
-                date_str,
-                time_str,
-                day_of_week,
-                hour_of_day,
-                attempt_data.get('method', 'voice_biometric'),
-                attempt_data.get('handler', 'robust_v1'),
-                attempt_data.get('audio_duration_sec'),
-                attempt_data.get('audio_quality'),
-                attempt_data.get('embedding_json'),
-                attempt_data.get('environment'),
-                attempt_data.get('microphone'),
-                0,  # Not yet used for training
-                attempt_data.get('learning_quality_score'),
-                now.isoformat()
-            ))
+                # Insert attempt record with enhanced fields
+                cursor.execute("""
+                    INSERT OR REPLACE INTO vbi_unlock_attempts (
+                        attempt_id, speaker_name,
+                        confidence, confidence_pct, threshold, above_threshold,
+                        success, error_reason,
+                        duration_ms, verification_time_ms, unlock_time_ms,
+                        timestamp, date, time, day_of_week, hour_of_day,
+                        method, handler,
+                        audio_duration_sec, audio_quality, embedding_json,
+                        environment, microphone,
+                        used_for_training, learning_quality_score,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    attempt_data.get('attempt_id'),
+                    attempt_data.get('speaker_name'),
+                    confidence_raw,
+                    confidence_pct,
+                    threshold,
+                    above_threshold,
+                    1 if attempt_data.get('success') else 0,
+                    attempt_data.get('error_reason'),
+                    attempt_data.get('duration_ms'),
+                    attempt_data.get('verification_time_ms'),
+                    attempt_data.get('unlock_time_ms'),
+                    timestamp_str,
+                    date_str,
+                    time_str,
+                    day_of_week,
+                    hour_of_day,
+                    attempt_data.get('method', 'voice_biometric'),
+                    attempt_data.get('handler', 'robust_v1'),
+                    attempt_data.get('audio_duration_sec'),
+                    attempt_data.get('audio_quality'),
+                    attempt_data.get('embedding_json'),
+                    attempt_data.get('environment'),
+                    attempt_data.get('microphone'),
+                    0,  # Not yet used for training
+                    attempt_data.get('learning_quality_score'),
+                    now.isoformat()
+                ))
 
-            conn.commit()
-            attempt_id = cursor.lastrowid
-            conn.close()
+                conn.commit()
+                attempt_id = cursor.lastrowid
 
-            return attempt_id
+                return attempt_id
 
         except Exception as e:
             logger.error(f"Failed to record unlock attempt: {e}")
@@ -2269,89 +2286,88 @@ class MetricsDatabase:
             Dictionary with pattern analysis and recommendations
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            # Analyze successful character typing
-            cursor.execute("""
-                SELECT
-                    char_type,
-                    requires_shift,
-                    COUNT(*) as sample_count,
-                    AVG(total_duration_ms) as avg_duration,
-                    STDEV(total_duration_ms) as std_duration,
-                    MIN(total_duration_ms) as min_duration,
-                    MAX(total_duration_ms) as max_duration,
-                    AVG(inter_char_delay_ms) as avg_inter_char_delay,
-                    AVG(shift_press_duration_ms) as avg_shift_duration,
-                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate
-                FROM character_typing_metrics
-                WHERE success = 1
-                GROUP BY char_type, requires_shift
-                HAVING sample_count >= 5
-            """)
-
-            patterns = []
-            for row in cursor.fetchall():
-                pattern = {
-                    'char_type': row['char_type'],
-                    'requires_shift': bool(row['requires_shift']),
-                    'sample_count': row['sample_count'],
-                    'avg_duration_ms': row['avg_duration'],
-                    'std_duration_ms': row['std_duration'],
-                    'min_duration_ms': row['min_duration'],
-                    'max_duration_ms': row['max_duration'],
-                    'avg_inter_char_delay_ms': row['avg_inter_char_delay'],
-                    'avg_shift_duration_ms': row['avg_shift_duration'],
-                    'success_rate': row['success_rate'],
-                    'confidence': min(row['sample_count'] / 100.0, 1.0)  # Confidence increases with samples
-                }
-
-                # Calculate optimal timing (use fastest successful timing + small margin)
-                pattern['optimal_duration_ms'] = row['min_duration'] * 1.1
-                pattern['optimal_inter_char_delay_ms'] = max(row['avg_inter_char_delay'], 80.0)
-
-                patterns.append(pattern)
-
-                # Store in pattern analytics table
+                # Analyze successful character typing
                 cursor.execute("""
-                    INSERT INTO typing_pattern_analytics (
-                        calculated_at, pattern_type, char_type, requires_shift,
-                        sample_count, success_rate,
-                        avg_duration_ms, std_duration_ms, min_duration_ms, max_duration_ms,
-                        optimal_char_duration_ms, optimal_inter_char_delay_ms,
-                        optimal_shift_duration_ms, confidence_score,
-                        last_updated, training_samples_used
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    datetime.now().isoformat(),
-                    'successful_timing',
-                    pattern['char_type'],
-                    1 if pattern['requires_shift'] else 0,
-                    pattern['sample_count'],
-                    pattern['success_rate'],
-                    pattern['avg_duration_ms'],
-                    pattern['std_duration_ms'],
-                    pattern['min_duration_ms'],
-                    pattern['max_duration_ms'],
-                    pattern['optimal_duration_ms'],
-                    pattern['optimal_inter_char_delay_ms'],
-                    pattern['avg_shift_duration_ms'],
-                    pattern['confidence'],
-                    datetime.now().isoformat(),
-                    pattern['sample_count']
-                ))
+                    SELECT
+                        char_type,
+                        requires_shift,
+                        COUNT(*) as sample_count,
+                        AVG(total_duration_ms) as avg_duration,
+                        STDEV(total_duration_ms) as std_duration,
+                        MIN(total_duration_ms) as min_duration,
+                        MAX(total_duration_ms) as max_duration,
+                        AVG(inter_char_delay_ms) as avg_inter_char_delay,
+                        AVG(shift_press_duration_ms) as avg_shift_duration,
+                        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as success_rate
+                    FROM character_typing_metrics
+                    WHERE success = 1
+                    GROUP BY char_type, requires_shift
+                    HAVING sample_count >= 5
+                """)
 
-            conn.commit()
-            conn.close()
+                patterns = []
+                for row in cursor.fetchall():
+                    pattern = {
+                        'char_type': row['char_type'],
+                        'requires_shift': bool(row['requires_shift']),
+                        'sample_count': row['sample_count'],
+                        'avg_duration_ms': row['avg_duration'],
+                        'std_duration_ms': row['std_duration'],
+                        'min_duration_ms': row['min_duration'],
+                        'max_duration_ms': row['max_duration'],
+                        'avg_inter_char_delay_ms': row['avg_inter_char_delay'],
+                        'avg_shift_duration_ms': row['avg_shift_duration'],
+                        'success_rate': row['success_rate'],
+                        'confidence': min(row['sample_count'] / 100.0, 1.0)  # Confidence increases with samples
+                    }
 
-            logger.info(f"✅ Analyzed {len(patterns)} typing patterns")
-            return {
-                'patterns': patterns,
-                'total_patterns': len(patterns),
-                'timestamp': datetime.now().isoformat()
-            }
+                    # Calculate optimal timing (use fastest successful timing + small margin)
+                    pattern['optimal_duration_ms'] = row['min_duration'] * 1.1
+                    pattern['optimal_inter_char_delay_ms'] = max(row['avg_inter_char_delay'], 80.0)
+
+                    patterns.append(pattern)
+
+                    # Store in pattern analytics table
+                    cursor.execute("""
+                        INSERT INTO typing_pattern_analytics (
+                            calculated_at, pattern_type, char_type, requires_shift,
+                            sample_count, success_rate,
+                            avg_duration_ms, std_duration_ms, min_duration_ms, max_duration_ms,
+                            optimal_char_duration_ms, optimal_inter_char_delay_ms,
+                            optimal_shift_duration_ms, confidence_score,
+                            last_updated, training_samples_used
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        datetime.now().isoformat(),
+                        'successful_timing',
+                        pattern['char_type'],
+                        1 if pattern['requires_shift'] else 0,
+                        pattern['sample_count'],
+                        pattern['success_rate'],
+                        pattern['avg_duration_ms'],
+                        pattern['std_duration_ms'],
+                        pattern['min_duration_ms'],
+                        pattern['max_duration_ms'],
+                        pattern['optimal_duration_ms'],
+                        pattern['optimal_inter_char_delay_ms'],
+                        pattern['avg_shift_duration_ms'],
+                        pattern['confidence'],
+                        datetime.now().isoformat(),
+                        pattern['sample_count']
+                    ))
+
+                conn.commit()
+
+                logger.info(f"✅ Analyzed {len(patterns)} typing patterns")
+                return {
+                    'patterns': patterns,
+                    'total_patterns': len(patterns),
+                    'timestamp': datetime.now().isoformat()
+                }
 
         except Exception as e:
             logger.error(f"Failed to analyze typing patterns: {e}", exc_info=True)
@@ -2365,52 +2381,50 @@ class MetricsDatabase:
             Dictionary with optimal timing parameters for password typing
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            # Get latest pattern analytics
-            cursor.execute("""
-                SELECT
-                    char_type,
-                    requires_shift,
-                    optimal_char_duration_ms,
-                    optimal_inter_char_delay_ms,
-                    optimal_shift_duration_ms,
-                    confidence_score
-                FROM typing_pattern_analytics
-                WHERE pattern_type = 'successful_timing'
-                AND sample_count >= 10
-                ORDER BY last_updated DESC
-                LIMIT 100
-            """)
+                # Get latest pattern analytics
+                cursor.execute("""
+                    SELECT
+                        char_type,
+                        requires_shift,
+                        optimal_char_duration_ms,
+                        optimal_inter_char_delay_ms,
+                        optimal_shift_duration_ms,
+                        confidence_score
+                    FROM typing_pattern_analytics
+                    WHERE pattern_type = 'successful_timing'
+                    AND sample_count >= 10
+                    ORDER BY last_updated DESC
+                    LIMIT 100
+                """)
 
-            config = {
-                'letter': {'duration': 50, 'delay': 100},
-                'digit': {'duration': 50, 'delay': 100},
-                'special': {'duration': 60, 'delay': 120},
-                'shift_duration': 30,
-                'confidence': 0.0
-            }
+                config = {
+                    'letter': {'duration': 50, 'delay': 100},
+                    'digit': {'duration': 50, 'delay': 100},
+                    'special': {'duration': 60, 'delay': 120},
+                    'shift_duration': 30,
+                    'confidence': 0.0
+                }
 
-            results = cursor.fetchall()
-            if results:
-                # Group by char_type and compute weighted average
-                for row in results:
-                    char_type = row['char_type']
-                    if char_type in config:
-                        # Use confidence as weight
-                        weight = row['confidence_score']
-                        config[char_type]['duration'] = row['optimal_char_duration_ms'] * weight + config[char_type]['duration'] * (1 - weight)
-                        config[char_type]['delay'] = row['optimal_inter_char_delay_ms'] * weight + config[char_type]['delay'] * (1 - weight)
+                results = cursor.fetchall()
+                if results:
+                    # Group by char_type and compute weighted average
+                    for row in results:
+                        char_type = row['char_type']
+                        if char_type in config:
+                            # Use confidence as weight
+                            weight = row['confidence_score']
+                            config[char_type]['duration'] = row['optimal_char_duration_ms'] * weight + config[char_type]['duration'] * (1 - weight)
+                            config[char_type]['delay'] = row['optimal_inter_char_delay_ms'] * weight + config[char_type]['delay'] * (1 - weight)
 
-                config['shift_duration'] = sum(r['optimal_shift_duration_ms'] or 30 for r in results) / len(results)
-                config['confidence'] = sum(r['confidence_score'] for r in results) / len(results)
+                    config['shift_duration'] = sum(r['optimal_shift_duration_ms'] or 30 for r in results) / len(results)
+                    config['confidence'] = sum(r['confidence_score'] for r in results) / len(results)
 
-            conn.close()
-
-            logger.info(f"✅ Retrieved optimal timing config (confidence: {config['confidence']:.2%})")
-            return config
+                logger.info(f"✅ Retrieved optimal timing config (confidence: {config['confidence']:.2%})")
+                return config
 
         except Exception as e:
             logger.error(f"Failed to get optimal timing: {e}", exc_info=True)
@@ -2441,149 +2455,148 @@ class MetricsDatabase:
             Row ID if successful, None otherwise
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Get current aggregated stats
-            cursor.execute("""
-                SELECT
-                    COUNT(*) as total_attempts,
-                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_attempts,
-                    AVG(total_duration_ms) as avg_duration_all
-                FROM unlock_attempts
-            """)
-            row = cursor.fetchone()
-            total_attempts = (row[0] or 0) + 1
-            successful_attempts = (row[1] or 0) + (1 if success else 0)
-            avg_duration_all = row[2] or duration_ms
-
-            # Calculate success rate
-            success_rate = successful_attempts / total_attempts if total_attempts > 0 else 0.0
-
-            # Get last 10 attempts average duration
-            cursor.execute("""
-                SELECT AVG(total_duration_ms) as avg_last_10
-                FROM (
-                    SELECT total_duration_ms
+                # Get current aggregated stats
+                cursor.execute("""
+                    SELECT
+                        COUNT(*) as total_attempts,
+                        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successful_attempts,
+                        AVG(total_duration_ms) as avg_duration_all
                     FROM unlock_attempts
-                    ORDER BY timestamp DESC
-                    LIMIT 10
-                )
-            """)
-            avg_last_10 = cursor.fetchone()[0] or duration_ms
+                """)
+                row = cursor.fetchone()
+                total_attempts = (row[0] or 0) + 1
+                successful_attempts = (row[1] or 0) + (1 if success else 0)
+                avg_duration_all = row[2] or duration_ms
 
-            # Get last 50 attempts average duration
-            cursor.execute("""
-                SELECT AVG(total_duration_ms) as avg_last_50
-                FROM (
-                    SELECT total_duration_ms
-                    FROM unlock_attempts
-                    ORDER BY timestamp DESC
-                    LIMIT 50
-                )
-            """)
-            avg_last_50 = cursor.fetchone()[0] or duration_ms
+                # Calculate success rate
+                success_rate = successful_attempts / total_attempts if total_attempts > 0 else 0.0
 
-            # Get fastest ever
-            cursor.execute("""
-                SELECT MIN(total_duration_ms) FROM unlock_attempts WHERE success = 1
-            """)
-            fastest_ever = cursor.fetchone()[0] or duration_ms
+                # Get last 10 attempts average duration
+                cursor.execute("""
+                    SELECT AVG(total_duration_ms) as avg_last_10
+                    FROM (
+                        SELECT total_duration_ms
+                        FROM unlock_attempts
+                        ORDER BY timestamp DESC
+                        LIMIT 10
+                    )
+                """)
+                avg_last_10 = cursor.fetchone()[0] or duration_ms
 
-            # Calculate improvement
-            improvement = ((avg_duration_all - avg_last_10) / avg_duration_all * 100) if avg_duration_all > 0 else 0
+                # Get last 50 attempts average duration
+                cursor.execute("""
+                    SELECT AVG(total_duration_ms) as avg_last_50
+                    FROM (
+                        SELECT total_duration_ms
+                        FROM unlock_attempts
+                        ORDER BY timestamp DESC
+                        LIMIT 50
+                    )
+                """)
+                avg_last_50 = cursor.fetchone()[0] or duration_ms
 
-            # Get consecutive successes/failures
-            cursor.execute("""
-                SELECT success FROM unlock_attempts ORDER BY timestamp DESC LIMIT 20
-            """)
-            recent_results = [r[0] for r in cursor.fetchall()]
+                # Get fastest ever
+                cursor.execute("""
+                    SELECT MIN(total_duration_ms) FROM unlock_attempts WHERE success = 1
+                """)
+                fastest_ever = cursor.fetchone()[0] or duration_ms
 
-            consecutive_successes = 0
-            consecutive_failures = 0
-            for r in recent_results:
-                if r == 1:
-                    if consecutive_failures == 0:
-                        consecutive_successes += 1
+                # Calculate improvement
+                improvement = ((avg_duration_all - avg_last_10) / avg_duration_all * 100) if avg_duration_all > 0 else 0
+
+                # Get consecutive successes/failures
+                cursor.execute("""
+                    SELECT success FROM unlock_attempts ORDER BY timestamp DESC LIMIT 20
+                """)
+                recent_results = [r[0] for r in cursor.fetchall()]
+
+                consecutive_successes = 0
+                consecutive_failures = 0
+                for r in recent_results:
+                    if r == 1:
+                        if consecutive_failures == 0:
+                            consecutive_successes += 1
+                        else:
+                            break
                     else:
-                        break
+                        if consecutive_successes == 0:
+                            consecutive_failures += 1
+                        else:
+                            break
+
+                # Calculate failure rate last 10
+                failure_rate_last_10 = sum(1 for r in recent_results[:10] if r == 0) / min(10, len(recent_results)) if recent_results else 0
+
+                # Determine strategy based on success rate
+                if success_rate >= 0.95:
+                    strategy = "aggressive"
+                elif success_rate >= 0.85:
+                    strategy = "balanced"
                 else:
-                    if consecutive_successes == 0:
-                        consecutive_failures += 1
-                    else:
-                        break
+                    strategy = "conservative"
 
-            # Calculate failure rate last 10
-            failure_rate_last_10 = sum(1 for r in recent_results[:10] if r == 0) / min(10, len(recent_results)) if recent_results else 0
-
-            # Determine strategy based on success rate
-            if success_rate >= 0.95:
-                strategy = "aggressive"
-            elif success_rate >= 0.85:
-                strategy = "balanced"
-            else:
-                strategy = "conservative"
-
-            # Insert learning progress entry
-            cursor.execute("""
-                INSERT INTO learning_progress (
-                    timestamp,
+                # Insert learning progress entry
+                cursor.execute("""
+                    INSERT INTO learning_progress (
+                        timestamp,
+                        total_attempts,
+                        successful_attempts,
+                        success_rate,
+                        avg_typing_duration_last_10,
+                        avg_typing_duration_last_50,
+                        avg_typing_duration_all_time,
+                        improvement_percentage,
+                        avg_char_duration_last_10,
+                        avg_char_duration_last_50,
+                        fastest_ever_typing_ms,
+                        consecutive_successes,
+                        consecutive_failures,
+                        failure_rate_last_10,
+                        model_version,
+                        prediction_accuracy,
+                        optimal_timing_applied,
+                        best_time_of_day,
+                        best_system_load_range,
+                        current_strategy,
+                        timing_adjustments_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    datetime.now().isoformat(),
                     total_attempts,
                     successful_attempts,
                     success_rate,
-                    avg_typing_duration_last_10,
-                    avg_typing_duration_last_50,
-                    avg_typing_duration_all_time,
-                    improvement_percentage,
-                    avg_char_duration_last_10,
-                    avg_char_duration_last_50,
-                    fastest_ever_typing_ms,
+                    avg_last_10,
+                    avg_last_50,
+                    avg_duration_all,
+                    improvement,
+                    avg_last_10 / 10 if avg_last_10 else 0,  # Rough estimate
+                    avg_last_50 / 10 if avg_last_50 else 0,
+                    fastest_ever,
                     consecutive_successes,
                     consecutive_failures,
                     failure_rate_last_10,
-                    model_version,
-                    prediction_accuracy,
-                    optimal_timing_applied,
-                    best_time_of_day,
-                    best_system_load_range,
-                    current_strategy,
-                    timing_adjustments_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.now().isoformat(),
-                total_attempts,
-                successful_attempts,
-                success_rate,
-                avg_last_10,
-                avg_last_50,
-                avg_duration_all,
-                improvement,
-                avg_last_10 / 10 if avg_last_10 else 0,  # Rough estimate
-                avg_last_50 / 10 if avg_last_50 else 0,
-                fastest_ever,
-                consecutive_successes,
-                consecutive_failures,
-                failure_rate_last_10,
-                "v1.0-fuzzy",
-                confidence,
-                1 if match_type == "learned" else 0,
-                datetime.now().strftime("%H:00"),
-                "normal",
-                strategy,
-                json.dumps({
-                    "match_type": match_type,
-                    "command_text": command_text[:100] if command_text else None,
-                    "speaker": speaker_name,
-                    "confidence": confidence,
-                })
-            ))
+                    "v1.0-fuzzy",
+                    confidence,
+                    1 if match_type == "learned" else 0,
+                    datetime.now().strftime("%H:00"),
+                    "normal",
+                    strategy,
+                    json.dumps({
+                        "match_type": match_type,
+                        "command_text": command_text[:100] if command_text else None,
+                        "speaker": speaker_name,
+                        "confidence": confidence,
+                    })
+                ))
 
-            row_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
+                row_id = cursor.lastrowid
+                conn.commit()
 
-            logger.info(f"✅ Updated learning_progress (ID: {row_id}, success_rate: {success_rate:.1%}, strategy: {strategy})")
-            return row_id
+                logger.info(f"✅ Updated learning_progress (ID: {row_id}, success_rate: {success_rate:.1%}, strategy: {strategy})")
+                return row_id
 
         except Exception as e:
             logger.error(f"Failed to update learning progress: {e}", exc_info=True)
@@ -2614,73 +2627,72 @@ class MetricsDatabase:
             Row ID if successful, None otherwise
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Extract display context data
-            displays = display_context.get('displays', [])
-            mode = display_context.get('mode', 'SINGLE')
-            is_mirrored = display_context.get('is_mirrored', False)
-            has_external = display_context.get('has_external', False)
-            tv_info = display_context.get('tv_info', {})
-            primary_display = display_context.get('primary_display', {})
-            external_display = display_context.get('external_display', {})
+                # Extract display context data
+                displays = display_context.get('displays', [])
+                mode = display_context.get('mode', 'SINGLE')
+                is_mirrored = display_context.get('is_mirrored', False)
+                has_external = display_context.get('has_external', False)
+                tv_info = display_context.get('tv_info', {})
+                primary_display = display_context.get('primary_display', {})
+                external_display = display_context.get('external_display', {})
 
-            # Extract typing config
-            strategy = typing_config.get('strategy', 'UNKNOWN') if typing_config else 'UNKNOWN'
-            keystroke_delay = typing_config.get('keystroke_delay_ms', 0) if typing_config else 0
-            wake_delay = typing_config.get('wake_delay_ms', 0) if typing_config else 0
-            strategy_reasoning = typing_config.get('reasoning', '') if typing_config else ''
+                # Extract typing config
+                strategy = typing_config.get('strategy', 'UNKNOWN') if typing_config else 'UNKNOWN'
+                keystroke_delay = typing_config.get('keystroke_delay_ms', 0) if typing_config else 0
+                wake_delay = typing_config.get('wake_delay_ms', 0) if typing_config else 0
+                strategy_reasoning = typing_config.get('reasoning', '') if typing_config else ''
 
-            # Extract detection metrics
-            detection_time = detection_metrics.get('detection_time_ms', 0) if detection_metrics else 0
-            detection_method = detection_metrics.get('method', 'unknown') if detection_metrics else 'unknown'
+                # Extract detection metrics
+                detection_time = detection_metrics.get('detection_time_ms', 0) if detection_metrics else 0
+                detection_method = detection_metrics.get('method', 'unknown') if detection_metrics else 'unknown'
 
-            cursor.execute("""
-                INSERT INTO display_context (
-                    attempt_id, timestamp,
-                    total_displays, display_mode, is_mirrored, has_external,
-                    is_tv_connected, tv_name, tv_brand, tv_detection_confidence, tv_detection_reasons,
-                    primary_display_name, primary_display_type, primary_width, primary_height, primary_is_builtin,
-                    external_display_name, external_display_type, external_width, external_height,
-                    typing_strategy, keystroke_delay_ms, wake_delay_ms, strategy_reasoning,
-                    detection_time_ms, detection_method
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                attempt_id,
-                datetime.now().isoformat(),
-                len(displays),
-                mode,
-                1 if is_mirrored else 0,
-                1 if has_external else 0,
-                1 if tv_info.get('is_tv', False) else 0,
-                tv_info.get('name'),
-                tv_info.get('brand'),
-                tv_info.get('confidence', 0),
-                json.dumps(tv_info.get('reasons', [])),
-                primary_display.get('name'),
-                primary_display.get('type'),
-                primary_display.get('width'),
-                primary_display.get('height'),
-                1 if primary_display.get('is_builtin', False) else 0,
-                external_display.get('name'),
-                external_display.get('type'),
-                external_display.get('width'),
-                external_display.get('height'),
-                strategy,
-                keystroke_delay,
-                wake_delay,
-                strategy_reasoning,
-                detection_time,
-                detection_method
-            ))
+                cursor.execute("""
+                    INSERT INTO display_context (
+                        attempt_id, timestamp,
+                        total_displays, display_mode, is_mirrored, has_external,
+                        is_tv_connected, tv_name, tv_brand, tv_detection_confidence, tv_detection_reasons,
+                        primary_display_name, primary_display_type, primary_width, primary_height, primary_is_builtin,
+                        external_display_name, external_display_type, external_width, external_height,
+                        typing_strategy, keystroke_delay_ms, wake_delay_ms, strategy_reasoning,
+                        detection_time_ms, detection_method
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    attempt_id,
+                    datetime.now().isoformat(),
+                    len(displays),
+                    mode,
+                    1 if is_mirrored else 0,
+                    1 if has_external else 0,
+                    1 if tv_info.get('is_tv', False) else 0,
+                    tv_info.get('name'),
+                    tv_info.get('brand'),
+                    tv_info.get('confidence', 0),
+                    json.dumps(tv_info.get('reasons', [])),
+                    primary_display.get('name'),
+                    primary_display.get('type'),
+                    primary_display.get('width'),
+                    primary_display.get('height'),
+                    1 if primary_display.get('is_builtin', False) else 0,
+                    external_display.get('name'),
+                    external_display.get('type'),
+                    external_display.get('width'),
+                    external_display.get('height'),
+                    strategy,
+                    keystroke_delay,
+                    wake_delay,
+                    strategy_reasoning,
+                    detection_time,
+                    detection_method
+                ))
 
-            row_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
+                row_id = cursor.lastrowid
+                conn.commit()
 
-            logger.info(f"✅ Stored display_context (ID: {row_id}, mode: {mode}, tv: {tv_info.get('is_tv', False)}, strategy: {strategy})")
-            return row_id
+                logger.info(f"✅ Stored display_context (ID: {row_id}, mode: {mode}, tv: {tv_info.get('is_tv', False)}, strategy: {strategy})")
+                return row_id
 
         except Exception as e:
             logger.error(f"Failed to store display context: {e}", exc_info=True)
@@ -2713,205 +2725,204 @@ class MetricsDatabase:
             Row ID of the updated analytics record, None on failure
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            today = datetime.now().strftime("%Y-%m-%d")
-            now = datetime.now().isoformat()
+                today = datetime.now().strftime("%Y-%m-%d")
+                now = datetime.now().isoformat()
 
-            # Check if we have a record for today
-            cursor.execute("""
-                SELECT id, tv_unlock_attempts, tv_unlock_successes, tv_unlock_failures,
-                       non_tv_unlock_attempts, non_tv_unlock_successes, non_tv_unlock_failures,
-                       applescript_attempts, applescript_successes,
-                       core_graphics_attempts, core_graphics_successes,
-                       hybrid_attempts, hybrid_successes,
-                       avg_tv_unlock_duration_ms, avg_non_tv_unlock_duration_ms,
-                       unique_tv_brands, tv_brand_success_rates,
-                       mirrored_attempts, mirrored_successes,
-                       extended_attempts, extended_successes
-                FROM tv_unlock_analytics
-                WHERE date = ? AND period_type = 'daily'
-            """, (today,))
+                # Check if we have a record for today
+                cursor.execute("""
+                    SELECT id, tv_unlock_attempts, tv_unlock_successes, tv_unlock_failures,
+                           non_tv_unlock_attempts, non_tv_unlock_successes, non_tv_unlock_failures,
+                           applescript_attempts, applescript_successes,
+                           core_graphics_attempts, core_graphics_successes,
+                           hybrid_attempts, hybrid_successes,
+                           avg_tv_unlock_duration_ms, avg_non_tv_unlock_duration_ms,
+                           unique_tv_brands, tv_brand_success_rates,
+                           mirrored_attempts, mirrored_successes,
+                           extended_attempts, extended_successes
+                    FROM tv_unlock_analytics
+                    WHERE date = ? AND period_type = 'daily'
+                """, (today,))
 
-            row = cursor.fetchone()
+                row = cursor.fetchone()
 
-            if row:
-                # Update existing record
-                row_id = row[0]
-                tv_attempts = row[1] or 0
-                tv_successes = row[2] or 0
-                tv_failures = row[3] or 0
-                non_tv_attempts = row[4] or 0
-                non_tv_successes = row[5] or 0
-                non_tv_failures = row[6] or 0
-                applescript_attempts = row[7] or 0
-                applescript_successes = row[8] or 0
-                cg_attempts = row[9] or 0
-                cg_successes = row[10] or 0
-                hybrid_attempts = row[11] or 0
-                hybrid_successes = row[12] or 0
-                avg_tv_duration = row[13] or 0
-                avg_non_tv_duration = row[14] or 0
-                unique_brands = json.loads(row[15]) if row[15] else []
-                brand_rates = json.loads(row[16]) if row[16] else {}
-                mirrored_attempts = row[17] or 0
-                mirrored_successes = row[18] or 0
-                extended_attempts = row[19] or 0
-                extended_successes = row[20] or 0
-            else:
-                # Create new record
-                row_id = None
-                tv_attempts = tv_successes = tv_failures = 0
-                non_tv_attempts = non_tv_successes = non_tv_failures = 0
-                applescript_attempts = applescript_successes = 0
-                cg_attempts = cg_successes = 0
-                hybrid_attempts = hybrid_successes = 0
-                avg_tv_duration = avg_non_tv_duration = 0
-                unique_brands = []
-                brand_rates = {}
-                mirrored_attempts = mirrored_successes = 0
-                extended_attempts = extended_successes = 0
-
-            # Update counters based on this attempt
-            if is_tv:
-                tv_attempts += 1
-                if success:
-                    tv_successes += 1
+                if row:
+                    # Update existing record
+                    row_id = row[0]
+                    tv_attempts = row[1] or 0
+                    tv_successes = row[2] or 0
+                    tv_failures = row[3] or 0
+                    non_tv_attempts = row[4] or 0
+                    non_tv_successes = row[5] or 0
+                    non_tv_failures = row[6] or 0
+                    applescript_attempts = row[7] or 0
+                    applescript_successes = row[8] or 0
+                    cg_attempts = row[9] or 0
+                    cg_successes = row[10] or 0
+                    hybrid_attempts = row[11] or 0
+                    hybrid_successes = row[12] or 0
+                    avg_tv_duration = row[13] or 0
+                    avg_non_tv_duration = row[14] or 0
+                    unique_brands = json.loads(row[15]) if row[15] else []
+                    brand_rates = json.loads(row[16]) if row[16] else {}
+                    mirrored_attempts = row[17] or 0
+                    mirrored_successes = row[18] or 0
+                    extended_attempts = row[19] or 0
+                    extended_successes = row[20] or 0
                 else:
-                    tv_failures += 1
-                # Update rolling average for TV duration
-                if avg_tv_duration > 0:
-                    avg_tv_duration = (avg_tv_duration * (tv_attempts - 1) + unlock_duration_ms) / tv_attempts
-                else:
-                    avg_tv_duration = unlock_duration_ms
+                    # Create new record
+                    row_id = None
+                    tv_attempts = tv_successes = tv_failures = 0
+                    non_tv_attempts = non_tv_successes = non_tv_failures = 0
+                    applescript_attempts = applescript_successes = 0
+                    cg_attempts = cg_successes = 0
+                    hybrid_attempts = hybrid_successes = 0
+                    avg_tv_duration = avg_non_tv_duration = 0
+                    unique_brands = []
+                    brand_rates = {}
+                    mirrored_attempts = mirrored_successes = 0
+                    extended_attempts = extended_successes = 0
 
-                # Track TV brand
-                if tv_brand and tv_brand not in unique_brands:
-                    unique_brands.append(tv_brand)
-                if tv_brand:
-                    if tv_brand not in brand_rates:
-                        brand_rates[tv_brand] = {'attempts': 0, 'successes': 0}
-                    brand_rates[tv_brand]['attempts'] += 1
+                # Update counters based on this attempt
+                if is_tv:
+                    tv_attempts += 1
                     if success:
-                        brand_rates[tv_brand]['successes'] += 1
-            else:
-                non_tv_attempts += 1
-                if success:
-                    non_tv_successes += 1
+                        tv_successes += 1
+                    else:
+                        tv_failures += 1
+                    # Update rolling average for TV duration
+                    if avg_tv_duration > 0:
+                        avg_tv_duration = (avg_tv_duration * (tv_attempts - 1) + unlock_duration_ms) / tv_attempts
+                    else:
+                        avg_tv_duration = unlock_duration_ms
+
+                    # Track TV brand
+                    if tv_brand and tv_brand not in unique_brands:
+                        unique_brands.append(tv_brand)
+                    if tv_brand:
+                        if tv_brand not in brand_rates:
+                            brand_rates[tv_brand] = {'attempts': 0, 'successes': 0}
+                        brand_rates[tv_brand]['attempts'] += 1
+                        if success:
+                            brand_rates[tv_brand]['successes'] += 1
                 else:
-                    non_tv_failures += 1
-                if avg_non_tv_duration > 0:
-                    avg_non_tv_duration = (avg_non_tv_duration * (non_tv_attempts - 1) + unlock_duration_ms) / non_tv_attempts
+                    non_tv_attempts += 1
+                    if success:
+                        non_tv_successes += 1
+                    else:
+                        non_tv_failures += 1
+                    if avg_non_tv_duration > 0:
+                        avg_non_tv_duration = (avg_non_tv_duration * (non_tv_attempts - 1) + unlock_duration_ms) / non_tv_attempts
+                    else:
+                        avg_non_tv_duration = unlock_duration_ms
+
+                # Update strategy counters
+                strategy_upper = typing_strategy.upper() if typing_strategy else ''
+                if 'APPLESCRIPT' in strategy_upper:
+                    applescript_attempts += 1
+                    if success:
+                        applescript_successes += 1
+                elif 'CORE_GRAPHICS' in strategy_upper or 'CG_' in strategy_upper:
+                    cg_attempts += 1
+                    if success:
+                        cg_successes += 1
+                elif 'HYBRID' in strategy_upper:
+                    hybrid_attempts += 1
+                    if success:
+                        hybrid_successes += 1
+
+                # Update mirrored/extended counters
+                if is_mirrored:
+                    mirrored_attempts += 1
+                    if success:
+                        mirrored_successes += 1
+                elif is_tv:  # External but not mirrored = extended
+                    extended_attempts += 1
+                    if success:
+                        extended_successes += 1
+
+                # Calculate success rates
+                tv_success_rate = tv_successes / tv_attempts if tv_attempts > 0 else 0
+                non_tv_success_rate = non_tv_successes / non_tv_attempts if non_tv_attempts > 0 else 0
+                applescript_rate = applescript_successes / applescript_attempts if applescript_attempts > 0 else 0
+                cg_rate = cg_successes / cg_attempts if cg_attempts > 0 else 0
+                hybrid_rate = hybrid_successes / hybrid_attempts if hybrid_attempts > 0 else 0
+                mirrored_rate = mirrored_successes / mirrored_attempts if mirrored_attempts > 0 else 0
+                extended_rate = extended_successes / extended_attempts if extended_attempts > 0 else 0
+
+                # Calculate brand success rates
+                brand_success_rates = {brand: data['successes'] / data['attempts'] if data['attempts'] > 0 else 0
+                                       for brand, data in brand_rates.items()}
+
+                # Find most common TV
+                most_common_tv = max(brand_rates.items(), key=lambda x: x[1]['attempts'])[0] if brand_rates else None
+
+                # Performance overhead
+                tv_overhead = avg_tv_duration - avg_non_tv_duration if avg_tv_duration > 0 and avg_non_tv_duration > 0 else 0
+
+                if row_id:
+                    # Update existing record
+                    cursor.execute("""
+                        UPDATE tv_unlock_analytics SET
+                            timestamp = ?,
+                            tv_unlock_attempts = ?, tv_unlock_successes = ?, tv_unlock_failures = ?, tv_success_rate = ?,
+                            non_tv_unlock_attempts = ?, non_tv_unlock_successes = ?, non_tv_unlock_failures = ?, non_tv_success_rate = ?,
+                            applescript_attempts = ?, applescript_successes = ?, applescript_success_rate = ?,
+                            core_graphics_attempts = ?, core_graphics_successes = ?, core_graphics_success_rate = ?,
+                            hybrid_attempts = ?, hybrid_successes = ?, hybrid_success_rate = ?,
+                            avg_tv_unlock_duration_ms = ?, avg_non_tv_unlock_duration_ms = ?, tv_performance_overhead_ms = ?,
+                            unique_tv_brands = ?, most_common_tv = ?, tv_brand_success_rates = ?,
+                            mirrored_attempts = ?, mirrored_successes = ?, mirrored_success_rate = ?,
+                            extended_attempts = ?, extended_successes = ?, extended_success_rate = ?
+                        WHERE id = ?
+                    """, (
+                        now,
+                        tv_attempts, tv_successes, tv_failures, tv_success_rate,
+                        non_tv_attempts, non_tv_successes, non_tv_failures, non_tv_success_rate,
+                        applescript_attempts, applescript_successes, applescript_rate,
+                        cg_attempts, cg_successes, cg_rate,
+                        hybrid_attempts, hybrid_successes, hybrid_rate,
+                        avg_tv_duration, avg_non_tv_duration, tv_overhead,
+                        json.dumps(unique_brands), most_common_tv, json.dumps(brand_success_rates),
+                        mirrored_attempts, mirrored_successes, mirrored_rate,
+                        extended_attempts, extended_successes, extended_rate,
+                        row_id
+                    ))
                 else:
-                    avg_non_tv_duration = unlock_duration_ms
+                    # Insert new record
+                    cursor.execute("""
+                        INSERT INTO tv_unlock_analytics (
+                            timestamp, date, period_type, period_start, period_end,
+                            tv_unlock_attempts, tv_unlock_successes, tv_unlock_failures, tv_success_rate,
+                            non_tv_unlock_attempts, non_tv_unlock_successes, non_tv_unlock_failures, non_tv_success_rate,
+                            applescript_attempts, applescript_successes, applescript_success_rate,
+                            core_graphics_attempts, core_graphics_successes, core_graphics_success_rate,
+                            hybrid_attempts, hybrid_successes, hybrid_success_rate,
+                            avg_tv_unlock_duration_ms, avg_non_tv_unlock_duration_ms, tv_performance_overhead_ms,
+                            unique_tv_brands, most_common_tv, tv_brand_success_rates,
+                            mirrored_attempts, mirrored_successes, mirrored_success_rate,
+                            extended_attempts, extended_successes, extended_success_rate
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        now, today, 'daily', f"{today} 00:00:00", f"{today} 23:59:59",
+                        tv_attempts, tv_successes, tv_failures, tv_success_rate,
+                        non_tv_attempts, non_tv_successes, non_tv_failures, non_tv_success_rate,
+                        applescript_attempts, applescript_successes, applescript_rate,
+                        cg_attempts, cg_successes, cg_rate,
+                        hybrid_attempts, hybrid_successes, hybrid_rate,
+                        avg_tv_duration, avg_non_tv_duration, tv_overhead,
+                        json.dumps(unique_brands), most_common_tv, json.dumps(brand_success_rates),
+                        mirrored_attempts, mirrored_successes, mirrored_rate,
+                        extended_attempts, extended_successes, extended_rate
+                    ))
+                    row_id = cursor.lastrowid
 
-            # Update strategy counters
-            strategy_upper = typing_strategy.upper() if typing_strategy else ''
-            if 'APPLESCRIPT' in strategy_upper:
-                applescript_attempts += 1
-                if success:
-                    applescript_successes += 1
-            elif 'CORE_GRAPHICS' in strategy_upper or 'CG_' in strategy_upper:
-                cg_attempts += 1
-                if success:
-                    cg_successes += 1
-            elif 'HYBRID' in strategy_upper:
-                hybrid_attempts += 1
-                if success:
-                    hybrid_successes += 1
+                conn.commit()
 
-            # Update mirrored/extended counters
-            if is_mirrored:
-                mirrored_attempts += 1
-                if success:
-                    mirrored_successes += 1
-            elif is_tv:  # External but not mirrored = extended
-                extended_attempts += 1
-                if success:
-                    extended_successes += 1
-
-            # Calculate success rates
-            tv_success_rate = tv_successes / tv_attempts if tv_attempts > 0 else 0
-            non_tv_success_rate = non_tv_successes / non_tv_attempts if non_tv_attempts > 0 else 0
-            applescript_rate = applescript_successes / applescript_attempts if applescript_attempts > 0 else 0
-            cg_rate = cg_successes / cg_attempts if cg_attempts > 0 else 0
-            hybrid_rate = hybrid_successes / hybrid_attempts if hybrid_attempts > 0 else 0
-            mirrored_rate = mirrored_successes / mirrored_attempts if mirrored_attempts > 0 else 0
-            extended_rate = extended_successes / extended_attempts if extended_attempts > 0 else 0
-
-            # Calculate brand success rates
-            brand_success_rates = {brand: data['successes'] / data['attempts'] if data['attempts'] > 0 else 0
-                                   for brand, data in brand_rates.items()}
-
-            # Find most common TV
-            most_common_tv = max(brand_rates.items(), key=lambda x: x[1]['attempts'])[0] if brand_rates else None
-
-            # Performance overhead
-            tv_overhead = avg_tv_duration - avg_non_tv_duration if avg_tv_duration > 0 and avg_non_tv_duration > 0 else 0
-
-            if row_id:
-                # Update existing record
-                cursor.execute("""
-                    UPDATE tv_unlock_analytics SET
-                        timestamp = ?,
-                        tv_unlock_attempts = ?, tv_unlock_successes = ?, tv_unlock_failures = ?, tv_success_rate = ?,
-                        non_tv_unlock_attempts = ?, non_tv_unlock_successes = ?, non_tv_unlock_failures = ?, non_tv_success_rate = ?,
-                        applescript_attempts = ?, applescript_successes = ?, applescript_success_rate = ?,
-                        core_graphics_attempts = ?, core_graphics_successes = ?, core_graphics_success_rate = ?,
-                        hybrid_attempts = ?, hybrid_successes = ?, hybrid_success_rate = ?,
-                        avg_tv_unlock_duration_ms = ?, avg_non_tv_unlock_duration_ms = ?, tv_performance_overhead_ms = ?,
-                        unique_tv_brands = ?, most_common_tv = ?, tv_brand_success_rates = ?,
-                        mirrored_attempts = ?, mirrored_successes = ?, mirrored_success_rate = ?,
-                        extended_attempts = ?, extended_successes = ?, extended_success_rate = ?
-                    WHERE id = ?
-                """, (
-                    now,
-                    tv_attempts, tv_successes, tv_failures, tv_success_rate,
-                    non_tv_attempts, non_tv_successes, non_tv_failures, non_tv_success_rate,
-                    applescript_attempts, applescript_successes, applescript_rate,
-                    cg_attempts, cg_successes, cg_rate,
-                    hybrid_attempts, hybrid_successes, hybrid_rate,
-                    avg_tv_duration, avg_non_tv_duration, tv_overhead,
-                    json.dumps(unique_brands), most_common_tv, json.dumps(brand_success_rates),
-                    mirrored_attempts, mirrored_successes, mirrored_rate,
-                    extended_attempts, extended_successes, extended_rate,
-                    row_id
-                ))
-            else:
-                # Insert new record
-                cursor.execute("""
-                    INSERT INTO tv_unlock_analytics (
-                        timestamp, date, period_type, period_start, period_end,
-                        tv_unlock_attempts, tv_unlock_successes, tv_unlock_failures, tv_success_rate,
-                        non_tv_unlock_attempts, non_tv_unlock_successes, non_tv_unlock_failures, non_tv_success_rate,
-                        applescript_attempts, applescript_successes, applescript_success_rate,
-                        core_graphics_attempts, core_graphics_successes, core_graphics_success_rate,
-                        hybrid_attempts, hybrid_successes, hybrid_success_rate,
-                        avg_tv_unlock_duration_ms, avg_non_tv_unlock_duration_ms, tv_performance_overhead_ms,
-                        unique_tv_brands, most_common_tv, tv_brand_success_rates,
-                        mirrored_attempts, mirrored_successes, mirrored_success_rate,
-                        extended_attempts, extended_successes, extended_success_rate
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    now, today, 'daily', f"{today} 00:00:00", f"{today} 23:59:59",
-                    tv_attempts, tv_successes, tv_failures, tv_success_rate,
-                    non_tv_attempts, non_tv_successes, non_tv_failures, non_tv_success_rate,
-                    applescript_attempts, applescript_successes, applescript_rate,
-                    cg_attempts, cg_successes, cg_rate,
-                    hybrid_attempts, hybrid_successes, hybrid_rate,
-                    avg_tv_duration, avg_non_tv_duration, tv_overhead,
-                    json.dumps(unique_brands), most_common_tv, json.dumps(brand_success_rates),
-                    mirrored_attempts, mirrored_successes, mirrored_rate,
-                    extended_attempts, extended_successes, extended_rate
-                ))
-                row_id = cursor.lastrowid
-
-            conn.commit()
-            conn.close()
-
-            logger.info(f"✅ Updated tv_unlock_analytics (ID: {row_id}, tv_rate: {tv_success_rate:.1%}, non_tv_rate: {non_tv_success_rate:.1%})")
-            return row_id
+                logger.info(f"✅ Updated tv_unlock_analytics (ID: {row_id}, tv_rate: {tv_success_rate:.1%}, non_tv_rate: {non_tv_success_rate:.1%})")
+                return row_id
 
         except Exception as e:
             logger.error(f"Failed to update TV analytics: {e}", exc_info=True)
@@ -2954,164 +2965,163 @@ class MetricsDatabase:
             Row ID if successful, None otherwise
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            now = datetime.now().isoformat()
+                now = datetime.now().isoformat()
 
-            # Check if we have a record for this display
-            cursor.execute("""
-                SELECT id, first_seen, total_attempts, successful_attempts, failed_attempts,
-                       current_streak, best_streak, worst_streak,
-                       applescript_attempts, applescript_successes,
-                       core_graphics_attempts, core_graphics_successes,
-                       preferred_strategy, optimal_keystroke_delay_ms, optimal_wake_delay_ms,
-                       avg_unlock_duration_ms, fastest_unlock_ms, slowest_unlock_ms
-                FROM display_success_history
-                WHERE display_identifier = ?
-            """, (display_identifier,))
-
-            row = cursor.fetchone()
-
-            if row:
-                # Update existing record
-                row_id = row[0]
-                first_seen = row[1]
-                total_attempts = (row[2] or 0) + 1
-                successful_attempts = (row[3] or 0) + (1 if success else 0)
-                failed_attempts = (row[4] or 0) + (0 if success else 1)
-                current_streak = row[5] or 0
-                best_streak = row[6] or 0
-                worst_streak = row[7] or 0
-                applescript_attempts = row[8] or 0
-                applescript_successes = row[9] or 0
-                cg_attempts = row[10] or 0
-                cg_successes = row[11] or 0
-                preferred_strategy = row[12]
-                optimal_keystroke = row[13]
-                optimal_wake = row[14]
-                avg_duration = row[15] or 0
-                fastest = row[16]
-                slowest = row[17]
-
-                # Update streak
-                if success:
-                    if current_streak >= 0:
-                        current_streak += 1
-                    else:
-                        current_streak = 1
-                    best_streak = max(best_streak, current_streak)
-                else:
-                    if current_streak <= 0:
-                        current_streak -= 1
-                    else:
-                        current_streak = -1
-                    worst_streak = min(worst_streak, current_streak)
-
-                # Update strategy counters
-                strategy_upper = typing_strategy.upper() if typing_strategy else ''
-                if 'APPLESCRIPT' in strategy_upper:
-                    applescript_attempts += 1
-                    if success:
-                        applescript_successes += 1
-                elif 'CORE_GRAPHICS' in strategy_upper or 'CG_' in strategy_upper:
-                    cg_attempts += 1
-                    if success:
-                        cg_successes += 1
-
-                # Determine preferred strategy based on success rates
-                applescript_rate = applescript_successes / applescript_attempts if applescript_attempts > 0 else 0
-                cg_rate = cg_successes / cg_attempts if cg_attempts > 0 else 0
-
-                if applescript_attempts >= 3 and cg_attempts >= 3:
-                    preferred_strategy = 'APPLESCRIPT_DIRECT' if applescript_rate > cg_rate else 'CORE_GRAPHICS_FAST'
-                elif applescript_attempts >= 3:
-                    preferred_strategy = 'APPLESCRIPT_DIRECT' if applescript_rate >= 0.8 else preferred_strategy
-                elif cg_attempts >= 3:
-                    preferred_strategy = 'CORE_GRAPHICS_FAST' if cg_rate >= 0.8 else preferred_strategy
-
-                # Update timing optimization (exponential moving average)
-                alpha = 0.3  # Learning rate
-                if success:  # Only learn from successful attempts
-                    if optimal_keystroke and keystroke_delay_ms > 0:
-                        optimal_keystroke = optimal_keystroke * (1 - alpha) + keystroke_delay_ms * alpha
-                    elif keystroke_delay_ms > 0:
-                        optimal_keystroke = keystroke_delay_ms
-
-                    if optimal_wake and wake_delay_ms > 0:
-                        optimal_wake = optimal_wake * (1 - alpha) + wake_delay_ms * alpha
-                    elif wake_delay_ms > 0:
-                        optimal_wake = wake_delay_ms
-
-                # Update duration stats
-                if unlock_duration_ms > 0:
-                    if avg_duration > 0:
-                        avg_duration = (avg_duration * (total_attempts - 1) + unlock_duration_ms) / total_attempts
-                    else:
-                        avg_duration = unlock_duration_ms
-
-                    if fastest is None or unlock_duration_ms < fastest:
-                        fastest = unlock_duration_ms
-                    if slowest is None or unlock_duration_ms > slowest:
-                        slowest = unlock_duration_ms
-
-                success_rate = successful_attempts / total_attempts if total_attempts > 0 else 0
-
+                # Check if we have a record for this display
                 cursor.execute("""
-                    UPDATE display_success_history SET
-                        last_seen = ?,
-                        total_attempts = ?, successful_attempts = ?, failed_attempts = ?, success_rate = ?,
-                        current_streak = ?, best_streak = ?, worst_streak = ?,
-                        applescript_attempts = ?, applescript_successes = ?,
-                        core_graphics_attempts = ?, core_graphics_successes = ?,
-                        preferred_strategy = ?, optimal_keystroke_delay_ms = ?, optimal_wake_delay_ms = ?,
-                        avg_unlock_duration_ms = ?, fastest_unlock_ms = ?, slowest_unlock_ms = ?
-                    WHERE id = ?
-                """, (
-                    now,
-                    total_attempts, successful_attempts, failed_attempts, success_rate,
-                    current_streak, best_streak, worst_streak,
-                    applescript_attempts, applescript_successes,
-                    cg_attempts, cg_successes,
-                    preferred_strategy, optimal_keystroke, optimal_wake,
-                    avg_duration, fastest, slowest,
-                    row_id
-                ))
-            else:
-                # Insert new record
-                success_rate = 1.0 if success else 0.0
-                current_streak = 1 if success else -1
+                    SELECT id, first_seen, total_attempts, successful_attempts, failed_attempts,
+                           current_streak, best_streak, worst_streak,
+                           applescript_attempts, applescript_successes,
+                           core_graphics_attempts, core_graphics_successes,
+                           preferred_strategy, optimal_keystroke_delay_ms, optimal_wake_delay_ms,
+                           avg_unlock_duration_ms, fastest_unlock_ms, slowest_unlock_ms
+                    FROM display_success_history
+                    WHERE display_identifier = ?
+                """, (display_identifier,))
 
-                cursor.execute("""
-                    INSERT INTO display_success_history (
-                        display_identifier, display_type, first_seen, last_seen,
+                row = cursor.fetchone()
+
+                if row:
+                    # Update existing record
+                    row_id = row[0]
+                    first_seen = row[1]
+                    total_attempts = (row[2] or 0) + 1
+                    successful_attempts = (row[3] or 0) + (1 if success else 0)
+                    failed_attempts = (row[4] or 0) + (0 if success else 1)
+                    current_streak = row[5] or 0
+                    best_streak = row[6] or 0
+                    worst_streak = row[7] or 0
+                    applescript_attempts = row[8] or 0
+                    applescript_successes = row[9] or 0
+                    cg_attempts = row[10] or 0
+                    cg_successes = row[11] or 0
+                    preferred_strategy = row[12]
+                    optimal_keystroke = row[13]
+                    optimal_wake = row[14]
+                    avg_duration = row[15] or 0
+                    fastest = row[16]
+                    slowest = row[17]
+
+                    # Update streak
+                    if success:
+                        if current_streak >= 0:
+                            current_streak += 1
+                        else:
+                            current_streak = 1
+                        best_streak = max(best_streak, current_streak)
+                    else:
+                        if current_streak <= 0:
+                            current_streak -= 1
+                        else:
+                            current_streak = -1
+                        worst_streak = min(worst_streak, current_streak)
+
+                    # Update strategy counters
+                    strategy_upper = typing_strategy.upper() if typing_strategy else ''
+                    if 'APPLESCRIPT' in strategy_upper:
+                        applescript_attempts += 1
+                        if success:
+                            applescript_successes += 1
+                    elif 'CORE_GRAPHICS' in strategy_upper or 'CG_' in strategy_upper:
+                        cg_attempts += 1
+                        if success:
+                            cg_successes += 1
+
+                    # Determine preferred strategy based on success rates
+                    applescript_rate = applescript_successes / applescript_attempts if applescript_attempts > 0 else 0
+                    cg_rate = cg_successes / cg_attempts if cg_attempts > 0 else 0
+
+                    if applescript_attempts >= 3 and cg_attempts >= 3:
+                        preferred_strategy = 'APPLESCRIPT_DIRECT' if applescript_rate > cg_rate else 'CORE_GRAPHICS_FAST'
+                    elif applescript_attempts >= 3:
+                        preferred_strategy = 'APPLESCRIPT_DIRECT' if applescript_rate >= 0.8 else preferred_strategy
+                    elif cg_attempts >= 3:
+                        preferred_strategy = 'CORE_GRAPHICS_FAST' if cg_rate >= 0.8 else preferred_strategy
+
+                    # Update timing optimization (exponential moving average)
+                    alpha = 0.3  # Learning rate
+                    if success:  # Only learn from successful attempts
+                        if optimal_keystroke and keystroke_delay_ms > 0:
+                            optimal_keystroke = optimal_keystroke * (1 - alpha) + keystroke_delay_ms * alpha
+                        elif keystroke_delay_ms > 0:
+                            optimal_keystroke = keystroke_delay_ms
+
+                        if optimal_wake and wake_delay_ms > 0:
+                            optimal_wake = optimal_wake * (1 - alpha) + wake_delay_ms * alpha
+                        elif wake_delay_ms > 0:
+                            optimal_wake = wake_delay_ms
+
+                    # Update duration stats
+                    if unlock_duration_ms > 0:
+                        if avg_duration > 0:
+                            avg_duration = (avg_duration * (total_attempts - 1) + unlock_duration_ms) / total_attempts
+                        else:
+                            avg_duration = unlock_duration_ms
+
+                        if fastest is None or unlock_duration_ms < fastest:
+                            fastest = unlock_duration_ms
+                        if slowest is None or unlock_duration_ms > slowest:
+                            slowest = unlock_duration_ms
+
+                    success_rate = successful_attempts / total_attempts if total_attempts > 0 else 0
+
+                    cursor.execute("""
+                        UPDATE display_success_history SET
+                            last_seen = ?,
+                            total_attempts = ?, successful_attempts = ?, failed_attempts = ?, success_rate = ?,
+                            current_streak = ?, best_streak = ?, worst_streak = ?,
+                            applescript_attempts = ?, applescript_successes = ?,
+                            core_graphics_attempts = ?, core_graphics_successes = ?,
+                            preferred_strategy = ?, optimal_keystroke_delay_ms = ?, optimal_wake_delay_ms = ?,
+                            avg_unlock_duration_ms = ?, fastest_unlock_ms = ?, slowest_unlock_ms = ?
+                        WHERE id = ?
+                    """, (
+                        now,
                         total_attempts, successful_attempts, failed_attempts, success_rate,
                         current_streak, best_streak, worst_streak,
                         applescript_attempts, applescript_successes,
-                        core_graphics_attempts, core_graphics_successes,
-                        preferred_strategy, optimal_keystroke_delay_ms, optimal_wake_delay_ms,
-                        avg_unlock_duration_ms, fastest_unlock_ms, slowest_unlock_ms,
-                        typical_resolution, is_tv, tv_brand, connection_type
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    display_identifier, display_type, now, now,
-                    1, 1 if success else 0, 0 if success else 1, success_rate,
-                    current_streak, max(current_streak, 0), min(current_streak, 0),
-                    1 if 'APPLESCRIPT' in (typing_strategy or '').upper() else 0,
-                    1 if success and 'APPLESCRIPT' in (typing_strategy or '').upper() else 0,
-                    1 if 'CORE_GRAPHICS' in (typing_strategy or '').upper() else 0,
-                    1 if success and 'CORE_GRAPHICS' in (typing_strategy or '').upper() else 0,
-                    typing_strategy, keystroke_delay_ms, wake_delay_ms,
-                    unlock_duration_ms, unlock_duration_ms if success else None, unlock_duration_ms if success else None,
-                    resolution, 1 if is_tv else 0, tv_brand, connection_type
-                ))
-                row_id = cursor.lastrowid
+                        cg_attempts, cg_successes,
+                        preferred_strategy, optimal_keystroke, optimal_wake,
+                        avg_duration, fastest, slowest,
+                        row_id
+                    ))
+                else:
+                    # Insert new record
+                    success_rate = 1.0 if success else 0.0
+                    current_streak = 1 if success else -1
 
-            conn.commit()
-            conn.close()
+                    cursor.execute("""
+                        INSERT INTO display_success_history (
+                            display_identifier, display_type, first_seen, last_seen,
+                            total_attempts, successful_attempts, failed_attempts, success_rate,
+                            current_streak, best_streak, worst_streak,
+                            applescript_attempts, applescript_successes,
+                            core_graphics_attempts, core_graphics_successes,
+                            preferred_strategy, optimal_keystroke_delay_ms, optimal_wake_delay_ms,
+                            avg_unlock_duration_ms, fastest_unlock_ms, slowest_unlock_ms,
+                            typical_resolution, is_tv, tv_brand, connection_type
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        display_identifier, display_type, now, now,
+                        1, 1 if success else 0, 0 if success else 1, success_rate,
+                        current_streak, max(current_streak, 0), min(current_streak, 0),
+                        1 if 'APPLESCRIPT' in (typing_strategy or '').upper() else 0,
+                        1 if success and 'APPLESCRIPT' in (typing_strategy or '').upper() else 0,
+                        1 if 'CORE_GRAPHICS' in (typing_strategy or '').upper() else 0,
+                        1 if success and 'CORE_GRAPHICS' in (typing_strategy or '').upper() else 0,
+                        typing_strategy, keystroke_delay_ms, wake_delay_ms,
+                        unlock_duration_ms, unlock_duration_ms if success else None, unlock_duration_ms if success else None,
+                        resolution, 1 if is_tv else 0, tv_brand, connection_type
+                    ))
+                    row_id = cursor.lastrowid
 
-            logger.info(f"✅ Updated display_success_history for '{display_identifier}' (ID: {row_id}, rate: {success_rate:.1%})")
-            return row_id
+                conn.commit()
+
+                logger.info(f"✅ Updated display_success_history for '{display_identifier}' (ID: {row_id}, rate: {success_rate:.1%})")
+                return row_id
 
         except Exception as e:
             logger.error(f"Failed to update display success history: {e}", exc_info=True)
@@ -3131,33 +3141,32 @@ class MetricsDatabase:
             Dictionary with display learning statistics
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            if display_identifier:
-                cursor.execute("""
-                    SELECT * FROM display_success_history WHERE display_identifier = ?
-                """, (display_identifier,))
-                row = cursor.fetchone()
-                if row:
-                    result = dict(row)
+                if display_identifier:
+                    cursor.execute("""
+                        SELECT * FROM display_success_history WHERE display_identifier = ?
+                    """, (display_identifier,))
+                    row = cursor.fetchone()
+                    if row:
+                        result = dict(row)
+                    else:
+                        result = None
                 else:
-                    result = None
-            else:
-                cursor.execute("""
-                    SELECT * FROM display_success_history ORDER BY total_attempts DESC
-                """)
-                rows = cursor.fetchall()
-                result = {
-                    'displays': [dict(row) for row in rows],
-                    'total_displays': len(rows),
-                    'tv_displays': sum(1 for row in rows if row['is_tv']),
-                    'overall_success_rate': sum(row['successful_attempts'] for row in rows) / sum(row['total_attempts'] for row in rows) if rows else 0
-                }
+                    cursor.execute("""
+                        SELECT * FROM display_success_history ORDER BY total_attempts DESC
+                    """)
+                    rows = cursor.fetchall()
+                    result = {
+                        'displays': [dict(row) for row in rows],
+                        'total_displays': len(rows),
+                        'tv_displays': sum(1 for row in rows if row['is_tv']),
+                        'overall_success_rate': sum(row['successful_attempts'] for row in rows) / sum(row['total_attempts'] for row in rows) if rows else 0
+                    }
 
-            conn.close()
-            return result
+                return result
 
         except Exception as e:
             logger.error(f"Failed to get display learning stats: {e}", exc_info=True)
@@ -3177,74 +3186,73 @@ class MetricsDatabase:
             Dictionary with aggregated TV unlock analytics
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            # Get aggregated stats
-            cursor.execute("""
-                SELECT
-                    SUM(tv_unlock_attempts) as total_tv_attempts,
-                    SUM(tv_unlock_successes) as total_tv_successes,
-                    SUM(non_tv_unlock_attempts) as total_non_tv_attempts,
-                    SUM(non_tv_unlock_successes) as total_non_tv_successes,
-                    SUM(applescript_attempts) as total_applescript_attempts,
-                    SUM(applescript_successes) as total_applescript_successes,
-                    SUM(core_graphics_attempts) as total_cg_attempts,
-                    SUM(core_graphics_successes) as total_cg_successes,
-                    SUM(mirrored_attempts) as total_mirrored_attempts,
-                    SUM(mirrored_successes) as total_mirrored_successes,
-                    AVG(avg_tv_unlock_duration_ms) as avg_tv_duration,
-                    AVG(avg_non_tv_unlock_duration_ms) as avg_non_tv_duration
-                FROM tv_unlock_analytics
-                WHERE date >= date('now', ? || ' days')
-            """, (f'-{days}',))
+                # Get aggregated stats
+                cursor.execute("""
+                    SELECT
+                        SUM(tv_unlock_attempts) as total_tv_attempts,
+                        SUM(tv_unlock_successes) as total_tv_successes,
+                        SUM(non_tv_unlock_attempts) as total_non_tv_attempts,
+                        SUM(non_tv_unlock_successes) as total_non_tv_successes,
+                        SUM(applescript_attempts) as total_applescript_attempts,
+                        SUM(applescript_successes) as total_applescript_successes,
+                        SUM(core_graphics_attempts) as total_cg_attempts,
+                        SUM(core_graphics_successes) as total_cg_successes,
+                        SUM(mirrored_attempts) as total_mirrored_attempts,
+                        SUM(mirrored_successes) as total_mirrored_successes,
+                        AVG(avg_tv_unlock_duration_ms) as avg_tv_duration,
+                        AVG(avg_non_tv_unlock_duration_ms) as avg_non_tv_duration
+                    FROM tv_unlock_analytics
+                    WHERE date >= date('now', ? || ' days')
+                """, (f'-{days}',))
 
-            row = cursor.fetchone()
+                row = cursor.fetchone()
 
-            if row and row['total_tv_attempts']:
-                total_tv = row['total_tv_attempts']
-                total_non_tv = row['total_non_tv_attempts'] or 0
+                if row and row['total_tv_attempts']:
+                    total_tv = row['total_tv_attempts']
+                    total_non_tv = row['total_non_tv_attempts'] or 0
 
-                summary = {
-                    'period_days': days,
-                    'tv_unlocks': {
-                        'total_attempts': total_tv,
-                        'successes': row['total_tv_successes'],
-                        'success_rate': row['total_tv_successes'] / total_tv if total_tv > 0 else 0,
-                        'avg_duration_ms': row['avg_tv_duration']
-                    },
-                    'non_tv_unlocks': {
-                        'total_attempts': total_non_tv,
-                        'successes': row['total_non_tv_successes'],
-                        'success_rate': row['total_non_tv_successes'] / total_non_tv if total_non_tv > 0 else 0,
-                        'avg_duration_ms': row['avg_non_tv_duration']
-                    },
-                    'strategy_effectiveness': {
-                        'applescript': {
-                            'attempts': row['total_applescript_attempts'] or 0,
-                            'success_rate': (row['total_applescript_successes'] or 0) / (row['total_applescript_attempts'] or 1)
+                    summary = {
+                        'period_days': days,
+                        'tv_unlocks': {
+                            'total_attempts': total_tv,
+                            'successes': row['total_tv_successes'],
+                            'success_rate': row['total_tv_successes'] / total_tv if total_tv > 0 else 0,
+                            'avg_duration_ms': row['avg_tv_duration']
                         },
-                        'core_graphics': {
-                            'attempts': row['total_cg_attempts'] or 0,
-                            'success_rate': (row['total_cg_successes'] or 0) / (row['total_cg_attempts'] or 1)
+                        'non_tv_unlocks': {
+                            'total_attempts': total_non_tv,
+                            'successes': row['total_non_tv_successes'],
+                            'success_rate': row['total_non_tv_successes'] / total_non_tv if total_non_tv > 0 else 0,
+                            'avg_duration_ms': row['avg_non_tv_duration']
+                        },
+                        'strategy_effectiveness': {
+                            'applescript': {
+                                'attempts': row['total_applescript_attempts'] or 0,
+                                'success_rate': (row['total_applescript_successes'] or 0) / (row['total_applescript_attempts'] or 1)
+                            },
+                            'core_graphics': {
+                                'attempts': row['total_cg_attempts'] or 0,
+                                'success_rate': (row['total_cg_successes'] or 0) / (row['total_cg_attempts'] or 1)
+                            }
+                        },
+                        'mirrored_display': {
+                            'attempts': row['total_mirrored_attempts'] or 0,
+                            'success_rate': (row['total_mirrored_successes'] or 0) / (row['total_mirrored_attempts'] or 1)
                         }
-                    },
-                    'mirrored_display': {
-                        'attempts': row['total_mirrored_attempts'] or 0,
-                        'success_rate': (row['total_mirrored_successes'] or 0) / (row['total_mirrored_attempts'] or 1)
                     }
-                }
-            else:
-                summary = {
-                    'period_days': days,
-                    'message': 'No TV unlock data available for this period',
-                    'tv_unlocks': {'total_attempts': 0, 'success_rate': 0},
-                    'non_tv_unlocks': {'total_attempts': 0, 'success_rate': 0}
-                }
+                else:
+                    summary = {
+                        'period_days': days,
+                        'message': 'No TV unlock data available for this period',
+                        'tv_unlocks': {'total_attempts': 0, 'success_rate': 0},
+                        'non_tv_unlocks': {'total_attempts': 0, 'success_rate': 0}
+                    }
 
-            conn.close()
-            return summary
+                return summary
 
         except Exception as e:
             logger.error(f"Failed to get TV analytics summary: {e}", exc_info=True)
@@ -3277,98 +3285,97 @@ class MetricsDatabase:
             Event ID if successful, None otherwise
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            now = datetime.now().isoformat()
+                now = datetime.now().isoformat()
 
-            # Extract display info
-            tv_info = display_context.get('tv_info', {}) or {}
-            is_tv = display_context.get('is_tv_connected', False)
+                # Extract display info
+                tv_info = display_context.get('tv_info', {}) or {}
+                is_tv = display_context.get('is_tv_connected', False)
 
-            # Determine display identifier
-            if is_tv and display_context.get('tv_name'):
-                display_identifier = display_context['tv_name']
-                display_type = 'TV'
-            elif display_context.get('external_display', {}).get('name'):
-                display_identifier = display_context['external_display']['name']
-                display_type = 'MONITOR'
-            else:
-                display_identifier = display_context.get('primary_display', {}).get('name', 'Built-in Display')
-                display_type = 'BUILTIN'
+                # Determine display identifier
+                if is_tv and display_context.get('tv_name'):
+                    display_identifier = display_context['tv_name']
+                    display_type = 'TV'
+                elif display_context.get('external_display', {}).get('name'):
+                    display_identifier = display_context['external_display']['name']
+                    display_type = 'MONITOR'
+                else:
+                    display_identifier = display_context.get('primary_display', {}).get('name', 'Built-in Display')
+                    display_type = 'BUILTIN'
 
-            # Get resolution
-            ext = display_context.get('external_display', {})
-            resolution = f"{ext.get('width', 0)}x{ext.get('height', 0)}" if ext else None
+                # Get resolution
+                ext = display_context.get('external_display', {})
+                resolution = f"{ext.get('width', 0)}x{ext.get('height', 0)}" if ext else None
 
-            # Get system uptime
-            system_uptime = None
-            try:
-                import subprocess
-                result = subprocess.run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    import time
-                    boot_time = int(result.stdout.split('sec = ')[1].split(',')[0])
-                    system_uptime = time.time() - boot_time
-            except Exception:
-                pass
+                # Get system uptime
+                system_uptime = None
+                try:
+                    import subprocess
+                    result = subprocess.run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        import time
+                        boot_time = int(result.stdout.split('sec = ')[1].split(',')[0])
+                        system_uptime = time.time() - boot_time
+                except Exception:
+                    pass
 
-            # Check if screen is locked
-            was_screen_locked = 0
-            try:
-                from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
-                was_screen_locked = 1 if is_screen_locked() else 0
-            except Exception:
-                pass
+                # Check if screen is locked
+                was_screen_locked = 0
+                try:
+                    from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
+                    was_screen_locked = 1 if is_screen_locked() else 0
+                except Exception:
+                    pass
 
-            cursor.execute("""
-                INSERT INTO display_connection_events (
-                    timestamp, event_type,
-                    display_identifier, display_name, display_type,
-                    is_tv, tv_brand, tv_confidence, tv_detection_reasons,
-                    total_displays, display_mode, is_mirrored, resolution, refresh_rate,
-                    sai_detection_method, sai_detection_time_ms, sai_confidence, sai_reasoning,
-                    system_uptime_seconds, was_screen_locked, trigger_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                now, event_type,
-                display_identifier,
-                display_context.get('tv_name') or display_identifier,
-                display_type,
-                1 if is_tv else 0,
-                tv_info.get('brand'),
-                tv_info.get('confidence', 0),
-                json.dumps(tv_info.get('reasons', [])),
-                display_context.get('total_displays', 1),
-                display_context.get('display_mode', 'SINGLE'),
-                1 if display_context.get('is_mirrored', False) else 0,
-                resolution,
-                ext.get('refresh_rate') if ext else None,
-                display_context.get('detection_method', 'sai_langgraph'),
-                display_context.get('detection_time_ms', 0),
-                tv_info.get('confidence', 0.5),
-                json.dumps(sai_reasoning or []),
-                system_uptime,
-                was_screen_locked,
-                trigger_source
-            ))
+                cursor.execute("""
+                    INSERT INTO display_connection_events (
+                        timestamp, event_type,
+                        display_identifier, display_name, display_type,
+                        is_tv, tv_brand, tv_confidence, tv_detection_reasons,
+                        total_displays, display_mode, is_mirrored, resolution, refresh_rate,
+                        sai_detection_method, sai_detection_time_ms, sai_confidence, sai_reasoning,
+                        system_uptime_seconds, was_screen_locked, trigger_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    now, event_type,
+                    display_identifier,
+                    display_context.get('tv_name') or display_identifier,
+                    display_type,
+                    1 if is_tv else 0,
+                    tv_info.get('brand'),
+                    tv_info.get('confidence', 0),
+                    json.dumps(tv_info.get('reasons', [])),
+                    display_context.get('total_displays', 1),
+                    display_context.get('display_mode', 'SINGLE'),
+                    1 if display_context.get('is_mirrored', False) else 0,
+                    resolution,
+                    ext.get('refresh_rate') if ext else None,
+                    display_context.get('detection_method', 'sai_langgraph'),
+                    display_context.get('detection_time_ms', 0),
+                    tv_info.get('confidence', 0.5),
+                    json.dumps(sai_reasoning or []),
+                    system_uptime,
+                    was_screen_locked,
+                    trigger_source
+                ))
 
-            event_id = cursor.lastrowid
+                event_id = cursor.lastrowid
 
-            # Update TV connection state
-            await self._update_tv_connection_state(cursor, event_type, display_context, tv_info)
+                # Update TV connection state
+                await self._update_tv_connection_state(cursor, event_type, display_context, tv_info)
 
-            # Handle TV session tracking
-            if event_type == 'CONNECTED' and is_tv:
-                await self._start_tv_session(cursor, display_identifier, display_context, tv_info)
-            elif event_type == 'DISCONNECTED' and is_tv:
-                await self._end_tv_session(cursor, display_identifier)
+                # Handle TV session tracking
+                if event_type == 'CONNECTED' and is_tv:
+                    await self._start_tv_session(cursor, display_identifier, display_context, tv_info)
+                elif event_type == 'DISCONNECTED' and is_tv:
+                    await self._end_tv_session(cursor, display_identifier)
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
-            logger.info(f"📊 [SAI-EVENT] Recorded {event_type} for '{display_identifier}' (ID: {event_id})")
-            return event_id
+                logger.info(f"📊 [SAI-EVENT] Recorded {event_type} for '{display_identifier}' (ID: {event_id})")
+                return event_id
 
         except Exception as e:
             logger.error(f"Failed to record connection event: {e}", exc_info=True)
@@ -3533,94 +3540,92 @@ class MetricsDatabase:
         Called after each unlock attempt when TV is connected.
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Get active session
-            cursor.execute("""
-                SELECT id, unlock_attempts, unlock_successes, unlock_failures,
-                       applescript_attempts, applescript_successes,
-                       core_graphics_attempts, core_graphics_successes,
-                       avg_unlock_duration_ms, fastest_unlock_ms, slowest_unlock_ms
-                FROM tv_sessions
-                WHERE is_active = 1
-                LIMIT 1
-            """)
+                # Get active session
+                cursor.execute("""
+                    SELECT id, unlock_attempts, unlock_successes, unlock_failures,
+                           applescript_attempts, applescript_successes,
+                           core_graphics_attempts, core_graphics_successes,
+                           avg_unlock_duration_ms, fastest_unlock_ms, slowest_unlock_ms
+                    FROM tv_sessions
+                    WHERE is_active = 1
+                    LIMIT 1
+                """)
 
-            row = cursor.fetchone()
-            if not row:
-                conn.close()
-                return
+                row = cursor.fetchone()
+                if not row:
+                    return
 
-            session_id = row[0]
-            attempts = (row[1] or 0) + 1
-            successes = (row[2] or 0) + (1 if success else 0)
-            failures = (row[3] or 0) + (0 if success else 1)
-            applescript_attempts = row[4] or 0
-            applescript_successes = row[5] or 0
-            cg_attempts = row[6] or 0
-            cg_successes = row[7] or 0
-            avg_duration = row[8] or 0
-            fastest = row[9]
-            slowest = row[10]
+                session_id = row[0]
+                attempts = (row[1] or 0) + 1
+                successes = (row[2] or 0) + (1 if success else 0)
+                failures = (row[3] or 0) + (0 if success else 1)
+                applescript_attempts = row[4] or 0
+                applescript_successes = row[5] or 0
+                cg_attempts = row[6] or 0
+                cg_successes = row[7] or 0
+                avg_duration = row[8] or 0
+                fastest = row[9]
+                slowest = row[10]
 
-            # Update strategy counters
-            strategy_upper = typing_strategy.upper() if typing_strategy else ''
-            if 'APPLESCRIPT' in strategy_upper:
-                applescript_attempts += 1
-                if success:
-                    applescript_successes += 1
-            elif 'CORE_GRAPHICS' in strategy_upper:
-                cg_attempts += 1
-                if success:
-                    cg_successes += 1
+                # Update strategy counters
+                strategy_upper = typing_strategy.upper() if typing_strategy else ''
+                if 'APPLESCRIPT' in strategy_upper:
+                    applescript_attempts += 1
+                    if success:
+                        applescript_successes += 1
+                elif 'CORE_GRAPHICS' in strategy_upper:
+                    cg_attempts += 1
+                    if success:
+                        cg_successes += 1
 
-            # Update duration stats
-            if avg_duration > 0:
-                avg_duration = (avg_duration * (attempts - 1) + unlock_duration_ms) / attempts
-            else:
-                avg_duration = unlock_duration_ms
+                # Update duration stats
+                if avg_duration > 0:
+                    avg_duration = (avg_duration * (attempts - 1) + unlock_duration_ms) / attempts
+                else:
+                    avg_duration = unlock_duration_ms
 
-            if fastest is None or unlock_duration_ms < fastest:
-                fastest = unlock_duration_ms
-            if slowest is None or unlock_duration_ms > slowest:
-                slowest = unlock_duration_ms
+                if fastest is None or unlock_duration_ms < fastest:
+                    fastest = unlock_duration_ms
+                if slowest is None or unlock_duration_ms > slowest:
+                    slowest = unlock_duration_ms
 
-            # Determine best strategy
-            applescript_rate = applescript_successes / applescript_attempts if applescript_attempts > 0 else 0
-            cg_rate = cg_successes / cg_attempts if cg_attempts > 0 else 0
-            best_strategy = 'APPLESCRIPT_DIRECT' if applescript_rate >= cg_rate else 'CORE_GRAPHICS_FAST'
+                # Determine best strategy
+                applescript_rate = applescript_successes / applescript_attempts if applescript_attempts > 0 else 0
+                cg_rate = cg_successes / cg_attempts if cg_attempts > 0 else 0
+                best_strategy = 'APPLESCRIPT_DIRECT' if applescript_rate >= cg_rate else 'CORE_GRAPHICS_FAST'
 
-            success_rate = successes / attempts if attempts > 0 else 0
+                success_rate = successes / attempts if attempts > 0 else 0
 
-            cursor.execute("""
-                UPDATE tv_sessions SET
-                    unlock_attempts = ?,
-                    unlock_successes = ?,
-                    unlock_failures = ?,
-                    session_success_rate = ?,
-                    applescript_attempts = ?,
-                    applescript_successes = ?,
-                    core_graphics_attempts = ?,
-                    core_graphics_successes = ?,
-                    best_strategy_this_session = ?,
-                    avg_unlock_duration_ms = ?,
-                    fastest_unlock_ms = ?,
-                    slowest_unlock_ms = ?
-                WHERE id = ?
-            """, (
-                attempts, successes, failures, success_rate,
-                applescript_attempts, applescript_successes,
-                cg_attempts, cg_successes,
-                best_strategy,
-                avg_duration, fastest, slowest,
-                session_id
-            ))
+                cursor.execute("""
+                    UPDATE tv_sessions SET
+                        unlock_attempts = ?,
+                        unlock_successes = ?,
+                        unlock_failures = ?,
+                        session_success_rate = ?,
+                        applescript_attempts = ?,
+                        applescript_successes = ?,
+                        core_graphics_attempts = ?,
+                        core_graphics_successes = ?,
+                        best_strategy_this_session = ?,
+                        avg_unlock_duration_ms = ?,
+                        fastest_unlock_ms = ?,
+                        slowest_unlock_ms = ?
+                    WHERE id = ?
+                """, (
+                    attempts, successes, failures, success_rate,
+                    applescript_attempts, applescript_successes,
+                    cg_attempts, cg_successes,
+                    best_strategy,
+                    avg_duration, fastest, slowest,
+                    session_id
+                ))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
-            logger.info(f"📺 [TV-SESSION] Updated: attempts={attempts}, rate={success_rate:.1%}")
+                logger.info(f"📺 [TV-SESSION] Updated: attempts={attempts}, rate={success_rate:.1%}")
 
         except Exception as e:
             logger.error(f"Failed to update TV session: {e}", exc_info=True)
@@ -3631,38 +3636,36 @@ class MetricsDatabase:
         Returns real-time awareness of TV connectivity.
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute("SELECT * FROM tv_connection_state LIMIT 1")
-            row = cursor.fetchone()
+                cursor.execute("SELECT * FROM tv_connection_state LIMIT 1")
+                row = cursor.fetchone()
 
-            if row:
-                state = dict(row)
+                if row:
+                    state = dict(row)
 
-                # Get active session info if TV connected
-                if state.get('is_tv_currently_connected'):
-                    cursor.execute("""
-                        SELECT * FROM tv_sessions WHERE is_active = 1 LIMIT 1
-                    """)
-                    session = cursor.fetchone()
-                    if session:
-                        state['active_session'] = dict(session)
-                        # Calculate current session duration
-                        start = datetime.fromisoformat(session['session_start'])
-                        state['active_session']['current_duration_minutes'] = (
-                            (datetime.now() - start).total_seconds() / 60
-                        )
+                    # Get active session info if TV connected
+                    if state.get('is_tv_currently_connected'):
+                        cursor.execute("""
+                            SELECT * FROM tv_sessions WHERE is_active = 1 LIMIT 1
+                        """)
+                        session = cursor.fetchone()
+                        if session:
+                            state['active_session'] = dict(session)
+                            # Calculate current session duration
+                            start = datetime.fromisoformat(session['session_start'])
+                            state['active_session']['current_duration_minutes'] = (
+                                (datetime.now() - start).total_seconds() / 60
+                            )
 
-                conn.close()
-                return state
-            else:
-                conn.close()
-                return {
-                    'is_tv_currently_connected': False,
-                    'message': 'No TV state recorded yet'
-                }
+                    return state
+                else:
+                    return {
+                        'is_tv_currently_connected': False,
+                        'message': 'No TV state recorded yet'
+                    }
 
         except Exception as e:
             logger.error(f"Failed to get TV state: {e}", exc_info=True)
@@ -3684,28 +3687,27 @@ class MetricsDatabase:
             List of connection events
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            if event_type:
-                cursor.execute("""
-                    SELECT * FROM display_connection_events
-                    WHERE event_type = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                """, (event_type, limit))
-            else:
-                cursor.execute("""
-                    SELECT * FROM display_connection_events
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                """, (limit,))
+                if event_type:
+                    cursor.execute("""
+                        SELECT * FROM display_connection_events
+                        WHERE event_type = ?
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    """, (event_type, limit))
+                else:
+                    cursor.execute("""
+                        SELECT * FROM display_connection_events
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    """, (limit,))
 
-            events = [dict(row) for row in cursor.fetchall()]
-            conn.close()
+                events = [dict(row) for row in cursor.fetchall()]
 
-            return events
+                return events
 
         except Exception as e:
             logger.error(f"Failed to get connection history: {e}", exc_info=True)
@@ -3754,63 +3756,62 @@ class MetricsDatabase:
             Sample ID if successful, None otherwise
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            now = datetime.now()
+                now = datetime.now()
 
-            # Determine time of day
-            hour = now.hour
-            if 5 <= hour < 12:
-                time_of_day = 'morning'
-            elif 12 <= hour < 17:
-                time_of_day = 'afternoon'
-            elif 17 <= hour < 21:
-                time_of_day = 'evening'
-            else:
-                time_of_day = 'night'
+                # Determine time of day
+                hour = now.hour
+                if 5 <= hour < 12:
+                    time_of_day = 'morning'
+                elif 12 <= hour < 17:
+                    time_of_day = 'afternoon'
+                elif 17 <= hour < 21:
+                    time_of_day = 'evening'
+                else:
+                    time_of_day = 'night'
 
-            cursor.execute("""
-                INSERT INTO voice_sample_log (
-                    timestamp, speaker_name,
-                    sample_source, audio_duration_ms, audio_quality_score, snr_db,
-                    confidence, was_verified, threshold_used,
-                    added_to_profile, rejection_reason,
+                cursor.execute("""
+                    INSERT INTO voice_sample_log (
+                        timestamp, speaker_name,
+                        sample_source, audio_duration_ms, audio_quality_score, snr_db,
+                        confidence, was_verified, threshold_used,
+                        added_to_profile, rejection_reason,
+                        environment_type, time_of_day,
+                        embedding_stored, embedding_dimensions
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    now.isoformat(), speaker_name,
+                    sample_source, audio_duration_ms, audio_quality, snr_db,
+                    confidence, 1 if was_verified else 0, threshold_used,
+                    1 if added_to_profile else 0, rejection_reason,
                     environment_type, time_of_day,
-                    embedding_stored, embedding_dimensions
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                now.isoformat(), speaker_name,
-                sample_source, audio_duration_ms, audio_quality, snr_db,
-                confidence, 1 if was_verified else 0, threshold_used,
-                1 if added_to_profile else 0, rejection_reason,
-                environment_type, time_of_day,
-                1 if added_to_profile else 0, embedding_dimensions
-            ))
+                    1 if added_to_profile else 0, embedding_dimensions
+                ))
 
-            sample_id = cursor.lastrowid
+                sample_id = cursor.lastrowid
 
-            # Update voice profile learning stats
-            await self._update_voice_profile_learning(
-                cursor, speaker_name, confidence, was_verified,
-                audio_quality, added_to_profile
-            )
+                # Update voice profile learning stats
+                await self._update_voice_profile_learning(
+                    cursor, speaker_name, confidence, was_verified,
+                    audio_quality, added_to_profile
+                )
 
-            # Update confidence history
-            await self._update_confidence_history(
-                cursor, speaker_name, confidence, environment_type, time_of_day
-            )
+                # Update confidence history
+                await self._update_confidence_history(
+                    cursor, speaker_name, confidence, environment_type, time_of_day
+                )
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
-            status = "✅ ADDED" if added_to_profile else "📝 LOGGED"
-            logger.info(
-                f"🎙️ [VOICE] {status} sample #{sample_id} for {speaker_name} "
-                f"(conf: {confidence:.1%}, quality: {audio_quality:.2f})"
-            )
+                status = "✅ ADDED" if added_to_profile else "📝 LOGGED"
+                logger.info(
+                    f"🎙️ [VOICE] {status} sample #{sample_id} for {speaker_name} "
+                    f"(conf: {confidence:.1%}, quality: {audio_quality:.2f})"
+                )
 
-            return sample_id
+                return sample_id
 
         except Exception as e:
             logger.error(f"Failed to record voice sample: {e}", exc_info=True)
@@ -3998,74 +3999,72 @@ class MetricsDatabase:
         and authentication performance.
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            # Get profile learning stats
-            cursor.execute("""
-                SELECT * FROM voice_profile_learning WHERE speaker_name = ?
-            """, (speaker_name,))
-            profile = cursor.fetchone()
+                # Get profile learning stats
+                cursor.execute("""
+                    SELECT * FROM voice_profile_learning WHERE speaker_name = ?
+                """, (speaker_name,))
+                profile = cursor.fetchone()
 
-            # Get recent samples
-            cursor.execute("""
-                SELECT confidence, was_verified, audio_quality_score, time_of_day
-                FROM voice_sample_log
-                WHERE speaker_name = ?
-                ORDER BY timestamp DESC
-                LIMIT 50
-            """, (speaker_name,))
-            recent_samples = cursor.fetchall()
+                # Get recent samples
+                cursor.execute("""
+                    SELECT confidence, was_verified, audio_quality_score, time_of_day
+                    FROM voice_sample_log
+                    WHERE speaker_name = ?
+                    ORDER BY timestamp DESC
+                    LIMIT 50
+                """, (speaker_name,))
+                recent_samples = cursor.fetchall()
 
-            # Get confidence history (last 7 days)
-            cursor.execute("""
-                SELECT date, avg_confidence_today, attempts_today
-                FROM voice_confidence_history
-                WHERE speaker_name = ?
-                ORDER BY date DESC
-                LIMIT 7
-            """, (speaker_name,))
-            history = cursor.fetchall()
+                # Get confidence history (last 7 days)
+                cursor.execute("""
+                    SELECT date, avg_confidence_today, attempts_today
+                    FROM voice_confidence_history
+                    WHERE speaker_name = ?
+                    ORDER BY date DESC
+                    LIMIT 7
+                """, (speaker_name,))
+                history = cursor.fetchall()
 
-            conn.close()
+                if profile:
+                    stats = dict(profile)
 
-            if profile:
-                stats = dict(profile)
+                    # Add recent sample analysis
+                    if recent_samples:
+                        confidences = [s['confidence'] for s in recent_samples]
+                        stats['recent_50_avg_confidence'] = sum(confidences) / len(confidences)
+                        stats['recent_50_best'] = max(confidences)
+                        stats['recent_50_worst'] = min(confidences)
 
-                # Add recent sample analysis
-                if recent_samples:
-                    confidences = [s['confidence'] for s in recent_samples]
-                    stats['recent_50_avg_confidence'] = sum(confidences) / len(confidences)
-                    stats['recent_50_best'] = max(confidences)
-                    stats['recent_50_worst'] = min(confidences)
+                        # Time-of-day performance
+                        tod_stats = {}
+                        for s in recent_samples:
+                            tod = s['time_of_day']
+                            if tod not in tod_stats:
+                                tod_stats[tod] = []
+                            tod_stats[tod].append(s['confidence'])
 
-                    # Time-of-day performance
-                    tod_stats = {}
-                    for s in recent_samples:
-                        tod = s['time_of_day']
-                        if tod not in tod_stats:
-                            tod_stats[tod] = []
-                        tod_stats[tod].append(s['confidence'])
+                        stats['time_of_day_performance'] = {
+                            tod: sum(confs) / len(confs)
+                            for tod, confs in tod_stats.items()
+                        }
 
-                    stats['time_of_day_performance'] = {
-                        tod: sum(confs) / len(confs)
-                        for tod, confs in tod_stats.items()
+                    # Add history
+                    stats['confidence_history_7days'] = [
+                        {'date': h['date'], 'avg': h['avg_confidence_today'], 'attempts': h['attempts_today']}
+                        for h in history
+                    ]
+
+                    return stats
+                else:
+                    return {
+                        'speaker_name': speaker_name,
+                        'message': 'No voice profile learning data yet',
+                        'total_samples_collected': 0
                     }
-
-                # Add history
-                stats['confidence_history_7days'] = [
-                    {'date': h['date'], 'avg': h['avg_confidence_today'], 'attempts': h['attempts_today']}
-                    for h in history
-                ]
-
-                return stats
-            else:
-                return {
-                    'speaker_name': speaker_name,
-                    'message': 'No voice profile learning data yet',
-                    'total_samples_collected': 0
-                }
 
         except Exception as e:
             logger.error(f"Failed to get voice profile stats: {e}", exc_info=True)
@@ -4105,115 +4104,114 @@ class MetricsDatabase:
         try:
             import base64
 
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            now = datetime.now().isoformat()
+                now = datetime.now().isoformat()
 
-            # Encode embedding as base64
-            embedding_b64 = base64.b64encode(embedding).decode('utf-8')
+                # Encode embedding as base64
+                embedding_b64 = base64.b64encode(embedding).decode('utf-8')
 
-            # Check if embedding exists for this speaker
-            cursor.execute("""
-                SELECT id, version FROM voice_embeddings WHERE speaker_name = ?
-            """, (speaker_name,))
-
-            row = cursor.fetchone()
-
-            if row:
-                # Update existing
-                embedding_id = row[0]
-                new_version = (row[1] or 0) + 1
-
+                # Check if embedding exists for this speaker
                 cursor.execute("""
-                    UPDATE voice_embeddings SET
-                        embedding_b64 = ?,
-                        embedding_dimensions = ?,
-                        speaker_id = COALESCE(?, speaker_id),
-                        version = ?,
-                        updated_at = ?,
-                        total_samples_used = ?,
-                        rolling_samples_in_avg = ?,
-                        avg_sample_confidence = ?,
-                        cloud_sql_synced = ?,
-                        cloud_sql_sync_time = ?,
-                        source = 'continuous_learning',
-                        last_verification_confidence = ?
-                    WHERE id = ?
-                """, (
-                    embedding_b64,
-                    embedding_dimensions,
-                    speaker_id,
-                    new_version,
-                    now,
-                    total_samples,
-                    rolling_samples,
-                    avg_confidence,
-                    1 if cloud_sql_synced else 0,
-                    now if cloud_sql_synced else None,
-                    avg_confidence,
-                    embedding_id
-                ))
+                    SELECT id, version FROM voice_embeddings WHERE speaker_name = ?
+                """, (speaker_name,))
 
-                # Save to history
-                cursor.execute("""
-                    INSERT INTO voice_embedding_history (
-                        timestamp, speaker_name, embedding_b64, embedding_dimensions,
-                        version, update_reason, samples_used, total_samples_at_update,
-                        avg_confidence_at_save, cloud_sql_synced
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    now, speaker_name, embedding_b64, embedding_dimensions,
-                    new_version, update_reason, rolling_samples, total_samples,
-                    avg_confidence, 1 if cloud_sql_synced else 0
-                ))
+                row = cursor.fetchone()
 
-                logger.info(
-                    f"🔄 [SQLITE-SYNC] Updated embedding for {speaker_name} "
-                    f"(v{new_version}, {total_samples} samples, synced={cloud_sql_synced})"
-                )
+                if row:
+                    # Update existing
+                    embedding_id = row[0]
+                    new_version = (row[1] or 0) + 1
 
-            else:
-                # Insert new
-                cursor.execute("""
-                    INSERT INTO voice_embeddings (
+                    cursor.execute("""
+                        UPDATE voice_embeddings SET
+                            embedding_b64 = ?,
+                            embedding_dimensions = ?,
+                            speaker_id = COALESCE(?, speaker_id),
+                            version = ?,
+                            updated_at = ?,
+                            total_samples_used = ?,
+                            rolling_samples_in_avg = ?,
+                            avg_sample_confidence = ?,
+                            cloud_sql_synced = ?,
+                            cloud_sql_sync_time = ?,
+                            source = 'continuous_learning',
+                            last_verification_confidence = ?
+                        WHERE id = ?
+                    """, (
+                        embedding_b64,
+                        embedding_dimensions,
+                        speaker_id,
+                        new_version,
+                        now,
+                        total_samples,
+                        rolling_samples,
+                        avg_confidence,
+                        1 if cloud_sql_synced else 0,
+                        now if cloud_sql_synced else None,
+                        avg_confidence,
+                        embedding_id
+                    ))
+
+                    # Save to history
+                    cursor.execute("""
+                        INSERT INTO voice_embedding_history (
+                            timestamp, speaker_name, embedding_b64, embedding_dimensions,
+                            version, update_reason, samples_used, total_samples_at_update,
+                            avg_confidence_at_save, cloud_sql_synced
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        now, speaker_name, embedding_b64, embedding_dimensions,
+                        new_version, update_reason, rolling_samples, total_samples,
+                        avg_confidence, 1 if cloud_sql_synced else 0
+                    ))
+
+                    logger.info(
+                        f"🔄 [SQLITE-SYNC] Updated embedding for {speaker_name} "
+                        f"(v{new_version}, {total_samples} samples, synced={cloud_sql_synced})"
+                    )
+
+                else:
+                    # Insert new
+                    cursor.execute("""
+                        INSERT INTO voice_embeddings (
+                            speaker_name, speaker_id, embedding_b64, embedding_dimensions,
+                            version, created_at, updated_at,
+                            total_samples_used, rolling_samples_in_avg, avg_sample_confidence,
+                            cloud_sql_synced, cloud_sql_sync_time, source, last_verification_confidence
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
                         speaker_name, speaker_id, embedding_b64, embedding_dimensions,
-                        version, created_at, updated_at,
-                        total_samples_used, rolling_samples_in_avg, avg_sample_confidence,
-                        cloud_sql_synced, cloud_sql_sync_time, source, last_verification_confidence
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    speaker_name, speaker_id, embedding_b64, embedding_dimensions,
-                    1, now, now,
-                    total_samples, rolling_samples, avg_confidence,
-                    1 if cloud_sql_synced else 0, now if cloud_sql_synced else None,
-                    'continuous_learning', avg_confidence
-                ))
+                        1, now, now,
+                        total_samples, rolling_samples, avg_confidence,
+                        1 if cloud_sql_synced else 0, now if cloud_sql_synced else None,
+                        'continuous_learning', avg_confidence
+                    ))
 
-                embedding_id = cursor.lastrowid
+                    embedding_id = cursor.lastrowid
 
-                # Save initial state to history
-                cursor.execute("""
-                    INSERT INTO voice_embedding_history (
-                        timestamp, speaker_name, embedding_b64, embedding_dimensions,
-                        version, update_reason, samples_used, total_samples_at_update,
-                        avg_confidence_at_save, cloud_sql_synced
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    now, speaker_name, embedding_b64, embedding_dimensions,
-                    1, 'initial_save', rolling_samples, total_samples,
-                    avg_confidence, 1 if cloud_sql_synced else 0
-                ))
+                    # Save initial state to history
+                    cursor.execute("""
+                        INSERT INTO voice_embedding_history (
+                            timestamp, speaker_name, embedding_b64, embedding_dimensions,
+                            version, update_reason, samples_used, total_samples_at_update,
+                            avg_confidence_at_save, cloud_sql_synced
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        now, speaker_name, embedding_b64, embedding_dimensions,
+                        1, 'initial_save', rolling_samples, total_samples,
+                        avg_confidence, 1 if cloud_sql_synced else 0
+                    ))
 
-                logger.info(
-                    f"🆕 [SQLITE-SYNC] Created embedding for {speaker_name} "
-                    f"(ID: {embedding_id}, {total_samples} samples)"
-                )
+                    logger.info(
+                        f"🆕 [SQLITE-SYNC] Created embedding for {speaker_name} "
+                        f"(ID: {embedding_id}, {total_samples} samples)"
+                    )
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
-            return embedding_id
+                return embedding_id
 
         except Exception as e:
             logger.error(f"Failed to sync embedding to SQLite: {e}", exc_info=True)
@@ -4230,29 +4228,28 @@ class MetricsDatabase:
             import base64
             import numpy as np
 
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute("""
-                SELECT * FROM voice_embeddings WHERE speaker_name = ?
-            """, (speaker_name,))
+                cursor.execute("""
+                    SELECT * FROM voice_embeddings WHERE speaker_name = ?
+                """, (speaker_name,))
 
-            row = cursor.fetchone()
-            conn.close()
+                row = cursor.fetchone()
 
-            if row:
-                result = dict(row)
+                if row:
+                    result = dict(row)
 
-                # Decode embedding from base64
-                embedding_b64 = result.get('embedding_b64')
-                if embedding_b64:
-                    embedding_bytes = base64.b64decode(embedding_b64)
-                    result['embedding'] = np.frombuffer(embedding_bytes, dtype=np.float32)
+                    # Decode embedding from base64
+                    embedding_b64 = result.get('embedding_b64')
+                    if embedding_b64:
+                        embedding_bytes = base64.b64decode(embedding_b64)
+                        result['embedding'] = np.frombuffer(embedding_bytes, dtype=np.float32)
 
-                return result
+                    return result
 
-            return None
+                return None
 
         except Exception as e:
             logger.error(f"Failed to get SQLite embedding: {e}", exc_info=True)
@@ -4274,23 +4271,22 @@ class MetricsDatabase:
             List of embedding history records
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            cursor.execute("""
-                SELECT id, timestamp, version, update_reason, samples_used,
-                       total_samples_at_update, avg_confidence_at_save, cloud_sql_synced
-                FROM voice_embedding_history
-                WHERE speaker_name = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (speaker_name, limit))
+                cursor.execute("""
+                    SELECT id, timestamp, version, update_reason, samples_used,
+                           total_samples_at_update, avg_confidence_at_save, cloud_sql_synced
+                    FROM voice_embedding_history
+                    WHERE speaker_name = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (speaker_name, limit))
 
-            history = [dict(row) for row in cursor.fetchall()]
-            conn.close()
+                history = [dict(row) for row in cursor.fetchall()]
 
-            return history
+                return history
 
         except Exception as e:
             logger.error(f"Failed to get embedding history: {e}", exc_info=True)
@@ -4308,58 +4304,56 @@ class MetricsDatabase:
             True if successful
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Get the historical embedding
-            cursor.execute("""
-                SELECT embedding_b64, embedding_dimensions, avg_confidence_at_save
-                FROM voice_embedding_history
-                WHERE speaker_name = ? AND version = ?
-            """, (speaker_name, version))
+                # Get the historical embedding
+                cursor.execute("""
+                    SELECT embedding_b64, embedding_dimensions, avg_confidence_at_save
+                    FROM voice_embedding_history
+                    WHERE speaker_name = ? AND version = ?
+                """, (speaker_name, version))
 
-            row = cursor.fetchone()
+                row = cursor.fetchone()
 
-            if not row:
-                logger.warning(f"No embedding found for {speaker_name} version {version}")
-                conn.close()
-                return False
+                if not row:
+                    logger.warning(f"No embedding found for {speaker_name} version {version}")
+                    return False
 
-            embedding_b64, dimensions, confidence = row
+                embedding_b64, dimensions, confidence = row
 
-            # Update current embedding
-            now = datetime.now().isoformat()
-            cursor.execute("""
-                UPDATE voice_embeddings SET
-                    embedding_b64 = ?,
-                    embedding_dimensions = ?,
-                    updated_at = ?,
-                    cloud_sql_synced = 0,
-                    source = 'rollback'
-                WHERE speaker_name = ?
-            """, (embedding_b64, dimensions, now, speaker_name))
+                # Update current embedding
+                now = datetime.now().isoformat()
+                cursor.execute("""
+                    UPDATE voice_embeddings SET
+                        embedding_b64 = ?,
+                        embedding_dimensions = ?,
+                        updated_at = ?,
+                        cloud_sql_synced = 0,
+                        source = 'rollback'
+                    WHERE speaker_name = ?
+                """, (embedding_b64, dimensions, now, speaker_name))
 
-            # Record rollback in history
-            cursor.execute("""
-                SELECT version FROM voice_embeddings WHERE speaker_name = ?
-            """, (speaker_name,))
-            current_version = cursor.fetchone()[0]
+                # Record rollback in history
+                cursor.execute("""
+                    SELECT version FROM voice_embeddings WHERE speaker_name = ?
+                """, (speaker_name,))
+                current_version = cursor.fetchone()[0]
 
-            cursor.execute("""
-                INSERT INTO voice_embedding_history (
-                    timestamp, speaker_name, embedding_b64, embedding_dimensions,
-                    version, update_reason, avg_confidence_at_save, cloud_sql_synced
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                now, speaker_name, embedding_b64, dimensions,
-                current_version + 1, f'rollback_to_v{version}', confidence, 0
-            ))
+                cursor.execute("""
+                    INSERT INTO voice_embedding_history (
+                        timestamp, speaker_name, embedding_b64, embedding_dimensions,
+                        version, update_reason, avg_confidence_at_save, cloud_sql_synced
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    now, speaker_name, embedding_b64, dimensions,
+                    current_version + 1, f'rollback_to_v{version}', confidence, 0
+                ))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
-            logger.info(f"🔙 [ROLLBACK] Rolled back {speaker_name} to version {version}")
-            return True
+                logger.info(f"🔙 [ROLLBACK] Rolled back {speaker_name} to version {version}")
+                return True
 
         except Exception as e:
             logger.error(f"Failed to rollback embedding: {e}", exc_info=True)
@@ -4442,92 +4436,91 @@ class MetricsDatabase:
             Hallucination ID if successful
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            now = datetime.now().isoformat()
-            date = datetime.now().strftime("%Y-%m-%d")
-            normalized = original_text.lower().strip()
+                now = datetime.now().isoformat()
+                date = datetime.now().strftime("%Y-%m-%d")
+                normalized = original_text.lower().strip()
 
-            # Check if this hallucination already exists
-            cursor.execute("""
-                SELECT id, occurrence_count, times_corrected, times_flagged
-                FROM stt_hallucinations WHERE original_text_normalized = ?
-            """, (normalized,))
-
-            existing = cursor.fetchone()
-
-            if existing:
-                # Update existing record
-                hallucination_id = existing[0]
-                occurrence_count = existing[1] + 1
-                times_corrected = existing[2] + (1 if corrected_text else 0)
-                times_flagged = existing[3] + (0 if corrected_text else 1)
-
+                # Check if this hallucination already exists
                 cursor.execute("""
-                    UPDATE stt_hallucinations SET
-                        occurrence_count = ?,
-                        last_occurrence = ?,
-                        times_corrected = ?,
-                        times_flagged = ?,
-                        detection_confidence = MAX(detection_confidence, ?),
-                        corrected_text = COALESCE(?, corrected_text)
-                    WHERE id = ?
-                """, (
-                    occurrence_count, now, times_corrected, times_flagged,
-                    confidence, corrected_text, hallucination_id
-                ))
+                    SELECT id, occurrence_count, times_corrected, times_flagged
+                    FROM stt_hallucinations WHERE original_text_normalized = ?
+                """, (normalized,))
 
-                logger.debug(f"📚 Updated hallucination #{hallucination_id}: occurrence {occurrence_count}")
+                existing = cursor.fetchone()
 
-            else:
-                # Insert new record
-                sai_tv = sai_context.get("is_tv_connected", False) if sai_context else False
-                sai_displays = sai_context.get("display_context", {}).get("display_count", 0) if sai_context else 0
+                if existing:
+                    # Update existing record
+                    hallucination_id = existing[0]
+                    occurrence_count = existing[1] + 1
+                    times_corrected = existing[2] + (1 if corrected_text else 0)
+                    times_flagged = existing[3] + (0 if corrected_text else 1)
 
-                cursor.execute("""
-                    INSERT INTO stt_hallucinations (
-                        timestamp, date, original_text, original_text_normalized,
-                        corrected_text, was_corrected, correction_source,
-                        hallucination_type, detection_confidence, detection_method,
+                    cursor.execute("""
+                        UPDATE stt_hallucinations SET
+                            occurrence_count = ?,
+                            last_occurrence = ?,
+                            times_corrected = ?,
+                            times_flagged = ?,
+                            detection_confidence = MAX(detection_confidence, ?),
+                            corrected_text = COALESCE(?, corrected_text)
+                        WHERE id = ?
+                    """, (
+                        occurrence_count, now, times_corrected, times_flagged,
+                        confidence, corrected_text, hallucination_id
+                    ))
+
+                    logger.debug(f"📚 Updated hallucination #{hallucination_id}: occurrence {occurrence_count}")
+
+                else:
+                    # Insert new record
+                    sai_tv = sai_context.get("is_tv_connected", False) if sai_context else False
+                    sai_displays = sai_context.get("display_context", {}).get("display_count", 0) if sai_context else 0
+
+                    cursor.execute("""
+                        INSERT INTO stt_hallucinations (
+                            timestamp, date, original_text, original_text_normalized,
+                            corrected_text, was_corrected, correction_source,
+                            hallucination_type, detection_confidence, detection_method,
+                            reasoning_steps, context, audio_hash,
+                            sai_tv_connected, sai_display_count,
+                            occurrence_count, last_occurrence, times_corrected, times_flagged
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        now, date, original_text, normalized,
+                        corrected_text, 1 if corrected_text else 0,
+                        "auto_learned" if corrected_text else None,
+                        hallucination_type, confidence, detection_method,
                         reasoning_steps, context, audio_hash,
-                        sai_tv_connected, sai_display_count,
-                        occurrence_count, last_occurrence, times_corrected, times_flagged
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    now, date, original_text, normalized,
-                    corrected_text, 1 if corrected_text else 0,
-                    "auto_learned" if corrected_text else None,
-                    hallucination_type, confidence, detection_method,
-                    reasoning_steps, context, audio_hash,
-                    1 if sai_tv else 0, sai_displays,
-                    1, now, 1 if corrected_text else 0, 0 if corrected_text else 1
-                ))
+                        1 if sai_tv else 0, sai_displays,
+                        1, now, 1 if corrected_text else 0, 0 if corrected_text else 1
+                    ))
 
-                hallucination_id = cursor.lastrowid
-                logger.info(f"📚 Recorded new hallucination #{hallucination_id}: '{original_text[:30]}...'")
+                    hallucination_id = cursor.lastrowid
+                    logger.info(f"📚 Recorded new hallucination #{hallucination_id}: '{original_text[:30]}...'")
 
-            # Also update/create correction mapping if we have a correction
-            if corrected_text:
-                cursor.execute("""
-                    INSERT INTO hallucination_corrections (
-                        timestamp, hallucination_normalized, correction,
-                        correction_confidence, times_applied, last_applied, source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(hallucination_normalized) DO UPDATE SET
-                        times_applied = hallucination_corrections.times_applied + 1,
-                        last_applied = ?,
-                        correction_confidence = MAX(hallucination_corrections.correction_confidence, ?)
-                """, (
-                    now, normalized, corrected_text,
-                    confidence, 1, now, "auto_learned",
-                    now, confidence
-                ))
+                # Also update/create correction mapping if we have a correction
+                if corrected_text:
+                    cursor.execute("""
+                        INSERT INTO hallucination_corrections (
+                            timestamp, hallucination_normalized, correction,
+                            correction_confidence, times_applied, last_applied, source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(hallucination_normalized) DO UPDATE SET
+                            times_applied = hallucination_corrections.times_applied + 1,
+                            last_applied = ?,
+                            correction_confidence = MAX(hallucination_corrections.correction_confidence, ?)
+                    """, (
+                        now, normalized, corrected_text,
+                        confidence, 1, now, "auto_learned",
+                        now, confidence
+                    ))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
-            return hallucination_id
+                return hallucination_id
 
         except Exception as e:
             logger.error(f"Failed to record hallucination: {e}", exc_info=True)
@@ -4541,21 +4534,20 @@ class MetricsDatabase:
             List of normalized hallucination texts
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Get patterns with at least 1 occurrence
-            cursor.execute("""
-                SELECT original_text_normalized
-                FROM stt_hallucinations
-                WHERE occurrence_count >= 1
-                ORDER BY occurrence_count DESC
-            """)
+                # Get patterns with at least 1 occurrence
+                cursor.execute("""
+                    SELECT original_text_normalized
+                    FROM stt_hallucinations
+                    WHERE occurrence_count >= 1
+                    ORDER BY occurrence_count DESC
+                """)
 
-            patterns = [row[0] for row in cursor.fetchall()]
-            conn.close()
+                patterns = [row[0] for row in cursor.fetchall()]
 
-            return patterns
+                return patterns
 
         except Exception as e:
             logger.error(f"Failed to get hallucination patterns: {e}")
@@ -4569,20 +4561,19 @@ class MetricsDatabase:
             Dict mapping normalized hallucination text to correction
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            cursor.execute("""
-                SELECT hallucination_normalized, correction
-                FROM hallucination_corrections
-                WHERE correction_confidence >= 0.5
-                ORDER BY times_applied DESC
-            """)
+                cursor.execute("""
+                    SELECT hallucination_normalized, correction
+                    FROM hallucination_corrections
+                    WHERE correction_confidence >= 0.5
+                    ORDER BY times_applied DESC
+                """)
 
-            corrections = {row[0]: row[1] for row in cursor.fetchall()}
-            conn.close()
+                corrections = {row[0]: row[1] for row in cursor.fetchall()}
 
-            return corrections
+                return corrections
 
         except Exception as e:
             logger.error(f"Failed to get hallucination corrections: {e}")
@@ -4596,47 +4587,45 @@ class MetricsDatabase:
             Dict with typical_phrases, typical_hours, score
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Get typical phrases
-            cursor.execute("""
-                SELECT phrase, occurrence_count, success_count, failure_count
-                FROM user_behavioral_patterns
-                WHERE context = ?
-                ORDER BY occurrence_count DESC
-                LIMIT 10
-            """, (context,))
+                # Get typical phrases
+                cursor.execute("""
+                    SELECT phrase, occurrence_count, success_count, failure_count
+                    FROM user_behavioral_patterns
+                    WHERE context = ?
+                    ORDER BY occurrence_count DESC
+                    LIMIT 10
+                """, (context,))
 
-            phrases_data = cursor.fetchall()
-            typical_phrases = [row[0] for row in phrases_data]
+                phrases_data = cursor.fetchall()
+                typical_phrases = [row[0] for row in phrases_data]
 
-            # Calculate success rate
-            total_success = sum(row[2] for row in phrases_data)
-            total_failure = sum(row[3] for row in phrases_data)
-            success_rate = total_success / max(total_success + total_failure, 1)
+                # Calculate success rate
+                total_success = sum(row[2] for row in phrases_data)
+                total_failure = sum(row[3] for row in phrases_data)
+                success_rate = total_success / max(total_success + total_failure, 1)
 
-            # Get typical hours from unlock_attempts
-            cursor.execute("""
-                SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hour, COUNT(*) as cnt
-                FROM unlock_attempts
-                WHERE success = 1
-                GROUP BY hour
-                HAVING cnt >= 3
-                ORDER BY cnt DESC
-            """)
+                # Get typical hours from unlock_attempts
+                cursor.execute("""
+                    SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hour, COUNT(*) as cnt
+                    FROM unlock_attempts
+                    WHERE success = 1
+                    GROUP BY hour
+                    HAVING cnt >= 3
+                    ORDER BY cnt DESC
+                """)
 
-            typical_hours = [row[0] for row in cursor.fetchall()]
+                typical_hours = [row[0] for row in cursor.fetchall()]
 
-            conn.close()
-
-            return {
-                "has_behavioral_data": len(typical_phrases) > 0,
-                "typical_phrases": typical_phrases,
-                "typical_hours": typical_hours,
-                "success_rate": success_rate,
-                "score": min(1.0, success_rate + 0.3 if typical_phrases else 0.5)
-            }
+                return {
+                    "has_behavioral_data": len(typical_phrases) > 0,
+                    "typical_phrases": typical_phrases,
+                    "typical_hours": typical_hours,
+                    "success_rate": success_rate,
+                    "score": min(1.0, success_rate + 0.3 if typical_phrases else 0.5)
+                }
 
         except Exception as e:
             logger.error(f"Failed to get behavioral patterns: {e}")
@@ -4657,29 +4646,28 @@ class MetricsDatabase:
             success: Whether this led to a successful action
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            now = datetime.now().isoformat()
-            normalized = phrase.lower().strip()
+                now = datetime.now().isoformat()
+                normalized = phrase.lower().strip()
 
-            cursor.execute("""
-                INSERT INTO user_behavioral_patterns (
-                    context, phrase, phrase_normalized, occurrence_count,
-                    last_used, success_count, failure_count
-                ) VALUES (?, ?, ?, 1, ?, ?, ?)
-                ON CONFLICT(context, phrase_normalized) DO UPDATE SET
-                    occurrence_count = user_behavioral_patterns.occurrence_count + 1,
-                    last_used = ?,
-                    success_count = user_behavioral_patterns.success_count + ?,
-                    failure_count = user_behavioral_patterns.failure_count + ?
-            """, (
-                context, phrase, normalized, now, 1 if success else 0, 0 if success else 1,
-                now, 1 if success else 0, 0 if success else 1
-            ))
+                cursor.execute("""
+                    INSERT INTO user_behavioral_patterns (
+                        context, phrase, phrase_normalized, occurrence_count,
+                        last_used, success_count, failure_count
+                    ) VALUES (?, ?, ?, 1, ?, ?, ?)
+                    ON CONFLICT(context, phrase_normalized) DO UPDATE SET
+                        occurrence_count = user_behavioral_patterns.occurrence_count + 1,
+                        last_used = ?,
+                        success_count = user_behavioral_patterns.success_count + ?,
+                        failure_count = user_behavioral_patterns.failure_count + ?
+                """, (
+                    context, phrase, normalized, now, 1 if success else 0, 0 if success else 1,
+                    now, 1 if success else 0, 0 if success else 1
+                ))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to record user phrase: {e}")
@@ -4702,34 +4690,33 @@ class MetricsDatabase:
         Store detailed reasoning trace for a hallucination detection.
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            now = datetime.now().isoformat()
+                now = datetime.now().isoformat()
 
-            cursor.execute("""
-                INSERT INTO hallucination_reasoning_log (
-                    timestamp, hallucination_id, reasoning_steps_json, hypotheses_json,
-                    evidence_json, pattern_analysis_json, consensus_analysis_json,
-                    context_analysis_json, phonetic_analysis_json, behavioral_analysis_json,
-                    sai_analysis_json, final_decision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                now, hallucination_id,
-                json.dumps(reasoning_steps),
-                json.dumps(hypotheses),
-                json.dumps(evidence),
-                json.dumps(pattern_analysis) if pattern_analysis else None,
-                json.dumps(consensus_analysis) if consensus_analysis else None,
-                json.dumps(context_analysis) if context_analysis else None,
-                json.dumps(phonetic_analysis) if phonetic_analysis else None,
-                json.dumps(behavioral_analysis) if behavioral_analysis else None,
-                json.dumps(sai_analysis) if sai_analysis else None,
-                final_decision
-            ))
+                cursor.execute("""
+                    INSERT INTO hallucination_reasoning_log (
+                        timestamp, hallucination_id, reasoning_steps_json, hypotheses_json,
+                        evidence_json, pattern_analysis_json, consensus_analysis_json,
+                        context_analysis_json, phonetic_analysis_json, behavioral_analysis_json,
+                        sai_analysis_json, final_decision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    now, hallucination_id,
+                    json.dumps(reasoning_steps),
+                    json.dumps(hypotheses),
+                    json.dumps(evidence),
+                    json.dumps(pattern_analysis) if pattern_analysis else None,
+                    json.dumps(consensus_analysis) if consensus_analysis else None,
+                    json.dumps(context_analysis) if context_analysis else None,
+                    json.dumps(phonetic_analysis) if phonetic_analysis else None,
+                    json.dumps(behavioral_analysis) if behavioral_analysis else None,
+                    json.dumps(sai_analysis) if sai_analysis else None,
+                    final_decision
+                ))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
         except Exception as e:
             logger.error(f"Failed to store hallucination reasoning: {e}")
@@ -4739,40 +4726,38 @@ class MetricsDatabase:
         Get statistics about hallucination detection.
         """
         try:
-            conn = sqlite3.connect(self.sqlite_path)
-            cursor = conn.cursor()
+            with self._safe_sqlite() as conn:
+                cursor = conn.cursor()
 
-            # Total hallucinations
-            cursor.execute("SELECT COUNT(*) FROM stt_hallucinations")
-            total = cursor.fetchone()[0]
+                # Total hallucinations
+                cursor.execute("SELECT COUNT(*) FROM stt_hallucinations")
+                total = cursor.fetchone()[0]
 
-            # By type
-            cursor.execute("""
-                SELECT hallucination_type, COUNT(*), SUM(occurrence_count)
-                FROM stt_hallucinations
-                GROUP BY hallucination_type
-            """)
-            by_type = {row[0]: {"unique": row[1], "total_occurrences": row[2]} for row in cursor.fetchall()}
+                # By type
+                cursor.execute("""
+                    SELECT hallucination_type, COUNT(*), SUM(occurrence_count)
+                    FROM stt_hallucinations
+                    GROUP BY hallucination_type
+                """)
+                by_type = {row[0]: {"unique": row[1], "total_occurrences": row[2]} for row in cursor.fetchall()}
 
-            # Corrections
-            cursor.execute("SELECT COUNT(*) FROM hallucination_corrections")
-            total_corrections = cursor.fetchone()[0]
+                # Corrections
+                cursor.execute("SELECT COUNT(*) FROM hallucination_corrections")
+                total_corrections = cursor.fetchone()[0]
 
-            # Recent (last 7 days)
-            week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            cursor.execute("""
-                SELECT COUNT(*) FROM stt_hallucinations WHERE date >= ?
-            """, (week_ago,))
-            recent = cursor.fetchone()[0]
+                # Recent (last 7 days)
+                week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+                cursor.execute("""
+                    SELECT COUNT(*) FROM stt_hallucinations WHERE date >= ?
+                """, (week_ago,))
+                recent = cursor.fetchone()[0]
 
-            conn.close()
-
-            return {
-                "total_unique_hallucinations": total,
-                "by_type": by_type,
-                "total_corrections_learned": total_corrections,
-                "hallucinations_last_7_days": recent
-            }
+                return {
+                    "total_unique_hallucinations": total,
+                    "by_type": by_type,
+                    "total_corrections_learned": total_corrections,
+                    "hallucinations_last_7_days": recent
+                }
 
         except Exception as e:
             logger.error(f"Failed to get hallucination stats: {e}")
