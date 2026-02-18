@@ -59014,6 +59014,8 @@ class JarvisSystemKernel:
         self._narration_engine_started_by_us: bool = False  # Track ownership
         self._screen_narration_bridge = None  # Strong ref to prevent WeakMethod GC
         self._screen_observation_lock = asyncio.Lock()  # Serializes activation
+        self._perm_type_cls = None   # Cached PermissionType class (set in _check_startup_permissions)
+        self._perm_status_cls = None  # Cached PermissionStatus class (set in _check_startup_permissions)
 
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
@@ -59979,6 +59981,18 @@ class JarvisSystemKernel:
                     self.logger.debug(f"[Kernel] {_proc_name} already exited")
 
         # v264.0: Screen Observation + Narration teardown (before Visual Pipeline)
+        #
+        # Ordering is critical: release bridge ref FIRST to kill all WeakMethod
+        # callbacks, THEN stop the analyzer. If stop_monitoring() times out and the
+        # internal loop is still running, _trigger_event will find 0 live callbacks
+        # (all WeakMethod refs died when bridge was collected), preventing calls to
+        # narrate_perception() on a stopped NarrationEngine.
+        self._screen_narration_bridge = None  # Kill callbacks before stopping analyzer
+
+        if self._screen_recording_check_task and not self._screen_recording_check_task.done():
+            self._screen_recording_check_task.cancel()
+            self.logger.debug("[Kernel] Permission recheck task cancelled")
+
         try:
             if self._screen_analyzer and getattr(self._screen_analyzer, 'is_monitoring', False):
                 await asyncio.wait_for(self._screen_analyzer.stop_monitoring(), timeout=5.0)
@@ -60004,12 +60018,6 @@ class JarvisSystemKernel:
                 self.logger.info("[Kernel] Permission Manager monitoring stopped")
         except Exception as e:
             self.logger.debug(f"[Kernel] Permission Manager stop error: {e}")
-
-        if self._screen_recording_check_task and not self._screen_recording_check_task.done():
-            self._screen_recording_check_task.cancel()
-            self.logger.debug("[Kernel] Permission recheck task cancelled")
-
-        self._screen_narration_bridge = None  # Release bridge ref
 
         # v250.0: Visual Pipeline teardown (N-Optic → Ghost Hands order)
         try:
@@ -66941,8 +66949,8 @@ class JarvisSystemKernel:
 
         Only runs on macOS (darwin). On other platforms, skips silently.
         """
-        import sys as _sys
-        if _sys.platform != "darwin":
+        import sys
+        if sys.platform != "darwin":
             self.logger.debug("[Permissions] Not macOS — skipping Screen Recording check")
             return
 
@@ -66966,6 +66974,11 @@ class JarvisSystemKernel:
             except ImportError:
                 self.logger.warning("[Permissions] permission_manager module not available — skipping")
                 return
+
+        # Store permission classes on self for reuse by _permission_recheck_loop(),
+        # avoiding triple-duplicated dual-path import blocks across methods.
+        self._perm_type_cls = PermType
+        self._perm_status_cls = PermStatus
 
         try:
             self._permission_manager = await get_pm()
@@ -67024,22 +67037,14 @@ class JarvisSystemKernel:
         interval = _get_env_float("JARVIS_PERMISSION_RECHECK_INTERVAL", 10.0)
         max_attempts = int(os.environ.get("JARVIS_PERMISSION_RECHECK_MAX", "60"))
 
-        PermType = None
-        PermStatus = None
-        try:
-            from backend.macos_helper.permission_manager import (
-                PermissionType as PermType,
-                PermissionStatus as PermStatus,
-            )
-        except ImportError:
-            try:
-                from macos_helper.permission_manager import (
-                    PermissionType as PermType,
-                    PermissionStatus as PermStatus,
-                )
-            except ImportError:
-                self.logger.warning("[Permissions] Cannot import for recheck — aborting loop")
-                return
+        # Reuse permission classes stored by _check_startup_permissions() to avoid
+        # triple-duplicated dual-path import blocks. If somehow not set (shouldn't
+        # happen — _check_startup_permissions always runs first), abort gracefully.
+        PermType = getattr(self, '_perm_type_cls', None)
+        PermStatus = getattr(self, '_perm_status_cls', None)
+        if PermType is None or PermStatus is None:
+            self.logger.warning("[Permissions] Permission classes not cached — aborting recheck loop")
+            return
 
         restart_hinted = False
         for attempt in range(1, max_attempts + 1):

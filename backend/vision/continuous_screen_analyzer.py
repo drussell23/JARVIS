@@ -76,11 +76,18 @@ class _CallbackSet:
             self._strong_refs.append(callback)
 
     def discard(self, callback) -> None:
-        """Remove a callback if present (from either weak or strong list)."""
-        self._weak_refs = [
-            ref for ref in self._weak_refs
-            if ref() is not None and not self._callbacks_equal(ref(), callback)
-        ]
+        """Remove a callback if present (from either weak or strong list).
+
+        Dereferences each weak ref exactly once into a local to avoid:
+        - 2N ephemeral MethodType allocations (WeakMethod creates new bound method per call)
+        - Theoretical atomicity gap (referent collected between first and second deref)
+        """
+        alive = []
+        for ref in self._weak_refs:
+            obj = ref()
+            if obj is not None and not self._callbacks_equal(obj, callback):
+                alive.append(ref)
+        self._weak_refs = alive
         self._strong_refs = [
             cb for cb in self._strong_refs
             if not self._callbacks_equal(cb, callback)
@@ -1263,19 +1270,23 @@ Be concise but thorough.'''
         self._event_last_fingerprint[event_type] = dedup_fingerprint
         self._event_stats['emitted'][event_type] += 1
 
-        # Resolve live callbacks from _CallbackSet to iterate safely
+        # Resolve live callbacks from _CallbackSet to iterate safely.
+        # v264.0: Uses call-then-check-result pattern instead of iscoroutinefunction()
+        # heuristic. This correctly handles async bound methods recreated by WeakMethod,
+        # functools.partial wrappers, and decorated callbacks that strip coroutine markers.
         callbacks = list(self.event_callbacks[event_type])
         async_tasks = []
         for callback in callbacks:
             try:
-                if asyncio.iscoroutinefunction(callback):
+                result = callback(payload)
+                if asyncio.iscoroutine(result) or asyncio.isfuture(result):
                     async_tasks.append(
                         asyncio.create_task(
-                            self._invoke_async_callback(callback, payload, event_type)
+                            self._invoke_async_callback_from_awaitable(
+                                result, event_type
+                            )
                         )
                     )
-                else:
-                    callback(payload)
             except Exception as e:
                 logger.error(f"Error in callback for {event_type}: {e}")
 
@@ -1285,6 +1296,25 @@ Be concise but thorough.'''
                 if isinstance(result, Exception):
                     logger.error("Async callback error for %s: %s", event_type, result)
         return True
+
+    async def _invoke_async_callback_from_awaitable(
+        self,
+        awaitable,
+        event_type: str,
+    ) -> None:
+        """Await an already-created coroutine/future with timeout isolation.
+
+        v264.0: Used by _trigger_event's call-then-check-result pattern.
+        The callback has already been called and returned a coroutine — we just
+        need to await it with a timeout guard.
+        """
+        timeout = max(0.1, float(self.config.get('callback_timeout_seconds', 3.0)))
+        try:
+            await asyncio.wait_for(asyncio.ensure_future(awaitable), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Async callback timeout for %s after %.2fs", event_type, timeout
+            )
 
     async def _invoke_async_callback(
         self,
