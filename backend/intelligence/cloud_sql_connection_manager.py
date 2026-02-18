@@ -5277,10 +5277,20 @@ class CloudSQLConnectionManager:
                     logger.error(f"❌ Failed to release connection: {e}")
 
     def _get_caller_info(self) -> str:
-        """Get caller stack trace for debugging."""
+        """Get caller stack trace for debugging.
+
+        v241.1: Also skip contextlib frames — they mask the real caller
+        when the connection is acquired via @asynccontextmanager wrappers.
+        Previously reported "contextlib.py:175 in __aenter__" instead of
+        the actual caller module.
+        """
+        _skip = {'cloud_sql', 'contextlib', 'asyncio'}
         try:
             stack = traceback.extract_stack()
-            relevant = [f for f in stack[:-4] if 'cloud_sql' not in f.filename.lower()]
+            relevant = [
+                f for f in stack[:-4]
+                if not any(s in f.filename.lower() for s in _skip)
+            ]
             if relevant:
                 frame = relevant[-1]
                 return f"{frame.filename.split('/')[-1]}:{frame.lineno} in {frame.name}"

@@ -3591,28 +3591,23 @@ class JARVISLearningDatabase:
                 redis_url="redis://localhost:6379"
             )
 
-            # v119.0: Wrap initialize with timeout to prevent startup hangs
-            # SQLite will always work, Cloud SQL and Redis are best-effort
+            # v241.1: initialize() now returns fast (SQLite-only critical path).
+            # Cloud services (CloudSQL, Redis, FAISS, Prometheus) init in background.
+            # The 25s outer timeout is kept as a safety net for the SQLite init
+            # (which has its own 10s inner timeout), not for cloud services.
             try:
                 await asyncio.wait_for(
                     self.hybrid_sync.initialize(),
                     timeout=init_timeout
                 )
-                logger.info("✅ Advanced hybrid sync V2.0 enabled - zero live queries mode")
+                logger.info("Hybrid sync V2.0 enabled — SQLite ready, cloud services initializing")
             except asyncio.TimeoutError:
-                logger.warning(f"⚠️  Hybrid sync init timed out after {init_timeout}s")
+                logger.warning(f"Hybrid sync init timed out after {init_timeout}s")
                 logger.info("   SQLite operational - Cloud SQL/Redis will retry in background")
-                # Don't disable sync - SQLite is working, cloud services will retry
                 return
 
             logger.info(f"   Local: {sqlite_sync_path}")
             logger.info(f"   Cloud: {cloudsql_config.get('instance_name', 'unknown')}")
-            logger.info(f"   📊 Phase 2 Features:")
-            logger.info(f"      Connection Orchestrator: 3 max connections")
-            logger.info(f"      FAISS Cache: Enabled")
-            logger.info(f"      Prometheus Metrics: http://localhost:9090/metrics")
-            logger.info(f"      Redis Metrics: Enabled")
-            logger.info(f"      ML Prefetcher: Enabled")
 
         except Exception as e:
             logger.warning(f"⚠️  Hybrid sync initialization failed: {e}")

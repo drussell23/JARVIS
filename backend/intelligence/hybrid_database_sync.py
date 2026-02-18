@@ -1123,6 +1123,7 @@ class HybridDatabaseSync:
         self.health_check_task: Optional[asyncio.Task] = None
         self.metrics_task: Optional[asyncio.Task] = None
         self.prefetch_task: Optional[asyncio.Task] = None
+        self._cloud_services_task: Optional[asyncio.Task] = None
         self._shutdown = False
         self._start_time = time.time()
 
@@ -1205,87 +1206,127 @@ class HybridDatabaseSync:
         """
         Initialize database connections and start background sync.
 
-        v113.0: Added per-step timeouts to prevent any single component
-        from blocking startup. Each step has its own timeout with graceful
-        fallback to ensure SQLite-first strategy always succeeds.
+        v241.1: Restructured into two phases:
+          Phase A (synchronous, critical): SQLite init only — fast, local, must succeed.
+          Phase B (background, optional): CloudSQL, Prometheus, Redis, FAISS, background
+                  services — all fire-and-forget. Failures are non-fatal.
+
+        Root cause fix: Previously ALL steps ran sequentially in the caller's await,
+        blocking for up to 30s (SQLite 10s + CloudSQL 10s + Redis 5s + FAISS 5s).
+        When this ran in parallel with ChromaDB via asyncio.gather, I/O contention
+        caused SQLite init to exceed its 10s timeout. The fix: SQLite init is the
+        ONLY blocking operation. Everything else runs in the background.
         """
-        # v113.0: Configurable per-step timeouts
+        # Phase A: SQLite init — critical, fast, local-only
         sqlite_timeout = float(os.getenv("HYBRID_SQLITE_TIMEOUT", "10.0"))
+        try:
+            await asyncio.wait_for(self._init_sqlite(), timeout=sqlite_timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"SQLite init timed out after {sqlite_timeout}s - this should not happen")
+            raise RuntimeError("SQLite initialization timeout - critical failure")
+
+        # Phase B: Cloud services init — background, non-blocking
+        # CloudSQL, Prometheus, Redis, FAISS are all optional. Launch them
+        # as a single background task so initialize() returns immediately
+        # after SQLite is ready. Callers can use SQLite-only mode while
+        # cloud services come online asynchronously.
+        self._cloud_services_task = asyncio.create_task(
+            self._init_cloud_services_bg(),
+            name="hybrid-sync-cloud-services",
+        )
+
+        logger.info("SQLite ready — cloud services initializing in background")
+
+    async def _init_cloud_services_bg(self) -> None:
+        """
+        v241.1: Background initialization of optional cloud services.
+
+        Runs after SQLite is ready. Each step has its own timeout and
+        graceful fallback. Failures here are non-fatal — SQLite-only
+        mode is always available.
+        """
         cloudsql_timeout = float(os.getenv("HYBRID_CLOUDSQL_TIMEOUT", "10.0"))
         redis_timeout = float(os.getenv("HYBRID_REDIS_TIMEOUT", "5.0"))
         faiss_timeout = float(os.getenv("HYBRID_FAISS_TIMEOUT", "5.0"))
 
-        # Initialize SQLite (always available, critical path)
-        try:
-            await asyncio.wait_for(self._init_sqlite(), timeout=sqlite_timeout)
-        except asyncio.TimeoutError:
-            logger.error(f"❌ SQLite init timed out after {sqlite_timeout}s - this should not happen")
-            raise RuntimeError("SQLite initialization timeout - critical failure")
-
-        # Initialize CloudSQL connection orchestrator (may fail gracefully)
+        # CloudSQL connection orchestrator
         try:
             await asyncio.wait_for(
                 self._init_cloudsql_with_circuit_breaker(),
                 timeout=cloudsql_timeout
             )
         except asyncio.TimeoutError:
-            logger.warning(f"⚠️  CloudSQL init timed out after {cloudsql_timeout}s - using SQLite-only mode")
+            logger.warning(f"CloudSQL init timed out after {cloudsql_timeout}s - using SQLite-only mode")
+            self.circuit_breaker.record_failure()
+            self.metrics.cloudsql_available = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"CloudSQL init failed: {e} - using SQLite-only mode")
             self.circuit_breaker.record_failure()
             self.metrics.cloudsql_available = False
 
-        # Phase 2: Start Prometheus metrics server - OFF THE EVENT LOOP
-        # v114.0: Run in thread to not block Phase 6 enterprise init
+        # Prometheus metrics server (off the event loop)
         if self.prometheus:
-            await asyncio.to_thread(self.prometheus.start_server)
+            try:
+                await asyncio.to_thread(self.prometheus.start_server)
+            except Exception as e:
+                logger.debug(f"Prometheus start failed: {e}")
 
-        # Phase 2: Connect to Redis with timeout
+        # Redis distributed metrics
         if self.redis:
             try:
                 await asyncio.wait_for(self.redis.connect(), timeout=redis_timeout)
             except asyncio.TimeoutError:
-                logger.warning(f"⚠️  Redis connect timed out after {redis_timeout}s - distributed metrics disabled")
+                logger.warning(f"Redis connect timed out after {redis_timeout}s - distributed metrics disabled")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Redis connect failed: {e}")
 
-        # Preload FAISS cache from SQLite for <1ms authentication
+        # FAISS cache preload
         if self.faiss_cache:
             try:
                 await asyncio.wait_for(self._preload_faiss_cache(), timeout=faiss_timeout)
             except asyncio.TimeoutError:
-                logger.warning(f"⚠️  FAISS cache preload timed out after {faiss_timeout}s - will load on demand")
+                logger.warning(f"FAISS cache preload timed out after {faiss_timeout}s - will load on demand")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"FAISS preload failed: {e}")
 
             # Bootstrap voice profiles from CloudSQL if SQLite cache is empty
-            if self.faiss_cache.size() == 0:
-                # Check if SQLite actually has profiles (might just need FAISS reload)
-                async with self.sqlite_conn.execute("SELECT COUNT(*) FROM speaker_profiles") as cursor:
-                    row = await cursor.fetchone()
-                    sqlite_count = row[0] if row else 0
+            try:
+                if self.faiss_cache.size() == 0:
+                    async with self.sqlite_conn.execute("SELECT COUNT(*) FROM speaker_profiles") as cursor:
+                        row = await cursor.fetchone()
+                        sqlite_count = row[0] if row else 0
 
-                if sqlite_count > 0:
-                    # Profiles exist in SQLite, just reload FAISS cache
-                    logger.info(f"✅ Voice profiles already cached in SQLite ({sqlite_count} profiles)")
-                    logger.info("   FAISS cache will auto-load on first authentication")
-                else:
-                    # SQLite is empty - bootstrap from CloudSQL
-                    logger.info("📥 SQLite cache empty - attempting bootstrap from CloudSQL...")
-                    bootstrap_success = await self.bootstrap_voice_profiles_from_cloudsql()
-                    if bootstrap_success:
-                        logger.info("✅ Voice profiles bootstrapped - ready for offline authentication")
+                    if sqlite_count > 0:
+                        logger.info(f"Voice profiles already cached in SQLite ({sqlite_count} profiles)")
                     else:
-                        logger.warning("⚠️  Bootstrap failed - voice authentication requires CloudSQL connection")
-            else:
-                logger.info(f"✅ Voice cache already loaded: {self.faiss_cache.size()} profile(s)")
-                logger.info("   Skipping bootstrap - profiles already cached locally")
+                        logger.info("SQLite cache empty - attempting bootstrap from CloudSQL...")
+                        bootstrap_success = await self.bootstrap_voice_profiles_from_cloudsql()
+                        if bootstrap_success:
+                            logger.info("Voice profiles bootstrapped - ready for offline authentication")
+                        else:
+                            logger.warning("Bootstrap failed - voice authentication requires CloudSQL connection")
+                else:
+                    logger.info(f"Voice cache already loaded: {self.faiss_cache.size()} profile(s)")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"FAISS bootstrap failed: {e}")
 
         # Start background services
         self.sync_task = asyncio.create_task(self._sync_loop())
         self.health_check_task = asyncio.create_task(self._health_check_loop())
         self.metrics_task = asyncio.create_task(self._metrics_loop())
 
-        # Phase 2: Start ML prefetch loop
         if self.ml_prefetcher:
             self.prefetch_task = asyncio.create_task(self._ml_prefetch_loop())
 
-        logger.info("✅ Advanced hybrid sync V2.0 initialized - zero live queries mode")
-        logger.info("   🚀 Phase 2 features active: Prometheus, Redis, ML Prefetch")
+        logger.info("Advanced hybrid sync V2.0 fully initialized — cloud services online")
 
     async def _init_sqlite(self):
         """Initialize local SQLite connection"""
@@ -3101,7 +3142,7 @@ class HybridDatabaseSync:
         self._shutdown = True
 
         # Cancel background tasks (including Phase 2 prefetch task)
-        tasks_to_cancel = [self.sync_task, self.health_check_task, self.metrics_task, self.prefetch_task]
+        tasks_to_cancel = [self._cloud_services_task, self.sync_task, self.health_check_task, self.metrics_task, self.prefetch_task]
         for task in tasks_to_cancel:
             if task:
                 task.cancel()

@@ -1484,6 +1484,8 @@ class MetricsDatabase:
         if not self.cloud_db:
             return
 
+        conn = None
+        cursor = None
         try:
             conn = self.cloud_db.get_connection()
             cursor = conn.cursor()
@@ -1575,12 +1577,25 @@ class MetricsDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_voice_stages_attempt ON voice_unlock_stages(attempt_id)")
 
             conn.commit()
-            cursor.close()
 
-            logger.info("✅ CloudSQL tables created for voice unlock metrics")
+            logger.info("CloudSQL tables created for voice unlock metrics")
 
         except Exception as e:
             logger.error(f"Failed to create CloudSQL tables: {e}", exc_info=True)
+        finally:
+            # v241.1: ALWAYS release connection back to pool.
+            # Previously missing — connection leaked on exception paths,
+            # triggering "Connection held 75s" warnings.
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     async def store_unlock_attempt(
         self,
