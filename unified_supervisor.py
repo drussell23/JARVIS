@@ -66023,10 +66023,11 @@ class JarvisSystemKernel:
                                     )
                                     return {
                                         "success": result.success if result else False,
-                                        "result": result.result if result else None,
-                                        "task_id": result.task_id if result else None,
+                                        "result": result.final_message if result else None,
+                                        "goal": result.goal if result else None,
                                         "actions_count": result.actions_count if result else 0,
-                                        "duration_ms": result.duration_ms if result else 0,
+                                        "duration_ms": result.execution_time_ms if result else 0,
+                                        "error": result.error if result else None,
                                     }
                                 except Exception as e:
                                     self.logger.error(f"[TwoTier] execute_tier2 error: {e}")
