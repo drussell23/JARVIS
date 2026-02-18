@@ -1549,15 +1549,19 @@ class IntelligentStartupNarrator:
         self._last_narration_time = datetime.now()
 
         # v3.0: Delegate to unified voice orchestrator with topic
+        # v241.0: Never block startup on TTS playback completion. The CRITICAL
+        # priority ensures the message jumps the queue, but wait=True would
+        # block until audio finishes playing (5-8s for completion messages),
+        # exceeding the kernel's 8s completion hook timeout. The voice
+        # orchestrator handles queueing and playback asynchronously.
         if self.config.voice_enabled:
             voice_priority = self._map_priority(priority)
-            wait = (priority == NarrationPriority.CRITICAL)
 
             await self._orchestrator.speak(
                 text=text,
                 priority=voice_priority,
                 source=VoiceSource.STARTUP,
-                wait=wait,
+                wait=False,
                 topic=SpeechTopic.STARTUP,  # v3.0: Use startup topic for cooldowns
             )
 

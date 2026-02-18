@@ -186,21 +186,26 @@ class MemoryAwareScreenAnalyzer:
         while self.is_monitoring:
             try:
                 # Check memory before capture (v255.1: async OOM bridge check)
-                if not await self._check_memory_available_async():
+                mem_ok, gcp_endpoint = await self._check_memory_available_async()
+                if not mem_ok and not gcp_endpoint:
                     logger.warning("Skipping capture due to low memory")
                     await asyncio.sleep(self.current_interval * 2)  # Wait longer
                     continue
-                
-                # Capture and analyze screen
-                await self._capture_and_analyze()
-                
+
+                if gcp_endpoint:
+                    # v241.0: Offload capture to GCP VM when local memory is constrained
+                    await self._capture_via_cloud(gcp_endpoint)
+                else:
+                    # Capture and analyze screen locally
+                    await self._capture_and_analyze()
+
                 # Adjust interval based on memory if enabled
                 if self.config['dynamic_interval_enabled']:
                     self._adjust_interval_based_on_memory()
-                
+
                 # Wait for next update
                 await asyncio.sleep(self.current_interval)
-                
+
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
                 await asyncio.sleep(self.current_interval)
@@ -281,12 +286,19 @@ class MemoryAwareScreenAnalyzer:
         
         return True
 
-    async def _check_memory_available_async(self) -> bool:
+    async def _check_memory_available_async(self) -> tuple:
         """Async memory check with OOM bridge consultation.
 
         v255.1: Runtime check consults OOM Prevention Bridge for cloud-aware
         decision with 6-tier graceful degradation. Falls back to sync psutil
         check if bridge unavailable.
+
+        v241.0: Returns (can_proceed_locally, gcp_endpoint_or_none) tuple.
+        When local memory is insufficient but a GCP VM is ready, returns
+        (False, endpoint_url) so the caller can offload capture to cloud.
+
+        Returns:
+            Tuple of (can_proceed: bool, gcp_endpoint: Optional[str])
         """
         _oom_timeout = float(os.getenv("JARVIS_VISION_OOM_CHECK_TIMEOUT", "2.0"))
         try:
@@ -304,22 +316,39 @@ class MemoryAwareScreenAnalyzer:
                 # Reset warning flag on recovery
                 if getattr(self, '_memory_warned', False):
                     self._memory_warned = False
-                return True
+                return True, None
 
-            # Log with cloud-aware context (rate-limited by _memory_warned flag)
-            if not getattr(self, '_memory_warned', False):
+            # v241.0: When local memory is insufficient, check if GCP VM
+            # can handle the capture instead of just skipping it.
+            gcp_endpoint = None
+            if result.gcp_vm_ready and result.gcp_vm_ip:
+                gcp_endpoint = f"http://{result.gcp_vm_ip}:8010/api/vision_capture"
+                if not getattr(self, '_cloud_offload_logged', False):
+                    logger.info(
+                        "OOM Bridge: offloading vision capture to GCP VM at %s "
+                        "(avail=%.1fGB, tier=%s)",
+                        result.gcp_vm_ip,
+                        result.available_ram_gb,
+                        getattr(result, 'degradation_tier', 'unknown'),
+                    )
+                    self._cloud_offload_logged = True
+
+            # Log skip only when no cloud fallback available
+            if not gcp_endpoint and not getattr(self, '_memory_warned', False):
                 logger.warning(
-                    "OOM Bridge: vision %s (avail=%.1fGB, tier=%s)",
+                    "OOM Bridge: vision %s (avail=%.1fGB, tier=%s, gcp_ready=%s)",
                     result.decision.value,
                     result.available_ram_gb,
                     getattr(result, 'degradation_tier', 'unknown'),
+                    result.gcp_vm_ready,
                 )
                 self._memory_warned = True
-            return False
+
+            return False, gcp_endpoint
 
         except (ImportError, asyncio.TimeoutError, Exception) as e:
             logger.debug("OOM bridge unavailable: %s — falling back to psutil", e)
-            return self._check_memory_available()
+            return self._check_memory_available(), None
 
     def _get_available_memory_mb(self) -> float:
         """Get available system memory in MB"""
@@ -512,6 +541,70 @@ class MemoryAwareScreenAnalyzer:
             
         except Exception as e:
             logger.error(f"Error capturing/analyzing screen: {e}")
+
+    async def _capture_via_cloud(self, gcp_endpoint: str) -> None:
+        """v241.0: Offload screen capture + analysis to GCP VM.
+
+        When local memory is insufficient, capture a lightweight screenshot
+        locally (minimal RAM — just the raw PNG bytes) and POST it to the
+        GCP VM for heavy Claude Vision analysis. Results are fed back into
+        the local event pipeline so downstream consumers see no difference.
+        """
+        _cloud_timeout = float(os.getenv("JARVIS_VISION_CLOUD_TIMEOUT", "15.0"))
+        try:
+            import aiohttp
+
+            # Lightweight local capture — just the raw bytes, no analysis
+            capture_result = await self.vision_handler.capture_screen()
+            if capture_result is None:
+                return
+
+            # Encode screenshot for transfer
+            img = capture_result
+            if isinstance(img, Image.Image):
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                img_bytes = buf.getvalue()
+            elif hasattr(img, 'tobytes'):
+                img_bytes = img.tobytes()
+            else:
+                logger.debug("Cloud capture: unsupported screenshot type %s", type(img))
+                return
+
+            # POST to GCP VM for analysis
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    gcp_endpoint,
+                    data=img_bytes,
+                    headers={"Content-Type": "image/png"},
+                    timeout=aiohttp.ClientTimeout(total=_cloud_timeout),
+                ) as resp:
+                    if resp.status == 200:
+                        analysis = await resp.json()
+                        # Feed cloud analysis back into local event pipeline
+                        current_time = time.time()
+                        await self._trigger_event('screen_captured', {
+                            'timestamp': current_time,
+                            'source': 'gcp_cloud',
+                            'gcp_endpoint': gcp_endpoint,
+                        })
+                        if analysis.get('content_changed'):
+                            await self._trigger_event('content_changed', {
+                                'app': analysis.get('current_app', ''),
+                                'text': analysis.get('text', ''),
+                                'analysis_source': 'gcp_cloud',
+                            })
+                        # Reset cloud offload log flag on success
+                        self._cloud_offload_logged = False
+                    else:
+                        logger.warning(
+                            "Cloud vision capture returned %d — falling back to skip",
+                            resp.status,
+                        )
+        except ImportError:
+            logger.debug("aiohttp not available for cloud capture offload")
+        except Exception as e:
+            logger.warning("Cloud vision capture failed: %s — will retry next cycle", e)
 
     def _normalize_app_name(self, app_name: Any) -> str:
         """Normalize app name from quick/full analyzers."""
