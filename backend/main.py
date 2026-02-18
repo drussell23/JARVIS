@@ -7959,10 +7959,16 @@ async def audio_ml_error(request: dict):
     import time as _time
     from datetime import datetime
 
-    error_code = request.get("error_code", "unknown")
-    browser = request.get("browser", "unknown")
+    # v242.1: Sanitize user-controlled values before logging (CWE-117 log injection fix)
+    def _sanitize_log(val: str, max_len: int = 64) -> str:
+        """Strip control chars and limit length to prevent log injection."""
+        import re as _re_log
+        return _re_log.sub(r'[\x00-\x1f\x7f]', '', str(val))[:max_len]
+
+    error_code = _sanitize_log(request.get("error_code", "unknown"))
+    browser = _sanitize_log(request.get("browser", "unknown"))
     session_duration = request.get("session_duration", 0)
-    permission_state = request.get("permission_state", "unknown")
+    permission_state = _sanitize_log(request.get("permission_state", "unknown"))
     retry_count = request.get("retry_count", 0)
 
     # Rate-limit logging for repetitive errors (e.g. Chrome permission denied)

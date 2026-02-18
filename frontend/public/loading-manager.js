@@ -2828,10 +2828,11 @@ class JARVISLoadingManager {
             // v263.0: Accept dynamic startup timeout from backend
             // Check both metadata (from supervisor broadcasts) and top-level data
             // (from loading_server to_dict() on WebSocket connect/reconnect)
-            const timeoutMs = metadata.startup_timeout_ms || data.startup_timeout_ms;
-            if (timeoutMs && timeoutMs > 0) {
+            const timeoutMs = Number(metadata.startup_timeout_ms || data.startup_timeout_ms);
+            if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
                 if (!this.state.startupTimeout.negotiated || timeoutMs > this.state.startupTimeout.negotiatedMs) {
-                    console.log(`[v263.0] Startup timeout negotiated: ${timeoutMs}ms (${(timeoutMs / 60000).toFixed(1)}min)`);
+                    // v242.1: Coerce to Number to prevent log injection (CWE-117)
+                    console.log(`[v263.0] Startup timeout negotiated: ${Number(timeoutMs)}ms (${(timeoutMs / 60000).toFixed(1)}min)`);
                     this.state.startupTimeout.negotiatedMs = timeoutMs;
                     this.state.startupTimeout.negotiated = true;
                 }

@@ -400,13 +400,12 @@ class PrimeRouter:
             self._local_circuit.reset_for_endpoint(
                 endpoint_id=f"gcp:{host}:{port}", health_checked=True
             )
-            # v242.0 Gap K: Cancel orphaned tasks from old endpoint
+            # v242.0 Gap K: Cancel orphaned prime_router task from old endpoint
+            # (targeted — voice/reactor tasks are unrelated to endpoint swap)
             try:
                 _uc = await _get_ultra_coordinator()
-                if _uc:
-                    cancelled = _uc.cancel_all_shielded_tasks()
-                    if cancelled:
-                        logger.info(f"[PrimeRouter] v242.0 Cancelled {cancelled} orphan tasks on GCP promotion")
+                if _uc and _uc.cancel_shielded_task("prime_router"):
+                    logger.info("[PrimeRouter] v242.0 Cancelled orphan prime_router task on GCP promotion")
             except Exception:
                 pass  # Never break promotion for cleanup
             logger.info("[PrimeRouter] v232.0: GCP VM promotion successful, routing updated")
@@ -622,12 +621,9 @@ class PrimeRouter:
     ) -> RouterResponse:
         """Try local Prime first, fall back to cloud on failure."""
         try:
-            # v235.4: Use GCP timeout when routed to GCP VM (CPU inference ~25-35s).
-            is_gcp = self._gcp_promoted or bool(os.environ.get("JARVIS_INVINCIBLE_NODE_IP"))
-            base_timeout = (
-                self._config.gcp_timeout if is_gcp
-                else self._config.local_timeout
-            )
+            # v242.0: HYBRID is now only for local Prime (GCP goes to GCP_PRIME path).
+            # Removed stale env var check that could give 120s timeout to local endpoint.
+            base_timeout = self._config.local_timeout
             # v241.0: Circuit breaker probe uses short timeout; then cap to deadline
             probed_timeout = self._local_circuit.get_timeout_override(base_timeout)
             effective_timeout = compute_remaining(deadline, probed_timeout)

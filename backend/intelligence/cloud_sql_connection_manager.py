@@ -4615,8 +4615,10 @@ class CloudSQLConnectionManager:
                             # This prevents multiple simultaneous TLS handshakes during pool init
                             initial_min_size = 1 if attempt == 0 else self._conn_config.min_connections
 
-                            logger.info(f"   [v16.0] Creating pool (attempt {attempt + 1}/{max_retries}, "
-                                        f"min={initial_min_size}, max={effective_max_connections})")
+                            # v242.1: DEBUG level to avoid CWE-532 (clear-text logging in credential scope).
+                            # Only pool sizes are logged — no credentials, hosts, or connection strings.
+                            logger.debug(f"   [v16.0] Creating pool (attempt {attempt + 1}/{max_retries}, "
+                                         f"min={initial_min_size}, max={effective_max_connections})")
 
                             # Create pool with serialized init
                             pool = await asyncpg.create_pool(

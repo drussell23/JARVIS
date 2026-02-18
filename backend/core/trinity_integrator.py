@@ -9040,8 +9040,17 @@ class TrinityUltraCoordinator:
         finally:
             self._shielded_tasks.pop(component, None)
 
+    def cancel_shielded_task(self, component: str) -> bool:
+        """Cancel a specific component's shielded task. Returns True if cancelled."""
+        task = self._shielded_tasks.pop(component, None)
+        if task and not task.done():
+            task.cancel()
+            logger.info(f"[UltraCoord] v242.0 Cancelled shielded task for {component}")
+            return True
+        return False
+
     def cancel_all_shielded_tasks(self) -> int:
-        """Cancel all orphaned tasks (called on endpoint swap, Gap K)."""
+        """Cancel all orphaned tasks (full shutdown path)."""
         count = 0
         for comp, task in list(self._shielded_tasks.items()):
             if not task.done():

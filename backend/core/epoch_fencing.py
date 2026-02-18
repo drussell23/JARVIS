@@ -302,7 +302,7 @@ class EpochManager:
             fd = os.open(
                 str(self._epoch_file),
                 os.O_RDWR | os.O_CREAT,
-                0o644,
+                0o600,  # v242.1: Owner-only (was 0o644 — CWE-732 overly permissive)
             )
             fcntl.flock(fd, fcntl.LOCK_EX)
 

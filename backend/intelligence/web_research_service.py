@@ -673,7 +673,10 @@ class WebResearchService:
     @staticmethod
     def _decode_duckduckgo_redirect(url: str) -> str:
         parsed = urlparse(url)
-        if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        # v242.1: Exact domain match to prevent CWE-20 URL substring bypass
+        # (was: "duckduckgo.com" in parsed.netloc — matched evil-duckduckgo.com)
+        _netloc = (parsed.netloc or "").lower()
+        if (_netloc == "duckduckgo.com" or _netloc.endswith(".duckduckgo.com")) and parsed.path.startswith("/l/"):
             query_params = parse_qs(parsed.query)
             uddg = query_params.get("uddg", [])
             if uddg:
