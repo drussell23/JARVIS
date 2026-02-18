@@ -2455,7 +2455,7 @@ class SupervisorSingleton:
             self._lock_fd = os.open(
                 str(SUPERVISOR_LOCK_FILE),
                 os.O_CREAT | os.O_RDWR,
-                0o644
+                0o600
             )
 
             # Try to acquire exclusive lock (non-blocking)
@@ -2534,7 +2534,7 @@ class SupervisorSingleton:
                             self._lock_fd = os.open(
                                 str(SUPERVISOR_LOCK_FILE),
                                 os.O_CREAT | os.O_RDWR,
-                                0o644
+                                0o600
                             )
                             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                             lock_acquired = True

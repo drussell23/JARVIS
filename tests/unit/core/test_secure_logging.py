@@ -1,6 +1,5 @@
 """Tests for centralized log sanitization (CWE-117 prevention)."""
 
-import pytest
 from backend.core.secure_logging import sanitize_for_log, mask_sensitive
 
 

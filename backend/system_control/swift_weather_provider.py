@@ -38,7 +38,7 @@ class SwiftWeatherProvider:
             elif not os.access(self.tool_path, os.X_OK):
                 logger.warning(f"jarvis-weather is not executable, attempting to fix...")
                 try:
-                    self.tool_path.chmod(0o755)
+                    self.tool_path.chmod(0o700)
                     self.tool_available = True
                 except Exception as e:
                     logger.error(f"Failed to make jarvis-weather executable: {e}")

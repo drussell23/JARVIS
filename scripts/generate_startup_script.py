@@ -37,7 +37,7 @@ def generate_startup_script():
     output_path.write_text(script)
 
     # Make executable
-    output_path.chmod(0o755)
+    output_path.chmod(0o700)
 
     print(f"✅ Generated {output_path}")
     print(f"   Source: start_system.py:_generate_startup_script()")

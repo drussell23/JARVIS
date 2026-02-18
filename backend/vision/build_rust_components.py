@@ -614,7 +614,7 @@ print("\n✓ All tests passed!")
         
         test_file = self.vision_dir / "test_rust_components.py"
         test_file.write_text(test_content)
-        test_file.chmod(0o755)
+        test_file.chmod(0o700)
         logger.info(f"✓ Created test script: {test_file}")
         
     async def main(self):

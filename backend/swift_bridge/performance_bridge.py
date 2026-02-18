@@ -118,7 +118,7 @@ else
 fi
 """
     script_path.write_text(script_content)
-    script_path.chmod(0o755)
+    script_path.chmod(0o700)
 
 def _setup_function_signatures() -> None:
     """Setup C function signatures for the Swift library.

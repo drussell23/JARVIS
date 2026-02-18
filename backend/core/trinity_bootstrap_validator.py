@@ -1270,7 +1270,7 @@ class SelfHealingSuggestionEngine:
         script_path = ValidatorConfig.STATE_DIR / "fix_validation_issues.sh"
         script_path.parent.mkdir(parents=True, exist_ok=True)
         script_path.write_text(script)
-        script_path.chmod(0o755)
+        script_path.chmod(0o700)
 
         return script_path
 

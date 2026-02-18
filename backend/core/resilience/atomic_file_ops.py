@@ -82,8 +82,8 @@ class AtomicFileConfig:
     backup_on_write: bool = False  # Keep .bak of original
 
     # Permissions
-    file_mode: int = 0o644
-    dir_mode: int = 0o755
+    file_mode: int = 0o600
+    dir_mode: int = 0o700
 
     # Temp file settings
     temp_suffix: str = ".tmp"

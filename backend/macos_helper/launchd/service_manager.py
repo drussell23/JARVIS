@@ -278,7 +278,8 @@ class LaunchAgentManager:
             save_plist(plist, self.plist_path)
 
             # Set permissions
-            os.chmod(self.plist_path, 0o600)
+            # launchd requires plist files to be world-readable (0o644)
+            os.chmod(self.plist_path, 0o644)
 
             logger.info(f"Installed LaunchAgent: {self.plist_path}")
 
