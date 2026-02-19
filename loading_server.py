@@ -1246,6 +1246,8 @@ class CrossRepoHealthAggregator:
                 # Extract circuit breaker states
                 circuit_breakers = trinity_health.get("circuit_breakers", {})
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.debug(f"[HealthAggregator] Trinity health check error: {e}")
 
@@ -3309,6 +3311,8 @@ class ConnectionManager:
                     logger.warning("[ConnectionManager] Broadcast timeout - connection may be slow")
                     disconnected.add(ws)
                     self._record_error("broadcast_timeout")
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logger.debug(f"Broadcast failed to client: {e}")
                     disconnected.add(ws)
@@ -3758,6 +3762,8 @@ class GracefulShutdownManager:
             try:
                 await self._app_runner.cleanup()
                 logger.info("[GracefulShutdown] App runner cleaned up")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"[GracefulShutdown] Cleanup error: {e}")
 
@@ -3963,6 +3969,8 @@ class HealthChecker:
             return False, "Backend timeout"
         except aiohttp.ClientError as e:
             return False, f"Backend connection error: {e}"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return False, f"Backend check error: {e}"
 
@@ -3983,6 +3991,8 @@ class HealthChecker:
             return False, "Frontend timeout"
         except aiohttp.ClientError as e:
             return False, f"Frontend connection error: {e}"
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return False, f"Frontend check error: {e}"
 
@@ -4204,6 +4214,8 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             elif msg.type == web.WSMsgType.ERROR:
                 logger.debug(f'[WebSocket] Error: {ws.exception()}')
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug(f"[WebSocket] Connection error: {e}")
     finally:
@@ -4315,6 +4327,8 @@ async def update_progress_endpoint(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         metrics.record_error("Invalid JSON in progress update")
         return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Update] Error: {e}")
@@ -4368,6 +4382,8 @@ async def graceful_shutdown_endpoint(request: web.Request) -> web.Response:
         result = await shutdown_manager.request_shutdown(reason)
         return web.json_response(result)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"[Shutdown] Error handling shutdown request: {e}")
         return web.json_response({
@@ -4426,6 +4442,8 @@ async def force_shutdown_endpoint(request: web.Request) -> web.Response:
             "reason": reason
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"[Shutdown] Error handling force shutdown: {e}")
         return web.json_response({
@@ -4508,7 +4526,9 @@ async def update_zero_touch_status(request: web.Request) -> web.Response:
             "event": event_type,
             "zero_touch": progress_state.zero_touch.to_dict(),
         })
-        
+
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Zero-Touch] Update error: {e}")
@@ -4572,7 +4592,9 @@ async def update_dms_status(request: web.Request) -> web.Response:
             "event": event_type,
             "dms": progress_state.dms.to_dict(),
         })
-        
+
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[DMS] Update error: {e}")
@@ -4692,6 +4714,8 @@ async def update_two_tier_status(request: web.Request) -> web.Response:
             "two_tier": progress_state.two_tier.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Two-Tier] Update error: {e}")
@@ -4793,6 +4817,8 @@ async def update_flywheel_status(request: web.Request) -> web.Response:
             "flywheel": progress_state.flywheel.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Flywheel] Update error: {e}")
@@ -4862,6 +4888,8 @@ async def update_learning_goals_status(request: web.Request) -> web.Response:
             "learning_goals": progress_state.learning_goals.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Learning Goals] Update error: {e}")
@@ -4950,6 +4978,8 @@ async def update_jarvis_prime_status(request: web.Request) -> web.Response:
             "jarvis_prime": progress_state.jarvis_prime.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[JARVIS-Prime] Update error: {e}")
@@ -5038,6 +5068,8 @@ async def update_reactor_core_status(request: web.Request) -> web.Response:
             "reactor_core": progress_state.reactor_core.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Reactor-Core] Update error: {e}")
@@ -5165,6 +5197,8 @@ async def update_training_status(request: web.Request) -> web.Response:
             "training": progress_state.training.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Training] Update error: {e}")
@@ -5294,6 +5328,8 @@ async def update_learning_goals_status(request: web.Request) -> web.Response:
 
         return web.json_response({"status": "ok"})
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -5327,6 +5363,8 @@ async def add_learning_goal(request: web.Request) -> web.Response:
             "note": "Topic will be processed in next discovery cycle.",
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -5355,6 +5393,8 @@ async def broadcast_learning_goals_update() -> None:
             "timestamp": datetime.now().isoformat(),
         }
         await broadcast_message(message)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug(f"Learning goals broadcast error: {e}")
 
@@ -5482,6 +5522,8 @@ async def update_model_status(request: web.Request) -> web.Response:
 
         return web.json_response({"status": "ok"})
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -5503,6 +5545,8 @@ async def trigger_model_download(request: web.Request) -> web.Response:
             "message": f"Download requested for {model_name}. Check supervisor logs for progress.",
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -5517,6 +5561,8 @@ async def broadcast_model_update() -> None:
             "timestamp": datetime.now().isoformat(),
         }
         await broadcast_message(message)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug(f"Model broadcast error: {e}")
 
@@ -5676,6 +5722,8 @@ async def update_neural_mesh_status(request: web.Request) -> web.Response:
 
         return web.json_response({"status": "ok"})
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -5690,6 +5738,8 @@ async def broadcast_neural_mesh_update() -> None:
             "timestamp": datetime.now().isoformat(),
         }
         await broadcast_message(message)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug(f"Neural Mesh broadcast error: {e}")
 
@@ -5805,6 +5855,8 @@ async def update_voice_biometrics_status(request: web.Request) -> web.Response:
             "voice_biometrics": progress_state.voice_biometrics.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[VoiceBio] Update error: {e}")
@@ -5848,6 +5900,8 @@ async def get_trinity_voice_status(request: web.Request) -> web.Response:
                 "timestamp": datetime.now().isoformat(),
             })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Trinity Voice] Get status error: {e}")
@@ -5895,6 +5949,8 @@ async def test_trinity_voice(request: web.Request) -> web.Response:
                 "timestamp": datetime.now().isoformat(),
             }, status=503)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Trinity Voice] Test error: {e}")
@@ -5992,6 +6048,8 @@ async def update_narrator_status(request: web.Request) -> web.Response:
             "narrator": progress_state.narrator.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Narrator] Update error: {e}")
@@ -6091,6 +6149,8 @@ async def update_cost_optimization_status(request: web.Request) -> web.Response:
             "cost_optimization": progress_state.cost_optimization.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[CostOpt] Update error: {e}")
@@ -6201,6 +6261,8 @@ async def update_cross_repo_status(request: web.Request) -> web.Response:
             "cross_repo": progress_state.cross_repo.to_dict(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[CrossRepo] Update error: {e}")
@@ -6291,6 +6353,8 @@ async def get_unified_health(request: web.Request) -> web.Response:
             "timestamp": datetime.now().isoformat(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[UnifiedHealth] Error: {e}")
@@ -6324,6 +6388,8 @@ async def get_startup_analytics(request: web.Request) -> web.Response:
             "timestamp": datetime.now().isoformat(),
         })
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[StartupAnalytics] Error: {e}")
@@ -6455,6 +6521,8 @@ async def get_progress_resume(request: web.Request) -> web.Response:
             try:
                 health_data = await cross_repo_health_aggregator.get_unified_health()
                 response_data['unified_health'] = health_data
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.debug(f"[Resume] Health aggregation failed: {e}")
 
@@ -6478,6 +6546,8 @@ async def get_progress_resume(request: web.Request) -> web.Response:
             "status": "error",
             "message": f"Invalid last_sequence parameter: {str(e)}"
         }, status=400)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Resume] Error: {e}")
@@ -6624,7 +6694,9 @@ async def supervisor_event_handler(request: web.Request) -> web.Response:
             "event": event_type,
             "processed": True,
         })
-        
+
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         metrics.record_error(str(e))
         logger.error(f"[Supervisor Event] Error: {e}")
@@ -6686,6 +6758,8 @@ async def system_health_watchdog():
                 else:
                     logger.debug(f"[Watchdog] System not ready: {reason}")
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"[Watchdog] Check failed: {e}")
 
@@ -6719,6 +6793,8 @@ async def on_startup(app: web.Application):
             logger.debug("👁️ [v211.0] Running standalone - no parent watcher needed")
     except ImportError:
         logger.debug("Parent death watcher not available")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug(f"Could not start parent death watcher: {e}")
 
@@ -6754,6 +6830,8 @@ async def on_shutdown(app: web.Application):
             from backend.utils.parent_death_watcher import stop_parent_watcher
             await stop_parent_watcher()
             logger.info("👁️ [v211.0] Parent death watcher stopped")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"Parent death watcher cleanup: {e}")
 
@@ -6926,6 +7004,8 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
     try:
         await cross_repo_health_aggregator.initialize_trinity_integration()
         logger.info("[v87.0] ✅ Cross-repo health aggregator initialized")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning(f"[v87.0] Cross-repo health unavailable: {e}")
 
@@ -6951,6 +7031,8 @@ async def start_server(host: str = '0.0.0.0', port: Optional[int] = None):
             logger.info(f"[v87.0] ✅ Fallback page ready: {fallback_path}")
         else:
             logger.warning("[v87.0] ⚠️  Fallback page generation failed")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning(f"[v87.0] ⚠️  Fallback page error: {e}")
 
@@ -7231,9 +7313,11 @@ class StartupProgressReporter:
                         return True
             except asyncio.TimeoutError:
                 pass
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.debug(f"Progress update failed: {e}")
-            
+
             if attempt < self.retry_count - 1:
                 await asyncio.sleep(0.5 * (attempt + 1))
         return False
@@ -7398,6 +7482,8 @@ class StartupProgressReporter:
                 url = f"http://{self.host}:{self.port}/api/zero-touch/update"
                 async with session.post(url, json=payload) as resp:
                     return resp.status == 200
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"Zero-Touch event failed: {e}")
         return False
@@ -7444,6 +7530,8 @@ class StartupProgressReporter:
                 url = f"http://{self.host}:{self.port}/api/dms/update"
                 async with session.post(url, json=payload) as resp:
                     return resp.status == 200
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"DMS event failed: {e}")
         return False
@@ -7474,6 +7562,8 @@ class StartupProgressReporter:
                 url = f"http://{self.host}:{self.port}/api/supervisor/event"
                 async with session.post(url, json=payload) as resp:
                     return resp.status == 200
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"Supervisor event failed: {e}")
         return False
@@ -7523,6 +7613,8 @@ class StartupProgressReporter:
                 url = f"http://{self.host}:{self.port}/api/flywheel/update"
                 async with session.post(url, json=payload) as resp:
                     return resp.status == 200
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"Flywheel event failed: {e}")
         return False
@@ -7562,6 +7654,8 @@ class StartupProgressReporter:
                 url = f"http://{self.host}:{self.port}/api/learning-goals/update"
                 async with session.post(url, json=payload) as resp:
                     return resp.status == 200
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"Learning goal event failed: {e}")
         return False
@@ -7605,6 +7699,8 @@ class StartupProgressReporter:
                 url = f"http://{self.host}:{self.port}/api/jarvis-prime/update"
                 async with session.post(url, json=payload) as resp:
                     return resp.status == 200
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"JARVIS-Prime event failed: {e}")
         return False
@@ -7651,6 +7747,8 @@ class StartupProgressReporter:
                 url = f"http://{self.host}:{self.port}/api/reactor-core/update"
                 async with session.post(url, json=payload) as resp:
                     return resp.status == 200
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"Reactor-Core event failed: {e}")
         return False
@@ -7706,6 +7804,8 @@ async def _check_server_health(host: str, port: int, timeout: float = 1.0) -> bo
         ) as session:
             async with session.get(f"http://{host}:{port}/health") as resp:
                 return resp.status == 200
+    except asyncio.CancelledError:
+        raise
     except Exception:
         return False
 
@@ -7756,6 +7856,8 @@ async def _kill_existing_on_port(port: int) -> bool:
                     pass
             await asyncio.sleep(0.5)  # Give time for port to be released
             return True
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug(f"No existing process to kill on port {port}: {e}")
     return False
@@ -7886,6 +7988,8 @@ async def start_loading_server_background() -> bool:
         # Give it a bit more time - it might be a slow startup
         return True  # Return true since process is running
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.error(f"Failed to start loading server: {e}", exc_info=True)
         return False
@@ -7917,6 +8021,8 @@ async def stop_loading_server_background():
         except ProcessLookupError:
             # Process already dead
             pass
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(f"Error stopping loading server: {e}")
             try:
