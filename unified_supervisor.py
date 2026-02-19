@@ -13035,19 +13035,44 @@ class AsyncVoiceNarrator:
             self._last_spoken_text = text
             self._last_spoken_time = now
 
-            self._process = await asyncio.create_subprocess_exec(
-                "say",
-                "-v", self.voice,
-                "-r", str(self.rate),
-                text,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+            # v236.4: AudioBus-aware TTS routing to prevent device contention.
+            # Root cause: When AudioBus is active, FullDuplexDevice holds the audio
+            # device in duplex mode at 48kHz.  A raw `say` subprocess opens a SECOND
+            # output stream → CoreAudio mixing conflicts → audible static.
+            # Fix: Route through UnifiedTTSEngine which uses `say -o <file>` (writes
+            # to disk, no playback device) then plays audio through AudioBus —
+            # single output stream, zero device contention.
+            _ab_active = os.getenv(
+                "JARVIS_AUDIO_BUS_ENABLED", "false"
+            ).lower() in ("true", "1", "yes")
 
-            if wait:
-                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
-            else:
-                # Fire and forget for non-blocking, but still hold lock during speech
+            _used_audiobus_tts = False
+            if _ab_active:
+                try:
+                    from backend.voice.engines.unified_tts_engine import get_tts_engine
+                    tts = await asyncio.wait_for(get_tts_engine(), timeout=5.0)
+                    await asyncio.wait_for(tts.speak(text, play_audio=True), timeout=30.0)
+                    _used_audiobus_tts = True
+                    _unified_logger.debug(
+                        f"[Voice v236.4] Spoke via AudioBus TTS (no device contention)"
+                    )
+                except Exception as tts_err:
+                    _unified_logger.debug(
+                        f"[Voice v236.4] AudioBus TTS failed: {tts_err}, "
+                        f"falling back to raw say"
+                    )
+
+            if not _used_audiobus_tts:
+                # Fallback: raw `say` subprocess (AudioBus disabled or TTS failed)
+                self._process = await asyncio.create_subprocess_exec(
+                    "say",
+                    "-v", self.voice,
+                    "-r", str(self.rate),
+                    text,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+
                 await asyncio.wait_for(self._process.communicate(), timeout=30.0)
 
             self._messages_spoken += 1
@@ -62381,6 +62406,19 @@ class JarvisSystemKernel:
                 self.logger.debug("[Narrator] Queue processor started")
             except Exception as qp_err:
                 self.logger.debug(f"[Narrator] Queue processor failed to start: {qp_err}")
+
+        # v236.4: Start IntelligentStartupNarrator + UnifiedVoiceOrchestrator
+        # so that phase narration messages are actually processed.
+        # Previously, UnifiedVoiceOrchestrator.start() was never called from
+        # unified_supervisor.py — IntelligentStartupNarrator queued messages
+        # into a dead queue (processor never started), silently losing all
+        # phase narration and orchestrator event announcements.
+        if self._startup_narrator and hasattr(self._startup_narrator, 'start'):
+            try:
+                await self._startup_narrator.start()
+                self.logger.debug("[Narrator] IntelligentStartupNarrator + UnifiedVoiceOrchestrator started")
+            except Exception as sn_err:
+                self.logger.debug(f"[Narrator] IntelligentStartupNarrator start failed: {sn_err}")
 
         # Voice narrator startup announcement
         if self._narrator:
