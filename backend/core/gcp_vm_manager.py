@@ -106,7 +106,7 @@ try:
 except ImportError:
     pass
 
-from backend.core.async_safety import LazyAsyncLock
+from backend.core.async_safety import LazyAsyncLock, create_safe_task
 
 # Log severity bridge for criticality-aware logging
 try:
@@ -5483,8 +5483,9 @@ class GCPVMManager:
             if diagnostic else "repeated stalls"
         )
         try:
-            asyncio.create_task(
-                self._trigger_golden_image_rebuild(image_name, reason)
+            create_safe_task(
+                self._trigger_golden_image_rebuild(image_name, reason),
+                name=f"golden_image_rebuild_{image_name}",
             )
             logger.info(
                 f"[CorruptionDetect] Auto-rebuild triggered for '{image_name}' "

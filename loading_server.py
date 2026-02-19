@@ -142,6 +142,7 @@ import aiohttp
 from aiohttp import web, WSCloseCode
 
 from backend.core.secure_logging import sanitize_for_log
+from backend.core.async_safety import create_safe_task
 
 # Configure logging with structured format
 logging.basicConfig(
@@ -7211,7 +7212,10 @@ class StartupProgressReporter:
         }
         
         if fire_and_forget:
-            asyncio.create_task(self._send_with_retry(payload))
+            create_safe_task(
+                self._send_with_retry(payload),
+                name="telemetry_send",
+            )
             return True
         return await self._send_with_retry(payload)
     
@@ -7293,7 +7297,10 @@ class StartupProgressReporter:
         }
         
         # Fire and forget for logs
-        asyncio.create_task(self._send_with_retry(payload))
+        create_safe_task(
+            self._send_with_retry(payload),
+            name="telemetry_send",
+        )
         return True
     
     async def log_batch(
@@ -7325,7 +7332,10 @@ class StartupProgressReporter:
             }
         }
         
-        asyncio.create_task(self._send_with_retry(payload))
+        create_safe_task(
+            self._send_with_retry(payload),
+            name="telemetry_send",
+        )
         return True
     
     async def close(self):
