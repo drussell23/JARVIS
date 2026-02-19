@@ -130,8 +130,8 @@ class SentenceSplitter:
     ) -> AsyncIterator[str]:
         """
         Consume an async stream of tokens and yield complete sentences.
-
-        Sentence boundaries: .!? followed by whitespace or end of stream.
+        Handles cases where sentence-ending punctuation arrives without
+        trailing whitespace (common with token-by-token LLM streaming).
         """
         buffer = ""
 
@@ -147,6 +147,17 @@ class SentenceSplitter:
                     if sentence:
                         yield sentence
                 else:
+                    # Also check for punctuation at end of buffer
+                    # (next token may not start with whitespace)
+                    if (len(buffer) >= self._min_len
+                            and buffer.rstrip()
+                            and buffer.rstrip()[-1] in '.!?'
+                            and len(buffer) > len(buffer.rstrip())):
+                        # Punctuation followed by trailing space
+                        sentence = buffer.rstrip()
+                        buffer = ""
+                        if sentence:
+                            yield sentence
                     break
 
         # Flush remaining buffer
@@ -483,28 +494,40 @@ class ConversationPipeline:
     async def _speak_sentence(
         self, sentence: str, cancel_event: asyncio.Event
     ) -> None:
-        """Speak a single sentence through TTS, checking for barge-in."""
+        """Speak a single sentence through TTS, routing through AudioBus for AEC."""
         if cancel_event.is_set():
             return
 
-        if self._tts_engine is not None:
-            try:
-                # Use streaming TTS with barge-in cancel support
-                if hasattr(self._tts_engine, 'speak_stream'):
-                    await self._tts_engine.speak_stream(
-                        sentence,
-                        play_audio=True,
-                        cancel_event=cancel_event,
-                        source="conversation_pipeline",
-                    )
-                else:
-                    await self._tts_engine.speak(
-                        sentence,
-                        play_audio=True,
-                        source="conversation_pipeline",
-                    )
-            except Exception as e:
-                logger.debug(f"[ConvPipeline] TTS error: {e}")
+        if self._tts_engine is None:
+            return
+
+        try:
+            # Generate audio from TTS engine (get raw audio, don't play directly)
+            if hasattr(self._tts_engine, 'synthesize'):
+                # Preferred: get raw audio bytes and route through AudioBus
+                audio_data = await self._tts_engine.synthesize(sentence)
+                if audio_data is not None and self._audio_bus is not None:
+                    import numpy as np
+                    # Convert bytes to float32 if needed
+                    if isinstance(audio_data, bytes):
+                        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32767.0
+                    elif isinstance(audio_data, np.ndarray):
+                        audio_np = audio_data
+                    else:
+                        audio_np = None
+
+                    if audio_np is not None and not cancel_event.is_set():
+                        sample_rate = getattr(self._tts_engine, 'sample_rate', 22050)
+                        await self._audio_bus.play_audio(audio_np, sample_rate)
+                        return
+
+            # Fallback: direct TTS playback (legacy path, no AEC reference)
+            if hasattr(self._tts_engine, 'speak_stream'):
+                await self._tts_engine.speak_stream(sentence, play_audio=True)
+            else:
+                await self._tts_engine.speak(sentence, play_audio=True)
+        except Exception as e:
+            logger.debug(f"[ConvPipeline] TTS error: {e}")
 
     async def _is_self_voice_echo(self, text: str) -> bool:
         """
