@@ -703,15 +703,24 @@ def get_speech_state_manager_sync() -> UnifiedSpeechStateManager:
 # INTEGRATION HELPER: Register with existing WebSocket service
 # =============================================================================
 
+_websocket_registration_done: bool = False
+
+
 async def register_with_websocket_service() -> bool:
     """
     Register speech state broadcasts with the unified WebSocket service.
 
     Call this during app startup to enable frontend synchronization.
+    Idempotent — safe to call multiple times (only registers once).
 
     Returns:
-        True if registration successful
+        True if registration successful (or already registered)
     """
+    global _websocket_registration_done
+    if _websocket_registration_done:
+        logger.debug("Speech state WebSocket broadcaster already registered")
+        return True
+
     try:
         manager = await get_speech_state_manager()
 
@@ -721,6 +730,7 @@ async def register_with_websocket_service() -> bool:
             await broadcast_manager.broadcast(message)
 
         manager.register_websocket_broadcaster(broadcast_speech_state)
+        _websocket_registration_done = True
         logger.info("Speech state registered with WebSocket broadcaster")
         return True
     except Exception as e:

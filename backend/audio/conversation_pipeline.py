@@ -283,19 +283,30 @@ class ConversationPipeline:
                 if not user_text.strip():
                     continue
 
-                # 2. Add user turn to session
+                # 2. Self-voice echo filter — last line of defense.
+                # If AEC didn't fully cancel JARVIS's voice, Whisper may
+                # transcribe fragments of what JARVIS just said. Check
+                # against recent speech via the unified speech state manager.
+                if await self._is_self_voice_echo(user_text):
+                    logger.info(
+                        f"[ConvPipeline] Rejected self-voice echo: "
+                        f"{user_text[:60]!r}"
+                    )
+                    continue
+
+                # 3. Add user turn to session
                 self._session.add_turn("user", user_text)
                 logger.info(
                     f"[ConvPipeline] User: {user_text[:80]}"
                     f"{'...' if len(user_text) > 80 else ''}"
                 )
 
-                # 3. Check for exit commands
+                # 4. Check for exit commands
                 if self._is_exit_command(user_text):
                     logger.info("[ConvPipeline] Exit command detected")
                     break
 
-                # 4. Generate and speak response
+                # 5. Generate and speak response
                 await self._generate_and_speak_response()
 
             except asyncio.CancelledError:
@@ -478,13 +489,71 @@ class ConversationPipeline:
 
         if self._tts_engine is not None:
             try:
-                # Use streaming TTS when available
+                # Use streaming TTS with barge-in cancel support
                 if hasattr(self._tts_engine, 'speak_stream'):
-                    await self._tts_engine.speak_stream(sentence, play_audio=True)
+                    await self._tts_engine.speak_stream(
+                        sentence,
+                        play_audio=True,
+                        cancel_event=cancel_event,
+                        source="conversation_pipeline",
+                    )
                 else:
-                    await self._tts_engine.speak(sentence, play_audio=True)
+                    await self._tts_engine.speak(
+                        sentence,
+                        play_audio=True,
+                        source="conversation_pipeline",
+                    )
             except Exception as e:
                 logger.debug(f"[ConvPipeline] TTS error: {e}")
+
+    async def _is_self_voice_echo(self, text: str) -> bool:
+        """
+        Check if transcribed text is an echo of JARVIS's own recent speech.
+
+        Uses the UnifiedSpeechStateManager's similarity check as a safety net
+        against imperfect AEC. In conversation mode, cooldown is already
+        disabled (AEC handles echo at the signal level), so only the
+        semantic similarity check fires — detecting partial transcriptions
+        of JARVIS's own words that leaked through AEC.
+
+        Also checks against the most recent assistant turn in the session
+        for a direct text match (catches cases where the speech state
+        manager's 10-second window has expired but the echo is still
+        from the immediately preceding response).
+        """
+        try:
+            from backend.core.unified_speech_state import get_speech_state_manager
+            manager = await get_speech_state_manager()
+            result = manager.should_reject_audio(transcribed_text=text)
+            if result.reject and result.reason == "echo_detected":
+                return True
+        except Exception as e:
+            logger.debug(f"[ConvPipeline] Echo check failed: {e}")
+
+        # Secondary check: compare against last assistant turn in session
+        if self._session and self._session.turns:
+            for turn in reversed(self._session.turns):
+                if turn.role != "assistant":
+                    break
+                # If the user's text is a substring of what JARVIS just said
+                # (or vice versa), it's likely a partial echo
+                text_lower = text.lower().strip()
+                turn_lower = turn.text.lower().strip()
+                if len(text_lower) > 5:
+                    if text_lower in turn_lower or turn_lower in text_lower:
+                        return True
+                    # Check word overlap ratio
+                    user_words = set(text_lower.split())
+                    jarvis_words = set(turn_lower.split())
+                    if user_words and jarvis_words:
+                        overlap = len(user_words & jarvis_words)
+                        ratio = overlap / max(len(user_words), 1)
+                        if ratio > float(os.getenv(
+                            "JARVIS_ECHO_WORD_OVERLAP_THRESHOLD", "0.7"
+                        )):
+                            return True
+
+        return False
 
     def _is_exit_command(self, text: str) -> bool:
         """Check if the user wants to exit conversation mode."""

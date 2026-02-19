@@ -58973,6 +58973,7 @@ class JarvisSystemKernel:
             "agi_os": {"status": "pending", "message": "Waiting to start"},  # v200.0: AGI OS
             "ghost_display": {"status": "pending", "message": "Waiting to start"},  # v240.0: Virtual Display
             "visual_pipeline": {"status": "pending", "message": "Waiting to start"},  # v250.0: Visual Pipeline
+            "audio_infrastructure": {"status": "pending", "message": "Waiting to start"},  # v238.0: Audio Bus
             "frontend": {"status": "pending", "message": "Waiting to start"},
         }
 
@@ -59004,6 +59005,16 @@ class JarvisSystemKernel:
         self._screen_observation_lock = asyncio.Lock()  # Serializes activation
         self._perm_type_cls = None   # Cached PermissionType class (set in _check_startup_permissions)
         self._perm_status_cls = None  # Cached PermissionStatus class (set in _check_startup_permissions)
+
+        # v238.0: Real-Time Voice Conversation (Audio Bus Infrastructure)
+        self._audio_bus = None
+        self._audio_bus_enabled: bool = os.getenv(
+            "JARVIS_AUDIO_BUS_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+        self._conversation_pipeline = None
+        self._mode_dispatcher = None
+        self._audio_health_task: Optional[asyncio.Task] = None
+        self._audio_infrastructure_initialized: bool = False
 
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
@@ -61224,6 +61235,49 @@ class JarvisSystemKernel:
 
         self._started_at = time.time()
 
+        # =====================================================================
+        # v238.0: AUDIO BUS EARLY INIT (before narrator)
+        # =====================================================================
+        # Initialize AudioBus BEFORE narrator starts speaking so that TTS
+        # audio can route through the bus from the very first utterance.
+        # On failure, revert self._audio_bus_enabled = False so all
+        # downstream code uses legacy paths.
+        # =====================================================================
+        if self._audio_bus_enabled:
+            _ab_timeout = _get_env_float("JARVIS_AUDIO_BUS_INIT_TIMEOUT", 10.0)
+            try:
+                from backend.audio.audio_bus import AudioBus
+                self._audio_bus = AudioBus()
+                await asyncio.wait_for(self._audio_bus.start(), timeout=_ab_timeout)
+                self._component_status["audio_infrastructure"] = {
+                    "status": "running",
+                    "message": "AudioBus initialized",
+                }
+                self.logger.info("[Kernel] AudioBus started (v238.0)")
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"[Kernel] AudioBus init timed out ({_ab_timeout:.0f}s) — disabling"
+                )
+                self._audio_bus_enabled = False
+                self._audio_bus = None
+                self._component_status["audio_infrastructure"] = {
+                    "status": "degraded",
+                    "message": "AudioBus init timeout — using legacy audio",
+                }
+            except Exception as ab_err:
+                self.logger.warning(f"[Kernel] AudioBus init failed: {ab_err} — disabling")
+                self._audio_bus_enabled = False
+                self._audio_bus = None
+                self._component_status["audio_infrastructure"] = {
+                    "status": "degraded",
+                    "message": f"AudioBus init failed: {ab_err}",
+                }
+        else:
+            self._component_status["audio_infrastructure"] = {
+                "status": "disabled",
+                "message": "JARVIS_AUDIO_BUS_ENABLED not set",
+            }
+
         # v186.0: Start voice narrator queue processor for non-blocking speech
         # This MUST be started before any narrate_* calls to prevent blocking
         if self._narrator:
@@ -62386,6 +62440,25 @@ class JarvisSystemKernel:
                     if self._narrator:
                         self._voice_orchestrator.set_tts_callback(self._narrator.speak)
 
+                    # v238.0: Register a transcript forwarding hook so that when
+                    # ModeDispatcher is wired later (after Phase 4), incoming
+                    # voice transcripts from the orchestrator are forwarded to it.
+                    if self._audio_bus_enabled:
+                        _supervisor_ref = self  # prevent closure over 'self'
+
+                        def _forward_transcript_to_mode_dispatcher(transcript: str):
+                            md = _supervisor_ref._mode_dispatcher
+                            if md is not None and hasattr(md, 'on_transcript'):
+                                try:
+                                    md.on_transcript(transcript)
+                                except Exception:
+                                    pass
+
+                        if hasattr(self._voice_orchestrator, 'set_transcript_callback'):
+                            self._voice_orchestrator.set_transcript_callback(
+                                _forward_transcript_to_mode_dispatcher
+                            )
+
                     self.logger.success("[Kernel] Voice Orchestrator started")
                 except Exception as vo_err:
                     self.logger.warning(f"[Kernel] Voice Orchestrator failed to start: {vo_err}")
@@ -62568,6 +62641,117 @@ class JarvisSystemKernel:
             # is ready. Non-fatal — degraded mode without autonomous goal pursuit.
             # =====================================================================
             await self._start_agent_runtime()
+
+            # =====================================================================
+            # v238.0: CONVERSATION PIPELINE WIRING (Deferred)
+            # =====================================================================
+            # Wire up the real-time voice conversation components AFTER Phase 4
+            # (Intelligence) completes, so the LLM client is available.
+            # Each sub-component is independently optional — partial wiring is OK.
+            # Gated behind JARVIS_AUDIO_BUS_ENABLED to avoid touching legacy paths.
+            # =====================================================================
+            if self._audio_bus_enabled and self._audio_bus is not None:
+                try:
+                    _wire_start = time.time()
+
+                    # 1. TTS singleton (already init'd by AudioBus path)
+                    _tts_engine = None
+                    try:
+                        from backend.voice.engines.unified_tts_engine import (
+                            get_unified_tts_engine,
+                        )
+                        _tts_engine = await asyncio.wait_for(
+                            get_unified_tts_engine(), timeout=15.0
+                        )
+                    except Exception as tts_err:
+                        self.logger.debug(f"[Kernel] TTS singleton init skipped: {tts_err}")
+
+                    # 2. StreamingSTT
+                    _streaming_stt = None
+                    try:
+                        from backend.voice.streaming_stt import StreamingSTTEngine
+                        _streaming_stt = StreamingSTTEngine()
+                        await asyncio.wait_for(_streaming_stt.start(), timeout=10.0)
+                    except Exception as stt_err:
+                        self.logger.debug(f"[Kernel] StreamingSTT init skipped: {stt_err}")
+                        _streaming_stt = None
+
+                    # 3. TurnDetector + BargeInController
+                    _turn_detector = None
+                    _barge_in = None
+                    try:
+                        from backend.audio.turn_detector import TurnDetector
+                        from backend.audio.barge_in_controller import BargeInController
+                        _turn_detector = TurnDetector()
+                        _barge_in = BargeInController()
+                        _barge_in.set_audio_bus(self._audio_bus)
+                        _barge_in.set_loop(asyncio.get_running_loop())
+                        try:
+                            from backend.core.unified_speech_state import (
+                                get_speech_state_manager,
+                            )
+                            _speech_state = await get_speech_state_manager()
+                            _barge_in.set_speech_state(_speech_state)
+                        except Exception:
+                            pass
+                    except Exception as bi_err:
+                        self.logger.debug(f"[Kernel] TurnDetector/BargeIn skipped: {bi_err}")
+
+                    # 4. ConversationPipeline
+                    try:
+                        from backend.audio.conversation_pipeline import (
+                            ConversationPipeline,
+                        )
+                        self._conversation_pipeline = ConversationPipeline(
+                            audio_bus=self._audio_bus,
+                            streaming_stt=_streaming_stt,
+                            turn_detector=_turn_detector,
+                            barge_in=_barge_in,
+                            tts_engine=_tts_engine,
+                            llm_client=self._model_serving,
+                        )
+                    except Exception as cp_err:
+                        self.logger.debug(f"[Kernel] ConversationPipeline init skipped: {cp_err}")
+
+                    # 5. ModeDispatcher
+                    try:
+                        from backend.audio.mode_dispatcher import ModeDispatcher
+                        self._mode_dispatcher = ModeDispatcher(
+                            conversation_pipeline=self._conversation_pipeline,
+                        )
+                        await self._mode_dispatcher.start()
+                    except Exception as md_err:
+                        self.logger.debug(f"[Kernel] ModeDispatcher init skipped: {md_err}")
+                        self._mode_dispatcher = None
+
+                    self._audio_infrastructure_initialized = True
+                    _wire_ms = (time.time() - _wire_start) * 1000
+                    self._component_status["audio_infrastructure"] = {
+                        "status": "running",
+                        "message": (
+                            f"Pipeline wired in {_wire_ms:.0f}ms "
+                            f"(stt={'OK' if _streaming_stt else 'N/A'}, "
+                            f"tts={'OK' if _tts_engine else 'N/A'}, "
+                            f"llm={'OK' if self._model_serving else 'N/A'})"
+                        ),
+                    }
+                    self.logger.info(
+                        f"[Kernel] Audio pipeline wired (v238.0) in {_wire_ms:.0f}ms"
+                    )
+
+                    # Launch background health monitor
+                    self._audio_health_task = create_safe_task(
+                        self._audio_health_loop(),
+                        name="audio-health",
+                    )
+                    self._background_tasks.append(self._audio_health_task)
+
+                except Exception as ap_err:
+                    self.logger.warning(f"[Kernel] Audio pipeline wiring failed: {ap_err}")
+                    self._component_status["audio_infrastructure"] = {
+                        "status": "degraded",
+                        "message": f"Pipeline wiring failed: {ap_err}",
+                    }
 
             # v258.3 (Gap GCP-2): Re-evaluate startup mode after Intelligence phase.
             # At this point, backend is loaded + intelligence systems initialized.
@@ -67768,6 +67952,80 @@ class JarvisSystemKernel:
                 break
             except Exception as e:
                 self.logger.debug(f"[VisualPipeline] Health loop error: {e}")
+
+    # =========================================================================
+    # v238.0: AUDIO INFRASTRUCTURE HEALTH MONITOR
+    # =========================================================================
+
+    async def _audio_health_loop(self) -> None:
+        """
+        v238.0: Background health monitoring for Audio Bus infrastructure.
+
+        Periodically checks AudioBus.is_running and updates component status.
+        On failure, attempts a single restart before marking degraded.
+
+        Env vars:
+            JARVIS_AUDIO_HEALTH_INTERVAL: Check frequency (default: 30.0s)
+            JARVIS_AUDIO_HEALTH_GRACE: Delay before first check (default: 15.0s)
+        """
+        grace = _get_env_float("JARVIS_AUDIO_HEALTH_GRACE", 15.0)
+        interval = _get_env_float("JARVIS_AUDIO_HEALTH_INTERVAL", 30.0)
+
+        try:
+            await asyncio.sleep(grace)
+        except asyncio.CancelledError:
+            return
+
+        restart_attempted = False
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(interval)
+
+                if self._audio_bus is None:
+                    continue
+
+                if self._audio_bus.is_running:
+                    restart_attempted = False
+                    stats = {}
+                    if hasattr(self._audio_bus, 'get_stats'):
+                        try:
+                            stats = self._audio_bus.get_stats()
+                        except Exception:
+                            pass
+                    self._component_status["audio_infrastructure"] = {
+                        "status": "running",
+                        "message": f"Healthy (sinks={stats.get('sink_count', '?')})",
+                    }
+                else:
+                    if not restart_attempted:
+                        self.logger.warning(
+                            "[AudioHealth] AudioBus not running — attempting restart"
+                        )
+                        restart_attempted = True
+                        try:
+                            await asyncio.wait_for(
+                                self._audio_bus.start(), timeout=10.0
+                            )
+                            self.logger.info("[AudioHealth] AudioBus restarted")
+                        except Exception as restart_err:
+                            self.logger.warning(
+                                f"[AudioHealth] AudioBus restart failed: {restart_err}"
+                            )
+                            self._component_status["audio_infrastructure"] = {
+                                "status": "degraded",
+                                "message": f"AudioBus restart failed: {restart_err}",
+                            }
+                    else:
+                        self._component_status["audio_infrastructure"] = {
+                            "status": "degraded",
+                            "message": "AudioBus not running (restart already attempted)",
+                        }
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug(f"[AudioHealth] Health loop error: {e}")
 
     # =========================================================================
     # v186.0: TRINITY PROGRESS CALLBACK
@@ -73511,6 +73769,58 @@ class JarvisSystemKernel:
                     self.logger.info("[Kernel] Voice Orchestrator stopped")
                 except Exception as vo_err:
                     self.logger.warning(f"[Kernel] Voice Orchestrator stop error: {vo_err}")
+
+            # =====================================================================
+            # v238.0: AUDIO INFRASTRUCTURE SHUTDOWN
+            # =====================================================================
+            # Reverse order: ModeDispatcher → ConversationPipeline → AudioBus
+            # Each wrapped in wait_for to prevent shutdown stall.
+            # =====================================================================
+            if self._audio_infrastructure_initialized:
+                _audio_shutdown_timeout = 5.0
+
+                # 1. Cancel health monitor
+                if self._audio_health_task is not None:
+                    self._audio_health_task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            self._audio_health_task, timeout=2.0
+                        )
+                    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                        pass
+
+                # 2. ModeDispatcher
+                if self._mode_dispatcher is not None:
+                    try:
+                        stop_fn = getattr(self._mode_dispatcher, 'stop', None)
+                        if stop_fn:
+                            await asyncio.wait_for(stop_fn(), timeout=_audio_shutdown_timeout)
+                        self.logger.debug("[Kernel] ModeDispatcher stopped")
+                    except Exception as md_err:
+                        self.logger.debug(f"[Kernel] ModeDispatcher stop error: {md_err}")
+
+                # 3. ConversationPipeline
+                if self._conversation_pipeline is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self._conversation_pipeline.end_session(),
+                            timeout=_audio_shutdown_timeout,
+                        )
+                        self.logger.debug("[Kernel] ConversationPipeline ended")
+                    except Exception as cp_err:
+                        self.logger.debug(f"[Kernel] ConversationPipeline end error: {cp_err}")
+
+                # 4. AudioBus
+                if self._audio_bus is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self._audio_bus.stop(), timeout=_audio_shutdown_timeout
+                        )
+                        self.logger.info("[Kernel] AudioBus stopped")
+                    except Exception as ab_err:
+                        self.logger.debug(f"[Kernel] AudioBus stop error: {ab_err}")
+
+                self._audio_infrastructure_initialized = False
 
             # =====================================================================
             # v181.0: GCP VM CLEANUP (Normal Path)

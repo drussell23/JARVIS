@@ -16,4 +16,17 @@ __all__ = [
     "Wav2VecEngine",
     "WhisperLocalEngine",
     "WhisperGCPEngine",
+    "get_unified_tts_engine",
+    "get_tts_engine",
 ]
+
+
+def get_unified_tts_engine():
+    """Lazy re-export — avoid loading TTS at import time."""
+    from .unified_tts_engine import get_unified_tts_engine as _get
+    return _get()
+
+
+def get_tts_engine():
+    """Alias for get_unified_tts_engine."""
+    return get_unified_tts_engine()

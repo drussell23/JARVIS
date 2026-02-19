@@ -1313,8 +1313,12 @@ class RealTimeVoiceCommunicator:
         This bypasses the queue for time-critical VBI narration where
         immediate auditory feedback is essential.
 
+        Uses AudioBus path when enabled (JARVIS_AUDIO_BUS_ENABLED=true) so
+        AEC gets the reference signal for echo cancellation. Falls back to
+        raw macOS `say` subprocess when AudioBus is not available.
+
         Uses a lock to prevent voice overlap - only one speech at a time.
-        If interrupt=True, kills any current speech before starting.
+        If interrupt=True, flushes AudioBus or kills any current speech.
 
         Args:
             text: Text to speak
@@ -1328,13 +1332,28 @@ class RealTimeVoiceCommunicator:
         if self._muted:
             return True
 
-        # If interrupt mode, kill any current speech
-        if interrupt and self._current_speech_process:
-            try:
-                self._current_speech_process.kill()
-                await asyncio.sleep(0.1)  # Brief pause for cleanup
-            except Exception:
-                pass
+        _bus_enabled = os.getenv(
+            "JARVIS_AUDIO_BUS_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+
+        # If interrupt mode, stop any current speech via the correct path
+        if interrupt:
+            if _bus_enabled:
+                # AudioBus path: flush playback (kills TTS stream)
+                try:
+                    from backend.audio.audio_bus import get_audio_bus_safe
+                    bus = get_audio_bus_safe()
+                    if bus is not None and bus.is_running:
+                        bus.flush_playback()
+                except Exception:
+                    pass
+            elif self._current_speech_process:
+                # Legacy path: kill the say subprocess
+                try:
+                    self._current_speech_process.kill()
+                    await asyncio.sleep(0.1)
+                except Exception:
+                    pass
 
         # Acquire lock to prevent overlapping speech
         async with self._immediate_speech_lock:
@@ -1343,13 +1362,9 @@ class RealTimeVoiceCommunicator:
                 # =========================================================
                 # 🔇 CRITICAL: Set is_speaking BEFORE speech starts
                 # =========================================================
-                # This flag is checked by self-voice suppression to reject
-                # audio input that arrives while JARVIS is speaking.
-                # Setting it BEFORE speech ensures no audio leaks through.
-                # =========================================================
                 self._is_speaking = True
-                self._current_message = text  # Track what we're saying
-                
+                self._current_message = text
+
                 # v8.0: Notify unified speech state manager BEFORE speech
                 if UNIFIED_SPEECH_STATE_AVAILABLE:
                     try:
@@ -1361,45 +1376,72 @@ class RealTimeVoiceCommunicator:
                     except Exception as e:
                         logger.debug(f"Unified speech state start error: {e}")
 
-                config = self._mode_configs.get(mode, self._mode_configs[VoiceMode.NORMAL])
-
-                cmd = [
-                    'say',
-                    '-v', config.voice,
-                    '-r', str(config.rate),
-                    text
-                ]
-
                 logger.debug(f"🔊 [SPEAKING] Starting: {text[:50]}...")
 
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
+                # =========================================================
+                # AudioBus path — TTS singleton routes audio through the
+                # bus so AEC gets the reference signal for echo cancellation.
+                # =========================================================
+                if _bus_enabled:
+                    try:
+                        from backend.voice.engines.unified_tts_engine import get_tts_engine
+                        tts = await get_tts_engine()
+                        await asyncio.wait_for(
+                            tts.speak(text, play_audio=True, source="tts_backend"),
+                            timeout=timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        raise  # Re-raise so outer handler catches it
+                    except Exception as e:
+                        logger.debug("AudioBus speak_immediate failed, falling back: %s", e)
+                        # Fall through to legacy path
+                        _bus_enabled = False
 
-                # Store reference for interrupt capability
-                self._current_speech_process = process
-
-                await asyncio.wait_for(process.wait(), timeout=timeout)
+                if not _bus_enabled:
+                    # Legacy: direct macOS say subprocess
+                    config = self._mode_configs.get(mode, self._mode_configs[VoiceMode.NORMAL])
+                    cmd = [
+                        'say',
+                        '-v', config.voice,
+                        '-r', str(config.rate),
+                        text
+                    ]
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    self._current_speech_process = process
+                    await asyncio.wait_for(process.wait(), timeout=timeout)
+                    self._current_speech_process = None
 
                 logger.debug(f"🔊 [SPEAKING] Finished: {text[:50]}...")
-                self._current_speech_process = None
 
                 # =========================================================
-                # 🔇 POST-SPEECH BUFFER: Keep is_speaking=True briefly
+                # POST-SPEECH BUFFER: Conditional on conversation mode.
                 # =========================================================
-                # The microphone might still pick up the tail end of JARVIS's
-                # speech (echo/reverb) even after the TTS process completes.
-                # Keep the flag set for 300ms to reject any trailing audio.
-                # v8.0: Unified state manager handles its own cooldown too.
+                # In conversation mode, AEC handles echo suppression at the
+                # signal level — no time-based cooldown needed. Without AEC
+                # (legacy mode), the mic may still pick up reverb/echo, so
+                # keep is_speaking=True for 300ms to reject trailing audio.
                 # =========================================================
-                await asyncio.sleep(0.3)
+                _in_conversation_mode = False
+                if UNIFIED_SPEECH_STATE_AVAILABLE:
+                    try:
+                        mgr = get_speech_state_manager_sync()
+                        _in_conversation_mode = mgr.conversation_mode
+                    except Exception:
+                        pass
+
+                if not _in_conversation_mode and not _bus_enabled:
+                    await asyncio.sleep(
+                        float(os.getenv("JARVIS_POST_SPEECH_BUFFER_S", "0.3"))
+                    )
 
                 speech_duration_ms = (time.time() - speech_start_time) * 1000
-                self._is_speaking = False  # Clear flag after buffer
+                self._is_speaking = False
                 self._current_message = None
-                
+
                 # v8.0: Notify unified speech state manager AFTER speech
                 if UNIFIED_SPEECH_STATE_AVAILABLE:
                     try:
@@ -1407,21 +1449,30 @@ class RealTimeVoiceCommunicator:
                         await manager.stop_speaking(actual_duration_ms=speech_duration_ms)
                     except Exception as e:
                         logger.debug(f"Unified speech state stop error: {e}")
-                
+
                 return True
 
             except asyncio.TimeoutError:
                 logger.warning("Immediate speech timed out: %s", text[:50])
-                try:
-                    if self._current_speech_process:
-                        self._current_speech_process.kill()
-                    self._current_speech_process = None
-                except Exception:
-                    pass
-                self._is_speaking = False  # Always clear flag on error
+                # Clean up whichever path was active
+                if _bus_enabled:
+                    try:
+                        from backend.audio.audio_bus import get_audio_bus_safe
+                        bus = get_audio_bus_safe()
+                        if bus is not None and bus.is_running:
+                            bus.flush_playback()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        if self._current_speech_process:
+                            self._current_speech_process.kill()
+                        self._current_speech_process = None
+                    except Exception:
+                        pass
+                self._is_speaking = False
                 self._current_message = None
-                
-                # v8.0: Notify unified speech state manager on error too
+
                 if UNIFIED_SPEECH_STATE_AVAILABLE:
                     try:
                         manager = get_speech_state_manager_sync()
@@ -1430,13 +1481,13 @@ class RealTimeVoiceCommunicator:
                     except Exception:
                         pass
                 return False
+
             except Exception as e:
                 logger.error("Immediate speech error: %s - %s", e, text[:50])
                 self._current_speech_process = None
-                self._is_speaking = False  # Always clear flag on error
+                self._is_speaking = False
                 self._current_message = None
-                
-                # v8.0: Notify unified speech state manager on error too
+
                 if UNIFIED_SPEECH_STATE_AVAILABLE:
                     try:
                         manager = get_speech_state_manager_sync()

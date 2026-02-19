@@ -811,5 +811,36 @@ async def test_tts():
     print("\n✅ Test complete!")
 
 
+# ============================================================================
+# Singleton Factory
+# ============================================================================
+
+_tts_singleton: Optional[UnifiedTTSEngine] = None
+_tts_singleton_lock = asyncio.Lock()
+
+
+async def get_unified_tts_engine() -> UnifiedTTSEngine:
+    """Get or create the singleton UnifiedTTSEngine.
+
+    Thread-safe, double-checked locking. Returns an initialized engine
+    that can be shared across all callers (WebSocket endpoints,
+    ConversationPipeline, macOS voice bridge, etc.).
+    """
+    global _tts_singleton
+    if _tts_singleton is not None and _tts_singleton.active_engine is not None:
+        return _tts_singleton
+    async with _tts_singleton_lock:
+        if _tts_singleton is not None and _tts_singleton.active_engine is not None:
+            return _tts_singleton
+        engine = UnifiedTTSEngine()
+        await engine.initialize()
+        _tts_singleton = engine
+        return _tts_singleton
+
+
+# Alias for shorter imports
+get_tts_engine = get_unified_tts_engine
+
+
 if __name__ == "__main__":
     asyncio.run(test_tts())

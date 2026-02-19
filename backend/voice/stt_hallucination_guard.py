@@ -285,6 +285,17 @@ class HallucinationGuardConfig:
     circuit_breaker_threshold: int = 5
     circuit_breaker_timeout_sec: int = 30
 
+    # Conversation mode settings — adjusted when AEC + streaming STT is active
+    conversation_mode_sensitivity: float = float(os.getenv(
+        "HALLUCINATION_CONV_SENSITIVITY", "0.65"
+    ))
+    conversation_mode_min_confidence: float = float(os.getenv(
+        "HALLUCINATION_CONV_MIN_CONFIDENCE", "0.5"
+    ))
+    aec_artifact_confidence: float = float(os.getenv(
+        "HALLUCINATION_AEC_ARTIFACT_CONFIDENCE", "0.85"
+    ))
+
     @classmethod
     def from_dynamic_config(cls) -> 'HallucinationGuardConfig':
         """Create config from dynamic sources"""
@@ -586,7 +597,32 @@ class DynamicPatternDetector:
                 })
                 result['confidence'] = max(result['confidence'], 0.85)
                 result['category'] = result['category'] or 'repetitive'
-        
+
+        # AEC-artifact heuristic — imperfect echo cancellation produces
+        # distorted residual signals that Whisper can hallucinate on.
+        # Characteristics: very short garbled fragments, single-word noise,
+        # or text that is mostly non-alphabetic characters.
+        if len(normalized) > 0:
+            alpha_ratio = sum(1 for c in normalized if c.isalpha()) / max(len(normalized), 1)
+            # Mostly non-alphabetic content (distortion artifacts)
+            if alpha_ratio < 0.4 and len(normalized) > 2:
+                aec_conf = float(os.getenv("HALLUCINATION_AEC_ARTIFACT_CONFIDENCE", "0.85"))
+                result['is_suspicious'] = True
+                result['matched_patterns'].append({
+                    'category': 'aec_artifact',
+                    'pattern': 'low_alpha_ratio',
+                    'matched_text': text,
+                    'confidence': aec_conf,
+                    'alpha_ratio': alpha_ratio,
+                })
+                result['confidence'] = max(result['confidence'], aec_conf)
+                result['category'] = result['category'] or 'aec_artifact'
+
+            # Very short transcription (1-2 words under 6 chars total) with
+            # low STT confidence is likely AEC residual noise, not real speech.
+            if len(words) <= 2 and len(normalized) <= 6:
+                result.setdefault('_aec_short_fragment', True)
+
         return result
 
 
@@ -906,11 +942,17 @@ class HypothesisEngine:
     
     def form_hypothesis(
         self,
-        analysis_results: Dict[str, Any]
+        analysis_results: Dict[str, Any],
+        sensitivity_override: Optional[float] = None,
     ) -> Tuple[bool, Optional[str], float, List[Dict[str, Any]]]:
         """
         Form hypothesis about whether transcription is a hallucination.
-        
+
+        Args:
+            analysis_results: Results from all parallel analyzers.
+            sensitivity_override: If provided, overrides self.config.sensitivity
+                for this call (used in conversation mode / streaming).
+
         Returns:
             Tuple of (is_hallucination, hallucination_type, confidence, hypotheses)
         """
@@ -982,9 +1024,10 @@ class HypothesisEngine:
             # Apply SAI confidence modifier
             sai_modifier = sai.get('sai_confidence_modifier', 1.0)
             adjusted_confidence = top_hypothesis['confidence'] * sai_modifier
-            
+
             # Threshold for hallucination determination
-            if adjusted_confidence >= self.config.sensitivity:
+            threshold = sensitivity_override if sensitivity_override is not None else self.config.sensitivity
+            if adjusted_confidence >= threshold:
                 is_hallucination = True
                 hallucination_type = top_hypothesis['hallucination_type']
                 hallucination_confidence = adjusted_confidence
@@ -1173,25 +1216,78 @@ class STTHallucinationGuard:
         confidence: float,
         audio_data: Optional[bytes] = None,
         engine_results: Optional[List[Dict[str, Any]]] = None,
-        context: Optional[str] = "unlock_command"
+        context: Optional[str] = "unlock_command",
+        conversation_mode: bool = False,
+        is_partial: bool = False,
     ) -> Tuple[VerificationResult, Optional[HallucinationDetection], str]:
         """
         Main verification method with parallel analysis.
-        
+
+        Args:
+            transcription: The STT transcript to verify.
+            confidence: STT confidence score (0.0 - 1.0).
+            audio_data: Raw audio bytes for phonetic analysis.
+            engine_results: Results from multiple STT engines.
+            context: Verification context ("unlock_command", "conversation", etc.).
+            conversation_mode: When True, adjusts sensitivity for streaming STT
+                with AEC. Enables AEC-artifact detection and lowers the confidence
+                floor for partial transcripts.
+            is_partial: Whether this is a partial (intermediate) transcript from
+                streaming STT. Partials have inherently lower confidence and
+                may trigger false positives at default thresholds.
+
         Returns:
             Tuple of (result, detection_details, final_text)
         """
         start_time = time.time()
         self.metrics['total_checks'] += 1
-        
+
         audio_hash = None
         if audio_data:
             audio_hash = hashlib.md5(audio_data[:1000]).hexdigest()[:8]
-        
-        logger.info(f"🔍 Verifying: '{transcription}' (conf: {confidence:.2f})")
-        
+
+        # In conversation mode, use adjusted thresholds for streaming STT.
+        # Partials are inherently less confident — don't flag them prematurely.
+        effective_sensitivity = self.config.sensitivity
+        effective_min_confidence = self.config.min_confidence_threshold
+        if conversation_mode:
+            effective_sensitivity = self.config.conversation_mode_sensitivity
+            effective_min_confidence = self.config.conversation_mode_min_confidence
+        if is_partial:
+            # Partials get even more lenient — only catch high-confidence hallucinations
+            effective_sensitivity = min(effective_sensitivity + 0.1, 0.95)
+
+        logger.info(
+            f"🔍 Verifying: '{transcription}' (conf: {confidence:.2f}"
+            f"{' conv_mode' if conversation_mode else ''}"
+            f"{' partial' if is_partial else ''})"
+        )
+
         normalized = transcription.lower().strip()
-        
+
+        # Conversation mode: reject very short AEC artifact fragments
+        # (1-2 garbled words under 6 chars with low STT confidence)
+        if conversation_mode and len(normalized) <= 6 and confidence < 0.5:
+            words = normalized.split()
+            if len(words) <= 2:
+                detection = HallucinationDetection(
+                    original_text=transcription,
+                    corrected_text=None,
+                    hallucination_type=HallucinationType.KNOWN_PATTERN,
+                    confidence=self.config.aec_artifact_confidence,
+                    detection_method="aec_short_fragment",
+                    audio_hash=audio_hash,
+                    processing_time_ms=(time.time() - start_time) * 1000,
+                )
+                self._detection_history.append(detection)
+                self.metrics['hallucinations_detected'] += 1
+                logger.info(
+                    f"🔇 [AEC] Rejected short artifact: '{transcription}' "
+                    f"(conf={confidence:.2f}, len={len(normalized)})"
+                )
+                self._update_timing_metrics((time.time() - start_time) * 1000)
+                return VerificationResult.CONFIRMED, detection, transcription
+
         # 🚀 FAST PATH 1: Check learned hallucinations cache
         if normalized in self._learned_hallucinations:
             correction = self._learned_corrections.get(normalized, "unlock my screen")
@@ -1269,9 +1365,13 @@ class STTHallucinationGuard:
             analyzers
         )
         
-        # Form hypothesis from analysis results
+        # Form hypothesis from analysis results (pass effective sensitivity
+        # which may be adjusted for conversation mode / streaming partials)
         is_hallucination, hallucination_type, hallucination_confidence, hypotheses = \
-            self._hypothesis_engine.form_hypothesis(analysis_results)
+            self._hypothesis_engine.form_hypothesis(
+                analysis_results,
+                sensitivity_override=effective_sensitivity,
+            )
         
         if is_hallucination:
             # Attempt correction
