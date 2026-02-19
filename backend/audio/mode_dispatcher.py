@@ -19,6 +19,7 @@ Triggers:
 import asyncio
 import logging
 import os
+import queue
 import time
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -83,7 +84,7 @@ class ModeDispatcher:
 
         # Biometric authentication state
         self._biometric_task: Optional[asyncio.Task] = None
-        self._biometric_audio_buffer: List[Any] = []
+        self._biometric_audio_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._biometric_audio_consumer: Optional[Callable] = None
 
         # Lazy-loaded service references (set by supervisor after two-tier init)
@@ -198,12 +199,18 @@ class ModeDispatcher:
             # Unregister AudioBus mic consumer
             self._unregister_biometric_consumer()
 
-            # Clear audio buffer
-            self._biometric_audio_buffer.clear()
+            # Drain audio queue
+            while not self._biometric_audio_queue.empty():
+                try:
+                    self._biometric_audio_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-            # Resume conversation if it was paused
-            if self._conversation_pipeline is not None and hasattr(
-                self._conversation_pipeline, 'resume'
+            # Resume conversation only if it was the previous mode (was paused)
+            if (
+                self._previous_mode == VoiceMode.CONVERSATION
+                and self._conversation_pipeline is not None
+                and hasattr(self._conversation_pipeline, 'resume')
             ):
                 await self._conversation_pipeline.resume()
 
@@ -348,12 +355,17 @@ class ModeDispatcher:
 
         try:
             # 1. Register mic consumer on AudioBus for AEC-cleaned capture
-            self._biometric_audio_buffer.clear()
+            # Drain any stale frames from previous attempt
+            while not self._biometric_audio_queue.empty():
+                try:
+                    self._biometric_audio_queue.get_nowait()
+                except queue.Empty:
+                    break
 
             def _on_biometric_frame(frame: np.ndarray) -> None:
-                """Accumulate AEC-cleaned audio frames for biometric verification."""
+                """Accumulate AEC-cleaned audio frames (thread-safe via SimpleQueue)."""
                 if frame.size > 0:
-                    self._biometric_audio_buffer.append(frame.copy())
+                    self._biometric_audio_queue.put_nowait(frame.copy())
 
             self._biometric_audio_consumer = _on_biometric_frame
             if self._audio_bus is not None:
@@ -368,14 +380,21 @@ class ModeDispatcher:
             )
             await asyncio.sleep(capture_duration)
 
-            # 4. Concatenate captured frames
-            if not self._biometric_audio_buffer:
+            # 4. Drain queue and concatenate frames (thread-safe snapshot)
+            frames: List[Any] = []
+            while not self._biometric_audio_queue.empty():
+                try:
+                    frames.append(self._biometric_audio_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            if not frames:
                 await self._speak_biometric(
                     "I couldn't capture your voice. Please try again."
                 )
                 return
 
-            audio_data = np.concatenate(self._biometric_audio_buffer)
+            audio_data = np.concatenate(frames)
 
             # Unregister consumer before processing (stop capturing)
             self._unregister_biometric_consumer()
@@ -400,13 +419,21 @@ class ModeDispatcher:
             raise
         except Exception as e:
             logger.error(f"[ModeDispatcher] Biometric auth error: {e}")
-            await self._speak_biometric(
-                "Voice authentication encountered an error. "
-                "Please try again or use password unlock."
-            )
+            try:
+                await asyncio.shield(self._speak_biometric(
+                    "Voice authentication encountered an error. "
+                    "Please try again or use password unlock."
+                ))
+            except asyncio.CancelledError:
+                pass  # Cleanup happens in finally
         finally:
             self._unregister_biometric_consumer()
-            self._biometric_audio_buffer.clear()
+            # Drain remaining queue frames
+            while not self._biometric_audio_queue.empty():
+                try:
+                    self._biometric_audio_queue.get_nowait()
+                except queue.Empty:
+                    break
 
     async def _authenticate_voice(self, audio_data) -> Dict[str, Any]:
         """
@@ -437,6 +464,7 @@ class ModeDispatcher:
                 return {"success": False, "reason": "Authentication timed out"}
             except Exception as e:
                 logger.error(f"[ModeDispatcher] Voice unlock error: {e}")
+                # Fall through to VBIA fallback intentionally
 
         # Fallback: TieredVBIAAdapter
         if self._vbia_adapter is not None:
@@ -483,7 +511,8 @@ class ModeDispatcher:
                                 io.BytesIO(audio_bytes), dtype='float32',
                             )
                             sample_rate = file_sr
-                        except Exception:
+                        except Exception as sf_err:
+                            logger.debug(f"[ModeDispatcher] soundfile decode failed: {sf_err}, trying raw PCM")
                             audio_np = np.frombuffer(
                                 audio_bytes, dtype=np.int16,
                             ).astype(np.float32) / 32767.0
@@ -527,7 +556,12 @@ class ModeDispatcher:
         if self._current_mode == VoiceMode.BIOMETRIC:
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(self.return_from_biometric())
+                t = loop.create_task(
+                    self.return_from_biometric(), name="biometric-return"
+                )
+                t.add_done_callback(
+                    lambda _t: _t.exception() if not _t.cancelled() else None
+                )
             except RuntimeError:
                 self._current_mode = self._previous_mode or VoiceMode.COMMAND
 
