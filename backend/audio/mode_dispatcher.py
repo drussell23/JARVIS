@@ -252,12 +252,20 @@ class ModeDispatcher:
         }
 
     def _on_conversation_done(self, task: asyncio.Task) -> None:
-        """Handle unexpected conversation task completion."""
+        """Handle conversation task completion (natural exit or error)."""
         if task.cancelled():
             return
         exc = task.exception()
         if exc is not None:
             logger.error(f"[ModeDispatcher] Conversation task failed: {exc}")
+        # Natural completion (e.g., user said "goodbye") — reset to command mode
+        if self._current_mode == VoiceMode.CONVERSATION:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.switch_mode(VoiceMode.COMMAND))
+            except RuntimeError:
+                # No running loop (shutdown) — just update state directly
+                self._current_mode = VoiceMode.COMMAND
 
     async def start(self) -> None:
         """Start the mode dispatcher. Currently a no-op — modes are event-driven."""

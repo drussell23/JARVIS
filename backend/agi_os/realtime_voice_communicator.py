@@ -204,6 +204,10 @@ class RealTimeVoiceCommunicator:
         # Lifecycle-managed background tasks (timeouts, delayed opens, async notifications)
         self._background_tasks: Set[asyncio.Task] = set()
 
+        # Transcript hooks — called with each user utterance text before processing.
+        # Used by ModeDispatcher to intercept mode-switching phrases.
+        self._transcript_hooks: List[Callable] = []
+
         # Initialize voices
         self._discover_voices()
 
@@ -246,6 +250,14 @@ class RealTimeVoiceCommunicator:
         except Exception as e:
             logger.warning("Failed to discover voices: %s", e)
             self._primary_voice = 'Daniel'  # Fallback
+
+    def register_transcript_hook(self, hook: Callable) -> None:
+        """Register a hook called with each user utterance text before processing.
+
+        Used by ModeDispatcher to intercept mode-switching phrases like
+        'let's chat' or 'goodbye'. Hooks are async callables: hook(text) -> Optional[Any].
+        """
+        self._transcript_hooks.append(hook)
 
     async def start(self) -> None:
         """Start the voice communicator."""
@@ -861,6 +873,15 @@ class RealTimeVoiceCommunicator:
         normalized = (text or "").strip()
         if not normalized:
             return None
+
+        # Invoke transcript hooks (e.g., ModeDispatcher mode switching)
+        for hook in self._transcript_hooks:
+            try:
+                result = hook(normalized)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as hook_err:
+                logger.debug("Transcript hook error: %s", hook_err)
 
         utterance = UserUtterance(
             text=normalized,
