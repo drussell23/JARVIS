@@ -1433,6 +1433,135 @@ _infer_task_type()                             ChatRequest.metadata
 
 ---
 
+### v238.0 — Real-Time Voice Conversation Infrastructure (February 2026)
+
+JARVIS now supports **real-time voice conversation** — continuous, bidirectional, streaming voice dialogue instead of the traditional record → transcribe → respond → play cycle. This transforms JARVIS from a command-response assistant into an AI companion you can talk to naturally, with interruptions, follow-ups, and flowing multi-turn dialogue.
+
+#### The Paradigm Shift: Audio-as-Stream, Not Audio-as-Events
+
+Previously, every voice component operated on complete audio blobs — record a full utterance, transcribe the whole thing, generate a complete response, synthesize all the audio, then play it. Real-time conversation treats audio as a **continuous bidirectional stream** where all components run simultaneously on overlapping data.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                REAL-TIME VOICE CONVERSATION PIPELINE                     │
+│                ══════════════════════════════════════                    │
+│                                                                          │
+│  Mic → FullDuplexDevice ──→ AEC ──→ StreamingSTT ──→ TurnDetector      │
+│            ↕ (same clock)      │         │                │              │
+│  Speaker ← PlaybackRingBuffer  │    Partial transcripts   │              │
+│            ↑                   │         │           "turn_end"          │
+│  AudioBus ─┘                   │         ▼                │              │
+│     ↑                          │   ConversationSession    │              │
+│  Streaming TTS ← Sentence     │     (20-turn context)    │              │
+│     ↑           Splitter       │         │                │              │
+│  LLM Token Stream (SSE)       │         ▼                ▼              │
+│     ↑                          │   jarvis-prime (/v1/chat/completions)   │
+│  ConversationPipeline ─────────┘   (GCP, SSE streaming)                 │
+│     ↑                                                                    │
+│  ModeDispatcher ── "JARVIS, let's chat" → CONVERSATION mode             │
+│                 ── "JARVIS, unlock"      → BIOMETRIC mode               │
+│                 ── "goodbye"             → COMMAND mode                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Architecture: 7 Layers (-1 through 6)
+
+| Layer | Component | Purpose | File |
+|-------|-----------|---------|------|
+| **-1** | FullDuplexDevice | Single `sounddevice.Stream` with synchronized mic+speaker at the same sample clock | `backend/audio/full_duplex_device.py` |
+| **-1** | PlaybackRingBuffer | Lock-free ring buffer for real-time audio playback mixing | `backend/audio/playback_ring_buffer.py` |
+| **0** | AudioBus + AEC | Central audio routing singleton. **All** audio I/O flows through this. Acoustic Echo Cancellation via `speexdsp` (spectral subtraction fallback) | `backend/audio/audio_bus.py` |
+| **1** | Streaming TTS (Piper) | Local neural TTS with true audio streaming (~50ms time-to-first-audio). Replaces macOS `say` subprocess | `backend/voice/engines/piper_tts_engine.py` |
+| **2** | Streaming STT | Incremental transcription via `faster-whisper`. Partial + final transcripts as user speaks | `backend/voice/streaming_stt.py` |
+| **3** | Turn Detector | Adaptive silence-based turn detection. 300ms after yes/no questions, 600ms default, 900ms after open-ended | `backend/audio/turn_detector.py` |
+| **4** | Barge-In Controller | Interrupt JARVIS mid-sentence when user speaks. AEC cleans the mic signal — no cooldown needed | `backend/audio/barge_in_controller.py` |
+| **5** | Conversation Pipeline | Full orchestrator: listen → understand → respond → repeat. Sliding 20-turn context window for LLM | `backend/audio/conversation_pipeline.py` |
+| **6** | Mode Dispatcher | Routes between COMMAND / CONVERSATION / BIOMETRIC modes. Wake word runs in parallel | `backend/audio/mode_dispatcher.py` |
+| **boot** | Pipeline Bootstrap | Two-phase factory: Phase 1 (AudioBus, before narrator) + Phase 2 (full pipeline, after Intelligence) | `backend/audio/audio_pipeline_bootstrap.py` |
+
+#### Key Design Decisions
+
+**AudioBus is a constraint, not a convention.** The `FullDuplexDevice` callback is private to AudioBus. No component can bypass it. This is the only way audio reaches speakers or leaves the mic. Every `say` subprocess caller (11 sites) was migrated to route through AudioBus, with a feature flag (`JARVIS_AUDIO_BUS_ENABLED`) for safe rollback.
+
+**AEC replaces time-based cooldowns.** The previous echo suppression used 1.5-3 second cooldowns after JARVIS spoke — dropping the first seconds of the user's response every turn. With signal-level AEC (`speexdsp`), JARVIS's voice is subtracted from the mic input in real-time. In conversation mode, cooldowns are skipped entirely.
+
+**Two-phase supervisor integration.** AudioBus starts early (before the narrator speaks during startup). The full ConversationPipeline is wired later (after Phase 4: Intelligence provides the LLM client). If AudioBus fails, the flag reverts to false and all voice output uses legacy paths. If the pipeline fails, AudioBus still works for basic TTS routing.
+
+**LLM streaming through jarvis-prime.** Conversation responses stream through the existing `UnifiedModelServing` tier chain: PRIME_API (jarvis-prime on GCP, SSE streaming) → PRIME_LOCAL → CLAUDE fallback. Tokens are accumulated into sentence-sized chunks by the SentenceSplitter, then each sentence is immediately dispatched to streaming TTS. The user hears the first word at ~300-500ms, not after the full response is generated.
+
+**Self-voice echo filtering as defense-in-depth.** Even with AEC, imperfect cancellation can cause Whisper to transcribe fragments of JARVIS's own speech. The conversation pipeline checks every user transcript against what JARVIS recently said (via `UnifiedSpeechStateManager` similarity check) and drops anything that matches. The `stt_hallucination_guard.py` also has a `conversation_mode` flag with relaxed thresholds for streaming partials.
+
+#### How to Use
+
+```bash
+# Ensure audio bus is enabled
+export JARVIS_AUDIO_BUS_ENABLED=true
+
+# Start the system
+python3 unified_supervisor.py
+
+# Say "JARVIS, let's chat" to enter conversation mode
+# Say "goodbye" or "JARVIS, stop" to return to command mode
+# Say "JARVIS, unlock my screen" mid-conversation for biometric auth
+```
+
+**WebSocket endpoint** for remote clients:
+
+```
+ws://localhost:8010/ws/voice-conversation
+
+Binary frames: raw 16-bit PCM audio (16kHz mono) — bidirectional
+JSON frames: control messages, partial transcripts, turn events
+```
+
+#### Dependencies
+
+```bash
+pip install piper-tts         # Local neural TTS with streaming
+pip install speexdsp          # Acoustic echo cancellation
+pip install faster-whisper    # Streaming STT via CTranslate2
+pip install samplerate        # High-quality audio resampling
+```
+
+Already available: `sounddevice`, `webrtcvad`, `soundfile`, `numpy`, `pyaudio`
+
+#### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `JARVIS_AUDIO_BUS_ENABLED` | `false` | Master switch for audio bus infrastructure |
+| `JARVIS_AUDIO_SAMPLE_RATE` | `48000` | Device sample rate (48kHz = native macOS) |
+| `JARVIS_AUDIO_INTERNAL_RATE` | `16000` | Internal processing rate (16kHz for VAD/STT/AEC) |
+| `JARVIS_AUDIO_FRAME_MS` | `20` | Audio frame duration in milliseconds |
+| `JARVIS_PIPER_VOICE` | `en_US-lessac-medium` | Piper TTS voice model |
+| `JARVIS_CONV_MAX_TURNS` | `20` | Maximum turns in sliding conversation context |
+| `JARVIS_CONV_SESSION_TIMEOUT` | `300` | Conversation session timeout (seconds) |
+| `JARVIS_CONV_INACTIVITY_TIMEOUT` | `300` | Inactivity timeout — returns to command mode |
+| `JARVIS_AEC_ALPHA` | `1.0` | AEC spectral subtraction aggressiveness |
+| `JARVIS_BARGEIN_ENERGY_THRESHOLD` | `0.01` | Barge-in RMS energy threshold |
+
+#### Files Created (10) and Evolved (12)
+
+**New files:**
+
+| File | Lines | Layer | Purpose |
+|------|-------|-------|---------|
+| `backend/audio/__init__.py` | 60 | pkg | Package exports |
+| `backend/audio/full_duplex_device.py` | 294 | -1 | Synchronized audio I/O |
+| `backend/audio/playback_ring_buffer.py` | 205 | -1 | Real-time playback buffer |
+| `backend/audio/audio_bus.py` | 410 | 0 | Central routing + AEC |
+| `backend/audio/audio_pipeline_bootstrap.py` | 289 | boot | Two-phase lifecycle factory |
+| `backend/voice/engines/piper_tts_engine.py` | 321 | 1 | Local neural streaming TTS |
+| `backend/voice/streaming_stt.py` | 315 | 2 | Incremental transcription |
+| `backend/audio/turn_detector.py` | 191 | 3 | Adaptive turn detection |
+| `backend/audio/barge_in_controller.py` | 182 | 4 | Interrupt TTS on user speech |
+| `backend/audio/conversation_pipeline.py` | 425 | 5 | Full conversation orchestrator |
+| `backend/audio/mode_dispatcher.py` | 230 | 6 | Command/conversation/biometric routing |
+
+**Evolved files:** `base_tts_engine.py` (TTSChunk, PIPER, synthesize_stream), `unified_tts_engine.py` (Piper + AudioBus routing), `unified_speech_state.py` (conversation_mode), `unified_voice_orchestrator.py` (AudioBus routing), `realtime_voice_communicator.py` (AudioBus + speak_immediate), `macos_voice.py` (AudioBus), `voice_engine.py` (AudioBus), `jarvis_voice.py` (TTS singleton), `trinity_voice_coordinator.py` (AudioBus), `hybrid_stt_router.py` (transcribe_stream), `unified_websocket.py` (/ws/voice-conversation), `stt_hallucination_guard.py` (conversation_mode flag), `unified_supervisor.py` (bootstrap integration)
+
+---
+
 ### Architectural Status Report — System-Wide Audit (February 2026)
 
 A comprehensive architectural audit identified several critical system-wide issues that affect JARVIS's ability to operate as a truly autonomous AI agent. These findings inform the roadmap below.
@@ -1497,6 +1626,17 @@ The Neural Mesh (60+ agents) and the Autonomy System (`AutonomousAgent`, `Agenti
 ---
 
 ### Roadmap — Next Phases
+
+#### v248.0 — Real-Time Voice Conversation V2 (Planned)
+
+Build on the v238.0 voice conversation infrastructure with production hardening:
+
+- [ ] **ML-based turn detection (V2)** — Train a small classifier on conversation data to replace heuristic silence thresholds. Better at distinguishing "thinking pauses" from turn endings.
+- [ ] **Tonal/emotional awareness** — Detect urgency, frustration, excitement from audio features. Adapt JARVIS's response style and priority accordingly.
+- [ ] **Speaker diarization** — When multiple people are in the room, track who is speaking and respond only to the verified user. Integrates with ECAPA-TDNN biometric pipeline.
+- [ ] **Conversation memory** — Persist conversation sessions across restarts. Resume mid-conversation with "where were we?"
+- [ ] **Frontend conversation UI** — Real-time transcript display, waveform visualization, turn indicators, mode badge (COMMAND/CONVERSATION/BIOMETRIC).
+- [ ] **Cloud API hybrid mode** — `ConversationModeRouter` that routes to OpenAI Realtime API or Gemini Live for highest quality when available, with local pipeline as offline fallback.
 
 #### v241.2 — 14B Model Tier + Ouroboros Foundation (Planned)
 

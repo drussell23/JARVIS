@@ -27812,6 +27812,21 @@ class EventSourcingManager(SystemService):
             self._handlers[event_type] = []
         self._handlers[event_type].append(handler)
 
+    def subscribe(
+        self,
+        event_type: str,
+        handler: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Subscribe to events of a given type.
+
+        Args:
+            event_type: Event type string (e.g. "intelligence_decision")
+            handler: Async callback receiving the event dict
+        """
+        if event_type not in self._handlers:
+            self._handlers[event_type] = []
+        self._handlers[event_type].append(handler)
+
     async def _notify_handlers(self, event: Dict[str, Any]) -> None:
         """Notify registered handlers of an event."""
         event_type = event.get("type", "")
@@ -66407,6 +66422,30 @@ class JarvisSystemKernel:
                     try:
                         _ssr_r4 = await self._service_registry.activate_phase(4)
                         self.logger.info(f"[Kernel] Phase 4 services: {_ssr_r4}")
+
+                        # Wire 7: EventSourcing → audit trail subscriptions
+                        _es = self._service_registry.get("event_sourcing")
+                        if _es and hasattr(_es, 'subscribe'):
+                            # Store for direct event recording by intelligence + voice auth
+                            self._event_sourcing = _es
+
+                            # Subscribe audit handlers
+                            async def _audit_intelligence(event: Dict[str, Any]) -> None:
+                                """Log intelligence decisions for audit trail."""
+                                self.logger.debug(
+                                    "[AuditTrail] Intelligence event: %s",
+                                    event.get("payload", {}).get("decision", "unknown"),
+                                )
+
+                            async def _audit_voice_auth(event: Dict[str, Any]) -> None:
+                                """Log voice auth attempts for audit trail."""
+                                self.logger.debug(
+                                    "[AuditTrail] Voice auth: %s",
+                                    event.get("payload", {}).get("result", "unknown"),
+                                )
+
+                            _es.subscribe("intelligence_decision", _audit_intelligence)
+                            _es.subscribe("voice_auth_attempt", _audit_voice_auth)
 
                         # Wire 8: MessageBroker → bridge SupervisorEventBus
                         _mb = self._service_registry.get("message_broker")
