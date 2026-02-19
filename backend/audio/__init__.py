@@ -40,6 +40,16 @@ from backend.audio.conversation_pipeline import (
 )
 from backend.audio.mode_dispatcher import ModeDispatcher, VoiceMode
 
+try:
+    from backend.audio.audio_pipeline_bootstrap import (
+        start_audio_bus as bootstrap_start_audio_bus,
+        wire_conversation_pipeline,
+        shutdown as bootstrap_shutdown,
+        PipelineHandle,
+    )
+except ImportError:
+    pass
+
 __all__ = [
     "AudioBus",
     "AudioSink",
@@ -57,4 +67,8 @@ __all__ = [
     "WebSocketSink",
     "get_audio_bus",
     "get_audio_bus_safe",
+    "PipelineHandle",
+    "bootstrap_shutdown",
+    "bootstrap_start_audio_bus",
+    "wire_conversation_pipeline",
 ]
