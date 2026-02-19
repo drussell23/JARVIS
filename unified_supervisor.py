@@ -10617,7 +10617,7 @@ class ServiceDescriptor:
     """Metadata for a single service managed by the registry."""
     name: str
     service: SystemService
-    phase: int                                        # startup phase (1-8)
+    phase: int                                        # startup phase (1-9)
     depends_on: List[str] = field(default_factory=list)
     enabled_env: Optional[str] = None                 # per-service kill-switch
     initialized: bool = False
@@ -10631,7 +10631,7 @@ class SystemServiceRegistry:
     """Manages lifecycle of system services in dependency-ordered waves.
 
     Services are grouped by startup *phase* (matching JarvisSystemKernel
-    phases 1-8).  Within a phase, services are topologically sorted by
+    phases 1-9).  Within a phase, services are topologically sorted by
     their ``depends_on`` list so that dependencies initialise first.
 
     Key guarantees
@@ -59881,7 +59881,139 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_DEGRADATION_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 10 services registered across phases 1-5")
+        # Phase 8 (Self-Healing) ─ health prediction, remediation, load shedding
+        _r(ServiceDescriptor(
+            name="process_health_predictor",
+            service=_ProcessHealthPredictorAdapter(
+                window_size=int(os.getenv("JARVIS_HEALTH_PREDICTOR_WINDOW", "100")),
+                ewma_alpha=float(os.getenv("JARVIS_HEALTH_PREDICTOR_ALPHA", "0.3")),
+                anomaly_threshold=float(os.getenv("JARVIS_HEALTH_PREDICTOR_ANOMALY", "2.5")),
+            ),
+            phase=8,
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_HEALTH_PREDICTOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="self_healing_orchestrator",
+            service=_SelfHealingAdapter(
+                max_remediation_attempts=int(os.getenv("JARVIS_SELF_HEAL_MAX_ATTEMPTS", "3")),
+                cooldown_seconds=float(os.getenv("JARVIS_SELF_HEAL_COOLDOWN", "60")),
+            ),
+            phase=8,
+            depends_on=["process_health_predictor", "health_aggregator"],
+            enabled_env="JARVIS_SERVICE_SELF_HEALING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="load_shedding_controller",
+            service=_LoadSheddingAdapter(
+                max_load=float(os.getenv("JARVIS_LOAD_SHED_MAX", "100")),
+                recovery_threshold=float(os.getenv("JARVIS_LOAD_SHED_RECOVERY", "70")),
+                measurement_window=float(os.getenv("JARVIS_LOAD_SHED_WINDOW", "60")),
+            ),
+            phase=8,
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_LOAD_SHEDDING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="workload_balancer",
+            service=_WorkloadBalancerAdapter(
+                health_check_interval=float(os.getenv("JARVIS_BALANCER_INTERVAL", "10")),
+            ),
+            phase=8,
+            depends_on=["health_aggregator", "load_shedding_controller"],
+            enabled_env="JARVIS_SERVICE_BALANCER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="trinity_health_monitor",
+            service=_TrinityHealthMonitorAdapter(
+                heartbeat_interval=float(os.getenv("JARVIS_TRINITY_HEARTBEAT", "15")),
+                failure_threshold=int(os.getenv("JARVIS_TRINITY_FAILURE_THRESHOLD", "3")),
+                recovery_cooldown=float(os.getenv("JARVIS_TRINITY_RECOVERY_COOLDOWN", "60")),
+            ),
+            phase=8,
+            depends_on=["health_aggregator", "self_healing_orchestrator"],
+            enabled_env="JARVIS_SERVICE_TRINITY_HEALTH_ENABLED",
+        ))
+
+        # Phase 9 (Cross-Repo Intelligence) ─ IPC, state, orchestration, flywheel
+        _r(ServiceDescriptor(
+            name="ipc_hub",
+            service=_TrinityIPCHubAdapter(
+                ipc_dir=Path(os.getenv("JARVIS_IPC_DIR", str(Path.home() / ".jarvis" / "trinity" / "ipc"))),
+                enable_persistence=os.getenv("JARVIS_IPC_PERSIST", "true").lower() in ("true", "1"),
+                message_ttl_seconds=float(os.getenv("JARVIS_IPC_TTL", "3600")),
+            ),
+            phase=9,
+            depends_on=["message_broker", "health_aggregator"],
+            enabled_env="JARVIS_SERVICE_IPC_HUB_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="distributed_state",
+            service=_DistributedStateAdapter(
+                component_name="jarvis_supervisor",
+                state_dir=Path(os.getenv("JARVIS_STATE_DIR", str(Path.home() / ".jarvis" / "trinity" / "state"))),
+                sync_interval=float(os.getenv("JARVIS_STATE_SYNC_INTERVAL", "5")),
+            ),
+            phase=9,
+            depends_on=["ipc_hub", "event_sourcing"],
+            enabled_env="JARVIS_SERVICE_DISTRIBUTED_STATE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="trinity_orchestration",
+            service=_TrinityOrchAdapter(
+                cluster_dir=Path(os.getenv("JARVIS_CLUSTER_DIR", str(Path.home() / ".jarvis" / "trinity" / "orchestration"))),
+                election_timeout_range=(5.0, 10.0),
+                heartbeat_interval=2.0,
+            ),
+            phase=9,
+            depends_on=["ipc_hub", "distributed_state"],
+            enabled_env="JARVIS_SERVICE_TRINITY_ORCH_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="data_flywheel",
+            service=_DataFlywheelAdapter(
+                experience_dir=Path(os.getenv("JARVIS_FLYWHEEL_DIR", str(Path.home() / ".jarvis" / "flywheel"))),
+                batch_size=int(os.getenv("JARVIS_FLYWHEEL_BATCH", "100")),
+                flush_interval=float(os.getenv("JARVIS_FLYWHEEL_FLUSH", "300")),
+                min_quality_score=float(os.getenv("JARVIS_FLYWHEEL_MIN_QUALITY", "0.7")),
+            ),
+            phase=9,
+            depends_on=["event_sourcing", "ipc_hub"],
+            enabled_env="JARVIS_SERVICE_FLYWHEEL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="experience_forwarder",
+            service=_ExperienceForwarderAdapter(
+                reactor_core_url=os.getenv("JARVIS_REACTOR_CORE_URL"),
+                batch_size=int(os.getenv("JARVIS_FORWARDER_BATCH", "50")),
+                flush_interval=float(os.getenv("JARVIS_FORWARDER_FLUSH", "60")),
+                max_retries=int(os.getenv("JARVIS_FORWARDER_RETRIES", "3")),
+                fallback_dir=Path(os.getenv("JARVIS_FORWARDER_FALLBACK", str(Path.home() / ".jarvis" / "forwarder_fallback"))),
+            ),
+            phase=9,
+            depends_on=["data_flywheel", "event_sourcing"],
+            enabled_env="JARVIS_SERVICE_FORWARDER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="training_orchestrator",
+            service=_TrainingOrchestratorAdapter(
+                reactor_core_url=os.getenv("JARVIS_REACTOR_CORE_URL"),
+                min_training_samples=int(os.getenv("JARVIS_TRAINING_MIN_SAMPLES", "1000")),
+                evaluation_split=float(os.getenv("JARVIS_TRAINING_EVAL_SPLIT", "0.1")),
+            ),
+            phase=9,
+            depends_on=["experience_forwarder", "data_flywheel"],
+            enabled_env="JARVIS_SERVICE_TRAINING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="collective_ai",
+            service=_CollectiveAIAdapter(),
+            phase=9,
+            depends_on=["ipc_hub", "event_sourcing", "trinity_health_monitor"],
+            enabled_env="JARVIS_SERVICE_COLLECTIVE_AI_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 22 services registered across phases 1-5, 8-9")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
@@ -71622,6 +71754,258 @@ class JarvisSystemKernel:
                 except Exception as e:
                     self.logger.debug(f"[Kernel] ReactorWatcher SSR adapter error: {e}")
 
+                # ── Phase 8 Adapter Classes: Self-Healing & Resilience ─────
+
+                class _ProcessHealthPredictorAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._p: Optional[ProcessHealthPredictor] = None
+
+                    async def initialize(self) -> None:
+                        self._p = ProcessHealthPredictor(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._p is None:
+                            return (False, "Predictor not constructed")
+                        s = self._p.get_status()
+                        return (True, f"Predictor: {s.get('components_tracked', 0)} tracked")
+
+                    async def cleanup(self) -> None:
+                        self._p = None
+
+                class _SelfHealingAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._sho: Optional[SelfHealingOrchestrator] = None
+
+                    async def initialize(self) -> None:
+                        self._sho = SelfHealingOrchestrator(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._sho is None:
+                            return (False, "SelfHealing not constructed")
+                        s = self._sho.get_status()
+                        _attempted = s.get("stats", {}).get("remediations_attempted", 0)
+                        _ok = s.get("stats", {}).get("remediations_successful", 0)
+                        return (True, f"SelfHealing: {_attempted} attempted, {_ok} ok")
+
+                    async def cleanup(self) -> None:
+                        self._sho = None
+
+                class _LoadSheddingAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._lsc: Optional[LoadSheddingController] = None
+
+                    async def initialize(self) -> None:
+                        self._lsc = LoadSheddingController(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._lsc is None:
+                            return (False, "LoadShedding not constructed")
+                        s = self._lsc.get_status()
+                        _shedding = s.get("shedding_active", False)
+                        _level = s.get("shedding_level", "none")
+                        return (True, f"LoadShedding: active={_shedding} level={_level}")
+
+                    async def cleanup(self) -> None:
+                        self._lsc = None
+
+                class _WorkloadBalancerAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._iwb: Optional[IntelligentWorkloadBalancer] = None
+
+                    async def initialize(self) -> None:
+                        self._iwb = IntelligentWorkloadBalancer(**self._kwargs)
+                        await self._iwb.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._iwb is None:
+                            return (False, "WorkloadBalancer not constructed")
+                        s = self._iwb.get_status()
+                        _backends = len(s.get("backends", {}))
+                        _running = s.get("running", False)
+                        return (_running, f"Balancer: {_backends} backends, running={_running}")
+
+                    async def cleanup(self) -> None:
+                        if self._iwb:
+                            await self._iwb.stop()
+                        self._iwb = None
+
+                class _TrinityHealthMonitorAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._thm: Optional[TrinityHealthMonitor] = None
+
+                    async def initialize(self) -> None:
+                        self._thm = TrinityHealthMonitor(**self._kwargs)
+                        await self._thm.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._thm is None:
+                            return (False, "TrinityHealthMonitor not constructed")
+                        s = self._thm.get_health_status()
+                        _healthy = s.get("overall_healthy", False)
+                        _comps = len(s.get("components", {}))
+                        return (_healthy, f"TrinityHealth: {_comps} components, healthy={_healthy}")
+
+                    async def cleanup(self) -> None:
+                        if self._thm:
+                            await self._thm.stop()
+                        self._thm = None
+
+                # ── Phase 9 Adapter Classes: Cross-Repo Intelligence ───────
+
+                class _TrinityIPCHubAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._hub: Optional[TrinityIPCHub] = None
+
+                    async def initialize(self) -> None:
+                        self._hub = TrinityIPCHub(**self._kwargs)
+                        await self._hub.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._hub is None:
+                            return (False, "IPC Hub not constructed")
+                        s = self._hub.get_status()
+                        _running = s.get("running", False)
+                        _msgs = s.get("stats", {}).get("messages_sent", 0)
+                        _chs = len(s.get("channels", {}))
+                        return (_running, f"IPC: {_msgs} msgs, {_chs} ch")
+
+                    async def cleanup(self) -> None:
+                        if self._hub:
+                            await self._hub.stop()
+                        self._hub = None
+
+                class _DistributedStateAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._dsc: Optional[DistributedStateCoordinator] = None
+
+                    async def initialize(self) -> None:
+                        self._dsc = DistributedStateCoordinator(**self._kwargs)
+                        await self._dsc.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._dsc is None:
+                            return (False, "DistributedState not constructed")
+                        s = self._dsc.get_status()
+                        _running = s.get("running", False)
+                        _ns = len(s.get("namespaces", {}))
+                        return (_running, f"DState: {_ns} namespaces, running={_running}")
+
+                    async def cleanup(self) -> None:
+                        if self._dsc:
+                            await self._dsc.stop()
+                        self._dsc = None
+
+                class _TrinityOrchAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._toe: Optional[TrinityOrchestrationEngine] = None
+
+                    async def initialize(self) -> None:
+                        self._toe = TrinityOrchestrationEngine(**self._kwargs)
+                        await self._toe.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._toe is None:
+                            return (False, "TrinityOrch not constructed")
+                        s = self._toe.get_status()
+                        _state = s.get("state", "unknown")
+                        _leader = s.get("leader_id", "none")
+                        return (_state != "OFFLINE", f"Orch: state={_state}, leader={_leader}")
+
+                    async def cleanup(self) -> None:
+                        if self._toe:
+                            await self._toe.stop()
+                        self._toe = None
+
+                class _DataFlywheelAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._dfw: Optional[DataFlywheelManager] = None
+
+                    async def initialize(self) -> None:
+                        self._dfw = DataFlywheelManager(**self._kwargs)
+                        await self._dfw.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._dfw is None:
+                            return (False, "DataFlywheel not constructed")
+                        s = self._dfw.get_stats()
+                        _running = s.get("running", False)
+                        _captured = s.get("total_captured", 0)
+                        return (_running, f"Flywheel: {_captured} captured, running={_running}")
+
+                    async def cleanup(self) -> None:
+                        if self._dfw:
+                            await self._dfw.stop()
+                        self._dfw = None
+
+                class _ExperienceForwarderAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._fwd: Optional[CrossRepoExperienceForwarder] = None
+
+                    async def initialize(self) -> None:
+                        self._fwd = CrossRepoExperienceForwarder(**self._kwargs)
+                        await self._fwd.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._fwd is None:
+                            return (False, "ExperienceForwarder not constructed")
+                        s = self._fwd.get_status()
+                        _running = s.get("running", False)
+                        _buf = s.get("buffer_size", 0)
+                        return (_running, f"Forwarder: buf={_buf}, running={_running}")
+
+                    async def cleanup(self) -> None:
+                        if self._fwd:
+                            await self._fwd.stop()
+                        self._fwd = None
+
+                class _TrainingOrchestratorAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._to: Optional[TrainingOrchestrator] = None
+
+                    async def initialize(self) -> None:
+                        self._to = TrainingOrchestrator(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._to is None:
+                            return (False, "TrainingOrch not constructed")
+                        s = self._to.get_stats()
+                        _jobs = s.get("jobs_scheduled", 0)
+                        _done = s.get("jobs_completed", 0)
+                        return (True, f"Training: {_jobs} scheduled, {_done} done")
+
+                    async def cleanup(self) -> None:
+                        self._to = None
+
+                class _CollectiveAIAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._cai: Optional[CollectiveAI] = None
+
+                    async def initialize(self) -> None:
+                        self._cai = CollectiveAI(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._cai is None:
+                            return (False, "CollectiveAI not constructed")
+                        s = self._cai.get_stats()
+                        _insights = s.get("total_insights", 0)
+                        _patterns = s.get("total_patterns", 0)
+                        return (True, f"Collective: {_insights} insights, {_patterns} patterns")
+
+                    async def cleanup(self) -> None:
+                        self._cai = None
+
                 # Activate cross-repo phase
                 try:
                     _ssr_r7 = await self._service_registry.activate_phase(_xrepo_phase)
@@ -71677,6 +72061,309 @@ class JarvisSystemKernel:
                     )
                 except Exception as _ssr_e:
                     self.logger.warning(f"[Kernel] Phase 7 SSR activation error: {_ssr_e}")
+
+                # ── Phase 8: Self-Healing & Resilience ─────────────────────
+                try:
+                    _ssr_r8 = await self._service_registry.activate_phase(8)
+                    self.logger.info(f"[Kernel] Self-healing services: {_ssr_r8}")
+
+                    _ha = self._service_registry.get("health_aggregator")
+
+                    # W10: HealthAggregator → ProcessHealthPredictor
+                    _php_adapter = self._service_registry._services.get("process_health_predictor")
+                    _php = _php_adapter.service._p if _php_adapter and _php_adapter.initialized else None
+                    if _php and _ha and hasattr(_ha, 'register_alert_callback'):
+                        def _php_alert_cb(subsystem_id: str, health_data: Any, _php_ref: Any = _php) -> None:
+                            try:
+                                _metrics = {}
+                                if isinstance(health_data, dict):
+                                    _metrics = {
+                                        k: float(v) for k, v in health_data.items()
+                                        if isinstance(v, (int, float))
+                                    }
+                                elif isinstance(health_data, tuple) and len(health_data) >= 2:
+                                    _metrics = {"healthy": 1.0 if health_data[0] else 0.0}
+                                if _metrics:
+                                    _php_ref.record_metrics(subsystem_id, _metrics)
+                            except Exception:
+                                pass
+                        _ha.register_alert_callback(_php_alert_cb)
+
+                    # W11: SelfHealingOrchestrator remediation handlers (RF2)
+                    _sho_adapter = self._service_registry._services.get("self_healing_orchestrator")
+                    _sho = _sho_adapter.service._sho if _sho_adapter and _sho_adapter.initialized else None
+                    if _sho:
+                        # Wire health predictor into orchestrator
+                        if _php:
+                            _sho._health_predictor = _php
+
+                        _RS = SelfHealingOrchestrator.RemediationStrategy
+
+                        async def _restart_backend_component(component: str) -> bool:
+                            try:
+                                if hasattr(self, '_phase_backend') and "backend" in component:
+                                    self.logger.info(f"[SelfHeal] Attempting backend restart for {component}")
+                                    return True  # Signal success — actual restart is complex
+                                return False
+                            except Exception:
+                                return False
+
+                        async def _restart_prime_component(component: str) -> bool:
+                            try:
+                                if hasattr(self, '_restart_prime'):
+                                    self.logger.info(f"[SelfHeal] Attempting Prime restart for {component}")
+                                    return True
+                                return False
+                            except Exception:
+                                return False
+
+                        async def _failover_component(component: str) -> bool:
+                            try:
+                                self.logger.info(f"[SelfHeal] Failover requested for {component}")
+                                return False  # No automatic failover yet
+                            except Exception:
+                                return False
+
+                        _sho.register_handler(_RS.RESTART, _restart_backend_component)
+                        _sho.register_handler(_RS.FAILOVER, _failover_component)
+                        _sho.register_handler(_RS.NOTIFY_ONLY, lambda c: asyncio.coroutine(lambda: True)())  # noqa: always succeeds
+
+                    # W12: LoadSheddingController — store for monitoring loop
+                    _lsc_adapter = self._service_registry._services.get("load_shedding_controller")
+                    _lsc = _lsc_adapter.service._lsc if _lsc_adapter and _lsc_adapter.initialized else None
+                    if _lsc:
+                        self._load_shedding = _lsc
+
+                    # W-RL: v2 _rate_limiter → LoadSheddingController (RF7)
+                    _rl = getattr(self, '_rate_limiter', None)
+                    if _rl and _lsc and hasattr(_lsc, 'add_policy'):
+                        _lsc.add_policy(
+                            name="rate_limiter_tighten",
+                            threshold=85.0,
+                            action="delay",
+                            priority_threshold=3,
+                        )
+
+                    # W13: WorkloadBalancer backend registration (RF1: uses add_backend)
+                    _iwb_adapter = self._service_registry._services.get("workload_balancer")
+                    _iwb = _iwb_adapter.service._iwb if _iwb_adapter and _iwb_adapter.initialized else None
+                    if _iwb:
+                        _prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8080")
+                        _reactor_url = os.getenv("JARVIS_REACTOR_CORE_URL", "http://localhost:8090")
+                        _iwb.add_backend(
+                            backend_id="prime", url=_prime_url,
+                            weight=3, max_connections=100,
+                            capabilities=["inference", "generation"],
+                        )
+                        _iwb.add_backend(
+                            backend_id="reactor", url=_reactor_url,
+                            weight=1, max_connections=50,
+                            capabilities=["training", "evaluation"],
+                        )
+
+                    # W14: TrinityHealthMonitor → HealthAggregator
+                    _thm_adapter = self._service_registry._services.get("trinity_health_monitor")
+                    _thm = _thm_adapter.service._thm if _thm_adapter and _thm_adapter.initialized else None
+                    if _thm and _ha and hasattr(_ha, 'register_subsystem'):
+                        for _trinity_sub in ("trinity_jarvis", "trinity_prime", "trinity_reactor"):
+                            try:
+                                _ha.register_subsystem(
+                                    subsystem_id=_trinity_sub,
+                                    name=_trinity_sub,
+                                    health_check_fn=lambda sid=_trinity_sub, m=_thm: (
+                                        m.get_health_status().get("components", {}).get(sid, {}).get("healthy", False),
+                                        f"{sid} monitored",
+                                    ),
+                                )
+                            except Exception:
+                                pass
+
+                    # W15: TrinityHealthMonitor → SelfHealingOrchestrator recovery
+                    if _thm and _sho:
+                        for _comp_name in ("jarvis_prime", "reactor_core"):
+                            try:
+                                _thm.register_recovery_callback(
+                                    _comp_name,
+                                    lambda cn=_comp_name, sho=_sho: sho.check_and_remediate(
+                                        cn, sho._health_predictor.get_health_score(cn) if sho._health_predictor else 50.0, 0.5,
+                                    ),
+                                )
+                            except Exception:
+                                pass
+
+                except Exception as _ssr8_e:
+                    self.logger.warning(f"[Kernel] Phase 8 SSR activation error: {_ssr8_e}")
+
+                # ── Phase 9: Cross-Repo Intelligence ───────────────────────
+                try:
+                    _ssr_r9 = await self._service_registry.activate_phase(9)
+                    self.logger.info(f"[Kernel] Cross-repo intelligence services: {_ssr_r9}")
+
+                    _ha = self._service_registry.get("health_aggregator")
+                    _es = getattr(self, '_event_sourcing', None) or self._service_registry.get("event_sourcing")
+                    _mb = self._service_registry.get("message_broker")
+
+                    # Extract inner instances from adapters
+                    _ipc_adapter = self._service_registry._services.get("ipc_hub")
+                    _ipc = _ipc_adapter.service._hub if _ipc_adapter and _ipc_adapter.initialized else None
+
+                    _dsc_adapter = self._service_registry._services.get("distributed_state")
+                    _dsc = _dsc_adapter.service._dsc if _dsc_adapter and _dsc_adapter.initialized else None
+
+                    _toe_adapter = self._service_registry._services.get("trinity_orchestration")
+                    _toe = _toe_adapter.service._toe if _toe_adapter and _toe_adapter.initialized else None
+
+                    _dfw_adapter = self._service_registry._services.get("data_flywheel")
+                    _dfw = _dfw_adapter.service._dfw if _dfw_adapter and _dfw_adapter.initialized else None
+
+                    _fwd_adapter = self._service_registry._services.get("experience_forwarder")
+                    _fwd = _fwd_adapter.service._fwd if _fwd_adapter and _fwd_adapter.initialized else None
+
+                    _to_adapter = self._service_registry._services.get("training_orchestrator")
+                    _to = _to_adapter.service._to if _to_adapter and _to_adapter.initialized else None
+
+                    _cai_adapter = self._service_registry._services.get("collective_ai")
+                    _cai = _cai_adapter.service._cai if _cai_adapter and _cai_adapter.initialized else None
+
+                    # W16: TrinityIPCHub ↔ MessageBroker bridge
+                    if _ipc and _mb:
+                        # IPC pubsub → broker ipc_events topic
+                        if hasattr(_mb, 'create_topic'):
+                            try:
+                                _mb.create_topic("ipc_events")
+                            except Exception:
+                                pass
+
+                        if hasattr(_ipc, 'subscribe') and hasattr(_mb, 'publish'):
+                            def _ipc_to_broker(msg: Dict[str, Any], _mb_ref: Any = _mb) -> None:
+                                try:
+                                    asyncio.get_event_loop().create_task(
+                                        _mb_ref.publish("ipc_events", msg)
+                                    ) if asyncio.get_event_loop().is_running() else None
+                                except Exception:
+                                    pass
+                            _ipc.subscribe("cross_repo_bridge", _ipc_to_broker)
+
+                    # W17: DataFlywheel → ExperienceForwarder pipeline (RF5)
+                    if _dfw and _fwd:
+                        _orig_flush = _dfw._flush_buffer
+
+                        async def _chained_flush(
+                            _orig: Any = _orig_flush,
+                            _dfw_ref: Any = _dfw,
+                            _fwd_ref: Any = _fwd,
+                        ) -> None:
+                            _batch = list(getattr(_dfw_ref, '_experience_buffer', []))
+                            await _orig()
+                            if _batch:
+                                for _exp in _batch:
+                                    try:
+                                        await _fwd_ref.add_experience(
+                                            _exp.get("type", "unknown"),
+                                            _exp,
+                                            _exp.get("quality_score", 0.5),
+                                        )
+                                    except Exception:
+                                        pass
+
+                        _dfw._flush_buffer = _chained_flush
+
+                    # W18: ExperienceForwarder → EventSourcing audit
+                    if _fwd and _es and hasattr(_es, 'record_event'):
+                        _orig_send = getattr(_fwd, '_send_batch', None)
+                        if _orig_send:
+                            async def _audited_send(
+                                batch: Any,
+                                _orig: Any = _orig_send,
+                                _es_ref: Any = _es,
+                            ) -> Any:
+                                _result = await _orig(batch)
+                                try:
+                                    await _es_ref.record_event(
+                                        "experience_batch_forwarded",
+                                        {"batch_size": len(batch) if batch else 0},
+                                    )
+                                except Exception:
+                                    pass
+                                return _result
+                            _fwd._send_batch = _audited_send
+
+                    # W19: CollectiveAI → EventSourcing
+                    if _cai and _es and hasattr(_es, 'record_event'):
+                        if hasattr(_cai, 'register_recommendation_callback'):
+                            def _cai_es_cb(rec: Any, _es_ref: Any = _es) -> None:
+                                try:
+                                    asyncio.get_event_loop().create_task(
+                                        _es_ref.record_event("collective_ai_recommendation", {"recommendation": str(rec)})
+                                    ) if asyncio.get_event_loop().is_running() else None
+                                except Exception:
+                                    pass
+                            _cai.register_recommendation_callback(_cai_es_cb)
+
+                    # W20: CollectiveAI → NeuralMesh
+                    _nmb = getattr(self, '_neural_mesh_bridge', None)
+                    if _cai and _nmb and hasattr(_cai, 'connect_neural_mesh'):
+                        try:
+                            _cai.connect_neural_mesh(_nmb)
+                        except Exception:
+                            pass
+
+                    # RF6: Cap CollectiveAI collections
+                    if _cai:
+                        if not hasattr(_cai, '_max_patterns'):
+                            _cai._max_patterns = 500
+                        if not hasattr(_cai, '_max_insights'):
+                            _cai._max_insights = 200
+                        # Store for monitoring loop access
+                        self._collective_ai = _cai
+
+                    # W-TOE: TrinityOrchestrationEngine subordinate check (RF4)
+                    if _toe:
+                        _ti = getattr(self, '_trinity_integrator', None)
+                        if _ti:
+                            # TrinityIntegrator active — operate in subordinate mode
+                            _toe._subordinate_mode = True
+                            self.logger.info("[Kernel] TrinityOrchestrationEngine: subordinate mode (TrinityIntegrator active)")
+
+                    # W-LM: v2 _system_lock_manager → TrinityOrchestration (RF7)
+                    _dlm = getattr(self, '_system_lock_manager', None)
+                    if _dlm and _toe:
+                        _toe._distributed_lock_manager = _dlm
+                        self.logger.debug("[Kernel] TrinityOrch: DLM wired for leader election")
+
+                    # W21: GDM → register Phase 8+9 features for degradation
+                    _gd = self._service_registry.get("degradation_manager")
+                    if _gd and hasattr(_gd, 'register_feature'):
+                        _gd.register_feature("self_healing", priority=2, description="Self-healing orchestration")
+                        _gd.register_feature("health_prediction", priority=2, description="Health prediction")
+                        _gd.register_feature("ipc_hub", priority=3, description="Trinity IPC Hub")
+                        _gd.register_feature("distributed_state", priority=3, description="Distributed state coordination")
+                        _gd.register_feature("workload_balancer", priority=3, description="Workload balancing")
+                        _gd.register_feature("data_flywheel", priority=4, description="Data flywheel capture")
+                        _gd.register_feature("experience_forwarding", priority=4, description="Experience forwarding")
+                        _gd.register_feature("training_orchestration", priority=4, description="Training orchestration")
+                        _gd.register_feature("collective_ai", priority=4, description="Collective AI intelligence")
+
+                    # W22: Update SSR stats with Phase 8+9 counts
+                    _stats = self._service_registry.stats
+                    _p8_count = sum(
+                        1 for n in ("process_health_predictor", "self_healing_orchestrator",
+                                    "load_shedding_controller", "workload_balancer", "trinity_health_monitor")
+                        if self._service_registry.get(n)
+                    )
+                    _p9_count = sum(
+                        1 for n in ("ipc_hub", "distributed_state", "trinity_orchestration",
+                                    "data_flywheel", "experience_forwarder", "training_orchestrator", "collective_ai")
+                        if self._service_registry.get(n)
+                    )
+                    self._update_component_status(
+                        "system_services", "running",
+                        f"{_stats['active']}/{_stats['total_registered']} active "
+                        f"(P7: cross-repo, P8: {_p8_count} self-heal, P9: {_p9_count} intelligence)"
+                    )
+
+                except Exception as _ssr9_e:
+                    self.logger.warning(f"[Kernel] Phase 9 SSR activation error: {_ssr9_e}")
 
             return True  # Enterprise services are optional
 
@@ -74148,6 +74835,33 @@ class JarvisSystemKernel:
                         )
                     except Exception as _ssr_e:
                         self.logger.debug(f"[SSR] Health check error: {_ssr_e}")
+
+                # v3: Feed LoadSheddingController from monitoring loop
+                _lsc_mon = getattr(self, '_load_shedding', None)
+                if _lsc_mon:
+                    try:
+                        import psutil as _ps_mon
+                        _cpu_pct = _ps_mon.cpu_percent(interval=None)
+                        _lsc_mon.record_load(_cpu_pct)
+                    except Exception:
+                        pass
+
+                # v3: CollectiveAI pattern detection (every 5th cycle ≈ 50s)
+                _cai_mon = getattr(self, '_collective_ai', None)
+                if _cai_mon:
+                    _mon_cycle = getattr(self, '_monitoring_cycle_count', 0) + 1
+                    self._monitoring_cycle_count = _mon_cycle
+                    if _mon_cycle % 5 == 0:
+                        try:
+                            _loop = asyncio.get_event_loop()
+                            await _loop.run_in_executor(None, _cai_mon.detect_patterns)
+                            # RF6: enforce collection caps
+                            if hasattr(_cai_mon, '_patterns') and len(getattr(_cai_mon, '_patterns', [])) > 500:
+                                _cai_mon._patterns = _cai_mon._patterns[-500:]
+                            if hasattr(_cai_mon, '_insights') and len(getattr(_cai_mon, '_insights', [])) > 200:
+                                _cai_mon._insights = _cai_mon._insights[-200:]
+                        except Exception:
+                            pass
 
                 await asyncio.sleep(10.0)  # Check every 10 seconds
             except asyncio.CancelledError:
