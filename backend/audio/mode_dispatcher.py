@@ -191,7 +191,7 @@ class ModeDispatcher:
                 self._conversation_task = None
 
             # Stop continuous speaker verification
-            self._stop_speaker_verification()
+            await self._stop_speaker_verification()
 
             # Disable conversation mode in speech state
             if self._speech_state is not None:
@@ -602,9 +602,12 @@ class ModeDispatcher:
             except queue.Empty:
                 break
 
+        # Cap at ~30s of audio at 50fps (16kHz/320 samples per frame)
+        max_queue_depth = 1500
+
         def _on_speaker_frame(frame: np.ndarray) -> None:
             """Accumulate frames for periodic speaker verification (thread-safe)."""
-            if frame.size > 0:
+            if frame.size > 0 and self._speaker_audio_queue.qsize() < max_queue_depth:
                 self._speaker_audio_queue.put_nowait(frame.copy())
 
         self._speaker_audio_consumer = _on_speaker_frame
@@ -615,10 +618,14 @@ class ModeDispatcher:
         )
         logger.info("[ModeDispatcher] Speaker verification monitor started")
 
-    def _stop_speaker_verification(self) -> None:
-        """Stop continuous speaker verification."""
+    async def _stop_speaker_verification(self) -> None:
+        """Stop continuous speaker verification and await task cancellation."""
         if self._speaker_verification_task is not None:
             self._speaker_verification_task.cancel()
+            try:
+                await self._speaker_verification_task
+            except asyncio.CancelledError:
+                pass
             self._speaker_verification_task = None
 
         if self._speaker_audio_consumer is not None and self._audio_bus is not None:
@@ -673,13 +680,18 @@ class ModeDispatcher:
                     confidence = await self._verify_speaker_identity(audio_data)
                     self._last_speaker_confidence = confidence
 
-                    # Feed result to VBIA adapter cache
-                    if self._vbia_adapter is not None:
+                    # Feed result to VBIA adapter cache (only if above threshold;
+                    # below-threshold results trigger escalation, and caching a
+                    # failure would poison the biometric fallback path)
+                    if (
+                        self._vbia_adapter is not None
+                        and confidence >= self._speaker_confidence_threshold
+                    ):
                         self._vbia_adapter.set_verification_result(
                             confidence=confidence,
                             speaker_id="owner",
-                            is_owner=confidence >= self._speaker_confidence_threshold,
-                            verified=confidence >= self._speaker_confidence_threshold,
+                            is_owner=True,
+                            verified=True,
                             metadata={
                                 "source": "continuous_verification",
                                 "mode": "conversation",
@@ -689,6 +701,9 @@ class ModeDispatcher:
 
                     # Auto-escalate if confidence drops
                     if confidence < self._speaker_confidence_threshold:
+                        # Guard: mode may have changed during verification
+                        if self._current_mode != VoiceMode.CONVERSATION:
+                            return
                         logger.warning(
                             f"[ModeDispatcher] Speaker confidence dropped: "
                             f"{confidence:.2f} < {self._speaker_confidence_threshold}"
@@ -710,21 +725,13 @@ class ModeDispatcher:
         Verify speaker identity from audio data.
 
         Returns confidence score (0.0 to 1.0).
-        Uses VBIA adapter (lighter weight) or voice unlock service.
-        """
-        # Try VBIA adapter first (lighter weight, designed for continuous use)
-        if self._vbia_adapter is not None:
-            try:
-                threshold = self._speaker_confidence_threshold
-                passed, confidence = await asyncio.wait_for(
-                    self._vbia_adapter.verify_speaker(threshold),
-                    timeout=5.0,
-                )
-                return confidence
-            except Exception:
-                pass
 
-        # Fallback: voice unlock service
+        Uses voice unlock service (processes raw audio). Does NOT call
+        VBIA adapter's verify_speaker() here — that reads the cache we
+        populate via set_verification_result(), which would create a
+        circular dependency.
+        """
+        # Voice unlock service — actually processes audio_data
         if self._voice_unlock_service is not None:
             try:
                 result = await asyncio.wait_for(
