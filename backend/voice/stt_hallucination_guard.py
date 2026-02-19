@@ -217,6 +217,7 @@ class VerificationResult(Enum):
     SUSPECTED = "suspected"
     CONFIRMED = "confirmed"
     CORRECTED = "corrected"
+    VERIFIED = "verified"
 
 
 class ReasoningStep(Enum):
@@ -1239,6 +1240,16 @@ class STTHallucinationGuard:
         Returns:
             Tuple of (result, detection_details, final_text)
         """
+
+        # In conversation mode, partial transcripts are expected to have
+        # lower confidence and AEC artifacts. Skip aggressive filtering
+        # for high-confidence conversation input.
+        if conversation_mode and confidence > 0.6:
+            return (
+                VerificationResult.VERIFIED,
+                None,
+                transcription,
+            )
         start_time = time.time()
         self.metrics['total_checks'] += 1
 
