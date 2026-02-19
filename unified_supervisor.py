@@ -60979,6 +60979,15 @@ class JarvisSystemKernel:
             except Exception:
                 pass
 
+        # v241.0: Shutdown Voice Unlock System (cleanup auth state, release models)
+        if hasattr(self, '_voice_unlock_service') and self._voice_unlock_service:
+            try:
+                from backend.voice_unlock import cleanup_voice_unlock
+                await asyncio.wait_for(cleanup_voice_unlock(), timeout=10.0)
+                self.logger.info("[Kernel] Voice Unlock System stopped")
+            except Exception:
+                pass
+
         # Stop backend deterministically (in-process first, then subprocess fallback)
         if self._backend_server or self._backend_server_task:
             await self._stop_backend_in_process(
@@ -71731,6 +71740,111 @@ class JarvisSystemKernel:
                 self.logger.debug("[Zone6/DI] DI container module not available")
             except Exception as e:
                 self.logger.warning(f"[Zone6/DI] ⚠ Error: {e}")
+
+            # v241.0: Voice Unlock Authentication System — full stack initialization
+            # Activates: IntelligentVoiceUnlockService, LangGraph reasoning,
+            #            LangChain MFA orchestrator, ChromaDB pattern memory,
+            #            Langfuse audit trail, Helicone cost tracker
+            _voice_unlock_status: Dict[str, Any] = {
+                "initialized": False,
+                "subsystems_active": 0,
+                "subsystems_total": 5,
+                "enabled": False,
+            }
+            try:
+                from backend.voice_unlock import (
+                    initialize_voice_unlock,
+                    get_voice_auth_reasoning_graph,
+                    get_voice_pattern_memory,
+                    get_voice_auth_orchestrator,
+                    get_voice_auth_tracer,
+                    get_voice_auth_cost_tracker,
+                )
+                if os.getenv("JARVIS_VOICE_UNLOCK_ENABLED", "true").lower() in (
+                    "true", "1", "yes"
+                ):
+                    _voice_unlock_status["enabled"] = True
+
+                    # Core service — orchestrates all voice auth subsystems
+                    _voice_svc = await asyncio.wait_for(
+                        initialize_voice_unlock(), timeout=SERVICE_TIMEOUT,
+                    )
+                    if _voice_svc:
+                        self._voice_unlock_service = _voice_svc
+                        _voice_unlock_status["initialized"] = True
+                        self.logger.info("[Zone6/VoiceUnlock] ✓ Core service ready")
+                    else:
+                        self.logger.warning("[Zone6/VoiceUnlock] ⚠ Core service unavailable")
+
+                    # Subsystem warm-up — each is optional, failures don't block
+                    _subsystems = {
+                        "LangGraph reasoning": get_voice_auth_reasoning_graph,
+                        "ChromaDB patterns": get_voice_pattern_memory,
+                        "LangChain orchestrator": get_voice_auth_orchestrator,
+                        "Langfuse tracer": get_voice_auth_tracer,
+                        "Helicone cost tracker": get_voice_auth_cost_tracker,
+                    }
+                    _active = 0
+                    for _sub_name, _sub_init in _subsystems.items():
+                        try:
+                            _sub_result = await asyncio.wait_for(
+                                _sub_init(), timeout=SERVICE_TIMEOUT,
+                            )
+                            if _sub_result is not None:
+                                _active += 1
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as _sub_err:
+                            self.logger.debug(
+                                f"[Zone6/VoiceUnlock] {_sub_name}: {_sub_err}"
+                            )
+                    _voice_unlock_status["subsystems_active"] = _active
+                    self.logger.info(
+                        f"[Zone6/VoiceUnlock] ✓ Subsystems: {_active}/{len(_subsystems)} active"
+                    )
+                else:
+                    self.logger.info(
+                        "[Zone6/VoiceUnlock] ○ Disabled via JARVIS_VOICE_UNLOCK_ENABLED"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"[Zone6/VoiceUnlock] ⏱️ Core service timed out after {SERVICE_TIMEOUT}s"
+                )
+            except ImportError:
+                self.logger.debug("[Zone6/VoiceUnlock] Voice unlock module not available")
+            except Exception as e:
+                self.logger.warning(f"[Zone6/VoiceUnlock] ⚠ Error: {e}")
+
+            # Store voice unlock status in enterprise status + emit event
+            self._enterprise_status["voice_unlock"] = _voice_unlock_status
+            if self._readiness_manager:
+                self._readiness_manager.mark_component_ready(
+                    "voice_unlock", _voice_unlock_status["initialized"]
+                )
+            try:
+                get_event_bus().emit(SupervisorEvent(
+                    event_type=SupervisorEventType.COMPONENT_STATUS,
+                    timestamp=time.time(),
+                    message=(
+                        f"Voice Unlock: {'ready' if _voice_unlock_status['initialized'] else 'unavailable'}"
+                        f" ({_voice_unlock_status['subsystems_active']}/{_voice_unlock_status['subsystems_total']} subsystems)"
+                    ),
+                    severity=(
+                        SupervisorEventSeverity.SUCCESS
+                        if _voice_unlock_status["initialized"]
+                        else SupervisorEventSeverity.WARNING
+                    ),
+                    phase="enterprise",
+                    component="voice_unlock",
+                    metadata=(
+                        ("initialized", _voice_unlock_status["initialized"]),
+                        ("subsystems_active", _voice_unlock_status["subsystems_active"]),
+                    ),
+                ))
+            except Exception:
+                pass  # Event bus emission is best-effort
 
             # v239.0: System Service Registry — Phase 6 (Training pipeline adapters)
             if self._service_registry:
