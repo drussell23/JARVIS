@@ -248,7 +248,7 @@ class CircuitBreaker:
 
             return result
 
-        except Exception as exc:
+        except Exception:
             # Handle failure
             async with self._lock:
                 if current_state == CircuitState.HALF_OPEN:

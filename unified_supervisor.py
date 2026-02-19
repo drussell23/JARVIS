@@ -3024,6 +3024,8 @@ class UnifiedLogger:
         self._verbose = _get_env_bool("JARVIS_VERBOSE", False)
         self._colors_enabled = sys.stdout.isatty()
         self._log_lock = threading.Lock()
+        # v239.0: External metrics sink (set by SSR Wire 1 → ObservabilityPipeline)
+        self._external_metrics_sink: Optional[Any] = None
 
     def _elapsed_ms(self) -> float:
         """Get elapsed time since logger start in milliseconds."""
@@ -3099,6 +3101,15 @@ class UnifiedLogger:
         duration = (time.perf_counter() - self._active_phases.pop(phase_name)) * 1000
         self._phase_times[phase_name] = duration
         self._metrics[phase_name].append(duration)
+        # v239.0 Wire 1: forward to ObservabilityPipeline if available
+        _sink = self._external_metrics_sink
+        if _sink is not None:
+            try:
+                _record = getattr(_sink, 'record_histogram', None) or getattr(_sink, 'record_metric', None)
+                if callable(_record):
+                    _record(f"phase.{phase_name}.duration_ms", duration)
+            except Exception:
+                pass
         return duration
 
     @contextmanager
@@ -9935,6 +9946,19 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
         Returns:
             Cache result dict if hit, None if miss
         """
+        # v239.0 Wire 3: L1/L2 fast path via CacheHierarchyManager (< 1ms)
+        _hcache = getattr(self, '_hierarchy_cache', None)
+        if _hcache is not None:
+            _key = f"voice:{speaker_filter or 'any'}:{hash(tuple(embedding[:8]))}"
+            try:
+                _get = getattr(_hcache, 'get', None)
+                _cached = await _get(_key) if callable(_get) and asyncio.iscoroutinefunction(_get) else (_get(_key) if callable(_get) else None)
+                if _cached is not None:
+                    self._cache_hits += 1
+                    return _cached
+            except Exception:
+                pass  # fall through to ChromaDB
+
         if not self.enabled or not self._collection:
             self._cache_misses += 1
             return None
@@ -10029,6 +10053,28 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
                 metadatas=[cache_metadata],
                 ids=[cache_id]
             )
+
+            # v239.0 Wire 3: write-through to L1/L2 CacheHierarchyManager
+            _hcache = getattr(self, '_hierarchy_cache', None)
+            if _hcache is not None:
+                _key = f"voice:{speaker_name}:{hash(tuple(embedding[:8]))}"
+                _result = {
+                    "cached": True,
+                    "similarity": 1.0,
+                    "speaker_name": speaker_name,
+                    "confidence": confidence,
+                    "verified": verified,
+                    "cached_at": cache_metadata["timestamp"],
+                    "age_hours": 0.0,
+                }
+                try:
+                    _put = getattr(_hcache, 'set', None) or getattr(_hcache, 'put', None)
+                    if callable(_put):
+                        _r = _put(_key, _result)
+                        if asyncio.iscoroutine(_r):
+                            await _r
+                except Exception:
+                    pass
 
             # Trigger cleanup if over limit
             if self._collection.count() > self.max_entries:
@@ -10612,14 +10658,37 @@ class SystemServiceRegistry:
 
     # ── activation ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _current_rss_mb() -> float:
+        """Return current RSS in MB.  Uses psutil (accurate) with
+        fallback to resource.getrusage (peak RSS only, less accurate)."""
+        try:
+            import psutil
+            return psutil.Process().memory_info().rss / (1024 * 1024)
+        except Exception:
+            pass
+        try:
+            import resource as _res
+            _raw = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+            # macOS: bytes; Linux: KB
+            if sys.platform == "darwin":
+                return _raw / (1024 * 1024)
+            return _raw / 1024
+        except Exception:
+            return 0.0
+
     async def activate_phase(
         self,
         phase: int,
         timeout_per_service: float = 30.0,
     ) -> Dict[str, bool]:
-        """Activate all services registered for *phase*, in dependency order."""
-        import resource as _res
+        """Activate all services registered for *phase*, in dependency order.
 
+        Cross-phase dependencies (services already initialized in a prior
+        phase) are validated via the global ``_services`` dict — they will
+        not appear in the topological sort but will satisfy dependency
+        checks.
+        """
         phase_services = [
             s for s in self._services.values()
             if s.phase == phase and not s.initialized
@@ -10635,7 +10704,8 @@ class SystemServiceRegistry:
                     results[desc.name] = False
                     continue
 
-            # dependency check
+            # dependency check — works for BOTH within-phase and
+            # cross-phase deps because we look at the global registry.
             unmet = [
                 d for d in desc.depends_on
                 if d not in self._services or not self._services[d].initialized
@@ -10649,8 +10719,8 @@ class SystemServiceRegistry:
                 )
                 continue
 
-            # activate with telemetry
-            _mem_before = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+            # activate with telemetry (current RSS, not peak)
+            _mem_before = self._current_rss_mb()
             _t0 = time.monotonic()
             try:
                 await asyncio.wait_for(
@@ -10658,8 +10728,7 @@ class SystemServiceRegistry:
                 )
                 desc.initialized = True
                 desc.init_time_ms = (time.monotonic() - _t0) * 1000
-                _mem_after = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
-                desc.memory_delta_mb = (_mem_after - _mem_before) / (1024 * 1024)
+                desc.memory_delta_mb = self._current_rss_mb() - _mem_before
                 self._activation_order.append(desc.name)
                 results[desc.name] = True
                 logger.info(
@@ -21776,9 +21845,27 @@ class PersistentConversationMemoryAgent:
         return False
 
     def _enqueue(self, event_kind: str, payload: Dict[str, Any]) -> bool:
-        """Non-blocking bounded enqueue with drop-oldest on overflow."""
+        """Non-blocking bounded enqueue with drop-oldest on overflow.
+
+        v239.0 Wire 6: if an SSR TaskQueueManager is available (set as
+        ``_task_queue`` by Phase 3 wiring), delegate for priority ordering,
+        persistence, and retry.  Falls back to the in-process asyncio.Queue.
+        """
         if not self._running:
             return False
+
+        # Wire 6: delegate to TaskQueueManager if wired
+        _tq = getattr(self, '_task_queue', None)
+        if _tq is not None:
+            try:
+                create_safe_task(
+                    _tq.enqueue(f"memory_{event_kind}", payload),
+                    name=f"mem_tq_{event_kind}",
+                )
+                self._stats["events_enqueued"] += 1
+                return True
+            except Exception:
+                pass  # fall through to local queue
 
         try:
             if self._queue.full():
@@ -23791,6 +23878,19 @@ class GracefulDegradationManager(SystemService):
             },
             "stats": self._stats,
         }
+
+    # ── Wire 9 consumer: HealthAggregator → GDM alert integration ──
+    async def _on_health_alert(self, subsystem_id: str, health: Any) -> None:
+        """Receive health alerts from HealthAggregator and trigger degradation
+        if a critical subsystem becomes unhealthy.
+
+        Signature matches HealthAggregator.register_alert_callback:
+            Callable[[str, SubsystemHealth], Awaitable[None]]
+        """
+        _healthy = getattr(health, 'healthy', True) if health else True
+        if not _healthy:
+            # A subsystem just went unhealthy — force a resource check
+            await self._check_resources()
 
     # ── SystemService ABC ──────────────────────────────────────────
     async def initialize(self) -> None:
@@ -65654,6 +65754,11 @@ class JarvisSystemKernel:
                         except (ImportError, Exception):
                             pass
 
+                    # Wire 4: TokenBucketRateLimiter — expose for API + voice auth
+                    _rl = self._service_registry.get("rate_limiter")
+                    if _rl:
+                        self._rate_limiter = _rl
+
                     # Wire 10: DistributedLockManager — store for file lock replacement
                     _dlm = self._service_registry.get("lock_manager")
                     if _dlm:
@@ -65734,6 +65839,22 @@ class JarvisSystemKernel:
                 try:
                     _ssr_r3 = await self._service_registry.activate_phase(3)
                     self.logger.info(f"[Kernel] Phase 3 services: {_ssr_r3}")
+
+                    # Wire 6: TaskQueue → PersistentConversationMemoryAgent
+                    _tq = self._service_registry.get("task_queue")
+                    if _tq and hasattr(self, '_memory_agent') and self._memory_agent:
+                        self._memory_agent._task_queue = _tq
+                        # Register memory event handlers
+                        for _evt in ("memory_interaction", "memory_preference"):
+                            try:
+                                _tq.register_handler(
+                                    _evt,
+                                    getattr(self._memory_agent, '_persist_interaction', None)
+                                    if _evt == "memory_interaction" else
+                                    getattr(self._memory_agent, '_persist_preference', None),
+                                )
+                            except Exception:
+                                pass
                 except Exception as _ssr_e:
                     self.logger.warning(f"[Kernel] Phase 3 SSR activation error: {_ssr_e}")
 
@@ -66295,6 +66416,23 @@ class JarvisSystemKernel:
                                 _mb.create_topic("voice")
                                 _mb.create_topic("inference")
                                 _mb.create_topic("lifecycle")
+
+                                # Consumer-side: bridge EventBus events → Broker topics
+                                _event_bus = SupervisorEventBus()
+                                _topic_map = {
+                                    "health": "health", "voice": "voice",
+                                    "inference": "inference",
+                                }
+
+                                def _bridge_handler(event: SupervisorEvent, broker=_mb, tmap=_topic_map) -> None:
+                                    _t = tmap.get(getattr(event, 'event_type', ''), "lifecycle")
+                                    _payload = getattr(event, 'data', {}) if hasattr(event, 'data') else {"event": str(event)}
+                                    create_safe_task(
+                                        broker.publish(_t, _payload),
+                                        name=f"ssr_bridge_{_t}",
+                                    )
+
+                                _event_bus.subscribe(_bridge_handler)
                             except Exception:
                                 pass
                     except Exception as _ssr_e:
@@ -70862,6 +71000,7 @@ class JarvisSystemKernel:
                         self.logger.info(f"[Kernel] Phase 5 services: {_ssr_r5}")
 
                         # Wire 9: GracefulDegradationManager → register feature priorities
+                        #         + connect HealthAggregator alert → GDM
                         _gd = self._service_registry.get("degradation_manager")
                         if _gd and hasattr(_gd, 'register_feature'):
                             for _feat_name, _feat_pri, _feat_desc in [
@@ -70876,6 +71015,14 @@ class JarvisSystemKernel:
                                     _gd.register_feature(
                                         _feat_name, priority=_feat_pri, description=_feat_desc
                                     )
+                                except Exception:
+                                    pass
+
+                            # Consumer-side: HealthAggregator alerts → GDM auto-degradation
+                            _ha = self._service_registry.get("health_aggregator")
+                            if _ha and hasattr(_ha, 'register_alert_callback') and hasattr(_gd, '_on_health_alert'):
+                                try:
+                                    _ha.register_alert_callback(_gd._on_health_alert)
                                 except Exception:
                                     pass
 
