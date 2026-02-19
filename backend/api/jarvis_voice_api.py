@@ -4392,7 +4392,10 @@ class JARVISVoiceAPI:
                         await _se_mgr.stop_speaking()
                     # Also clear AudioBus mic gate
                     try:
-                        from backend.audio.audio_bus import get_audio_bus_safe
+                        try:
+                            from backend.audio.audio_bus import get_audio_bus_safe
+                        except ImportError:
+                            from audio.audio_bus import get_audio_bus_safe
                         _se_bus = get_audio_bus_safe()
                         if _se_bus and hasattr(_se_bus, "set_mic_gate"):
                             _se_bus.set_mic_gate(False)
