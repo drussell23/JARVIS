@@ -24,6 +24,7 @@ Architecture:
 """
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -31,6 +32,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Dict, List, Optional
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -147,17 +150,18 @@ class SentenceSplitter:
                     if sentence:
                         yield sentence
                 else:
-                    # Also check for punctuation at end of buffer
-                    # (next token may not start with whitespace)
-                    if (len(buffer) >= self._min_len
-                            and buffer.rstrip()
-                            and buffer.rstrip()[-1] in '.!?'
-                            and len(buffer) > len(buffer.rstrip())):
-                        # Punctuation followed by trailing space
-                        sentence = buffer.rstrip()
+                    # Check for punctuation at end of buffer followed by
+                    # trailing whitespace (the regex doesn't match because
+                    # there's no subsequent text yet).
+                    stripped = buffer.rstrip()
+                    if (
+                        len(stripped) >= self._min_len
+                        and stripped
+                        and stripped[-1] in '.!?'
+                        and len(buffer) != len(stripped)
+                    ):
                         buffer = ""
-                        if sentence:
-                            yield sentence
+                        yield stripped
                     break
 
         # Flush remaining buffer
@@ -502,30 +506,57 @@ class ConversationPipeline:
             return
 
         try:
-            # Generate audio from TTS engine (get raw audio, don't play directly)
-            if hasattr(self._tts_engine, 'synthesize'):
-                # Preferred: get raw audio bytes and route through AudioBus
-                audio_data = await self._tts_engine.synthesize(sentence)
-                if audio_data is not None and self._audio_bus is not None:
-                    import numpy as np
-                    # Convert bytes to float32 if needed
-                    if isinstance(audio_data, bytes):
-                        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32767.0
-                    elif isinstance(audio_data, np.ndarray):
-                        audio_np = audio_data
-                    else:
-                        audio_np = None
+            # Preferred path: synthesize → decode WAV → stream through AudioBus
+            # This gives AEC a reference signal and supports barge-in cancel.
+            if (
+                hasattr(self._tts_engine, 'synthesize')
+                and self._audio_bus is not None
+            ):
+                tts_result = await self._tts_engine.synthesize(sentence)
+                if tts_result is not None:
+                    audio_bytes = getattr(tts_result, 'audio_data', None)
+                    sample_rate = getattr(tts_result, 'sample_rate', 22050)
 
-                    if audio_np is not None and not cancel_event.is_set():
-                        sample_rate = getattr(self._tts_engine, 'sample_rate', 22050)
-                        await self._audio_bus.play_audio(audio_np, sample_rate)
-                        return
+                    if audio_bytes is not None and not cancel_event.is_set():
+                        # Decode WAV container to float32 PCM
+                        try:
+                            import soundfile as sf
+                            audio_np, file_sr = sf.read(
+                                io.BytesIO(audio_bytes), dtype='float32',
+                            )
+                            sample_rate = file_sr
+                        except Exception:
+                            # Raw int16 PCM fallback (no WAV header)
+                            audio_np = np.frombuffer(
+                                audio_bytes, dtype=np.int16,
+                            ).astype(np.float32) / 32767.0
+
+                        if not cancel_event.is_set():
+                            # Stream through AudioBus with barge-in cancel
+                            _chunk_size = int(sample_rate * 0.1)  # 100ms chunks
+
+                            async def _audio_chunks():
+                                for i in range(0, len(audio_np), _chunk_size):
+                                    yield audio_np[i:i + _chunk_size]
+
+                            await self._audio_bus.play_stream(
+                                _audio_chunks(), sample_rate,
+                                cancel=cancel_event,
+                            )
+                            return
 
             # Fallback: direct TTS playback (legacy path, no AEC reference)
             if hasattr(self._tts_engine, 'speak_stream'):
-                await self._tts_engine.speak_stream(sentence, play_audio=True)
+                await self._tts_engine.speak_stream(
+                    sentence, play_audio=True,
+                    cancel_event=cancel_event,
+                    source="conversation_pipeline",
+                )
             else:
-                await self._tts_engine.speak(sentence, play_audio=True)
+                await self._tts_engine.speak(
+                    sentence, play_audio=True,
+                    source="conversation_pipeline",
+                )
         except Exception as e:
             logger.debug(f"[ConvPipeline] TTS error: {e}")
 
