@@ -5,11 +5,9 @@ Replaces manual os.environ.pop() in 7+ exception paths with a single
 async with block that guarantees cleanup on exit, error, or cancellation.
 """
 
-import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

@@ -2,14 +2,20 @@
 CircuitBreaker - State Machine for Protecting Against Cascading Failures
 ========================================================================
 
-This module provides a circuit breaker implementation that prevents cascading
-failures by tracking consecutive failures and temporarily blocking calls
-when a failure threshold is reached.
+This module provides the resilience-layer circuit breaker with a ``call()``-based
+API (wraps an async function, raises ``CircuitOpen`` on trip).  It also re-exports
+the enterprise-grade kernel circuit breaker and its supplementary types so that
+callers can access both through a single import path.
 
-The circuit breaker pattern is like an electrical circuit breaker:
-- CLOSED: Normal operation, requests flow through
-- OPEN: Too many failures, requests are rejected immediately
-- HALF_OPEN: Testing recovery, one request is allowed through
+Canonical kernel implementation: backend/kernel/circuit_breaker.py
+    - KernelCircuitBreaker (aliased)  -- check/record style API
+    - CircuitBreakerConfig, CircuitBreakerState, CircuitBreakerRegistry
+    - RetryConfig, RetryWithBackoff
+    - get_circuit_breaker, get_registry
+
+Local (this module):
+    - CircuitBreaker   -- dataclass with ``call(func, *args, **kwargs)``
+    - CircuitOpen       -- exception raised when the breaker is OPEN
 
 State Transitions:
     CLOSED -> OPEN: When failure_threshold consecutive failures occur
@@ -17,38 +23,20 @@ State Transitions:
     HALF_OPEN -> CLOSED: If the probe request succeeds
     HALF_OPEN -> OPEN: If the probe request fails
 
-Features:
-- Configurable failure threshold
-- Configurable recovery timeout
-- Async callbacks for state change notifications
-- Thread-safe with asyncio.Lock
-- Manual reset capability
-
 Example usage:
     from backend.core.resilience.circuit_breaker import CircuitBreaker, CircuitOpen
 
-    # Basic usage
     breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 
     try:
         result = await breaker.call(my_async_function, arg1, arg2)
     except CircuitOpen:
-        # Circuit is open, use fallback
         result = await fallback_function()
 
-    # With callbacks
-    async def on_open():
-        logger.warning("Circuit opened - service unavailable")
-        await alert_team()
-
-    async def on_close():
-        logger.info("Circuit closed - service recovered")
-
-    breaker = CircuitBreaker(
-        failure_threshold=5,
-        recovery_timeout=30.0,
-        on_open=on_open,
-        on_close=on_close,
+    # Access kernel-level registry / retry helpers:
+    from backend.core.resilience.circuit_breaker import (
+        get_circuit_breaker,
+        RetryWithBackoff,
     )
 """
 
@@ -66,8 +54,26 @@ from typing import (
 
 from backend.core.resilience.types import CircuitState
 
+# ---------------------------------------------------------------------------
+# Re-exports from the canonical kernel implementation
+# ---------------------------------------------------------------------------
+from backend.kernel.circuit_breaker import (  # noqa: F401
+    CircuitBreaker as KernelCircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerState,
+    CircuitBreakerRegistry,
+    RetryConfig,
+    RetryWithBackoff,
+    get_circuit_breaker,
+    get_registry,
+)
+
 T = TypeVar("T")
 
+
+# ---------------------------------------------------------------------------
+# Backward-compatible CircuitOpen exception
+# ---------------------------------------------------------------------------
 
 class CircuitOpen(Exception):
     """
@@ -87,6 +93,10 @@ class CircuitOpen(Exception):
 
     pass
 
+
+# ---------------------------------------------------------------------------
+# Resilience-layer CircuitBreaker (call-based API)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CircuitBreaker:
@@ -125,6 +135,10 @@ class CircuitBreaker:
             recovery_timeout=60.0,
             on_open=alert_team,
         )
+
+    Note:
+        For the kernel-level check/record API, use ``KernelCircuitBreaker``
+        or import directly from ``backend.kernel.circuit_breaker``.
     """
 
     failure_threshold: int = 5
@@ -309,6 +323,16 @@ class CircuitBreaker:
 
 
 __all__ = [
+    # Local resilience-layer API
     "CircuitBreaker",
     "CircuitOpen",
+    # Kernel re-exports
+    "KernelCircuitBreaker",
+    "CircuitBreakerConfig",
+    "CircuitBreakerState",
+    "CircuitBreakerRegistry",
+    "RetryConfig",
+    "RetryWithBackoff",
+    "get_circuit_breaker",
+    "get_registry",
 ]

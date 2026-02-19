@@ -71185,56 +71185,112 @@ class JarvisSystemKernel:
             if self._service_registry:
                 _training_phase = 6
 
-                # Adapter: CognitiveSystem (classmethod factory pattern)
+                # Adapter: CognitiveSystem — defers construction to initialize(),
+                # inspects _initialized flag for real health, calls module-level
+                # shutdown_cognitive_system() on cleanup.
                 try:
-                    from backend.core.cognitive_architecture import CognitiveSystem
-                    _cog = CognitiveSystem()
+                    from backend.core.cognitive_architecture import CognitiveSystem  # noqa: F811
 
                     class _CogAdapter(SystemService):
-                        def __init__(self, cog): self._cog = cog
-                        async def initialize(self): await self._cog.initialize()
-                        async def health_check(self): return (True, "CognitiveSystem ready")
-                        async def cleanup(self): pass
+                        def __init__(self) -> None:
+                            self._cog: Optional[CognitiveSystem] = None
+
+                        async def initialize(self) -> None:
+                            self._cog = CognitiveSystem()
+                            await self._cog.initialize()
+
+                        async def health_check(self) -> Tuple[bool, str]:
+                            if self._cog is None:
+                                return (False, "CognitiveSystem not constructed")
+                            if not getattr(self._cog, '_initialized', False):
+                                return (False, "CognitiveSystem init incomplete")
+                            return (True, "CognitiveSystem ready")
+
+                        async def cleanup(self) -> None:
+                            try:
+                                from backend.core.cognitive_architecture import (
+                                    shutdown_cognitive_system,
+                                )
+                                await shutdown_cognitive_system()
+                            except Exception:
+                                pass
+                            self._cog = None
 
                     self._service_registry.register(ServiceDescriptor(
-                        name="cognitive_system", service=_CogAdapter(_cog),
+                        name="cognitive_system", service=_CogAdapter(),
                         phase=_training_phase,
                     ))
                 except Exception as e:
                     self.logger.debug(f"[Kernel] CognitiveSystem not available: {e}")
 
-                # Adapter: MetaCognitiveEngine (start/stop pattern)
+                # Adapter: MetaCognitiveEngine — defers construction to initialize(),
+                # inspects _running flag for real health, calls stop() on cleanup.
                 try:
-                    from backend.intelligence.meta_cognitive_engine import MetaCognitiveEngine
-                    _meta = MetaCognitiveEngine()
+                    from backend.intelligence.meta_cognitive_engine import MetaCognitiveEngine  # noqa: F811
 
                     class _MetaAdapter(SystemService):
-                        def __init__(self, m): self._m = m
-                        async def initialize(self): await self._m.start()
-                        async def health_check(self): return (True, "MetaCognitive running")
-                        async def cleanup(self): await self._m.stop()
+                        def __init__(self) -> None:
+                            self._m: Optional[MetaCognitiveEngine] = None
+
+                        async def initialize(self) -> None:
+                            self._m = MetaCognitiveEngine()
+                            await self._m.start()
+
+                        async def health_check(self) -> Tuple[bool, str]:
+                            if self._m is None:
+                                return (False, "MetaCognitiveEngine not constructed")
+                            if not getattr(self._m, '_running', False):
+                                return (False, "MetaCognitiveEngine not running")
+                            return (True, "MetaCognitiveEngine running")
+
+                        async def cleanup(self) -> None:
+                            if self._m is not None:
+                                try:
+                                    await self._m.stop()
+                                except Exception:
+                                    pass
+                            self._m = None
 
                     self._service_registry.register(ServiceDescriptor(
-                        name="meta_cognitive", service=_MetaAdapter(_meta),
+                        name="meta_cognitive", service=_MetaAdapter(),
                         phase=_training_phase,
                     ))
                 except Exception as e:
                     self.logger.debug(f"[Kernel] MetaCognitiveEngine not available: {e}")
 
-                # Adapter: TrinityTrainingPipeline (async classmethod factory)
+                # Adapter: TrinityTrainingPipeline — async classmethod factory,
+                # defers construction to initialize(), inspects _running for health,
+                # calls stop()/shutdown() on cleanup.
                 try:
-                    from backend.core.trinity_training_pipeline import TrinityTrainingPipeline
+                    from backend.core.trinity_training_pipeline import TrinityTrainingPipeline  # noqa: F811
 
                     class _TTPAdapter(SystemService):
-                        def __init__(self): self._ttp = None
-                        async def initialize(self):
+                        def __init__(self) -> None:
+                            self._ttp: Optional[TrinityTrainingPipeline] = None
+
+                        async def initialize(self) -> None:
                             self._ttp = await TrinityTrainingPipeline.create()
-                        async def health_check(self):
-                            return (self._ttp is not None,
-                                    "TTP active" if self._ttp else "TTP failed")
-                        async def cleanup(self):
-                            if self._ttp and hasattr(self._ttp, 'stop'):
-                                await self._ttp.stop()
+
+                        async def health_check(self) -> Tuple[bool, str]:
+                            if self._ttp is None:
+                                return (False, "TrinityTrainingPipeline not created")
+                            if not getattr(self._ttp, '_running', False):
+                                return (False, "TrinityTrainingPipeline not running")
+                            return (True, "TrinityTrainingPipeline active")
+
+                        async def cleanup(self) -> None:
+                            if self._ttp is not None:
+                                for _method in ('stop', 'shutdown', 'cleanup'):
+                                    _fn = getattr(self._ttp, _method, None)
+                                    if callable(_fn):
+                                        try:
+                                            _result = _fn()
+                                            if asyncio.iscoroutine(_result):
+                                                await _result
+                                        except Exception:
+                                            pass
+                                        break
+                            self._ttp = None
 
                     self._service_registry.register(ServiceDescriptor(
                         name="training_pipeline", service=_TTPAdapter(),
