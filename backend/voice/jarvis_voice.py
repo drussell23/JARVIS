@@ -1558,20 +1558,17 @@ class EnhancedVoiceEngine:
             self._start_optimization_thread()
 
         # Text-to-speech — AudioBus-aware initialization
-        _bus_enabled = os.getenv(
+        self._audio_bus_enabled = os.getenv(
             "JARVIS_AUDIO_BUS_ENABLED", "false"
         ).lower() in ("true", "1", "yes")
-        if _bus_enabled:
-            try:
-                from backend.voice.engines.unified_tts_engine import UnifiedTTSEngine
-                self.tts_engine: Union[MacOSVoice, Any] = UnifiedTTSEngine()
-            except ImportError:
-                self.tts_engine = MacOSVoice() if USE_MACOS_VOICE else pyttsx3.init()
+        if self._audio_bus_enabled:
+            self.tts_engine: Union[MacOSVoice, Any] = None  # Lazy: use _get_tts() to acquire
         elif USE_MACOS_VOICE:
             self.tts_engine = MacOSVoice()
         else:
             self.tts_engine = pyttsx3.init()
-        self._setup_voice()
+        if self.tts_engine is not None:
+            self._setup_voice()
 
         # Audio feedback
         pygame.mixer.init()
@@ -1681,6 +1678,16 @@ class EnhancedVoiceEngine:
                 "hi",
             ],
         }
+
+    async def _get_tts(self):
+        """Get the TTS singleton (lazy init)."""
+        if self.tts_engine is None and getattr(self, '_audio_bus_enabled', False):
+            try:
+                from backend.voice.engines.unified_tts_engine import get_tts_engine
+                self.tts_engine = await get_tts_engine()
+            except Exception as e:
+                logger.debug(f"TTS singleton unavailable: {e}")
+        return self.tts_engine
 
     def _setup_voice(self):
         """Configure JARVIS voice settings from environment."""
@@ -1876,6 +1883,11 @@ class EnhancedVoiceEngine:
         """Convert text to speech with JARVIS voice"""
         # Add subtle processing sound
         self._play_sound("processing")
+
+        # AudioBus lazy path — tts_engine may be None until async init
+        if self.tts_engine is None:
+            logger.debug("[TTS] Engine not yet initialized (lazy), skipping speak")
+            return
 
         # Speak
         if USE_MACOS_VOICE:

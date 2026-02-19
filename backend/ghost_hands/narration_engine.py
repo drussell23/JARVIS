@@ -527,6 +527,22 @@ class TTSBridge:
         self._speaking = False
         self._speak_lock = asyncio.Lock()
 
+    async def _get_tts(self):
+        """Get the TTS singleton (lazy init)."""
+        if self._tts_engine is None:
+            try:
+                from voice.engines.unified_tts_engine import get_tts_engine
+            except ImportError:
+                try:
+                    from backend.voice.engines.unified_tts_engine import get_tts_engine
+                except ImportError:
+                    return None
+            try:
+                self._tts_engine = await get_tts_engine()
+            except Exception as e:
+                logger.debug(f"TTS singleton unavailable: {e}")
+        return self._tts_engine
+
     def _resolve_voice_name(self) -> str:
         """Resolve canonical narration voice with JARVIS fallback chain."""
         return (
@@ -613,25 +629,21 @@ class TTSBridge:
             )
             return True
 
-        # 3) Last resort: legacy unified TTS engine.
+        # 3) Last resort: legacy unified TTS engine (lazy singleton).
         try:
-            from voice.engines.unified_tts_engine import UnifiedTTSEngine
+            tts = await self._get_tts()
+            if tts:
+                # Configure voice if specified
+                if self.config.tts_voice:
+                    tts.set_voice(self.config.tts_voice)
 
-            self._tts_engine = UnifiedTTSEngine()
-            await self._tts_engine.initialize()
+                if self.config.tts_speed != 1.0:
+                    tts.set_speed(self.config.tts_speed)
 
-            # Configure voice if specified
-            if self.config.tts_voice:
-                self._tts_engine.set_voice(self.config.tts_voice)
+                self._initialized = True
+                logger.info("[NARRATION] TTS bridge initialized via UnifiedTTSEngine")
+                return True
 
-            if self.config.tts_speed != 1.0:
-                self._tts_engine.set_speed(self.config.tts_speed)
-
-            self._initialized = True
-            logger.info("[NARRATION] TTS bridge initialized via UnifiedTTSEngine")
-            return True
-
-        except ImportError:
             logger.warning("[NARRATION] UnifiedTTSEngine not available")
             return False
         except Exception as e:
@@ -692,8 +704,9 @@ class TTSBridge:
                     logger.error(f"[NARRATION] macOS say failed ({proc.returncode}): {err}")
                     return False
 
-                if self._tts_engine:
-                    await self._tts_engine.speak(text, play_audio=True)
+                tts = await self._get_tts()
+                if tts:
+                    await tts.speak(text, play_audio=True)
                     return True
 
                 logger.debug(f"[NARRATION] (No active backend) Would say: {text}")

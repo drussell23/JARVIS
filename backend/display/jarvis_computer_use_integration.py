@@ -153,6 +153,16 @@ class JARVISComputerUse:
             logger.error(f"[JARVIS CU] ❌ Initialization failed: {e}")
             return False
 
+    async def _get_tts(self):
+        """Get the TTS singleton (lazy init)."""
+        if self._tts_engine is None:
+            try:
+                from backend.voice.engines.unified_tts_engine import get_tts_engine
+                self._tts_engine = await get_tts_engine()
+            except Exception as e:
+                logger.debug(f"TTS singleton unavailable: {e}")
+        return self._tts_engine
+
     async def _init_tts(self) -> None:
         """Initialize TTS engine for voice narration."""
         if self.execution_mode == ExecutionMode.SILENT:
@@ -160,16 +170,13 @@ class JARVISComputerUse:
             return
 
         try:
-            from backend.voice.engines.unified_tts_engine import UnifiedTTSEngine
-
-            self._tts_engine = UnifiedTTSEngine()
-            await self._tts_engine.initialize()
-
-            # Set JARVIS voice to Daniel (British male voice)
-            self._tts_engine.set_voice("Daniel")
-            logger.info("[JARVIS CU] ✅ TTS engine initialized with Daniel voice")
-        except ImportError:
-            logger.warning("[JARVIS CU] TTS engine not available")
+            tts = await self._get_tts()
+            if tts:
+                # Set JARVIS voice to Daniel (British male voice)
+                tts.set_voice("Daniel")
+                logger.info("[JARVIS CU] ✅ TTS engine initialized with Daniel voice")
+            else:
+                logger.warning("[JARVIS CU] TTS engine not available")
         except Exception as e:
             logger.warning(f"[JARVIS CU] TTS initialization failed: {e}")
 
@@ -226,9 +233,10 @@ class JARVISComputerUse:
             return None
 
         async def speak(text: str) -> None:
-            if self._tts_engine:
+            tts = await self._get_tts()
+            if tts:
                 try:
-                    await self._tts_engine.speak(text)
+                    await tts.speak(text)
                 except Exception as e:
                     logger.warning(f"[JARVIS CU] TTS failed: {e}")
 
@@ -258,9 +266,10 @@ class JARVISComputerUse:
 
         logger.info(f"[JARVIS CU] 🔊 {message}")
 
-        if self._tts_engine:
+        tts = await self._get_tts()
+        if tts:
             try:
-                await self._tts_engine.speak(message)
+                await tts.speak(message)
             except Exception as e:
                 logger.warning(f"[JARVIS CU] Narration failed: {e}")
 

@@ -790,6 +790,17 @@ class VisionUINavigator:
 
         return self._computer_use_connector
 
+    async def _get_tts(self):
+        """Get the TTS singleton (lazy init)."""
+        if not hasattr(self, '_tts_engine') or self._tts_engine is None:
+            try:
+                from backend.voice.engines.unified_tts_engine import get_tts_engine
+                self._tts_engine = await get_tts_engine()
+            except Exception as e:
+                logger.debug(f"TTS singleton unavailable: {e}")
+                self._tts_engine = None
+        return self._tts_engine
+
     async def _get_tts_callback(self):
         """Get TTS callback for voice narration.
 
@@ -797,25 +808,21 @@ class VisionUINavigator:
         enabling JARVIS to narrate its actions transparently.
         """
         try:
-            # Try to get TTS from unified engine
-            from backend.voice.engines.unified_tts_engine import UnifiedTTSEngine
-
-            if not hasattr(self, '_tts_engine'):
-                self._tts_engine = UnifiedTTSEngine()
-                await self._tts_engine.initialize()
+            tts = await self._get_tts()
+            if tts is None:
+                return None
 
             async def speak(text: str) -> None:
                 """Async TTS callback."""
                 try:
-                    await self._tts_engine.speak(text)
+                    engine = await self._get_tts()
+                    if engine:
+                        await engine.speak(text)
                 except Exception as e:
                     logger.warning(f"[VISION NAV] TTS speak failed: {e}")
 
             return speak
 
-        except ImportError:
-            logger.debug("[VISION NAV] TTS engine not available")
-            return None
         except Exception as e:
             logger.warning(f"[VISION NAV] Could not initialize TTS: {e}")
             return None

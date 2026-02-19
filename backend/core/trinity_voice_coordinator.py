@@ -1157,8 +1157,19 @@ class Pyttsx3Engine(TTSEngine):
     def __init__(self, config: VoiceConfig):
         super().__init__("pyttsx3", config)
         self._engine: Optional[Any] = None
+        self._tts_engine = None  # Lazy: use _get_tts() to acquire
         self._lock = threading.Lock()
         self._executor_lock = asyncio.Lock()
+
+    async def _get_tts(self):
+        """Get the TTS singleton (lazy init)."""
+        if self._tts_engine is None:
+            try:
+                from backend.voice.engines.unified_tts_engine import get_tts_engine
+                self._tts_engine = await get_tts_engine()
+            except Exception as e:
+                logger.debug(f"TTS singleton unavailable: {e}")
+        return self._tts_engine
 
     async def initialize(self) -> bool:
         """Initialize pyttsx3 engine."""
@@ -1201,11 +1212,10 @@ class Pyttsx3Engine(TTSEngine):
         ).lower() in ("true", "1", "yes")
         if _bus_enabled:
             try:
-                from backend.voice.engines.unified_tts_engine import UnifiedTTSEngine
-                tts = UnifiedTTSEngine()
-                await tts.initialize()
-                await tts.speak(message, play_audio=True)
-                return True
+                tts = await self._get_tts()
+                if tts:
+                    await tts.speak(message, play_audio=True)
+                    return True
             except Exception:
                 pass  # Fall through to pyttsx3
 
