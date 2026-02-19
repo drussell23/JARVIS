@@ -71492,6 +71492,189 @@ class JarvisSystemKernel:
                 except Exception as _ssr_e:
                     self.logger.warning(f"[Kernel] Phase 6 SSR activation error: {_ssr_e}")
 
+                # ── Phase 7: Cross-Repo Integration (Prime + Reactor Core) ──
+                # These adapters wrap existing singleton services that were
+                # already initialized by the enterprise phase.  Registration
+                # provides unified health monitoring, graceful degradation
+                # awareness, event sourcing, and coordinated shutdown.
+                _xrepo_phase = 7
+
+                # Adapter: JARVIS-Prime (PrimeRouter singleton)
+                try:
+                    from backend.core.prime_router import PrimeRouter as _PR
+
+                    class _PrimeRouterAdapter(SystemService):
+                        def __init__(self) -> None:
+                            self._router: Optional[Any] = None
+
+                        async def initialize(self) -> None:
+                            try:
+                                self._router = _PR.get_instance()
+                            except Exception:
+                                self._router = None
+
+                        async def health_check(self) -> Tuple[bool, str]:
+                            if self._router is None:
+                                return (False, "PrimeRouter not available")
+                            try:
+                                _status = self._router.get_status()
+                                _route = _status.get("current_route", "unknown")
+                                _healthy = _status.get("healthy", False)
+                                return (_healthy, f"PrimeRouter: route={_route}")
+                            except Exception as e:
+                                return (False, f"PrimeRouter health error: {e}")
+
+                        async def cleanup(self) -> None:
+                            if self._router is not None:
+                                try:
+                                    await self._router.close()
+                                except Exception:
+                                    pass
+                            self._router = None
+
+                    self._service_registry.register(ServiceDescriptor(
+                        name="prime_router", service=_PrimeRouterAdapter(),
+                        phase=_xrepo_phase,
+                        depends_on=["health_aggregator"],
+                        enabled_env="JARVIS_SERVICE_PRIME_ENABLED",
+                    ))
+                except ImportError:
+                    self.logger.debug("[Kernel] PrimeRouter not importable — skipping SSR registration")
+                except Exception as e:
+                    self.logger.debug(f"[Kernel] PrimeRouter SSR adapter error: {e}")
+
+                # Adapter: Reactor-Core Client
+                try:
+                    from backend.clients.reactor_core_client import (
+                        ReactorCoreClient as _RCC,
+                        get_reactor_core_client as _get_rcc,
+                    )
+
+                    class _ReactorCoreAdapter(SystemService):
+                        def __init__(self) -> None:
+                            self._client: Optional[Any] = None
+
+                        async def initialize(self) -> None:
+                            try:
+                                self._client = await _get_rcc()
+                            except Exception:
+                                self._client = None
+
+                        async def health_check(self) -> Tuple[bool, str]:
+                            if self._client is None:
+                                return (False, "ReactorCoreClient not available")
+                            try:
+                                _hc = await self._client.health_check()
+                                _healthy = _hc.get("healthy", False) if isinstance(_hc, dict) else bool(_hc)
+                                _stage = _hc.get("stage", "idle") if isinstance(_hc, dict) else "unknown"
+                                return (_healthy, f"ReactorCore: stage={_stage}")
+                            except Exception as e:
+                                return (False, f"ReactorCore health error: {e}")
+
+                        async def cleanup(self) -> None:
+                            self._client = None  # Singleton — don't close
+
+                    self._service_registry.register(ServiceDescriptor(
+                        name="reactor_core", service=_ReactorCoreAdapter(),
+                        phase=_xrepo_phase,
+                        depends_on=["health_aggregator"],
+                        enabled_env="JARVIS_SERVICE_REACTOR_ENABLED",
+                    ))
+                except ImportError:
+                    self.logger.debug("[Kernel] ReactorCoreClient not importable — skipping SSR registration")
+                except Exception as e:
+                    self.logger.debug(f"[Kernel] ReactorCoreClient SSR adapter error: {e}")
+
+                # Adapter: Reactor-Core Watcher (model auto-deploy)
+                try:
+                    class _ReactorWatcherAdapter(SystemService):
+                        def __init__(self, kernel: Any) -> None:
+                            self._kernel = kernel
+
+                        async def initialize(self) -> None:
+                            pass  # Already started by enterprise phase
+
+                        async def health_check(self) -> Tuple[bool, str]:
+                            _w = getattr(self._kernel, '_reactor_core_watcher', None)
+                            if _w is None:
+                                return (False, "ReactorCoreWatcher not running")
+                            _active = getattr(_w, '_running', False) or (
+                                hasattr(_w, '_watch_task') and _w._watch_task and not _w._watch_task.done()
+                            )
+                            return (_active, "ReactorCoreWatcher active" if _active else "ReactorCoreWatcher stopped")
+
+                        async def cleanup(self) -> None:
+                            try:
+                                from backend.autonomy.reactor_core_watcher import stop_reactor_core_watcher
+                                await asyncio.wait_for(stop_reactor_core_watcher(), timeout=5.0)
+                            except Exception:
+                                pass
+
+                    self._service_registry.register(ServiceDescriptor(
+                        name="reactor_watcher", service=_ReactorWatcherAdapter(self),
+                        phase=_xrepo_phase,
+                        depends_on=["reactor_core"],
+                        enabled_env="JARVIS_SERVICE_REACTOR_WATCHER_ENABLED",
+                    ))
+                except Exception as e:
+                    self.logger.debug(f"[Kernel] ReactorWatcher SSR adapter error: {e}")
+
+                # Activate cross-repo phase
+                try:
+                    _ssr_r7 = await self._service_registry.activate_phase(_xrepo_phase)
+                    self.logger.info(f"[Kernel] Cross-repo services: {_ssr_r7}")
+
+                    # Wire cross-repo services into HealthAggregator
+                    _ha = self._service_registry.get("health_aggregator")
+                    if _ha and hasattr(_ha, 'register_subsystem'):
+                        for _xr_name in ("prime_router", "reactor_core", "reactor_watcher"):
+                            _xr_svc = self._service_registry.get(_xr_name)
+                            if _xr_svc:
+                                try:
+                                    _ha.register_subsystem(
+                                        subsystem_id=_xr_name,
+                                        name=_xr_name,
+                                        health_check_fn=lambda svc=_xr_svc: svc.health_check(),
+                                    )
+                                except Exception:
+                                    pass
+
+                    # Wire into EventSourcing for audit trail
+                    _es = getattr(self, '_event_sourcing', None)
+                    if _es and hasattr(_es, 'record_event'):
+                        for _xr_name in ("prime_router", "reactor_core"):
+                            _xr_desc = self._service_registry._services.get(_xr_name)
+                            if _xr_desc and _xr_desc.initialized:
+                                await _es.record_event(
+                                    "cross_repo_service_activated",
+                                    {"service": _xr_name, "phase": _xrepo_phase},
+                                )
+
+                    # Wire into MessageBroker — create cross-repo topic
+                    _mb = self._service_registry.get("message_broker")
+                    if _mb and hasattr(_mb, 'create_topic'):
+                        try:
+                            _mb.create_topic("cross_repo")
+                        except Exception:
+                            pass
+
+                    # Wire into GDM — register cross-repo features for degradation
+                    _gd = self._service_registry.get("degradation_manager")
+                    if _gd and hasattr(_gd, 'register_feature'):
+                        _gd.register_feature("prime_inference", priority=1, description="JARVIS-Prime inference")
+                        _gd.register_feature("reactor_training", priority=3, description="Reactor-Core training")
+                        _gd.register_feature("model_auto_deploy", priority=3, description="Auto-deploy new models")
+
+                    # Update overall SSR status
+                    _stats = self._service_registry.stats
+                    self._update_component_status(
+                        "system_services", "running",
+                        f"{_stats['active']}/{_stats['total_registered']} active "
+                        f"(incl. {sum(1 for n in ('prime_router','reactor_core','reactor_watcher') if self._service_registry.get(n))} cross-repo)"
+                    )
+                except Exception as _ssr_e:
+                    self.logger.warning(f"[Kernel] Phase 7 SSR activation error: {_ssr_e}")
+
             return True  # Enterprise services are optional
 
     # =========================================================================
