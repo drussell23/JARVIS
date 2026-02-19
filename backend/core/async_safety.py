@@ -1688,6 +1688,41 @@ def signal_shutdown() -> None:
 
 
 # =============================================================================
+# SHIELDED WAIT_FOR — prevents task cancellation on timeout
+# =============================================================================
+
+async def shielded_wait_for(
+    coro_or_task,
+    timeout: float,
+    *,
+    name: str = "shielded_op",
+):
+    """
+    Like asyncio.wait_for() but shields the inner task from cancellation.
+
+    When wait_for() times out, it CANCELS the inner coroutine/task.
+    This wrapper uses asyncio.shield() so the inner task continues
+    running even if the timeout fires.
+
+    Use this for:
+    - Singleton initialization (half-init is worse than slow-init)
+    - Resource cleanup (must complete even if parent times out)
+    - Background tasks that should outlive the waiter
+
+    Raises asyncio.TimeoutError on timeout (inner task keeps running).
+    """
+    if asyncio.iscoroutine(coro_or_task):
+        task = asyncio.ensure_future(coro_or_task)
+    else:
+        task = coro_or_task
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("[AsyncSafety] shielded_wait_for '%s' timed out after %.1fs (task continues)", name, timeout)
+        raise
+
+
+# =============================================================================
 # v210.0: FIRE-AND-FORGET TASK WRAPPER
 # =============================================================================
 # Properly handles "Future exception was never retrieved" errors by wrapping
@@ -2726,6 +2761,9 @@ __all__ = [
     "fire_and_forget",
     "get_pending_fire_and_forget_count",
     "wait_for_fire_and_forget_tasks",
+
+    # Shielded wait_for
+    "shielded_wait_for",
 
     # Backpressure
     "BackpressureController",
