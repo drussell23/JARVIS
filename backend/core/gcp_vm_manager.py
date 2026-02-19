@@ -3515,6 +3515,14 @@ class GCPVMManager:
                         internal_ip=internal_ip,
                         health_status="unknown",
                         trigger_reason="adopted-on-startup",
+                        # v236.3: Set last_activity_time = created_at for adopted VMs.
+                        # ROOT CAUSE FIX: The default (time.time()) made idle_time_minutes
+                        # start at 0 on every supervisor restart, preventing the cost
+                        # tracker from ever reaching the 30-minute idle threshold needed
+                        # to terminate unused VMs. For an adopted VM with no known
+                        # activity history, idle time should equal uptime — the VM has
+                        # been idle since creation as far as we know.
+                        last_activity_time=created_at,
                         metadata={
                             "adopted": True,
                             "adopted_at": time.time(),
