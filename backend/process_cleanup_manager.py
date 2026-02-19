@@ -4085,39 +4085,94 @@ class ProcessCleanupManager:
 
         return hasher.hexdigest()
 
-    def _clear_python_cache(self) -> int:
+    def _clear_python_cache(self, clear_runtime_modules: Optional[bool] = None) -> int:
         """
-        Aggressively clear all Python __pycache__ directories, .pyc files, AND runtime modules.
-        This ensures fresh code is ALWAYS loaded on restart.
+        Clear Python bytecode cache, with opt-in runtime module eviction.
+
+        Root-cause note:
+            Clearing ``sys.modules`` in an active supervisor process can split
+            singleton state (for example, voice/audio orchestrators) and cause
+            overlapping audio paths during startup. Runtime module eviction is
+            therefore OFF by default and guarded.
+
+        Args:
+            clear_runtime_modules:
+                If True, also evict selected modules from ``sys.modules``.
+                Defaults to env var ``JARVIS_CLEAR_RUNTIME_MODULES`` (false).
 
         Returns:
-            Number of cache directories/files removed
+            Number of cache directories/files/modules removed.
         """
         cleared_count = 0
 
-        logger.info("🧹 Clearing all Python cache to ensure fresh code loads...")
+        logger.info("🧹 Clearing Python bytecode cache to ensure fresh code loads...")
 
-        # STEP 1: Clear runtime module cache from sys.modules
-        # This is critical - even if .pyc files are deleted, Python caches modules in memory
-        modules_to_remove = []
-        for module_name in list(sys.modules.keys()):
-            # Remove JARVIS-specific modules from cache
-            if any(pattern in module_name for pattern in [
-                'voice', 'intelligence', 'api', 'backend', 'core',
-                'chatbots', 'display', 'memory', 'vision', 'engines',
-                'context_intelligence', 'neural_trinity', 'macos_keychain_unlock'
-            ]):
-                modules_to_remove.append(module_name)
+        # STEP 1 (optional): Clear runtime module cache from sys.modules.
+        # Disabled by default because in-process eviction can duplicate
+        # singleton subsystems (audio/voice/orchestrators) mid-startup.
+        if clear_runtime_modules is None:
+            clear_runtime_modules = os.getenv(
+                "JARVIS_CLEAR_RUNTIME_MODULES", "false"
+            ).lower() in ("1", "true", "yes", "on")
 
-        for module_name in modules_to_remove:
-            try:
-                del sys.modules[module_name]
-                cleared_count += 1
-            except Exception as e:
-                logger.debug(f"Could not remove module {module_name}: {e}")
+        event_loop_running = False
+        try:
+            asyncio.get_running_loop()
+            event_loop_running = True
+        except RuntimeError:
+            event_loop_running = False
 
-        if modules_to_remove:
-            logger.info(f"✅ Cleared {len(modules_to_remove)} cached modules from sys.modules")
+        runtime_module_clear_allowed = clear_runtime_modules and not event_loop_running
+        if clear_runtime_modules and event_loop_running:
+            logger.warning(
+                "Skipping runtime module cache clear: active asyncio loop detected "
+                "(prevents singleton split/voice overlap during startup)"
+            )
+
+        if runtime_module_clear_allowed:
+            module_patterns = [
+                "voice", "intelligence", "api", "backend", "core",
+                "chatbots", "display", "memory", "vision", "engines",
+                "context_intelligence", "neural_trinity", "macos_keychain_unlock",
+            ]
+            protected_modules = (
+                "unified_supervisor",
+                "backend.process_cleanup_manager",
+                "backend.core.supervisor.unified_voice_orchestrator",
+                "backend.core.supervisor.startup_narrator",
+                "backend.voice.engines.unified_tts_engine",
+                "backend.audio.audio_bus",
+                "backend.audio.full_duplex_device",
+                "backend.core.unified_speech_state",
+            )
+
+            modules_to_remove = []
+            for module_name in list(sys.modules.keys()):
+                if any(
+                    module_name == protected
+                    or module_name.startswith(f"{protected}.")
+                    for protected in protected_modules
+                ):
+                    continue
+                if any(pattern in module_name for pattern in module_patterns):
+                    modules_to_remove.append(module_name)
+
+            for module_name in modules_to_remove:
+                try:
+                    del sys.modules[module_name]
+                    cleared_count += 1
+                except Exception as e:
+                    logger.debug(f"Could not remove module {module_name}: {e}")
+
+            if modules_to_remove:
+                logger.info(
+                    f"✅ Cleared {len(modules_to_remove)} cached modules from sys.modules"
+                )
+        else:
+            logger.debug(
+                "Runtime module cache clear disabled "
+                "(set JARVIS_CLEAR_RUNTIME_MODULES=true to enable in non-async contexts)"
+            )
 
         # STEP 2: Clear __pycache__ directories recursively
         try:

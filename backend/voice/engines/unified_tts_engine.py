@@ -17,6 +17,7 @@ import hashlib
 import io
 import logging
 import os
+import platform
 import subprocess
 import tempfile
 import time
@@ -624,7 +625,8 @@ class UnifiedTTSEngine:
         Decision matrix:
           bus.is_running  →  use bus.play_audio() (single stream, no contention)
           bus.play_audio() FAILS while bus.is_running  →  RAISE (sd.play would -9986)
-          bus not running / not imported  →  sd.play() is safe
+          bus not running / not imported  →  native playback (afplay on macOS),
+                                             else sounddevice fallback
         """
         try:
             # Load audio from bytes
@@ -653,14 +655,46 @@ class UnifiedTTSEngine:
                 # fall through to sd.play() (would always fail with -9986).
 
             # Device is free (AudioBus not running / not started / failed).
-            # sd.play() is safe — no device contention.
+            # Prefer native macOS playback to avoid PortAudio startup artifacts.
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, lambda: sd.play(data, sample_rate) or sd.wait()
-            )
+            if platform.system() == "Darwin":
+                try:
+                    await loop.run_in_executor(None, lambda: self._play_with_afplay(audio_data))
+                    return
+                except Exception as afplay_err:
+                    logger.warning(
+                        f"[UnifiedTTS] afplay failed, falling back to sounddevice: {afplay_err}"
+                    )
+
+            # Non-macOS fallback: use PortAudio/sounddevice.
+            await loop.run_in_executor(None, lambda: sd.play(data, sample_rate) or sd.wait())
 
         except Exception as e:
             logger.error(f"Audio playback error: {e}", exc_info=True)
+
+    @staticmethod
+    def _play_with_afplay(audio_data: bytes) -> None:
+        """
+        Play WAV bytes via native macOS afplay.
+
+        Uses an on-disk temp file because afplay expects a file path.
+        """
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".wav", prefix="jarvis_tts_play_")
+        os.close(temp_fd)
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(audio_data)
+            subprocess.run(
+                ["afplay", temp_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
     async def speak_stream(
         self,
