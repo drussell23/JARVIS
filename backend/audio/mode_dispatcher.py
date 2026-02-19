@@ -93,6 +93,18 @@ class ModeDispatcher:
         self._voice_unlock_service = None
         self._vbia_adapter = None
 
+        # Continuous speaker verification state
+        self._speaker_verification_task: Optional[asyncio.Task] = None
+        self._speaker_audio_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._speaker_audio_consumer: Optional[Callable] = None
+        self._last_speaker_confidence: float = 0.0
+        self._speaker_verification_interval = float(
+            os.getenv("JARVIS_SPEAKER_VERIFY_INTERVAL", "15")
+        )
+        self._speaker_confidence_threshold = float(
+            os.getenv("JARVIS_SPEAKER_CONFIDENCE_THRESHOLD", "0.70")
+        )
+
     @property
     def current_mode(self) -> VoiceMode:
         return self._current_mode
@@ -178,6 +190,9 @@ class ModeDispatcher:
                     pass
                 self._conversation_task = None
 
+            # Stop continuous speaker verification
+            self._stop_speaker_verification()
+
             # Disable conversation mode in speech state
             if self._speech_state is not None:
                 self._speech_state.set_conversation_mode(False)
@@ -231,6 +246,9 @@ class ModeDispatcher:
                 self._conversation_task.add_done_callback(
                     self._on_conversation_done
                 )
+
+                # Start continuous speaker verification
+                self._start_speaker_verification()
 
         elif mode == VoiceMode.BIOMETRIC:
             # Pause conversation if it was running
@@ -321,6 +339,11 @@ class ModeDispatcher:
             "biometric_task_running": (
                 self._biometric_task is not None
                 and not self._biometric_task.done()
+            ),
+            "speaker_confidence": self._last_speaker_confidence,
+            "speaker_verification_active": (
+                self._speaker_verification_task is not None
+                and not self._speaker_verification_task.done()
             ),
         }
 
@@ -564,6 +587,161 @@ class ModeDispatcher:
                 )
             except RuntimeError:
                 self._current_mode = self._previous_mode or VoiceMode.COMMAND
+
+    def _start_speaker_verification(self) -> None:
+        """Start continuous speaker verification during conversation mode."""
+        if self._audio_bus is None:
+            return
+
+        import numpy as np
+
+        # Drain stale frames
+        while not self._speaker_audio_queue.empty():
+            try:
+                self._speaker_audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        def _on_speaker_frame(frame: np.ndarray) -> None:
+            """Accumulate frames for periodic speaker verification (thread-safe)."""
+            if frame.size > 0:
+                self._speaker_audio_queue.put_nowait(frame.copy())
+
+        self._speaker_audio_consumer = _on_speaker_frame
+        self._audio_bus.register_mic_consumer(_on_speaker_frame)
+
+        self._speaker_verification_task = asyncio.ensure_future(
+            self._speaker_verification_loop()
+        )
+        logger.info("[ModeDispatcher] Speaker verification monitor started")
+
+    def _stop_speaker_verification(self) -> None:
+        """Stop continuous speaker verification."""
+        if self._speaker_verification_task is not None:
+            self._speaker_verification_task.cancel()
+            self._speaker_verification_task = None
+
+        if self._speaker_audio_consumer is not None and self._audio_bus is not None:
+            try:
+                self._audio_bus.unregister_mic_consumer(
+                    self._speaker_audio_consumer
+                )
+            except Exception:
+                pass
+            self._speaker_audio_consumer = None
+
+        # Drain queue
+        while not self._speaker_audio_queue.empty():
+            try:
+                self._speaker_audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        logger.info("[ModeDispatcher] Speaker verification monitor stopped")
+
+    async def _speaker_verification_loop(self) -> None:
+        """
+        Periodically verify speaker identity during conversation mode.
+
+        Results feed into TieredVBIAAdapter via set_verification_result()
+        for transparent Tier 2 escalation.
+        """
+        import numpy as np
+
+        try:
+            while self._current_mode == VoiceMode.CONVERSATION:
+                await asyncio.sleep(self._speaker_verification_interval)
+
+                # Drain queue into local frames list
+                frames = []
+                while not self._speaker_audio_queue.empty():
+                    try:
+                        frames.append(self._speaker_audio_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                if not frames:
+                    continue
+
+                audio_data = np.concatenate(frames)
+
+                # Skip if too little audio (less than 0.5s at 16kHz)
+                if audio_data.size < 8000:
+                    continue
+
+                # Run verification
+                try:
+                    confidence = await self._verify_speaker_identity(audio_data)
+                    self._last_speaker_confidence = confidence
+
+                    # Feed result to VBIA adapter cache
+                    if self._vbia_adapter is not None:
+                        self._vbia_adapter.set_verification_result(
+                            confidence=confidence,
+                            speaker_id="owner",
+                            is_owner=confidence >= self._speaker_confidence_threshold,
+                            verified=confidence >= self._speaker_confidence_threshold,
+                            metadata={
+                                "source": "continuous_verification",
+                                "mode": "conversation",
+                                "aec_cleaned": True,
+                            },
+                        )
+
+                    # Auto-escalate if confidence drops
+                    if confidence < self._speaker_confidence_threshold:
+                        logger.warning(
+                            f"[ModeDispatcher] Speaker confidence dropped: "
+                            f"{confidence:.2f} < {self._speaker_confidence_threshold}"
+                        )
+                        # Switch to biometric for re-verification
+                        await self.switch_mode(VoiceMode.BIOMETRIC)
+                        return
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug(f"[ModeDispatcher] Speaker verify error: {e}")
+
+        except asyncio.CancelledError:
+            pass
+
+    async def _verify_speaker_identity(self, audio_data) -> float:
+        """
+        Verify speaker identity from audio data.
+
+        Returns confidence score (0.0 to 1.0).
+        Uses VBIA adapter (lighter weight) or voice unlock service.
+        """
+        # Try VBIA adapter first (lighter weight, designed for continuous use)
+        if self._vbia_adapter is not None:
+            try:
+                threshold = self._speaker_confidence_threshold
+                passed, confidence = await asyncio.wait_for(
+                    self._vbia_adapter.verify_speaker(threshold),
+                    timeout=5.0,
+                )
+                return confidence
+            except Exception:
+                pass
+
+        # Fallback: voice unlock service
+        if self._voice_unlock_service is not None:
+            try:
+                result = await asyncio.wait_for(
+                    self._voice_unlock_service.process_voice_unlock_command(
+                        audio_data=audio_data,
+                        context={
+                            "source": "continuous_verification",
+                            "mode": "conversation",
+                        },
+                    ),
+                    timeout=10.0,
+                )
+                return result.get("confidence", 0.0)
+            except Exception:
+                pass
+
+        return 0.0
 
     async def start(self) -> None:
         """Start the mode dispatcher. Currently a no-op — modes are event-driven."""
