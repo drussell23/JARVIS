@@ -3,6 +3,10 @@ Tests for default_components module.
 
 Tests the predefined component definitions for JARVIS system.
 """
+import os
+from pathlib import Path
+from unittest import mock
+
 import pytest
 from typing import List
 
@@ -20,6 +24,8 @@ from backend.core.default_components import (
     JARVIS_CORE_COMPONENTS,
     register_default_components,
     get_all_default_components,
+    _resolve_repo_path,
+    _resolve_health_endpoint,
 )
 
 
@@ -59,12 +65,17 @@ class TestCrossRepoComponents:
         assert jarvis_prime is not None
         assert jarvis_prime.criticality == Criticality.DEGRADED_OK
         assert jarvis_prime.process_type == ProcessType.SUBPROCESS
-        assert jarvis_prime.repo_path == "${JARVIS_PRIME_PATH}"
+        # repo_path should be a resolved absolute path, NOT a shell-syntax literal
+        assert "${" not in jarvis_prime.repo_path, "repo_path must not contain unresolved shell variables"
+        assert Path(jarvis_prime.repo_path).is_absolute(), "repo_path must be an absolute path"
         assert "local-inference" in jarvis_prime.provides_capabilities
         assert "llm" in jarvis_prime.provides_capabilities
         assert "embeddings" in jarvis_prime.provides_capabilities
         assert jarvis_prime.health_check_type == HealthCheckType.HTTP
-        assert jarvis_prime.health_endpoint == "http://localhost:${JARVIS_PRIME_PORT}/health"
+        # health_endpoint should contain a resolved port number
+        assert "${" not in jarvis_prime.health_endpoint, "health_endpoint must not contain unresolved shell variables"
+        assert jarvis_prime.health_endpoint.startswith("http://localhost:")
+        assert jarvis_prime.health_endpoint.endswith("/health")
         assert jarvis_prime.startup_timeout == 120.0
         assert jarvis_prime.fallback_strategy == FallbackStrategy.RETRY_THEN_CONTINUE
         assert jarvis_prime.fallback_for_capabilities == {"inference": "claude-api", "embeddings": "openai-api"}
@@ -91,13 +102,18 @@ class TestCrossRepoComponents:
         assert reactor_core is not None
         assert reactor_core.criticality == Criticality.OPTIONAL
         assert reactor_core.process_type == ProcessType.SUBPROCESS
-        assert reactor_core.repo_path == "${REACTOR_CORE_PATH}"
+        # repo_path should be a resolved absolute path, NOT a shell-syntax literal
+        assert "${" not in reactor_core.repo_path, "repo_path must not contain unresolved shell variables"
+        assert Path(reactor_core.repo_path).is_absolute(), "repo_path must be an absolute path"
         assert "training" in reactor_core.provides_capabilities
         assert "fine-tuning" in reactor_core.provides_capabilities
         assert "jarvis-core" in reactor_core.dependencies
         assert "jarvis-prime" in reactor_core.dependencies
         assert reactor_core.health_check_type == HealthCheckType.HTTP
-        assert reactor_core.health_endpoint == "http://localhost:${REACTOR_PORT}/health"
+        # health_endpoint should contain a resolved port number
+        assert "${" not in reactor_core.health_endpoint, "health_endpoint must not contain unresolved shell variables"
+        assert reactor_core.health_endpoint.startswith("http://localhost:")
+        assert reactor_core.health_endpoint.endswith("/health")
         assert reactor_core.startup_timeout == 90.0
         assert reactor_core.fallback_strategy == FallbackStrategy.CONTINUE
         assert reactor_core.disable_env_var == "REACTOR_ENABLED"
@@ -421,3 +437,56 @@ class TestComponentCapabilities:
         all_components = get_all_default_components()
         names = [c.name for c in all_components]
         assert len(names) == len(set(names)), "Duplicate component names found"
+
+
+class TestResolverFunctions:
+    """Tests for _resolve_repo_path and _resolve_health_endpoint helpers."""
+
+    def test_resolve_repo_path_from_env(self):
+        """_resolve_repo_path should use env var when set."""
+        with mock.patch.dict(os.environ, {"TEST_PATH": "/custom/path/to/repo"}):
+            result = _resolve_repo_path("TEST_PATH", "fallback-dir")
+        assert result == "/custom/path/to/repo"
+
+    def test_resolve_repo_path_expands_tilde(self):
+        """_resolve_repo_path should expand ~ in env var values."""
+        with mock.patch.dict(os.environ, {"TEST_PATH": "~/my-repos/test"}):
+            result = _resolve_repo_path("TEST_PATH", "fallback-dir")
+        assert "~" not in result
+        assert result.endswith("my-repos/test")
+
+    def test_resolve_repo_path_fallback(self):
+        """_resolve_repo_path should fall back to ~/Documents/repos/<dirname>."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NONEXISTENT_VAR", None)
+            result = _resolve_repo_path("NONEXISTENT_VAR", "my-project")
+        expected = str(Path.home() / "Documents" / "repos" / "my-project")
+        assert result == expected
+
+    def test_resolve_repo_path_returns_absolute(self):
+        """_resolve_repo_path should always return an absolute path."""
+        result = _resolve_repo_path("NONEXISTENT_VAR_2", "test-dir")
+        assert Path(result).is_absolute()
+
+    def test_resolve_health_endpoint_default_port(self):
+        """_resolve_health_endpoint should use default port when env not set."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TEST_PORT", None)
+            result = _resolve_health_endpoint("localhost", "TEST_PORT", "9999", "/health")
+        assert result == "http://localhost:9999/health"
+
+    def test_resolve_health_endpoint_env_port(self):
+        """_resolve_health_endpoint should use env var port when set."""
+        with mock.patch.dict(os.environ, {"TEST_PORT": "1234"}):
+            result = _resolve_health_endpoint("localhost", "TEST_PORT", "9999", "/health")
+        assert result == "http://localhost:1234/health"
+
+    def test_no_shell_syntax_in_any_component(self):
+        """No component should contain unresolved shell variable syntax."""
+        for comp in get_all_default_components():
+            if comp.repo_path:
+                assert "${" not in comp.repo_path, \
+                    f"{comp.name}.repo_path contains unresolved shell variable: {comp.repo_path}"
+            if comp.health_endpoint:
+                assert "${" not in comp.health_endpoint, \
+                    f"{comp.name}.health_endpoint contains unresolved shell variable: {comp.health_endpoint}"

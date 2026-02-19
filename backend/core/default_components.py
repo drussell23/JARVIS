@@ -8,6 +8,8 @@ This module provides predefined ComponentDefinition instances for:
 These definitions serve as the canonical source for component configuration,
 including criticality levels, dependencies, capabilities, and fallback strategies.
 """
+import os
+from pathlib import Path
 from typing import List
 
 from backend.core.component_registry import (
@@ -19,6 +21,24 @@ from backend.core.component_registry import (
     FallbackStrategy,
     Dependency,
 )
+
+
+def _resolve_repo_path(env_var: str, default_dirname: str) -> str:
+    """Resolve a cross-repo path from env var with intelligent fallback.
+
+    Checks env var first, then falls back to sibling directory convention
+    (~/Documents/repos/<dirname>). Returns the resolved absolute path string.
+    """
+    env_val = os.getenv(env_var)
+    if env_val:
+        return str(Path(env_val).expanduser().resolve())
+    return str(Path.home() / "Documents" / "repos" / default_dirname)
+
+
+def _resolve_health_endpoint(host: str, port_env: str, port_default: str, path: str) -> str:
+    """Build a health endpoint URL from env-resolved port."""
+    port = os.getenv(port_env, port_default)
+    return f"http://{host}:{port}{path}"
 
 
 # Cross-repository components that interact with other JARVIS repos
@@ -35,14 +55,14 @@ CROSS_REPO_COMPONENTS: List[ComponentDefinition] = [
         name="jarvis-prime",
         criticality=Criticality.DEGRADED_OK,
         process_type=ProcessType.SUBPROCESS,
-        repo_path="${JARVIS_PRIME_PATH}",
+        repo_path=_resolve_repo_path("JARVIS_PRIME_PATH", "jarvis-prime"),
         provides_capabilities=["local-inference", "llm", "embeddings"],
         dependencies=[
             "jarvis-core",
             Dependency("gcp-prewarm", soft=True),
         ],
         health_check_type=HealthCheckType.HTTP,
-        health_endpoint="http://localhost:${JARVIS_PRIME_PORT}/health",
+        health_endpoint=_resolve_health_endpoint("localhost", "JARVIS_PRIME_PORT", "8000", "/health"),
         startup_timeout=120.0,
         fallback_strategy=FallbackStrategy.RETRY_THEN_CONTINUE,
         fallback_for_capabilities={"inference": "claude-api", "embeddings": "openai-api"},
@@ -53,11 +73,11 @@ CROSS_REPO_COMPONENTS: List[ComponentDefinition] = [
         name="reactor-core",
         criticality=Criticality.OPTIONAL,
         process_type=ProcessType.SUBPROCESS,
-        repo_path="${REACTOR_CORE_PATH}",
+        repo_path=_resolve_repo_path("REACTOR_CORE_PATH", "reactor-core"),
         provides_capabilities=["training", "fine-tuning"],
         dependencies=["jarvis-core", "jarvis-prime"],
         health_check_type=HealthCheckType.HTTP,
-        health_endpoint="http://localhost:${REACTOR_PORT}/health",
+        health_endpoint=_resolve_health_endpoint("localhost", "TRINITY_REACTOR_PORT", "8090", "/health"),
         startup_timeout=90.0,
         fallback_strategy=FallbackStrategy.CONTINUE,
         disable_env_var="REACTOR_ENABLED",
