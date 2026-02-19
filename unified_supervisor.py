@@ -3105,8 +3105,8 @@ class UnifiedLogger:
         _sink = self._external_metrics_sink
         if _sink is not None:
             try:
-                _record = getattr(_sink, 'record_histogram', None) or getattr(_sink, 'record_metric', None)
-                if callable(_record):
+                _record = getattr(_sink, 'record_histogram', None)
+                if callable(_record) and not asyncio.iscoroutinefunction(_record):
                     _record(f"phase.{phase_name}.duration_ms", duration)
             except Exception:
                 pass
@@ -9949,7 +9949,7 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
         # v239.0 Wire 3: L1/L2 fast path via CacheHierarchyManager (< 1ms)
         _hcache = getattr(self, '_hierarchy_cache', None)
         if _hcache is not None:
-            _key = f"voice:{speaker_filter or 'any'}:{hash(tuple(embedding[:8]))}"
+            _key = f"voice:{speaker_filter or 'any'}:{hashlib.sha256(repr(embedding).encode()).hexdigest()[:16]}"
             try:
                 _get = getattr(_hcache, 'get', None)
                 _cached = await _get(_key) if callable(_get) and asyncio.iscoroutinefunction(_get) else (_get(_key) if callable(_get) else None)
@@ -10057,7 +10057,7 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
             # v239.0 Wire 3: write-through to L1/L2 CacheHierarchyManager
             _hcache = getattr(self, '_hierarchy_cache', None)
             if _hcache is not None:
-                _key = f"voice:{speaker_name}:{hash(tuple(embedding[:8]))}"
+                _key = f"voice:{speaker_name}:{hashlib.sha256(repr(embedding).encode()).hexdigest()[:16]}"
                 _result = {
                     "cached": True,
                     "similarity": 1.0,
@@ -59808,7 +59808,7 @@ class JarvisSystemKernel:
         _r(ServiceDescriptor(
             name="cost_tracker",
             service=CostTracker(
-                config=self._config if hasattr(self, "_config") else None,
+                config=self.config if hasattr(self, "config") else None,
             ),
             phase=2,
             enabled_env="JARVIS_SERVICE_COST_ENABLED",
@@ -66459,13 +66459,16 @@ class JarvisSystemKernel:
                                 # Consumer-side: bridge EventBus events → Broker topics
                                 _event_bus = SupervisorEventBus()
                                 _topic_map = {
-                                    "health": "health", "voice": "voice",
-                                    "inference": "inference",
+                                    SupervisorEventType.HEALTH_CHECK: "health",
+                                    SupervisorEventType.RECOVERY_START: "health",
+                                    SupervisorEventType.RECOVERY_END: "health",
+                                    SupervisorEventType.ERROR: "health",
+                                    SupervisorEventType.METRIC: "inference",
                                 }
 
                                 def _bridge_handler(event: SupervisorEvent, broker=_mb, tmap=_topic_map) -> None:
-                                    _t = tmap.get(getattr(event, 'event_type', ''), "lifecycle")
-                                    _payload = getattr(event, 'data', {}) if hasattr(event, 'data') else {"event": str(event)}
+                                    _t = tmap.get(getattr(event, 'event_type', None), "lifecycle")
+                                    _payload = event.to_json_dict() if hasattr(event, 'to_json_dict') else {"event": str(event)}
                                     create_safe_task(
                                         broker.publish(_t, _payload),
                                         name=f"ssr_bridge_{_t}",
