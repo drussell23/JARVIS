@@ -59015,6 +59015,7 @@ class JarvisSystemKernel:
         self._mode_dispatcher = None
         self._audio_health_task: Optional[asyncio.Task] = None
         self._audio_infrastructure_initialized: bool = False
+        self._audio_pipeline_handle = None  # v238.1: PipelineHandle from bootstrap
 
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
@@ -62643,100 +62644,48 @@ class JarvisSystemKernel:
             await self._start_agent_runtime()
 
             # =====================================================================
-            # v238.0: CONVERSATION PIPELINE WIRING (Deferred)
+            # v238.1: CONVERSATION PIPELINE WIRING (via Bootstrap)
             # =====================================================================
-            # Wire up the real-time voice conversation components AFTER Phase 4
-            # (Intelligence) completes, so the LLM client is available.
-            # Each sub-component is independently optional — partial wiring is OK.
-            # Gated behind JARVIS_AUDIO_BUS_ENABLED to avoid touching legacy paths.
+            # Wire real-time voice conversation components AFTER Phase 4
+            # (Intelligence) so the LLM client is available.
+            # Uses audio_pipeline_bootstrap for clean composition.
             # =====================================================================
             if self._audio_bus_enabled and self._audio_bus is not None:
                 try:
                     _wire_start = time.time()
+                    from backend.audio.audio_pipeline_bootstrap import (
+                        wire_conversation_pipeline,
+                    )
 
-                    # 1. TTS singleton (already init'd by AudioBus path)
-                    _tts_engine = None
+                    # Get speech state for mode transitions
+                    _speech_state = None
                     try:
-                        from backend.voice.engines.unified_tts_engine import (
-                            get_unified_tts_engine,
+                        from backend.core.unified_speech_state import (
+                            get_speech_state_manager,
                         )
-                        _tts_engine = await asyncio.wait_for(
-                            get_unified_tts_engine(), timeout=15.0
-                        )
-                    except Exception as tts_err:
-                        self.logger.debug(f"[Kernel] TTS singleton init skipped: {tts_err}")
+                        _speech_state = await get_speech_state_manager()
+                    except Exception:
+                        pass
 
-                    # 2. StreamingSTT
-                    _streaming_stt = None
-                    try:
-                        from backend.voice.streaming_stt import StreamingSTTEngine
-                        _streaming_stt = StreamingSTTEngine()
-                        await asyncio.wait_for(_streaming_stt.start(), timeout=10.0)
-                    except Exception as stt_err:
-                        self.logger.debug(f"[Kernel] StreamingSTT init skipped: {stt_err}")
-                        _streaming_stt = None
+                    self._audio_pipeline_handle = await wire_conversation_pipeline(
+                        audio_bus=self._audio_bus,
+                        llm_client=self._model_serving,
+                        speech_state=_speech_state,
+                    )
 
-                    # 3. TurnDetector + BargeInController
-                    _turn_detector = None
-                    _barge_in = None
-                    try:
-                        from backend.audio.turn_detector import TurnDetector
-                        from backend.audio.barge_in_controller import BargeInController
-                        _turn_detector = TurnDetector()
-                        _barge_in = BargeInController()
-                        _barge_in.set_audio_bus(self._audio_bus)
-                        _barge_in.set_loop(asyncio.get_running_loop())
-                        try:
-                            from backend.core.unified_speech_state import (
-                                get_speech_state_manager,
-                            )
-                            _speech_state = await get_speech_state_manager()
-                            _barge_in.set_speech_state(_speech_state)
-                        except Exception:
-                            pass
-                    except Exception as bi_err:
-                        self.logger.debug(f"[Kernel] TurnDetector/BargeIn skipped: {bi_err}")
-
-                    # 4. ConversationPipeline
-                    try:
-                        from backend.audio.conversation_pipeline import (
-                            ConversationPipeline,
-                        )
-                        self._conversation_pipeline = ConversationPipeline(
-                            audio_bus=self._audio_bus,
-                            streaming_stt=_streaming_stt,
-                            turn_detector=_turn_detector,
-                            barge_in=_barge_in,
-                            tts_engine=_tts_engine,
-                            llm_client=self._model_serving,
-                        )
-                    except Exception as cp_err:
-                        self.logger.debug(f"[Kernel] ConversationPipeline init skipped: {cp_err}")
-
-                    # 5. ModeDispatcher
-                    try:
-                        from backend.audio.mode_dispatcher import ModeDispatcher
-                        self._mode_dispatcher = ModeDispatcher(
-                            conversation_pipeline=self._conversation_pipeline,
-                        )
-                        await self._mode_dispatcher.start()
-                    except Exception as md_err:
-                        self.logger.debug(f"[Kernel] ModeDispatcher init skipped: {md_err}")
-                        self._mode_dispatcher = None
+                    # Store references for shutdown and status
+                    self._conversation_pipeline = self._audio_pipeline_handle.conversation_pipeline
+                    self._mode_dispatcher = self._audio_pipeline_handle.mode_dispatcher
 
                     self._audio_infrastructure_initialized = True
                     _wire_ms = (time.time() - _wire_start) * 1000
+
                     self._component_status["audio_infrastructure"] = {
                         "status": "running",
-                        "message": (
-                            f"Pipeline wired in {_wire_ms:.0f}ms "
-                            f"(stt={'OK' if _streaming_stt else 'N/A'}, "
-                            f"tts={'OK' if _tts_engine else 'N/A'}, "
-                            f"llm={'OK' if self._model_serving else 'N/A'})"
-                        ),
+                        "message": f"Pipeline wired via bootstrap in {_wire_ms:.0f}ms",
                     }
                     self.logger.info(
-                        f"[Kernel] Audio pipeline wired (v238.0) in {_wire_ms:.0f}ms"
+                        f"[Kernel] Audio pipeline wired (v238.1) in {_wire_ms:.0f}ms"
                     )
 
                     # Launch background health monitor
@@ -62747,10 +62696,12 @@ class JarvisSystemKernel:
                     self._background_tasks.append(self._audio_health_task)
 
                 except Exception as ap_err:
-                    self.logger.warning(f"[Kernel] Audio pipeline wiring failed: {ap_err}")
+                    self.logger.warning(
+                        f"[Kernel] Audio pipeline wiring failed: {ap_err}"
+                    )
                     self._component_status["audio_infrastructure"] = {
                         "status": "degraded",
-                        "message": f"Pipeline wiring failed: {ap_err}",
+                        "message": f"Wiring failed: {ap_err}",
                     }
 
             # v258.3 (Gap GCP-2): Re-evaluate startup mode after Intelligence phase.
@@ -73771,14 +73722,9 @@ class JarvisSystemKernel:
                     self.logger.warning(f"[Kernel] Voice Orchestrator stop error: {vo_err}")
 
             # =====================================================================
-            # v238.0: AUDIO INFRASTRUCTURE SHUTDOWN
-            # =====================================================================
-            # Reverse order: ModeDispatcher → ConversationPipeline → AudioBus
-            # Each wrapped in wait_for to prevent shutdown stall.
+            # v238.1: AUDIO INFRASTRUCTURE SHUTDOWN (via Bootstrap)
             # =====================================================================
             if self._audio_infrastructure_initialized:
-                _audio_shutdown_timeout = 5.0
-
                 # 1. Cancel health monitor
                 if self._audio_health_task is not None:
                     self._audio_health_task.cancel()
@@ -73789,32 +73735,24 @@ class JarvisSystemKernel:
                     except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                         pass
 
-                # 2. ModeDispatcher
-                if self._mode_dispatcher is not None:
-                    try:
-                        stop_fn = getattr(self._mode_dispatcher, 'stop', None)
-                        if stop_fn:
-                            await asyncio.wait_for(stop_fn(), timeout=_audio_shutdown_timeout)
-                        self.logger.debug("[Kernel] ModeDispatcher stopped")
-                    except Exception as md_err:
-                        self.logger.debug(f"[Kernel] ModeDispatcher stop error: {md_err}")
-
-                # 3. ConversationPipeline
-                if self._conversation_pipeline is not None:
-                    try:
+                # 2. Bootstrap shutdown (handles ModeDispatcher, Pipeline, STT, BargeIn)
+                try:
+                    from backend.audio.audio_pipeline_bootstrap import (
+                        shutdown as bootstrap_shutdown,
+                    )
+                    if self._audio_pipeline_handle is not None:
                         await asyncio.wait_for(
-                            self._conversation_pipeline.end_session(),
-                            timeout=_audio_shutdown_timeout,
+                            bootstrap_shutdown(self._audio_pipeline_handle),
+                            timeout=10.0,
                         )
-                        self.logger.debug("[Kernel] ConversationPipeline ended")
-                    except Exception as cp_err:
-                        self.logger.debug(f"[Kernel] ConversationPipeline end error: {cp_err}")
+                except Exception as bs_err:
+                    self.logger.debug(f"[Kernel] Bootstrap shutdown error: {bs_err}")
 
-                # 4. AudioBus
+                # 3. AudioBus has its own lifecycle
                 if self._audio_bus is not None:
                     try:
                         await asyncio.wait_for(
-                            self._audio_bus.stop(), timeout=_audio_shutdown_timeout
+                            self._audio_bus.stop(), timeout=5.0,
                         )
                         self.logger.info("[Kernel] AudioBus stopped")
                     except Exception as ab_err:
