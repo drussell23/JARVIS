@@ -69257,6 +69257,9 @@ class JarvisSystemKernel:
                 progress = 66 + min(5, int(elapsed / 12))  # 5% over 60s
             elif status == "healthy":
                 progress = 72
+                # v236.1: Raise phase ceiling so Reactor-Core progress isn't capped at 73%
+                # (ceiling was 68 from Phase 5 start, +5 drift = 73 max)
+                self._current_startup_progress = 72
             else:
                 progress = 66
         elif component == "reactor_core":
@@ -69574,6 +69577,19 @@ class JarvisSystemKernel:
                     f"(+{progress_delta:.1f}%), elapsed={elapsed:.0f}s, remaining={remaining:.0f}s"
                     + (f", ETA={eta_seconds:.0f}s" if eta_seconds else "")
                     + phase_label
+                )
+
+                # v236.1: Broadcast incremental progress during component health wait
+                # to prevent PHASE HOLD HARD CAP (300s) from firing.
+                # Maps internal model progress (0-100%) to startup range (72-77%).
+                # The _trinity_progress_callback handles discrete status transitions
+                # (starting/waiting/healthy), but this covers the continuous wait
+                # between callbacks when the model is loading.
+                _poll_startup_pct = 72 + min(5, int(current_progress / 20))  # 72-77%
+                await self._broadcast_startup_progress(
+                    stage="trinity",
+                    message=f"Component health wait ({current_progress:.0f}% internal)",
+                    progress=_poll_startup_pct,
                 )
 
                 # v224.0: Phase-aware stall thresholds — different phases have
@@ -70177,6 +70193,10 @@ class JarvisSystemKernel:
                             if self._startup_watchdog:
                                 trinity_heartbeat_progress["current"] = 68
                                 self._startup_watchdog.update_phase("trinity", 68)
+                            # v236.1: Also broadcast to _current_progress (prevents PHASE HOLD HARD CAP stall)
+                            await self._broadcast_startup_progress(
+                                stage="trinity", message="Cross-repo startup lock acquired", progress=68
+                            )
 
                             # Check if Hollow Client mode was activated by orchestrator
                             if os.environ.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() == "true":
@@ -70190,6 +70210,10 @@ class JarvisSystemKernel:
                             if self._startup_watchdog:
                                 trinity_heartbeat_progress["current"] = 69
                                 self._startup_watchdog.update_phase("trinity", 69)
+                            # v236.1: Broadcast to _current_progress
+                            await self._broadcast_startup_progress(
+                                stage="trinity", message="Initializing Trinity integrator", progress=69
+                            )
 
                             # Log repo search paths
                             prime_path = self.config.prime_repo_path
@@ -70223,6 +70247,10 @@ class JarvisSystemKernel:
                                 if self._startup_watchdog:
                                     trinity_heartbeat_progress["current"] = 70
                                     self._startup_watchdog.update_phase("trinity", 70)
+                                # v236.1: Broadcast to _current_progress
+                                await self._broadcast_startup_progress(
+                                    stage="trinity", message="Trinity integrator initialized", progress=70
+                                )
 
                                 # Get detailed status after initialization
                                 status = trinity_integrator.get_status()
@@ -70388,6 +70416,17 @@ class JarvisSystemKernel:
                                                 _last_gcp_status = _status_msg
                                         except Exception:
                                             pass
+
+                                        # v236.1: Periodic progress broadcast during golden image wait
+                                        # to prevent PHASE HOLD HARD CAP (300s) from firing.
+                                        # Broadcasts every ~30s with slowly incrementing progress (70-71%).
+                                        if int(_wait_elapsed) % 30 < int(_gw_poll_interval):
+                                            _gw_broadcast_pct = 70 + min(1, int(_wait_elapsed / 120))
+                                            await self._broadcast_startup_progress(
+                                                stage="trinity",
+                                                message=f"Waiting for golden image VM ({_wait_elapsed:.0f}s)",
+                                                progress=_gw_broadcast_pct,
+                                            )
 
                                         # v233.2: Only APARS (real) progress resets stall timer.
                                         # Synthetic progress continuously increases and would
@@ -70992,7 +71031,17 @@ class JarvisSystemKernel:
                                     base_timeout=trinity_timeout,
                                     integrator_name="Trinity/ProcessOrchestrator",
                                 )
-                                
+
+                                # v236.1: Broadcast progress after component startup returns.
+                                # This prevents a 300s gap between J-Prime healthy (72%) and
+                                # post-startup processing. Raise ceiling to allow higher values.
+                                self._current_startup_progress = 78
+                                await self._broadcast_startup_progress(
+                                    stage="trinity",
+                                    message="Component startup phase complete",
+                                    progress=78,
+                                )
+
                                 if _trinity_timed_out:
                                     _trinity_startup_error = True
                                     _trinity_startup_timed_out = True  # v222.0: Track for result handling
@@ -71315,6 +71364,12 @@ class JarvisSystemKernel:
                     message=f"Trinity integration complete: {started_count} component(s) active"
                 )
 
+                # v236.1: Progress broadcast before narration (prevents hard cap stall)
+                self._current_startup_progress = 80
+                await self._broadcast_startup_progress(
+                    stage="trinity", message="Trinity components online, finalizing", progress=80
+                )
+
                 # Voice narration for Trinity components
                 if self._narrator:
                     for component, connected in results.items():
@@ -71325,6 +71380,11 @@ class JarvisSystemKernel:
                             )
                         except Exception:
                             pass
+
+                # v236.1: Progress broadcast after narration
+                await self._broadcast_startup_progress(
+                    stage="trinity", message="Trinity narration complete", progress=82
+                )
 
                 if self._readiness_manager:
                     self._readiness_manager.mark_component_ready("trinity", started_count > 0)
