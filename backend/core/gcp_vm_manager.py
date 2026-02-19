@@ -126,7 +126,7 @@ T = TypeVar('T')
 # v235.0: Startup script version tag — bumped on every significant script change.
 # Embedded in VM metadata at creation. Running VMs with a stale version are
 # automatically recycled (deleted + recreated) to pick up the latest script.
-_STARTUP_SCRIPT_VERSION = "235.3"
+_STARTUP_SCRIPT_VERSION = "236.0"
 
 
 # ============================================================================
@@ -1728,10 +1728,12 @@ MODELS = {{
         "config_overrides": {{"n_ctx": 32768, "chat_template": "chatml", "n_gpu_layers": 0, "flash_attn": False}},
     }},
     "llava-v1.6-mistral-7b": {{
-        "repo": "cjpais/llava-v1.6-mistral-7b-gguf",
+        "repo": "cjpais/llava-1.6-mistral-7b-gguf",
         "filename": "llava-v1.6-mistral-7b.Q4_K_M.gguf",
         "size_gb": 4.9,
         "routable": False,
+        "mmproj_filename": "mmproj-model-f16.gguf",
+        "mmproj_size_gb": 0.6,
     }},
     "phi-3.5-mini": {{
         "repo": "bartowski/Phi-3.5-mini-instruct-GGUF",
@@ -1829,6 +1831,28 @@ for i, (model_id, spec) in enumerate(MODELS.items()):
         "config_overrides": spec.get("config_overrides", {{}}),
     }}
 
+# v236.0: Download mmproj CLIP files for multimodal models
+for model_id, spec in MODELS.items():
+    if "mmproj_filename" not in spec:
+        continue
+    mmproj_path = os.path.join(models_dir, spec["mmproj_filename"])
+    if os.path.exists(mmproj_path) and os.path.getsize(mmproj_path) > 100_000:
+        print(f"  mmproj already cached: {{spec['mmproj_filename']}}")
+    else:
+        try:
+            hf_hub_download(
+                repo_id=spec["repo"],
+                filename=spec["mmproj_filename"],
+                local_dir=models_dir,
+                local_dir_use_symlinks=False,
+            )
+            print(f"  mmproj downloaded: {{spec['mmproj_filename']}}")
+        except Exception as e:
+            print(f"  mmproj download FAILED for {{model_id}}: {{e}}")
+    # F7: Add mmproj_path to manifest if model entry exists
+    if model_id in manifest.get("models", {{}}):
+        manifest["models"][model_id]["mmproj_path"] = mmproj_path
+
 # Write manifest (primary inventory source at runtime)
 manifest_path = os.path.join(models_dir, "manifest.json")
 with open(manifest_path, "w") as f:
@@ -1903,6 +1927,35 @@ EOFSVC
 
 systemctl daemon-reload
 log "   ✅ systemd service configured with EnvironmentFile"
+
+# === v236.0: Vision Server systemd service (LLaVA on port 8001) ===
+cat > /etc/systemd/system/jarvis-prime-vision.service << EOFVSVC
+[Unit]
+Description=JARVIS-Prime Vision Server (LLaVA on port 8001)
+After=network.target jarvis-prime.service
+Wants=jarvis-prime.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$JARVIS_DIR
+EnvironmentFile=$JARVIS_DIR/.env
+Environment=PATH=$JARVIS_DIR/venv/bin:/usr/bin:/bin
+ExecStart=$JARVIS_DIR/venv/bin/python $JARVIS_DIR/vision_server.py --port 8001 --models-dir $MODEL_CACHE
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+StandardOutput=append:/var/log/jarvis-prime-vision.log
+StandardError=append:/var/log/jarvis-prime-vision.log
+
+[Install]
+WantedBy=multi-user.target
+EOFVSVC
+
+systemctl daemon-reload
+systemctl enable jarvis-prime-vision
+systemctl start jarvis-prime-vision
+log "   ✅ Vision server systemd service started on port 8001"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 7: Build Integrity Validation and Cleanup

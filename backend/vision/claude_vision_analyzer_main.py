@@ -100,6 +100,23 @@ except ImportError as e:
     )
 
 
+import contextvars
+from enum import Enum
+
+
+class VisionProvider(str, Enum):
+    """Vision analysis backend. v236.0."""
+    CLAUDE_API = "claude_api"
+    JPRIME_LLAVA = "jprime_llava"
+    AUTO = "auto"
+
+
+# F5: Coroutine-safe flag for continuous monitoring (no race condition)
+_is_continuous_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    '_is_continuous', default=False
+)
+
+
 @dataclass
 class VisionConfig:
     """Dynamic configuration for vision analyzer with memory safety"""
@@ -218,6 +235,20 @@ class VisionConfig:
         default_factory=lambda: float(
             os.getenv("VISION_INTELLIGENCE_CONFIDENCE", "0.7")
         )
+    )
+
+    # v236.0: Provider dispatch — J-Prime LLaVA vs Claude API
+    vision_provider: str = field(
+        default_factory=lambda: os.getenv("VISION_PROVIDER", "auto")
+    )
+    jprime_vision_timeout: float = field(
+        default_factory=lambda: float(os.getenv("VISION_JPRIME_TIMEOUT", "120"))
+    )
+    jprime_fallback_to_claude: bool = field(
+        default_factory=lambda: os.getenv("VISION_JPRIME_FALLBACK", "true").lower() == "true"
+    )
+    vision_dual_fail_cooldown: float = field(
+        default_factory=lambda: float(os.getenv("VISION_DUAL_FAIL_COOLDOWN", "60"))
     )
 
     @staticmethod
@@ -1113,6 +1144,12 @@ class ClaudeVisionAnalyzer:
         self._CAPTURE_CIRCUIT_THRESHOLD = int(os.environ.get("JARVIS_CAPTURE_CIRCUIT_THRESHOLD", "5"))
         self._CAPTURE_CIRCUIT_PROBE_INTERVAL = float(os.environ.get("JARVIS_CAPTURE_CIRCUIT_PROBE_SECONDS", "60.0"))
         self._CAPTURE_PERMISSION_CHECK_TTL = float(os.environ.get("JARVIS_CAPTURE_PERMISSION_TTL", "30.0"))
+
+        # v236.0: Vision provider dispatch state
+        self._vision_provider = VisionProvider(self.config.vision_provider)
+        self._prime_vision_client = None  # Lazy init
+        # F9: Backoff when both providers fail
+        self._vision_both_failed_until: float = 0.0
 
         logger.info(
             f"Initialized ClaudeVisionAnalyzer with config: {self.config.to_dict()}"
@@ -3026,16 +3063,51 @@ class ClaudeVisionAnalyzer:
                         region_info = ""
                     enhanced_prompt = prompt + region_info
 
-                if priority == "high":
-                    # High priority requests get processed immediately
-                    result = await self._call_claude_api(image_base64, enhanced_prompt)
+                # v236.0: Provider dispatch — J-Prime LLaVA for background, Claude for user queries
+                # F9: Check dual-fail cooldown
+                if time.time() < self._vision_both_failed_until:
+                    raise RuntimeError(
+                        f"Vision temporarily unavailable (both providers failed, "
+                        f"retry in {self._vision_both_failed_until - time.time():.0f}s)"
+                    )
+
+                # F5: Read coroutine-safe continuous flag (no race condition)
+                _is_continuous = _is_continuous_ctx.get(False)
+                _use_jprime = (
+                    self._vision_provider == VisionProvider.AUTO
+                    and priority != "high"
+                    and _is_continuous
+                ) or self._vision_provider == VisionProvider.JPRIME_LLAVA
+
+                if _use_jprime:
+                    try:
+                        result = await self._call_jprime_vision(image_base64, enhanced_prompt)
+                    except Exception as e:
+                        logger.warning(f"[VisionProvider] LLaVA failed ({e}), falling back to Claude")
+                        if self.config.jprime_fallback_to_claude:
+                            try:
+                                result = await self._call_claude_api(image_base64, enhanced_prompt)
+                            except Exception as e2:
+                                # F9: Both failed — set cooldown
+                                self._vision_both_failed_until = (
+                                    time.time() + self.config.vision_dual_fail_cooldown
+                                )
+                                logger.error(
+                                    f"[VisionProvider] Both LLaVA and Claude failed. "
+                                    f"Cooling down {self.config.vision_dual_fail_cooldown}s"
+                                )
+                                raise
+                        else:
+                            raise
                 else:
-                    # Normal priority may be delayed if system is busy
-                    if self._get_system_load() > (
-                        self.config.cpu_threshold_percent / 100
-                    ):
-                        await asyncio.sleep(0.5)  # Brief delay to reduce load
-                    result = await self._call_claude_api(image_base64, enhanced_prompt)
+                    if priority == "high":
+                        result = await self._call_claude_api(image_base64, enhanced_prompt)
+                    else:
+                        if self._get_system_load() > (
+                            self.config.cpu_threshold_percent / 100
+                        ):
+                            await asyncio.sleep(0.5)
+                        result = await self._call_claude_api(image_base64, enhanced_prompt)
             metrics.api_call_time = time.time() - api_start
 
             # Parse response
@@ -4599,6 +4671,43 @@ class ClaudeVisionAnalyzer:
             f"Enhanced prompt with advanced intelligence: {enhanced_prompt[:300]}..."
         )
         return enhanced_prompt
+
+    # -----------------------------------------------------------------
+    # v236.0: J-Prime LLaVA vision support
+    # -----------------------------------------------------------------
+
+    async def _get_prime_vision_client(self):
+        """Lazy-init PrimeClient for vision requests."""
+        if self._prime_vision_client is not None:
+            return self._prime_vision_client
+        try:
+            from backend.core.prime_client import get_prime_client
+            client = await get_prime_client()
+            if client:
+                self._prime_vision_client = client
+                return client
+        except Exception as e:
+            logger.debug(f"[VisionProvider] PrimeClient unavailable: {e}")
+        return None
+
+    async def _call_jprime_vision(self, image_base64: str, prompt: str) -> str:
+        """Call J-Prime LLaVA vision server (port 8001). CPU inference ~30-60s.
+
+        F3: Applies same prompt enhancement as Claude path.
+        """
+        client = await self._get_prime_vision_client()
+        if client is None:
+            raise RuntimeError("J-Prime vision client not available")
+        # F3: Apply the same prompt enhancement that _call_claude_api uses
+        enhanced = self._enhance_prompt_for_ui_elements(prompt)
+        response = await client.send_vision_request(
+            image_base64=image_base64,
+            prompt=enhanced,
+            max_tokens=self.config.max_tokens,
+            temperature=0.1,
+            timeout=self.config.jprime_vision_timeout,
+        )
+        return response.content
 
     async def _call_claude_api(self, image_base64: str, prompt: str) -> str:
         """Make API call to Claude with timeout"""
@@ -6872,7 +6981,12 @@ For this query, provide a helpful response that leverages the multi-space inform
             if isinstance(screenshot, Image.Image):
                 screenshot = np.array(screenshot)
 
-        result = await self.smart_analyze(screenshot, query)
+        # v236.0: Set coroutine-safe continuous flag (F5: no race condition)
+        _is_continuous_token = _is_continuous_ctx.set(params.get("_is_continuous", False))
+        try:
+            result = await self.smart_analyze(screenshot, query)
+        finally:
+            _is_continuous_ctx.reset(_is_continuous_token)  # F5: Always reset
         return {
             "success": True,
             "description": result.get("description", result.get("summary", "")),

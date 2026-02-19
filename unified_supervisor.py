@@ -60269,6 +60269,11 @@ class JarvisSystemKernel:
         except Exception as e:
             self.logger.debug(f"[InvincibleNode] Trinity event sync failed: {e}")
 
+        # v236.0: Propagate vision server endpoint (LLaVA on port 8001)
+        _vision_port = os.getenv("JARVIS_PRIME_VISION_PORT", "8001")
+        os.environ["JARVIS_PRIME_VISION_URL"] = f"http://{node_ip}:{_vision_port}"
+        os.environ["JARVIS_PRIME_VISION_PORT"] = _vision_port
+
     async def _notify_prime_router_of_gcp(self, host: str, port: int) -> None:
         """v232.0: Notify PrimeRouter that GCP VM is ready for routing."""
         try:

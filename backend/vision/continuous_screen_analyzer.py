@@ -899,9 +899,10 @@ class MemoryAwareScreenAnalyzer:
 5. What the user appears to be doing
 6. Any text content that might be relevant
 
-Be concise but thorough.'''
+Be concise but thorough.''',
+            '_is_continuous': True,  # v236.0: Route to J-Prime LLaVA
         }
-        
+
         result = await self.vision_handler.describe_screen(params)
 
         # describe_screen() may return a dict (claude_vision_analyzer_main)
@@ -1361,25 +1362,27 @@ Be concise but thorough.'''
         if context.get('current_app') == 'weather':
             # Weather app is already open, just read it
             params = {
-                'query': 'Read the weather information from the Weather app. What is the temperature, conditions, and forecast?'
+                'query': 'Read the weather information from the Weather app. What is the temperature, conditions, and forecast?',
+                '_is_continuous': True,  # v236.0: Route to J-Prime LLaVA
             }
         else:
             # Need to open Weather app first
             try:
                 from system_control import MacOSController
                 controller = MacOSController()
-                
+
                 # Open Weather app
                 controller.open_application("Weather")
                 await asyncio.sleep(2.0)  # Wait for it to open
-                
+
                 # Now read the weather
                 params = {
-                    'query': 'The Weather app should now be open. Read the weather information: temperature, conditions, and forecast for today.'
+                    'query': 'The Weather app should now be open. Read the weather information: temperature, conditions, and forecast for today.',
+                    '_is_continuous': True,  # v236.0: Route to J-Prime LLaVA
                 }
             except ImportError:
                 return None
-        
+
         result = await self.vision_handler.describe_screen(params)
 
         # Handle both dict and object return types from describe_screen()

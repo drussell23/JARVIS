@@ -201,6 +201,11 @@ class PrimeClientConfig:
     enable_cloud_fallback: bool = field(default_factory=lambda: _get_env_bool("PRIME_ENABLE_CLOUD_FALLBACK", True))
     prefer_local: bool = field(default_factory=lambda: _get_env_bool("PRIME_PREFER_LOCAL", True))
 
+    # v236.0: Vision server (LLaVA on dedicated port)
+    prime_vision_port: int = field(
+        default_factory=lambda: _get_env_int("JARVIS_PRIME_VISION_PORT", 8001)
+    )
+
     def __post_init__(self):
         """Log resolved configuration for debugging."""
         is_gcp = self.prime_host != "localhost" and self.prime_host != "127.0.0.1"
@@ -229,6 +234,16 @@ class PrimeClientConfig:
     def health_url(self) -> str:
         """Get the health check URL."""
         return f"http://{self.prime_host}:{self.prime_port}/health"
+
+    @property
+    def vision_base_url(self) -> str:
+        """v236.0: Get the base URL for Vision server (LLaVA on port 8001)."""
+        return f"http://{self.prime_host}:{self.prime_vision_port}/v1"
+
+    @property
+    def vision_health_url(self) -> str:
+        """v236.0: Get the vision server health check URL."""
+        return f"http://{self.prime_host}:{self.prime_vision_port}/health"
 
 
 # =============================================================================
@@ -261,6 +276,21 @@ class PrimeRequest:
     stream: bool = False
     stop: Optional[List[str]] = None  # v237.0: Stop sequences for generation
     metadata: Dict[str, Any] = field(default_factory=dict)
+    request_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.request_id is None:
+            import uuid
+            self.request_id = str(uuid.uuid4())[:8]
+
+
+@dataclass
+class PrimeVisionRequest:
+    """Request to Prime Vision Server (LLaVA on port 8001). v236.0."""
+    image_base64: str
+    prompt: str
+    max_tokens: int = 512
+    temperature: float = 0.1
     request_id: Optional[str] = None
 
     def __post_init__(self):
@@ -516,6 +546,10 @@ class PrimeClient:
         self._health_max_backoff: float = _get_env_float("PRIME_HEALTH_MAX_BACKOFF", 300.0)
         self._health_backoff_factor: float = _get_env_float("PRIME_HEALTH_BACKOFF_FACTOR", 2.0)
         self._health_failure_logged: bool = False
+        # v236.0: F8 — Dedicated vision session (separate from text server pool, different port)
+        self._vision_session: Optional[Any] = None  # aiohttp.ClientSession
+        self._vision_healthy: bool = False
+        self._vision_last_check: float = 0.0
 
     async def initialize(self) -> None:
         """Initialize the client and start health monitoring."""
@@ -540,6 +574,90 @@ class PrimeClient:
             self._initialized = True
             logger.info(f"[PrimeClient] Initialized, status={self._status.value}")
 
+    # -----------------------------------------------------------------
+    # v236.0: Vision server support (LLaVA on port 8001)
+    # -----------------------------------------------------------------
+
+    async def _get_vision_session(self):
+        """Get or create dedicated session for vision server (port 8001).
+
+        F8: Separate from text server's connection pool to avoid port mismatch.
+        """
+        if self._vision_session is None or self._vision_session.closed:
+            import aiohttp
+            self._vision_session = aiohttp.ClientSession()
+        return self._vision_session
+
+    async def _check_vision_health(self) -> bool:
+        """Check vision server health (cached 30s). Uses dedicated session (F8)."""
+        now = time.time()
+        if now - self._vision_last_check < 30.0:
+            return self._vision_healthy
+        try:
+            import aiohttp
+            session = await self._get_vision_session()
+            async with session.get(
+                self._config.vision_health_url,
+                timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._vision_healthy = data.get("ready_for_inference", False)
+                else:
+                    self._vision_healthy = False
+        except Exception:
+            self._vision_healthy = False
+        self._vision_last_check = now
+        return self._vision_healthy
+
+    async def send_vision_request(
+        self, image_base64: str, prompt: str,
+        max_tokens: int = 512, temperature: float = 0.1, timeout: float = 120.0,
+    ) -> 'PrimeResponse':
+        """Send vision analysis to LLaVA server on port 8001.
+
+        F4: Uses dedicated vision session (not text server pool).
+        F8: Connects to vision_base_url (port 8001), not text port.
+        """
+        if not await self._check_vision_health():
+            raise RuntimeError("Vision server unavailable")
+
+        import aiohttp
+        import uuid
+
+        payload = {
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+                {"type": "text", "text": prompt},
+            ]}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "model": "llava-v1.6-mistral-7b",
+        }
+
+        url = f"{self._config.vision_base_url}/chat/completions"
+        start = time.time()
+
+        session = await self._get_vision_session()
+        try:
+            async with session.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Vision server {resp.status}: {await resp.text()}")
+                data = await resp.json()
+        except Exception as e:
+            raise RuntimeError(f"Vision request failed: {e}")
+
+        content = data["choices"][0]["message"]["content"]
+        return PrimeResponse(
+            content=content, request_id=str(uuid.uuid4())[:8],
+            model="llava-v1.6-mistral-7b", source="gcp_vision",
+            latency_ms=(time.time() - start) * 1000,
+            metadata={"inference_time": data.get("x_inference_time_seconds")},
+        )
+
     async def close(self) -> None:
         """Close the client and cleanup resources."""
         if self._health_check_task:
@@ -548,6 +666,11 @@ class PrimeClient:
                 await self._health_check_task
             except asyncio.CancelledError:
                 pass
+
+        # v236.0: Close dedicated vision session
+        if self._vision_session and not self._vision_session.closed:
+            await self._vision_session.close()
+            self._vision_session = None
 
         await self._pool.close()
         self._initialized = False
