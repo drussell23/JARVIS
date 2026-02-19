@@ -172,6 +172,9 @@ class ModeDispatcher:
                 self._conversation_task = asyncio.ensure_future(
                     self._conversation_pipeline.run()
                 )
+                self._conversation_task.add_done_callback(
+                    self._on_conversation_done
+                )
 
         elif mode == VoiceMode.BIOMETRIC:
             pass  # Biometric mode handled by existing voice_unlock system
@@ -248,12 +251,20 @@ class ModeDispatcher:
             "conversation_active": self._current_mode == VoiceMode.CONVERSATION,
         }
 
+    def _on_conversation_done(self, task: asyncio.Task) -> None:
+        """Handle unexpected conversation task completion."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"[ModeDispatcher] Conversation task failed: {exc}")
+
     async def start(self) -> None:
         """Start the mode dispatcher. Currently a no-op — modes are event-driven."""
         logger.info("[ModeDispatcher] Started")
 
     async def stop(self) -> None:
         """Stop the mode dispatcher and clean up any active mode."""
-        if self._current_mode == VoiceMode.CONVERSATION:
-            await self._leave_mode(VoiceMode.CONVERSATION)
+        if self._current_mode != VoiceMode.COMMAND:
+            await self.switch_mode(VoiceMode.COMMAND)
         logger.info("[ModeDispatcher] Stopped")
