@@ -183,6 +183,23 @@ async def wire_conversation_pipeline(
     except Exception as e:
         logger.warning(f"[Bootstrap] ModeDispatcher init skipped: {e}")
 
+    # 6. Register ModeDispatcher transcript hook on voice communicator
+    try:
+        from backend.agi_os.realtime_voice_communicator import (
+            get_voice_communicator,
+        )
+        _communicator = await get_voice_communicator()
+        if _communicator is not None and handle.mode_dispatcher is not None:
+            if hasattr(_communicator, "register_transcript_hook"):
+                _communicator.register_transcript_hook(
+                    handle.mode_dispatcher.handle_transcript
+                )
+                logger.info("[Bootstrap] ModeDispatcher registered as transcript hook")
+            else:
+                logger.debug("[Bootstrap] Voice communicator lacks register_transcript_hook")
+    except Exception as e:
+        logger.debug(f"[Bootstrap] Transcript hook registration skipped: {e}")
+
     return handle
 
 
