@@ -8622,7 +8622,7 @@ class SmartWatchdog:
 # =============================================================================
 # COST TRACKER
 # =============================================================================
-class CostTracker(ResourceManagerBase):
+class CostTracker(ResourceManagerBase, SystemService):
     """
     Enterprise-grade cost tracking for cloud resources.
 
@@ -10416,6 +10416,220 @@ class ResourceManagerRegistry:
     def manager_count(self) -> int:
         """Number of registered managers."""
         return len(self._managers)
+
+
+# =============================================================================
+# v239.0: SYSTEM SERVICE REGISTRY — Uniform lifecycle for dead-code activation
+# =============================================================================
+
+class SystemService(ABC):
+    """Uniform lifecycle contract for all system services.
+
+    Every service activated via the SystemServiceRegistry MUST implement
+    these three methods.  Classes that already have start()/stop() or
+    initialize()/cleanup() should add thin wrappers that delegate.
+    """
+
+    @abstractmethod
+    async def initialize(self) -> None:
+        """Set up resources.  Called once during activation."""
+
+    @abstractmethod
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message).  Called periodically by the registry."""
+
+    @abstractmethod
+    async def cleanup(self) -> None:
+        """Release resources.  Called during shutdown."""
+
+
+@dataclass
+class ServiceDescriptor:
+    """Metadata for a single service managed by the registry."""
+    name: str
+    service: SystemService
+    phase: int                                        # startup phase (1-8)
+    depends_on: List[str] = field(default_factory=list)
+    enabled_env: Optional[str] = None                 # per-service kill-switch
+    initialized: bool = False
+    healthy: bool = True
+    error: Optional[str] = None
+    init_time_ms: float = 0.0
+    memory_delta_mb: float = 0.0
+
+
+class SystemServiceRegistry:
+    """Manages lifecycle of system services in dependency-ordered waves.
+
+    Services are grouped by startup *phase* (matching JarvisSystemKernel
+    phases 1-8).  Within a phase, services are topologically sorted by
+    their ``depends_on`` list so that dependencies initialise first.
+
+    Key guarantees
+    ──────────────
+    • Each service is initialised at most once.
+    • Shutdown happens in exact reverse activation order.
+    • Individual services can be disabled via environment variables.
+    • Every activation records wall-clock time and RSS memory delta.
+    """
+
+    def __init__(self) -> None:
+        self._services: Dict[str, ServiceDescriptor] = {}
+        self._activation_order: List[str] = []
+
+    # ── registration ────────────────────────────────────────────────────
+
+    def register(self, desc: ServiceDescriptor) -> None:
+        self._services[desc.name] = desc
+
+    def get(self, name: str) -> Optional[Any]:
+        """Return a service instance if it is initialised, else None."""
+        desc = self._services.get(name)
+        return desc.service if desc and desc.initialized else None
+
+    # ── activation ──────────────────────────────────────────────────────
+
+    async def activate_phase(
+        self,
+        phase: int,
+        timeout_per_service: float = 30.0,
+    ) -> Dict[str, bool]:
+        """Activate all services registered for *phase*, in dependency order."""
+        import resource as _res
+
+        phase_services = [
+            s for s in self._services.values()
+            if s.phase == phase and not s.initialized
+        ]
+        ordered = self._topological_sort(phase_services)
+        results: Dict[str, bool] = {}
+
+        for desc in ordered:
+            # per-service kill switch
+            if desc.enabled_env:
+                val = os.getenv(desc.enabled_env, "true").lower()
+                if val not in ("true", "1", "yes"):
+                    results[desc.name] = False
+                    continue
+
+            # dependency check
+            unmet = [
+                d for d in desc.depends_on
+                if d not in self._services or not self._services[d].initialized
+            ]
+            if unmet:
+                desc.error = f"Unmet dependencies: {unmet}"
+                desc.healthy = False
+                results[desc.name] = False
+                logger.warning(
+                    "[SSR] Skipping %s: unmet deps %s", desc.name, unmet,
+                )
+                continue
+
+            # activate with telemetry
+            _mem_before = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+            _t0 = time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    desc.service.initialize(), timeout=timeout_per_service,
+                )
+                desc.initialized = True
+                desc.init_time_ms = (time.monotonic() - _t0) * 1000
+                _mem_after = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+                desc.memory_delta_mb = (_mem_after - _mem_before) / (1024 * 1024)
+                self._activation_order.append(desc.name)
+                results[desc.name] = True
+                logger.info(
+                    "[SSR] Activated %s in %.0fms (+%.1fMB)",
+                    desc.name, desc.init_time_ms, desc.memory_delta_mb,
+                )
+            except Exception as e:
+                desc.error = str(e)
+                desc.healthy = False
+                results[desc.name] = False
+                logger.warning("[SSR] Failed to activate %s: %s", desc.name, e)
+
+        return results
+
+    # ── health ──────────────────────────────────────────────────────────
+
+    async def health_check_all(self) -> Dict[str, Tuple[bool, str]]:
+        """Run active health check on every initialised service."""
+        results: Dict[str, Tuple[bool, str]] = {}
+        for name in self._activation_order:
+            desc = self._services[name]
+            try:
+                healthy, msg = await asyncio.wait_for(
+                    desc.service.health_check(), timeout=5.0,
+                )
+                desc.healthy = healthy
+                desc.error = None if healthy else msg
+                results[name] = (healthy, msg)
+            except Exception as e:
+                desc.healthy = False
+                desc.error = str(e)
+                results[name] = (False, str(e))
+        return results
+
+    # ── shutdown ────────────────────────────────────────────────────────
+
+    async def shutdown_all(self, timeout_per: float = 5.0) -> None:
+        """Shutdown in reverse activation order."""
+        for name in reversed(self._activation_order):
+            desc = self._services.get(name)
+            if desc and desc.initialized:
+                try:
+                    await asyncio.wait_for(
+                        desc.service.cleanup(), timeout=timeout_per,
+                    )
+                except Exception as e:
+                    logger.warning("[SSR] Cleanup error for %s: %s", name, e)
+                desc.initialized = False
+        self._activation_order.clear()
+
+    # ── helpers ─────────────────────────────────────────────────────────
+
+    def _topological_sort(
+        self, services: List[ServiceDescriptor],
+    ) -> List[ServiceDescriptor]:
+        """Kahn-style topological sort respecting depends_on within a phase."""
+        name_map = {s.name: s for s in services}
+        visited: set = set()
+        result: List[ServiceDescriptor] = []
+
+        def _visit(s: ServiceDescriptor) -> None:
+            if s.name in visited:
+                return
+            visited.add(s.name)
+            for dep in s.depends_on:
+                if dep in name_map:
+                    _visit(name_map[dep])
+            result.append(s)
+
+        for s in services:
+            _visit(s)
+        return result
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        total = len(self._services)
+        active = sum(1 for s in self._services.values() if s.initialized)
+        healthy = sum(
+            1 for s in self._services.values() if s.initialized and s.healthy
+        )
+        total_mem = sum(
+            s.memory_delta_mb for s in self._services.values() if s.initialized
+        )
+        total_time = sum(
+            s.init_time_ms for s in self._services.values() if s.initialized
+        )
+        return {
+            "total_registered": total,
+            "active": active,
+            "healthy": healthy,
+            "memory_mb": round(total_mem, 1),
+            "init_time_ms": round(total_time, 0),
+        }
 
 
 # =============================================================================
@@ -17823,7 +18037,7 @@ def get_process_cleaner() -> ParallelProcessCleaner:
 # v110.0: Dynamic Python module and bytecode cache management
 
 
-class IntelligentCacheManager:
+class _Deprecated_IntelligentCacheManager:  # v239.0: superseded by IntelligentCacheManager(ResourceManagerBase) at line ~10879
     """
     Intelligent Cache Manager for Dynamic Python Module and Data Caching.
 
@@ -18468,7 +18682,7 @@ class PhysicsAwareAuthManager:
 # v109.0: GCP Spot VM preemption handling and automatic fallback
 
 
-class SpotInstanceResilienceHandler:
+class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotInstanceResilienceHandler(ResourceManagerBase) at line ~10638
     """
     Spot Instance Resilience Handler for GCP Preemption.
 
@@ -23268,7 +23482,7 @@ class TrinityHealthMonitor:
         }
 
 
-class GracefulDegradationManager:
+class GracefulDegradationManager(SystemService):
     """
     Resource-aware feature flag manager for graceful degradation.
 
@@ -23430,6 +23644,18 @@ class GracefulDegradationManager:
             },
             "stats": self._stats,
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        enabled = sum(1 for (_, is_on, _) in self._features.values() if is_on)
+        total = len(self._features)
+        return (True, f"Degradation: {enabled}/{total} features enabled")
+
+    async def cleanup(self) -> None:
+        await self.stop()
 
 
 class AGIOrchestrator:
@@ -26690,7 +26916,7 @@ class AdvancedCircuitBreaker:
         }
 
 
-class CacheHierarchyManager:
+class CacheHierarchyManager(SystemService):
     """
     Multi-tier caching system with L1/L2/L3 hierarchy.
 
@@ -26742,6 +26968,19 @@ class CacheHierarchyManager:
             "demotions": 0,
             "evictions": 0,
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        pass  # L1/L2 are ready after __init__; L3 dir created on demand
+
+    async def health_check(self) -> Tuple[bool, str]:
+        l1_size = len(self._l1_cache)
+        l2_size = len(self._l2_cache)
+        return (True, f"Cache: L1={l1_size}/{self._l1_max_size}, L2={l2_size}/{self._l2_max_size}")
+
+    async def cleanup(self) -> None:
+        self._l1_cache.clear()
+        self._l2_cache.clear()
 
     async def get(self, key: str) -> Optional[Any]:
         """Get a value from the cache hierarchy."""
@@ -26951,7 +27190,7 @@ class CacheHierarchyManager:
         }
 
 
-class TokenBucketRateLimiter:
+class TokenBucketRateLimiter(SystemService):
     """
     Token bucket rate limiter for API protection.
 
@@ -27001,6 +27240,17 @@ class TokenBucketRateLimiter:
             "tokens_consumed": 0,
             "wait_time_total_ms": 0,
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        pass  # Ready after __init__
+
+    async def health_check(self) -> Tuple[bool, str]:
+        bucket_count = len(self._buckets)
+        return (True, f"RateLimiter: {bucket_count} active buckets")
+
+    async def cleanup(self) -> None:
+        self._buckets.clear()
 
     async def acquire(
         self,
@@ -27108,7 +27358,7 @@ class TokenBucketRateLimiter:
         }
 
 
-class EventSourcingManager:
+class EventSourcingManager(SystemService):
     """
     Event sourcing system for audit trails and state reconstruction.
 
@@ -27367,6 +27617,16 @@ class EventSourcingManager:
             "handlers_registered": sum(len(h) for h in self._handlers.values()),
             "stats": self._stats,
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        return (True, f"EventSourcing: {self._event_count} events, {len(self._handlers)} handlers")
+
+    async def cleanup(self) -> None:
+        if self._events:
+            await self._create_snapshot()
+        self._events.clear()
+        self._handlers.clear()
 
 
 class DynamicConfigurationManager:
@@ -27640,7 +27900,7 @@ class FencingToken:
         return token
 
 
-class DistributedLockManager:
+class DistributedLockManager(SystemService):
     """
     Distributed lock manager with fencing tokens.
 
@@ -27975,6 +28235,17 @@ class DistributedLockManager:
             "resources_locked": list(self._held_locks.keys()),
             "stats": self._stats.copy(),
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        held = len(self._held_locks)
+        return (True, f"LockManager: {held} locks held")
+
+    async def cleanup(self) -> None:
+        await self.stop()
 
 
 class ServiceEndpoint:
@@ -28684,7 +28955,7 @@ class LogEntry:
         }
 
 
-class ObservabilityPipeline:
+class ObservabilityPipeline(SystemService):
     """
     Unified observability pipeline for metrics, traces, and logs.
 
@@ -28779,6 +29050,17 @@ class ObservabilityPipeline:
 
         # Final flush
         await self._flush_all()
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        active = len(self._metrics_buffer) + len(self._traces_buffer) + len(self._logs_buffer)
+        return (True, f"ObservabilityPipeline: {active} items buffered")
+
+    async def cleanup(self) -> None:
+        await self.stop()
 
     # === Metrics ===
 
@@ -31398,7 +31680,7 @@ class QueuedTask:
         }
 
 
-class TaskQueueManager:
+class TaskQueueManager(SystemService):
     """
     Priority-based task queue with delayed execution.
 
@@ -31732,6 +32014,19 @@ class TaskQueueManager:
             "handlers_registered": list(self._handlers.keys()),
             "stats": self._stats.copy(),
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        stats = {"enqueued": self._stats.get("tasks_enqueued", 0),
+                 "completed": self._stats.get("tasks_completed", 0),
+                 "failed": self._stats.get("tasks_failed", 0)}
+        return (True, f"TaskQueue: {stats}")
+
+    async def cleanup(self) -> None:
+        await self.stop()
 
 
 class StateTransition:
@@ -35551,7 +35846,7 @@ class Topic:
         self.message_count = 0
 
 
-class MessageBroker:
+class MessageBroker(SystemService):
     """
     Pub/sub messaging with topic management.
 
@@ -35727,6 +36022,19 @@ class MessageBroker:
             "dead_letter_count": len(self._dead_letter),
             "stats": self._stats.copy(),
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        pass  # Ready after __init__
+
+    async def health_check(self) -> Tuple[bool, str]:
+        topic_count = len(self._topics)
+        dl_count = len(self._dead_letter)
+        return (True, f"MessageBroker: {topic_count} topics, {dl_count} dead letters")
+
+    async def cleanup(self) -> None:
+        self._topics.clear()
+        self._dead_letter.clear()
 
 
 class ScheduledJob:
@@ -40156,7 +40464,7 @@ class EventStream:
     version: int = 0
 
 
-class EventSourcingManager:
+class _Deprecated_EventSourcingManager:  # v239.0: superseded by EventSourcingManager at line ~27325
     """
     Event sourcing and CQRS manager.
 
@@ -51253,7 +51561,7 @@ class HealthCheckResult(NamedTuple):
     total_response_time_ms: float
 
 
-class HealthAggregator:
+class HealthAggregator(SystemService):
     """
     Centralized health aggregation across all kernel subsystems.
 
@@ -51292,11 +51600,15 @@ class HealthAggregator:
             except asyncio.CancelledError:
                 pass
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        return (True, f"HealthAggregator: {len(self._subsystems)} subsystems monitored")
+
     def register_subsystem(
         self,
         subsystem_id: str,
         name: str,
-        health_check: Callable[[], Awaitable[Tuple[bool, str, Dict[str, Any]]]],
+        health_check_fn: Callable[[], Awaitable[Tuple[bool, str, Dict[str, Any]]]],
         dependencies: Optional[List[str]] = None,
     ) -> None:
         """
@@ -51305,10 +51617,10 @@ class HealthAggregator:
         Args:
             subsystem_id: Unique subsystem identifier
             name: Human-readable name
-            health_check: Async function returning (healthy, message, details)
+            health_check_fn: Async function returning (healthy, message, details)
             dependencies: List of subsystem IDs this depends on
         """
-        self._subsystems[subsystem_id] = health_check
+        self._subsystems[subsystem_id] = health_check_fn
         self._dependencies[subsystem_id] = dependencies or []
         self._health_history[subsystem_id] = []
 
@@ -51838,7 +52150,7 @@ class DegradationState(NamedTuple):
     reason: str
 
 
-class GracefulDegradationManager:
+class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulDegradationManager at line ~23485
     """
     Manages graceful degradation during system stress.
 
@@ -58974,6 +59286,7 @@ class JarvisSystemKernel:
             "ghost_display": {"status": "pending", "message": "Waiting to start"},  # v240.0: Virtual Display
             "visual_pipeline": {"status": "pending", "message": "Waiting to start"},  # v250.0: Visual Pipeline
             "audio_infrastructure": {"status": "pending", "message": "Waiting to start"},  # v238.0: Audio Bus
+            "system_services": {"status": "pending", "message": "Waiting for flag"},  # v239.0: SSR
             "frontend": {"status": "pending", "message": "Waiting to start"},
         }
 
@@ -59130,6 +59443,14 @@ class JarvisSystemKernel:
         # This prevents broadcast attempts before server is ready
         self._loading_server_ready: bool = False
 
+        # v239.0: System Service Registry (10 priority services)
+        self._system_services_enabled: bool = os.getenv(
+            "JARVIS_SYSTEM_SERVICES_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+        self._service_registry: Optional[SystemServiceRegistry] = None
+        if self._system_services_enabled:
+            self._init_service_registry()
+
     @property
     def state(self) -> KernelState:
         """Current kernel state."""
@@ -59157,6 +59478,149 @@ class JarvisSystemKernel:
             "instance_name": self.config.invincible_node_instance_name,
             "port": self.config.invincible_node_port,
         }
+
+    # ── v239.0: System Service Registry wiring ────────────────────────
+
+    def _init_service_registry(self) -> None:
+        """Construct (but do NOT initialise) the 10 priority system services."""
+        self._service_registry = SystemServiceRegistry()
+        _r = self._service_registry.register
+
+        # Phase 1 (Preflight) ─ observability + health first
+        _r(ServiceDescriptor(
+            name="observability",
+            service=ObservabilityPipeline(
+                service_name="jarvis",
+                metrics_flush_interval=float(os.getenv("JARVIS_METRICS_FLUSH_INTERVAL", "10")),
+                storage_path=Path(os.getenv(
+                    "JARVIS_TELEMETRY_DIR",
+                    str(Path.home() / ".jarvis" / "telemetry"),
+                )),
+            ),
+            phase=1,
+            enabled_env="JARVIS_SERVICE_OBSERVABILITY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="health_aggregator",
+            service=HealthAggregator(
+                check_interval=float(os.getenv("JARVIS_HEALTH_CHECK_INTERVAL", "30")),
+            ),
+            phase=1,
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_HEALTH_ENABLED",
+        ))
+
+        # Phase 2 (Resources) ─ cache, rate-limiter, cost, locks
+        _r(ServiceDescriptor(
+            name="cache_hierarchy",
+            service=CacheHierarchyManager(
+                l1_max_size=int(os.getenv("JARVIS_CACHE_L1_SIZE", "100")),
+                l2_max_size=int(os.getenv("JARVIS_CACHE_L2_SIZE", "1000")),
+                l2_ttl_seconds=float(os.getenv("JARVIS_CACHE_L2_TTL", "300")),
+                l3_dir=Path(os.getenv(
+                    "JARVIS_CACHE_L3_DIR",
+                    str(Path.home() / ".jarvis" / "cache"),
+                )),
+            ),
+            phase=2,
+            enabled_env="JARVIS_SERVICE_CACHE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rate_limiter",
+            service=TokenBucketRateLimiter(
+                rate=float(os.getenv("JARVIS_RATE_LIMIT_RPS", "10")),
+                capacity=int(os.getenv("JARVIS_RATE_LIMIT_CAPACITY", "100")),
+            ),
+            phase=2,
+            enabled_env="JARVIS_SERVICE_RATELIMIT_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cost_tracker",
+            service=CostTracker(
+                config=self._config if hasattr(self, "_config") else None,
+            ),
+            phase=2,
+            enabled_env="JARVIS_SERVICE_COST_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="lock_manager",
+            service=DistributedLockManager(
+                lock_timeout_seconds=float(os.getenv("JARVIS_LOCK_TIMEOUT", "30")),
+                heartbeat_interval=float(os.getenv("JARVIS_LOCK_HEARTBEAT", "5")),
+                storage_path=Path(os.getenv(
+                    "JARVIS_LOCK_DIR", "/tmp/.jarvis/state/locks",
+                )),
+            ),
+            phase=2,
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_LOCKS_ENABLED",
+        ))
+
+        # Phase 3 (Backend) ─ task queue
+        _r(ServiceDescriptor(
+            name="task_queue",
+            service=TaskQueueManager(
+                max_workers=int(os.getenv("JARVIS_TASK_WORKERS", "10")),
+                storage_path=Path(os.getenv(
+                    "JARVIS_TASK_QUEUE_DIR",
+                    str(Path.home() / ".jarvis" / "task_queue"),
+                )),
+            ),
+            phase=3,
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_TASKQUEUE_ENABLED",
+        ))
+
+        # Phase 4 (Intelligence) ─ event sourcing + message broker
+        _r(ServiceDescriptor(
+            name="event_sourcing",
+            service=EventSourcingManager(
+                event_dir=Path(os.getenv(
+                    "JARVIS_EVENT_DIR",
+                    str(Path.home() / ".jarvis" / "events"),
+                )),
+                snapshot_interval=int(os.getenv("JARVIS_EVENT_SNAPSHOT_INTERVAL", "1000")),
+            ),
+            phase=4,
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_EVENTSOURCING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="message_broker",
+            service=MessageBroker(
+                delivery_timeout=float(os.getenv("JARVIS_BROKER_DELIVERY_TIMEOUT", "30")),
+                max_retries=int(os.getenv("JARVIS_BROKER_MAX_RETRIES", "3")),
+            ),
+            phase=4,
+            depends_on=["observability", "health_aggregator"],
+            enabled_env="JARVIS_SERVICE_BROKER_ENABLED",
+        ))
+
+        # Phase 5 (Trinity) ─ graceful degradation
+        _r(ServiceDescriptor(
+            name="degradation_manager",
+            service=GracefulDegradationManager(
+                memory_threshold_high=float(os.getenv("JARVIS_DEGRADE_MEM_HIGH", "85")),
+                memory_threshold_extreme=float(os.getenv("JARVIS_DEGRADE_MEM_EXTREME", "95")),
+                cpu_threshold_high=float(os.getenv("JARVIS_DEGRADE_CPU_HIGH", "80")),
+                cpu_threshold_extreme=float(os.getenv("JARVIS_DEGRADE_CPU_EXTREME", "95")),
+            ),
+            phase=5,
+            depends_on=["health_aggregator", "observability"],
+            enabled_env="JARVIS_SERVICE_DEGRADATION_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 10 services registered across phases 1-5")
+
+    # ── v239.0: helper for health aggregator wiring ─────────────────
+
+    async def _component_health_check(
+        self, component_name: str,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """Adapter: turn _component_status entry into a HealthAggregator check."""
+        status = self._component_status.get(component_name, {})
+        healthy = status.get("status") in ("running", "operational", "ready")
+        return (healthy, status.get("message", "unknown"), status)
 
     def _mark_startup_activity(self, source: str, stage: Optional[str] = None) -> None:
         """
@@ -59255,14 +59719,18 @@ class JarvisSystemKernel:
 
         # v232.0: Notify PrimeRouter singleton of GCP endpoint promotion
         try:
-            asyncio.ensure_future(self._notify_prime_router_of_gcp(node_ip, port))
+            create_safe_task(
+                self._notify_prime_router_of_gcp(node_ip, port),
+                name="notify_prime_router_gcp_up",
+            )
         except Exception:
             pass
 
         # v234.0: Notify UnifiedModelServing of GCP endpoint
         try:
-            asyncio.ensure_future(
-                self._notify_model_serving_of_gcp(node_ip, port)
+            create_safe_task(
+                self._notify_model_serving_of_gcp(node_ip, port),
+                name="notify_model_serving_gcp_up",
             )
         except Exception:
             pass
@@ -59404,13 +59872,19 @@ class JarvisSystemKernel:
 
         # v232.0: Notify PrimeRouter to demote back to local
         try:
-            asyncio.ensure_future(self._notify_prime_router_demote())
+            create_safe_task(
+                self._notify_prime_router_demote(),
+                name="notify_prime_router_demote",
+            )
         except Exception:
             pass
 
         # v234.0: Notify UnifiedModelServing to demote from GCP
         try:
-            asyncio.ensure_future(self._notify_model_serving_demote())
+            create_safe_task(
+                self._notify_model_serving_demote(),
+                name="notify_model_serving_demote",
+            )
         except Exception:
             pass
 
@@ -61980,32 +62454,31 @@ class JarvisSystemKernel:
 
             async def _early_wake_invincible_node():
                 """v233.4: Early boot invincible node provisioning with hard timeout."""
-                try:
-                    return await asyncio.wait_for(
-                        _early_wake_inner(),
-                        timeout=_early_gcp_timeout,
-                    )
-                except asyncio.CancelledError:
-                    # v236.0: CancelledError is a BaseException (Python 3.9+).
-                    # Clean up env var before re-raising so orchestrator doesn't
-                    # think we're still booting.
-                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)
-                    self.logger.info(
-                        "[EarlyGCP] Task cancelled (non-fatal)"
-                    )
-                    raise  # Re-raise so asyncio properly marks the task as cancelled
-                except asyncio.TimeoutError:
-                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
-                    self.logger.warning(
-                        f"[EarlyGCP] Hard timeout after {_early_gcp_timeout:.0f}s"
-                    )
-                    return False, None, "EARLY_TIMEOUT"
-                except Exception as e:
-                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
-                    self.logger.warning(
-                        f"[EarlyGCP] Early pre-warm error (non-fatal): {e}"
-                    )
-                    return False, None, f"EARLY_ERROR: {e}"
+                from backend.core.coordination_flags import coordination_flag
+
+                async with coordination_flag("JARVIS_INVINCIBLE_NODE_BOOTING"):
+                    try:
+                        return await asyncio.wait_for(
+                            _early_wake_inner(),
+                            timeout=_early_gcp_timeout,
+                        )
+                    except asyncio.CancelledError:
+                        # v236.0: CancelledError is a BaseException (Python 3.9+).
+                        # coordination_flag's finally clears the env var before re-raise.
+                        self.logger.info(
+                            "[EarlyGCP] Task cancelled (non-fatal)"
+                        )
+                        raise  # Re-raise so asyncio properly marks the task as cancelled
+                    except asyncio.TimeoutError:
+                        self.logger.warning(
+                            f"[EarlyGCP] Hard timeout after {_early_gcp_timeout:.0f}s"
+                        )
+                        return False, None, "EARLY_TIMEOUT"
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[EarlyGCP] Early pre-warm error (non-fatal): {e}"
+                        )
+                        return False, None, f"EARLY_ERROR: {e}"
 
             async def _early_wake_inner():
                 """v233.4: Inner provisioning logic (wrapped with timeout)."""
@@ -62098,7 +62571,6 @@ class JarvisSystemKernel:
                     if success and ip:
                         self._invincible_node_ready = True
                         self._invincible_node_ip = ip
-                        os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1: Clear race guard
                         self.logger.info(
                             f"[EarlyGCP] VM ready at {ip} (early boot)"
                         )
@@ -62131,7 +62603,6 @@ class JarvisSystemKernel:
                             except (ValueError, ProcessLookupError, OSError):
                                 pass
                     else:
-                        os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                         self.logger.info(
                             f"[EarlyGCP] VM not ready yet: {status}"
                         )
@@ -62139,13 +62610,11 @@ class JarvisSystemKernel:
                     return success, ip, status
 
                 except ImportError as e:
-                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                     self.logger.warning(
                         f"[EarlyGCP] GCP module not available: {e}"
                     )
                     return False, None, f"IMPORT_ERROR: {e}"
                 except Exception as e:
-                    os.environ.pop("JARVIS_INVINCIBLE_NODE_BOOTING", None)  # v235.1
                     self.logger.warning(
                         f"[EarlyGCP] Early pre-warm error (non-fatal): {e}"
                     )
@@ -62157,11 +62626,12 @@ class JarvisSystemKernel:
             )
             self._background_tasks.append(self._early_invincible_task)
             # v235.1: Signal to orchestrator that invincible node boot is in progress
-            # Prevents _start_gcp_prewarm() from provisioning a duplicate Spot VM
-            os.environ["JARVIS_INVINCIBLE_NODE_BOOTING"] = "true"
+            # Prevents _start_gcp_prewarm() from provisioning a duplicate Spot VM.
+            # The coordination_flag context manager inside _early_wake_invincible_node()
+            # sets JARVIS_INVINCIBLE_NODE_BOOTING on entry and clears it on ALL exit paths.
             self.logger.info(
                 "[Kernel] v233.4 Early invincible node task created "
-                "(JARVIS_INVINCIBLE_NODE_BOOTING=true)"
+                "(JARVIS_INVINCIBLE_NODE_BOOTING managed by coordination_flag)"
             )
 
         try:
@@ -64041,6 +64511,33 @@ class JarvisSystemKernel:
             self._update_component_status("preflight", "complete", "Preflight complete")
 
             self._readiness_manager.mark_tier(ReadinessTier.PROCESS_STARTED)
+
+            # v239.0: System Service Registry — Phase 1 activation (Observability, Health)
+            if self._service_registry:
+                try:
+                    _ssr_r1 = await self._service_registry.activate_phase(1)
+                    self.logger.info(f"[Kernel] Phase 1 services: {_ssr_r1}")
+
+                    # Wire 1: ObservabilityPipeline → UnifiedLogger metrics sink
+                    _obs = self._service_registry.get("observability")
+                    if _obs and hasattr(self, '_unified_logger') and self._unified_logger:
+                        self._unified_logger._external_metrics_sink = _obs
+
+                    # Wire 2: HealthAggregator → register existing components
+                    _ha = self._service_registry.get("health_aggregator")
+                    if _ha:
+                        for _comp_name in list(self._component_status.keys()):
+                            try:
+                                _ha.register_subsystem(
+                                    subsystem_id=_comp_name,
+                                    name=_comp_name,
+                                    health_check_fn=lambda cn=_comp_name: self._component_health_check(cn),
+                                )
+                            except Exception:
+                                pass
+                except Exception as _ssr_e:
+                    self.logger.warning(f"[Kernel] Phase 1 SSR activation error: {_ssr_e}")
+
             return True
 
     async def _phase_resources(self) -> bool:
@@ -64963,6 +65460,36 @@ class JarvisSystemKernel:
                     pass
 
             self._update_component_status("resources", "complete", "Resources initialized")
+
+            # v239.0: System Service Registry — Phase 2 activation (Cache, RateLimiter, Cost, Locks)
+            if self._service_registry:
+                try:
+                    _ssr_r2 = await self._service_registry.activate_phase(2)
+                    self.logger.info(f"[Kernel] Phase 2 services: {_ssr_r2}")
+
+                    # Wire 3: CacheHierarchyManager → SemanticVoiceCacheManager fast path
+                    _cache = self._service_registry.get("cache_hierarchy")
+                    if _cache and hasattr(self, '_voice_cache') and self._voice_cache:
+                        self._voice_cache._hierarchy_cache = _cache
+
+                    # Wire 5: CostTracker → GCP VM manager
+                    _ct = self._service_registry.get("cost_tracker")
+                    if _ct:
+                        try:
+                            from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                            _gcp = await get_gcp_vm_manager_safe()
+                            if _gcp:
+                                _gcp._cost_tracker = _ct
+                        except (ImportError, Exception):
+                            pass
+
+                    # Wire 10: DistributedLockManager — store for file lock replacement
+                    _dlm = self._service_registry.get("lock_manager")
+                    if _dlm:
+                        self._system_lock_manager = _dlm
+                except Exception as _ssr_e:
+                    self.logger.warning(f"[Kernel] Phase 2 SSR activation error: {_ssr_e}")
+
             return True
 
     async def _phase_backend(self) -> bool:
@@ -65030,6 +65557,14 @@ class JarvisSystemKernel:
                 self._update_component_status("backend", "error", "Backend failed to start")
                 if self._readiness_manager:
                     self._readiness_manager.mark_component_ready("backend", False)
+
+            # v239.0: System Service Registry — Phase 3 activation (TaskQueue)
+            if self._service_registry:
+                try:
+                    _ssr_r3 = await self._service_registry.activate_phase(3)
+                    self.logger.info(f"[Kernel] Phase 3 services: {_ssr_r3}")
+                except Exception as _ssr_e:
+                    self.logger.warning(f"[Kernel] Phase 3 SSR activation error: {_ssr_e}")
 
             return success
 
@@ -65574,6 +66109,26 @@ class JarvisSystemKernel:
                     self._update_component_status("intelligence", "complete", f"Intelligence ready: {ready_count}/{len(results)} initialized")
                 else:
                     self._update_component_status("intelligence", "error", "No intelligence components initialized")
+
+                # v239.0: System Service Registry — Phase 4 activation (EventSourcing, MessageBroker)
+                if self._service_registry:
+                    try:
+                        _ssr_r4 = await self._service_registry.activate_phase(4)
+                        self.logger.info(f"[Kernel] Phase 4 services: {_ssr_r4}")
+
+                        # Wire 8: MessageBroker → bridge SupervisorEventBus
+                        _mb = self._service_registry.get("message_broker")
+                        if _mb:
+                            try:
+                                _mb.create_topic("health")
+                                _mb.create_topic("voice")
+                                _mb.create_topic("inference")
+                                _mb.create_topic("lifecycle")
+                            except Exception:
+                                pass
+                    except Exception as _ssr_e:
+                        self.logger.warning(f"[Kernel] Phase 4 SSR activation error: {_ssr_e}")
+
                 return ready_count > 0
 
             except asyncio.CancelledError:
@@ -66147,7 +66702,10 @@ class JarvisSystemKernel:
                             if _micro_progress > _current:
                                 self._current_startup_progress = _micro_progress
 
-                _heartbeat_task = asyncio.ensure_future(_progress_heartbeat())
+                _heartbeat_task = create_safe_task(
+                    _progress_heartbeat(),
+                    name="startup_progress_heartbeat",
+                )
 
                 # v256.1: Inspect gather results for unexpected exceptions (R1-#1, R2-#7)
                 try:
@@ -70124,6 +70682,40 @@ class JarvisSystemKernel:
                         pass
                     self.logger.debug("[Trinity] 💓 DMS heartbeat stopped")
 
+                # v239.0: System Service Registry — Phase 5 activation (GracefulDegradation)
+                if self._service_registry:
+                    try:
+                        _ssr_r5 = await self._service_registry.activate_phase(5)
+                        self.logger.info(f"[Kernel] Phase 5 services: {_ssr_r5}")
+
+                        # Wire 9: GracefulDegradationManager → register feature priorities
+                        _gd = self._service_registry.get("degradation_manager")
+                        if _gd and hasattr(_gd, 'register_feature'):
+                            for _feat_name, _feat_pri, _feat_desc in [
+                                ("voice_auth", 1, "Voice biometric auth"),
+                                ("model_inference", 1, "LLM inference"),
+                                ("gcp_vm", 2, "Cloud VM management"),
+                                ("voice_cache", 3, "Voice embedding cache"),
+                                ("analytics", 4, "Usage analytics"),
+                                ("recommendations", 4, "Proactive suggestions"),
+                            ]:
+                                try:
+                                    _gd.register_feature(
+                                        _feat_name, priority=_feat_pri, description=_feat_desc
+                                    )
+                                except Exception:
+                                    pass
+
+                        # Update overall SSR component status
+                        _stats = self._service_registry.stats
+                        self._update_component_status(
+                            "system_services", "running",
+                            f"{_stats['active']}/{_stats['total_registered']} active, "
+                            f"{_stats['healthy']} healthy"
+                        )
+                    except Exception as _ssr_e:
+                        self.logger.warning(f"[Kernel] Phase 5 SSR activation error: {_ssr_e}")
+
                 return True  # Trinity is optional
 
             except Exception as e:
@@ -70415,6 +71007,76 @@ class JarvisSystemKernel:
                 self._readiness_manager.mark_component_ready("voice_biometrics", voice_ready)
 
             self._update_component_status("enterprise", "complete", f"Enterprise: {len(successful)}/{len(services)} active")
+
+            # v239.0: System Service Registry — Phase 6 (Training pipeline adapters)
+            if self._service_registry:
+                _training_phase = 6
+
+                # Adapter: CognitiveSystem (classmethod factory pattern)
+                try:
+                    from backend.core.cognitive_architecture import CognitiveSystem
+                    _cog = CognitiveSystem()
+
+                    class _CogAdapter(SystemService):
+                        def __init__(self, cog): self._cog = cog
+                        async def initialize(self): await self._cog.initialize()
+                        async def health_check(self): return (True, "CognitiveSystem ready")
+                        async def cleanup(self): pass
+
+                    self._service_registry.register(ServiceDescriptor(
+                        name="cognitive_system", service=_CogAdapter(_cog),
+                        phase=_training_phase,
+                    ))
+                except Exception as e:
+                    self.logger.debug(f"[Kernel] CognitiveSystem not available: {e}")
+
+                # Adapter: MetaCognitiveEngine (start/stop pattern)
+                try:
+                    from backend.intelligence.meta_cognitive_engine import MetaCognitiveEngine
+                    _meta = MetaCognitiveEngine()
+
+                    class _MetaAdapter(SystemService):
+                        def __init__(self, m): self._m = m
+                        async def initialize(self): await self._m.start()
+                        async def health_check(self): return (True, "MetaCognitive running")
+                        async def cleanup(self): await self._m.stop()
+
+                    self._service_registry.register(ServiceDescriptor(
+                        name="meta_cognitive", service=_MetaAdapter(_meta),
+                        phase=_training_phase,
+                    ))
+                except Exception as e:
+                    self.logger.debug(f"[Kernel] MetaCognitiveEngine not available: {e}")
+
+                # Adapter: TrinityTrainingPipeline (async classmethod factory)
+                try:
+                    from backend.core.trinity_training_pipeline import TrinityTrainingPipeline
+
+                    class _TTPAdapter(SystemService):
+                        def __init__(self): self._ttp = None
+                        async def initialize(self):
+                            self._ttp = await TrinityTrainingPipeline.create()
+                        async def health_check(self):
+                            return (self._ttp is not None,
+                                    "TTP active" if self._ttp else "TTP failed")
+                        async def cleanup(self):
+                            if self._ttp and hasattr(self._ttp, 'stop'):
+                                await self._ttp.stop()
+
+                    self._service_registry.register(ServiceDescriptor(
+                        name="training_pipeline", service=_TTPAdapter(),
+                        phase=_training_phase,
+                    ))
+                except Exception as e:
+                    self.logger.debug(f"[Kernel] TrinityTrainingPipeline not available: {e}")
+
+                # Activate training phase
+                try:
+                    _ssr_r6 = await self._service_registry.activate_phase(_training_phase)
+                    self.logger.info(f"[Kernel] Training services: {_ssr_r6}")
+                except Exception as _ssr_e:
+                    self.logger.warning(f"[Kernel] Phase 6 SSR activation error: {_ssr_e}")
+
             return True  # Enterprise services are optional
 
     # =========================================================================
@@ -72868,6 +73530,24 @@ class JarvisSystemKernel:
         while self._state == KernelState.RUNNING:
             try:
                 await self._check_and_revoke_readiness()
+
+                # v239.0: Active health checks on system services
+                if self._service_registry:
+                    try:
+                        await self._service_registry.health_check_all()
+                        _stats = self._service_registry.stats
+                        _ssr_status = (
+                            "running" if _stats["healthy"] == _stats["active"]
+                            else "degraded"
+                        )
+                        self._update_component_status(
+                            "system_services", _ssr_status,
+                            f"{_stats['active']}/{_stats['total_registered']} active, "
+                            f"{_stats['healthy']} healthy"
+                        )
+                    except Exception as _ssr_e:
+                        self.logger.debug(f"[SSR] Health check error: {_ssr_e}")
+
                 await asyncio.sleep(10.0)  # Check every 10 seconds
             except asyncio.CancelledError:
                 self.logger.debug("[Readiness] Monitoring loop cancelled")
@@ -73619,6 +74299,23 @@ class JarvisSystemKernel:
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
                 self.logger.debug("[Kernel] Readiness monitor stopped")
+
+            # v239.0: System Service Registry — shutdown all services in reverse order
+            if self._service_registry:
+                try:
+                    await asyncio.wait_for(
+                        self._service_registry.shutdown_all(timeout_per=5.0),
+                        timeout=60.0,
+                    )
+                    _ssr_stats = self._service_registry.stats
+                    self.logger.info(
+                        f"[Kernel] System services shut down "
+                        f"({_ssr_stats['active']} remaining)"
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.warning("[Kernel] SSR shutdown timed out (60s)")
+                except Exception as _ssr_e:
+                    self.logger.warning(f"[Kernel] SSR shutdown error: {_ssr_e}")
 
             # Stop in-process backend before broad task cancellation so uvicorn can
             # complete lifespan shutdown without abrupt task cancellation.
