@@ -178,6 +178,11 @@ async def wire_conversation_pipeline(
             conversation_pipeline=handle.conversation_pipeline,
             speech_state=speech_state,
         )
+        # Wire AudioBus and TTS for biometric mode + speaker verification
+        if audio_bus is not None:
+            handle.mode_dispatcher.set_audio_bus(audio_bus)
+        if handle.tts_engine is not None:
+            handle.mode_dispatcher.set_tts_engine(handle.tts_engine)
         await handle.mode_dispatcher.start()
         logger.info("[Bootstrap] ModeDispatcher started")
     except Exception as e:
@@ -235,6 +240,17 @@ async def shutdown(handle: PipelineHandle) -> None:
             await asyncio.wait_for(handle.mode_dispatcher.stop(), timeout=_timeout)
         except Exception as e:
             logger.debug(f"[Bootstrap] ModeDispatcher stop error: {e}")
+
+    # 1b. Stop speaker verification (unregisters its AudioBus consumer)
+    if handle.mode_dispatcher is not None:
+        try:
+            if hasattr(handle.mode_dispatcher, '_stop_speaker_verification'):
+                await asyncio.wait_for(
+                    handle.mode_dispatcher._stop_speaker_verification(),
+                    timeout=_timeout,
+                )
+        except Exception:
+            pass
 
     # 2. BargeInController — disable before pipeline teardown to prevent
     #    call_soon_threadsafe on a closing event loop from the audio thread.
