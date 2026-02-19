@@ -60013,7 +60013,121 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_COLLECTIVE_AI_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 22 services registered across phases 1-5, 8-9")
+        # ── v4 Phase 10: Infrastructure & Security ──────────────────────
+        _r(ServiceDescriptor(
+            name="connection_pool_manager",
+            service=_ConnectionPoolManagerAdapter(),
+            phase=10,
+            depends_on=[],
+            enabled_env="JARVIS_SERVICE_CONN_POOL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="secret_vault",
+            service=_SecretVaultAdapter(
+                encryption_key=os.getenv("JARVIS_SECRET_VAULT_KEY", "").encode() or None,
+                rotation_check_interval=float(os.getenv("JARVIS_VAULT_ROTATION_INTERVAL", "60")),
+            ),
+            phase=10,
+            depends_on=[],
+            enabled_env="JARVIS_SERVICE_SECRET_VAULT_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="batch_processor",
+            service=_BatchProcessorAdapter(
+                default_batch_size=int(os.getenv("JARVIS_BATCH_SIZE", "100")),
+                max_concurrency=int(os.getenv("JARVIS_BATCH_CONCURRENCY", "10")),
+            ),
+            phase=10,
+            depends_on=[],
+            enabled_env="JARVIS_SERVICE_BATCH_PROC_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="performance_profiler",
+            service=_PerformanceProfilerAdapter(config=self.config),
+            phase=10,
+            depends_on=[],
+            enabled_env="JARVIS_SERVICE_PROFILER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="service_mesh_router",
+            service=_ServiceMeshRouterAdapter(
+                default_timeout_ms=float(os.getenv("JARVIS_MESH_TIMEOUT_MS", "30000")),
+                health_check_interval=float(os.getenv("JARVIS_MESH_HEALTH_INTERVAL", "10")),
+                unhealthy_threshold=int(os.getenv("JARVIS_MESH_UNHEALTHY_THRESHOLD", "3")),
+                healthy_threshold=int(os.getenv("JARVIS_MESH_HEALTHY_THRESHOLD", "2")),
+            ),
+            phase=10,
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_MESH_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cron_scheduler",
+            service=_CronSchedulerAdapter(
+                max_concurrent_jobs=int(os.getenv("JARVIS_CRON_MAX_CONCURRENT", "10")),
+            ),
+            phase=10,
+            depends_on=[],
+            enabled_env="JARVIS_SERVICE_CRON_ENABLED",
+        ))
+
+        # ── v4 Phase 11: Operational Intelligence ───────────────────────
+        _r(ServiceDescriptor(
+            name="cache_invalidation",
+            service=_CacheInvalidationAdapter(),
+            phase=11,
+            depends_on=["cache_hierarchy"],
+            enabled_env="JARVIS_SERVICE_CACHE_INVAL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_cleanup",
+            service=_ResourceCleanupAdapter(
+                default_timeout=float(os.getenv("JARVIS_CLEANUP_TIMEOUT", "30")),
+            ),
+            phase=11,
+            depends_on=[],
+            enabled_env="JARVIS_SERVICE_CLEANUP_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="health_check_orchestrator",
+            service=_HealthCheckOrchestratorAdapter(
+                check_interval=float(os.getenv("JARVIS_HEALTH_ORCH_INTERVAL", "30")),
+            ),
+            phase=11,
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_HEALTH_ORCH_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="anomaly_detector",
+            service=_AnomalyDetectorAdapter(config=self.config),
+            phase=11,
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_ANOMALY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="alerting_manager",
+            service=_AlertingManagerAdapter(config=self.config),
+            phase=11,
+            depends_on=["health_aggregator", "anomaly_detector"],
+            enabled_env="JARVIS_SERVICE_ALERTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="auto_scaling_controller",
+            service=_AutoScalingControllerAdapter(
+                min_replicas=int(os.getenv("JARVIS_AUTOSCALE_MIN", "1")),
+                max_replicas=int(os.getenv("JARVIS_AUTOSCALE_MAX", "10")),
+                target_cpu_percent=float(os.getenv("JARVIS_AUTOSCALE_CPU_TARGET", "70")),
+                target_memory_percent=float(os.getenv("JARVIS_AUTOSCALE_MEM_TARGET", "80")),
+                scale_up_cooldown=float(os.getenv("JARVIS_AUTOSCALE_UP_COOLDOWN", "60")),
+                scale_down_cooldown=float(os.getenv("JARVIS_AUTOSCALE_DOWN_COOLDOWN", "300")),
+                scale_to_zero_enabled=os.getenv("JARVIS_AUTOSCALE_TO_ZERO", "false").lower() == "true",
+                scale_to_zero_idle_seconds=float(os.getenv("JARVIS_AUTOSCALE_IDLE_SECS", "600")),
+            ),
+            phase=11,
+            depends_on=["load_shedding_controller"],
+            enabled_env="JARVIS_SERVICE_AUTOSCALE_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 34 services registered across phases 1-5, 8-11")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
@@ -72006,6 +72120,236 @@ class JarvisSystemKernel:
                     async def cleanup(self) -> None:
                         self._cai = None
 
+                # ── v4 Phase 10: Infrastructure & Security adapters ──────────
+
+                class _ConnectionPoolManagerAdapter(SystemService):
+                    def __init__(self) -> None:
+                        self._cpm: Optional[ConnectionPoolManager] = None
+
+                    async def initialize(self) -> None:
+                        self._cpm = ConnectionPoolManager()
+                        await self._cpm.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._cpm is None:
+                            return (False, "ConnPool not constructed")
+                        s = self._cpm.get_all_status()
+                        return (s.get("running", False), f"Pools: {s.get('pools_count', 0)}, conns: {s.get('total_connections', 0)}")
+
+                    async def cleanup(self) -> None:
+                        if self._cpm:
+                            await self._cpm.stop()
+                        self._cpm = None
+
+                class _SecretVaultAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._svm: Optional[SecretVaultManager] = None
+
+                    async def initialize(self) -> None:
+                        self._svm = SecretVaultManager(**self._kwargs)
+                        await self._svm.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._svm is None:
+                            return (False, "Vault not constructed")
+                        s = self._svm.get_status()
+                        return (s.get("running", False), f"Vault: {s.get('secrets_count', 0)} secrets")
+
+                    async def cleanup(self) -> None:
+                        if self._svm:
+                            await self._svm.stop()
+                        self._svm = None
+
+                class _BatchProcessorAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._bp: Optional[BatchProcessor] = None
+
+                    async def initialize(self) -> None:
+                        self._bp = BatchProcessor(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._bp is None:
+                            return (False, "BatchProc not constructed")
+                        s = self._bp.get_status()
+                        return (True, f"Batch: {s.get('active_jobs', 0)} active, concurrency={s.get('max_concurrency', 0)}")
+
+                    async def cleanup(self) -> None:
+                        self._bp = None
+
+                class _PerformanceProfilerAdapter(SystemService):
+                    def __init__(self, config: Any) -> None:
+                        self._config = config
+                        self._pp: Optional[PerformanceProfiler] = None
+
+                    async def initialize(self) -> None:
+                        self._pp = PerformanceProfiler(self._config)
+                        if not await self._pp.initialize():
+                            raise RuntimeError("PerformanceProfiler.initialize() returned False")
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._pp is None:
+                            return (False, "Profiler not constructed")
+                        _hot = self._pp.get_hot_paths(limit=1)
+                        _top = _hot[0]["function_name"] if _hot else "none"
+                        return (True, f"Profiler: enabled={self._pp._enabled}, hottest={_top}")
+
+                    async def cleanup(self) -> None:
+                        if self._pp:
+                            self._pp.clear()
+                        self._pp = None
+
+                class _ServiceMeshRouterAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._smr: Optional[ServiceMeshRouter] = None
+
+                    async def initialize(self) -> None:
+                        self._smr = ServiceMeshRouter(**self._kwargs)
+                        await self._smr.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._smr is None:
+                            return (False, "Mesh not constructed")
+                        s = self._smr.get_status()
+                        return (s.get("running", False), f"Mesh: {len(s.get('services', {}))} svc")
+
+                    async def cleanup(self) -> None:
+                        if self._smr:
+                            await self._smr.stop()
+                        self._smr = None
+
+                class _CronSchedulerAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._cs: Optional[CronScheduler] = None
+
+                    async def initialize(self) -> None:
+                        self._cs = CronScheduler(**self._kwargs)
+                        await self._cs.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._cs is None:
+                            return (False, "Cron not constructed")
+                        s = self._cs.get_status()
+                        return (s.get("running", False), f"Cron: {s.get('jobs_count', 0)} jobs, {s.get('enabled_jobs', 0)} enabled")
+
+                    async def cleanup(self) -> None:
+                        if self._cs:
+                            await self._cs.stop()
+                        self._cs = None
+
+                # ── v4 Phase 11: Operational Intelligence adapters ───────────
+
+                class _CacheInvalidationAdapter(SystemService):
+                    def __init__(self) -> None:
+                        self._cic: Optional[CacheInvalidationCoordinator] = None
+
+                    async def initialize(self) -> None:
+                        self._cic = CacheInvalidationCoordinator()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._cic is None:
+                            return (False, "CacheInval not constructed")
+                        s = self._cic.get_status()
+                        return (True, f"CacheInval: {s.get('regions', 0)} regions, {s.get('total_keys_tracked', 0)} keys")
+
+                    async def cleanup(self) -> None:
+                        self._cic = None
+
+                class _ResourceCleanupAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._rcc: Optional[ResourceCleanupCoordinator] = None
+
+                    async def initialize(self) -> None:
+                        self._rcc = ResourceCleanupCoordinator(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._rcc is None:
+                            return (False, "Cleanup not constructed")
+                        s = self._rcc.get_statistics()
+                        return (True, f"Cleanup: {s.get('registered_tasks', 0)} tasks ({s.get('critical_tasks', 0)} critical)")
+
+                    async def cleanup(self) -> None:
+                        self._rcc = None
+
+                class _HealthCheckOrchestratorAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._hco: Optional[HealthCheckOrchestrator] = None
+
+                    async def initialize(self) -> None:
+                        self._hco = HealthCheckOrchestrator(**self._kwargs)
+                        await self._hco.start()
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._hco is None:
+                            return (False, "HealthOrch not constructed")
+                        s = self._hco.get_status()
+                        return (s.get("all_healthy", False), f"HealthOrch: {s.get('checks_registered', 0)} checks")
+
+                    async def cleanup(self) -> None:
+                        if self._hco:
+                            await self._hco.stop()
+                        self._hco = None
+
+                class _AnomalyDetectorAdapter(SystemService):
+                    def __init__(self, config: Any) -> None:
+                        self._config = config
+                        self._ad: Optional[AnomalyDetector] = None
+
+                    async def initialize(self) -> None:
+                        self._ad = AnomalyDetector(self._config)
+                        if not await self._ad.initialize():
+                            raise RuntimeError("AnomalyDetector.initialize() returned False")
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._ad is None:
+                            return (False, "AnomalyDet not constructed")
+                        _recent = self._ad.get_recent_anomalies(limit=5)
+                        return (True, f"AnomalyDet: {len(_recent)} recent anomalies")
+
+                    async def cleanup(self) -> None:
+                        self._ad = None
+
+                class _AlertingManagerAdapter(SystemService):
+                    def __init__(self, config: Any) -> None:
+                        self._config = config
+                        self._am: Optional[AlertingManager] = None
+
+                    async def initialize(self) -> None:
+                        self._am = AlertingManager(self._config)
+                        if not await self._am.initialize():
+                            raise RuntimeError("AlertingManager.initialize() returned False")
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._am is None:
+                            return (False, "Alerting not constructed")
+                        s = self._am.get_statistics()
+                        return (True, f"Alerting: {s.get('rules_count', 0)} rules, {s.get('active_alerts', 0)} active")
+
+                    async def cleanup(self) -> None:
+                        self._am = None
+
+                class _AutoScalingControllerAdapter(SystemService):
+                    def __init__(self, **kwargs: Any) -> None:
+                        self._kwargs = kwargs
+                        self._asc: Optional[AutoScalingController] = None
+
+                    async def initialize(self) -> None:
+                        self._asc = AutoScalingController(**self._kwargs)
+
+                    async def health_check(self) -> Tuple[bool, str]:
+                        if self._asc is None:
+                            return (False, "AutoScale not constructed")
+                        s = self._asc.get_status()
+                        return (True, f"AutoScale: {s.get('current_replicas', 0)} replicas")
+
+                    async def cleanup(self) -> None:
+                        self._asc = None
+
                 # Activate cross-repo phase
                 try:
                     _ssr_r7 = await self._service_registry.activate_phase(_xrepo_phase)
@@ -72364,6 +72708,201 @@ class JarvisSystemKernel:
 
                 except Exception as _ssr9_e:
                     self.logger.warning(f"[Kernel] Phase 9 SSR activation error: {_ssr9_e}")
+
+                # ── v4 Phase 10: Infrastructure & Security activation ────────
+                _infra_phase = 10
+                try:
+                    _ssr_r10 = await self._service_registry.activate_phase(_infra_phase)
+                    self.logger.info(f"[Kernel] Phase 10 infrastructure services: {_ssr_r10}")
+
+                    # W30: ServiceMeshRouter → register Prime/Reactor endpoints
+                    _smr_svc = self._service_registry.get("service_mesh_router")
+                    _smr = _smr_svc._smr if _smr_svc else None
+                    if _smr:
+                        _prime_host = os.getenv("JARVIS_PRIME_HOST", "127.0.0.1")
+                        _prime_port = int(os.getenv("JARVIS_PRIME_PORT", "8100"))
+                        _smr.register_endpoint("prime", "prime_main", _prime_host, _prime_port, weight=3.0)
+                        _reactor_host = os.getenv("JARVIS_REACTOR_HOST", "127.0.0.1")
+                        _reactor_port = int(os.getenv("JARVIS_REACTOR_PORT", "8200"))
+                        _smr.register_endpoint("reactor", "reactor_main", _reactor_host, _reactor_port, weight=2.0)
+                        self.logger.debug("[Kernel] W30: ServiceMeshRouter endpoints registered")
+
+                    # W31: PerformanceProfiler → store kernel-level reference
+                    _pp_svc = self._service_registry.get("performance_profiler")
+                    if _pp_svc and _pp_svc._pp:
+                        self._performance_profiler = _pp_svc._pp
+                        self.logger.debug("[Kernel] W31: PerformanceProfiler stored for kernel access")
+
+                    # W32: SecretVaultManager → store kernel-level reference
+                    _sv_svc = self._service_registry.get("secret_vault")
+                    if _sv_svc and _sv_svc._svm:
+                        self._secret_vault = _sv_svc._svm
+                        self.logger.debug("[Kernel] W32: SecretVault stored for kernel access")
+
+                except Exception as _ssr10_e:
+                    self.logger.warning(f"[Kernel] Phase 10 SSR activation error: {_ssr10_e}")
+
+                # ── v4 Phase 11: Operational Intelligence activation ─────────
+                _ops_intel_phase = 11
+                try:
+                    _ssr_r11 = await self._service_registry.activate_phase(_ops_intel_phase)
+                    self.logger.info(f"[Kernel] Phase 11 operational intelligence services: {_ssr_r11}")
+
+                    # W33: CacheInvalidationCoordinator → CacheHierarchyManager broadcast
+                    _cic_svc = self._service_registry.get("cache_invalidation")
+                    _cic = _cic_svc._cic if _cic_svc else None
+                    _chm = self._service_registry.get("cache_hierarchy")
+                    if _cic and _chm:
+                        _chm_inner = getattr(_chm, '_chm', None)
+                        if _chm_inner and hasattr(_chm_inner, 'invalidate'):
+                            async def _cic_broadcast(inv_type: str, targets: list) -> None:
+                                for _t in targets:
+                                    try:
+                                        await _chm_inner.invalidate(_t)
+                                    except Exception:
+                                        pass
+                            _cic._broadcast_callback = _cic_broadcast
+                            self.logger.debug("[Kernel] W33: CacheInvalidation → CacheHierarchy broadcast wired")
+
+                    # W34: HealthCheckOrchestrator → all SSR services (exclude self)
+                    _hco_svc = self._service_registry.get("health_check_orchestrator")
+                    _hco = _hco_svc._hco if _hco_svc else None
+                    if _hco:
+                        for _svc_name, _svc_desc in self._service_registry._services.items():
+                            if _svc_name == "health_check_orchestrator":
+                                continue  # Flaw G: avoid circular monitoring
+                            if _svc_desc.initialized and _svc_desc.service:
+                                try:
+                                    _hco.register_check(
+                                        _svc_name,
+                                        HealthCheckType.READINESS,
+                                        _svc_desc.service.health_check,
+                                    )
+                                except Exception:
+                                    pass
+                        self.logger.debug(f"[Kernel] W34: HealthCheckOrchestrator registered {len(self._service_registry._services) - 1} checks")
+
+                    # W35: AnomalyDetector ← HealthAggregator alert callback
+                    _ad_svc = self._service_registry.get("anomaly_detector")
+                    _ad = _ad_svc._ad if _ad_svc else None
+                    _ha = self._service_registry.get("health_aggregator")
+                    if _ad and _ha:
+                        _ha_inner = getattr(_ha, '_ha', None)
+                        if _ha_inner and hasattr(_ha_inner, 'register_alert_callback'):
+                            async def _ha_to_ad_cb(alert_data: dict) -> None:
+                                _metrics = {k: float(v) for k, v in alert_data.items() if isinstance(v, (int, float))}
+                                if _metrics:
+                                    await _ad.record_observation("health", _metrics, metadata=alert_data)
+                            _ha_inner.register_alert_callback(_ha_to_ad_cb)
+                            self.logger.debug("[Kernel] W35: HealthAggregator → AnomalyDetector wired")
+
+                    # W36: AlertingManager ← AnomalyDetector handler
+                    _am_svc = self._service_registry.get("alerting_manager")
+                    _am = _am_svc._am if _am_svc else None
+                    if _am and _ad:
+                        async def _ad_to_am_handler(score, metadata) -> None:
+                            try:
+                                await _am.record_metric("anomaly_score", score.score if hasattr(score, 'score') else float(score))
+                            except Exception:
+                                pass
+                        _ad.register_handler(_ad_to_am_handler)
+                        self.logger.debug("[Kernel] W36: AnomalyDetector → AlertingManager handler wired")
+
+                    # W37: AutoScalingController ← CronScheduler + LoadShedding
+                    _asc_svc = self._service_registry.get("auto_scaling_controller")
+                    _asc = _asc_svc._asc if _asc_svc else None
+                    _cs_svc = self._service_registry.get("cron_scheduler")
+                    _cs = _cs_svc._cs if _cs_svc else None
+                    if _asc and _cs:
+                        async def _asc_evaluate_job() -> None:
+                            try:
+                                await _asc.evaluate()
+                            except Exception:
+                                pass
+                        _cs.schedule("autoscale_evaluate", "*/2 * * * *", _asc_evaluate_job, enabled=True)
+                        self.logger.debug("[Kernel] W37: AutoScaling evaluate scheduled every 2min via CronScheduler")
+
+                    # W38: ResourceCleanupCoordinator → all SSR services
+                    _rcc_svc = self._service_registry.get("resource_cleanup")
+                    _rcc = _rcc_svc._rcc if _rcc_svc else None
+                    if _rcc:
+                        for _svc_name, _svc_desc in self._service_registry._services.items():
+                            if _svc_desc.initialized and _svc_desc.service:
+                                _svc_ref = _svc_desc.service
+                                _is_critical = _svc_name in ("health_aggregator", "event_sourcing", "cache_hierarchy")
+                                # Wrap cleanup() (returns None) into bool-returning handler
+                                async def _make_cleanup_handler(_s=_svc_ref):
+                                    try:
+                                        await _s.cleanup()
+                                        return True
+                                    except Exception:
+                                        return False
+                                _rcc.register_cleanup(
+                                    _svc_name,
+                                    _make_cleanup_handler,
+                                    priority=20 if _is_critical else 50,
+                                    critical=_is_critical,
+                                )
+                        self.logger.debug(f"[Kernel] W38: ResourceCleanup registered {len(self._service_registry._services)} handlers")
+
+                    # W39: CronScheduler periodic jobs (health sweeps, anomaly baselines)
+                    if _cs and _hco:
+                        async def _health_sweep_job() -> None:
+                            try:
+                                for _chk_name in list(_hco._checks.keys()):
+                                    await _hco.check_now(_chk_name)
+                            except Exception:
+                                pass
+                        _cs.schedule("health_sweep", "*/5 * * * *", _health_sweep_job, enabled=True)
+                        self.logger.debug("[Kernel] W39: Health sweep scheduled every 5min")
+
+                    if _cs and _ad:
+                        async def _anomaly_baseline_job() -> None:
+                            try:
+                                await _ad.record_observation("baseline_refresh", {"heartbeat": 1.0})
+                            except Exception:
+                                pass
+                        _cs.schedule("anomaly_baseline", "0 * * * *", _anomaly_baseline_job, enabled=True)
+                        self.logger.debug("[Kernel] W39: Anomaly baseline refresh scheduled hourly")
+
+                    # W40: GDM → register Phase 10+11 features for degradation
+                    _gd = self._service_registry.get("degradation_manager")
+                    if _gd and hasattr(_gd, 'register_feature'):
+                        _gd.register_feature("connection_pool", priority=3, description="Connection pool management")
+                        _gd.register_feature("secrets_vault", priority=2, description="Secret vault management")
+                        _gd.register_feature("service_mesh", priority=3, description="Service mesh routing")
+                        _gd.register_feature("cron_scheduler", priority=4, description="Cron job scheduling")
+                        _gd.register_feature("cache_invalidation", priority=3, description="Cache invalidation coordination")
+                        _gd.register_feature("alerting", priority=2, description="Alerting and notification")
+                        _gd.register_feature("profiler", priority=4, description="Performance profiling")
+                        _gd.register_feature("anomaly_detection", priority=2, description="Anomaly detection")
+                        _gd.register_feature("auto_scaling", priority=3, description="Auto-scaling control")
+                        _gd.register_feature("batch_processing", priority=4, description="Batch processing")
+                        _gd.register_feature("health_orchestration", priority=2, description="Health check orchestration")
+                        _gd.register_feature("resource_cleanup", priority=2, description="Resource cleanup coordination")
+                        self.logger.debug("[Kernel] W40: GDM registered 12 Phase 10+11 features")
+
+                    # W41: SSR stats → component_status with Phase 10+11 counts
+                    _stats = self._service_registry.stats
+                    _p10_count = sum(
+                        1 for n in ("connection_pool_manager", "secret_vault", "batch_processor",
+                                    "performance_profiler", "service_mesh_router", "cron_scheduler")
+                        if self._service_registry.get(n)
+                    )
+                    _p11_count = sum(
+                        1 for n in ("cache_invalidation", "resource_cleanup", "health_check_orchestrator",
+                                    "anomaly_detector", "alerting_manager", "auto_scaling_controller")
+                        if self._service_registry.get(n)
+                    )
+                    self._update_component_status(
+                        "system_services", "running",
+                        f"{_stats['active']}/{_stats['total_registered']} active "
+                        f"(P7: cross-repo, P8: {_p8_count} self-heal, P9: {_p9_count} intelligence, "
+                        f"P10: {_p10_count} infra, P11: {_p11_count} ops-intel)"
+                    )
+
+                except Exception as _ssr11_e:
+                    self.logger.warning(f"[Kernel] Phase 11 SSR activation error: {_ssr11_e}")
 
             return True  # Enterprise services are optional
 
@@ -74862,6 +75401,23 @@ class JarvisSystemKernel:
                                 _cai_mon._insights = _cai_mon._insights[-200:]
                         except Exception:
                             pass
+
+                # v4: Feed AutoScalingController metrics + evaluate every 5th cycle
+                _asc_mon = getattr(self, '_auto_scaling_controller', None)
+                if not _asc_mon:
+                    _asc_s = self._service_registry.get("auto_scaling_controller") if self._service_registry else None
+                    _asc_mon = _asc_s._asc if _asc_s else None
+                if _asc_mon:
+                    try:
+                        import psutil as _ps_asc
+                        _cpu = _ps_asc.cpu_percent(interval=None)
+                        _mem = _ps_asc.virtual_memory().percent
+                        _asc_mon.record_metrics(_cpu, _mem)
+                        _cyc = getattr(self, '_monitoring_cycle_count', 0)
+                        if _cyc % 5 == 0:
+                            await _asc_mon.evaluate()
+                    except Exception:
+                        pass
 
                 await asyncio.sleep(10.0)  # Check every 10 seconds
             except asyncio.CancelledError:
