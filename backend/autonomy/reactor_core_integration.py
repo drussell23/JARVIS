@@ -54,7 +54,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,76 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Configuration
 # =============================================================================
+
+
+def _parse_int_list_env(var_name: str, default_values: List[int]) -> List[int]:
+    """Parse an integer list environment variable while preserving order."""
+    raw_value = os.getenv(var_name, "").strip()
+    items = raw_value.split(",") if raw_value else [str(v) for v in default_values]
+    parsed: List[int] = []
+    seen: set = set()
+    for item in items:
+        token = item.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if value <= 0:
+            continue
+        if value in seen:
+            continue
+        parsed.append(value)
+        seen.add(value)
+    return parsed or list(default_values)
+
+
+def _parse_path_list_env(var_name: str, default_paths: List[str]) -> List[str]:
+    """Parse comma-separated endpoint paths and normalize to absolute-style paths."""
+    raw_value = os.getenv(var_name, "").strip()
+    items = raw_value.split(",") if raw_value else list(default_paths)
+    normalized: List[str] = []
+    seen: set = set()
+    for item in items:
+        path = item.strip()
+        if not path:
+            continue
+        if "://" in path:
+            # Ignore full URLs here; this list is path-only.
+            continue
+        if not path.startswith("/"):
+            path = f"/{path}"
+        if path in seen:
+            continue
+        normalized.append(path)
+        seen.add(path)
+    return normalized or list(default_paths)
+
+
+def _unique_ints(values: List[int]) -> List[int]:
+    """Deduplicate integer list while preserving order."""
+    result: List[int] = []
+    seen: set = set()
+    for value in values:
+        if value in seen:
+            continue
+        result.append(value)
+        seen.add(value)
+    return result
+
+
+def _adaptive_timeout(base_timeout: float, observed_latency: Optional[float]) -> float:
+    """
+    Derive a dynamic timeout from observed network latency.
+
+    Keeps a deterministic floor while adapting upward when a link is slower than normal.
+    """
+    if observed_latency is None:
+        return base_timeout
+    # 4x recent latency, clamped to avoid runaway waits.
+    dynamic_timeout = max(base_timeout, observed_latency * 4.0)
+    return min(dynamic_timeout, base_timeout * 6.0)
 
 @dataclass
 class ReactorCoreConfig:
@@ -119,8 +189,40 @@ class ReactorCoreConfig:
     prime_port: int = field(
         default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8002"))
     )
+    prime_port_candidates: List[int] = field(
+        default_factory=lambda: _parse_int_list_env(
+            "JARVIS_PRIME_PORT_CANDIDATES",
+            [
+                int(os.getenv("JARVIS_PRIME_PORT", "8002")),
+                8000,
+                8001,
+                8002,
+            ],
+        )
+    )
     prime_websocket_enabled: bool = field(
         default_factory=lambda: os.getenv("PRIME_WEBSOCKET_ENABLED", "true").lower() == "true"
+    )
+    prime_websocket_paths: List[str] = field(
+        default_factory=lambda: _parse_path_list_env(
+            "JARVIS_PRIME_WEBSOCKET_PATHS",
+            ["/ws/events"],
+        )
+    )
+    prime_health_paths: List[str] = field(
+        default_factory=lambda: _parse_path_list_env(
+            "JARVIS_PRIME_HEALTH_PATHS",
+            ["/health"],
+        )
+    )
+    prime_event_poll_interval: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_EVENT_POLL_INTERVAL", "5.0"))
+    )
+    prime_event_probe_timeout: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_EVENT_PROBE_TIMEOUT", "3.0"))
+    )
+    prime_transport_reprobe_interval: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_TRANSPORT_REPROBE_INTERVAL", "30.0"))
     )
 
     # Training pipeline settings
@@ -195,6 +297,93 @@ class ReactorCoreIntegration:
         logger.info("[ReactorCore] Initialization complete")
         return True
 
+    def _prime_port_candidates(self) -> List[int]:
+        """Ordered, de-duplicated Prime ports (preferred first)."""
+        return _unique_ints([self.config.prime_port] + list(self.config.prime_port_candidates))
+
+    def _prime_health_url_candidates(self) -> List[Tuple[int, str, str]]:
+        """Generate Prime health endpoint candidates (port + path)."""
+        candidates: List[Tuple[int, str, str]] = []
+        for port in self._prime_port_candidates():
+            for path in self.config.prime_health_paths:
+                url = f"http://{self.config.prime_host}:{port}{path}"
+                candidates.append((port, path, url))
+        return candidates
+
+    async def _resolve_live_prime_port(self) -> int:
+        """
+        Probe configured Prime candidates and return the first healthy/reachable port.
+
+        Falls back to configured `prime_port` if no candidate responds.
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            return self.config.prime_port
+
+        timeout_s = max(1.0, self.config.prime_event_probe_timeout)
+        adaptive_timeout_s = _adaptive_timeout(timeout_s, None)
+        timeout = aiohttp.ClientTimeout(total=adaptive_timeout_s)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for port, _path, url in self._prime_health_url_candidates():
+                try:
+                    async with session.get(url) as resp:
+                        # 200 (ready) and 503 (starting) both indicate a live service.
+                        if resp.status in (200, 503):
+                            if port != self.config.prime_port:
+                                logger.info(
+                                    "[ReactorCore] Prime endpoint drift detected; "
+                                    f"switching from configured port {self.config.prime_port} to live port {port}"
+                                )
+                            return port
+                except Exception:
+                    continue
+
+        return self.config.prime_port
+
+    async def _poll_prime_health_event(self) -> Optional[Dict[str, Any]]:
+        """Poll Prime health endpoints and emit a synthetic status event."""
+        try:
+            import aiohttp
+        except ImportError:
+            return None
+
+        timeout_s = max(1.0, self.config.prime_event_probe_timeout)
+        timeout = aiohttp.ClientTimeout(total=_adaptive_timeout(timeout_s, None))
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for port, path, url in self._prime_health_url_candidates():
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status >= 500:
+                            continue
+
+                        payload: Any
+                        try:
+                            payload = await resp.json(content_type=None)
+                        except Exception:
+                            payload = {"raw": await resp.text()}
+
+                        if not isinstance(payload, dict):
+                            payload = {"value": payload}
+
+                        return {
+                            "event_type": "status_poll",
+                            "data": {
+                                **payload,
+                                "_prime_host": self.config.prime_host,
+                                "_prime_port": port,
+                                "_prime_health_path": path,
+                                "_prime_http_status": resp.status,
+                            },
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                except Exception:
+                    continue
+
+        return None
+
     async def _init_jarvis_connector(self) -> None:
         """Initialize JARVIS Connector for experience ingestion."""
         try:
@@ -251,12 +440,20 @@ class ReactorCoreIntegration:
                 PrimeConnectorConfig,
             )
 
+            live_port = await self._resolve_live_prime_port()
+            self.config.prime_port = live_port
+
+            prime_cfg = PrimeConnectorConfig(
+                host=self.config.prime_host,
+                port=self.config.prime_port,
+                enable_websocket=self.config.prime_websocket_enabled,
+            )
+            # Backwards-compatible override for connectors that still use a single WS path.
+            if hasattr(prime_cfg, "websocket_path") and self.config.prime_websocket_paths:
+                setattr(prime_cfg, "websocket_path", self.config.prime_websocket_paths[0])
+
             self._prime_connector = PrimeConnector(
-                PrimeConnectorConfig(
-                    host=self.config.prime_host,
-                    port=self.config.prime_port,
-                    enable_websocket=self.config.prime_websocket_enabled,
-                )
+                prime_cfg
             )
             logger.info("[ReactorCore] ✓ PrimeConnector initialized")
 
@@ -498,19 +695,48 @@ class ReactorCoreIntegration:
         Yields:
             Event dictionaries as they occur
         """
-        if not self._prime_connector:
-            return
+        if self._prime_connector:
+            try:
+                async with self._prime_connector:
+                    async for event in self._prime_connector.stream_events():
+                        yield {
+                            "event_type": getattr(event, "event_type", "unknown"),
+                            "data": getattr(event, "data", {}),
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[ReactorCore] Prime event streaming via WebSocket failed; "
+                    f"falling back to health polling: {e}"
+                )
+        else:
+            logger.warning(
+                "[ReactorCore] Prime connector unavailable; using health-poll fallback stream"
+            )
 
-        try:
-            async with self._prime_connector:
-                async for event in self._prime_connector.stream_events():
-                    yield {
-                        "event_type": getattr(event, 'event_type', 'unknown'),
-                        "data": getattr(event, 'data', {}),
-                        "timestamp": datetime.now().isoformat(),
-                    }
-        except Exception as e:
-            logger.error(f"[ReactorCore] Prime event streaming failed: {e}")
+        # Deterministic fallback stream: always emits status snapshots while Prime is reachable.
+        poll_interval = max(0.5, self.config.prime_event_poll_interval)
+        failures = 0
+        while True:
+            try:
+                event = await self._poll_prime_health_event()
+                if event is not None:
+                    failures = 0
+                    yield event
+                else:
+                    failures += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failures += 1
+                if failures <= 3 or failures % 10 == 0:
+                    logger.debug(f"[ReactorCore] Prime health stream poll failed: {e}")
+
+            backoff = min(poll_interval * (1.0 + (0.25 * min(failures, 8))), poll_interval * 4.0)
+            await asyncio.sleep(backoff)
 
     def register_prime_callback(self, callback: Callable) -> None:
         """Register a callback for Prime events."""
@@ -652,24 +878,24 @@ class PrimeNeuralMeshBridge:
         │                  JARVIS-Prime Neural Mesh Bridge               │
         ├────────────────────────────────────────────────────────────────┤
         │                                                                │
-        │  ┌──────────────────┐     ┌──────────────────┐                │
+        │  ┌──────────────────┐     ┌──────────────────┐                 │
         │  │  JARVIS-Prime    │────►│  Event Translator │                │
         │  │  (Model Events)  │     │  (Prime→AgentMsg) │                │
-        │  └──────────────────┘     └────────┬─────────┘                │
+        │  └──────────────────┘     └────────┬─────────┘                 │
         │                                     │                          │
-        │                          ┌──────────▼──────────┐              │
-        │                          │  Neural Mesh Bus    │              │
-        │                          │  (Pub/Sub System)   │              │
-        │                          └──────────┬──────────┘              │
+        │                          ┌──────────▼──────────┐               │
+        │                          │  Neural Mesh Bus    │               │
+        │                          │  (Pub/Sub System)   │               │
+        │                          └──────────┬──────────┘               │
         │                                     │                          │
-        │  ┌──────────────────────────────────┼──────────────────────┐  │
-        │  │                                  ▼                       │  │
-        │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐        │  │
-        │  │  │  Memory    │  │  Pattern   │  │  Health    │        │  │
-        │  │  │  Agent     │  │  Agent     │  │  Monitor   │        │  │
-        │  │  └────────────┘  └────────────┘  └────────────┘        │  │
-        │  │              Neural Mesh Subscribers                    │  │
-        │  └─────────────────────────────────────────────────────────┘  │
+        │  ┌──────────────────────────────────┼──────────────────────┐   │
+        │  │                                  ▼                      │   │
+        │  │  ┌────────────┐  ┌────────────┐  ┌────────────┐         │   │
+        │  │  │  Memory    │  │  Pattern   │  │  Health    │         │   │
+        │  │  │  Agent     │  │  Agent     │  │  Monitor   │         │   │
+        │  │  └────────────┘  └────────────┘  └────────────┘         │   │
+        │  │              Neural Mesh Subscribers                    │   │
+        │  └─────────────────────────────────────────────────────────┘   │
         └────────────────────────────────────────────────────────────────┘
     """
 
@@ -680,6 +906,12 @@ class PrimeNeuralMeshBridge:
         self._prime_client = None
         self._event_stream_task: Optional[asyncio.Task] = None
         self._callbacks: List[Callable] = []
+        self._prime_probe_latency_ema: Optional[float] = None
+        self._ws_candidate_index: int = 0
+        self._health_candidate_index: int = 0
+        self._last_successful_ws_url: Optional[str] = None
+        self._last_successful_health_url: Optional[str] = None
+        self._current_transport: str = "websocket" if self.config.prime_websocket_enabled else "polling"
 
         logger.info("[PrimeNeuralMesh] Bridge initialized")
 
@@ -772,45 +1004,142 @@ class PrimeNeuralMeshBridge:
         self._event_stream_task = asyncio.create_task(self._stream_prime_events())
         logger.info("[PrimeNeuralMesh] Event stream started")
 
-    async def _stream_prime_events(self) -> None:
-        """
-        Background task that streams Prime events to Neural Mesh.
+    def _ordered_prime_ports(self) -> List[int]:
+        return _unique_ints([self.config.prime_port] + list(self.config.prime_port_candidates))
 
-        v8.0 - Non-Blocking Startup Edition:
-        - During startup phase, uses short delays (2-5s) to avoid blocking
-        - Switches to normal delays after initial startup window (120s)
-        - Graceful degradation: if WebSocket unavailable, uses REST polling
-        - Never blocks main JARVIS startup
-        """
-        retry_count = 0
-        base_delay = 2.0  # Start with 2s, not 10s
-        start_time = asyncio.get_event_loop().time()
-        startup_window = 120.0  # First 2 minutes use short delays
+    def _ws_url_base_candidates(self) -> List[str]:
+        scheme = "wss" if os.getenv("JARVIS_PRIME_SSL", "false").lower() == "true" else "ws"
+        candidates: List[str] = []
+        for port in self._ordered_prime_ports():
+            for path in self.config.prime_websocket_paths:
+                candidates.append(f"{scheme}://{self.config.prime_host}:{port}{path}")
+        return candidates
 
-        ws_connection_timeout = float(os.getenv("TIMEOUT_PRIME_WS_CONNECTION", "30.0"))
-        while True:
+    def _health_url_base_candidates(self) -> List[str]:
+        scheme = "https" if os.getenv("JARVIS_PRIME_SSL", "false").lower() == "true" else "http"
+        candidates: List[str] = []
+        for port in self._ordered_prime_ports():
+            for path in self.config.prime_health_paths:
+                candidates.append(f"{scheme}://{self.config.prime_host}:{port}{path}")
+        return candidates
+
+    def _rotated_candidates(self, base: List[str], start_index: int) -> List[str]:
+        if not base:
+            return []
+        idx = start_index % len(base)
+        return base[idx:] + base[:idx]
+
+    def _observe_probe_latency(self, latency_seconds: float) -> None:
+        if latency_seconds <= 0:
+            return
+        alpha = 0.30
+        if self._prime_probe_latency_ema is None:
+            self._prime_probe_latency_ema = latency_seconds
+            return
+        self._prime_probe_latency_ema = (
+            (1.0 - alpha) * self._prime_probe_latency_ema
+            + alpha * latency_seconds
+        )
+
+    def _probe_timeout_seconds(self) -> float:
+        base = max(1.0, self.config.prime_event_probe_timeout)
+        return _adaptive_timeout(base, self._prime_probe_latency_ema)
+
+    @staticmethod
+    def _is_endpoint_contract_error(exc: Exception) -> bool:
+        """Return True when an error indicates a missing/forbidden websocket endpoint."""
+        msg = str(exc).lower()
+        exc_type = type(exc).__name__
+        endpoint_tokens = ("404", "403", "not found", "forbidden")
+        return (
+            any(token in msg for token in endpoint_tokens)
+            or exc_type in ("InvalidStatusCode", "InvalidStatus")
+        )
+
+    async def _connect_prime_websocket(self, timeout_seconds: float):
+        """Try websocket candidates in priority order and return (ws, url)."""
+        import websockets
+
+        base_candidates = self._ws_url_base_candidates()
+        last_error: Optional[Exception] = None
+        for url in self._rotated_candidates(base_candidates, self._ws_candidate_index):
+            started_at = asyncio.get_event_loop().time()
             try:
-                # Check if we're still in startup window
-                elapsed = asyncio.get_event_loop().time() - start_time
-                in_startup = elapsed < startup_window
-
-                # Connect to Prime WebSocket for real-time events
-                prime_url = f"ws://{self.config.prime_host}:{self.config.prime_port}/ws/events"
-
-                import websockets
-                # Python 3.9 compatible (asyncio.timeout is 3.11+)
                 ws = await asyncio.wait_for(
                     websockets.connect(
-                        prime_url,
+                        url,
                         ping_interval=20,
                         ping_timeout=10,
                         close_timeout=5,
                     ),
-                    timeout=ws_connection_timeout
+                    timeout=timeout_seconds,
                 )
+                self._observe_probe_latency(asyncio.get_event_loop().time() - started_at)
+                # Keep stable path first after success.
+                self._last_successful_ws_url = url
+                return ws, url
+            except Exception as exc:
+                last_error = exc
+                if self._is_endpoint_contract_error(exc):
+                    self._ws_candidate_index += 1
+                continue
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Prime websocket endpoint unavailable for all configured candidates")
+
+    async def _stream_prime_events(self) -> None:
+        """
+        Background task that streams Prime events to Neural Mesh.
+
+        Uses adaptive endpoint negotiation:
+        - Rotates across configured Prime ports + websocket paths
+        - Falls back to health polling when websocket contracts are unavailable
+        - Periodically re-probes websocket transport from polling mode
+        """
+        retry_count = 0
+        base_delay = 2.0
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
+        startup_window = 120.0
+        polling_mode = not self.config.prime_websocket_enabled
+        polling_started_at: Optional[float] = loop.time() if polling_mode else None
+
+        while True:
+            elapsed = loop.time() - start_time
+            in_startup = elapsed < startup_window
+
+            try:
+                if polling_mode:
+                    ok = await self._poll_prime_status()
+                    if ok:
+                        retry_count = 0
+                    else:
+                        retry_count += 1
+
+                    if (
+                        self.config.prime_websocket_enabled
+                        and polling_started_at is not None
+                        and (loop.time() - polling_started_at) >= self.config.prime_transport_reprobe_interval
+                    ):
+                        polling_mode = False
+                        polling_started_at = None
+                        retry_count = 0
+                        continue
+
+                    poll_delay = max(0.5, self.config.prime_event_poll_interval)
+                    backoff = min(poll_delay * (1.0 + 0.20 * min(retry_count, 8)), poll_delay * 4.0)
+                    await asyncio.sleep(backoff)
+                    continue
+
+                ws_timeout = _adaptive_timeout(
+                    float(os.getenv("TIMEOUT_PRIME_WS_CONNECTION", "30.0")),
+                    self._prime_probe_latency_ema,
+                )
+                ws, prime_url = await self._connect_prime_websocket(timeout_seconds=ws_timeout)
                 async with ws:
                     logger.info(f"[PrimeNeuralMesh] ✓ Connected to Prime WebSocket: {prime_url}")
-                    retry_count = 0  # Reset on successful connection
+                    retry_count = 0
+                    self._current_transport = "websocket"
 
                     async for message in ws:
                         try:
@@ -821,137 +1150,105 @@ class PrimeNeuralMeshBridge:
                             continue
 
             except ImportError:
-                logger.warning("[PrimeNeuralMesh] websockets library not available")
-                break
-
-            except ConnectionRefusedError:
-                retry_count += 1
-                # Short delays during startup, longer after
-                if in_startup:
-                    delay = min(base_delay * (1.5 ** min(retry_count - 1, 3)), 10.0)  # Max 10s during startup
-                else:
-                    delay = min(base_delay * (2 ** min(retry_count, 6)), 120.0)  # Max 2min normally
-
-                if retry_count <= 3 or retry_count % 10 == 0:  # Log first 3, then every 10th
-                    logger.debug(f"[PrimeNeuralMesh] Prime not available (attempt {retry_count}), retry in {delay:.1f}s")
-                await asyncio.sleep(delay)
+                logger.warning("[PrimeNeuralMesh] websockets library not available; using health polling")
+                polling_mode = True
+                polling_started_at = loop.time()
+                self._current_transport = "polling"
 
             except asyncio.CancelledError:
                 logger.info("[PrimeNeuralMesh] Event stream cancelled")
                 break
 
-            # v93.16: Handle WebSocket connection closed errors gracefully
-            # This includes "no close frame received or sent" which happens when:
-            # - Server restarts/crashes
-            # - Network interruption
-            # - Idle timeout
-            except Exception as ws_exc:
-                # Check if this is a websockets ConnectionClosed exception
-                exc_type_name = type(ws_exc).__name__
-                exc_module = type(ws_exc).__module__
-
-                if exc_type_name in ("ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK") and "websockets" in exc_module:
-                    # WebSocket closed - this is normal, just reconnect
-                    retry_count += 1
-                    delay = min(base_delay * (1.2 ** min(retry_count - 1, 5)), 15.0)
-
-                    # Only log occasionally to avoid spam
-                    if retry_count == 1:
-                        logger.debug("[PrimeNeuralMesh] WebSocket closed, reconnecting...")
-                    elif retry_count % 5 == 0:
-                        logger.debug(f"[PrimeNeuralMesh] WebSocket reconnect attempt {retry_count}")
-
-                    await asyncio.sleep(delay)
-                    continue  # Try to reconnect
-
-                # Not a WebSocket close error - re-raise to be handled by the generic handler
-                raise
-
-            except Exception as e:
-                error_msg = str(e)
+            except Exception as exc:
                 retry_count += 1
-
-                if "404" in error_msg:
-                    # WebSocket endpoint not available - Prime may not have this endpoint
-                    # Use very short delays during startup to not block
-                    if in_startup:
-                        delay = min(5.0 * retry_count, 15.0)  # 5s, 10s, 15s during startup
-                        max_startup_retries = 5
-                        if retry_count <= max_startup_retries:
-                            if retry_count == 1:
-                                logger.info("[PrimeNeuralMesh] Waiting for Prime WebSocket (background)...")
-                            await asyncio.sleep(delay)
-                        else:
-                            # During startup, just switch to polling and don't block
-                            logger.info("[PrimeNeuralMesh] Prime WebSocket not ready - using REST polling (non-blocking)")
-                            asyncio.create_task(self._poll_prime_status())  # Fire and forget
-                            retry_count = 0
-                            await asyncio.sleep(30)  # Wait 30s before trying WebSocket again
-                    else:
-                        # After startup, use normal retry logic
-                        delay = min(base_delay * (2 ** min(retry_count - 1, 5)), 60.0)
-                        max_retries = int(os.getenv("PRIME_WEBSOCKET_MAX_RETRIES", "15"))
-
-                        if retry_count <= max_retries:
-                            if retry_count == 1 or retry_count % 5 == 0:
-                                logger.info(f"[PrimeNeuralMesh] WebSocket retry {retry_count}/{max_retries} in {delay:.1f}s")
-                            await asyncio.sleep(delay)
-                        else:
-                            logger.info("[PrimeNeuralMesh] Falling back to REST polling")
-                            await self._poll_prime_status()
-                            retry_count = 0
-                            await asyncio.sleep(60)
-                elif "403" in error_msg:
-                    # v93.15: HTTP 403 Forbidden - WebSocket endpoint might not be ready yet
-                    # or authentication/CORS issue. This is common during startup.
-                    if in_startup:
-                        delay = min(5.0 * retry_count, 15.0)
-                        if retry_count <= 5:
-                            if retry_count == 1:
-                                logger.info("[PrimeNeuralMesh] WebSocket not ready (403) - Prime may still be starting")
-                            await asyncio.sleep(delay)
-                        else:
-                            logger.info("[PrimeNeuralMesh] WebSocket unavailable - using REST polling")
-                            asyncio.create_task(self._poll_prime_status())
-                            retry_count = 0
-                            await asyncio.sleep(30)
-                    else:
-                        # After startup, use REST polling as fallback
-                        delay = min(30.0 * (retry_count - 1), 120.0)
-                        if retry_count <= 3:
-                            logger.info(f"[PrimeNeuralMesh] WebSocket 403 - retry {retry_count}/3 in {delay:.0f}s")
-                            await asyncio.sleep(delay)
-                        else:
-                            logger.info("[PrimeNeuralMesh] WebSocket unavailable - falling back to REST polling")
-                            await self._poll_prime_status()
-                            retry_count = 0
-                            await asyncio.sleep(60)
-                else:
-                    # Other errors
+                if self._is_endpoint_contract_error(exc):
+                    # Move to next path/port candidate and degrade to polling until reprobe window.
+                    self._ws_candidate_index += 1
+                    polling_mode = True
+                    polling_started_at = loop.time()
+                    self._current_transport = "polling"
                     if retry_count <= 3:
-                        logger.warning(f"[PrimeNeuralMesh] Event stream error: {e}")
-                    delay = min(5.0 * (1.5 ** min(retry_count - 1, 4)), 30.0)
-                    await asyncio.sleep(delay)
+                        logger.info(
+                            "[PrimeNeuralMesh] Prime websocket endpoint contract not available; "
+                            "switching to health polling and will reprobe"
+                        )
+                    await self._poll_prime_status()
+                    await asyncio.sleep(max(1.0, self.config.prime_event_poll_interval))
+                    continue
 
-    async def _poll_prime_status(self) -> None:
+                # Handle graceful websocket closures without hard fallback.
+                exc_type_name = type(exc).__name__
+                exc_module = type(exc).__module__
+                if exc_type_name in ("ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK") and "websockets" in exc_module:
+                    delay = min(base_delay * (1.2 ** min(retry_count - 1, 5)), 15.0)
+                    if retry_count == 1 or retry_count % 5 == 0:
+                        logger.debug(f"[PrimeNeuralMesh] WebSocket reconnect attempt {retry_count}")
+                    await asyncio.sleep(delay)
+                    continue
+
+                if retry_count <= 3 or retry_count % 10 == 0:
+                    logger.warning(f"[PrimeNeuralMesh] Event stream error: {exc}")
+
+                if in_startup and retry_count >= 5:
+                    polling_mode = True
+                    polling_started_at = loop.time()
+                    self._current_transport = "polling"
+                    await self._poll_prime_status()
+                    await asyncio.sleep(max(1.0, self.config.prime_event_poll_interval))
+                    continue
+
+                delay = min(base_delay * (1.5 ** min(retry_count - 1, 6)), 45.0)
+                await asyncio.sleep(delay)
+
+    async def _poll_prime_status(self) -> bool:
         """Fallback: Poll Prime status via REST when WebSocket unavailable."""
         try:
             import aiohttp
+        except ImportError:
+            return False
 
-            prime_health_url = f"http://{self.config.prime_host}:{self.config.prime_port}/health"
+        candidates = self._rotated_candidates(
+            self._health_url_base_candidates(),
+            self._health_candidate_index,
+        )
+        if not candidates:
+            return False
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(prime_health_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Emit as event
-                        await self._handle_prime_event({
-                            "event_type": "status_poll",
-                            "data": data,
-                        })
+        timeout_seconds = self._probe_timeout_seconds()
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for offset, prime_health_url in enumerate(candidates):
+                started_at = asyncio.get_event_loop().time()
+                try:
+                    async with session.get(prime_health_url) as resp:
+                        if resp.status >= 500:
+                            continue
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception:
+                            data = {"raw": await resp.text()}
+                        if not isinstance(data, dict):
+                            data = {"value": data}
+
+                        self._observe_probe_latency(asyncio.get_event_loop().time() - started_at)
+                        self._last_successful_health_url = prime_health_url
+                        self._health_candidate_index += offset
+                        await self._handle_prime_event(
+                            {
+                                "event_type": "status_poll",
+                                "data": {
+                                    **data,
+                                    "_prime_health_url": prime_health_url,
+                                    "_prime_http_status": resp.status,
+                                },
+                            }
+                        )
                         logger.debug("[PrimeNeuralMesh] REST poll successful")
-        except Exception as e:
-            logger.debug(f"[PrimeNeuralMesh] REST poll failed: {e}")
+                        return True
+                except Exception:
+                    continue
+
+        return False
 
     async def _handle_prime_event(self, event: Dict[str, Any]) -> None:
         """Handle an event from JARVIS-Prime."""
@@ -1096,11 +1393,21 @@ class PrimeNeuralMeshBridge:
             "initialized": self._initialized,
             "communication_bus_connected": self._communication_bus is not None,
             "prime_client_connected": self._prime_client is not None,
+            "transport_mode": self._current_transport,
             "event_stream_active": (
                 self._event_stream_task is not None
                 and not self._event_stream_task.done()
             ),
             "registered_callbacks": len(self._callbacks),
+            "last_successful_ws_url": self._last_successful_ws_url,
+            "last_successful_health_url": self._last_successful_health_url,
+            "prime_probe_latency_ema_ms": (
+                round(self._prime_probe_latency_ema * 1000.0, 2)
+                if self._prime_probe_latency_ema is not None
+                else None
+            ),
+            "prime_ws_candidates": len(self._ws_url_base_candidates()),
+            "prime_health_candidates": len(self._health_url_base_candidates()),
         }
 
 
