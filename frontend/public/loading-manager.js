@@ -1355,6 +1355,9 @@ class JARVISLoadingManager {
             }
         };
 
+        // Ensure completion flow is single-flight across duplicate complete updates
+        this._completionPromise = null;
+
         this.elements = this.cacheElements();
         this.init();
     }
@@ -3413,7 +3416,7 @@ class JARVISLoadingManager {
         if (stage === 'complete' || progress >= 100) {
             const success = metadata.success !== false;
             const redirectUrl = metadata.redirect_url || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
-            this.handleCompletion(success, redirectUrl, message);
+            this.handleCompletion(success, redirectUrl, message, metadata);
         }
 
         // v5.0: Handle PARTIAL completion (supervisor FALLBACK 5)
@@ -3435,7 +3438,7 @@ class JARVISLoadingManager {
 
             // Still proceed to main app after brief delay
             setTimeout(() => {
-                this.handleCompletion(success, redirectUrl, message || 'JARVIS partially ready');
+                this.handleCompletion(success, redirectUrl, message || 'JARVIS partially ready', metadata);
             }, 2000);
         }
 
@@ -4327,7 +4330,63 @@ class JARVISLoadingManager {
         console.log(`[Status] ${text} (${status})`);
     }
 
-    async handleCompletion(success, redirectUrl, message) {
+    _buildReadyRedirectUrl(redirectUrl) {
+        // Pass backend readiness state to main app via URL parameters.
+        const backendPort = this.config.backendPort || 8010;
+        const timestamp = Date.now().toString();
+        const params = new URLSearchParams({
+            jarvis_ready: '1',
+            backend_port: backendPort.toString(),
+            ts: timestamp
+        });
+
+        const baseRedirectUrl = redirectUrl || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+        return baseRedirectUrl.includes('?')
+            ? `${baseRedirectUrl}&${params.toString()}`
+            : `${baseRedirectUrl}?${params.toString()}`;
+    }
+
+    _isSupervisorAuthoritativeCompletion(metadata = {}) {
+        return (
+            metadata.final === true ||
+            metadata.supervisor_verified === true ||
+            metadata.authority === 'unified_supervisor'
+        );
+    }
+
+    async _runFastCompletionChecks(metadata = {}) {
+        const frontendOptionalByMetadata = metadata.frontend_optional === true;
+        const frontendRequired = !this.config.frontendOptional && !frontendOptionalByMetadata;
+
+        const checks = [this.quickBackendCheck()];
+        if (frontendRequired) {
+            checks.push(this.checkFrontendReady());
+        }
+
+        const results = await Promise.all(checks);
+        const backendReady = results[0] === true;
+        const frontendReady = frontendRequired ? results[1] === true : true;
+        return backendReady && frontendReady;
+    }
+
+    async handleCompletion(success, redirectUrl, message, metadata = {}) {
+        // De-duplicate completion across polling/WebSocket/race paths.
+        if (this._completionPromise) {
+            console.log('[Complete] Completion already in progress - ignoring duplicate trigger');
+            return this._completionPromise;
+        }
+
+        this._completionPromise = this._handleCompletionInternal(success, redirectUrl, message, metadata)
+            .catch(async (error) => {
+                console.error('[Complete] Completion flow crashed:', error);
+                this.state.redirecting = false;
+                this._completionPromise = null;
+                await this.showError('Startup completion flow failed. Please refresh.');
+            });
+        return this._completionPromise;
+    }
+
+    async _handleCompletionInternal(success, redirectUrl, message, metadata = {}) {
         // ═══════════════════════════════════════════════════════════════════════════
         // v4.0: ROBUST COMPLETION HANDLING
         // Never redirect until BOTH backend AND frontend are VERIFIED operational
@@ -4343,6 +4402,30 @@ class JARVISLoadingManager {
         this.state.progress = 95;
         this.state.targetProgress = 95;
         this.updateProgressBar();
+
+        // Fast path: supervisor has already verified readiness and emitted completion.
+        // We keep a short local sanity check, then redirect immediately.
+        const authoritativeCompletion = this._isSupervisorAuthoritativeCompletion(metadata);
+        if (authoritativeCompletion) {
+            console.log('[Complete] Supervisor-authoritative completion detected - running fast checks');
+            this.updateStatusText('Finalizing redirect...', 'verifying');
+            const fastChecksPassed = await this._runFastCompletionChecks(metadata);
+
+            if (fastChecksPassed) {
+                const finalRedirectUrl = this._buildReadyRedirectUrl(redirectUrl);
+                this.elements.subtitle.textContent = 'SYSTEM READY';
+                this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+                this.updateStatusText('System ready', 'ready');
+                this.state.progress = 100;
+                this.state.targetProgress = 100;
+                this.updateProgressBar();
+                this.cleanup();
+                window.location.href = finalRedirectUrl;
+                return;
+            }
+
+            console.warn('[Complete] Fast-path checks failed, falling back to full verification flow');
+        }
 
         // ═══════════════════════════════════════════════════════════════════════════
         // STEP 1: Wait for BACKEND to be OPERATIONALLY ready (not just HTTP responding)
@@ -4434,28 +4517,7 @@ class JARVISLoadingManager {
         this.state.progress = 100;
         this.state.targetProgress = 100;
         this.updateProgressBar();
-
-        // CRITICAL: Pass backend readiness state to main app via URL parameters
-        // localStorage doesn't work cross-origin (port 3001 -> port 3000 are different origins)
-        // So we encode the state in the redirect URL instead
-        const backendPort = this.config.backendPort || 8010;
-        const timestamp = Date.now().toString();
-
-        // Build redirect URL with backend readiness parameters
-        // The main app's JarvisConnectionService will read these for instant connection
-        const params = new URLSearchParams({
-            jarvis_ready: '1',
-            backend_port: backendPort.toString(),
-            ts: timestamp
-        });
-
-        // Ensure we have a valid redirect URL
-        const baseRedirectUrl = redirectUrl || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
-
-        // Append params to redirect URL
-        const finalRedirectUrl = baseRedirectUrl.includes('?')
-            ? `${baseRedirectUrl}&${params.toString()}`
-            : `${baseRedirectUrl}?${params.toString()}`;
+        const finalRedirectUrl = this._buildReadyRedirectUrl(redirectUrl);
 
         console.log('[Complete] ✓ Backend readiness encoded in redirect URL');
         console.log(`[Complete] Redirect URL: ${finalRedirectUrl}`);

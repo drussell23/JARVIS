@@ -74519,12 +74519,15 @@ class JarvisSystemKernel:
                     self._release_browser_lock()
 
             # Step 4: Gracefully stop the loading server
-            # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
-            # The loading server also has transition grace period protection
-            redirect_stabilization_delay = float(
-                os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "1.0")
+            # v264.0: Keep only a short, configurable stabilization window.
+            # The old 1.0s default added fixed startup latency even when redirect
+            # was already complete.
+            redirect_stabilization_delay = max(
+                0.0,
+                float(os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "0.25")),
             )
-            await asyncio.sleep(redirect_stabilization_delay)
+            if redirect_stabilization_delay > 0:
+                await asyncio.sleep(redirect_stabilization_delay)
             # The graceful shutdown will wait for Chrome to naturally disconnect
             await self._stop_loading_server()
 
@@ -74905,14 +74908,55 @@ class JarvisSystemKernel:
         # v205.0: Send final 100% progress before stopping
         # This allows the loading page to show completion before being terminated
         try:
+            frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+            frontend_status = self._component_status.get("frontend", {}).get("status", "pending")
+            backend_status = self._component_status.get("backend", {}).get("status", "pending")
+            frontend_ready = frontend_status in ("complete", "ready")
+            backend_ready = backend_status in ("complete", "ready")
+            frontend_optional = os.environ.get("FRONTEND_OPTIONAL", "false").lower() == "true"
+
+            if frontend_ready:
+                redirect_url = f"http://localhost:{frontend_port}"
+            elif frontend_optional:
+                redirect_url = f"http://localhost:{self.config.backend_port}"
+            else:
+                redirect_url = f"http://localhost:{frontend_port}"
+
+            component_snapshot = {
+                "loading_server": self._component_status.get("loading_server", {}).get("status", "pending"),
+                "preflight": self._component_status.get("preflight", {}).get("status", "pending"),
+                "resources": self._component_status.get("resources", {}).get("status", "pending"),
+                "backend": backend_status,
+                "intelligence": self._component_status.get("intelligence", {}).get("status", "pending"),
+                "trinity": self._component_status.get("trinity", {}).get("status", "pending"),
+                "frontend": frontend_status,
+            }
+
             await self._broadcast_startup_progress(
                 stage="complete",
                 message="JARVIS startup complete",
                 progress=100,
-                metadata={"final": True}
+                metadata={
+                    "final": True,
+                    "authority": "unified_supervisor",
+                    "supervisor_verified": True,
+                    "backend_ready": backend_ready,
+                    "frontend_ready": frontend_ready,
+                    "frontend_optional": frontend_optional,
+                    "trinity_ready": self._is_trinity_ready(),
+                    "redirect_url": redirect_url,
+                    "components": component_snapshot,
+                    "component_status": component_snapshot,
+                }
             )
-            # Brief wait for the progress update to be received and processed
-            await asyncio.sleep(1.0)
+            # v264.0: Keep a small configurable grace period for the browser to
+            # consume final progress before we close the loading server.
+            final_progress_grace = max(
+                0.0,
+                float(os.getenv("LOADING_SERVER_FINAL_PROGRESS_GRACE", "0.25")),
+            )
+            if final_progress_grace > 0:
+                await asyncio.sleep(final_progress_grace)
             self.logger.debug("[LoadingServer] Sent final 100% progress before shutdown")
         except Exception as e:
             self.logger.debug(f"[LoadingServer] Could not send final progress: {e}")
