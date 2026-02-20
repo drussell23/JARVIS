@@ -1378,6 +1378,72 @@ except ImportError:
             return len(tasks)
 
 # =============================================================================
+# ENTERPRISE HARDENING STACK
+# =============================================================================
+# Health contracts, recovery engine, capability router, and enterprise integration.
+# These modules form the enterprise overlay: health aggregation, intelligent recovery,
+# dynamic capability routing, and cross-repo orchestration.
+# =============================================================================
+
+# Enterprise Health Contracts - system-level health aggregation
+try:
+    from backend.core.health_contracts import (
+        SystemHealthAggregator,
+        HealthStatus as EnterpriseHealthStatus,
+        get_health_aggregator,
+    )
+    ENTERPRISE_HEALTH_AVAILABLE = True
+except ImportError:
+    ENTERPRISE_HEALTH_AVAILABLE = False
+    SystemHealthAggregator = None
+    EnterpriseHealthStatus = None
+    get_health_aggregator = None
+
+# Enterprise Recovery Engine - intelligent failure classification and recovery
+try:
+    from backend.core.recovery_engine import (
+        RecoveryEngine,
+        RecoveryPhase,
+        RecoveryStrategy,
+        RecoveryAction,
+        ErrorClassifier,
+        get_recovery_engine,
+    )
+    ENTERPRISE_RECOVERY_AVAILABLE = True
+except ImportError:
+    ENTERPRISE_RECOVERY_AVAILABLE = False
+    RecoveryEngine = None
+    RecoveryPhase = None
+    RecoveryStrategy = None
+    RecoveryAction = None
+    ErrorClassifier = None
+    get_recovery_engine = None
+
+# Enterprise Capability Router - dynamic routing with circuit breaker fallback
+try:
+    from backend.core.capability_router import (
+        CapabilityRouter,
+        get_capability_router,
+    )
+    ENTERPRISE_CAPABILITY_AVAILABLE = True
+except ImportError:
+    ENTERPRISE_CAPABILITY_AVAILABLE = False
+    CapabilityRouter = None
+    get_capability_router = None
+
+# Enterprise Component Registry - single source of truth for component state
+try:
+    from backend.core.component_registry import (
+        get_component_registry,
+        ComponentStatus as EnterpriseComponentStatus,
+    )
+    ENTERPRISE_REGISTRY_AVAILABLE = True
+except ImportError:
+    ENTERPRISE_REGISTRY_AVAILABLE = False
+    get_component_registry = None
+    EnterpriseComponentStatus = None
+
+# =============================================================================
 # v210.0: MODULAR INTEGRATION HELPERS
 # =============================================================================
 # These functions provide unified access to either modular or inline implementations.
@@ -56474,6 +56540,19 @@ class TrinityIntegrator:
         # Discovery cache
         self._discovery_cache: Dict[str, Optional[Path]] = {}
 
+        # v238.0: NightShift training monitor task
+        self._nightshift_task: Optional[asyncio.Task] = None
+
+        # v238.0: Enterprise recovery engine (lazy-initialized on first use)
+        self._recovery_engine = None
+        if ENTERPRISE_RECOVERY_AVAILABLE and ENTERPRISE_REGISTRY_AVAILABLE:
+            try:
+                _reg = get_component_registry()
+                self._recovery_engine = get_recovery_engine(_reg)
+                self.logger.debug("[Trinity] Enterprise recovery engine initialized")
+            except Exception:
+                pass  # Graceful degradation — legacy restart logic will be used
+
     async def initialize(self) -> bool:
         """Initialize Trinity integration."""
         if not self._enabled:
@@ -56730,6 +56809,13 @@ class TrinityIntegrator:
         # Start health monitoring
         if any(results.values()):
             await self._start_health_monitor()
+
+        # v238.0: Start NightShift training trigger if reactor-core is alive
+        if results.get("reactor-core") and self._reactor:
+            self._nightshift_task = create_safe_task(
+                self._nightshift_training_monitor(),
+                name="nightshift-training-monitor",
+            )
 
         return results
 
@@ -57347,7 +57433,13 @@ class TrinityIntegrator:
                     )
                 except Exception:
                     pass
-                    
+
+                # v238.0: Bridge completeness check for jarvis-prime
+                # After Prime health succeeds, verify cross-repo bridges are active.
+                # Missing bridges = degraded mode (not a failure — Prime is still useful).
+                if component.name == "jarvis-prime" and AIOHTTP_AVAILABLE:
+                    await self._check_bridge_completeness(component)
+
                 return True
             else:
                 component.state = "failed"
@@ -58316,7 +58408,49 @@ class TrinityIntegrator:
                             self.logger.warning(f"[Trinity] {component.name} became unhealthy")
                             component.state = "unhealthy"
 
-                            if component.restart_count < self._max_restarts:
+                            # v238.0: Use RecoveryEngine for intelligent failure handling
+                            # instead of bare restart. Classifies failure type and decides
+                            # strategy: retry, restart, fallback, disable, or escalate.
+                            if ENTERPRISE_RECOVERY_AVAILABLE and self._recovery_engine:
+                                try:
+                                    _err = RuntimeError(f"{component.name} health check failed")
+                                    _action = await self._recovery_engine.handle_failure(
+                                        component.name, _err, RecoveryPhase.RUNTIME,
+                                    )
+                                    if _action.strategy == RecoveryStrategy.RETRY:
+                                        self.logger.info(
+                                            f"[Trinity] Recovery engine: RETRY {component.name} "
+                                            f"after {_action.delay:.1f}s"
+                                        )
+                                        await asyncio.sleep(_action.delay)
+                                        component.restart_count += 1
+                                        await self._start_component(component)
+                                    elif _action.strategy == RecoveryStrategy.FULL_RESTART:
+                                        self.logger.info(f"[Trinity] Recovery engine: RESTART {component.name}")
+                                        component.restart_count += 1
+                                        await self._start_component(component)
+                                    elif _action.strategy == RecoveryStrategy.FALLBACK_MODE:
+                                        self.logger.warning(
+                                            f"[Trinity] Recovery engine: FALLBACK for {component.name}"
+                                        )
+                                        component.state = "degraded"
+                                    elif _action.strategy == RecoveryStrategy.DISABLE_AND_CONTINUE:
+                                        self.logger.warning(
+                                            f"[Trinity] Recovery engine: DISABLE {component.name}"
+                                        )
+                                        component.state = "disabled"
+                                    else:
+                                        self.logger.error(
+                                            f"[Trinity] Recovery engine: ESCALATE {component.name} — "
+                                            f"{_action.message or 'manual intervention needed'}"
+                                        )
+                                except Exception as _re_err:
+                                    self.logger.debug(f"[Trinity] Recovery engine error: {_re_err}")
+                                    # Fall through to legacy restart
+                                    if component.restart_count < self._max_restarts:
+                                        component.restart_count += 1
+                                        await self._start_component(component)
+                            elif component.restart_count < self._max_restarts:
                                 self.logger.info(f"[Trinity] Attempting to restart {component.name}")
                                 component.restart_count += 1
                                 await self._start_component(component)
@@ -58325,6 +58459,126 @@ class TrinityIntegrator:
                 break
             except Exception as e:
                 self.logger.debug(f"[Trinity] Health monitor error: {e}")
+
+    async def _check_bridge_completeness(self, component: TrinityComponent) -> None:
+        """
+        v238.0: Check cross-repo bridge status after jarvis-prime health succeeds.
+
+        Queries Prime's /health endpoint for bridge fields and logs warnings
+        for any missing bridges. This is informational only — missing bridges
+        mean degraded cross-repo integration, not a startup failure.
+        """
+        _bridge_fields = [
+            "bridge_enabled",
+            "reactor_bridge_enabled",
+            "jarvis_bridge_enabled",
+            "neural_routing_enabled",
+        ]
+        try:
+            async with aiohttp.ClientSession() as session:
+                _url = component.health_url or f"http://localhost:{component.port}/health"
+                async with session.get(_url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                    if resp.status != 200:
+                        self.logger.debug(f"[Trinity] Bridge check: {component.name} returned {resp.status}")
+                        return
+                    data = await resp.json()
+
+            _missing = [f for f in _bridge_fields if not data.get(f)]
+            _active = [f for f in _bridge_fields if data.get(f)]
+
+            if _missing:
+                self.logger.warning(
+                    f"[Trinity] {component.name} bridges degraded: "
+                    f"{len(_active)}/{len(_bridge_fields)} active, "
+                    f"missing: {', '.join(_missing)}"
+                )
+            else:
+                self.logger.info(
+                    f"[Trinity] {component.name} all {len(_bridge_fields)} bridges active"
+                )
+        except Exception as e:
+            self.logger.debug(f"[Trinity] Bridge completeness check skipped: {e}")
+
+    async def _nightshift_training_monitor(self) -> None:
+        """
+        v238.0: Background task that periodically checks reactor-core experience
+        count and triggers NightShift training when thresholds are met.
+
+        Replaces manual POST /api/v1/pipeline/run. Runs every NIGHTSHIFT_CHECK_INTERVAL
+        seconds (default: 300s / 5min). Triggers training when accumulated experiences
+        exceed NIGHTSHIFT_EXPERIENCE_THRESHOLD (default: 500).
+        """
+        _interval = float(os.getenv("NIGHTSHIFT_CHECK_INTERVAL", "300"))
+        _threshold = int(os.getenv("NIGHTSHIFT_EXPERIENCE_THRESHOLD", "500"))
+        _reactor_url = os.getenv(
+            "REACTOR_CORE_URL",
+            f"http://localhost:{self._reactor.port if self._reactor else 8090}",
+        )
+
+        self.logger.info(
+            f"[NightShift] Training monitor started "
+            f"(interval={_interval}s, threshold={_threshold} experiences)"
+        )
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(_interval)
+
+                if not self._reactor or self._reactor.state != "healthy":
+                    continue
+
+                if not AIOHTTP_AVAILABLE:
+                    continue
+
+                # Query reactor-core experience count
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{_reactor_url}/api/v1/pipeline/status",
+                        timeout=aiohttp.ClientTimeout(total=10.0),
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+
+                _exp_count = data.get("experience_count", 0)
+                _last_training = data.get("last_training_time")
+                _is_training = data.get("training_in_progress", False)
+
+                if _is_training:
+                    self.logger.debug(f"[NightShift] Training already in progress")
+                    continue
+
+                if _exp_count >= _threshold:
+                    self.logger.info(
+                        f"[NightShift] Threshold reached ({_exp_count}/{_threshold}), "
+                        f"triggering training pipeline"
+                    )
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(
+                                f"{_reactor_url}/api/v1/pipeline/run",
+                                json={"source": "nightshift_monitor", "experience_count": _exp_count},
+                                timeout=aiohttp.ClientTimeout(total=30.0),
+                            ) as t_resp:
+                                if t_resp.status == 200:
+                                    _result = await t_resp.json()
+                                    self.logger.info(
+                                        f"[NightShift] Training triggered: "
+                                        f"job_id={_result.get('job_id', 'unknown')}"
+                                    )
+                                else:
+                                    self.logger.warning(
+                                        f"[NightShift] Training trigger returned {t_resp.status}"
+                                    )
+                    except Exception as _t_err:
+                        self.logger.debug(f"[NightShift] Training trigger failed: {_t_err}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.debug(f"[NightShift] Monitor error: {e}")
+
+        self.logger.info("[NightShift] Training monitor stopped")
 
     async def _check_health(self, component: TrinityComponent) -> bool:
         """
@@ -58375,6 +58629,14 @@ class TrinityIntegrator:
             self._health_monitor_task.cancel()
             try:
                 await self._health_monitor_task
+            except asyncio.CancelledError:
+                pass
+
+        # v238.0: Stop NightShift training monitor
+        if self._nightshift_task:
+            self._nightshift_task.cancel()
+            try:
+                await self._nightshift_task
             except asyncio.CancelledError:
                 pass
 
@@ -71320,6 +71582,36 @@ class JarvisSystemKernel:
                     except Exception as _ssr_e:
                         self.logger.warning(f"[Kernel] Phase 5 SSR activation error: {_ssr_e}")
 
+                # v238.0: Capability activation after Trinity health checks pass
+                # HTTP call to J-Prime to activate additional capabilities (reasoning,
+                # continuous learning, etc.) that require Trinity to be online first.
+                if AIOHTTP_AVAILABLE and self._trinity:
+                    _jprime = getattr(self._trinity, '_jprime', None)
+                    if _jprime and _jprime.state == "healthy":
+                        _activate_url = f"http://localhost:{_jprime.port}/api/v1/capabilities/activate"
+                        try:
+                            async with aiohttp.ClientSession() as _cap_session:
+                                async with _cap_session.post(
+                                    _activate_url,
+                                    json={"source": "unified_supervisor", "phase": "post_trinity"},
+                                    timeout=aiohttp.ClientTimeout(total=10.0),
+                                ) as _cap_resp:
+                                    if _cap_resp.status == 200:
+                                        _cap_data = await _cap_resp.json()
+                                        _activated = _cap_data.get("activated", [])
+                                        if _activated:
+                                            self.logger.info(
+                                                f"[Kernel] Activated {len(_activated)} capabilities on J-Prime: "
+                                                f"{', '.join(_activated[:5])}"
+                                                f"{'...' if len(_activated) > 5 else ''}"
+                                            )
+                                    elif _cap_resp.status == 404:
+                                        self.logger.debug("[Kernel] J-Prime does not expose /api/v1/capabilities/activate (OK)")
+                                    else:
+                                        self.logger.debug(f"[Kernel] Capability activation returned {_cap_resp.status}")
+                        except Exception as _cap_err:
+                            self.logger.debug(f"[Kernel] Capability activation skipped: {_cap_err}")
+
                 return True  # Trinity is optional
 
             except Exception as e:
@@ -71611,6 +71903,28 @@ class JarvisSystemKernel:
                 self._readiness_manager.mark_component_ready("voice_biometrics", voice_ready)
 
             self._update_component_status("enterprise", "complete", f"Enterprise: {len(successful)}/{len(services)} active")
+
+            # v238.0: Health Contract Enforcement — aggregate health from all components
+            # Uses SystemHealthAggregator to determine system-level health status
+            # from individual component health reports (Prime, Reactor, Body services).
+            if ENTERPRISE_HEALTH_AVAILABLE and ENTERPRISE_REGISTRY_AVAILABLE:
+                try:
+                    _reg = get_component_registry()
+                    _aggregator = get_health_aggregator(_reg)
+                    _system_health = await _aggregator.collect_all()
+                    _overall = _system_health.overall
+                    if _overall == EnterpriseHealthStatus.HEALTHY:
+                        self.logger.info("[Zone6] Health contracts: system HEALTHY")
+                    elif _overall == EnterpriseHealthStatus.DEGRADED:
+                        self.logger.warning(
+                            f"[Zone6] Health contracts: system DEGRADED — "
+                            f"{sum(1 for r in _system_health.components.values() if r.status != EnterpriseHealthStatus.HEALTHY)} "
+                            f"component(s) degraded/unhealthy"
+                        )
+                    else:
+                        self.logger.warning(f"[Zone6] Health contracts: system {_overall.value}")
+                except Exception as _hc_err:
+                    self.logger.debug(f"[Zone6] Health contract check skipped: {_hc_err}")
 
             # v239.0: System Service Registry — Phase 6 (Training pipeline adapters)
             if self._service_registry:
