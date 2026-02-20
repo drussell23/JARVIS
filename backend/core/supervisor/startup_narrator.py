@@ -217,6 +217,12 @@ class NarrationConfig:
     rate: int = field(
         default_factory=lambda: int(os.getenv("STARTUP_NARRATOR_RATE", "190"))
     )
+    intelligent_announcements_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "STARTUP_NARRATOR_INTELLIGENT",
+            "false",
+        ).lower() == "true"
+    )
     
     # Behavior settings
     narrate_slow_phases: bool = True  # Announce when phase takes long
@@ -2443,6 +2449,10 @@ class IntelligentStartupNarrator:
             event_type: Type of event (flywheel, training, learning, etc.)
             fallback_message: Message to use if JARVIS-Prime is unavailable
         """
+        if not self.config.intelligent_announcements_enabled:
+            await self._speak(fallback_message, NarrationPriority.MEDIUM)
+            return
+
         try:
             from .unified_voice_orchestrator import speak_intelligent
             await speak_intelligent(
@@ -3204,4 +3214,3 @@ async def narrate_partial_complete(
         progress=progress,
         duration_seconds=duration_seconds,
     )
-

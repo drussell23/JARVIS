@@ -2125,6 +2125,7 @@ warnings.filterwarnings("ignore", message=".*speechbrain.*deprecated.*", categor
 warnings.filterwarnings("ignore", message=".*torchaudio.*deprecated.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*Wav2Vec2Model is frozen.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*model is frozen.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*non-supported Python version.*", category=FutureWarning)
 
 # Configure noisy loggers
 for _logger_name in [
@@ -2136,6 +2137,30 @@ for _logger_name in [
     # Prevent third-party debug chatter from leaking through root handlers
     # when external modules reconfigure logging at runtime.
     _noisy_logger.propagate = False
+
+
+class _RegisteredCheckpointFilter(logging.Filter):
+    """Suppress repetitive SpeechBrain checkpoint hook registration chatter."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "registered checkpoint" not in record.getMessage().lower()
+
+
+if os.getenv("JARVIS_SUPPRESS_REGISTERED_CHECKPOINT_LOGS", "true").strip().lower() in (
+    "1", "true", "yes", "on"
+):
+    _checkpoint_filter = _RegisteredCheckpointFilter()
+    for _target_logger in (
+        logging.getLogger(),
+        logging.getLogger("speechbrain"),
+        logging.getLogger("speechbrain.utils"),
+        logging.getLogger("speechbrain.utils.checkpoints"),
+    ):
+        if _checkpoint_filter not in _target_logger.filters:
+            _target_logger.addFilter(_checkpoint_filter)
+    for _handler in logging.getLogger().handlers:
+        if _checkpoint_filter not in _handler.filters:
+            _handler.addFilter(_checkpoint_filter)
 
 # =============================================================================
 # ENVIRONMENT LOADING
@@ -12850,6 +12875,11 @@ class AsyncVoiceNarrator:
             enabled = os.getenv("JARVIS_VOICE_ENABLED", "true").lower() == "true"
         self.enabled = enabled and platform.system() == "Darwin"
 
+        # Enforce canonical startup voice identity.
+        os.environ["JARVIS_FORCE_DANIEL_VOICE"] = "true"
+        os.environ["JARVIS_ENFORCE_CANONICAL_VOICE"] = "true"
+        os.environ["JARVIS_CANONICAL_VOICE_NAME"] = "Daniel"
+        os.environ["JARVIS_VOICE_NAME"] = "Daniel"
         self.voice = self._resolve_voice_name(voice)
         self.rate = rate or int(os.getenv("JARVIS_VOICE_RATE", "175"))
         self._owner_name = owner_name or os.getenv("JARVIS_OWNER_NAME", "")
@@ -12884,6 +12914,8 @@ class AsyncVoiceNarrator:
         self._startup_announced = False
 
         if self.enabled:
+            os.environ.setdefault("JARVIS_CANONICAL_VOICE_NAME", self.voice)
+            os.environ.setdefault("JARVIS_VOICE_NAME", self.voice)
             _unified_logger.debug(f"Voice narrator initialized: voice={self.voice}, rate={self.rate}")
 
     async def start_queue_processor(self) -> None:
@@ -12958,6 +12990,63 @@ class AsyncVoiceNarrator:
             pass
         return self._speech_lock
 
+    @staticmethod
+    def _map_unified_voice_priority(priority: "VoicePriority") -> "Any":
+        """Map supervisor narrator priority to UnifiedVoiceOrchestrator priority."""
+        from backend.core.supervisor.unified_voice_orchestrator import (
+            VoicePriority as UnifiedVoicePriority,
+        )
+
+        if priority == VoicePriority.CRITICAL:
+            return UnifiedVoicePriority.CRITICAL
+        if priority == VoicePriority.HIGH:
+            return UnifiedVoicePriority.HIGH
+        if priority == VoicePriority.MEDIUM:
+            return UnifiedVoicePriority.MEDIUM
+        return UnifiedVoicePriority.LOW
+
+    async def _speak_via_unified_orchestrator(
+        self,
+        text: str,
+        wait: bool,
+        priority: VoicePriority,
+    ) -> Optional[bool]:
+        """
+        Route speech through UnifiedVoiceOrchestrator for deterministic startup audio.
+
+        This keeps startup narration on the same single-stream path as the rest of
+        the system and avoids direct subprocess divergence unless fallback is needed.
+        """
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import (
+                VoiceSource,
+                SpeechTopic,
+                get_voice_orchestrator,
+            )
+
+            orchestrator = get_voice_orchestrator()
+            if not getattr(orchestrator, "_running", False):
+                await orchestrator.start()
+
+            unified_priority = self._map_unified_voice_priority(priority)
+            if wait:
+                return await orchestrator.speak_and_wait(
+                    text=text,
+                    priority=unified_priority,
+                    source=VoiceSource.SUPERVISOR,
+                    topic=SpeechTopic.STARTUP,
+                )
+            return await orchestrator.speak(
+                text=text,
+                priority=unified_priority,
+                source=VoiceSource.SUPERVISOR,
+                wait=False,
+                topic=SpeechTopic.STARTUP,
+            )
+        except Exception as e:
+            _unified_logger.debug(f"[Voice] Unified orchestrator path unavailable: {e}")
+            return None
+
     async def _speak_internal(
         self,
         text: str,
@@ -12990,6 +13079,26 @@ class AsyncVoiceNarrator:
             _unified_logger.debug(f"[Voice] Skipping duplicate message: {text[:50]}...")
             self._messages_deduplicated += 1
             return
+
+        # Prefer the unified orchestrator path to avoid mixed startup audio stacks.
+        self._last_spoken_text = text
+        self._last_spoken_time = now
+        use_unified_orchestrator = self._env_flag(
+            "JARVIS_SUPERVISOR_USE_UNIFIED_VOICE_ORCHESTRATOR",
+            "true",
+        )
+        if use_unified_orchestrator:
+            delegated = await self._speak_via_unified_orchestrator(
+                text=text,
+                wait=wait,
+                priority=priority,
+            )
+            if delegated is True:
+                self._messages_spoken += 1
+                return
+            if delegated is False:
+                self._messages_skipped += 1
+                return
 
         # v251.5: Share lock with the orchestrator to prevent concurrent say
         speech_lock = self._get_shared_speech_lock()
@@ -13032,8 +13141,6 @@ class AsyncVoiceNarrator:
 
             self._speaking = True
             self._current_priority = priority
-            self._last_spoken_text = text
-            self._last_spoken_time = now
 
             self._process = await asyncio.create_subprocess_exec(
                 "say",
@@ -74030,14 +74137,21 @@ class JarvisSystemKernel:
 
         # If Trinity is enabled, check Prime and Reactor
         if self.config.trinity_enabled:
-            # Prime and Reactor are optional if not configured
+            # Prime and Reactor are optional by policy; optional components in
+            # "running" state should not block frontend transition indefinitely.
             prime_status = self._component_status.get("jarvis_prime", {})
             reactor_status = self._component_status.get("reactor_core", {})
+            prime_optional = bool(
+                getattr(self.config, "jprime_optional", os.getenv("TRINITY_JPRIME_OPTIONAL", "true").lower() == "true")
+            )
+            reactor_optional = bool(
+                getattr(self.config, "reactor_core_optional", os.getenv("TRINITY_REACTOR_OPTIONAL", "true").lower() == "true")
+            )
 
             # If configured but not complete, not ready
-            if prime_status.get("status") == "running":
+            if not prime_optional and prime_status.get("status") in {"pending", "running", "error", "failed"}:
                 return False
-            if reactor_status.get("status") == "running":
+            if not reactor_optional and reactor_status.get("status") in {"pending", "running", "error", "failed"}:
                 return False
 
         return True
@@ -75237,6 +75351,50 @@ class JarvisSystemKernel:
         self._ipc_server.register_handler(IPCCommand.STATUS, self._ipc_status)
         self._ipc_server.register_handler(IPCCommand.SHUTDOWN, self._ipc_shutdown)
 
+    def _collect_tier3_capabilities_status(self) -> Dict[str, Any]:
+        """
+        Collect policy + availability for optional Tier-3 capabilities.
+
+        This keeps optional modules explicit and observable instead of hidden.
+        """
+        repo_root = Path(__file__).resolve().parent
+        reactor_repo = Path(
+            os.getenv(
+                "REACTOR_CORE_REPO_PATH",
+                str(Path.home() / "Documents" / "repos" / "reactor-core"),
+            )
+        )
+
+        def _flag(name: str, default: str = "false") -> bool:
+            return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+        return {
+            "reactor_training": {
+                "federated_learning": {
+                    "available": (reactor_repo / "reactor_core" / "training" / "federated_learning.py").exists(),
+                    "enabled": _flag("REACTOR_TIER3_FEDERATED_ENABLED", "false"),
+                    "activation_policy": "multi-node",
+                },
+                "fsdp_training": {
+                    "available": (reactor_repo / "reactor_core" / "training" / "fsdp_training.py").exists(),
+                    "enabled": _flag("REACTOR_TIER3_FSDP_ENABLED", "false"),
+                    "activation_policy": "multi-gpu",
+                },
+            },
+            "jarvis": {
+                "ouroboros_simulator": {
+                    "available": (repo_root / "backend" / "core" / "ouroboros" / "simulator.py").exists(),
+                    "enabled": _flag("JARVIS_OUROBOROS_SIMULATOR_ENABLED", "true"),
+                    "activation_policy": "runtime_introspection",
+                },
+                "ecapa_cloud_service": {
+                    "available": (repo_root / "backend" / "cloud_services" / "ecapa_cloud_service.py").exists(),
+                    "enabled": _flag("JARVIS_ECAPA_SIDECAR_ENABLED", "false"),
+                    "activation_policy": "voice_backend_sidecar",
+                },
+            },
+        }
+
     async def _ipc_health(self) -> Dict[str, Any]:
         """
         Handle health IPC command (v119.0 enterprise-compatible).
@@ -75351,6 +75509,8 @@ class JarvisSystemKernel:
             "static_ip_name": self.config.invincible_node_static_ip_name,
             "status": self.invincible_node_status,
         }
+
+        status["tier3_capabilities"] = self._collect_tier3_capabilities_status()
 
         return status
 

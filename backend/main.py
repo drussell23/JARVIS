@@ -629,6 +629,30 @@ for _lib in [
     _logger.setLevel(logging.WARNING)
     _logger.propagate = False  # Don't propagate to root logger
 
+
+class _RegisteredCheckpointFilter(logging.Filter):
+    """Suppress repetitive SpeechBrain checkpoint hook registration logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "registered checkpoint" not in record.getMessage().lower()
+
+
+if os.getenv("JARVIS_SUPPRESS_REGISTERED_CHECKPOINT_LOGS", "true").lower() in (
+    "1", "true", "yes", "on"
+):
+    _checkpoint_filter = _RegisteredCheckpointFilter()
+    for _target_logger in (
+        logging.getLogger(),
+        logging.getLogger("speechbrain"),
+        logging.getLogger("speechbrain.utils"),
+        logging.getLogger("speechbrain.utils.checkpoints"),
+    ):
+        if _checkpoint_filter not in _target_logger.filters:
+            _target_logger.addFilter(_checkpoint_filter)
+    for _handler in logging.getLogger().handlers:
+        if _checkpoint_filter not in _handler.filters:
+            _handler.addFilter(_checkpoint_filter)
+
 # Check if we're in optimized mode - default to True for faster startup
 OPTIMIZE_STARTUP = os.getenv("OPTIMIZE_STARTUP", "true").lower() == "true"
 PARALLEL_IMPORTS = os.getenv("BACKEND_PARALLEL_IMPORTS", "true").lower() == "true"
