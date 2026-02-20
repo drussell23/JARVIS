@@ -599,13 +599,13 @@ async def get_component_health(component: str) -> Optional[HealthReport]:
     if not _COMPONENT_REGISTRY:
         return None
 
-    defn = _COMPONENT_REGISTRY.get(component)
-    if not defn:
+    state = _COMPONENT_REGISTRY.get_state(component)
+    if not state:
         return None
 
     return HealthReport(
         name=component,
-        status=HealthStatus.HEALTHY if defn.status == ComponentStatus.RUNNING else HealthStatus.FAILED,
+        status=HealthStatus.HEALTHY if state.status == ComponentStatus.HEALTHY else HealthStatus.FAILED,
         timestamp=datetime.now(),
     )
 
@@ -630,15 +630,15 @@ def update_component_health(
 
     # Map HealthStatus to ComponentStatus
     status_map = {
-        HealthStatus.HEALTHY: ComponentStatus.RUNNING,
+        HealthStatus.HEALTHY: ComponentStatus.HEALTHY,
         HealthStatus.DEGRADED: ComponentStatus.DEGRADED,
         HealthStatus.UNHEALTHY: ComponentStatus.FAILED,
         HealthStatus.FAILED: ComponentStatus.FAILED,
-        HealthStatus.UNKNOWN: ComponentStatus.UNKNOWN,
+        HealthStatus.UNKNOWN: ComponentStatus.FAILED,
     }
 
-    component_status = status_map.get(status, ComponentStatus.UNKNOWN)
-    _COMPONENT_REGISTRY.update_status(component, component_status)
+    component_status = status_map.get(status, ComponentStatus.FAILED)
+    _COMPONENT_REGISTRY.mark_status(component, component_status)
 
 
 # =============================================================================
