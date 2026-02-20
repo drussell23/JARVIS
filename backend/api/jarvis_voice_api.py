@@ -982,31 +982,70 @@ class JARVISVoiceAPI:
         try:
             # Generate time-based greeting using coordinator
             greeting = coordinator.generate_greeting()
-
-            # Send greeting via WebSocket to frontend (will show in transcript AND speak)
             logger.warning(f"[STARTUP VOICE] 🎤 JARVIS_VOICE_API ANNOUNCING: {greeting}")
 
-            # Get WebSocket manager from pipeline if available
-            from core.async_pipeline import get_async_pipeline
+            # Enforce canonical Daniel voice identity for startup speech.
+            os.environ.setdefault("JARVIS_FORCE_DANIEL_VOICE", "true")
+            os.environ.setdefault("JARVIS_ENFORCE_CANONICAL_VOICE", "true")
+            os.environ.setdefault("JARVIS_CANONICAL_VOICE_NAME", "Daniel")
 
+            ws_manager = None
             if self._jarvis_initialized and self.jarvis:
+                from core.async_pipeline import get_async_pipeline
+
                 pipeline = get_async_pipeline(self.jarvis)
                 if pipeline and hasattr(pipeline, "websocket_manager"):
-                    # Send via WebSocket to show in transcript
-                    logger.warning("[STARTUP VOICE] 📡 Sending via WebSocket to frontend")
-                    await pipeline.websocket_manager.broadcast(
-                        {
-                            "type": "command_response",
-                            "response": greeting,
-                            "command": "system_startup",
-                            "speak": True,  # Tell frontend to speak this
-                            "metadata": {"is_startup_greeting": True, "priority": "high"},
-                        }
-                    )
-                elif hasattr(self.jarvis, "voice"):
-                    # Fallback to direct voice if WebSocket not available
-                    logger.warning("[STARTUP VOICE] 🔊 Using direct voice.speak()")
+                    ws_manager = pipeline.websocket_manager
+
+            # Primary path: backend unified voice orchestrator (single audio source).
+            backend_spoken = False
+            try:
+                from core.supervisor.unified_voice_orchestrator import (
+                    SpeechTopic,
+                    VoicePriority,
+                    VoiceSource,
+                    get_voice_orchestrator,
+                )
+
+                logger.warning("[STARTUP VOICE] 🔊 Speaking via UnifiedVoiceOrchestrator")
+                backend_spoken = await get_voice_orchestrator().speak(
+                    greeting,
+                    priority=VoicePriority.HIGH,
+                    source=VoiceSource.STARTUP,
+                    topic=SpeechTopic.STARTUP,
+                    wait=False,
+                )
+            except Exception as e:
+                logger.debug(f"[STARTUP VOICE] UnifiedVoiceOrchestrator unavailable: {e}")
+
+            # Secondary fallback: legacy jarvis.voice speaker if orchestrator path is unavailable.
+            if not backend_spoken and self._jarvis_initialized and self.jarvis and hasattr(self.jarvis, "voice"):
+                try:
+                    logger.warning("[STARTUP VOICE] 🔊 Fallback to jarvis.voice.speak()")
                     await self.jarvis.voice.speak(greeting, priority=1)
+                    backend_spoken = True
+                except Exception as e:
+                    logger.debug(f"[STARTUP VOICE] jarvis.voice fallback failed: {e}")
+
+            # Frontend always gets transcript. It only speaks if backend speech failed.
+            if ws_manager:
+                logger.warning(
+                    "[STARTUP VOICE] 📡 Sending startup transcript via WebSocket (frontend_speak=%s)",
+                    not backend_spoken,
+                )
+                await ws_manager.broadcast(
+                    {
+                        "type": "command_response",
+                        "response": greeting,
+                        "command": "system_startup",
+                        "speak": not backend_spoken,
+                        "metadata": {
+                            "is_startup_greeting": True,
+                            "priority": "high",
+                            "spoken_by_backend": backend_spoken,
+                        },
+                    }
+                )
 
         except Exception as e:
             logger.error(f"[STARTUP] Error announcing startup: {e}")

@@ -4475,8 +4475,15 @@ class BenignWarningFilter(logging.Filter):
 
 # Install benign warning filter on noisy loggers
 _benign_filter = BenignWarningFilter()
-for _logger_name in ["speechbrain", "transformers", "transformers.modeling_utils"]:
+for _logger_name in [
+    "speechbrain",
+    "speechbrain.utils",
+    "speechbrain.utils.checkpoints",
+    "transformers",
+    "transformers.modeling_utils",
+]:
     logging.getLogger(_logger_name).addFilter(_benign_filter)
+logging.getLogger().addFilter(_benign_filter)
 
 
 # =============================================================================
