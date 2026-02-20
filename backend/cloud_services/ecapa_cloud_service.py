@@ -122,6 +122,76 @@ logging.basicConfig(
 logger = logging.getLogger("ecapa_cloud_service")
 
 
+def _parse_log_level(level_name: str, default: int) -> int:
+    """Parse a logging level name safely."""
+    level = getattr(logging, str(level_name).upper(), None)
+    return level if isinstance(level, int) else default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse common truthy/falsey environment values."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class _RegisteredCheckpointFilter(logging.Filter):
+    """Suppress SpeechBrain checkpoint hook registration noise."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "registered checkpoint" not in record.getMessage().lower()
+
+
+def _configure_third_party_log_noise() -> None:
+    """
+    Enforce deterministic third-party logging policy for ECAPA service.
+
+    This keeps SpeechBrain debug chatter from polluting startup/control-plane logs.
+    """
+    third_party_level = _parse_log_level(
+        os.getenv("JARVIS_THIRD_PARTY_LOG_LEVEL", "WARNING"),
+        logging.WARNING,
+    )
+    speechbrain_level = _parse_log_level(
+        os.getenv("JARVIS_SPEECHBRAIN_LOG_LEVEL", "ERROR"),
+        logging.ERROR,
+    )
+
+    noisy_loggers = (
+        "speechbrain",
+        "speechbrain.utils",
+        "speechbrain.utils.checkpoints",
+        "transformers",
+        "transformers.modeling_utils",
+        "huggingface_hub",
+    )
+
+    for logger_name in noisy_loggers:
+        noisy_logger = logging.getLogger(logger_name)
+        if logger_name.startswith("speechbrain"):
+            noisy_logger.setLevel(speechbrain_level)
+        else:
+            noisy_logger.setLevel(third_party_level)
+
+    if _env_flag("JARVIS_SUPPRESS_REGISTERED_CHECKPOINT_LOGS", True):
+        checkpoint_filter = _RegisteredCheckpointFilter()
+        for target_logger in (
+            logging.getLogger(),
+            logging.getLogger("speechbrain"),
+            logging.getLogger("speechbrain.utils"),
+            logging.getLogger("speechbrain.utils.checkpoints"),
+        ):
+            if checkpoint_filter not in target_logger.filters:
+                target_logger.addFilter(checkpoint_filter)
+        for handler in logging.getLogger().handlers:
+            if checkpoint_filter not in handler.filters:
+                handler.addFilter(checkpoint_filter)
+
+
+_configure_third_party_log_noise()
+
+
 # =============================================================================
 # PROCESS-ISOLATED MODEL LOADING (v21.0.0)
 # =============================================================================

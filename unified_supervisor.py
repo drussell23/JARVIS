@@ -2212,11 +2212,48 @@ warnings.filterwarnings("ignore", message=".*Wav2Vec2Model is frozen.*", categor
 warnings.filterwarnings("ignore", message=".*model is frozen.*", category=UserWarning)
 
 # Configure noisy loggers
-for _logger_name in [
-    "speechbrain", "speechbrain.utils.checkpoints", "transformers",
-    "transformers.modeling_utils", "urllib3", "asyncio",
-]:
-    logging.getLogger(_logger_name).setLevel(logging.ERROR)
+def _parse_log_level(level_name: str, default: int) -> int:
+    """Parse a logging level name safely."""
+    level = getattr(logging, str(level_name).upper(), None)
+    return level if isinstance(level, int) else default
+
+
+_NOISY_THIRD_PARTY_LOGGERS: Tuple[str, ...] = (
+    "speechbrain",
+    "speechbrain.utils",
+    "speechbrain.utils.checkpoints",
+    "transformers",
+    "transformers.modeling_utils",
+    "urllib3",
+    "asyncio",
+)
+
+
+def _configure_noisy_library_loggers() -> None:
+    """
+    Apply deterministic third-party logger policy.
+
+    This centralizes SpeechBrain/Transformers noise suppression and can be
+    re-applied after dotenv loading so .env overrides are honored.
+    """
+    third_party_level = _parse_log_level(
+        os.getenv("JARVIS_THIRD_PARTY_LOG_LEVEL", "WARNING"),
+        logging.WARNING,
+    )
+    speechbrain_level = _parse_log_level(
+        os.getenv("JARVIS_SPEECHBRAIN_LOG_LEVEL", "ERROR"),
+        logging.ERROR,
+    )
+
+    for _logger_name in _NOISY_THIRD_PARTY_LOGGERS:
+        _logger = logging.getLogger(_logger_name)
+        if _logger_name.startswith("speechbrain"):
+            _logger.setLevel(speechbrain_level)
+        else:
+            _logger.setLevel(third_party_level)
+
+
+_configure_noisy_library_loggers()
 
 # =============================================================================
 # ENVIRONMENT LOADING
@@ -2254,6 +2291,8 @@ def _load_environment_files() -> List[str]:
 
 # Load environment files immediately
 _loaded_env_files = _load_environment_files()
+# Re-apply after dotenv load so .env logger overrides are effective everywhere.
+_configure_noisy_library_loggers()
 
 
 # v236.2: Centralized subprocess environment builder.
@@ -2271,6 +2310,12 @@ _CRITICAL_ENV_KEYS = (
     "JARVIS_CLOUD_ML_ENDPOINT",
 )
 
+_LOGGING_ENV_DEFAULTS: Tuple[Tuple[str, str], ...] = (
+    ("JARVIS_THIRD_PARTY_LOG_LEVEL", "WARNING"),
+    ("JARVIS_SPEECHBRAIN_LOG_LEVEL", "ERROR"),
+    ("JARVIS_SUPPRESS_REGISTERED_CHECKPOINT_LOGS", "true"),
+)
+
 
 def _build_subprocess_env(**extra: str) -> Dict[str, str]:
     """Build environment dict for subprocess with authoritative dotenv values.
@@ -2284,6 +2329,10 @@ def _build_subprocess_env(**extra: str) -> Dict[str, str]:
         value = os.getenv(key, "")
         if value:
             env[key] = value
+    for key, fallback in _LOGGING_ENV_DEFAULTS:
+        env.setdefault(key, os.getenv(key, fallback))
+    if "SB_LOG_LEVEL" not in env:
+        env["SB_LOG_LEVEL"] = env.get("JARVIS_SPEECHBRAIN_LOG_LEVEL", "ERROR")
     env.update(extra)
     return env
 
@@ -4592,9 +4641,31 @@ class BenignWarningFilter(logging.Filter):
         return True
 
 
+def _install_filter_on_root_handlers(log_filter: logging.Filter) -> None:
+    """
+    Install filter on root logger and active root handlers.
+
+    Logger-level filters on parent loggers do not reliably affect child logger
+    records. Installing on handlers guarantees suppression at emit time.
+    """
+    _root_logger = logging.getLogger()
+    if log_filter not in _root_logger.filters:
+        _root_logger.addFilter(log_filter)
+    for _handler in _root_logger.handlers:
+        if log_filter not in _handler.filters:
+            _handler.addFilter(log_filter)
+
+
 # Install benign warning filter on noisy loggers
 _benign_filter = BenignWarningFilter()
-for _logger_name in ["speechbrain", "transformers", "transformers.modeling_utils"]:
+_install_filter_on_root_handlers(_benign_filter)
+for _logger_name in [
+    "speechbrain",
+    "speechbrain.utils",
+    "speechbrain.utils.checkpoints",
+    "transformers",
+    "transformers.modeling_utils",
+]:
     logging.getLogger(_logger_name).addFilter(_benign_filter)
 
 
@@ -4670,7 +4741,7 @@ class SecretRedactionFilter(logging.Filter):
 
 # Install secret redaction filter globally
 _secret_filter = SecretRedactionFilter()
-logging.getLogger().addFilter(_secret_filter)
+_install_filter_on_root_handlers(_secret_filter)
 
 
 # =============================================================================
@@ -62323,6 +62394,10 @@ class JarvisSystemKernel:
         try:
             log_handler = get_dashboard_log_handler()
             log_handler.set_dashboard(dashboard)
+            # Preserve global suppression/redaction guarantees for late handlers.
+            for _log_filter in (_benign_filter, _secret_filter):
+                if _log_filter not in log_handler.filters:
+                    log_handler.addFilter(_log_filter)
             # Add to root logger to capture all important logs
             logging.getLogger().addHandler(log_handler)
             # Also add to our main logger
