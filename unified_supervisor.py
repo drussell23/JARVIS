@@ -277,88 +277,6 @@ del _os, _sys, _Path, _ensure_venv_python
 
 
 # =============================================================================
-# EARLY RUNTIME PATH RESOLUTION (before heavy imports)
-# =============================================================================
-# Resolve writable runtime directories for lock/cache/log/state I/O before any
-# module-level imports that might touch filesystem paths.
-# =============================================================================
-import os as _runtime_os
-import tempfile as _runtime_tempfile
-from pathlib import Path as _RuntimePath
-
-
-def _is_writable_dir(path: _RuntimePath) -> bool:
-    """Check whether a directory can be created and written to."""
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        probe = path / f".jarvis_write_probe_{_runtime_os.getpid()}"
-        probe.write_text("ok")
-        probe.unlink(missing_ok=True)
-        return True
-    except Exception:
-        return False
-
-
-def _configure_runtime_paths() -> None:
-    """
-    Resolve canonical writable runtime directories for this process.
-
-    Candidate order:
-    1) Explicit JARVIS_HOME (if writable)
-    2) ~/.jarvis
-    3) <repo>/.jarvis_runtime
-    4) /tmp/jarvis_<uid>
-    """
-    script_dir = _RuntimePath(__file__).parent.resolve()
-    explicit_home = _runtime_os.environ.get("JARVIS_HOME", "").strip()
-
-    candidates = []
-    if explicit_home:
-        candidates.append(_RuntimePath(explicit_home).expanduser())
-    candidates.extend(
-        [
-            _RuntimePath.home() / ".jarvis",
-            _RuntimePath(_runtime_tempfile.gettempdir())
-            / f"jarvis_{getattr(_runtime_os, 'getuid', lambda: _runtime_os.getpid())()}",
-            script_dir / ".jarvis_runtime",
-        ]
-    )
-
-    runtime_home = None
-    for candidate in candidates:
-        if _is_writable_dir(candidate):
-            runtime_home = candidate
-            break
-
-    if runtime_home is None:
-        runtime_home = _RuntimePath(_runtime_tempfile.gettempdir()) / "jarvis_fallback"
-        runtime_home.mkdir(parents=True, exist_ok=True)
-
-    lock_dir = runtime_home / "locks"
-    cache_dir = runtime_home / "cache"
-    log_dir = runtime_home / "logs"
-    cross_repo_dir = runtime_home / "cross_repo"
-    trinity_readiness_dir = runtime_home / "trinity" / "readiness"
-
-    for path in (lock_dir, cache_dir, log_dir, cross_repo_dir, trinity_readiness_dir):
-        path.mkdir(parents=True, exist_ok=True)
-
-    # Export resolved runtime paths so imported modules use the same roots.
-    _runtime_os.environ["JARVIS_HOME"] = str(runtime_home)
-    _runtime_os.environ["JARVIS_LOCK_DIR"] = str(lock_dir)
-    _runtime_os.environ["JARVIS_CACHE_DIR"] = str(cache_dir)
-    _runtime_os.environ["JARVIS_LOG_DIR"] = str(log_dir)
-    _runtime_os.environ["JARVIS_CROSS_REPO_DIR"] = str(cross_repo_dir)
-    _runtime_os.environ["JARVIS_TRINITY_DIR"] = str(trinity_readiness_dir)
-
-
-_configure_runtime_paths()
-
-# Clean up bootstrap-only imports.
-del _runtime_os, _runtime_tempfile, _RuntimePath, _is_writable_dir, _configure_runtime_paths
-
-
-# =============================================================================
 # FAST EARLY-EXIT FOR RUNNING KERNEL
 # =============================================================================
 # Check runs BEFORE heavy imports (PyTorch, transformers, GCP libs).
@@ -387,14 +305,11 @@ def _fast_kernel_check() -> bool:
     if any(flag in _sys.argv for flag in action_flags):
         return False  # Need full initialization
 
-    # Check if IPC socket exists in resolved lock directory.
-    lock_dir = _Path(
-        _os.environ.get("JARVIS_LOCK_DIR", str(_Path.home() / ".jarvis" / "locks"))
-    ).expanduser()
-    sock_path = lock_dir / "kernel.sock"
+    # Check if IPC socket exists
+    sock_path = _Path.home() / ".jarvis" / "locks" / "kernel.sock"
     if not sock_path.exists():
         # Try legacy path
-        sock_path = lock_dir / "supervisor.sock"
+        sock_path = _Path.home() / ".jarvis" / "locks" / "supervisor.sock"
         if not sock_path.exists():
             return False  # No kernel running
 
@@ -1663,10 +1578,10 @@ KERNEL_NAME = "JARVIS Unified System Kernel"
 # Default paths (dynamically resolved at runtime)
 PROJECT_ROOT = Path(__file__).parent.resolve()
 BACKEND_DIR = PROJECT_ROOT / "backend"
-JARVIS_HOME = Path(os.getenv("JARVIS_HOME", str(Path.home() / ".jarvis"))).expanduser()
-LOCKS_DIR = Path(os.getenv("JARVIS_LOCK_DIR", str(JARVIS_HOME / "locks"))).expanduser()
-CACHE_DIR = Path(os.getenv("JARVIS_CACHE_DIR", str(JARVIS_HOME / "cache"))).expanduser()
-LOGS_DIR = Path(os.getenv("JARVIS_LOG_DIR", str(JARVIS_HOME / "logs"))).expanduser()
+JARVIS_HOME = Path.home() / ".jarvis"
+LOCKS_DIR = JARVIS_HOME / "locks"
+CACHE_DIR = JARVIS_HOME / "cache"
+LOGS_DIR = JARVIS_HOME / "logs"
 
 # IPC socket paths
 KERNEL_SOCKET_PATH = LOCKS_DIR / "kernel.sock"
@@ -2212,48 +2127,11 @@ warnings.filterwarnings("ignore", message=".*Wav2Vec2Model is frozen.*", categor
 warnings.filterwarnings("ignore", message=".*model is frozen.*", category=UserWarning)
 
 # Configure noisy loggers
-def _parse_log_level(level_name: str, default: int) -> int:
-    """Parse a logging level name safely."""
-    level = getattr(logging, str(level_name).upper(), None)
-    return level if isinstance(level, int) else default
-
-
-_NOISY_THIRD_PARTY_LOGGERS: Tuple[str, ...] = (
-    "speechbrain",
-    "speechbrain.utils",
-    "speechbrain.utils.checkpoints",
-    "transformers",
-    "transformers.modeling_utils",
-    "urllib3",
-    "asyncio",
-)
-
-
-def _configure_noisy_library_loggers() -> None:
-    """
-    Apply deterministic third-party logger policy.
-
-    This centralizes SpeechBrain/Transformers noise suppression and can be
-    re-applied after dotenv loading so .env overrides are honored.
-    """
-    third_party_level = _parse_log_level(
-        os.getenv("JARVIS_THIRD_PARTY_LOG_LEVEL", "WARNING"),
-        logging.WARNING,
-    )
-    speechbrain_level = _parse_log_level(
-        os.getenv("JARVIS_SPEECHBRAIN_LOG_LEVEL", "ERROR"),
-        logging.ERROR,
-    )
-
-    for _logger_name in _NOISY_THIRD_PARTY_LOGGERS:
-        _logger = logging.getLogger(_logger_name)
-        if _logger_name.startswith("speechbrain"):
-            _logger.setLevel(speechbrain_level)
-        else:
-            _logger.setLevel(third_party_level)
-
-
-_configure_noisy_library_loggers()
+for _logger_name in [
+    "speechbrain", "speechbrain.utils.checkpoints", "transformers",
+    "transformers.modeling_utils", "urllib3", "asyncio",
+]:
+    logging.getLogger(_logger_name).setLevel(logging.ERROR)
 
 # =============================================================================
 # ENVIRONMENT LOADING
@@ -2273,12 +2151,10 @@ def _load_environment_files() -> List[str]:
         return []
 
     loaded = []
-    # v236.2: Load order matters — less specific first, root .env LAST.
-    # With override=True, last-loaded wins. Root .env is authoritative source of truth.
     env_files = [
+        PROJECT_ROOT / ".env",
         PROJECT_ROOT / "backend" / ".env",
         PROJECT_ROOT / ".env.gcp",
-        PROJECT_ROOT / ".env",  # Root .env always wins (loaded last)
     ]
 
     for env_file in env_files:
@@ -2291,50 +2167,6 @@ def _load_environment_files() -> List[str]:
 
 # Load environment files immediately
 _loaded_env_files = _load_environment_files()
-# Re-apply after dotenv load so .env logger overrides are effective everywhere.
-_configure_noisy_library_loggers()
-
-
-# v236.2: Centralized subprocess environment builder.
-# Ensures all subprocess launches inherit dotenv-loaded credentials,
-# not stale shell environment variables.
-_CRITICAL_ENV_KEYS = (
-    "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_SEARCH_API_KEY",
-    "BRAVE_SEARCH_API_KEY",
-    "GITHUB_TOKEN",
-    "LANGFUSE_SECRET_KEY",
-    "LANGFUSE_PUBLIC_KEY",
-    "JARVIS_PRIME_CLOUD_RUN_URL",
-    "JARVIS_CLOUD_ML_ENDPOINT",
-)
-
-_LOGGING_ENV_DEFAULTS: Tuple[Tuple[str, str], ...] = (
-    ("JARVIS_THIRD_PARTY_LOG_LEVEL", "WARNING"),
-    ("JARVIS_SPEECHBRAIN_LOG_LEVEL", "ERROR"),
-    ("JARVIS_SUPPRESS_REGISTERED_CHECKPOINT_LOGS", "true"),
-)
-
-
-def _build_subprocess_env(**extra: str) -> Dict[str, str]:
-    """Build environment dict for subprocess with authoritative dotenv values.
-
-    Starts from os.environ (which has dotenv-loaded values after module init),
-    then ensures critical keys are explicitly set from the current process env
-    (which was loaded via _load_environment_files with correct override order).
-    """
-    env = os.environ.copy()
-    for key in _CRITICAL_ENV_KEYS:
-        value = os.getenv(key, "")
-        if value:
-            env[key] = value
-    for key, fallback in _LOGGING_ENV_DEFAULTS:
-        env.setdefault(key, os.getenv(key, fallback))
-    if "SB_LOG_LEVEL" not in env:
-        env["SB_LOG_LEVEL"] = env.get("JARVIS_SPEECHBRAIN_LOG_LEVEL", "ERROR")
-    env.update(extra)
-    return env
 
 
 # =============================================================================
@@ -3273,8 +3105,8 @@ class UnifiedLogger:
         _sink = self._external_metrics_sink
         if _sink is not None:
             try:
-                _record = getattr(_sink, 'record_histogram', None)
-                if callable(_record) and not asyncio.iscoroutinefunction(_record):
+                _record = getattr(_sink, 'record_histogram', None) or getattr(_sink, 'record_metric', None)
+                if callable(_record):
                     _record(f"phase.{phase_name}.duration_ms", duration)
             except Exception:
                 pass
@@ -4641,31 +4473,9 @@ class BenignWarningFilter(logging.Filter):
         return True
 
 
-def _install_filter_on_root_handlers(log_filter: logging.Filter) -> None:
-    """
-    Install filter on root logger and active root handlers.
-
-    Logger-level filters on parent loggers do not reliably affect child logger
-    records. Installing on handlers guarantees suppression at emit time.
-    """
-    _root_logger = logging.getLogger()
-    if log_filter not in _root_logger.filters:
-        _root_logger.addFilter(log_filter)
-    for _handler in _root_logger.handlers:
-        if log_filter not in _handler.filters:
-            _handler.addFilter(log_filter)
-
-
 # Install benign warning filter on noisy loggers
 _benign_filter = BenignWarningFilter()
-_install_filter_on_root_handlers(_benign_filter)
-for _logger_name in [
-    "speechbrain",
-    "speechbrain.utils",
-    "speechbrain.utils.checkpoints",
-    "transformers",
-    "transformers.modeling_utils",
-]:
+for _logger_name in ["speechbrain", "transformers", "transformers.modeling_utils"]:
     logging.getLogger(_logger_name).addFilter(_benign_filter)
 
 
@@ -4741,7 +4551,7 @@ class SecretRedactionFilter(logging.Filter):
 
 # Install secret redaction filter globally
 _secret_filter = SecretRedactionFilter()
-_install_filter_on_root_handlers(_secret_filter)
+logging.getLogger().addFilter(_secret_filter)
 
 
 # =============================================================================
@@ -8938,49 +8748,28 @@ class SmartWatchdog:
 
 
 # =============================================================================
-# v239.0: SYSTEM SERVICE ABC — Forward declaration for CostTracker et al.
-# (Full SystemServiceRegistry remains at its original location below.)
+# COST TRACKER
 # =============================================================================
-
 class SystemService(ABC):
-    """Uniform lifecycle contract for all system services.
+    """Uniform lifecycle contract for system services.
 
-    Every service activated via the SystemServiceRegistry MUST implement
-    these three methods.  Classes that already have start()/stop() or
-    initialize()/cleanup() should add thin wrappers that delegate.
+    Declared before service subclasses so class inheritance resolution is
+    deterministic at import time.
     """
 
     @abstractmethod
     async def initialize(self) -> None:
-        """Set up resources.  Called once during activation."""
+        """Set up resources. Called once during activation."""
 
     @abstractmethod
     async def health_check(self) -> Tuple[bool, str]:
-        """Return (healthy, message).  Called periodically by the registry."""
+        """Return (healthy, message). Called periodically by registries."""
 
     @abstractmethod
     async def cleanup(self) -> None:
-        """Release resources.  Called during shutdown."""
+        """Release resources. Called during shutdown."""
 
 
-@dataclass
-class ServiceDescriptor:
-    """Metadata for a single service managed by the registry."""
-    name: str
-    service: 'SystemService'
-    phase: int                                        # startup phase (1-9)
-    depends_on: List[str] = field(default_factory=list)
-    enabled_env: Optional[str] = None                 # per-service kill-switch
-    initialized: bool = False
-    healthy: bool = True
-    error: Optional[str] = None
-    init_time_ms: float = 0.0
-    memory_delta_mb: float = 0.0
-
-
-# =============================================================================
-# COST TRACKER
-# =============================================================================
 class CostTracker(ResourceManagerBase, SystemService):
     """
     Enterprise-grade cost tracking for cloud resources.
@@ -10180,7 +9969,7 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
         # v239.0 Wire 3: L1/L2 fast path via CacheHierarchyManager (< 1ms)
         _hcache = getattr(self, '_hierarchy_cache', None)
         if _hcache is not None:
-            _key = f"voice:{speaker_filter or 'any'}:{hashlib.sha256(repr(embedding).encode()).hexdigest()[:16]}"
+            _key = f"voice:{speaker_filter or 'any'}:{hash(tuple(embedding[:8]))}"
             try:
                 _get = getattr(_hcache, 'get', None)
                 _cached = await _get(_key) if callable(_get) and asyncio.iscoroutinefunction(_get) else (_get(_key) if callable(_get) else None)
@@ -10288,7 +10077,7 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
             # v239.0 Wire 3: write-through to L1/L2 CacheHierarchyManager
             _hcache = getattr(self, '_hierarchy_cache', None)
             if _hcache is not None:
-                _key = f"voice:{speaker_name}:{hashlib.sha256(repr(embedding).encode()).hexdigest()[:16]}"
+                _key = f"voice:{speaker_name}:{hash(tuple(embedding[:8]))}"
                 _result = {
                     "cached": True,
                     "similarity": 1.0,
@@ -10820,15 +10609,31 @@ class ResourceManagerRegistry:
 
 # =============================================================================
 # v239.0: SYSTEM SERVICE REGISTRY — Uniform lifecycle for dead-code activation
-# NOTE: SystemService ABC + ServiceDescriptor are forward-declared before
-#       CostTracker (line ~8750) to resolve class ordering dependency.
 # =============================================================================
+# NOTE: `SystemService` is declared earlier (before first subclass) to avoid
+# import-time base-class NameError from class ordering.
+
+
+@dataclass
+class ServiceDescriptor:
+    """Metadata for a single service managed by the registry."""
+    name: str
+    service: SystemService
+    phase: int                                        # startup phase (1-8)
+    depends_on: List[str] = field(default_factory=list)
+    enabled_env: Optional[str] = None                 # per-service kill-switch
+    initialized: bool = False
+    healthy: bool = True
+    error: Optional[str] = None
+    init_time_ms: float = 0.0
+    memory_delta_mb: float = 0.0
+
 
 class SystemServiceRegistry:
     """Manages lifecycle of system services in dependency-ordered waves.
 
     Services are grouped by startup *phase* (matching JarvisSystemKernel
-    phases 1-9).  Within a phase, services are topologically sorted by
+    phases 1-8).  Within a phase, services are topologically sorted by
     their ``depends_on`` list so that dependencies initialise first.
 
     Key guarantees
@@ -13086,13 +12891,7 @@ class AsyncVoiceNarrator:
         if not self.enabled:
             return
 
-        # v266.0: Respect wait=False as truly non-blocking.
-        # Historically wait=False still awaited _speak_internal(), which blocked
-        # startup phase transitions and made loading-page progress look stalled.
-        # Queueing here keeps startup responsive while preserving serialization.
-        if queue or not wait:
-            if self._queue_processor_task is None or self._queue_processor_task.done():
-                await self.start_queue_processor()
+        if queue:
             await self._queue.put((priority.value, time.time(), text))
             return
 
@@ -13119,60 +12918,6 @@ class AsyncVoiceNarrator:
         except Exception:
             pass
         return self._speech_lock
-
-    async def _route_to_unified_voice_orchestrator(
-        self,
-        text: str,
-        *,
-        wait: bool,
-        priority: VoicePriority,
-    ) -> bool:
-        """
-        Route narration through UnifiedVoiceOrchestrator when available.
-
-        This creates a single startup speech authority across supervisor,
-        startup narrator, and cross-repo announcers, reducing duplicate/
-        overlapping startup speech paths.
-        """
-        try:
-            from backend.core.supervisor.unified_voice_orchestrator import (
-                get_voice_orchestrator,
-                SpeechTopic as _UVOSpeechTopic,
-                VoicePriority as _UVOPriority,
-                VoiceSource as _UVOSource,
-            )
-
-            orchestrator = get_voice_orchestrator()
-            if orchestrator is None:
-                return False
-
-            if not getattr(orchestrator, "_running", False):
-                await orchestrator.start()
-
-            priority_map = {
-                VoicePriority.CRITICAL: _UVOPriority.CRITICAL,
-                VoicePriority.HIGH: _UVOPriority.HIGH,
-                VoicePriority.MEDIUM: _UVOPriority.MEDIUM,
-                VoicePriority.LOW: _UVOPriority.LOW,
-            }
-
-            accepted = await orchestrator.speak(
-                text=text,
-                priority=priority_map.get(priority, _UVOPriority.MEDIUM),
-                source=_UVOSource.STARTUP,
-                wait=wait,
-                metadata={"path": "async_voice_narrator"},
-                topic=_UVOSpeechTopic.STARTUP,
-            )
-            if accepted:
-                self._messages_spoken += 1
-                self._last_spoken_text = text
-                self._last_spoken_time = time.time()
-            else:
-                self._messages_skipped += 1
-            return True
-        except Exception:
-            return False
 
     async def _speak_internal(
         self,
@@ -13205,15 +12950,6 @@ class AsyncVoiceNarrator:
             (now - self._last_spoken_time) < self._duplicate_prevention_window):
             _unified_logger.debug(f"[Voice] Skipping duplicate message: {text[:50]}...")
             self._messages_deduplicated += 1
-            return
-
-        # v266.0: Prefer unified orchestrator path to keep one startup voice
-        # authority. Fallback to legacy direct path only if unavailable.
-        if await self._route_to_unified_voice_orchestrator(
-            text,
-            wait=wait,
-            priority=priority,
-        ):
             return
 
         # v251.5: Share lock with the orchestrator to prevent concurrent say
@@ -13260,53 +12996,20 @@ class AsyncVoiceNarrator:
             self._last_spoken_text = text
             self._last_spoken_time = now
 
-            # v236.5: AudioBus-aware TTS routing to prevent device contention.
-            #
-            # When FullDuplexDevice HOLDS the audio device (bus.is_running),
-            # raw `say` opens a second CoreAudio stream → static / mixing.
-            # Route through UnifiedTTSEngine which uses `say -o <file>`
-            # (writes to disk) then plays via AudioBus (single stream).
-            #
-            # When AudioBus is NOT running (failed / not started), the device
-            # is free — raw `say` is safe and preferred (no TTS init overhead).
-            _device_held = False
-            try:
-                from backend.audio.audio_bus import AudioBus as _ABProbe
-                _probe_bus = _ABProbe.get_instance_safe()
-                _device_held = _probe_bus is not None and _probe_bus.is_running
-            except ImportError:
-                pass
+            self._process = await asyncio.create_subprocess_exec(
+                "say",
+                "-v", self.voice,
+                "-r", str(self.rate),
+                text,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
 
-            _used_audiobus_tts = False
-            if _device_held:
-                # FullDuplexDevice holds audio device — must route via TTS engine
-                try:
-                    from backend.voice.engines.unified_tts_engine import get_tts_engine
-                    tts = await asyncio.wait_for(get_tts_engine(), timeout=5.0)
-                    await asyncio.wait_for(tts.speak(text, play_audio=True), timeout=30.0)
-                    _used_audiobus_tts = True
-                except Exception as tts_err:
-                    # Device is held but TTS failed — skip speech entirely
-                    # rather than cause static with raw `say`.
-                    _unified_logger.warning(
-                        f"[Voice v236.5] AudioBus TTS failed while device held: "
-                        f"{tts_err} — skipping speech"
-                    )
-                    _used_audiobus_tts = True  # prevent raw say fallback
-
-            if not _used_audiobus_tts:
-                # Device is free — raw `say` is safe (no contention)
-                self._process = await asyncio.create_subprocess_exec(
-                    "say",
-                    "-v", self.voice,
-                    "-r", str(self.rate),
-                    text,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await asyncio.wait_for(
-                    self._process.communicate(), timeout=30.0
-                )
+            if wait:
+                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
+            else:
+                # Fire and forget for non-blocking, but still hold lock during speech
+                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
 
             self._messages_spoken += 1
 
@@ -55257,16 +54960,9 @@ class StartupWatchdog:
     # Environment overrides: JARVIS_DMS_TIMEOUT_<PHASE>=<seconds>
     # v210.0: Added 'two_tier' phase for VBIA/Watchdog initialization
     DEFAULT_PHASES: Dict[str, PhaseConfig] = {
-        # v236.2: Increased from 30→60s. Clean slate performs lock cleanup (5s timeout),
-        # IPC timeout (5s), handover timeout (30s) — minimum 40s sequential. 60s gives buffer.
-        "clean_slate": PhaseConfig("Clean Slate", 60.0, 0, 5, "diagnostic"),
-        # v236.2: Increased from 45→75s. Chrome startup + loading server health can take 50-60s
-        # on cold start (Chrome profile init, extension loads). Recovery changed to diagnostic
-        # since restarting the loading server mid-launch just adds latency.
-        "loading_server": PhaseConfig("Loading Server", 75.0, 5, 15, "diagnostic"),
-        # v236.2: Increased from 60→90s. Preflight includes kernel takeover (30s handover
-        # timeout), service registry cleanup, IPC init — 60s was borderline under load.
-        "preflight": PhaseConfig("Preflight", 90.0, 15, 25, "diagnostic"),
+        "clean_slate": PhaseConfig("Clean Slate", 30.0, 0, 5, "diagnostic"),
+        "loading_server": PhaseConfig("Loading Server", 45.0, 5, 15, "restart"),
+        "preflight": PhaseConfig("Preflight", 60.0, 15, 25, "diagnostic"),
         # v192.0: Resources timeout synced with JARVIS_RESOURCE_TIMEOUT (default 300s + 30s buffer)
         "resources": PhaseConfig("Resources", 330.0, 25, 45, "restart"),
         # v232.1: Backend recovery changed from "restart" to "diagnostic".
@@ -55294,10 +54990,7 @@ class StartupWatchdog:
         "visual_pipeline": PhaseConfig("Visual Pipeline", 60.0, 90, 93, "diagnostic"),
         # v236.1: frontend progress_start fixed from 85→90 to avoid overlap with agi_os
         # v250.0: frontend progress_start adjusted from 90→93 for visual_pipeline phase
-        # v236.2: Increased from 60→150s (outer warmup timeout is 120s + 30s buffer).
-        # Recovery changed from "rollback" to "diagnostic" — frontend is non-critical,
-        # rolling back the entire system because React startup is slow is destructive.
-        "frontend": PhaseConfig("Frontend", 150.0, 93, 100, "diagnostic"),
+        "frontend": PhaseConfig("Frontend", 60.0, 93, 100, "rollback"),
     }
     
     def __init__(
@@ -57351,12 +57044,10 @@ class TrinityIntegrator:
 
         try:
             # Start process with Trinity environment
-            # v236.2: Use centralized env builder for authoritative credential propagation
-            env = _build_subprocess_env(
-                TRINITY_COMPONENT=component.name,
-                TRINITY_PORT=str(component.port),
-                TRINITY_ENABLED="true",
-            )
+            env = os.environ.copy()
+            env["TRINITY_COMPONENT"] = component.name
+            env["TRINITY_PORT"] = str(component.port)
+            env["TRINITY_ENABLED"] = "true"
 
             # v216.0: jarvis-prime specific optimizations
             # These enable local ML on hardware with <32GB RAM (e.g., 16GB MacBooks)
@@ -60119,7 +59810,7 @@ class JarvisSystemKernel:
         _r(ServiceDescriptor(
             name="cost_tracker",
             service=CostTracker(
-                config=self.config if hasattr(self, "config") else None,
+                config=self._config if hasattr(self, "_config") else None,
             ),
             phase=2,
             enabled_env="JARVIS_SERVICE_COST_ENABLED",
@@ -60192,253 +59883,7 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_DEGRADATION_ENABLED",
         ))
 
-        # Phase 8 (Self-Healing) ─ health prediction, remediation, load shedding
-        _r(ServiceDescriptor(
-            name="process_health_predictor",
-            service=_ProcessHealthPredictorAdapter(
-                window_size=int(os.getenv("JARVIS_HEALTH_PREDICTOR_WINDOW", "100")),
-                ewma_alpha=float(os.getenv("JARVIS_HEALTH_PREDICTOR_ALPHA", "0.3")),
-                anomaly_threshold=float(os.getenv("JARVIS_HEALTH_PREDICTOR_ANOMALY", "2.5")),
-            ),
-            phase=8,
-            depends_on=["health_aggregator"],
-            enabled_env="JARVIS_SERVICE_HEALTH_PREDICTOR_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="self_healing_orchestrator",
-            service=_SelfHealingAdapter(
-                max_remediation_attempts=int(os.getenv("JARVIS_SELF_HEAL_MAX_ATTEMPTS", "3")),
-                cooldown_seconds=float(os.getenv("JARVIS_SELF_HEAL_COOLDOWN", "60")),
-            ),
-            phase=8,
-            depends_on=["process_health_predictor", "health_aggregator"],
-            enabled_env="JARVIS_SERVICE_SELF_HEALING_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="load_shedding_controller",
-            service=_LoadSheddingAdapter(
-                max_load=float(os.getenv("JARVIS_LOAD_SHED_MAX", "100")),
-                recovery_threshold=float(os.getenv("JARVIS_LOAD_SHED_RECOVERY", "70")),
-                measurement_window=float(os.getenv("JARVIS_LOAD_SHED_WINDOW", "60")),
-            ),
-            phase=8,
-            depends_on=["health_aggregator"],
-            enabled_env="JARVIS_SERVICE_LOAD_SHEDDING_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="workload_balancer",
-            service=_WorkloadBalancerAdapter(
-                health_check_interval=float(os.getenv("JARVIS_BALANCER_INTERVAL", "10")),
-            ),
-            phase=8,
-            depends_on=["health_aggregator", "load_shedding_controller"],
-            enabled_env="JARVIS_SERVICE_BALANCER_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="trinity_health_monitor",
-            service=_TrinityHealthMonitorAdapter(
-                heartbeat_interval=float(os.getenv("JARVIS_TRINITY_HEARTBEAT", "15")),
-                failure_threshold=int(os.getenv("JARVIS_TRINITY_FAILURE_THRESHOLD", "3")),
-                recovery_cooldown=float(os.getenv("JARVIS_TRINITY_RECOVERY_COOLDOWN", "60")),
-            ),
-            phase=8,
-            depends_on=["health_aggregator", "self_healing_orchestrator"],
-            enabled_env="JARVIS_SERVICE_TRINITY_HEALTH_ENABLED",
-        ))
-
-        # Phase 9 (Cross-Repo Intelligence) ─ IPC, state, orchestration, flywheel
-        _r(ServiceDescriptor(
-            name="ipc_hub",
-            service=_TrinityIPCHubAdapter(
-                ipc_dir=Path(os.getenv("JARVIS_IPC_DIR", str(Path.home() / ".jarvis" / "trinity" / "ipc"))),
-                enable_persistence=os.getenv("JARVIS_IPC_PERSIST", "true").lower() in ("true", "1"),
-                message_ttl_seconds=float(os.getenv("JARVIS_IPC_TTL", "3600")),
-            ),
-            phase=9,
-            depends_on=["message_broker", "health_aggregator"],
-            enabled_env="JARVIS_SERVICE_IPC_HUB_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="distributed_state",
-            service=_DistributedStateAdapter(
-                component_name="jarvis_supervisor",
-                state_dir=Path(os.getenv("JARVIS_STATE_DIR", str(Path.home() / ".jarvis" / "trinity" / "state"))),
-                sync_interval=float(os.getenv("JARVIS_STATE_SYNC_INTERVAL", "5")),
-            ),
-            phase=9,
-            depends_on=["ipc_hub", "event_sourcing"],
-            enabled_env="JARVIS_SERVICE_DISTRIBUTED_STATE_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="trinity_orchestration",
-            service=_TrinityOrchAdapter(
-                cluster_dir=Path(os.getenv("JARVIS_CLUSTER_DIR", str(Path.home() / ".jarvis" / "trinity" / "orchestration"))),
-                election_timeout_range=(5.0, 10.0),
-                heartbeat_interval=2.0,
-            ),
-            phase=9,
-            depends_on=["ipc_hub", "distributed_state"],
-            enabled_env="JARVIS_SERVICE_TRINITY_ORCH_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="data_flywheel",
-            service=_DataFlywheelAdapter(
-                experience_dir=Path(os.getenv("JARVIS_FLYWHEEL_DIR", str(Path.home() / ".jarvis" / "flywheel"))),
-                batch_size=int(os.getenv("JARVIS_FLYWHEEL_BATCH", "100")),
-                flush_interval=float(os.getenv("JARVIS_FLYWHEEL_FLUSH", "300")),
-                min_quality_score=float(os.getenv("JARVIS_FLYWHEEL_MIN_QUALITY", "0.7")),
-            ),
-            phase=9,
-            depends_on=["event_sourcing", "ipc_hub"],
-            enabled_env="JARVIS_SERVICE_FLYWHEEL_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="experience_forwarder",
-            service=_ExperienceForwarderAdapter(
-                reactor_core_url=os.getenv("JARVIS_REACTOR_CORE_URL"),
-                batch_size=int(os.getenv("JARVIS_FORWARDER_BATCH", "50")),
-                flush_interval=float(os.getenv("JARVIS_FORWARDER_FLUSH", "60")),
-                max_retries=int(os.getenv("JARVIS_FORWARDER_RETRIES", "3")),
-                fallback_dir=Path(os.getenv("JARVIS_FORWARDER_FALLBACK", str(Path.home() / ".jarvis" / "forwarder_fallback"))),
-            ),
-            phase=9,
-            depends_on=["data_flywheel", "event_sourcing"],
-            enabled_env="JARVIS_SERVICE_FORWARDER_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="training_orchestrator",
-            service=_TrainingOrchestratorAdapter(
-                reactor_core_url=os.getenv("JARVIS_REACTOR_CORE_URL"),
-                min_training_samples=int(os.getenv("JARVIS_TRAINING_MIN_SAMPLES", "1000")),
-                evaluation_split=float(os.getenv("JARVIS_TRAINING_EVAL_SPLIT", "0.1")),
-            ),
-            phase=9,
-            depends_on=["experience_forwarder", "data_flywheel"],
-            enabled_env="JARVIS_SERVICE_TRAINING_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="collective_ai",
-            service=_CollectiveAIAdapter(),
-            phase=9,
-            depends_on=["ipc_hub", "event_sourcing", "trinity_health_monitor"],
-            enabled_env="JARVIS_SERVICE_COLLECTIVE_AI_ENABLED",
-        ))
-
-        # ── v4 Phase 10: Infrastructure & Security ──────────────────────
-        _r(ServiceDescriptor(
-            name="connection_pool_manager",
-            service=_ConnectionPoolManagerAdapter(),
-            phase=10,
-            depends_on=[],
-            enabled_env="JARVIS_SERVICE_CONN_POOL_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="secret_vault",
-            service=_SecretVaultAdapter(
-                encryption_key=os.getenv("JARVIS_SECRET_VAULT_KEY", "").encode() or None,
-                rotation_check_interval=float(os.getenv("JARVIS_VAULT_ROTATION_INTERVAL", "60")),
-            ),
-            phase=10,
-            depends_on=[],
-            enabled_env="JARVIS_SERVICE_SECRET_VAULT_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="batch_processor",
-            service=_BatchProcessorAdapter(
-                default_batch_size=int(os.getenv("JARVIS_BATCH_SIZE", "100")),
-                max_concurrency=int(os.getenv("JARVIS_BATCH_CONCURRENCY", "10")),
-            ),
-            phase=10,
-            depends_on=[],
-            enabled_env="JARVIS_SERVICE_BATCH_PROC_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="performance_profiler",
-            service=_PerformanceProfilerAdapter(config=self.config),
-            phase=10,
-            depends_on=[],
-            enabled_env="JARVIS_SERVICE_PROFILER_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="service_mesh_router",
-            service=_ServiceMeshRouterAdapter(
-                default_timeout_ms=float(os.getenv("JARVIS_MESH_TIMEOUT_MS", "30000")),
-                health_check_interval=float(os.getenv("JARVIS_MESH_HEALTH_INTERVAL", "10")),
-                unhealthy_threshold=int(os.getenv("JARVIS_MESH_UNHEALTHY_THRESHOLD", "3")),
-                healthy_threshold=int(os.getenv("JARVIS_MESH_HEALTHY_THRESHOLD", "2")),
-            ),
-            phase=10,
-            depends_on=["health_aggregator"],
-            enabled_env="JARVIS_SERVICE_MESH_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="cron_scheduler",
-            service=_CronSchedulerAdapter(
-                max_concurrent_jobs=int(os.getenv("JARVIS_CRON_MAX_CONCURRENT", "10")),
-            ),
-            phase=10,
-            depends_on=[],
-            enabled_env="JARVIS_SERVICE_CRON_ENABLED",
-        ))
-
-        # ── v4 Phase 11: Operational Intelligence ───────────────────────
-        _r(ServiceDescriptor(
-            name="cache_invalidation",
-            service=_CacheInvalidationAdapter(),
-            phase=11,
-            depends_on=["cache_hierarchy"],
-            enabled_env="JARVIS_SERVICE_CACHE_INVAL_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="resource_cleanup",
-            service=_ResourceCleanupAdapter(
-                default_timeout=float(os.getenv("JARVIS_CLEANUP_TIMEOUT", "30")),
-            ),
-            phase=11,
-            depends_on=[],
-            enabled_env="JARVIS_SERVICE_CLEANUP_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="health_check_orchestrator",
-            service=_HealthCheckOrchestratorAdapter(
-                check_interval=float(os.getenv("JARVIS_HEALTH_ORCH_INTERVAL", "30")),
-            ),
-            phase=11,
-            depends_on=["health_aggregator"],
-            enabled_env="JARVIS_SERVICE_HEALTH_ORCH_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="anomaly_detector",
-            service=_AnomalyDetectorAdapter(config=self.config),
-            phase=11,
-            depends_on=["health_aggregator"],
-            enabled_env="JARVIS_SERVICE_ANOMALY_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="alerting_manager",
-            service=_AlertingManagerAdapter(config=self.config),
-            phase=11,
-            depends_on=["health_aggregator", "anomaly_detector"],
-            enabled_env="JARVIS_SERVICE_ALERTING_ENABLED",
-        ))
-        _r(ServiceDescriptor(
-            name="auto_scaling_controller",
-            service=_AutoScalingControllerAdapter(
-                min_replicas=int(os.getenv("JARVIS_AUTOSCALE_MIN", "1")),
-                max_replicas=int(os.getenv("JARVIS_AUTOSCALE_MAX", "10")),
-                target_cpu_percent=float(os.getenv("JARVIS_AUTOSCALE_CPU_TARGET", "70")),
-                target_memory_percent=float(os.getenv("JARVIS_AUTOSCALE_MEM_TARGET", "80")),
-                scale_up_cooldown=float(os.getenv("JARVIS_AUTOSCALE_UP_COOLDOWN", "60")),
-                scale_down_cooldown=float(os.getenv("JARVIS_AUTOSCALE_DOWN_COOLDOWN", "300")),
-                scale_to_zero_enabled=os.getenv("JARVIS_AUTOSCALE_TO_ZERO", "false").lower() == "true",
-                scale_to_zero_idle_seconds=float(os.getenv("JARVIS_AUTOSCALE_IDLE_SECS", "600")),
-            ),
-            phase=11,
-            depends_on=["load_shedding_controller"],
-            enabled_env="JARVIS_SERVICE_AUTOSCALE_ENABLED",
-        ))
-
-        logger.info("[Kernel] Service registry: 34 services registered across phases 1-5, 8-11")
+        logger.info("[Kernel] Service registry: 10 services registered across phases 1-5")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
@@ -60580,11 +60025,6 @@ class JarvisSystemKernel:
         except Exception as e:
             self.logger.debug(f"[InvincibleNode] Trinity event sync failed: {e}")
 
-        # v236.0: Propagate vision server endpoint (LLaVA on port 8001)
-        _vision_port = os.getenv("JARVIS_PRIME_VISION_PORT", "8001")
-        os.environ["JARVIS_PRIME_VISION_URL"] = f"http://{node_ip}:{_vision_port}"
-        os.environ["JARVIS_PRIME_VISION_PORT"] = _vision_port
-
     async def _notify_prime_router_of_gcp(self, host: str, port: int) -> None:
         """v232.0: Notify PrimeRouter that GCP VM is ready for routing."""
         try:
@@ -60720,10 +60160,6 @@ class JarvisSystemKernel:
             )
         except Exception:
             pass
-
-        # v236.0: Clear vision server endpoint vars (symmetric with _propagate)
-        os.environ.pop("JARVIS_PRIME_VISION_URL", None)
-        os.environ.pop("JARVIS_PRIME_VISION_PORT", None)
 
         # v235.1: Clear Trinity GCP ready event so orchestrator knows to re-provision
         try:
@@ -61084,8 +60520,7 @@ class JarvisSystemKernel:
 
         Does NOT wait for graceful shutdown - uses kill signals.
         """
-        _shutdown_log = self.logger.info if expected else self.logger.warning
-        _shutdown_log(
+        self.logger.warning(
             f"[Kernel] ⚠️ Emergency shutdown initiated (reason={reason}, expected={expected})"
         )
         self._state = KernelState.SHUTTING_DOWN
@@ -61093,75 +60528,68 @@ class JarvisSystemKernel:
         # v258.4: Publish shutdown phase to Trinity IPC for cross-repo consumers.
         _publish_system_phase_to_trinity("shutdown", {"reason": reason, "expected": expected})
 
-        crash_marker = LOCKS_DIR / "kernel_crash.marker"
-        if expected:
-            # Expected shutdown paths should not create crash-recovery markers.
-            try:
-                if crash_marker.exists():
-                    await asyncio.to_thread(crash_marker.unlink)
-            except Exception:
-                pass
-        else:
-            # v181.0: Write crash marker for next startup
-            # v205.0: Use asyncio.to_thread to avoid blocking the event loop
-            # v242.5: Enriched with diagnostic context (JSON) for crash forensics
-            try:
-                def _write_crash_marker() -> None:
-                    """Sync helper for crash marker write — captures diagnostic snapshot."""
-                    crash_marker.parent.mkdir(parents=True, exist_ok=True)
-                    # v242.5: Capture diagnostic context for next-startup forensics
-                    uptime = time.time() - self._started_at if self._started_at else 0.0
-                    diag = {
-                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "epoch": time.time(),
-                        "pid": os.getpid(),
-                        "kernel_state": self._state.value if self._state else "unknown",
-                        "shutdown_mode": "emergency",
-                        "shutdown_reason": reason,
-                        "expected": bool(expected),
-                        "uptime_seconds": round(uptime, 1),
-                        "component_status": {},
-                    }
-                    # Capture component status snapshot (what was running/failed)
-                    try:
-                        for comp_name, comp_info in (self._component_status or {}).items():
-                            diag["component_status"][comp_name] = comp_info.get("status", "unknown")
-                    except Exception:
-                        pass
-                    # Capture Trinity component states
-                    try:
-                        if self._trinity and hasattr(self._trinity, "_components"):
-                            trinity_states = {}
-                            for name, comp in self._trinity._components.items():
-                                trinity_states[name] = {
-                                    "running": getattr(comp, "is_running", False),
-                                    "pid": getattr(comp, "pid", None),
-                                }
-                            diag["trinity_components"] = trinity_states
-                    except Exception:
-                        pass
-                    # Capture memory info if psutil available
-                    try:
-                        import psutil
-                        proc = psutil.Process(os.getpid())
-                        mem = proc.memory_info()
-                        diag["memory_rss_mb"] = round(mem.rss / (1024 * 1024), 1)
-                        diag["memory_vms_mb"] = round(mem.vms / (1024 * 1024), 1)
-                        diag["system_memory_pct"] = round(psutil.virtual_memory().percent, 1)
-                    except Exception:
-                        pass
-                    try:
-                        crash_marker.write_text(json.dumps(diag, indent=2))
-                    except Exception:
-                        # Fallback to plain text if JSON serialization fails
-                        crash_marker.write_text(
-                            f"Emergency shutdown at {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                            f"(reason={reason}, expected={expected})"
-                        )
+        # v181.0: Write crash marker for next startup
+        # v205.0: Use asyncio.to_thread to avoid blocking the event loop
+        # v242.5: Enriched with diagnostic context (JSON) for crash forensics
+        try:
+            crash_marker = LOCKS_DIR / "kernel_crash.marker"
 
-                await asyncio.to_thread(_write_crash_marker)
-            except Exception:
-                pass
+            def _write_crash_marker() -> None:
+                """Sync helper for crash marker write — captures diagnostic snapshot."""
+                crash_marker.parent.mkdir(parents=True, exist_ok=True)
+                # v242.5: Capture diagnostic context for next-startup forensics
+                uptime = time.time() - self._started_at if self._started_at else 0.0
+                diag = {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "epoch": time.time(),
+                    "pid": os.getpid(),
+                    "kernel_state": self._state.value if self._state else "unknown",
+                    "shutdown_mode": "emergency",
+                    "shutdown_reason": reason,
+                    "expected": bool(expected),
+                    "uptime_seconds": round(uptime, 1),
+                    "component_status": {},
+                }
+                # Capture component status snapshot (what was running/failed)
+                try:
+                    for comp_name, comp_info in (self._component_status or {}).items():
+                        diag["component_status"][comp_name] = comp_info.get("status", "unknown")
+                except Exception:
+                    pass
+                # Capture Trinity component states
+                try:
+                    if self._trinity and hasattr(self._trinity, "_components"):
+                        trinity_states = {}
+                        for name, comp in self._trinity._components.items():
+                            trinity_states[name] = {
+                                "running": getattr(comp, "is_running", False),
+                                "pid": getattr(comp, "pid", None),
+                            }
+                        diag["trinity_components"] = trinity_states
+                except Exception:
+                    pass
+                # Capture memory info if psutil available
+                try:
+                    import psutil
+                    proc = psutil.Process(os.getpid())
+                    mem = proc.memory_info()
+                    diag["memory_rss_mb"] = round(mem.rss / (1024 * 1024), 1)
+                    diag["memory_vms_mb"] = round(mem.vms / (1024 * 1024), 1)
+                    diag["system_memory_pct"] = round(psutil.virtual_memory().percent, 1)
+                except Exception:
+                    pass
+                try:
+                    crash_marker.write_text(json.dumps(diag, indent=2))
+                except Exception:
+                    # Fallback to plain text if JSON serialization fails
+                    crash_marker.write_text(
+                        f"Emergency shutdown at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"(reason={reason}, expected={expected})"
+                    )
+
+            await asyncio.to_thread(_write_crash_marker)
+        except Exception:
+            pass
 
         # v181.0/v206.0: Stop Trinity components FIRST (prevents orphaned processes)
         # v206.0: PILLAR 5 - Use tiered_stop() for idempotent, bounded, never-raises cleanup
@@ -61277,42 +60705,6 @@ class JarvisSystemKernel:
                 from backend.autonomy.reactor_core_integration import shutdown_reactor_core
                 await asyncio.wait_for(shutdown_reactor_core(), timeout=5.0)
                 self.logger.info("[Kernel] Reactor Core pipeline stopped")
-            except Exception:
-                pass
-
-        # v240.0: Shutdown AGI Orchestrator (EventBus, StateManager, LearningPipeline)
-        try:
-            from backend.core.unified_agi_orchestrator import stop_agi_orchestrator
-            await asyncio.wait_for(stop_agi_orchestrator(), timeout=10.0)
-            self.logger.info("[Kernel] AGI Orchestrator stopped")
-        except Exception:
-            pass
-
-        # v240.0: Shutdown Enterprise Integration (ComponentRegistry, RecoveryEngine)
-        try:
-            from backend.core.enterprise_supervisor_integration import enterprise_shutdown
-            await asyncio.wait_for(enterprise_shutdown(), timeout=10.0)
-            self.logger.info("[Kernel] Enterprise Integration stopped")
-        except Exception:
-            pass
-
-        # v240.0: Shutdown DI Intelligence Services
-        if hasattr(self, '_di_container') and self._di_container:
-            try:
-                from backend.core.di.intelligence_services import shutdown_intelligence_services
-                await asyncio.wait_for(
-                    shutdown_intelligence_services(self._di_container), timeout=10.0,
-                )
-                self.logger.info("[Kernel] DI Intelligence Services stopped")
-            except Exception:
-                pass
-
-        # v241.0: Shutdown Voice Unlock System (cleanup auth state, release models)
-        if hasattr(self, '_voice_unlock_service') and self._voice_unlock_service:
-            try:
-                from backend.voice_unlock import cleanup_voice_unlock
-                await asyncio.wait_for(cleanup_voice_unlock(), timeout=10.0)
-                self.logger.info("[Kernel] Voice Unlock System stopped")
             except Exception:
                 pass
 
@@ -61569,9 +60961,7 @@ class JarvisSystemKernel:
             self.logger.debug(f"[Kernel] Final task drain error: {e}")
 
         self._state = KernelState.STOPPED
-        (_shutdown_log if expected else self.logger.warning)(
-            "[Kernel] ⚠️ Emergency shutdown complete"
-        )
+        self.logger.warning("[Kernel] ⚠️ Emergency shutdown complete")
 
     async def emergency_shutdown(
         self,
@@ -62394,10 +61784,6 @@ class JarvisSystemKernel:
         try:
             log_handler = get_dashboard_log_handler()
             log_handler.set_dashboard(dashboard)
-            # Preserve global suppression/redaction guarantees for late handlers.
-            for _log_filter in (_benign_filter, _secret_filter):
-                if _log_filter not in log_handler.filters:
-                    log_handler.addFilter(_log_filter)
             # Add to root logger to capture all important logs
             logging.getLogger().addHandler(log_handler)
             # Also add to our main logger
@@ -62632,68 +62018,13 @@ class JarvisSystemKernel:
                     "message": "AudioBus init timeout — using legacy audio",
                 }
             except Exception as ab_err:
-                ab_text = str(ab_err).lower()
-                input_device_error = any(
-                    token in ab_text
-                    for token in (
-                        "input device",
-                        "default input",
-                        "no valid input",
-                        "invalid input",
-                    )
-                )
-                if input_device_error:
-                    # v266.0: Root-cause fallback — keep AudioBus alive in output-only
-                    # mode when input is unavailable so startup speech stays on the
-                    # single-stream path and avoids mixed-engine static.
-                    self.logger.warning(
-                        "[Kernel] AudioBus input unavailable (%s) — retrying output-only mode",
-                        ab_err,
-                    )
-                    try:
-                        from backend.audio.audio_bus import AudioBus
-                        from backend.audio.full_duplex_device import DeviceConfig
-
-                        with contextlib.suppress(Exception):
-                            if self._audio_bus is not None:
-                                await self._audio_bus.stop()
-
-                        self._audio_bus = AudioBus()
-                        output_only_cfg = DeviceConfig(
-                            require_input=False,
-                            allow_output_only=True,
-                        )
-                        output_only_cfg.input_device = None
-                        await asyncio.wait_for(
-                            self._audio_bus.start(config=output_only_cfg),
-                            timeout=_ab_timeout,
-                        )
-                        self._component_status["audio_infrastructure"] = {
-                            "status": "degraded",
-                            "message": "AudioBus running in output-only mode (no input device)",
-                        }
-                        self.logger.warning(
-                            "[Kernel] AudioBus started in output-only mode (input unavailable)"
-                        )
-                    except Exception as fallback_err:
-                        self.logger.warning(
-                            "[Kernel] AudioBus output-only fallback failed: %s — disabling",
-                            fallback_err,
-                        )
-                        self._audio_bus_enabled = False
-                        self._audio_bus = None
-                        self._component_status["audio_infrastructure"] = {
-                            "status": "degraded",
-                            "message": f"AudioBus init failed: {ab_err}",
-                        }
-                else:
-                    self.logger.warning(f"[Kernel] AudioBus init failed: {ab_err} — disabling")
-                    self._audio_bus_enabled = False
-                    self._audio_bus = None
-                    self._component_status["audio_infrastructure"] = {
-                        "status": "degraded",
-                        "message": f"AudioBus init failed: {ab_err}",
-                    }
+                self.logger.warning(f"[Kernel] AudioBus init failed: {ab_err} — disabling")
+                self._audio_bus_enabled = False
+                self._audio_bus = None
+                self._component_status["audio_infrastructure"] = {
+                    "status": "degraded",
+                    "message": f"AudioBus init failed: {ab_err}",
+                }
         else:
             self._component_status["audio_infrastructure"] = {
                 "status": "disabled",
@@ -62709,28 +62040,8 @@ class JarvisSystemKernel:
             except Exception as qp_err:
                 self.logger.debug(f"[Narrator] Queue processor failed to start: {qp_err}")
 
-        # v236.4: Start IntelligentStartupNarrator + UnifiedVoiceOrchestrator
-        # so that phase narration messages are actually processed.
-        # Previously, UnifiedVoiceOrchestrator.start() was never called from
-        # unified_supervisor.py — IntelligentStartupNarrator queued messages
-        # into a dead queue (processor never started), silently losing all
-        # phase narration and orchestrator event announcements.
-        if self._startup_narrator and hasattr(self._startup_narrator, 'start'):
-            try:
-                await self._startup_narrator.start()
-                self.logger.debug("[Narrator] IntelligentStartupNarrator + UnifiedVoiceOrchestrator started")
-            except Exception as sn_err:
-                self.logger.debug(f"[Narrator] IntelligentStartupNarrator start failed: {sn_err}")
-
         # Voice narrator startup announcement
-        # Prefer IntelligentStartupNarrator when available to keep startup speech
-        # on a single orchestrated path (prevents duplicate/overlapping startup audio).
-        _allow_legacy_startup_narration = os.getenv(
-            "JARVIS_LEGACY_STARTUP_NARRATION", "false"
-        ).strip().lower() in ("1", "true", "yes", "on")
-        if self._narrator and (
-            self._startup_narrator is None or _allow_legacy_startup_narration
-        ):
+        if self._narrator:
             try:
                 await self._narrator.narrate_startup_begin()
             except Exception as narr_err:
@@ -63203,12 +62514,10 @@ class JarvisSystemKernel:
                     self.logger.info(f"[EarlyPrime] Found startup script: {os.path.basename(startup_script)}")
                     
                     # Prepare environment with startup grace period
-                    # v236.2: Use centralized env builder for authoritative credential propagation
-                    env = _build_subprocess_env(
-                        JARVIS_EARLY_PREWARM="true",
-                        JARVIS_PORT=str(prime_port),
-                        JARVIS_STARTUP_GRACE_PERIOD="720",  # 12 minutes
-                    )
+                    env = os.environ.copy()
+                    env["JARVIS_EARLY_PREWARM"] = "true"
+                    env["JARVIS_PORT"] = str(prime_port)
+                    env["JARVIS_STARTUP_GRACE_PERIOD"] = "720"  # 12 minutes
                     
                     self.logger.info(f"[EarlyPrime] Starting Prime at port {prime_port} using {os.path.basename(startup_script)}...")
                     
@@ -64167,9 +63476,7 @@ class JarvisSystemKernel:
             # cleanup at line 62228 covers the normal path, but if intelligence phase
             # timeout cancels before reaching it, the active flag may leak.
             update_dashboard_model_loading(active=False)
-            # v236.2: Default aligned with outer init timeout (80s) at line 63787.
-            # Was 60s — DMS would fire at 90s (60+30 buffer) before outer timeout at 80s.
-            two_tier_timeout = float(os.environ.get("JARVIS_TWO_TIER_TIMEOUT", "80.0"))
+            two_tier_timeout = float(os.environ.get("JARVIS_TWO_TIER_TIMEOUT", "60.0"))
             if self._startup_watchdog:
                 self._startup_watchdog.update_phase("two_tier", 55, operational_timeout=two_tier_timeout)
 
@@ -64203,21 +63510,6 @@ class JarvisSystemKernel:
                     IssueCategory.INTELLIGENCE,
                     suggestion="Increase JARVIS_TWO_TIER_INIT_TIMEOUT or check component health"
                 )
-
-            # v242.0: Wire VBIA adapter + voice unlock into ModeDispatcher
-            # for biometric auth and continuous speaker verification (Gaps 1, 4).
-            if self._mode_dispatcher is not None:
-                if self._vbia_adapter is not None:
-                    self._mode_dispatcher.set_vbia_adapter(self._vbia_adapter)
-                    self.logger.debug("[Phase4] VBIA adapter → ModeDispatcher")
-                if (
-                    hasattr(self, '_voice_unlock_service')
-                    and self._voice_unlock_service is not None
-                ):
-                    self._mode_dispatcher.set_voice_unlock_service(
-                        self._voice_unlock_service
-                    )
-                    self.logger.debug("[Phase4] Voice unlock service → ModeDispatcher")
 
             # v256.1: Reset two_tier stall timer by advancing progress (R3-#3).
             # Don't transition to trinity yet — that happens at line ~61905.
@@ -66707,11 +65999,9 @@ class JarvisSystemKernel:
 
         try:
             # Start process
-            # v236.2: Use centralized env builder for authoritative credential propagation
-            env = _build_subprocess_env(
-                JARVIS_BACKEND_PORT=str(self.config.backend_port),
-                JARVIS_KERNEL_PID=str(os.getpid()),
-            )
+            env = os.environ.copy()
+            env["JARVIS_BACKEND_PORT"] = str(self.config.backend_port)
+            env["JARVIS_KERNEL_PID"] = str(os.getpid())
 
             self._backend_process = await asyncio.create_subprocess_exec(
                 sys.executable,
@@ -67171,16 +66461,13 @@ class JarvisSystemKernel:
                                 # Consumer-side: bridge EventBus events → Broker topics
                                 _event_bus = SupervisorEventBus()
                                 _topic_map = {
-                                    SupervisorEventType.HEALTH_CHECK: "health",
-                                    SupervisorEventType.RECOVERY_START: "health",
-                                    SupervisorEventType.RECOVERY_END: "health",
-                                    SupervisorEventType.ERROR: "health",
-                                    SupervisorEventType.METRIC: "inference",
+                                    "health": "health", "voice": "voice",
+                                    "inference": "inference",
                                 }
 
                                 def _bridge_handler(event: SupervisorEvent, broker=_mb, tmap=_topic_map) -> None:
-                                    _t = tmap.get(getattr(event, 'event_type', None), "lifecycle")
-                                    _payload = event.to_json_dict() if hasattr(event, 'to_json_dict') else {"event": str(event)}
+                                    _t = tmap.get(getattr(event, 'event_type', ''), "lifecycle")
+                                    _payload = getattr(event, 'data', {}) if hasattr(event, 'data') else {"event": str(event)}
                                     create_safe_task(
                                         broker.publish(_t, _payload),
                                         name=f"ssr_bridge_{_t}",
@@ -69656,9 +68943,6 @@ class JarvisSystemKernel:
                 progress = 66 + min(5, int(elapsed / 12))  # 5% over 60s
             elif status == "healthy":
                 progress = 72
-                # v236.1: Raise phase ceiling so Reactor-Core progress isn't capped at 73%
-                # (ceiling was 68 from Phase 5 start, +5 drift = 73 max)
-                self._current_startup_progress = 72
             else:
                 progress = 66
         elif component == "reactor_core":
@@ -69669,8 +68953,6 @@ class JarvisSystemKernel:
                 progress = 73 + min(6, int(elapsed / 10))  # 6% over 60s
             elif status == "healthy":
                 progress = 80
-                # v236.2: Raise ceiling so progress=80 isn't capped at 77 (72+5)
-                self._current_startup_progress = 80
             else:
                 progress = 73
         else:
@@ -69978,25 +69260,6 @@ class JarvisSystemKernel:
                     f"(+{progress_delta:.1f}%), elapsed={elapsed:.0f}s, remaining={remaining:.0f}s"
                     + (f", ETA={eta_seconds:.0f}s" if eta_seconds else "")
                     + phase_label
-                )
-
-                # v236.1: Broadcast incremental progress during component health wait
-                # to prevent PHASE HOLD HARD CAP (300s) from firing.
-                # Maps internal model progress (0-100%) to startup range (72-77%).
-                # The _trinity_progress_callback handles discrete status transitions
-                # (starting/waiting/healthy), but this covers the continuous wait
-                # between callbacks when the model is loading.
-                # v236.2: Time-proportional fallback — when health endpoint is
-                # unreachable (current_progress=0), elapsed-based increment ensures
-                # progress still advances (~1% per 60s). Without this, the formula
-                # degenerates to a constant 72 and the hard cap fires after 300s.
-                _progress_component = min(5, int(current_progress / 20))  # 0-5 from model progress
-                _elapsed_component = min(5, int(elapsed / 60))  # 0-5 from elapsed time (1%/min)
-                _poll_startup_pct = 72 + max(_progress_component, _elapsed_component)  # 72-77%
-                await self._broadcast_startup_progress(
-                    stage="trinity",
-                    message=f"Component health wait ({current_progress:.0f}% internal, {elapsed:.0f}s)",
-                    progress=_poll_startup_pct,
                 )
 
                 # v224.0: Phase-aware stall thresholds — different phases have
@@ -70600,10 +69863,6 @@ class JarvisSystemKernel:
                             if self._startup_watchdog:
                                 trinity_heartbeat_progress["current"] = 68
                                 self._startup_watchdog.update_phase("trinity", 68)
-                            # v236.1: Also broadcast to _current_progress (prevents PHASE HOLD HARD CAP stall)
-                            await self._broadcast_startup_progress(
-                                stage="trinity", message="Cross-repo startup lock acquired", progress=68
-                            )
 
                             # Check if Hollow Client mode was activated by orchestrator
                             if os.environ.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() == "true":
@@ -70617,10 +69876,6 @@ class JarvisSystemKernel:
                             if self._startup_watchdog:
                                 trinity_heartbeat_progress["current"] = 69
                                 self._startup_watchdog.update_phase("trinity", 69)
-                            # v236.1: Broadcast to _current_progress
-                            await self._broadcast_startup_progress(
-                                stage="trinity", message="Initializing Trinity integrator", progress=69
-                            )
 
                             # Log repo search paths
                             prime_path = self.config.prime_repo_path
@@ -70654,10 +69909,6 @@ class JarvisSystemKernel:
                                 if self._startup_watchdog:
                                     trinity_heartbeat_progress["current"] = 70
                                     self._startup_watchdog.update_phase("trinity", 70)
-                                # v236.1: Broadcast to _current_progress
-                                await self._broadcast_startup_progress(
-                                    stage="trinity", message="Trinity integrator initialized", progress=70
-                                )
 
                                 # Get detailed status after initialization
                                 status = trinity_integrator.get_status()
@@ -70823,29 +70074,6 @@ class JarvisSystemKernel:
                                                 _last_gcp_status = _status_msg
                                         except Exception:
                                             pass
-
-                                        # v236.1: Periodic progress broadcast during golden image wait
-                                        # to prevent PHASE HOLD HARD CAP (300s) from firing.
-                                        # v236.2: Time-proportional increments that ALSO raise the
-                                        # ceiling periodically. Cloud-only waits can reach 600s, so
-                                        # we need guaranteed increments every <300s across the range.
-                                        # Strategy: 1% per 90s (70→73 over 270s = 4 transitions),
-                                        # PLUS ceiling bumps so progress isn't stuck at 73 after 270s.
-                                        if int(_wait_elapsed) % 30 < int(_gw_poll_interval):
-                                            _gw_time_pct = min(5, int(_wait_elapsed / 90))  # 0-5 over 450s
-                                            _gw_broadcast_pct = 70 + _gw_time_pct
-                                            # Raise ceiling to keep broadcasts effective beyond 73
-                                            # (68 + 5 = 73 at start; after 180s: 70 + 5 = 75, etc.)
-                                            _gw_new_ceiling = max(
-                                                getattr(self, '_current_startup_progress', 68),
-                                                68 + min(7, int(_wait_elapsed / 90))  # 68→75 over 630s
-                                            )
-                                            self._current_startup_progress = _gw_new_ceiling
-                                            await self._broadcast_startup_progress(
-                                                stage="trinity",
-                                                message=f"Waiting for golden image VM ({_wait_elapsed:.0f}s)",
-                                                progress=_gw_broadcast_pct,
-                                            )
 
                                         # v233.2: Only APARS (real) progress resets stall timer.
                                         # Synthetic progress continuously increases and would
@@ -71450,17 +70678,7 @@ class JarvisSystemKernel:
                                     base_timeout=trinity_timeout,
                                     integrator_name="Trinity/ProcessOrchestrator",
                                 )
-
-                                # v236.1: Broadcast progress after component startup returns.
-                                # This prevents a 300s gap between J-Prime healthy (72%) and
-                                # post-startup processing. Raise ceiling to allow higher values.
-                                self._current_startup_progress = 78
-                                await self._broadcast_startup_progress(
-                                    stage="trinity",
-                                    message="Component startup phase complete",
-                                    progress=78,
-                                )
-
+                                
                                 if _trinity_timed_out:
                                     _trinity_startup_error = True
                                     _trinity_startup_timed_out = True  # v222.0: Track for result handling
@@ -71505,13 +70723,6 @@ class JarvisSystemKernel:
                                 _trinity_startup_timed_out = True  # v222.0: Track for result handling
                                 self.logger.error(f"[Trinity] Trinity phase timeout after {trinity_budget}s")
                                 self.logger.warning("[Trinity] Consider increasing JARVIS_TRINITY_BUDGET if startup needs more time")
-                                # v236.2: Broadcast progress so ProgressController knows we're still alive
-                                self._current_startup_progress = 78
-                                await self._broadcast_startup_progress(
-                                    stage="trinity",
-                                    message=f"Component startup timed out after {trinity_budget}s, probing health",
-                                    progress=78,
-                                )
                                 # v228.0: Check live health before blanket-marking error
                                 for comp_key, comp_status_key in [("jarvis-prime", "jarvis_prime"), ("reactor-core", "reactor_core")]:
                                     actual_port = self._get_component_port(comp_status_key)
@@ -71525,13 +70736,6 @@ class JarvisSystemKernel:
                                 _trinity_startup_error = True
                                 _trinity_startup_timed_out = True  # v222.0: Treat exceptions as timeout for status
                                 self.logger.error(f"[Trinity] Unexpected error during startup: {e}")
-                                # v236.2: Broadcast progress so ProgressController knows we're still alive
-                                self._current_startup_progress = 78
-                                await self._broadcast_startup_progress(
-                                    stage="trinity",
-                                    message=f"Component startup error, probing health: {e}",
-                                    progress=78,
-                                )
                                 # v228.0: Check live health before blanket-marking error
                                 for comp_key, comp_status_key in [("jarvis-prime", "jarvis_prime"), ("reactor-core", "reactor_core")]:
                                     actual_port = self._get_component_port(comp_status_key)
@@ -71576,10 +70780,6 @@ class JarvisSystemKernel:
                     if self._startup_watchdog:
                         trinity_heartbeat_progress["current"] = 69
                         self._startup_watchdog.update_phase("trinity", 69)
-                    # v236.2: Broadcast to _current_progress (legacy path)
-                    await self._broadcast_startup_progress(
-                        stage="trinity", message="Legacy Trinity integration starting", progress=69
-                    )
 
                     # Log repo search paths
                     prime_path = self.config.prime_repo_path
@@ -71599,10 +70799,6 @@ class JarvisSystemKernel:
                     if self._startup_watchdog:
                         trinity_heartbeat_progress["current"] = 70
                         self._startup_watchdog.update_phase("trinity", 70)
-                    # v236.2: Broadcast to _current_progress (legacy path)
-                    await self._broadcast_startup_progress(
-                        stage="trinity", message="Trinity integrator initialized (legacy)", progress=70
-                    )
 
                     # Get detailed status after initialization
                     status = self._trinity.get_status()
@@ -71684,15 +70880,7 @@ class JarvisSystemKernel:
                         base_timeout=trinity_timeout,
                         integrator_name="Trinity/Legacy",
                     )
-
-                    # v236.2: Broadcast progress after component startup returns (legacy path)
-                    self._current_startup_progress = 78
-                    await self._broadcast_startup_progress(
-                        stage="trinity",
-                        message="Component startup phase complete (legacy)",
-                        progress=78,
-                    )
-
+                    
                     if _legacy_timed_out:
                         _trinity_startup_timed_out = True  # v222.0: Track for result handling
                         self.logger.error(f"[Trinity] Component startup timeout: {_legacy_timeout_context}")
@@ -71813,12 +71001,6 @@ class JarvisSystemKernel:
                     message=f"Trinity integration complete: {started_count} component(s) active"
                 )
 
-                # v236.1: Progress broadcast before narration (prevents hard cap stall)
-                self._current_startup_progress = 80
-                await self._broadcast_startup_progress(
-                    stage="trinity", message="Trinity components online, finalizing", progress=80
-                )
-
                 # Voice narration for Trinity components
                 if self._narrator:
                     for component, connected in results.items():
@@ -71829,11 +71011,6 @@ class JarvisSystemKernel:
                             )
                         except Exception:
                             pass
-
-                # v236.1: Progress broadcast after narration
-                await self._broadcast_startup_progress(
-                    stage="trinity", message="Trinity narration complete", progress=82
-                )
 
                 if self._readiness_manager:
                     self._readiness_manager.mark_component_ready("trinity", started_count > 0)
@@ -72192,209 +71369,6 @@ class JarvisSystemKernel:
 
             self._update_component_status("enterprise", "complete", f"Enterprise: {len(successful)}/{len(services)} active")
 
-            # v240.0: AGI Orchestrator — cross-repo intelligence coordination
-            # Activates: EventBus, PersistentStateManager, LearningPipeline,
-            #            AgentRegistry, CrossRepoHealthAggregator
-            try:
-                from backend.core.unified_agi_orchestrator import (
-                    start_agi_orchestrator,
-                )
-                if os.getenv("AGI_ORCHESTRATOR_ENABLED", "true").lower() in ("true", "1", "yes"):
-                    _agi_started = await asyncio.wait_for(
-                        start_agi_orchestrator(), timeout=SERVICE_TIMEOUT,
-                    )
-                    if _agi_started:
-                        self.logger.info("[Zone6/AGIOrch] ✓ AGI Orchestrator started")
-                    else:
-                        self.logger.warning("[Zone6/AGIOrch] ⚠ AGI Orchestrator failed to start")
-                else:
-                    self.logger.info("[Zone6/AGIOrch] ○ Disabled via AGI_ORCHESTRATOR_ENABLED")
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                self.logger.warning(f"[Zone6/AGIOrch] ⏱️ Timed out after {SERVICE_TIMEOUT}s")
-            except ImportError:
-                self.logger.debug("[Zone6/AGIOrch] AGI Orchestrator module not available")
-            except Exception as e:
-                self.logger.warning(f"[Zone6/AGIOrch] ⚠ Error: {e}")
-
-            # v240.0: Enterprise Startup Integration — structured component lifecycle
-            # Activates: ComponentRegistry DAG, RecoveryEngine, StartupSummary
-            try:
-                from backend.core.enterprise_supervisor_integration import (
-                    enterprise_startup,
-                    is_enterprise_mode_available,
-                )
-                if is_enterprise_mode_available() and os.getenv(
-                    "JARVIS_ENTERPRISE_MODE", "true"
-                ).lower() in ("true", "1", "yes"):
-                    _ent_result = await asyncio.wait_for(
-                        enterprise_startup(), timeout=SERVICE_TIMEOUT * 2,
-                    )
-                    _ent_status = getattr(_ent_result, "overall_status", "UNKNOWN")
-                    _ent_ok = getattr(_ent_result, "success", False)
-                    if _ent_ok:
-                        self.logger.info(f"[Zone6/Enterprise] ✓ Enterprise startup: {_ent_status}")
-                    else:
-                        self.logger.warning(f"[Zone6/Enterprise] ⚠ Enterprise startup: {_ent_status}")
-                else:
-                    self.logger.info("[Zone6/Enterprise] ○ Disabled or not available")
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                self.logger.warning(f"[Zone6/Enterprise] ⏱️ Timed out after {SERVICE_TIMEOUT * 2}s")
-            except ImportError:
-                self.logger.debug("[Zone6/Enterprise] Enterprise integration module not available")
-            except Exception as e:
-                self.logger.warning(f"[Zone6/Enterprise] ⚠ Error: {e}")
-
-            # v240.0: DI Intelligence Services — register with ServiceContainer
-            # Activates: CollaborationEngine, CodeOwnership, ReviewWorkflow, LSP, IDE
-            try:
-                from backend.core.di.container import create_container
-                from backend.core.di.intelligence_services import (
-                    register_intelligence_services,
-                    initialize_intelligence_services,
-                )
-                if os.getenv("JARVIS_DI_INTELLIGENCE_ENABLED", "true").lower() in (
-                    "true", "1", "yes"
-                ):
-                    _di_container = create_container()
-                    _reg_status = register_intelligence_services(_di_container)
-                    _init_status = await asyncio.wait_for(
-                        initialize_intelligence_services(_di_container),
-                        timeout=SERVICE_TIMEOUT,
-                    )
-                    _active = sum(1 for v in _init_status.values() if v == "initialized")
-                    self.logger.info(
-                        f"[Zone6/DI] ✓ Intelligence services: {_active}/{len(_init_status)} active"
-                    )
-                    self._di_container = _di_container
-                else:
-                    self.logger.info("[Zone6/DI] ○ Disabled via JARVIS_DI_INTELLIGENCE_ENABLED")
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                self.logger.warning(f"[Zone6/DI] ⏱️ Timed out after {SERVICE_TIMEOUT}s")
-            except ImportError:
-                self.logger.debug("[Zone6/DI] DI container module not available")
-            except Exception as e:
-                self.logger.warning(f"[Zone6/DI] ⚠ Error: {e}")
-
-            # v241.0: Voice Unlock Authentication System — full stack initialization
-            # Activates: IntelligentVoiceUnlockService, LangGraph reasoning,
-            #            LangChain MFA orchestrator, ChromaDB pattern memory,
-            #            Langfuse audit trail, Helicone cost tracker
-            _voice_unlock_status: Dict[str, Any] = {
-                "initialized": False,
-                "subsystems_active": 0,
-                "subsystems_total": 5,
-                "enabled": False,
-            }
-            try:
-                from backend.voice_unlock import (
-                    initialize_voice_unlock,
-                    get_voice_auth_reasoning_graph,
-                    get_voice_pattern_memory,
-                    get_voice_auth_orchestrator,
-                    get_voice_auth_tracer,
-                    get_voice_auth_cost_tracker,
-                )
-                if os.getenv("JARVIS_VOICE_UNLOCK_ENABLED", "true").lower() in (
-                    "true", "1", "yes"
-                ):
-                    _voice_unlock_status["enabled"] = True
-
-                    # Core service — orchestrates all voice auth subsystems
-                    _voice_svc = await asyncio.wait_for(
-                        initialize_voice_unlock(), timeout=SERVICE_TIMEOUT,
-                    )
-                    if _voice_svc:
-                        self._voice_unlock_service = _voice_svc
-                        _voice_unlock_status["initialized"] = True
-                        self.logger.info("[Zone6/VoiceUnlock] ✓ Core service ready")
-
-                        # v242.0: Wire into ModeDispatcher for biometric mode
-                        if self._mode_dispatcher is not None:
-                            self._mode_dispatcher.set_voice_unlock_service(
-                                self._voice_unlock_service
-                            )
-                            self.logger.debug(
-                                "[Zone6/VoiceUnlock] Wired into ModeDispatcher"
-                            )
-                    else:
-                        self.logger.warning("[Zone6/VoiceUnlock] ⚠ Core service unavailable")
-
-                    # Subsystem warm-up — each is optional, failures don't block
-                    _subsystems = {
-                        "LangGraph reasoning": get_voice_auth_reasoning_graph,
-                        "ChromaDB patterns": get_voice_pattern_memory,
-                        "LangChain orchestrator": get_voice_auth_orchestrator,
-                        "Langfuse tracer": get_voice_auth_tracer,
-                        "Helicone cost tracker": get_voice_auth_cost_tracker,
-                    }
-                    _active = 0
-                    for _sub_name, _sub_init in _subsystems.items():
-                        try:
-                            _sub_result = await asyncio.wait_for(
-                                _sub_init(), timeout=SERVICE_TIMEOUT,
-                            )
-                            if _sub_result is not None:
-                                _active += 1
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as _sub_err:
-                            self.logger.debug(
-                                f"[Zone6/VoiceUnlock] {_sub_name}: {_sub_err}"
-                            )
-                    _voice_unlock_status["subsystems_active"] = _active
-                    self.logger.info(
-                        f"[Zone6/VoiceUnlock] ✓ Subsystems: {_active}/{len(_subsystems)} active"
-                    )
-                else:
-                    self.logger.info(
-                        "[Zone6/VoiceUnlock] ○ Disabled via JARVIS_VOICE_UNLOCK_ENABLED"
-                    )
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                self.logger.warning(
-                    f"[Zone6/VoiceUnlock] ⏱️ Core service timed out after {SERVICE_TIMEOUT}s"
-                )
-            except ImportError:
-                self.logger.debug("[Zone6/VoiceUnlock] Voice unlock module not available")
-            except Exception as e:
-                self.logger.warning(f"[Zone6/VoiceUnlock] ⚠ Error: {e}")
-
-            # Store voice unlock status in enterprise status + emit event
-            self._enterprise_status["voice_unlock"] = _voice_unlock_status
-            if self._readiness_manager:
-                self._readiness_manager.mark_component_ready(
-                    "voice_unlock", _voice_unlock_status["initialized"]
-                )
-            try:
-                get_event_bus().emit(SupervisorEvent(
-                    event_type=SupervisorEventType.COMPONENT_STATUS,
-                    timestamp=time.time(),
-                    message=(
-                        f"Voice Unlock: {'ready' if _voice_unlock_status['initialized'] else 'unavailable'}"
-                        f" ({_voice_unlock_status['subsystems_active']}/{_voice_unlock_status['subsystems_total']} subsystems)"
-                    ),
-                    severity=(
-                        SupervisorEventSeverity.SUCCESS
-                        if _voice_unlock_status["initialized"]
-                        else SupervisorEventSeverity.WARNING
-                    ),
-                    phase="enterprise",
-                    component="voice_unlock",
-                    metadata=(
-                        ("initialized", _voice_unlock_status["initialized"]),
-                        ("subsystems_active", _voice_unlock_status["subsystems_active"]),
-                    ),
-                ))
-            except Exception:
-                pass  # Event bus emission is best-effort
-
             # v239.0: System Service Registry — Phase 6 (Training pipeline adapters)
             if self._service_registry:
                 _training_phase = 6
@@ -72522,7 +71496,7 @@ class JarvisSystemKernel:
 
                 # ── Phase 7: Cross-Repo Integration (Prime + Reactor Core) ──
                 # These adapters wrap existing singleton services that were
-                # already initialized by the enterprise phase.  Registration
+                # already initialized by the enterprise phase. Registration
                 # provides unified health monitoring, graceful degradation
                 # awareness, event sourcing, and coordinated shutdown.
                 _xrepo_phase = 7
@@ -72647,494 +71621,6 @@ class JarvisSystemKernel:
                 except Exception as e:
                     self.logger.debug(f"[Kernel] ReactorWatcher SSR adapter error: {e}")
 
-                # ── Phase 8 Adapter Classes: Self-Healing & Resilience ─────
-
-                class _ProcessHealthPredictorAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._p: Optional[ProcessHealthPredictor] = None
-
-                    async def initialize(self) -> None:
-                        self._p = ProcessHealthPredictor(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._p is None:
-                            return (False, "Predictor not constructed")
-                        s = self._p.get_status()
-                        return (True, f"Predictor: {s.get('components_tracked', 0)} tracked")
-
-                    async def cleanup(self) -> None:
-                        self._p = None
-
-                class _SelfHealingAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._sho: Optional[SelfHealingOrchestrator] = None
-
-                    async def initialize(self) -> None:
-                        self._sho = SelfHealingOrchestrator(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._sho is None:
-                            return (False, "SelfHealing not constructed")
-                        s = self._sho.get_status()
-                        _attempted = s.get("stats", {}).get("remediations_attempted", 0)
-                        _ok = s.get("stats", {}).get("remediations_successful", 0)
-                        return (True, f"SelfHealing: {_attempted} attempted, {_ok} ok")
-
-                    async def cleanup(self) -> None:
-                        self._sho = None
-
-                class _LoadSheddingAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._lsc: Optional[LoadSheddingController] = None
-
-                    async def initialize(self) -> None:
-                        self._lsc = LoadSheddingController(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._lsc is None:
-                            return (False, "LoadShedding not constructed")
-                        s = self._lsc.get_status()
-                        _shedding = s.get("shedding_active", False)
-                        _level = s.get("shedding_level", "none")
-                        return (True, f"LoadShedding: active={_shedding} level={_level}")
-
-                    async def cleanup(self) -> None:
-                        self._lsc = None
-
-                class _WorkloadBalancerAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._iwb: Optional[IntelligentWorkloadBalancer] = None
-
-                    async def initialize(self) -> None:
-                        self._iwb = IntelligentWorkloadBalancer(**self._kwargs)
-                        await self._iwb.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._iwb is None:
-                            return (False, "WorkloadBalancer not constructed")
-                        s = self._iwb.get_status()
-                        _backends = len(s.get("backends", {}))
-                        _running = s.get("running", False)
-                        return (_running, f"Balancer: {_backends} backends, running={_running}")
-
-                    async def cleanup(self) -> None:
-                        if self._iwb:
-                            await self._iwb.stop()
-                        self._iwb = None
-
-                class _TrinityHealthMonitorAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._thm: Optional[TrinityHealthMonitor] = None
-
-                    async def initialize(self) -> None:
-                        self._thm = TrinityHealthMonitor(**self._kwargs)
-                        await self._thm.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._thm is None:
-                            return (False, "TrinityHealthMonitor not constructed")
-                        s = self._thm.get_health_status()
-                        _healthy = s.get("overall_healthy", False)
-                        _comps = len(s.get("components", {}))
-                        return (_healthy, f"TrinityHealth: {_comps} components, healthy={_healthy}")
-
-                    async def cleanup(self) -> None:
-                        if self._thm:
-                            await self._thm.stop()
-                        self._thm = None
-
-                # ── Phase 9 Adapter Classes: Cross-Repo Intelligence ───────
-
-                class _TrinityIPCHubAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._hub: Optional[TrinityIPCHub] = None
-
-                    async def initialize(self) -> None:
-                        self._hub = TrinityIPCHub(**self._kwargs)
-                        await self._hub.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._hub is None:
-                            return (False, "IPC Hub not constructed")
-                        s = self._hub.get_status()
-                        _running = s.get("running", False)
-                        _msgs = s.get("stats", {}).get("messages_sent", 0)
-                        _chs = len(s.get("channels", {}))
-                        return (_running, f"IPC: {_msgs} msgs, {_chs} ch")
-
-                    async def cleanup(self) -> None:
-                        if self._hub:
-                            await self._hub.stop()
-                        self._hub = None
-
-                class _DistributedStateAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._dsc: Optional[DistributedStateCoordinator] = None
-
-                    async def initialize(self) -> None:
-                        self._dsc = DistributedStateCoordinator(**self._kwargs)
-                        await self._dsc.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._dsc is None:
-                            return (False, "DistributedState not constructed")
-                        s = self._dsc.get_status()
-                        _running = s.get("running", False)
-                        _ns = len(s.get("namespaces", {}))
-                        return (_running, f"DState: {_ns} namespaces, running={_running}")
-
-                    async def cleanup(self) -> None:
-                        if self._dsc:
-                            await self._dsc.stop()
-                        self._dsc = None
-
-                class _TrinityOrchAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._toe: Optional[TrinityOrchestrationEngine] = None
-
-                    async def initialize(self) -> None:
-                        self._toe = TrinityOrchestrationEngine(**self._kwargs)
-                        await self._toe.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._toe is None:
-                            return (False, "TrinityOrch not constructed")
-                        s = self._toe.get_status()
-                        _state = s.get("state", "unknown")
-                        _leader = s.get("leader_id", "none")
-                        return (_state != "OFFLINE", f"Orch: state={_state}, leader={_leader}")
-
-                    async def cleanup(self) -> None:
-                        if self._toe:
-                            await self._toe.stop()
-                        self._toe = None
-
-                class _DataFlywheelAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._dfw: Optional[DataFlywheelManager] = None
-
-                    async def initialize(self) -> None:
-                        self._dfw = DataFlywheelManager(**self._kwargs)
-                        await self._dfw.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._dfw is None:
-                            return (False, "DataFlywheel not constructed")
-                        s = self._dfw.get_stats()
-                        _running = s.get("running", False)
-                        _captured = s.get("total_captured", 0)
-                        return (_running, f"Flywheel: {_captured} captured, running={_running}")
-
-                    async def cleanup(self) -> None:
-                        if self._dfw:
-                            await self._dfw.stop()
-                        self._dfw = None
-
-                class _ExperienceForwarderAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._fwd: Optional[CrossRepoExperienceForwarder] = None
-
-                    async def initialize(self) -> None:
-                        self._fwd = CrossRepoExperienceForwarder(**self._kwargs)
-                        await self._fwd.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._fwd is None:
-                            return (False, "ExperienceForwarder not constructed")
-                        s = self._fwd.get_status()
-                        _running = s.get("running", False)
-                        _buf = s.get("buffer_size", 0)
-                        return (_running, f"Forwarder: buf={_buf}, running={_running}")
-
-                    async def cleanup(self) -> None:
-                        if self._fwd:
-                            await self._fwd.stop()
-                        self._fwd = None
-
-                class _TrainingOrchestratorAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._to: Optional[TrainingOrchestrator] = None
-
-                    async def initialize(self) -> None:
-                        self._to = TrainingOrchestrator(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._to is None:
-                            return (False, "TrainingOrch not constructed")
-                        s = self._to.get_stats()
-                        _jobs = s.get("jobs_scheduled", 0)
-                        _done = s.get("jobs_completed", 0)
-                        return (True, f"Training: {_jobs} scheduled, {_done} done")
-
-                    async def cleanup(self) -> None:
-                        self._to = None
-
-                class _CollectiveAIAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._cai: Optional[CollectiveAI] = None
-
-                    async def initialize(self) -> None:
-                        self._cai = CollectiveAI(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._cai is None:
-                            return (False, "CollectiveAI not constructed")
-                        s = self._cai.get_stats()
-                        _insights = s.get("total_insights", 0)
-                        _patterns = s.get("total_patterns", 0)
-                        return (True, f"Collective: {_insights} insights, {_patterns} patterns")
-
-                    async def cleanup(self) -> None:
-                        self._cai = None
-
-                # ── v4 Phase 10: Infrastructure & Security adapters ──────────
-
-                class _ConnectionPoolManagerAdapter(SystemService):
-                    def __init__(self) -> None:
-                        self._cpm: Optional[ConnectionPoolManager] = None
-
-                    async def initialize(self) -> None:
-                        self._cpm = ConnectionPoolManager()
-                        await self._cpm.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._cpm is None:
-                            return (False, "ConnPool not constructed")
-                        s = self._cpm.get_all_status()
-                        return (s.get("running", False), f"Pools: {s.get('pools_count', 0)}, conns: {s.get('total_connections', 0)}")
-
-                    async def cleanup(self) -> None:
-                        if self._cpm:
-                            await self._cpm.stop()
-                        self._cpm = None
-
-                class _SecretVaultAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._svm: Optional[SecretVaultManager] = None
-
-                    async def initialize(self) -> None:
-                        self._svm = SecretVaultManager(**self._kwargs)
-                        await self._svm.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._svm is None:
-                            return (False, "Vault not constructed")
-                        s = self._svm.get_status()
-                        return (s.get("running", False), f"Vault: {s.get('secrets_count', 0)} secrets")
-
-                    async def cleanup(self) -> None:
-                        if self._svm:
-                            await self._svm.stop()
-                        self._svm = None
-
-                class _BatchProcessorAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._bp: Optional[BatchProcessor] = None
-
-                    async def initialize(self) -> None:
-                        self._bp = BatchProcessor(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._bp is None:
-                            return (False, "BatchProc not constructed")
-                        s = self._bp.get_status()
-                        return (True, f"Batch: {s.get('active_jobs', 0)} active, concurrency={s.get('max_concurrency', 0)}")
-
-                    async def cleanup(self) -> None:
-                        self._bp = None
-
-                class _PerformanceProfilerAdapter(SystemService):
-                    def __init__(self, config: Any) -> None:
-                        self._config = config
-                        self._pp: Optional[PerformanceProfiler] = None
-
-                    async def initialize(self) -> None:
-                        self._pp = PerformanceProfiler(self._config)
-                        if not await self._pp.initialize():
-                            raise RuntimeError("PerformanceProfiler.initialize() returned False")
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._pp is None:
-                            return (False, "Profiler not constructed")
-                        _hot = self._pp.get_hot_paths(limit=1)
-                        _top = _hot[0]["function_name"] if _hot else "none"
-                        return (True, f"Profiler: enabled={self._pp._enabled}, hottest={_top}")
-
-                    async def cleanup(self) -> None:
-                        if self._pp:
-                            self._pp.clear()
-                        self._pp = None
-
-                class _ServiceMeshRouterAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._smr: Optional[ServiceMeshRouter] = None
-
-                    async def initialize(self) -> None:
-                        self._smr = ServiceMeshRouter(**self._kwargs)
-                        await self._smr.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._smr is None:
-                            return (False, "Mesh not constructed")
-                        s = self._smr.get_status()
-                        return (s.get("running", False), f"Mesh: {len(s.get('services', {}))} svc")
-
-                    async def cleanup(self) -> None:
-                        if self._smr:
-                            await self._smr.stop()
-                        self._smr = None
-
-                class _CronSchedulerAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._cs: Optional[CronScheduler] = None
-
-                    async def initialize(self) -> None:
-                        self._cs = CronScheduler(**self._kwargs)
-                        await self._cs.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._cs is None:
-                            return (False, "Cron not constructed")
-                        s = self._cs.get_status()
-                        return (s.get("running", False), f"Cron: {s.get('jobs_count', 0)} jobs, {s.get('enabled_jobs', 0)} enabled")
-
-                    async def cleanup(self) -> None:
-                        if self._cs:
-                            await self._cs.stop()
-                        self._cs = None
-
-                # ── v4 Phase 11: Operational Intelligence adapters ───────────
-
-                class _CacheInvalidationAdapter(SystemService):
-                    def __init__(self) -> None:
-                        self._cic: Optional[CacheInvalidationCoordinator] = None
-
-                    async def initialize(self) -> None:
-                        self._cic = CacheInvalidationCoordinator()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._cic is None:
-                            return (False, "CacheInval not constructed")
-                        s = self._cic.get_status()
-                        return (True, f"CacheInval: {s.get('regions', 0)} regions, {s.get('total_keys_tracked', 0)} keys")
-
-                    async def cleanup(self) -> None:
-                        self._cic = None
-
-                class _ResourceCleanupAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._rcc: Optional[ResourceCleanupCoordinator] = None
-
-                    async def initialize(self) -> None:
-                        self._rcc = ResourceCleanupCoordinator(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._rcc is None:
-                            return (False, "Cleanup not constructed")
-                        s = self._rcc.get_statistics()
-                        return (True, f"Cleanup: {s.get('registered_tasks', 0)} tasks ({s.get('critical_tasks', 0)} critical)")
-
-                    async def cleanup(self) -> None:
-                        # Execute all registered cleanup handlers before tearing down
-                        if self._rcc:
-                            try:
-                                await self._rcc.execute_cleanup()
-                            except Exception:
-                                pass
-                        self._rcc = None
-
-                class _HealthCheckOrchestratorAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._hco: Optional[HealthCheckOrchestrator] = None
-
-                    async def initialize(self) -> None:
-                        self._hco = HealthCheckOrchestrator(**self._kwargs)
-                        await self._hco.start()
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._hco is None:
-                            return (False, "HealthOrch not constructed")
-                        s = self._hco.get_status()
-                        return (s.get("all_healthy", False), f"HealthOrch: {s.get('checks_registered', 0)} checks")
-
-                    async def cleanup(self) -> None:
-                        if self._hco:
-                            await self._hco.stop()
-                        self._hco = None
-
-                class _AnomalyDetectorAdapter(SystemService):
-                    def __init__(self, config: Any) -> None:
-                        self._config = config
-                        self._ad: Optional[AnomalyDetector] = None
-
-                    async def initialize(self) -> None:
-                        self._ad = AnomalyDetector(self._config)
-                        if not await self._ad.initialize():
-                            raise RuntimeError("AnomalyDetector.initialize() returned False")
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._ad is None:
-                            return (False, "AnomalyDet not constructed")
-                        _recent = self._ad.get_recent_anomalies(limit=5)
-                        return (True, f"AnomalyDet: {len(_recent)} recent anomalies")
-
-                    async def cleanup(self) -> None:
-                        self._ad = None
-
-                class _AlertingManagerAdapter(SystemService):
-                    def __init__(self, config: Any) -> None:
-                        self._config = config
-                        self._am: Optional[AlertingManager] = None
-
-                    async def initialize(self) -> None:
-                        self._am = AlertingManager(self._config)
-                        if not await self._am.initialize():
-                            raise RuntimeError("AlertingManager.initialize() returned False")
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._am is None:
-                            return (False, "Alerting not constructed")
-                        s = self._am.get_statistics()
-                        return (True, f"Alerting: {s.get('rules_count', 0)} rules, {s.get('active_alerts', 0)} active")
-
-                    async def cleanup(self) -> None:
-                        self._am = None
-
-                class _AutoScalingControllerAdapter(SystemService):
-                    def __init__(self, **kwargs: Any) -> None:
-                        self._kwargs = kwargs
-                        self._asc: Optional[AutoScalingController] = None
-
-                    async def initialize(self) -> None:
-                        self._asc = AutoScalingController(**self._kwargs)
-
-                    async def health_check(self) -> Tuple[bool, str]:
-                        if self._asc is None:
-                            return (False, "AutoScale not constructed")
-                        s = self._asc.get_status()
-                        return (True, f"AutoScale: {s.get('current_replicas', 0)} replicas")
-
-                    async def cleanup(self) -> None:
-                        self._asc = None
-
                 # Activate cross-repo phase
                 try:
                     _ssr_r7 = await self._service_registry.activate_phase(_xrepo_phase)
@@ -73190,523 +71676,6 @@ class JarvisSystemKernel:
                     )
                 except Exception as _ssr_e:
                     self.logger.warning(f"[Kernel] Phase 7 SSR activation error: {_ssr_e}")
-
-                # ── Phase 8: Self-Healing & Resilience ─────────────────────
-                try:
-                    _ssr_r8 = await self._service_registry.activate_phase(8)
-                    self.logger.info(f"[Kernel] Self-healing services: {_ssr_r8}")
-
-                    _ha = self._service_registry.get("health_aggregator")
-
-                    # W10: HealthAggregator → ProcessHealthPredictor
-                    _php_adapter = self._service_registry._services.get("process_health_predictor")
-                    _php = _php_adapter.service._p if _php_adapter and _php_adapter.initialized else None
-                    if _php and _ha and hasattr(_ha, 'register_alert_callback'):
-                        def _php_alert_cb(subsystem_id: str, health_data: Any, _php_ref: Any = _php) -> None:
-                            try:
-                                _metrics = {}
-                                if isinstance(health_data, dict):
-                                    _metrics = {
-                                        k: float(v) for k, v in health_data.items()
-                                        if isinstance(v, (int, float))
-                                    }
-                                elif isinstance(health_data, tuple) and len(health_data) >= 2:
-                                    _metrics = {"healthy": 1.0 if health_data[0] else 0.0}
-                                if _metrics:
-                                    _php_ref.record_metrics(subsystem_id, _metrics)
-                            except Exception:
-                                pass
-                        _ha.register_alert_callback(_php_alert_cb)
-
-                    # W11: SelfHealingOrchestrator remediation handlers (RF2)
-                    _sho_adapter = self._service_registry._services.get("self_healing_orchestrator")
-                    _sho = _sho_adapter.service._sho if _sho_adapter and _sho_adapter.initialized else None
-                    if _sho:
-                        # Wire health predictor into orchestrator
-                        if _php:
-                            _sho._health_predictor = _php
-
-                        _RS = SelfHealingOrchestrator.RemediationStrategy
-
-                        async def _restart_backend_component(component: str) -> bool:
-                            try:
-                                if hasattr(self, '_phase_backend') and "backend" in component:
-                                    self.logger.info(f"[SelfHeal] Attempting backend restart for {component}")
-                                    return True  # Signal success — actual restart is complex
-                                return False
-                            except Exception:
-                                return False
-
-                        async def _restart_prime_component(component: str) -> bool:
-                            try:
-                                if hasattr(self, '_restart_prime'):
-                                    self.logger.info(f"[SelfHeal] Attempting Prime restart for {component}")
-                                    return True
-                                return False
-                            except Exception:
-                                return False
-
-                        async def _failover_component(component: str) -> bool:
-                            try:
-                                self.logger.info(f"[SelfHeal] Failover requested for {component}")
-                                return False  # No automatic failover yet
-                            except Exception:
-                                return False
-
-                        _sho.register_handler(_RS.RESTART, _restart_backend_component)
-                        _sho.register_handler(_RS.FAILOVER, _failover_component)
-                        _sho.register_handler(_RS.NOTIFY_ONLY, lambda c: asyncio.coroutine(lambda: True)())  # noqa: always succeeds
-
-                    # W12: LoadSheddingController — store for monitoring loop
-                    _lsc_adapter = self._service_registry._services.get("load_shedding_controller")
-                    _lsc = _lsc_adapter.service._lsc if _lsc_adapter and _lsc_adapter.initialized else None
-                    if _lsc:
-                        self._load_shedding = _lsc
-
-                    # W-RL: v2 _rate_limiter → LoadSheddingController (RF7)
-                    _rl = getattr(self, '_rate_limiter', None)
-                    if _rl and _lsc and hasattr(_lsc, 'add_policy'):
-                        _lsc.add_policy(
-                            name="rate_limiter_tighten",
-                            threshold=85.0,
-                            action="delay",
-                            priority_threshold=3,
-                        )
-
-                    # W13: WorkloadBalancer backend registration (RF1: uses add_backend)
-                    _iwb_adapter = self._service_registry._services.get("workload_balancer")
-                    _iwb = _iwb_adapter.service._iwb if _iwb_adapter and _iwb_adapter.initialized else None
-                    if _iwb:
-                        _prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8080")
-                        _reactor_url = os.getenv("JARVIS_REACTOR_CORE_URL", "http://localhost:8090")
-                        _iwb.add_backend(
-                            backend_id="prime", url=_prime_url,
-                            weight=3, max_connections=100,
-                            capabilities=["inference", "generation"],
-                        )
-                        _iwb.add_backend(
-                            backend_id="reactor", url=_reactor_url,
-                            weight=1, max_connections=50,
-                            capabilities=["training", "evaluation"],
-                        )
-
-                    # W14: TrinityHealthMonitor → HealthAggregator
-                    _thm_adapter = self._service_registry._services.get("trinity_health_monitor")
-                    _thm = _thm_adapter.service._thm if _thm_adapter and _thm_adapter.initialized else None
-                    if _thm and _ha and hasattr(_ha, 'register_subsystem'):
-                        for _trinity_sub in ("trinity_jarvis", "trinity_prime", "trinity_reactor"):
-                            try:
-                                _ha.register_subsystem(
-                                    subsystem_id=_trinity_sub,
-                                    name=_trinity_sub,
-                                    health_check_fn=lambda sid=_trinity_sub, m=_thm: (
-                                        m.get_health_status().get("components", {}).get(sid, {}).get("healthy", False),
-                                        f"{sid} monitored",
-                                    ),
-                                )
-                            except Exception:
-                                pass
-
-                    # W15: TrinityHealthMonitor → SelfHealingOrchestrator recovery
-                    if _thm and _sho:
-                        for _comp_name in ("jarvis_prime", "reactor_core"):
-                            try:
-                                _thm.register_recovery_callback(
-                                    _comp_name,
-                                    lambda cn=_comp_name, sho=_sho: sho.check_and_remediate(
-                                        cn, sho._health_predictor.get_health_score(cn) if sho._health_predictor else 50.0, 0.5,
-                                    ),
-                                )
-                            except Exception:
-                                pass
-
-                except Exception as _ssr8_e:
-                    self.logger.warning(f"[Kernel] Phase 8 SSR activation error: {_ssr8_e}")
-
-                # ── Phase 9: Cross-Repo Intelligence ───────────────────────
-                try:
-                    _ssr_r9 = await self._service_registry.activate_phase(9)
-                    self.logger.info(f"[Kernel] Cross-repo intelligence services: {_ssr_r9}")
-
-                    _ha = self._service_registry.get("health_aggregator")
-                    _es = getattr(self, '_event_sourcing', None) or self._service_registry.get("event_sourcing")
-                    _mb = self._service_registry.get("message_broker")
-
-                    # Extract inner instances from adapters
-                    _ipc_adapter = self._service_registry._services.get("ipc_hub")
-                    _ipc = _ipc_adapter.service._hub if _ipc_adapter and _ipc_adapter.initialized else None
-
-                    _dsc_adapter = self._service_registry._services.get("distributed_state")
-                    _dsc = _dsc_adapter.service._dsc if _dsc_adapter and _dsc_adapter.initialized else None
-
-                    _toe_adapter = self._service_registry._services.get("trinity_orchestration")
-                    _toe = _toe_adapter.service._toe if _toe_adapter and _toe_adapter.initialized else None
-
-                    _dfw_adapter = self._service_registry._services.get("data_flywheel")
-                    _dfw = _dfw_adapter.service._dfw if _dfw_adapter and _dfw_adapter.initialized else None
-
-                    _fwd_adapter = self._service_registry._services.get("experience_forwarder")
-                    _fwd = _fwd_adapter.service._fwd if _fwd_adapter and _fwd_adapter.initialized else None
-
-                    _to_adapter = self._service_registry._services.get("training_orchestrator")
-                    _to = _to_adapter.service._to if _to_adapter and _to_adapter.initialized else None
-
-                    _cai_adapter = self._service_registry._services.get("collective_ai")
-                    _cai = _cai_adapter.service._cai if _cai_adapter and _cai_adapter.initialized else None
-
-                    # W16: TrinityIPCHub ↔ MessageBroker bridge
-                    if _ipc and _mb:
-                        # IPC pubsub → broker ipc_events topic
-                        if hasattr(_mb, 'create_topic'):
-                            try:
-                                _mb.create_topic("ipc_events")
-                            except Exception:
-                                pass
-
-                        if hasattr(_ipc, 'subscribe') and hasattr(_mb, 'publish'):
-                            def _ipc_to_broker(msg: Dict[str, Any], _mb_ref: Any = _mb) -> None:
-                                try:
-                                    asyncio.get_event_loop().create_task(
-                                        _mb_ref.publish("ipc_events", msg)
-                                    ) if asyncio.get_event_loop().is_running() else None
-                                except Exception:
-                                    pass
-                            _ipc.subscribe("cross_repo_bridge", _ipc_to_broker)
-
-                    # W17: DataFlywheel → ExperienceForwarder pipeline (RF5)
-                    if _dfw and _fwd:
-                        _orig_flush = _dfw._flush_buffer
-
-                        async def _chained_flush(
-                            _orig: Any = _orig_flush,
-                            _dfw_ref: Any = _dfw,
-                            _fwd_ref: Any = _fwd,
-                        ) -> None:
-                            _batch = list(getattr(_dfw_ref, '_experience_buffer', []))
-                            await _orig()
-                            if _batch:
-                                for _exp in _batch:
-                                    try:
-                                        await _fwd_ref.add_experience(
-                                            _exp.get("type", "unknown"),
-                                            _exp,
-                                            _exp.get("quality_score", 0.5),
-                                        )
-                                    except Exception:
-                                        pass
-
-                        _dfw._flush_buffer = _chained_flush
-
-                    # W18: ExperienceForwarder → EventSourcing audit
-                    if _fwd and _es and hasattr(_es, 'record_event'):
-                        _orig_send = getattr(_fwd, '_send_batch', None)
-                        if _orig_send:
-                            async def _audited_send(
-                                batch: Any,
-                                _orig: Any = _orig_send,
-                                _es_ref: Any = _es,
-                            ) -> Any:
-                                _result = await _orig(batch)
-                                try:
-                                    await _es_ref.record_event(
-                                        "experience_batch_forwarded",
-                                        {"batch_size": len(batch) if batch else 0},
-                                    )
-                                except Exception:
-                                    pass
-                                return _result
-                            _fwd._send_batch = _audited_send
-
-                    # W19: CollectiveAI → EventSourcing
-                    if _cai and _es and hasattr(_es, 'record_event'):
-                        if hasattr(_cai, 'register_recommendation_callback'):
-                            def _cai_es_cb(rec: Any, _es_ref: Any = _es) -> None:
-                                try:
-                                    asyncio.get_event_loop().create_task(
-                                        _es_ref.record_event("collective_ai_recommendation", {"recommendation": str(rec)})
-                                    ) if asyncio.get_event_loop().is_running() else None
-                                except Exception:
-                                    pass
-                            _cai.register_recommendation_callback(_cai_es_cb)
-
-                    # W20: CollectiveAI → NeuralMesh
-                    _nmb = getattr(self, '_neural_mesh_bridge', None)
-                    if _cai and _nmb and hasattr(_cai, 'connect_neural_mesh'):
-                        try:
-                            _cai.connect_neural_mesh(_nmb)
-                        except Exception:
-                            pass
-
-                    # RF6: Cap CollectiveAI collections
-                    if _cai:
-                        if not hasattr(_cai, '_max_patterns'):
-                            _cai._max_patterns = 500
-                        if not hasattr(_cai, '_max_insights'):
-                            _cai._max_insights = 200
-                        # Store for monitoring loop access
-                        self._collective_ai = _cai
-
-                    # W-TOE: TrinityOrchestrationEngine subordinate check (RF4)
-                    if _toe:
-                        _ti = getattr(self, '_trinity_integrator', None)
-                        if _ti:
-                            # TrinityIntegrator active — operate in subordinate mode
-                            _toe._subordinate_mode = True
-                            self.logger.info("[Kernel] TrinityOrchestrationEngine: subordinate mode (TrinityIntegrator active)")
-
-                    # W-LM: v2 _system_lock_manager → TrinityOrchestration (RF7)
-                    _dlm = getattr(self, '_system_lock_manager', None)
-                    if _dlm and _toe:
-                        _toe._distributed_lock_manager = _dlm
-                        self.logger.debug("[Kernel] TrinityOrch: DLM wired for leader election")
-
-                    # W21: GDM → register Phase 8+9 features for degradation
-                    _gd = self._service_registry.get("degradation_manager")
-                    if _gd and hasattr(_gd, 'register_feature'):
-                        _gd.register_feature("self_healing", priority=2, description="Self-healing orchestration")
-                        _gd.register_feature("health_prediction", priority=2, description="Health prediction")
-                        _gd.register_feature("ipc_hub", priority=3, description="Trinity IPC Hub")
-                        _gd.register_feature("distributed_state", priority=3, description="Distributed state coordination")
-                        _gd.register_feature("workload_balancer", priority=3, description="Workload balancing")
-                        _gd.register_feature("data_flywheel", priority=4, description="Data flywheel capture")
-                        _gd.register_feature("experience_forwarding", priority=4, description="Experience forwarding")
-                        _gd.register_feature("training_orchestration", priority=4, description="Training orchestration")
-                        _gd.register_feature("collective_ai", priority=4, description="Collective AI intelligence")
-
-                    # W22: Update SSR stats with Phase 8+9 counts
-                    _stats = self._service_registry.stats
-                    _p8_count = sum(
-                        1 for n in ("process_health_predictor", "self_healing_orchestrator",
-                                    "load_shedding_controller", "workload_balancer", "trinity_health_monitor")
-                        if self._service_registry.get(n)
-                    )
-                    _p9_count = sum(
-                        1 for n in ("ipc_hub", "distributed_state", "trinity_orchestration",
-                                    "data_flywheel", "experience_forwarder", "training_orchestrator", "collective_ai")
-                        if self._service_registry.get(n)
-                    )
-                    self._update_component_status(
-                        "system_services", "running",
-                        f"{_stats['active']}/{_stats['total_registered']} active "
-                        f"(P7: cross-repo, P8: {_p8_count} self-heal, P9: {_p9_count} intelligence)"
-                    )
-
-                except Exception as _ssr9_e:
-                    self.logger.warning(f"[Kernel] Phase 9 SSR activation error: {_ssr9_e}")
-
-                # ── v4 Phase 10: Infrastructure & Security activation ────────
-                _infra_phase = 10
-                try:
-                    _ssr_r10 = await self._service_registry.activate_phase(_infra_phase)
-                    self.logger.info(f"[Kernel] Phase 10 infrastructure services: {_ssr_r10}")
-
-                    # W30: ServiceMeshRouter → register Prime/Reactor endpoints
-                    _smr_svc = self._service_registry.get("service_mesh_router")
-                    _smr = _smr_svc._smr if _smr_svc else None
-                    if _smr:
-                        _prime_host = os.getenv("JARVIS_PRIME_HOST", "127.0.0.1")
-                        _prime_port = int(os.getenv("JARVIS_PRIME_PORT", "8100"))
-                        _smr.register_endpoint("prime", "prime_main", _prime_host, _prime_port, weight=3.0)
-                        _reactor_host = os.getenv("JARVIS_REACTOR_HOST", "127.0.0.1")
-                        _reactor_port = int(os.getenv("JARVIS_REACTOR_PORT", "8200"))
-                        _smr.register_endpoint("reactor", "reactor_main", _reactor_host, _reactor_port, weight=2.0)
-                        self.logger.debug("[Kernel] W30: ServiceMeshRouter endpoints registered")
-
-                    # W31: PerformanceProfiler → store kernel-level reference
-                    _pp_svc = self._service_registry.get("performance_profiler")
-                    if _pp_svc and _pp_svc._pp:
-                        self._performance_profiler = _pp_svc._pp
-                        self.logger.debug("[Kernel] W31: PerformanceProfiler stored for kernel access")
-
-                    # W32: SecretVaultManager → store kernel-level reference
-                    _sv_svc = self._service_registry.get("secret_vault")
-                    if _sv_svc and _sv_svc._svm:
-                        self._secret_vault = _sv_svc._svm
-                        self.logger.debug("[Kernel] W32: SecretVault stored for kernel access")
-
-                except Exception as _ssr10_e:
-                    self.logger.warning(f"[Kernel] Phase 10 SSR activation error: {_ssr10_e}")
-
-                # ── v4 Phase 11: Operational Intelligence activation ─────────
-                _ops_intel_phase = 11
-                try:
-                    _ssr_r11 = await self._service_registry.activate_phase(_ops_intel_phase)
-                    self.logger.info(f"[Kernel] Phase 11 operational intelligence services: {_ssr_r11}")
-
-                    # W33: CacheInvalidationCoordinator → CacheHierarchyManager broadcast
-                    # CacheHierarchyManager is registered directly (no adapter wrapper)
-                    # Its invalidation method is delete(key), not invalidate()
-                    _cic_svc = self._service_registry.get("cache_invalidation")
-                    _cic = _cic_svc._cic if _cic_svc else None
-                    _chm_direct = self._service_registry.get("cache_hierarchy")
-                    if _cic and _chm_direct and hasattr(_chm_direct, 'delete'):
-                        async def _cic_broadcast(inv_type: str, targets: list, _chm_ref=_chm_direct) -> None:
-                            for _t in targets:
-                                try:
-                                    await _chm_ref.delete(_t)
-                                except Exception:
-                                    pass
-                        _cic._broadcast_callback = _cic_broadcast
-                        self.logger.debug("[Kernel] W33: CacheInvalidation → CacheHierarchy broadcast wired")
-
-                    # W34: HealthCheckOrchestrator → all SSR services (exclude self)
-                    _hco_svc = self._service_registry.get("health_check_orchestrator")
-                    _hco = _hco_svc._hco if _hco_svc else None
-                    if _hco:
-                        for _svc_name, _svc_desc in self._service_registry._services.items():
-                            if _svc_name == "health_check_orchestrator":
-                                continue  # Flaw G: avoid circular monitoring
-                            if _svc_desc.initialized and _svc_desc.service:
-                                try:
-                                    _hco.register_check(
-                                        _svc_name,
-                                        HealthCheckType.READINESS,
-                                        _svc_desc.service.health_check,
-                                    )
-                                except Exception:
-                                    pass
-                        self.logger.debug(f"[Kernel] W34: HealthCheckOrchestrator registered {len(self._service_registry._services) - 1} checks")
-
-                    # W35: AnomalyDetector ← HealthAggregator alert callback
-                    # HealthAggregator is registered directly (no adapter wrapper)
-                    # Callback signature: (str, SubsystemHealth) → Awaitable[None]
-                    _ad_svc = self._service_registry.get("anomaly_detector")
-                    _ad = _ad_svc._ad if _ad_svc else None
-                    _ha_direct = self._service_registry.get("health_aggregator")
-                    if _ad and _ha_direct and hasattr(_ha_direct, 'register_alert_callback'):
-                        async def _ha_to_ad_cb(name: str, health, _ad_ref=_ad) -> None:
-                            _metrics = {
-                                "response_time_ms": health.response_time_ms,
-                                "is_healthy": 1.0 if health.status == "healthy" else 0.0,
-                            }
-                            _meta = {"subsystem": name, "status": health.status, "message": health.message}
-                            await _ad_ref.record_observation("health", _metrics, metadata=_meta)
-                        _ha_direct.register_alert_callback(_ha_to_ad_cb)
-                        self.logger.debug("[Kernel] W35: HealthAggregator → AnomalyDetector wired")
-
-                    # W36: AlertingManager ← AnomalyDetector handler
-                    _am_svc = self._service_registry.get("alerting_manager")
-                    _am = _am_svc._am if _am_svc else None
-                    if _am and _ad:
-                        async def _ad_to_am_handler(score, metadata) -> None:
-                            try:
-                                await _am.record_metric("anomaly_score", score.score if hasattr(score, 'score') else float(score))
-                            except Exception:
-                                pass
-                        _ad.register_handler(_ad_to_am_handler)
-                        self.logger.debug("[Kernel] W36: AnomalyDetector → AlertingManager handler wired")
-
-                    # W37: AutoScalingController ← CronScheduler + LoadShedding
-                    _asc_svc = self._service_registry.get("auto_scaling_controller")
-                    _asc = _asc_svc._asc if _asc_svc else None
-                    _cs_svc = self._service_registry.get("cron_scheduler")
-                    _cs = _cs_svc._cs if _cs_svc else None
-                    if _asc and _cs:
-                        async def _asc_evaluate_job() -> None:
-                            try:
-                                await _asc.evaluate()
-                            except Exception:
-                                pass
-                        _cs.schedule("autoscale_evaluate", "*/2 * * * *", _asc_evaluate_job, enabled=True)
-                        self.logger.debug("[Kernel] W37: AutoScaling evaluate scheduled every 2min via CronScheduler")
-
-                    # W38: ResourceCleanupCoordinator → kernel-level resources
-                    # NOTE: SSR services are NOT registered here because SSR.shutdown_all()
-                    # already calls each service's cleanup() in reverse activation order.
-                    # Registering them here would cause double-cleanup. Instead, RCC handles
-                    # non-SSR kernel resources (aiohttp sessions, background tasks, etc.)
-                    _rcc_svc = self._service_registry.get("resource_cleanup")
-                    _rcc = _rcc_svc._rcc if _rcc_svc else None
-                    if _rcc:
-                        _rcc_count = 0
-                        # Register kernel-level aiohttp session cleanup
-                        _http_sess = getattr(self, '_http_session', None)
-                        if _http_sess:
-                            async def _cleanup_http(_s=_http_sess):
-                                try:
-                                    await _s.close()
-                                    return True
-                                except Exception:
-                                    return False
-                            _rcc.register_cleanup("kernel_http_session", _cleanup_http, priority=40)
-                            _rcc_count += 1
-                        # Register kernel-level background task cancellation
-                        _bg_tasks = getattr(self, '_background_tasks', None)
-                        if _bg_tasks:
-                            async def _cleanup_bg_tasks(_tasks=_bg_tasks):
-                                try:
-                                    for _t in list(_tasks):
-                                        if not _t.done():
-                                            _t.cancel()
-                                    return True
-                                except Exception:
-                                    return False
-                            _rcc.register_cleanup("kernel_background_tasks", _cleanup_bg_tasks, priority=30, critical=True)
-                            _rcc_count += 1
-                        self.logger.debug(f"[Kernel] W38: ResourceCleanup registered {_rcc_count} kernel handlers")
-
-                    # W39: CronScheduler periodic jobs
-                    # NOTE: No cron health sweep — HealthCheckOrchestrator has its own
-                    # background loop (check_interval), and SSR health_check_all() runs
-                    # every 10s in the monitoring loop. Adding a third would triple-fire.
-                    if _cs and _ad:
-                        async def _anomaly_baseline_job() -> None:
-                            try:
-                                await _ad.record_observation("baseline_refresh", {"heartbeat": 1.0})
-                            except Exception:
-                                pass
-                        _cs.schedule("anomaly_baseline", "0 * * * *", _anomaly_baseline_job, enabled=True)
-                        self.logger.debug("[Kernel] W39: Anomaly baseline refresh scheduled hourly")
-
-                    # W40: GDM → register Phase 10+11 features for degradation
-                    _gd = self._service_registry.get("degradation_manager")
-                    if _gd and hasattr(_gd, 'register_feature'):
-                        _gd.register_feature("connection_pool", priority=3, description="Connection pool management")
-                        _gd.register_feature("secrets_vault", priority=2, description="Secret vault management")
-                        _gd.register_feature("service_mesh", priority=3, description="Service mesh routing")
-                        _gd.register_feature("cron_scheduler", priority=4, description="Cron job scheduling")
-                        _gd.register_feature("cache_invalidation", priority=3, description="Cache invalidation coordination")
-                        _gd.register_feature("alerting", priority=2, description="Alerting and notification")
-                        _gd.register_feature("profiler", priority=4, description="Performance profiling")
-                        _gd.register_feature("anomaly_detection", priority=2, description="Anomaly detection")
-                        _gd.register_feature("auto_scaling", priority=3, description="Auto-scaling control")
-                        _gd.register_feature("batch_processing", priority=4, description="Batch processing")
-                        _gd.register_feature("health_orchestration", priority=2, description="Health check orchestration")
-                        _gd.register_feature("resource_cleanup", priority=2, description="Resource cleanup coordination")
-                        self.logger.debug("[Kernel] W40: GDM registered 12 Phase 10+11 features")
-
-                    # W41: SSR stats → component_status with Phase 10+11 counts
-                    # Recompute P8/P9 counts locally (cannot rely on Phase 9 try-block vars)
-                    _stats = self._service_registry.stats
-                    _p8_cnt = sum(
-                        1 for n in ("process_health_predictor", "self_healing_orchestrator",
-                                    "load_shedding_controller", "workload_balancer", "trinity_health_monitor")
-                        if self._service_registry.get(n)
-                    )
-                    _p9_cnt = sum(
-                        1 for n in ("ipc_hub", "distributed_state", "trinity_orchestration",
-                                    "data_flywheel", "experience_forwarder", "training_orchestrator", "collective_ai")
-                        if self._service_registry.get(n)
-                    )
-                    _p10_count = sum(
-                        1 for n in ("connection_pool_manager", "secret_vault", "batch_processor",
-                                    "performance_profiler", "service_mesh_router", "cron_scheduler")
-                        if self._service_registry.get(n)
-                    )
-                    _p11_count = sum(
-                        1 for n in ("cache_invalidation", "resource_cleanup", "health_check_orchestrator",
-                                    "anomaly_detector", "alerting_manager", "auto_scaling_controller")
-                        if self._service_registry.get(n)
-                    )
-                    self._update_component_status(
-                        "system_services", "running",
-                        f"{_stats['active']}/{_stats['total_registered']} active "
-                        f"(P7: cross-repo, P8: {_p8_cnt} self-heal, P9: {_p9_cnt} intelligence, "
-                        f"P10: {_p10_count} infra, P11: {_p11_count} ops-intel)"
-                    )
-
-                except Exception as _ssr11_e:
-                    self.logger.warning(f"[Kernel] Phase 11 SSR activation error: {_ssr11_e}")
 
             return True  # Enterprise services are optional
 
@@ -74718,15 +72687,12 @@ class JarvisSystemKernel:
                     self._release_browser_lock()
 
             # Step 4: Gracefully stop the loading server
-            # v264.0: Keep only a short, configurable stabilization window.
-            # The old 1.0s default added fixed startup latency even when redirect
-            # was already complete.
-            redirect_stabilization_delay = max(
-                0.0,
-                float(os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "0.25")),
+            # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
+            # The loading server also has transition grace period protection
+            redirect_stabilization_delay = float(
+                os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "1.0")
             )
-            if redirect_stabilization_delay > 0:
-                await asyncio.sleep(redirect_stabilization_delay)
+            await asyncio.sleep(redirect_stabilization_delay)
             # The graceful shutdown will wait for Chrome to naturally disconnect
             await self._stop_loading_server()
 
@@ -74792,8 +72758,7 @@ class JarvisSystemKernel:
             self.logger.debug(f"[LoadingServer] Using system Python: {python_executable}")
 
         # Step 2: Build base environment (shared across retry attempts)
-        # v236.2: Use centralized env builder for authoritative credential propagation
-        env = _build_subprocess_env(JARVIS_KERNEL_PID=str(os.getpid()))
+        env = os.environ.copy()
         pythonpath_parts = [
             str(project_root),
             str(project_root / "backend"),
@@ -74802,6 +72767,7 @@ class JarvisSystemKernel:
         if existing_pythonpath:
             pythonpath_parts.append(existing_pythonpath)
         env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+        env["JARVIS_KERNEL_PID"] = str(os.getpid())
         frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
         env["JARVIS_FRONTEND_PORT"] = str(frontend_port)
 
@@ -75107,55 +73073,14 @@ class JarvisSystemKernel:
         # v205.0: Send final 100% progress before stopping
         # This allows the loading page to show completion before being terminated
         try:
-            frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
-            frontend_status = self._component_status.get("frontend", {}).get("status", "pending")
-            backend_status = self._component_status.get("backend", {}).get("status", "pending")
-            frontend_ready = frontend_status in ("complete", "ready")
-            backend_ready = backend_status in ("complete", "ready")
-            frontend_optional = os.environ.get("FRONTEND_OPTIONAL", "false").lower() == "true"
-
-            if frontend_ready:
-                redirect_url = f"http://localhost:{frontend_port}"
-            elif frontend_optional:
-                redirect_url = f"http://localhost:{self.config.backend_port}"
-            else:
-                redirect_url = f"http://localhost:{frontend_port}"
-
-            component_snapshot = {
-                "loading_server": self._component_status.get("loading_server", {}).get("status", "pending"),
-                "preflight": self._component_status.get("preflight", {}).get("status", "pending"),
-                "resources": self._component_status.get("resources", {}).get("status", "pending"),
-                "backend": backend_status,
-                "intelligence": self._component_status.get("intelligence", {}).get("status", "pending"),
-                "trinity": self._component_status.get("trinity", {}).get("status", "pending"),
-                "frontend": frontend_status,
-            }
-
             await self._broadcast_startup_progress(
                 stage="complete",
                 message="JARVIS startup complete",
                 progress=100,
-                metadata={
-                    "final": True,
-                    "authority": "unified_supervisor",
-                    "supervisor_verified": True,
-                    "backend_ready": backend_ready,
-                    "frontend_ready": frontend_ready,
-                    "frontend_optional": frontend_optional,
-                    "trinity_ready": self._is_trinity_ready(),
-                    "redirect_url": redirect_url,
-                    "components": component_snapshot,
-                    "component_status": component_snapshot,
-                }
+                metadata={"final": True}
             )
-            # v264.0: Keep a small configurable grace period for the browser to
-            # consume final progress before we close the loading server.
-            final_progress_grace = max(
-                0.0,
-                float(os.getenv("LOADING_SERVER_FINAL_PROGRESS_GRACE", "0.25")),
-            )
-            if final_progress_grace > 0:
-                await asyncio.sleep(final_progress_grace)
+            # Brief wait for the progress update to be received and processed
+            await asyncio.sleep(1.0)
             self.logger.debug("[LoadingServer] Sent final 100% progress before shutdown")
         except Exception as e:
             self.logger.debug(f"[LoadingServer] Could not send final progress: {e}")
@@ -75354,13 +73279,11 @@ class JarvisSystemKernel:
                 self.logger.success("[Frontend] Dependencies installed")
 
             # Configure frontend environment
-            # v236.2: Use centralized env builder for authoritative credential propagation
             frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
-            env = _build_subprocess_env(
-                PORT=str(frontend_port),
-                BROWSER="none",  # Don't auto-open browser
-                REACT_APP_BACKEND_URL=f"http://localhost:{self.config.backend_port}",
-            )
+            env = os.environ.copy()
+            env["PORT"] = str(frontend_port)
+            env["BROWSER"] = "none"  # Don't auto-open browser
+            env["REACT_APP_BACKEND_URL"] = f"http://localhost:{self.config.backend_port}"
             
             # v211.0: DO NOT set CI=true - it causes React dev server issues
             # CI mode is for build processes, not the development server
@@ -76224,47 +74147,6 @@ class JarvisSystemKernel:
                         )
                     except Exception as _ssr_e:
                         self.logger.debug(f"[SSR] Health check error: {_ssr_e}")
-
-                # v3: Feed LoadSheddingController from monitoring loop
-                _lsc_mon = getattr(self, '_load_shedding', None)
-                if _lsc_mon:
-                    try:
-                        import psutil as _ps_mon
-                        _cpu_pct = _ps_mon.cpu_percent(interval=None)
-                        _lsc_mon.record_load(_cpu_pct)
-                    except Exception:
-                        pass
-
-                # v3: CollectiveAI pattern detection (every 5th cycle ≈ 50s)
-                _cai_mon = getattr(self, '_collective_ai', None)
-                if _cai_mon:
-                    _mon_cycle = getattr(self, '_monitoring_cycle_count', 0) + 1
-                    self._monitoring_cycle_count = _mon_cycle
-                    if _mon_cycle % 5 == 0:
-                        try:
-                            _loop = asyncio.get_event_loop()
-                            await _loop.run_in_executor(None, _cai_mon.detect_patterns)
-                            # RF6: enforce collection caps
-                            if hasattr(_cai_mon, '_patterns') and len(getattr(_cai_mon, '_patterns', [])) > 500:
-                                _cai_mon._patterns = _cai_mon._patterns[-500:]
-                            if hasattr(_cai_mon, '_insights') and len(getattr(_cai_mon, '_insights', [])) > 200:
-                                _cai_mon._insights = _cai_mon._insights[-200:]
-                        except Exception:
-                            pass
-
-                # v4: Feed AutoScalingController metrics (evaluate() driven by CronScheduler W37)
-                _asc_mon = getattr(self, '_auto_scaling_controller', None)
-                if not _asc_mon:
-                    _asc_s = self._service_registry.get("auto_scaling_controller") if self._service_registry else None
-                    _asc_mon = _asc_s._asc if _asc_s else None
-                if _asc_mon:
-                    try:
-                        import psutil as _ps_asc
-                        _cpu = _ps_asc.cpu_percent(interval=None)
-                        _mem = _ps_asc.virtual_memory().percent
-                        _asc_mon.record_metrics(_cpu, _mem)
-                    except Exception:
-                        pass
 
                 await asyncio.sleep(10.0)  # Check every 10 seconds
             except asyncio.CancelledError:
@@ -79070,12 +76952,10 @@ class JarvisSystemKernel:
             pass
 
         # Step 4: Start the router process
-        # v236.2: Use centralized env builder for authoritative credential propagation
-        env = _build_subprocess_env(
-            PORT=str(router_port),
-            NODE_ENV="production",
-            PYTHONUNBUFFERED="1",
-        )
+        env = os.environ.copy()
+        env["PORT"] = str(router_port)
+        env["NODE_ENV"] = "production"
+        env["PYTHONUNBUFFERED"] = "1"
 
         # Set up log file
         log_dir = self.config.backend_dir / "logs"
@@ -80376,11 +78256,9 @@ class JarvisSystemKernel:
             return False
 
         try:
-            # v236.2: Use centralized env builder for authoritative credential propagation
-            env = _build_subprocess_env(
-                JARVIS_KERNEL_PID=str(os.getpid()),
-                TRINITY_COORDINATOR="jarvis",
-            )
+            env = os.environ.copy()
+            env["JARVIS_KERNEL_PID"] = str(os.getpid())
+            env["TRINITY_COORDINATOR"] = "jarvis"
 
             process = await asyncio.create_subprocess_exec(
                 sys.executable, str(script_path),
@@ -83711,24 +81589,10 @@ async def async_main(args: argparse.Namespace) -> int:
 
             # Step 1: Ensure kernel shutdown is complete
             if kernel._state not in (KernelState.STOPPED, KernelState.INITIALIZING):
+                kernel.logger.warning("[Kernel] Forcing shutdown in finally block...")
                 try:
-                    startup_failure_states = (
-                        KernelState.PREFLIGHT,
-                        KernelState.STARTING_RESOURCES,
-                        KernelState.STARTING_BACKEND,
-                        KernelState.STARTING_INTELLIGENCE,
-                        KernelState.STARTING_TRINITY,
-                        KernelState.FAILED,
-                    )
                     expected_finally_shutdown = (
-                        (kernel._state == KernelState.SHUTTING_DOWN and exit_code in (0, 130, 143))
-                        or (
-                            exit_code not in (0, 130, 143)
-                            and kernel._state in startup_failure_states
-                        )
-                    )
-                    (kernel.logger.info if expected_finally_shutdown else kernel.logger.warning)(
-                        "[Kernel] Forcing shutdown in finally block..."
+                        kernel._state == KernelState.SHUTTING_DOWN and exit_code in (0, 130)
                     )
                     finally_shutdown_timeout = max(
                         5.0,
@@ -83874,48 +81738,6 @@ def _generate_launchd_plist() -> str:
 </plist>"""
 
 
-def _apply_canonical_voice_policy() -> str:
-    """
-    Enforce canonical voice identity across supervisor, startup narrator,
-    Trinity, and downstream TTS engines.
-
-    Default policy is strict so startup voice stays deterministic.
-    """
-    force_daniel = os.getenv("JARVIS_FORCE_DANIEL_VOICE", "true").strip().lower() in (
-        "1", "true", "yes", "on"
-    )
-    canonical = "Daniel" if force_daniel else (
-        os.getenv("JARVIS_CANONICAL_VOICE_NAME", "Daniel").strip() or "Daniel"
-    )
-    enforce = os.getenv("JARVIS_ENFORCE_CANONICAL_VOICE", "true").strip().lower() in (
-        "1", "true", "yes", "on"
-    )
-
-    if not enforce:
-        # Keep user-provided voice when enforcement is disabled.
-        effective = os.getenv("JARVIS_VOICE_NAME", canonical).strip() or canonical
-        os.environ["JARVIS_CANONICAL_VOICE_NAME"] = canonical
-        return effective
-
-    aliases = (
-        "JARVIS_VOICE_NAME",
-        "STARTUP_NARRATOR_VOICE_NAME",
-        "JARVIS_STARTUP_VOICE_NAME",
-        "JARVIS_NARRATOR_VOICE_NAME",
-        "JARVIS_RUNTIME_VOICE_NAME",
-        "JARVIS_ALERT_VOICE_NAME",
-        "JARVIS_SUCCESS_VOICE_NAME",
-        "JARVIS_TRINITY_VOICE_NAME",
-    )
-    for key in aliases:
-        os.environ[key] = canonical
-
-    os.environ["JARVIS_CANONICAL_VOICE_NAME"] = canonical
-    # Constrain fallback order to canonical voice for deterministic startup.
-    os.environ["JARVIS_VOICE_FALLBACK_ORDER"] = canonical
-    return canonical
-
-
 def main() -> int:
     """
     Main entry point for JARVIS Unified System Kernel.
@@ -83956,9 +81778,6 @@ def main() -> int:
     faulthandler.enable()
     if hasattr(_sig, "SIGUSR1"):
         faulthandler.register(_sig.SIGUSR1, all_threads=True, chain=False)
-
-    # Enforce canonical startup voice before component initialization.
-    _apply_canonical_voice_policy()
 
     # Parse arguments
     parser = create_argument_parser()
