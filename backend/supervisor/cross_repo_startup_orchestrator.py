@@ -13392,7 +13392,7 @@ class ProcessOrchestrator:
             # Step 3: GAP 11 - Try EnterpriseProcessManager first if available
             enterprise_cleanup_success = False
             try:
-                from backend.supervisor.enterprise_process_manager import EnterpriseProcessManager
+                from backend.core.enterprise_process_manager import EnterpriseProcessManager
                 epm = EnterpriseProcessManager()
 
                 logger.debug(f"[v136.0] Using EnterpriseProcessManager for port {port}")
