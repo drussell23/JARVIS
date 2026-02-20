@@ -81616,7 +81616,7 @@ async def async_main(args: argparse.Namespace) -> int:
             try:
                 emergency_timeout = max(
                     5.0,
-                    float(os.environ.get("JARVIS_STARTUP_CANCEL_SHUTDOWN_TIMEOUT", "45.0")),
+                    float(os.environ.get("JARVIS_STARTUP_CANCEL_SHUTDOWN_TIMEOUT", "20.0")),
                 )
                 await asyncio.wait_for(
                     asyncio.shield(
@@ -81629,6 +81629,31 @@ async def async_main(args: argparse.Namespace) -> int:
                 )
             except Exception as shutdown_err:
                 kernel.logger.debug(f"[Kernel] Startup cancel emergency shutdown: {shutdown_err}")
+
+            # Force-cancel any lingering startup tasks that ignored cancellation.
+            # Without this, partial startup coroutines can keep advancing phases
+            # after a signal-triggered shutdown request.
+            try:
+                current_task = asyncio.current_task()
+                lingering_tasks = [
+                    task
+                    for task in asyncio.all_tasks()
+                    if task is not current_task
+                    and task is not signal_wait_task
+                    and not task.done()
+                ]
+                if lingering_tasks:
+                    for task in lingering_tasks:
+                        task.cancel()
+                    await asyncio.wait_for(
+                        asyncio.gather(*lingering_tasks, return_exceptions=True),
+                        timeout=max(
+                            1.0,
+                            float(os.environ.get("JARVIS_STARTUP_CANCEL_TASK_DRAIN_TIMEOUT", "8.0")),
+                        ),
+                    )
+            except Exception as task_drain_err:
+                kernel.logger.debug(f"[Kernel] Startup cancel task drain: {task_drain_err}")
 
             if shutdown_reason == "SIGTERM":
                 exit_code = 143
