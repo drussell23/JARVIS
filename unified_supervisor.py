@@ -63995,8 +63995,45 @@ class JarvisSystemKernel:
 
             # v256.0: Outer timeout on Two-Tier init — prevents unbounded accumulation
             # of sequential step timeouts (cross-repo 30s + AgenticRunner 60s = 90s min).
+            # v238.1: Adaptive timeout — if upstream infra is degraded (Cloud SQL down,
+            # parallel init had failures), use a reduced fast-path timeout instead of
+            # burning 80s on components that will cascade-fail.
             if _ssm: await _ssm.start_component("two_tier_security")
             _two_tier_init_timeout = _get_env_float("JARVIS_TWO_TIER_INIT_TIMEOUT", 80.0)
+            _infra_degraded = False
+            try:
+                from intelligence.cloud_sql_connection_manager import (
+                    get_readiness_gate as _tt_get_gate,
+                    ReadinessState as _ttRS,
+                )
+                _tt_gate = _tt_get_gate()
+                if _tt_gate.state == _ttRS.UNAVAILABLE:
+                    _infra_degraded = True
+                    self.logger.info(
+                        "[TwoTier] Cloud SQL UNAVAILABLE — using fast-path timeout"
+                    )
+            except (ImportError, Exception):
+                pass
+            if not _infra_degraded:
+                # Check parallel initializer for widespread degradation
+                try:
+                    _pi = getattr(self.app.state, "parallel_initializer", None)
+                    if _pi:
+                        _failed_or_skipped = sum(
+                            1 for c in _pi.components.values()
+                            if c.phase.value in ("failed", "skipped")
+                        )
+                        if _failed_or_skipped >= 3:
+                            _infra_degraded = True
+                            self.logger.info(
+                                f"[TwoTier] {_failed_or_skipped} components failed/skipped "
+                                "— using fast-path timeout"
+                            )
+                except Exception:
+                    pass
+            if _infra_degraded:
+                _fast_timeout = _get_env_float("JARVIS_TWO_TIER_FAST_TIMEOUT", 30.0)
+                _two_tier_init_timeout = min(_two_tier_init_timeout, _fast_timeout)
             try:
                 _two_tier_ok = await asyncio.wait_for(
                     self._initialize_two_tier_security(),

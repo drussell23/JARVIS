@@ -1860,6 +1860,19 @@ class ParallelInitializer:
 
                         if result.state == ReadinessState.READY:
                             logger.info(f"   Gate confirmed ready")
+                            # Fall through to retry loop with CloudSQL available
+                        elif result.state in (ReadinessState.UNAVAILABLE, ReadinessState.DEGRADED_SQLITE):
+                            # v238.0: Gate gave definitive non-READY answer — skip retries,
+                            # initialize with SQLite fallback immediately. This eliminates
+                            # the 3×20s retry cascade when Cloud SQL is confirmed unavailable.
+                            logger.info(
+                                f"   Gate determined {result.state.value} after wait — "
+                                f"fast-falling to SQLite (skipping {3}×{20}s retries)"
+                            )
+                            await asyncio.wait_for(learning_db.initialize(), timeout=20.0)
+                            self.app.state.learning_db = learning_db
+                            logger.info("   ✅ Learning database ready (SQLite fallback, gate-directed)")
+                            return
                         else:
                             logger.info(f"   Gate determined state: {result.state.value} ({result.failure_reason or 'no details'})")
 
@@ -1876,6 +1889,29 @@ class ParallelInitializer:
 
             for attempt in range(max_retries):
                 try:
+                    # v238.0: Before each retry, re-check gate state — if it transitioned
+                    # to UNAVAILABLE since we started, bail immediately instead of wasting
+                    # another 20s timeout.
+                    if attempt > 0:
+                        try:
+                            from intelligence.cloud_sql_connection_manager import (
+                                get_readiness_gate as _get_gate,
+                                ReadinessState as _RS,
+                            )
+                            _gate = _get_gate()
+                            _gs = _gate.state
+                            if _gs in (_RS.UNAVAILABLE, _RS.DEGRADED_SQLITE):
+                                logger.info(
+                                    f"   Gate now {_gs.value} — aborting retry {attempt+1}, "
+                                    f"falling to SQLite"
+                                )
+                                await asyncio.wait_for(learning_db.initialize(), timeout=20.0)
+                                self.app.state.learning_db = learning_db
+                                logger.info("   ✅ Learning database ready (SQLite fallback, mid-retry gate check)")
+                                return
+                        except (ImportError, Exception):
+                            pass  # Gate unavailable — continue with retry
+
                     # v226.1: Create fresh instance per attempt to avoid partial-state
                     # reuse. A timed-out initialize() may leave SQLite connections open,
                     # partial schema, or half-initialized ChromaDB. Retrying on the same
@@ -1972,16 +2008,68 @@ class ParallelInitializer:
                 activate_cloud_ml_if_needed,
             )
 
-            startup_decision = await determine_startup_mode()
+            # Stage 1: Memory analysis (fast — just reads psutil stats)
+            _mode_timeout = float(os.environ.get("JARVIS_MEMORY_MODE_TIMEOUT", "10.0"))
+            startup_decision = await asyncio.wait_for(
+                determine_startup_mode(), timeout=_mode_timeout,
+            )
             self.app.state.startup_decision = startup_decision
 
             logger.info(f"   Memory mode: {startup_decision.mode.value}")
             logger.info(f"   Reason: {startup_decision.reason}")
 
+            # Stage 2: Cloud activation (potentially slow — GCP VM creation)
+            # Gets its own sub-timeout so it doesn't consume the entire component budget.
             if startup_decision.gcp_vm_required:
-                cloud_result = await activate_cloud_ml_if_needed(startup_decision)
-                self.app.state.cloud_ml_result = cloud_result
+                # Check if Cloud SQL is already known-unavailable — if so, skip cloud
+                # activation since it depends on infrastructure that's degraded.
+                _skip_cloud = False
+                try:
+                    from intelligence.cloud_sql_connection_manager import (
+                        get_readiness_gate as _get_gate,
+                        ReadinessState as _RS,
+                    )
+                    _gate = _get_gate()
+                    if _gate.state == _RS.UNAVAILABLE:
+                        logger.info(
+                            "   Cloud SQL UNAVAILABLE — skipping GCP ML activation "
+                            "(would cascade-fail)"
+                        )
+                        _skip_cloud = True
+                        self.app.state.cloud_ml_result = {
+                            "success": False,
+                            "mode": "skipped",
+                            "reason": "Cloud SQL unavailable — GCP activation deferred",
+                        }
+                except (ImportError, Exception):
+                    pass
 
+                if not _skip_cloud:
+                    _cloud_timeout = float(
+                        os.environ.get("JARVIS_CLOUD_ML_ACTIVATION_TIMEOUT", "45.0")
+                    )
+                    try:
+                        cloud_result = await asyncio.wait_for(
+                            activate_cloud_ml_if_needed(startup_decision),
+                            timeout=_cloud_timeout,
+                        )
+                        self.app.state.cloud_ml_result = cloud_result
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"   Cloud ML activation timed out ({_cloud_timeout:.0f}s) "
+                            "— continuing without cloud backend"
+                        )
+                        self.app.state.cloud_ml_result = {
+                            "success": False,
+                            "mode": "timeout",
+                            "reason": f"Activation timed out after {_cloud_timeout:.0f}s",
+                        }
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"   determine_startup_mode() timed out ({_mode_timeout:.0f}s) "
+                "— defaulting to local mode"
+            )
         except ImportError:
             logger.debug("Memory-aware startup not available")
         except Exception as e:
