@@ -13015,7 +13015,13 @@ class AsyncVoiceNarrator:
         if not self.enabled:
             return
 
-        if queue:
+        # v266.0: Respect wait=False as truly non-blocking.
+        # Historically wait=False still awaited _speak_internal(), which blocked
+        # startup phase transitions and made loading-page progress look stalled.
+        # Queueing here keeps startup responsive while preserving serialization.
+        if queue or not wait:
+            if self._queue_processor_task is None or self._queue_processor_task.done():
+                await self.start_queue_processor()
             await self._queue.put((priority.value, time.time(), text))
             return
 
@@ -13042,6 +13048,60 @@ class AsyncVoiceNarrator:
         except Exception:
             pass
         return self._speech_lock
+
+    async def _route_to_unified_voice_orchestrator(
+        self,
+        text: str,
+        *,
+        wait: bool,
+        priority: VoicePriority,
+    ) -> bool:
+        """
+        Route narration through UnifiedVoiceOrchestrator when available.
+
+        This creates a single startup speech authority across supervisor,
+        startup narrator, and cross-repo announcers, reducing duplicate/
+        overlapping startup speech paths.
+        """
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import (
+                get_voice_orchestrator,
+                SpeechTopic as _UVOSpeechTopic,
+                VoicePriority as _UVOPriority,
+                VoiceSource as _UVOSource,
+            )
+
+            orchestrator = get_voice_orchestrator()
+            if orchestrator is None:
+                return False
+
+            if not getattr(orchestrator, "_running", False):
+                await orchestrator.start()
+
+            priority_map = {
+                VoicePriority.CRITICAL: _UVOPriority.CRITICAL,
+                VoicePriority.HIGH: _UVOPriority.HIGH,
+                VoicePriority.MEDIUM: _UVOPriority.MEDIUM,
+                VoicePriority.LOW: _UVOPriority.LOW,
+            }
+
+            accepted = await orchestrator.speak(
+                text=text,
+                priority=priority_map.get(priority, _UVOPriority.MEDIUM),
+                source=_UVOSource.STARTUP,
+                wait=wait,
+                metadata={"path": "async_voice_narrator"},
+                topic=_UVOSpeechTopic.STARTUP,
+            )
+            if accepted:
+                self._messages_spoken += 1
+                self._last_spoken_text = text
+                self._last_spoken_time = time.time()
+            else:
+                self._messages_skipped += 1
+            return True
+        except Exception:
+            return False
 
     async def _speak_internal(
         self,
@@ -13074,6 +13134,15 @@ class AsyncVoiceNarrator:
             (now - self._last_spoken_time) < self._duplicate_prevention_window):
             _unified_logger.debug(f"[Voice] Skipping duplicate message: {text[:50]}...")
             self._messages_deduplicated += 1
+            return
+
+        # v266.0: Prefer unified orchestrator path to keep one startup voice
+        # authority. Fallback to legacy direct path only if unavailable.
+        if await self._route_to_unified_voice_orchestrator(
+            text,
+            wait=wait,
+            priority=priority,
+        ):
             return
 
         # v251.5: Share lock with the orchestrator to prevent concurrent say
@@ -62488,13 +62557,68 @@ class JarvisSystemKernel:
                     "message": "AudioBus init timeout — using legacy audio",
                 }
             except Exception as ab_err:
-                self.logger.warning(f"[Kernel] AudioBus init failed: {ab_err} — disabling")
-                self._audio_bus_enabled = False
-                self._audio_bus = None
-                self._component_status["audio_infrastructure"] = {
-                    "status": "degraded",
-                    "message": f"AudioBus init failed: {ab_err}",
-                }
+                ab_text = str(ab_err).lower()
+                input_device_error = any(
+                    token in ab_text
+                    for token in (
+                        "input device",
+                        "default input",
+                        "no valid input",
+                        "invalid input",
+                    )
+                )
+                if input_device_error:
+                    # v266.0: Root-cause fallback — keep AudioBus alive in output-only
+                    # mode when input is unavailable so startup speech stays on the
+                    # single-stream path and avoids mixed-engine static.
+                    self.logger.warning(
+                        "[Kernel] AudioBus input unavailable (%s) — retrying output-only mode",
+                        ab_err,
+                    )
+                    try:
+                        from backend.audio.audio_bus import AudioBus
+                        from backend.audio.full_duplex_device import DeviceConfig
+
+                        with contextlib.suppress(Exception):
+                            if self._audio_bus is not None:
+                                await self._audio_bus.stop()
+
+                        self._audio_bus = AudioBus()
+                        output_only_cfg = DeviceConfig(
+                            require_input=False,
+                            allow_output_only=True,
+                        )
+                        output_only_cfg.input_device = None
+                        await asyncio.wait_for(
+                            self._audio_bus.start(config=output_only_cfg),
+                            timeout=_ab_timeout,
+                        )
+                        self._component_status["audio_infrastructure"] = {
+                            "status": "degraded",
+                            "message": "AudioBus running in output-only mode (no input device)",
+                        }
+                        self.logger.warning(
+                            "[Kernel] AudioBus started in output-only mode (input unavailable)"
+                        )
+                    except Exception as fallback_err:
+                        self.logger.warning(
+                            "[Kernel] AudioBus output-only fallback failed: %s — disabling",
+                            fallback_err,
+                        )
+                        self._audio_bus_enabled = False
+                        self._audio_bus = None
+                        self._component_status["audio_infrastructure"] = {
+                            "status": "degraded",
+                            "message": f"AudioBus init failed: {ab_err}",
+                        }
+                else:
+                    self.logger.warning(f"[Kernel] AudioBus init failed: {ab_err} — disabling")
+                    self._audio_bus_enabled = False
+                    self._audio_bus = None
+                    self._component_status["audio_infrastructure"] = {
+                        "status": "degraded",
+                        "message": f"AudioBus init failed: {ab_err}",
+                    }
         else:
             self._component_status["audio_infrastructure"] = {
                 "status": "disabled",
@@ -83682,14 +83806,21 @@ def _apply_canonical_voice_policy() -> str:
 
     Default policy is strict so startup voice stays deterministic.
     """
-    canonical = os.getenv("JARVIS_CANONICAL_VOICE_NAME", "Daniel").strip() or "Daniel"
+    force_daniel = os.getenv("JARVIS_FORCE_DANIEL_VOICE", "true").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    canonical = "Daniel" if force_daniel else (
+        os.getenv("JARVIS_CANONICAL_VOICE_NAME", "Daniel").strip() or "Daniel"
+    )
     enforce = os.getenv("JARVIS_ENFORCE_CANONICAL_VOICE", "true").strip().lower() in (
         "1", "true", "yes", "on"
     )
 
     if not enforce:
         # Keep user-provided voice when enforcement is disabled.
-        return os.getenv("JARVIS_VOICE_NAME", canonical).strip() or canonical
+        effective = os.getenv("JARVIS_VOICE_NAME", canonical).strip() or canonical
+        os.environ["JARVIS_CANONICAL_VOICE_NAME"] = canonical
+        return effective
 
     aliases = (
         "JARVIS_VOICE_NAME",
@@ -83704,6 +83835,7 @@ def _apply_canonical_voice_policy() -> str:
     for key in aliases:
         os.environ[key] = canonical
 
+    os.environ["JARVIS_CANONICAL_VOICE_NAME"] = canonical
     # Constrain fallback order to canonical voice for deterministic startup.
     os.environ["JARVIS_VOICE_FALLBACK_ORDER"] = canonical
     return canonical

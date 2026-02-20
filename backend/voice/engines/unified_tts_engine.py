@@ -41,6 +41,8 @@ def _env_flag(name: str, default: str = "false") -> bool:
 
 def _canonical_voice_name() -> str:
     """Resolve canonical voice identity for deterministic TTS."""
+    if _env_flag("JARVIS_FORCE_DANIEL_VOICE", "true"):
+        return "Daniel"
     canonical = os.getenv("JARVIS_CANONICAL_VOICE_NAME", "").strip()
     if canonical:
         return canonical
@@ -61,6 +63,7 @@ def _allow_pyttsx3_on_darwin() -> bool:
 
 _tts_instance: Optional["UnifiedTTSEngine"] = None
 _tts_lock: Optional[asyncio.Lock] = None
+_tts_playback_lock: Optional[asyncio.Lock] = None
 
 
 def _get_tts_lock() -> asyncio.Lock:
@@ -69,6 +72,14 @@ def _get_tts_lock() -> asyncio.Lock:
     if _tts_lock is None:
         _tts_lock = asyncio.Lock()
     return _tts_lock
+
+
+def _get_tts_playback_lock() -> asyncio.Lock:
+    """Global playback mutex across all UnifiedTTSEngine instances."""
+    global _tts_playback_lock
+    if _tts_playback_lock is None:
+        _tts_playback_lock = asyncio.Lock()
+    return _tts_playback_lock
 
 
 async def get_tts_engine(
@@ -632,13 +643,14 @@ class UnifiedTTSEngine:
             if cached_result:
                 logger.debug("[TTS Cache HIT]")
                 if play_audio:
-                    await self._notify_speech_start(text, source)
-                    try:
-                        await self._play_audio(
-                            cached_result.audio_data, cached_result.sample_rate
-                        )
-                    finally:
-                        await self._notify_speech_stop(cached_result.duration_ms)
+                    async with _get_tts_playback_lock():
+                        await self._notify_speech_start(text, source)
+                        try:
+                            await self._play_audio(
+                                cached_result.audio_data, cached_result.sample_rate
+                            )
+                        finally:
+                            await self._notify_speech_stop(cached_result.duration_ms)
                 return cached_result
 
         # Synthesize
@@ -653,11 +665,12 @@ class UnifiedTTSEngine:
 
             # Play if requested — with speech state tracking
             if play_audio:
-                await self._notify_speech_start(text, source)
-                try:
-                    await self._play_audio(result.audio_data, result.sample_rate)
-                finally:
-                    await self._notify_speech_stop(result.duration_ms)
+                async with _get_tts_playback_lock():
+                    await self._notify_speech_start(text, source)
+                    try:
+                        await self._play_audio(result.audio_data, result.sample_rate)
+                    finally:
+                        await self._notify_speech_stop(result.duration_ms)
 
             logger.info(
                 f"[TTS] Synthesized {len(text)} chars "
@@ -780,6 +793,10 @@ class UnifiedTTSEngine:
         if not self.active_engine:
             await self.initialize()
 
+        if not play_audio:
+            await self.speak(text, play_audio=False, source=source)
+            return
+
         # v236.5: Probe actual AudioBus state — stream only if bus is running.
         # Falls back to speak() (which uses corrected _play_audio) otherwise.
         _bus = None
@@ -796,27 +813,28 @@ class UnifiedTTSEngine:
         try:
             bus = _bus
 
-            await self._notify_speech_start(text, source)
-            play_start = time.time()
-            try:
-                # Wrap the engine's chunk iterator to convert to numpy arrays
-                async def _chunk_to_numpy():
-                    async for chunk in self.active_engine.synthesize_stream(text):
-                        if not chunk.audio_data:
-                            continue
-                        audio_buf = io.BytesIO(chunk.audio_data)
-                        data, sr = sf.read(audio_buf, dtype="float32")
-                        yield np.asarray(data, dtype=np.float32)
+            async with _get_tts_playback_lock():
+                await self._notify_speech_start(text, source)
+                play_start = time.time()
+                try:
+                    # Wrap the engine's chunk iterator to convert to numpy arrays
+                    async def _chunk_to_numpy():
+                        async for chunk in self.active_engine.synthesize_stream(text):
+                            if not chunk.audio_data:
+                                continue
+                            audio_buf = io.BytesIO(chunk.audio_data)
+                            data, sr = sf.read(audio_buf, dtype="float32")
+                            yield np.asarray(data, dtype=np.float32)
 
-                # Use bus.play_stream() which supports cancel events for barge-in
-                await bus.play_stream(
-                    _chunk_to_numpy(),
-                    sample_rate=self.config.sample_rate if hasattr(self.config, 'sample_rate') else 22050,
-                    cancel=cancel_event,
-                )
-            finally:
-                actual_duration_ms = (time.time() - play_start) * 1000
-                await self._notify_speech_stop(actual_duration_ms)
+                    # Use bus.play_stream() which supports cancel events for barge-in
+                    await bus.play_stream(
+                        _chunk_to_numpy(),
+                        sample_rate=self.config.sample_rate if hasattr(self.config, 'sample_rate') else 22050,
+                        cancel=cancel_event,
+                    )
+                finally:
+                    actual_duration_ms = (time.time() - play_start) * 1000
+                    await self._notify_speech_stop(actual_duration_ms)
 
         except Exception as e:
             logger.warning(f"[UnifiedTTS] Stream failed, falling back: {e}")

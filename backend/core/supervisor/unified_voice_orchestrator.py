@@ -103,6 +103,8 @@ def _env_flag(name: str, default: str = "false") -> bool:
 
 def _canonical_voice_name() -> str:
     """Canonical voice identity for supervisor-controlled speech."""
+    if _env_flag("JARVIS_FORCE_DANIEL_VOICE", "true"):
+        return "Daniel"
     value = os.getenv("JARVIS_CANONICAL_VOICE_NAME", "Daniel").strip()
     return value or "Daniel"
 
@@ -915,22 +917,32 @@ class UnifiedVoiceOrchestrator:
         except ImportError:
             pass
 
-        # Device held: ONLY AudioBus-compatible route is safe.
-        if _device_held:
+        prefer_unified_tts = _env_flag("JARVIS_VOICE_PREFER_UNIFIED_TTS", "true")
+
+        # v266.0: Prefer UnifiedTTSEngine for both held and free device states.
+        # This centralizes playback through one engine path and works with
+        # UnifiedTTSEngine's global playback mutex to prevent cross-subsystem
+        # overlap/static. Direct `say` remains a controlled fallback.
+        if _device_held or prefer_unified_tts:
             try:
                 from backend.voice.engines.unified_tts_engine import get_tts_engine
                 tts = await get_tts_engine()
                 await tts.speak(text, play_audio=True)
-                logger.debug("[UnifiedVoice v236.6] Spoke via AudioBus/UnifiedTTSEngine")
+                logger.debug("[UnifiedVoice v266.0] Spoke via UnifiedTTSEngine")
                 return
             except Exception as e:
+                if _device_held:
+                    logger.warning(
+                        f"[UnifiedVoice] AudioBus TTS failed while device held: {e} "
+                        f"— skipping speech to prevent static"
+                    )
+                    return
                 logger.warning(
-                    f"[UnifiedVoice] AudioBus TTS failed while device held: {e} "
-                    f"— skipping speech to prevent static"
+                    f"[UnifiedVoice] UnifiedTTSEngine failed on free device: {e} "
+                    f"— falling back to direct say"
                 )
-                return
 
-        # Device free on macOS: direct say is deterministic and low-risk.
+        # Device free on macOS: direct say fallback.
         if self._is_macos:
             try:
                 cmd = [
