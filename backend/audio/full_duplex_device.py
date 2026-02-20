@@ -50,6 +50,7 @@ class DeviceConfig:
     playback_buffer_seconds: float = 2.0  # Ring buffer capacity
     require_input: bool = False           # Fail startup if no input device
     allow_output_only: bool = True        # Degrade to output-only when no input
+    startup_silence_ms: int = 120         # Silence window to avoid startup pop/click
 
     def __post_init__(self):
         # Allow env var overrides
@@ -64,6 +65,9 @@ class DeviceConfig:
         ))
         self.playback_buffer_seconds = float(os.getenv(
             "JARVIS_AUDIO_BUFFER_SECONDS", str(self.playback_buffer_seconds)
+        ))
+        self.startup_silence_ms = int(os.getenv(
+            "JARVIS_AUDIO_STARTUP_SILENCE_MS", str(self.startup_silence_ms)
         ))
         require_input_env = os.getenv("JARVIS_AUDIO_REQUIRE_INPUT")
         if require_input_env is not None:
@@ -129,6 +133,7 @@ class FullDuplexDevice:
         self._started_event = asyncio.Event()
         self._input_enabled = True
         self._mode = "duplex"
+        self._startup_silence_frames = 0
 
     @property
     def sample_rate(self) -> int:
@@ -159,50 +164,211 @@ class FullDuplexDevice:
                 "on",
             ):
                 self._validate_device_selection()
+        except Exception:
+            # Validation errors are terminal and should surface as-is.
+            raise
 
-            self._stream = sd.Stream(
-                samplerate=self.config.sample_rate,
-                blocksize=self.config.frame_size,
+        startup_profiles = self._build_startup_profiles()
+        startup_errors: List[str] = []
+
+        for idx, profile in enumerate(startup_profiles, start=1):
+            sample_rate = int(profile["sample_rate"])
+            mode = str(profile["mode"])
+            input_enabled = bool(profile["input_enabled"])
+
+            self._input_enabled = input_enabled
+            self._mode = mode
+            self.config.sample_rate = sample_rate
+
+            if not self._profile_supported(
+                mode=mode,
+                sample_rate=sample_rate,
+                input_device=self.config.input_device,
+                output_device=self.config.output_device,
+            ):
+                startup_errors.append(
+                    f"profile#{idx} unsupported (mode={mode}, sr={sample_rate})"
+                )
+                continue
+
+            try:
+                self._stream = self._create_stream(
+                    mode=mode,
+                    sample_rate=sample_rate,
+                )
+                self._stream.start()
+                self._running = True
+                self._started_event.set()
+                self._startup_silence_frames = max(
+                    0,
+                    int(self.config.sample_rate * self.config.startup_silence_ms / 1000),
+                )
+
+                in_device_label = (
+                    self.config.input_device
+                    if self.config.input_device is not None and self._input_enabled
+                    else "none"
+                )
+                out_device_label = (
+                    self.config.output_device
+                    if self.config.output_device is not None
+                    else "default"
+                )
+                fallback_note = ""
+                if idx > 1:
+                    fallback_note = f", fallback_profile={idx}/{len(startup_profiles)}"
+                logger.info(
+                    f"[FullDuplexDevice] Started: sr={self.config.sample_rate}, "
+                    f"frame={self.config.frame_size} samples "
+                    f"({self.config.frame_duration_ms}ms), "
+                    f"mode={self._mode}, "
+                    f"in={in_device_label}, out={out_device_label}, "
+                    f"startup_silence={self.config.startup_silence_ms}ms{fallback_note}"
+                )
+                return
+            except Exception as e:
+                startup_errors.append(
+                    f"profile#{idx} failed (mode={mode}, sr={sample_rate}): {e}"
+                )
+                self._safe_close_stream()
+                continue
+
+        self._started_event.clear()
+        self._running = False
+        joined_errors = " | ".join(startup_errors[-5:])
+        raise RuntimeError(
+            "[FullDuplexDevice] Failed to start audio stream "
+            f"after {len(startup_profiles)} profile(s): {joined_errors}"
+        )
+
+    def _build_startup_profiles(self) -> List[dict]:
+        """
+        Build deterministic startup profiles.
+
+        Order:
+        1) Preferred mode/sample-rate from config validation.
+        2) Output-only fallback when duplex startup fails.
+        3) Retry with output device default sample-rate.
+        """
+        output_default_sr = self._get_output_default_sample_rate()
+        sample_rates: List[int] = []
+        for sr in (self.config.sample_rate, output_default_sr):
+            if sr is None:
+                continue
+            try:
+                val = int(sr)
+            except Exception:
+                continue
+            if val > 0 and val not in sample_rates:
+                sample_rates.append(val)
+
+        if not sample_rates:
+            sample_rates = [int(self.config.sample_rate)]
+
+        profiles: List[dict] = []
+        for sr in sample_rates:
+            profiles.append(
+                {
+                    "mode": "duplex" if self._input_enabled else "output-only",
+                    "input_enabled": self._input_enabled,
+                    "sample_rate": sr,
+                }
+            )
+            if self.config.allow_output_only:
+                output_only_profile = {
+                    "mode": "output-only",
+                    "input_enabled": False,
+                    "sample_rate": sr,
+                }
+                if output_only_profile not in profiles:
+                    profiles.append(output_only_profile)
+        return profiles
+
+    def _get_output_default_sample_rate(self) -> Optional[int]:
+        """Return output device default sample rate, if available."""
+        if sd is None:
+            return None
+        try:
+            output_device = self.config.output_device
+            if output_device is None:
+                defaults = getattr(sd.default, "device", None)
+                if isinstance(defaults, (tuple, list)) and len(defaults) >= 2:
+                    output_device = defaults[1]
+            if output_device is None:
+                return None
+            info = sd.query_devices(int(output_device))
+            default_sr = info.get("default_samplerate")
+            if default_sr is None:
+                return None
+            return max(1, int(float(default_sr)))
+        except Exception:
+            return None
+
+    def _profile_supported(
+        self,
+        *,
+        mode: str,
+        sample_rate: int,
+        input_device: Optional[int],
+        output_device: Optional[int],
+    ) -> bool:
+        """Preflight-check stream settings to avoid noisy startup failures."""
+        assert sd is not None
+        try:
+            sd.check_output_settings(
+                device=output_device,
+                channels=self.config.channels,
+                samplerate=sample_rate,
+                dtype=self.config.dtype,
+            )
+            if mode == "duplex":
+                sd.check_input_settings(
+                    device=input_device,
+                    channels=self.config.channels,
+                    samplerate=sample_rate,
+                    dtype=self.config.dtype,
+                )
+            return True
+        except Exception:
+            return False
+
+    def _create_stream(self, *, mode: str, sample_rate: int) -> Any:
+        """Create a sounddevice stream for the given mode/profile."""
+        blocksize = int(sample_rate * self.config.frame_duration_ms / 1000)
+        blocksize = max(1, blocksize)
+        if mode == "duplex":
+            return sd.Stream(
+                samplerate=sample_rate,
+                blocksize=blocksize,
                 device=(self.config.input_device, self.config.output_device),
                 channels=self.config.channels,
                 dtype=self.config.dtype,
                 callback=self._audio_callback,
                 finished_callback=self._stream_finished,
-            ) if self._input_enabled else sd.OutputStream(
-                samplerate=self.config.sample_rate,
-                blocksize=self.config.frame_size,
-                device=self.config.output_device,
-                channels=self.config.channels,
-                dtype=self.config.dtype,
-                callback=self._output_only_callback,
-                finished_callback=self._stream_finished,
             )
-            self._stream.start()
-            self._running = True
-            self._started_event.set()
+        return sd.OutputStream(
+            samplerate=sample_rate,
+            blocksize=blocksize,
+            device=self.config.output_device,
+            channels=self.config.channels,
+            dtype=self.config.dtype,
+            callback=self._output_only_callback,
+            finished_callback=self._stream_finished,
+        )
 
-            in_device_label = (
-                self.config.input_device
-                if self.config.input_device is not None
-                else "none"
-            )
-            out_device_label = (
-                self.config.output_device
-                if self.config.output_device is not None
-                else "default"
-            )
-
-            logger.info(
-                f"[FullDuplexDevice] Started: sr={self.config.sample_rate}, "
-                f"frame={self.config.frame_size} samples "
-                f"({self.config.frame_duration_ms}ms), "
-                f"mode={self._mode}, "
-                f"in={in_device_label}, "
-                f"out={out_device_label}"
-            )
-        except Exception as e:
-            logger.error(f"[FullDuplexDevice] Failed to start: {e}")
-            raise
+    def _safe_close_stream(self) -> None:
+        """Best-effort cleanup for partially opened streams."""
+        if self._stream is None:
+            return
+        try:
+            self._stream.stop()
+        except Exception:
+            pass
+        try:
+            self._stream.close()
+        except Exception:
+            pass
+        self._stream = None
 
     def _validate_device_selection(self) -> None:
         """
@@ -341,6 +507,7 @@ class FullDuplexDevice:
             self._stream = None
 
         self._started_event.clear()
+        self._startup_silence_frames = 0
         logger.info("[FullDuplexDevice] Stopped")
 
     def add_capture_callback(self, cb: Callable[[np.ndarray], None]) -> None:
@@ -402,7 +569,9 @@ class FullDuplexDevice:
 
         # --- OUTPUT: Fill outdata from ring buffer ---
         out_flat = outdata[:, 0] if outdata.ndim == 2 else outdata
-        frames_read = self._playback_buffer.read(out_flat)
+        silenced = self._apply_startup_silence(out_flat)
+        if silenced < len(out_flat):
+            self._playback_buffer.read(out_flat[silenced:])
 
         # Save output for AEC reference
         with self._output_frame_lock:
@@ -431,9 +600,27 @@ class FullDuplexDevice:
             logger.debug(f"[FullDuplexDevice] Output stream status: {status}")
 
         out_flat = outdata[:, 0] if outdata.ndim == 2 else outdata
-        self._playback_buffer.read(out_flat)
+        silenced = self._apply_startup_silence(out_flat)
+        if silenced < len(out_flat):
+            self._playback_buffer.read(out_flat[silenced:])
         with self._output_frame_lock:
             self._last_output_frame = out_flat.copy()
+
+    def _apply_startup_silence(self, out_flat: np.ndarray) -> int:
+        """
+        Zero the first N output samples after stream start.
+
+        This prevents first-buffer speaker pop/static when CoreAudio takes a
+        moment to fully transition into the running state.
+        """
+        remaining = self._startup_silence_frames
+        if remaining <= 0:
+            return 0
+        to_silence = min(len(out_flat), remaining)
+        if to_silence > 0:
+            out_flat[:to_silence] = 0.0
+            self._startup_silence_frames = remaining - to_silence
+        return to_silence
 
     def _stream_finished(self) -> None:
         """Called when the stream finishes (e.g., device disconnected)."""

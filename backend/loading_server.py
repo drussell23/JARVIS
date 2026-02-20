@@ -1056,6 +1056,8 @@ class LoadingServer:
 
         # Background tasks
         self._background_tasks: List[asyncio.Task] = []
+        self._hub_connect_task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # v183.0: Supervisor heartbeat tracking
         self._last_supervisor_update: float = time.time()
@@ -1097,9 +1099,8 @@ class LoadingServer:
         if ADVANCED_FEATURES_AVAILABLE:
             self._init_advanced_features()
 
-        # Integration with unified hub (if available)
+        # Integration with unified hub (connected lazily after socket bind)
         self._hub = None
-        self._try_connect_hub()
 
     def _init_advanced_features(self) -> None:
         """Initialize v212.0 advanced features."""
@@ -1123,7 +1124,7 @@ class LoadingServer:
 
             # Container Awareness
             self._container_awareness = ContainerAwareness()
-            if self._container_awareness.is_containerized():
+            if self._container_awareness.is_containerized:
                 timeout_mult = self._container_awareness.get_timeout_multiplier()
                 logger.info(f"[v212.0] Container detected, timeout multiplier: {timeout_mult}x")
 
@@ -1154,7 +1155,7 @@ class LoadingServer:
                             "persistence": True,
                             "enhanced_eta": True,
                             "lock_free": True,
-                            "container_aware": self._container_awareness.is_containerized() if self._container_awareness else False,
+                            "container_aware": self._container_awareness.is_containerized if self._container_awareness else False,
                             "backpressure": True,
                             "message_generator": True,
                             "heartbeat_reader": True,
@@ -1168,19 +1169,55 @@ class LoadingServer:
         except Exception as e:
             logger.warning(f"[v212.0] Error initializing advanced features: {e}")
 
-    def _try_connect_hub(self):
+    def _try_connect_hub(self) -> bool:
         """Try to connect to the UnifiedStartupProgressHub."""
         try:
-            sys.path.insert(0, str(self.config.jarvis_repo))
+            repo_path = str(self.config.jarvis_repo)
+            if repo_path and repo_path not in sys.path:
+                sys.path.insert(0, repo_path)
             from backend.core.unified_startup_progress import get_progress_hub
             self._hub = get_progress_hub()
             self._hub.register_sync_target(self._on_hub_update)
             logger.info("[v125.0] Connected to UnifiedStartupProgressHub")
+            return True
         except Exception as e:
             logger.debug(f"[v125.0] Hub not available: {e}")
+            return False
+
+    async def _deferred_connect_hub(self) -> None:
+        """
+        Connect to the progress hub in the background after server bind.
+
+        This prevents synchronous import/discovery side effects from delaying
+        `/health` readiness and the startup landing page refresh path.
+        """
+        delay = max(0.0, float(os.getenv("LOADING_SERVER_HUB_CONNECT_DELAY", "0.25")))
+        timeout = max(1.0, float(os.getenv("LOADING_SERVER_HUB_CONNECT_TIMEOUT", "20.0")))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self._try_connect_hub), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[v125.0] Hub connection timed out after {timeout:.1f}s "
+                "(loading server remains healthy)"
+            )
+        except Exception as e:
+            logger.debug(f"[v125.0] Deferred hub connect failed: {e}")
 
     def _on_hub_update(self, state: Dict[str, Any]):
-        """Callback when unified hub updates."""
+        """Thread-safe callback when unified hub updates."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(self._apply_hub_update, dict(state))
+                return
+            except Exception:
+                pass
+        self._apply_hub_update(state)
+
+    def _apply_hub_update(self, state: Dict[str, Any]) -> None:
+        """Apply hub update on the loading-server event loop."""
         self._progress = state.get("progress", self._progress)
         self._phase = state.get("phase", self._phase)
         self._message = state.get("message", self._message)
@@ -2383,6 +2420,7 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
     async def start(self):
         """Start the loading server."""
         logger.info(f"[v212.0] Starting loading server on {self.config.host}:{self.config.port}")
+        self._loop = asyncio.get_running_loop()
 
         # =================================================================
         # v211.0: PARENT DEATH WATCHER - Prevent orphaned processes
@@ -2441,6 +2479,13 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
 
         addr = self._server.sockets[0].getsockname()
         logger.info(f"[v125.0] Loading server ready on http://{addr[0]}:{addr[1]}")
+
+        # Connect to hub lazily in background so health endpoint is immediately ready.
+        self._hub_connect_task = create_safe_task(
+            self._deferred_connect_hub(),
+            name="loading_server_hub_connect",
+        )
+        self._background_tasks.append(self._hub_connect_task)
 
         async with self._server:
             await self._server.serve_forever()

@@ -1304,31 +1304,66 @@ class CrossRepoStateInitializer:
                     await asyncio.sleep(self.config.heartbeat_interval_seconds)
                     continue
 
-                # v236.0: Env-var configurable heartbeat lock timeout
-                _hb_timeout = float(os.environ.get("JARVIS_HEARTBEAT_LOCK_TIMEOUT", "5.0"))
-                # v236.2: Env-var configurable TTL — 20s default gives 17s stall tolerance
-                # with 3s keepalive interval, while keeping crash recovery under 20s.
+                # v266.0: Adaptive lock-wait loop for heartbeat writes.
+                # Never skip a cycle due transient lock contention; extend wait
+                # windows with bounded backoff until acquisition succeeds.
                 _cr_ttl = float(os.environ.get("JARVIS_CROSS_REPO_LOCK_TTL", "20.0"))
-                async with self._lock_manager.acquire(
-                    "heartbeat",
-                    timeout=_hb_timeout,
-                    ttl=_cr_ttl,
-                    enable_keepalive=False,
-                ) as acquired:
-                    if not acquired:
-                        logger.debug("Could not acquire heartbeat lock, skipping update")
-                        continue
+                _base_timeout = _get_env_float(
+                    "JARVIS_HEARTBEAT_LOCK_TIMEOUT_BASE",
+                    max(0.5, self.config.heartbeat_interval_seconds * 0.5),
+                )
+                _max_timeout = _get_env_float(
+                    "JARVIS_HEARTBEAT_LOCK_TIMEOUT_MAX",
+                    max(_base_timeout, self.config.heartbeat_timeout_seconds),
+                )
+                _backoff = _get_env_float("JARVIS_HEARTBEAT_LOCK_TIMEOUT_BACKOFF", 0.5)
+                _stall_log_interval = _get_env_float(
+                    "JARVIS_HEARTBEAT_LOCK_STALL_LOG_INTERVAL",
+                    max(1.0, self.config.heartbeat_interval_seconds),
+                )
 
-                    heartbeats = await self._read_json_file(heartbeat_file, default={})
+                wait_start = time.monotonic()
+                wait_round = 0
+                next_stall_log_at = wait_start + _stall_log_interval
 
-                    heartbeats["jarvis"] = asdict(Heartbeat(
-                        repo_type=RepoType.JARVIS,
-                        status=self._jarvis_state.status,
-                        uptime_seconds=time.time() - self._start_time,
-                        active_sessions=self._jarvis_state.metrics.get("active_sessions", 0),
-                    ))
+                while self._running:
+                    lock_timeout = min(
+                        _max_timeout,
+                        _base_timeout * (1.0 + (_backoff * wait_round)),
+                    )
+                    async with self._lock_manager.acquire(
+                        "heartbeat",
+                        timeout=lock_timeout,
+                        ttl=_cr_ttl,
+                        enable_keepalive=False,
+                    ) as acquired:
+                        if acquired:
+                            heartbeats = await self._read_json_file(heartbeat_file, default={})
 
-                    await self._write_json_file(heartbeat_file, heartbeats)
+                            heartbeats["jarvis"] = asdict(Heartbeat(
+                                repo_type=RepoType.JARVIS,
+                                status=self._jarvis_state.status,
+                                uptime_seconds=time.time() - self._start_time,
+                                active_sessions=self._jarvis_state.metrics.get("active_sessions", 0),
+                            ))
+
+                            await self._write_json_file(heartbeat_file, heartbeats)
+                            break
+
+                    wait_round += 1
+                    now = time.monotonic()
+                    if now >= next_stall_log_at:
+                        elapsed = now - wait_start
+                        logger.warning(
+                            "[CrossRepoState] heartbeat lock still pending "
+                            f"after {elapsed:.2f}s (lock_timeout={lock_timeout:.2f}s, "
+                            f"wait_round={wait_round}) — extending wait"
+                        )
+                        next_stall_log_at = now + _stall_log_interval
+                    await asyncio.sleep(min(0.25, self.config.heartbeat_interval_seconds * 0.1))
+
+                if not self._running:
+                    break
 
                 # Update last heartbeat timestamp
                 self._jarvis_state.last_heartbeat = datetime.now().isoformat()

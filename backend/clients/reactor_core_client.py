@@ -129,6 +129,15 @@ class ReactorCoreConfig:
     scout_topics_path: str = field(
         default_factory=lambda: os.getenv("REACTOR_CORE_SCOUT_TOPICS_PATH", "/api/v1/scout/topics")
     )
+    training_trigger_path: str = field(
+        default_factory=lambda: os.getenv("REACTOR_CORE_TRAINING_TRIGGER_PATH", "/api/v1/training/trigger")
+    )
+    training_trigger_legacy_path: str = field(
+        default_factory=lambda: os.getenv("REACTOR_CORE_TRAINING_TRIGGER_LEGACY_PATH", "/api/v1/train")
+    )
+    training_mode: str = field(
+        default_factory=lambda: os.getenv("REACTOR_CORE_TRAINING_MODE", "nightshift").strip().lower()
+    )
 
     # Connection Settings
     max_retries: int = field(
@@ -678,8 +687,19 @@ class ReactorCoreClient:
                 "triggered_by": "jarvis_agentic_runner",
                 "trigger_time": datetime.now().isoformat(),
             }
+            requested_mode = (self.config.training_mode or "").strip().lower()
+            if requested_mode in {"nightshift", "unified"}:
+                payload["mode"] = requested_mode
 
-            data = await self._request("POST", "/api/v1/train", json=payload)
+            primary_path = self._normalize_api_path(self.config.training_trigger_path)
+            legacy_path = self._normalize_api_path(self.config.training_trigger_legacy_path)
+            data = await self._request("POST", primary_path, json=payload)
+            if data is None and legacy_path != primary_path:
+                logger.info(
+                    "[ReactorClient] Primary training trigger path unavailable, "
+                    f"retrying legacy path: {legacy_path}"
+                )
+                data = await self._request("POST", legacy_path, json=payload)
 
             if data and "job_id" in data:
                 job = TrainingJob(
@@ -695,7 +715,8 @@ class ReactorCoreClient:
 
                 logger.info(
                     f"[ReactorClient] Training triggered: job_id={job.job_id}, "
-                    f"experiences={experience_count}, priority={priority.value}"
+                    f"experiences={experience_count}, priority={priority.value}, "
+                    f"mode={data.get('mode', payload.get('mode', 'unified'))}"
                 )
 
                 # Emit event

@@ -230,6 +230,44 @@ class LocalSpeakerSink(AudioSink):
     def __init__(self, device: FullDuplexDevice, resampler: Resampler):
         self._device = device
         self._resampler = resampler
+        self._edge_fade_ms = max(
+            0.0,
+            float(os.getenv("JARVIS_AUDIO_EDGE_FADE_MS", "6.0")),
+        )
+        self._output_headroom = min(
+            1.0,
+            max(0.1, float(os.getenv("JARVIS_AUDIO_OUTPUT_HEADROOM", "0.98"))),
+        )
+
+    def _condition_audio(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Normalize and shape playback audio to prevent static/crackle artifacts.
+
+        - Replaces NaN/inf samples with silence.
+        - Enforces output headroom to avoid clipping distortion.
+        - Applies a short edge fade to remove click/pops at utterance boundaries.
+        """
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32, copy=False)
+        if audio.size == 0:
+            return audio
+
+        np.nan_to_num(audio, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        peak = float(np.max(np.abs(audio)))
+        if peak > self._output_headroom and peak > 0.0:
+            audio = (audio / peak) * self._output_headroom
+
+        np.clip(audio, -1.0, 1.0, out=audio)
+
+        fade_samples = int(self._device.sample_rate * (self._edge_fade_ms / 1000.0))
+        fade_samples = max(0, min(fade_samples, audio.size // 2))
+        if fade_samples > 0:
+            ramp = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+            audio[:fade_samples] *= ramp
+            audio[-fade_samples:] *= ramp[::-1]
+
+        return audio
 
     async def write(self, audio: np.ndarray, sample_rate: int) -> None:
         """Resample to device rate and queue for playback with pacing.
@@ -248,9 +286,8 @@ class LocalSpeakerSink(AudioSink):
         # applied the 16k→48k up-resampler to already-48kHz audio, producing
         # garbled output ("hallucinations").
 
-        # Ensure float32 dtype for the ring buffer
-        if audio.dtype != np.float32:
-            audio = audio.astype(np.float32)
+        # Ensure deterministic, artifact-resistant output shape.
+        audio = self._condition_audio(audio)
 
         # --- Paced chunked write (v237.0) ---
         # Write in chunks, waiting for ring-buffer space between chunks.

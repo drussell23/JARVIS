@@ -2131,7 +2131,11 @@ for _logger_name in [
     "speechbrain", "speechbrain.utils.checkpoints", "transformers",
     "transformers.modeling_utils", "urllib3", "asyncio",
 ]:
-    logging.getLogger(_logger_name).setLevel(logging.ERROR)
+    _noisy_logger = logging.getLogger(_logger_name)
+    _noisy_logger.setLevel(logging.ERROR)
+    # Prevent third-party debug chatter from leaking through root handlers
+    # when external modules reconfigure logging at runtime.
+    _noisy_logger.propagate = False
 
 # =============================================================================
 # ENVIRONMENT LOADING
@@ -12806,6 +12810,34 @@ class AsyncVoiceNarrator:
         ],
     }
 
+    @staticmethod
+    def _env_flag(name: str, default: str = "false") -> bool:
+        """Parse boolean environment values consistently."""
+        return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+    @classmethod
+    def _resolve_voice_name(cls, requested: Optional[str] = None) -> str:
+        """
+        Resolve narrator voice with canonical enforcement.
+
+        Default behavior is deterministic Daniel voice unless explicit
+        canonical enforcement is disabled.
+        """
+        force_daniel = cls._env_flag("JARVIS_FORCE_DANIEL_VOICE", "true")
+        if force_daniel:
+            canonical = "Daniel"
+        else:
+            canonical = os.getenv("JARVIS_CANONICAL_VOICE_NAME", "Daniel").strip() or "Daniel"
+
+        if cls._env_flag("JARVIS_ENFORCE_CANONICAL_VOICE", "true"):
+            return canonical
+
+        if requested and requested.strip():
+            return requested.strip()
+
+        env_voice = os.getenv("JARVIS_VOICE_NAME", "").strip()
+        return env_voice or canonical
+
     def __init__(
         self,
         enabled: Optional[bool] = None,
@@ -12818,7 +12850,7 @@ class AsyncVoiceNarrator:
             enabled = os.getenv("JARVIS_VOICE_ENABLED", "true").lower() == "true"
         self.enabled = enabled and platform.system() == "Darwin"
 
-        self.voice = voice or os.getenv("JARVIS_VOICE_NAME", "Daniel")
+        self.voice = self._resolve_voice_name(voice)
         self.rate = rate or int(os.getenv("JARVIS_VOICE_RATE", "175"))
         self._owner_name = owner_name or os.getenv("JARVIS_OWNER_NAME", "")
 
@@ -13059,7 +13091,7 @@ class AsyncVoiceNarrator:
 
     def _get_time_period(self) -> str:
         """Get current time period for greeting selection."""
-        hour = datetime.datetime.now().hour
+        hour = datetime.now().hour
         if 4 <= hour < 6:
             return "early_morning"
         elif 6 <= hour < 12:
@@ -81557,8 +81589,60 @@ async def async_main(args: argparse.Namespace) -> int:
     # This ensures resources are always cleaned up, even on unexpected exits
     exit_code = 1  # Default to failure
     try:
-        # Run startup
-        exit_code = await kernel.startup()
+        # Run startup with concurrent shutdown-signal monitoring.
+        # This prevents long startup phases from ignoring Ctrl+C until the
+        # current phase naturally completes.
+        startup_task = create_safe_task(kernel.startup(), name="kernel-startup")
+        signal_wait_task = create_safe_task(
+            kernel._signal_handler.wait_for_shutdown(),  # pylint: disable=protected-access
+            name="kernel-startup-signal-wait",
+        )
+        done, _ = await asyncio.wait(
+            {startup_task, signal_wait_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if signal_wait_task in done and not startup_task.done():
+            shutdown_reason = kernel._signal_handler.shutdown_reason or "SIGINT"  # pylint: disable=protected-access
+            kernel.logger.warning(
+                f"[Kernel] Shutdown requested during startup ({shutdown_reason}) - "
+                "cancelling startup task immediately"
+            )
+            startup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(startup_task, timeout=8.0)
+
+            # Best-effort fast teardown for partially-started startup state.
+            try:
+                emergency_timeout = max(
+                    5.0,
+                    float(os.environ.get("JARVIS_STARTUP_CANCEL_SHUTDOWN_TIMEOUT", "45.0")),
+                )
+                await asyncio.wait_for(
+                    asyncio.shield(
+                        kernel.emergency_shutdown(
+                            reason="startup_interrupted_signal",
+                            expected=True,
+                        )
+                    ),
+                    timeout=emergency_timeout,
+                )
+            except Exception as shutdown_err:
+                kernel.logger.debug(f"[Kernel] Startup cancel emergency shutdown: {shutdown_err}")
+
+            if shutdown_reason == "SIGTERM":
+                exit_code = 143
+            else:
+                exit_code = 130
+            return exit_code
+
+        # Startup finished first — cancel signal waiter and propagate startup result.
+        if not signal_wait_task.done():
+            signal_wait_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await signal_wait_task
+
+        exit_code = startup_task.result()
         if exit_code != 0:
             return exit_code
 
@@ -81598,8 +81682,13 @@ async def async_main(args: argparse.Namespace) -> int:
             if kernel._state not in (KernelState.STOPPED, KernelState.INITIALIZING):
                 kernel.logger.warning("[Kernel] Forcing shutdown in finally block...")
                 try:
+                    signal_requested = bool(
+                        getattr(getattr(kernel, "_signal_handler", None), "shutdown_requested", False)
+                    )
                     expected_finally_shutdown = (
-                        kernel._state == KernelState.SHUTTING_DOWN and exit_code in (0, 130)
+                        kernel._state == KernelState.SHUTTING_DOWN
+                        or signal_requested
+                        or exit_code in (0, 130, 143)
                     )
                     finally_shutdown_timeout = max(
                         5.0,
