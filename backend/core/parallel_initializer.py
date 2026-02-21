@@ -1,5 +1,5 @@
 """
-JARVIS Parallel Initializer v2.0.0
+JARVIS Parallel Initializer v3.0.0
 ==================================
 
 Runs ALL heavy initialization as background tasks AFTER uvicorn starts serving.
@@ -13,6 +13,10 @@ Key Features:
 - v2.0: Progressive readiness (interactive_ready before full_mode)
 - v2.0: Watchdog for hung component detection
 - v2.0: Reduced timeouts for faster startup
+- v3.0: Cooperative task cancellation — watchdog CANCELS zombie tasks
+- v3.0: Unified timeout authority — stale_threshold IS the timeout
+- v3.0: Dependency-failure events — instant cascade propagation
+- v3.0: Adaptive threshold calculator — EMA-based self-tuning thresholds
 
 Usage in main.py lifespan:
     from core.parallel_initializer import ParallelInitializer
@@ -33,6 +37,7 @@ Usage in main.py lifespan:
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -41,7 +46,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 # Trinity Unified Event Loop Manager - shared infrastructure across repos
 try:
@@ -152,6 +157,134 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# v3.0: Path for persisting adaptive threshold history across restarts
+_THRESHOLD_HISTORY_PATH = Path(
+    os.environ.get(
+        "JARVIS_THRESHOLD_HISTORY",
+        str(Path.home() / ".jarvis" / "init_threshold_history.json"),
+    )
+)
+
+
+class AdaptiveThresholdCalculator:
+    """
+    v3.0: EMA-based self-tuning thresholds for component initialization.
+
+    Tracks historical init times using exponential moving average (EMA).
+    On each startup, loads history and computes thresholds dynamically:
+        adaptive_threshold = max(ema * safety_factor, minimum_floor)
+
+    This replaces static hardcoded thresholds that either kill components
+    too early (15s for cloud operations) or too late (120s for fast components).
+
+    No ML needed — just statistical tracking with EMA smoothing.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.3,          # EMA smoothing factor (higher = more reactive)
+        safety_factor: float = 2.0,  # Multiply EMA by this for threshold headroom
+        minimum_floor: float = 10.0, # Never set threshold below this
+    ):
+        self._alpha = alpha
+        self._safety_factor = safety_factor
+        self._minimum_floor = minimum_floor
+        self._history: Dict[str, Dict[str, float]] = {}  # name → {ema, last, count}
+        self._load_history()
+
+    def _load_history(self) -> None:
+        """Load historical EMA data from disk."""
+        try:
+            if _THRESHOLD_HISTORY_PATH.exists():
+                with open(_THRESHOLD_HISTORY_PATH, "r") as f:
+                    self._history = json.load(f)
+                logger.debug(
+                    f"[AdaptiveThreshold] Loaded history for "
+                    f"{len(self._history)} components"
+                )
+        except (json.JSONDecodeError, OSError, TypeError) as e:
+            logger.debug(f"[AdaptiveThreshold] No valid history: {e}")
+            self._history = {}
+
+    def _save_history(self) -> None:
+        """Persist EMA data to disk for next startup."""
+        try:
+            _THRESHOLD_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_THRESHOLD_HISTORY_PATH, "w") as f:
+                json.dump(self._history, f, indent=2)
+        except OSError as e:
+            logger.debug(f"[AdaptiveThreshold] Failed to save history: {e}")
+
+    def get_threshold(self, name: str, static_default: float) -> float:
+        """
+        Get adaptive threshold for a component, falling back to static default
+        if no history exists.
+
+        Args:
+            name: Component name
+            static_default: The original static threshold (used if no history)
+
+        Returns:
+            Adaptive threshold in seconds
+        """
+        # Allow per-component env var override (always respected)
+        env_key = f"JARVIS_STALE_THRESHOLD_{name.upper()}"
+        env_val = os.environ.get(env_key)
+        if env_val:
+            try:
+                return float(env_val)
+            except (ValueError, TypeError):
+                pass
+
+        entry = self._history.get(name)
+        if entry and entry.get("count", 0) >= 3:
+            # Have enough samples — use EMA-based threshold
+            ema = entry["ema"]
+            adaptive = max(ema * self._safety_factor, self._minimum_floor)
+            # Never go below 60% of static default (guard against corrupted history)
+            adaptive = max(adaptive, static_default * 0.6)
+            return adaptive
+
+        return static_default
+
+    def record_duration(self, name: str, duration_seconds: float) -> None:
+        """
+        Record a component's actual init duration and update EMA.
+
+        Args:
+            name: Component name
+            duration_seconds: How long initialization took
+        """
+        entry = self._history.get(name, {"ema": duration_seconds, "last": 0, "count": 0})
+        old_ema = entry.get("ema", duration_seconds)
+        count = entry.get("count", 0)
+
+        if count == 0:
+            new_ema = duration_seconds
+        else:
+            new_ema = self._alpha * duration_seconds + (1 - self._alpha) * old_ema
+
+        self._history[name] = {
+            "ema": round(new_ema, 2),
+            "last": round(duration_seconds, 2),
+            "count": count + 1,
+        }
+
+    def save(self) -> None:
+        """Persist history to disk. Call once after all components finish."""
+        self._save_history()
+
+
+# Module-level singleton (created lazily in ParallelInitializer.__init__)
+_adaptive_calculator: Optional[AdaptiveThresholdCalculator] = None
+
+
+def get_adaptive_calculator() -> AdaptiveThresholdCalculator:
+    global _adaptive_calculator
+    if _adaptive_calculator is None:
+        _adaptive_calculator = AdaptiveThresholdCalculator()
+    return _adaptive_calculator
+
 
 class InitPhase(Enum):
     """Initialization phases"""
@@ -235,6 +368,19 @@ class ParallelInitializer:
         # Store references for cleanup
         self._tasks: List[asyncio.Task] = []
 
+        # v3.0: Per-component task storage for cooperative cancellation.
+        # Maps component name → asyncio.Task running its initializer.
+        # When watchdog marks SKIPPED, it CANCELS the task — no more zombies.
+        self._component_tasks: Dict[str, asyncio.Task] = {}
+
+        # v3.0: Dependency-failure events for instant cascade propagation.
+        # When a component fails/skips, its event is set. Dependents race
+        # their init work against dependency events and cancel immediately.
+        self._dep_failure_events: Dict[str, asyncio.Event] = {}
+
+        # v3.0: Adaptive threshold calculator — EMA-based self-tuning
+        self._adaptive_calc = get_adaptive_calculator()
+
         # Register standard components
         self._register_components()
 
@@ -299,14 +445,25 @@ class ParallelInitializer:
 
         # Cloud SQL proxy - give it more time but not critical for interactive use
         # v86.0: Now uses ProxyReadinessGate for DB-level verification
+        # v3.0: Threshold is now the REAL timeout (unified). 45s is tight for proxy
+        # + background DB verification. Keep at 45s — proxy itself is fast, the
+        # verify_db_level_readiness background task has its own lifecycle.
         self._add_component("cloud_sql_proxy", priority=10, stale_threshold=45.0)
         # Learning DB depends on cloud_sql_proxy for DB-level readiness
-        # v86.0: Explicit dependency ensures learning_db waits for DB-level gate
-        self._add_component("learning_database", priority=12, stale_threshold=40.0, dependencies=["cloud_sql_proxy"])
+        # v3.0: Increased from 40→60s. Init path: gate wait (15s) + retry (20s) +
+        # SQLite fallback (20s) = 55s worst case. With dependency-failure propagation,
+        # this timeout only fires if the gate is CHECKING the entire time (rare).
+        # The common failure path (Cloud SQL UNAVAILABLE) now cascades instantly via
+        # dep-failure events from cloud_sql_proxy.
+        self._add_component("learning_database", priority=12, stale_threshold=60.0, dependencies=["cloud_sql_proxy"])
 
         # Phase 2: ML Infrastructure (parallel, non-blocking)
         # All these can start simultaneously
-        self._add_component("memory_aware_startup", priority=20, stale_threshold=15.0)
+        # v3.0: memory_aware_startup increased from 15→55s. Init does psutil check
+        # (fast) but may also activate_cloud_ml_if_needed() which creates GCP VMs.
+        # 15s was killing it mid-cloud-activation. Sub-timeouts inside the init
+        # function (10s for mode, 45s for cloud) handle the real enforcement.
+        self._add_component("memory_aware_startup", priority=20, stale_threshold=55.0)
         if enable_spot_vm:
             self._add_component("gcp_vm_manager", priority=20, stale_threshold=30.0)
         self._add_component("cloud_ml_router", priority=20, stale_threshold=20.0)
@@ -354,15 +511,9 @@ class ParallelInitializer:
         stale_threshold: float = 30.0
     ):
         """Add a component to track with circuit breaker support"""
-        # v258.1: Allow per-component stale threshold override via env var
-        # e.g. JARVIS_STALE_THRESHOLD_CLOUD_ECAPA_CLIENT=90
-        env_key = f"JARVIS_STALE_THRESHOLD_{name.upper()}"
-        env_val = os.environ.get(env_key)
-        if env_val:
-            try:
-                stale_threshold = float(env_val)
-            except (ValueError, TypeError):
-                pass
+        # v3.0: Adaptive threshold — uses EMA history if available, falls back
+        # to static default. Per-component env var override is checked inside.
+        effective_threshold = self._adaptive_calc.get_threshold(name, stale_threshold)
 
         self.components[name] = ComponentInit(
             name=name,
@@ -370,8 +521,11 @@ class ParallelInitializer:
             is_critical=is_critical,
             dependencies=dependencies or [],
             is_interactive=is_interactive,
-            stale_threshold_seconds=stale_threshold
+            stale_threshold_seconds=effective_threshold,
         )
+
+        # v3.0: Create dependency-failure event for this component
+        self._dep_failure_events[name] = asyncio.Event()
 
     async def minimal_setup(self):
         """
@@ -597,6 +751,13 @@ class ParallelInitializer:
             total = len(self.components)
             logger.info(f"Initialization complete: {ready}/{total} components in {elapsed:.1f}s")
 
+            # v3.0: Persist adaptive threshold history for next startup
+            try:
+                self._adaptive_calc.save()
+                logger.debug("[v3.0] Adaptive threshold history saved")
+            except Exception as _ath_err:
+                logger.debug(f"[v3.0] Threshold history save failed: {_ath_err}")
+
             # Broadcast final completion to frontend
             broadcaster = get_startup_broadcaster()
             success = not failed_critical
@@ -709,15 +870,16 @@ class ParallelInitializer:
 
     async def _fast_forward_remaining_components(self):
         """
-        v125.0: Fast-forward all remaining PENDING components to SKIPPED.
+        v3.0: Fast-forward all remaining PENDING and RUNNING components to SKIPPED.
 
-        This is called when infrastructure failure is detected. Instead of waiting
-        for each component to timeout individually (which could take many minutes),
-        we immediately skip all PENDING components with a clear reason.
+        v125.0 only skipped PENDING components. v3.0 also cancels RUNNING
+        components because infrastructure failure makes their work pointless —
+        they'll just burn timeout budget retrying failed connections.
 
         This prevents the 600s global startup timeout from triggering.
         """
         skipped_count = 0
+        cancelled_count = 0
 
         for comp in self.components.values():
             if comp.phase == InitPhase.PENDING:
@@ -727,27 +889,40 @@ class ParallelInitializer:
                 )
                 skipped_count += 1
             elif comp.phase == InitPhase.RUNNING:
-                # Don't interrupt running components - let them timeout naturally
-                # or complete. The watchdog will handle stuck components.
-                logger.debug(f"[v125.0] Not skipping running component: {comp.name}")
+                # v3.0: Also cancel running components — infrastructure is down,
+                # they're just burning timeout budget retrying failed connections.
+                await self._mark_skipped(
+                    comp.name,
+                    "Fast-forward cancel (infrastructure failure)"
+                )
+                cancelled_count += 1
 
-        if skipped_count > 0:
+        total = skipped_count + cancelled_count
+        if total > 0:
             logger.warning(
-                f"⚡ v125.0: Fast-forward skipped {skipped_count} pending components"
+                f"[v3.0] Fast-forward: {skipped_count} skipped, "
+                f"{cancelled_count} cancelled (infrastructure failure)"
             )
             self._update_progress()
 
     async def _stale_component_watchdog(self):
         """
-        v2.0: Watchdog task that detects stale (hung) components.
+        v3.0: Watchdog task that detects and KILLS stale (hung) components.
+
+        Architecture changes from v2.0:
+        - v2.0: Marked SKIPPED but task kept running (zombie) for 45-100s
+        - v3.0: Marks SKIPPED AND cancels the stored asyncio.Task (cooperative cancellation)
+        - v3.0: _mark_skipped now signals dependency-failure events (cascade propagation)
+        - v3.0: Watchdog is a TRUE ENFORCER, not just a cosmetic logger
 
         Runs in background and:
         1. Checks for components stuck in RUNNING state too long
-        2. Marks stale components as SKIPPED (not FAILED) for graceful degradation
-        3. Checks for interactive readiness (WebSocket + Voice API)
-        4. Broadcasts interactive ready when core components are available
+        2. CANCELS stale component tasks (not just marks them)
+        3. Signals dependency-failure events for cascade propagation
+        4. Checks for interactive readiness (WebSocket + Voice API)
+        5. Broadcasts interactive ready when core components are available
         """
-        logger.info("🐕 Stale component watchdog started")
+        logger.info("[v3.0] Stale component watchdog started (cooperative cancellation)")
 
         check_interval = 3.0  # Check every 3 seconds
         max_runtime = 180.0  # Stop watchdog after 3 minutes
@@ -760,11 +935,10 @@ class ParallelInitializer:
 
                 # Stop watchdog after max runtime
                 if elapsed > max_runtime:
-                    logger.info("🐕 Watchdog completed (max runtime reached)")
+                    logger.info("[v3.0] Watchdog completed (max runtime reached)")
                     break
 
                 # v258.1 R2-#4: Early warning scan (BEFORE stale detection)
-                # Must be separate from stale_components loop since is_stale = already exceeded
                 for name, comp in self.components.items():
                     if comp.phase == InitPhase.RUNNING and comp.start_time:
                         _elapsed = comp.running_seconds
@@ -783,17 +957,20 @@ class ParallelInitializer:
                     if comp.is_stale:
                         stale_components.append((name, comp.running_seconds))
 
-                # Mark stale components as skipped
+                # v3.0: Mark stale components as skipped AND cancel their tasks
                 for name, running_secs in stale_components:
                     comp = self.components.get(name)
                     if comp and comp.phase == InitPhase.RUNNING:
                         logger.warning(
                             f"⚠️ Watchdog: {name} stale after {running_secs:.0f}s "
-                            f"(threshold: {comp.stale_threshold_seconds}s) - skipping"
+                            f"(threshold: {comp.stale_threshold_seconds:.0f}s) — "
+                            f"CANCELLING task"
                         )
+                        # _mark_skipped now also cancels the stored task
+                        # and signals dependency-failure events
                         await self._mark_skipped(
                             name,
-                            f"Stale after {running_secs:.0f}s (watchdog)"
+                            f"Stale after {running_secs:.0f}s (watchdog — task cancelled)"
                         )
 
                 # Check for interactive readiness
@@ -871,11 +1048,13 @@ class ParallelInitializer:
         """
         Initialize a single component with timeout protection and graceful degradation.
 
-        v2.0 Enhancements:
-        - Per-component timeout protection (60s default, 120s for heavy components)
-        - Graceful degradation for non-critical components
-        - Better error context and logging
-        - Skips already-completed components (e.g., config marked complete in minimal_setup)
+        v3.0 Architecture:
+        - UNIFIED TIMEOUT: stale_threshold IS the timeout (no dual-timer conflict)
+        - TASK STORAGE: Initializer runs as a named asyncio.Task for cancellation
+        - DEPENDENCY RACING: Init races against dependency-failure events —
+          if a dependency fails mid-execution, this component cancels immediately
+        - ADAPTIVE THRESHOLDS: Timeout derived from EMA of historical init times
+        - ZOMBIE PREVENTION: Watchdog cancels the stored task, not just sets a flag
         """
         comp = self.components.get(name)
         if not comp:
@@ -885,6 +1064,15 @@ class ParallelInitializer:
         if comp.phase == InitPhase.COMPLETE:
             logger.debug(f"[SKIP] {name} already complete")
             return
+
+        # v3.0: Check if any dependency already failed BEFORE we start
+        for dep_name in comp.dependencies:
+            dep_event = self._dep_failure_events.get(dep_name)
+            if dep_event and dep_event.is_set():
+                reason = f"Dependency '{dep_name}' already failed"
+                logger.warning(f"⚠️ {name}: {reason} — skipping")
+                await self._mark_skipped(name, reason)
+                return
 
         comp.phase = InitPhase.RUNNING
         comp.start_time = time.time()
@@ -896,35 +1084,75 @@ class ParallelInitializer:
             message=f"Initializing {name.replace('_', ' ').title()}..."
         )
 
-        # Determine timeout based on component type
-        # Heavy components (ML, DB) get more time
-        heavy_components = {
-            'vbi_prewarm', 'cloud_ecapa_client', 'neural_mesh',
-            'ml_engine_registry', 'cloud_sql_proxy', 'learning_database',
-            'agentic_system'
-        }
-        timeout = 120.0 if name in heavy_components else 60.0
+        # v3.0: UNIFIED TIMEOUT — stale_threshold IS the timeout.
+        # No more hardcoded heavy_components dict with 60/120s.
+        # The stale threshold is the single source of truth (adaptive or env-configured).
+        timeout = comp.stale_threshold_seconds
 
         try:
-            # Dispatch to component-specific initializer with timeout
             initializer = getattr(self, f"_init_{name}", None)
             if initializer:
+                # v3.0: Wrap initializer in a named task for cooperative cancellation.
+                init_task = asyncio.ensure_future(initializer())
+                self._component_tasks[name] = init_task
+
+                # v3.0: Race the initializer against dependency-failure events.
+                # If ANY dependency fails while we're running, cancel immediately.
+                dep_events = [
+                    self._dep_failure_events[d]
+                    for d in comp.dependencies
+                    if d in self._dep_failure_events
+                ]
+
                 try:
-                    await asyncio.wait_for(initializer(), timeout=timeout)
+                    if dep_events:
+                        # Race: init vs dependency failure
+                        await self._race_init_vs_deps(
+                            name, init_task, dep_events, timeout
+                        )
+                    else:
+                        # No dependencies — just run with timeout
+                        await asyncio.wait_for(
+                            asyncio.shield(init_task), timeout=timeout
+                        )
                 except asyncio.TimeoutError:
-                    error_msg = f"Initialization timeout after {timeout}s"
+                    # Cancel the actual task (not just mark it)
+                    init_task.cancel()
+                    try:
+                        await init_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    error_msg = f"Initialization timeout after {timeout:.0f}s"
                     if comp.is_critical:
-                        # Critical component timeout is a failure
                         raise RuntimeError(error_msg)
                     else:
-                        # Non-critical component timeout - log and continue
-                        logger.warning(f"⚠️ {name} initialization timeout ({timeout}s) - continuing with degraded functionality")
+                        logger.warning(
+                            f"⚠️ {name} timeout ({timeout:.0f}s) — "
+                            f"task cancelled, continuing degraded"
+                        )
                         await self._mark_skipped(name, error_msg)
                         return
+                except asyncio.CancelledError:
+                    # v3.0: Watchdog or dependency cancelled us
+                    if comp.phase == InitPhase.SKIPPED:
+                        logger.debug(f"[{name}] Cancelled (already marked SKIPPED)")
+                    else:
+                        logger.info(f"[{name}] Cancelled by watchdog/dependency")
+                        await self._mark_skipped(name, "Cancelled (watchdog or dependency)")
+                    return
+                finally:
+                    self._component_tasks.pop(name, None)
             else:
                 logger.debug(f"No initializer for {name}, marking complete")
 
-            await self._mark_complete(name)
+            # v3.0: Guard — only mark complete if not already SKIPPED/FAILED by watchdog
+            if comp.phase == InitPhase.RUNNING:
+                await self._mark_complete(name)
+
+                # v3.0: Record actual duration for adaptive threshold learning
+                if comp.start_time and comp.end_time:
+                    actual = comp.end_time - comp.start_time
+                    self._adaptive_calc.record_duration(name, actual)
 
         except Exception as e:
             error_context = str(e)
@@ -934,10 +1162,90 @@ class ParallelInitializer:
                 logger.warning(f"⚠️ Non-critical component {name} failed: {error_context}")
             await self._mark_failed(name, error_context)
 
+    async def _race_init_vs_deps(
+        self,
+        name: str,
+        init_task: "asyncio.Task",
+        dep_events: List[asyncio.Event],
+        timeout: float,
+    ) -> None:
+        """
+        v3.0: Race an initializer task against dependency-failure events.
+
+        If any dependency fails while the initializer is running, cancel the
+        initializer immediately — don't wait for it to discover the failure
+        via network timeout or retry loop.
+
+        This eliminates the 35-60s blind retry cascade (e.g., learning_database
+        retrying 3×20s when cloud_sql_proxy already failed at t=5s).
+        """
+        # Create waiters for each dependency failure event
+        async def _wait_for_dep_failure() -> str:
+            """Wait for any dependency-failure event to fire."""
+            while True:
+                for evt in dep_events:
+                    if evt.is_set():
+                        # Find which dependency failed
+                        for dep_name, dep_evt in self._dep_failure_events.items():
+                            if dep_evt is evt:
+                                return dep_name
+                        return "unknown_dependency"
+                await asyncio.sleep(0.5)
+
+        dep_waiter = asyncio.ensure_future(_wait_for_dep_failure())
+
+        try:
+            # Race: whichever finishes first wins
+            done, pending = await asyncio.wait(
+                [init_task, dep_waiter],
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if not done:
+                # Timeout — neither finished
+                dep_waiter.cancel()
+                raise asyncio.TimeoutError()
+
+            if dep_waiter in done:
+                # Dependency failed — cancel initializer
+                failed_dep = dep_waiter.result()
+                init_task.cancel()
+                try:
+                    await init_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                reason = f"Dependency '{failed_dep}' failed mid-execution"
+                logger.warning(f"⚠️ {name}: {reason} — cancelling")
+                await self._mark_skipped(name, reason)
+                return
+
+            # Init task completed — cancel dep waiter
+            dep_waiter.cancel()
+
+            # Re-raise any exception from init_task
+            if init_task.done() and init_task.exception():
+                raise init_task.exception()
+
+        except asyncio.CancelledError:
+            dep_waiter.cancel()
+            raise
+        finally:
+            if not dep_waiter.done():
+                dep_waiter.cancel()
+
     async def _mark_complete(self, name: str):
         """Mark a component as complete"""
         comp = self.components.get(name)
         if comp:
+            # v3.0: Guard against overwriting SKIPPED/FAILED set by watchdog
+            if comp.phase not in (InitPhase.RUNNING, InitPhase.PENDING):
+                logger.debug(
+                    f"[READY] {name} skipped — already {comp.phase.value} "
+                    f"(watchdog or dependency cancelled)"
+                )
+                return
+
             comp.phase = InitPhase.COMPLETE
             comp.end_time = time.time()
             self.app.state.components_ready.add(name)
@@ -974,6 +1282,9 @@ class ParallelInitializer:
             self.app.state.components_failed.add(name)
             logger.warning(f"[FAILED] {name}: {error}")
 
+            # v3.0: Signal dependency-failure event — dependents cancel immediately
+            self._signal_dependency_failure(name)
+
             # Broadcast failure via WebSocket (with timeout to prevent blocking)
             try:
                 broadcaster = get_startup_broadcaster()
@@ -995,8 +1306,29 @@ class ParallelInitializer:
         comp = self.components.get(name)
         if comp:
             comp.phase = InitPhase.SKIPPED
+            comp.end_time = time.time()
             comp.error = reason
             logger.info(f"[SKIPPED] {name}: {reason}")
+
+            # v3.0: Signal dependency-failure event — dependents cancel immediately
+            self._signal_dependency_failure(name)
+
+            # v3.0: Cancel the stored task if it's still running (kill the zombie)
+            task = self._component_tasks.pop(name, None)
+            if task and not task.done():
+                task.cancel()
+                logger.debug(f"[v3.0] Cancelled zombie task for {name}")
+
+    def _signal_dependency_failure(self, name: str) -> None:
+        """
+        v3.0: Signal that a component has failed/been-skipped.
+
+        Sets this component's failure event, which causes any running
+        dependent component to cancel via _race_init_vs_deps().
+        """
+        evt = self._dep_failure_events.get(name)
+        if evt:
+            evt.set()
 
     def _update_progress(self):
         """Update startup progress percentage"""
@@ -1755,7 +2087,17 @@ class ParallelInitializer:
                     logger.warning(f"   ⚠️ Cloud SQL readiness check failed: {e}")
                     conn_mgr.set_proxy_ready(False)
 
-            # Run DB-level readiness verification in background (don't block startup, tracked)
+            # v3.0: Run DB-level readiness verification with bounded inline wait.
+            #
+            # ARCHITECTURAL FIX: Previously this ran purely in background, causing
+            # a semantic gap — cloud_sql_proxy was marked COMPLETE while the gate
+            # was still CHECKING. learning_database saw dependency "ready" but the
+            # database wasn't actually reachable. This caused blind 3×20s retries.
+            #
+            # New approach: spawn background task, then wait for gate to reach a
+            # final state (up to 30s). If it resolves to UNAVAILABLE, we signal
+            # dependency-failure immediately — learning_database cancels instantly
+            # via dep-failure event instead of discovering it via network timeout.
             if TASK_MANAGER_AVAILABLE:
                 task_mgr = get_task_manager()
                 await task_mgr.spawn(
@@ -1769,6 +2111,47 @@ class ParallelInitializer:
                     name="cloud_sql_db_level_ready_signal"
                 )
                 self._tasks.append(ready_task)
+
+            # v3.0: Bounded inline wait for gate to reach a final state.
+            # This closes the semantic gap: we don't return COMPLETE while the
+            # gate is still CHECKING. If gate reaches UNAVAILABLE, dependents
+            # get instant cascade cancellation via dep-failure events.
+            _gate_inline_timeout = float(
+                os.environ.get("JARVIS_GATE_INLINE_WAIT", "30.0")
+            )
+            try:
+                _gate_result = await readiness_gate.wait_for_ready(
+                    timeout=_gate_inline_timeout
+                )
+                if _gate_result.state == ReadinessState.UNAVAILABLE:
+                    logger.warning(
+                        f"   Cloud SQL gate: UNAVAILABLE — "
+                        f"dependents will be cascade-cancelled"
+                    )
+                    # Don't raise — let _init_component mark COMPLETE, but the
+                    # dep-failure event will be triggered by the gate state check
+                    # in learning_database's init. Actually, better: raise so
+                    # _init_component marks this as FAILED, triggering dep cascade.
+                    raise RuntimeError(
+                        f"Cloud SQL UNAVAILABLE: {_gate_result.failure_reason or 'DB check failed'}"
+                    )
+                elif _gate_result.state == ReadinessState.DEGRADED_SQLITE:
+                    logger.info("   Cloud SQL gate: DEGRADED_SQLITE (SQLite fallback)")
+                    # Component is "complete" but in degraded mode
+                elif _gate_result.state == ReadinessState.READY:
+                    logger.info("   Cloud SQL gate: READY (DB-level verified)")
+                else:
+                    logger.info(
+                        f"   Cloud SQL gate: {_gate_result.state.value} "
+                        f"(proceeding, dependents will check)"
+                    )
+            except asyncio.TimeoutError:
+                # Gate didn't reach final state in time — proceed, let dependents
+                # handle via their own gate checks
+                logger.info(
+                    f"   Cloud SQL gate: still CHECKING after "
+                    f"{_gate_inline_timeout:.0f}s — proceeding"
+                )
 
             configured_port = proxy_manager.config.get('cloud_sql', {}).get('port', 5432)
             logger.info(
@@ -3066,6 +3449,15 @@ class ParallelInitializer:
                 )
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
+
+        # v3.0: Cancel any still-running component tasks
+        active_component_tasks = [
+            t for t in self._component_tasks.values() if not t.done()
+        ]
+        if active_component_tasks:
+            logger.info(f"Cancelling {len(active_component_tasks)} component tasks...")
+            for task in active_component_tasks:
+                task.cancel()
 
         # Cancel all tracked tasks with timeout protection
         active_tasks = [t for t in self._tasks if not t.done()]
