@@ -95,6 +95,17 @@ if _is_gui_session():
         pass
 
 logger = logging.getLogger(__name__)
+_PRIVATE_API_WARNING_EMITTED = False
+
+
+def _warn_private_api_once(message: str) -> None:
+    """Log private API bootstrap warnings once per process."""
+    global _PRIVATE_API_WARNING_EMITTED
+    if _PRIVATE_API_WARNING_EMITTED:
+        logger.debug(message)
+        return
+    _PRIVATE_API_WARNING_EMITTED = True
+    logger.warning(message)
 
 @dataclass
 class SpaceInfo:
@@ -129,47 +140,75 @@ class MacOSSpaceDetector:
     """
 
     def __init__(self):
-        self.workspace = NSWorkspace.sharedWorkspace()
-        self.screens = NSScreen.screens()
+        self.workspace = NSWorkspace.sharedWorkspace() if NSWorkspace else None
+        self.screens = NSScreen.screens() if NSScreen else []
+        self._private_api_available = False
+        self._cgs_copy_managed_display_spaces = None
+        self._cgs_get_active_space = None
         self._init_private_apis()
         self._space_cache = {}
         self._window_cache = {}
-        logger.info("MacOS Space Detector initialized with native APIs")
+        logger.info(
+            "MacOS Space Detector initialized (native=%s, private=%s)",
+            MACOS_NATIVE_AVAILABLE,
+            self._private_api_available,
+        )
 
     def _init_private_apis(self):
         """Initialize private macOS APIs for space management"""
+        self.cgs_connection = None
+
+        if objc is None:
+            _warn_private_api_once("Could not load private APIs, using fallback: PyObjC bridge unavailable")
+            return
+
         try:
-            # Load private framework for space management
+            # Load private framework for space management.
+            # Use a dedicated symbol map (not globals) so capability checks are explicit.
+            symbol_map: Dict[str, Any] = {}
             bundle = objc.loadBundle(
-                'CoreGraphics',
-                globals(),
-                bundle_path='/System/Library/Frameworks/CoreGraphics.framework'
+                "CoreGraphics",
+                symbol_map,
+                bundle_path="/System/Library/Frameworks/CoreGraphics.framework",
             )
 
-            # Define private API signatures
             objc.loadBundleFunctions(
                 bundle,
-                globals(),
+                symbol_map,
                 [
-                    ('CGSCopySpaces', b'@ii'),
-                    ('CGSCopySpacesForWindows', b'@ii@'),
-                    ('CGSSpaceGetType', b'iii'),
-                    ('CGSGetActiveSpace', b'ii'),
-                    ('CGSCopyManagedDisplaySpaces', b'@i'),
-                    ('CGSGetWindowCount', b'ii^i'),
-                    ('CGSGetOnScreenWindowList', b'iii^i^i'),
-                ]
+                    ("CGSCopySpaces", b"@ii"),
+                    ("CGSCopySpacesForWindows", b"@ii@"),
+                    ("CGSSpaceGetType", b"iii"),
+                    ("CGSGetActiveSpace", b"ii"),
+                    ("CGSCopyManagedDisplaySpaces", b"@i"),
+                    ("CGSGetWindowCount", b"ii^i"),
+                    ("CGSGetOnScreenWindowList", b"iii^i^i"),
+                    ("CGSMainConnectionID", b"i"),
+                ],
             )
 
-            # Get connection ID
-            self.cgs_connection = objc.objc_msgSend(
-                objc.objc_getClass('NSApplication'),
-                'sharedApplication'
-            )
+            self._cgs_copy_managed_display_spaces = symbol_map.get("CGSCopyManagedDisplaySpaces")
+            self._cgs_get_active_space = symbol_map.get("CGSGetActiveSpace")
+            main_connection_fn = symbol_map.get("CGSMainConnectionID")
+
+            if callable(main_connection_fn):
+                self.cgs_connection = int(main_connection_fn())
+            else:
+                # Connection 0 is accepted by many CGS calls and avoids hard coupling
+                # to private selector APIs that vary by PyObjC build.
+                self.cgs_connection = 0
+
+            self._private_api_available = callable(self._cgs_copy_managed_display_spaces)
+            if not self._private_api_available:
+                _warn_private_api_once(
+                    "Could not load private APIs, using fallback: CGSCopyManagedDisplaySpaces unavailable"
+                )
+                self.cgs_connection = None
 
         except Exception as e:
-            logger.warning(f"Could not load private APIs, using fallback: {e}")
+            _warn_private_api_once(f"Could not load private APIs, using fallback: {e}")
             self.cgs_connection = None
+            self._private_api_available = False
 
     def get_all_spaces(self) -> List[SpaceInfo]:
         """
@@ -178,9 +217,11 @@ class MacOSSpaceDetector:
         spaces = []
 
         try:
-            if self.cgs_connection:
+            if self._private_api_available and self.cgs_connection is not None:
                 # Use private APIs for accurate space detection
                 spaces_data = self._get_spaces_via_private_api()
+                if not spaces_data:
+                    spaces_data = self._get_spaces_via_applescript()
             else:
                 # Fallback to AppleScript/public APIs
                 spaces_data = self._get_spaces_via_applescript()
@@ -202,8 +243,10 @@ class MacOSSpaceDetector:
         spaces = []
 
         try:
+            if not self._private_api_available or not callable(self._cgs_copy_managed_display_spaces):
+                return spaces
             # Get managed display spaces
-            display_spaces = CGSCopyManagedDisplaySpaces(self.cgs_connection)
+            display_spaces = self._cgs_copy_managed_display_spaces(self.cgs_connection)
 
             for display_dict in display_spaces:
                 display_id = display_dict.get('Display Identifier')
@@ -620,6 +663,9 @@ class MacOSSpaceDetector:
     def monitor_space_changes(self, callback):
         """Monitor for space change events"""
         # Set up notification observer for space changes
+        if not NSWorkspace:
+            logger.warning("Space change monitoring unavailable: NSWorkspace not available")
+            return
         notification_center = NSWorkspace.sharedWorkspace().notificationCenter()
 
         notification_center.addObserverForName_object_queue_usingBlock_(

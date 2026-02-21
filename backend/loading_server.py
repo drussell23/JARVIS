@@ -845,6 +845,32 @@ class WebSocketManager:
             for conn_id in dead_connections:
                 del self._connections[conn_id]
 
+    async def close_all(self, timeout: float = 2.0) -> int:
+        """Close all active WebSocket connections with bounded wait."""
+        async with self._lock:
+            connections = list(self._connections.values())
+            self._connections.clear()
+
+        if not connections:
+            return 0
+
+        close_timeout = max(0.1, timeout)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(conn.close() for conn in connections),
+                    return_exceptions=True,
+                ),
+                timeout=close_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[WS] Timed out closing %d connection(s) after %.1fs",
+                len(connections),
+                close_timeout,
+            )
+        return len(connections)
+
     @property
     def connection_count(self) -> int:
         return len(self._connections)
@@ -1053,12 +1079,14 @@ class LoadingServer:
         self._message = "Starting JARVIS..."
         self._components: Dict[str, Dict[str, Any]] = {}
         self._shutdown_requested = False
+        self._stopping = False
         self._server: Optional[asyncio.Server] = None
 
         # Background tasks
         self._background_tasks: List[asyncio.Task] = []
         self._hub_connect_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._active_request_tasks: Set[asyncio.Task] = set()
 
         # v183.0: Supervisor heartbeat tracking
         self._last_supervisor_update: float = time.time()
@@ -1227,6 +1255,31 @@ class LoadingServer:
         # v210.0: Use safe task to prevent "Future exception was never retrieved"
         create_safe_task(self._broadcast_progress(), name="hub_broadcast_progress")
 
+    async def _drain_active_request_tasks(self, timeout: float) -> None:
+        """Wait for in-flight request handlers to exit, then cancel stragglers."""
+        wait_timeout = max(0.1, timeout)
+        pending = [
+            task for task in list(self._active_request_tasks)
+            if not task.done()
+        ]
+        if not pending:
+            return
+
+        _, still_pending = await asyncio.wait(pending, timeout=wait_timeout)
+        for task in still_pending:
+            task.cancel()
+
+        if still_pending:
+            _, final_pending = await asyncio.wait(
+                still_pending,
+                timeout=max(0.1, wait_timeout * 0.5),
+            )
+            if final_pending:
+                logger.warning(
+                    "[v212.1] %d request task(s) still pending after shutdown drain",
+                    len(final_pending),
+                )
+
     async def _broadcast_progress(self):
         """
         Broadcast current progress to all WebSocket clients.
@@ -1306,6 +1359,9 @@ class LoadingServer:
 
     async def handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming HTTP/WebSocket request."""
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_request_tasks.add(current_task)
         try:
             request_line = await asyncio.wait_for(reader.readline(), timeout=30.0)
             if not request_line:
@@ -1355,6 +1411,8 @@ class LoadingServer:
         except Exception as e:
             logger.debug(f"[v125.0] Request error: {e}")
         finally:
+            if current_task is not None:
+                self._active_request_tasks.discard(current_task)
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
@@ -2493,52 +2551,75 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
 
     async def stop(self):
         """Stop the loading server gracefully."""
+        if self._stopping:
+            return
+        self._stopping = True
+
         logger.info("[v212.0] Shutting down loading server...")
         self._shutdown_requested = True
+        stop_timeout = max(0.5, float(os.getenv("LOADING_SERVER_STOP_TIMEOUT", "6.0")))
+        try:
+            # =================================================================
+            # v211.0: PARENT DEATH WATCHER - Stop monitoring during graceful shutdown
+            # =================================================================
+            if hasattr(self, '_parent_watcher') and self._parent_watcher:
+                try:
+                    from backend.utils.parent_death_watcher import stop_parent_watcher
+                    await stop_parent_watcher()
+                    logger.info("[v211.0] Parent death watcher stopped")
+                except Exception as e:
+                    logger.debug(f"Parent death watcher cleanup: {e}")
 
-        # =================================================================
-        # v211.0: PARENT DEATH WATCHER - Stop monitoring during graceful shutdown
-        # =================================================================
-        if hasattr(self, '_parent_watcher') and self._parent_watcher:
+            # Close websocket clients immediately so request handlers blocked on
+            # reader.read() can observe disconnect and exit quickly.
             try:
-                from backend.utils.parent_death_watcher import stop_parent_watcher
-                await stop_parent_watcher()
-                logger.info("[v211.0] Parent death watcher stopped")
+                closed_connections = await self._ws_manager.close_all(timeout=stop_timeout / 3.0)
+                if closed_connections:
+                    logger.debug("[v212.1] Closed %d websocket connection(s)", closed_connections)
             except Exception as e:
-                logger.debug(f"Parent death watcher cleanup: {e}")
+                logger.debug(f"[v212.1] WebSocket close_all cleanup: {e}")
 
-        # Cancel background tasks
-        for task in self._background_tasks:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            # Cancel background tasks
+            for task in self._background_tasks:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            self._background_tasks.clear()
 
-        # Save ETA history
-        self._eta_engine.finish_tracking()
+            # Save ETA history
+            self._eta_engine.finish_tracking()
 
-        # v212.0: Save enhanced ETA history if available
-        if self._enhanced_eta:
-            self._enhanced_eta.finish_session()
+            # v212.0: Save enhanced ETA history if available
+            if self._enhanced_eta:
+                self._enhanced_eta.finish_session()
 
-        # v212.0: Log shutdown event
-        if self._event_log:
-            self._event_log.append_event(
-                "server_shutdown",
-                {
-                    "session_id": self._session_id,
-                    "progress": self._progress,
-                    "phase": self._phase,
-                    "uptime_seconds": time.time() - self._startup_time,
-                },
-                trace_id=self._trace_context.trace_id if self._trace_context else None,
-            )
+            # v212.0: Log shutdown event
+            if self._event_log:
+                self._event_log.append_event(
+                    "server_shutdown",
+                    {
+                        "session_id": self._session_id,
+                        "progress": self._progress,
+                        "phase": self._phase,
+                        "uptime_seconds": time.time() - self._startup_time,
+                    },
+                    trace_id=self._trace_context.trace_id if self._trace_context else None,
+                )
 
-        # Close server
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+            # Close server
+            if self._server:
+                self._server.close()
+                with suppress(Exception):
+                    await asyncio.wait_for(self._server.wait_closed(), timeout=stop_timeout / 3.0)
+                self._server = None
 
-        logger.info("[v212.0] Loading server stopped")
+            # Drain any in-flight HTTP/WebSocket request tasks.
+            with suppress(Exception):
+                await self._drain_active_request_tasks(timeout=stop_timeout / 2.0)
+
+            logger.info("[v212.0] Loading server stopped")
+        finally:
+            self._stopping = False
 
 
 # =============================================================================
