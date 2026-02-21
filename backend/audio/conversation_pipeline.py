@@ -31,7 +31,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -41,6 +41,45 @@ logger = logging.getLogger(__name__)
 _MAX_CONTEXT_TURNS = int(os.getenv("JARVIS_CONV_MAX_TURNS", "20"))
 _SESSION_TIMEOUT_S = float(os.getenv("JARVIS_CONV_SESSION_TIMEOUT", "300"))
 _SENTENCE_DELIMITERS = re.compile(r'(?<=[.!?])\s+')
+_EXECUTE_INTENT_CONFIDENCE = float(
+    os.getenv("JARVIS_CONV_EXECUTE_INTENT_CONFIDENCE", "0.62")
+)
+_AUTHENTICATE_PATTERN = re.compile(
+    r"\b(?:authenticate|biometric|voice\s+unlock|unlock\s+(?:my\s+)?screen)\b",
+    re.IGNORECASE,
+)
+_EXECUTE_IMPERATIVE_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:"
+    r"open|close|launch|run|execute|send|set|switch|turn|enable|disable|"
+    r"connect|disconnect|start|stop|restart|shutdown|lock|unlock|schedule|"
+    r"create|delete|kill"
+    r")\b",
+    re.IGNORECASE,
+)
+_COMPLEXITY_HINT_PATTERN = re.compile(
+    r"\b(?:analyze|compare|architecture|strategy|multi[-\s]?step|derive|proof)\b",
+    re.IGNORECASE,
+)
+_MATH_HINT_PATTERN = re.compile(
+    r"\b(?:solve|equation|integral|derivative|calculus|algebra|matrix|theorem)\b",
+    re.IGNORECASE,
+)
+_CODE_HINT_PATTERN = re.compile(
+    r"\b(?:python|javascript|typescript|java|c\+\+|rust|function|class|debug|bug|stacktrace)\b",
+    re.IGNORECASE,
+)
+# v258.3: Anchored exit pattern — requires the exit phrase to be the
+# ENTIRE utterance (with optional "jarvis" prefix and punctuation).
+# "stop" exits, but "stop the server" does NOT.
+_EXIT_PATTERN = re.compile(
+    r"^(?:(?:hey\s+)?jarvis[,\s]*)?(?:"
+    r"goodbye|good\s*bye|bye(?:\s+bye)?|stop|exit|quit|"
+    r"end\s+(?:the\s+)?conversation|that'?s\s+all|i'?m\s+done|"
+    r"stop\s+(?:talking|listening|the\s+conversation)|"
+    r"jarvis\s+(?:stop|quit)"
+    r")[\s.!?]*$",
+    re.IGNORECASE,
+)
 
 
 # ============================================================================
@@ -195,6 +234,10 @@ class ConversationPipeline:
         barge_in=None,
         tts_engine=None,
         llm_client=None,
+        intent_classifier=None,
+        command_processor=None,
+        query_complexity_manager=None,
+        mode_dispatcher=None,
     ):
         self._audio_bus = audio_bus
         self._streaming_stt = streaming_stt
@@ -202,6 +245,13 @@ class ConversationPipeline:
         self._barge_in = barge_in
         self._tts_engine = tts_engine
         self._llm_client = llm_client
+        self._intent_classifier = intent_classifier
+        self._command_processor = command_processor
+        self._query_complexity_manager = query_complexity_manager
+        self._mode_dispatcher = mode_dispatcher
+        self._intent_classifier_init_failed = False
+        self._command_processor_init_failed = False
+        self._query_complexity_lookup_attempted = False
 
         self._session: Optional[ConversationSession] = None
         self._sentence_splitter = SentenceSplitter()
@@ -218,6 +268,10 @@ class ConversationPipeline:
             "Use short sentences. Avoid markdown, code blocks, or lists "
             "unless specifically asked."
         )
+
+    def set_mode_dispatcher(self, dispatcher) -> None:
+        """Set the ModeDispatcher reference (for biometric auth delegation)."""
+        self._mode_dispatcher = dispatcher
 
     async def start_session(self) -> str:
         """Start a new conversation session. Returns session_id."""
@@ -312,7 +366,10 @@ class ConversationPipeline:
                 f"[ConvPipeline] Conversation mode {'enabled' if enabled else 'disabled'}"
             )
         except Exception as e:
-            logger.debug(f"[ConvPipeline] Speech state mode toggle failed: {e}")
+            # v258.3: WARNING not debug — speech state inconsistency can
+            # cause post-speech cooldown to stay active during conversation,
+            # rejecting legitimate user speech.
+            logger.warning("[ConvPipeline] Speech state mode toggle failed: %s", e)
 
     async def _conversation_loop(self) -> None:
         """Core conversation loop: listen → understand → respond → repeat."""
@@ -355,13 +412,50 @@ class ConversationPipeline:
                     f"{'...' if len(user_text) > 80 else ''}"
                 )
 
-                # 4. Check for exit commands
-                if self._is_exit_command(user_text):
+                # 4. Classify turn intent and route deterministically
+                intent_decision = await self._classify_turn_intent(user_text)
+                route = intent_decision.get("route", "discuss")
+                logger.info(
+                    "[ConvPipeline] Intent route=%s intent=%s confidence=%.2f",
+                    route,
+                    intent_decision.get("intent", "unknown"),
+                    float(intent_decision.get("confidence", 0.0) or 0.0),
+                )
+
+                # 5. Check for exit commands — AFTER intent classification.
+                # v258.3: Only exit when the route is "discuss". This prevents
+                # "stop the server" from killing the conversation when the
+                # intent router correctly classified it as a command.
+                if route == "discuss" and self._is_exit_command(user_text):
                     logger.info("[ConvPipeline] Exit command detected")
                     break
 
-                # 5. Generate and speak response
-                await self._generate_and_speak_response()
+                if route == "authenticate":
+                    # v258.3: Biometric auth has a dedicated flow that
+                    # pauses conversation, delegates to ModeDispatcher VBIA,
+                    # and resumes after authentication completes.
+                    handled = await self._handle_authenticate_turn(user_text)
+                    if handled:
+                        continue
+                    logger.info(
+                        "[ConvPipeline] Auth route unavailable, falling back to discuss"
+                    )
+                elif route == "execute":
+                    handled = await self._execute_command_turn(
+                        user_text=user_text,
+                        intent_decision=intent_decision,
+                    )
+                    if handled:
+                        continue
+                    logger.warning(
+                        "[ConvPipeline] Command route unavailable, falling back to discuss"
+                    )
+
+                # 6. Discuss route → generate and speak LLM response
+                await self._generate_and_speak_response(
+                    user_text=user_text,
+                    intent_decision=intent_decision,
+                )
 
             except asyncio.CancelledError:
                 raise
@@ -437,7 +531,11 @@ class ConversationPipeline:
         # Join all accumulated segments into one turn
         return " ".join(accumulated_text_parts)
 
-    async def _generate_and_speak_response(self) -> None:
+    async def _generate_and_speak_response(
+        self,
+        user_text: Optional[str] = None,
+        intent_decision: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Generate LLM response and stream it through TTS."""
         if self._session is None:
             return
@@ -462,7 +560,11 @@ class ConversationPipeline:
         try:
             if self._llm_client is not None:
                 # Use UnifiedModelServing for streaming response
-                token_stream = self._get_llm_stream(messages)
+                token_stream = self._get_llm_stream(
+                    messages,
+                    user_text=user_text,
+                    intent_decision=intent_decision,
+                )
 
                 async for sentence in self._sentence_splitter.split(token_stream):
                     if cancel_event.is_set():
@@ -493,7 +595,10 @@ class ConversationPipeline:
             )
 
     async def _get_llm_stream(
-        self, messages: List[Dict[str, str]]
+        self,
+        messages: List[Dict[str, str]],
+        user_text: Optional[str] = None,
+        intent_decision: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[str]:
         """
         Get a streaming token response from the LLM.
@@ -508,7 +613,10 @@ class ConversationPipeline:
             return
 
         try:
-            from backend.intelligence.unified_model_serving import ModelRequest
+            from backend.intelligence.unified_model_serving import (
+                ModelRequest,
+                TaskType,
+            )
 
             # Separate system prompt from conversation messages
             system_prompt = None
@@ -519,12 +627,33 @@ class ConversationPipeline:
                 else:
                     conversation_messages.append(m)
 
+            task_type_hint, complexity_level = await self._infer_task_route(
+                user_text or self._latest_user_turn_text()
+            )
+            request_task_type = self._map_task_type_hint_to_model_task(
+                task_type_hint, TaskType
+            )
+            request_context: Dict[str, Any] = {
+                "task_type": task_type_hint,
+                "complexity_level": complexity_level,
+                "conversation_mode": True,
+            }
+            if intent_decision:
+                request_context["conversation_intent"] = intent_decision.get(
+                    "intent"
+                )
+                request_context["intent_confidence"] = float(
+                    intent_decision.get("confidence", 0.0) or 0.0
+                )
+
             request = ModelRequest(
                 messages=conversation_messages,
                 system_prompt=system_prompt,
+                task_type=request_task_type,
                 stream=True,
                 temperature=float(os.getenv("JARVIS_CONV_TEMPERATURE", "0.7")),
                 max_tokens=int(os.getenv("JARVIS_CONV_MAX_TOKENS", "512")),
+                context=request_context,
             )
 
             async for chunk in self._llm_client.generate_stream(request):
@@ -533,6 +662,363 @@ class ConversationPipeline:
         except Exception as e:
             logger.error(f"[ConvPipeline] LLM stream error: {e}")
             yield "I'm sorry, I had trouble generating a response."
+
+    def _latest_user_turn_text(self) -> str:
+        """Return latest user utterance from session context, if any."""
+        if self._session is None:
+            return ""
+        for turn in reversed(self._session.turns):
+            if turn.role == "user":
+                return turn.text
+        return ""
+
+    async def _classify_turn_intent(self, user_text: str) -> Dict[str, Any]:
+        """
+        Classify conversational intent into deterministic route buckets.
+
+        Routes:
+            - discuss: normal conversational LLM response
+            - execute: route through UnifiedCommandProcessor
+            - authenticate: security-sensitive execution flow
+        """
+        lowered = (user_text or "").strip().lower()
+        if _AUTHENTICATE_PATTERN.search(lowered):
+            return {
+                "route": "authenticate",
+                "intent": "authenticate",
+                "confidence": 1.0,
+                "source": "heuristic",
+            }
+
+        prediction = await self._predict_intent(user_text)
+        intent = str(prediction.get("intent", "conversation")).lower()
+        confidence = float(prediction.get("confidence", 0.0) or 0.0)
+        route = "discuss"
+
+        execute_intents = {
+            "display_control",
+            "system_command",
+            "automation_request",
+            "preference_setting",
+        }
+
+        if intent in execute_intents and confidence >= _EXECUTE_INTENT_CONFIDENCE:
+            route = "execute"
+        elif _EXECUTE_IMPERATIVE_PATTERN.search(lowered):
+            # v258.3: Imperative verb pattern is a FALLBACK heuristic, not
+            # an override. Only fire when CAI was unavailable (source=fallback)
+            # or returned low confidence. If CAI confidently classified as
+            # "conversation", trust it — "run a thought experiment" is NOT a
+            # command even though it starts with "run".
+            source = prediction.get("source", "fallback")
+            if source == "fallback" or confidence < _EXECUTE_INTENT_CONFIDENCE:
+                route = "execute"
+
+        return {
+            "route": route,
+            "intent": intent,
+            "confidence": confidence,
+            "source": prediction.get("source", "fallback"),
+        }
+
+    async def _predict_intent(self, user_text: str) -> Dict[str, Any]:
+        """Predict intent using CAI when available; fall back safely when unavailable."""
+        if self._intent_classifier is None and not self._intent_classifier_init_failed:
+            try:
+                from backend.intelligence.context_awareness_intelligence import (
+                    ContextAwarenessIntelligence,
+                )
+
+                self._intent_classifier = ContextAwarenessIntelligence()
+            except Exception as e:
+                self._intent_classifier_init_failed = True
+                logger.debug("[ConvPipeline] CAI unavailable: %s", e)
+
+        if self._intent_classifier is None:
+            return {"intent": "conversation", "confidence": 0.0, "source": "fallback"}
+
+        try:
+            prediction = await asyncio.to_thread(
+                self._intent_classifier.predict_intent, user_text
+            )
+            if isinstance(prediction, dict):
+                prediction.setdefault("source", "cai")
+                return prediction
+        except Exception as e:
+            # v258.3: WARNING not debug — if CAI is consistently crashing,
+            # all conversation turns fall back to discuss-only (no command
+            # execution from conversation mode). Needs production visibility.
+            logger.warning("[ConvPipeline] CAI predict_intent failed: %s", e)
+
+        return {"intent": "conversation", "confidence": 0.0, "source": "fallback"}
+
+    async def _get_command_processor(self):
+        """Lazily initialize unified command processor for execute/auth routes."""
+        if self._command_processor is not None:
+            return self._command_processor
+        if self._command_processor_init_failed:
+            return None
+
+        try:
+            from backend.api.unified_command_processor import get_unified_processor
+
+            self._command_processor = get_unified_processor()
+        except Exception as e:
+            self._command_processor_init_failed = True
+            logger.warning("[ConvPipeline] Command processor unavailable: %s", e)
+            return None
+
+        return self._command_processor
+
+    async def _execute_command_turn(
+        self,
+        user_text: str,
+        intent_decision: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Execute a user turn as an actionable command and speak structured outcome."""
+        if self._session is None:
+            return False
+
+        command_processor = await self._get_command_processor()
+        if command_processor is None:
+            return False
+
+        result: Any = None
+        try:
+            result = await command_processor.process_command(user_text)
+        except Exception as e:
+            logger.error("[ConvPipeline] Command execution error: %s", e)
+            response_text = "I could not execute that command right now."
+        else:
+            response_text = self._extract_command_response(result)
+            success = True
+            if isinstance(result, dict):
+                success = bool(result.get("success", True))
+            if not response_text:
+                response_text = (
+                    "I could not complete that command."
+                    if not success
+                    else "I ran that command."
+                )
+
+        if self._barge_in is not None:
+            self._barge_in.reset()
+        cancel_event = (
+            self._barge_in.get_cancel_event()
+            if self._barge_in is not None
+            else asyncio.Event()
+        )
+
+        await self._speak_sentence(response_text, cancel_event)
+        self._session.add_turn("assistant", response_text)
+        logger.info(
+            "[ConvPipeline] Command response (%s): %s",
+            intent_decision.get("intent", "unknown") if intent_decision else "unknown",
+            response_text[:120],
+        )
+        return True
+
+    async def _handle_authenticate_turn(self, user_text: str) -> bool:
+        """
+        Handle biometric authentication requests from within conversation.
+
+        v258.3: Delegates to ModeDispatcher's BIOMETRIC flow which:
+        1. Pauses the conversation pipeline
+        2. Captures fresh mic audio for speaker verification
+        3. Runs VBIA authentication (challenge/response, voiceprint match)
+        4. Resumes conversation after auth completes
+
+        Falls back to command processor if ModeDispatcher is unavailable
+        (but without audio_data, voice biometric handlers will be limited).
+
+        Returns True if the auth attempt was handled, False to fall through.
+        """
+        if self._session is None:
+            return False
+
+        # --- Preferred path: ModeDispatcher biometric flow ---
+        dispatcher = self._mode_dispatcher
+        if dispatcher is None:
+            # Lazy-load from supervisor if not injected at construction
+            try:
+                from backend.audio.mode_dispatcher import (
+                    get_mode_dispatcher,  # type: ignore[attr-defined]
+                )
+                dispatcher = get_mode_dispatcher()
+            except Exception:
+                pass
+
+        if dispatcher is not None:
+            try:
+                from backend.audio.mode_dispatcher import VoiceMode
+
+                # Speak acknowledgment before entering biometric mode
+                cancel = asyncio.Event()
+                await self._speak_sentence(
+                    "Starting voice authentication. Please speak clearly.",
+                    cancel,
+                )
+
+                # Delegate to ModeDispatcher — this pauses conversation,
+                # runs biometric auth, and resumes when done.
+                await dispatcher.switch_mode(VoiceMode.BIOMETRIC)
+
+                # Wait for the biometric task to finish (it runs as a
+                # background task in the dispatcher). Poll with timeout.
+                auth_timeout = float(
+                    os.getenv("JARVIS_BIOMETRIC_AUTH_TIMEOUT", "25")
+                )
+                biometric_task = getattr(dispatcher, "_biometric_task", None)
+                if biometric_task is not None:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(biometric_task),
+                            timeout=auth_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[ConvPipeline] Biometric auth timed out after %.0fs",
+                            auth_timeout,
+                        )
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.warning(
+                            "[ConvPipeline] Biometric auth error: %s", e
+                        )
+
+                # ModeDispatcher's _on_biometric_done callback will
+                # switch back to previous mode and resume conversation.
+                # Record the authentication attempt in session transcript.
+                self._session.add_turn(
+                    "assistant",
+                    "Voice authentication completed.",
+                )
+                logger.info("[ConvPipeline] Biometric auth flow completed")
+                return True
+
+            except Exception as e:
+                logger.warning(
+                    "[ConvPipeline] ModeDispatcher biometric delegation failed: %s", e
+                )
+
+        # --- Fallback: route through command processor (no audio_data) ---
+        return await self._execute_command_turn(
+            user_text=user_text,
+            intent_decision={"intent": "authenticate", "route": "authenticate"},
+        )
+
+    def _extract_command_response(self, result: Any) -> str:
+        """Normalize UnifiedCommandProcessor output into a speakable sentence."""
+        if result is None:
+            return ""
+        if isinstance(result, str):
+            return result.strip()
+        if not isinstance(result, dict):
+            return str(result).strip()
+
+        for key in ("response", "formatted_response", "message", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    async def _infer_task_route(self, user_text: str) -> Tuple[str, str]:
+        """
+        Infer fine-grained task routing metadata for J-Prime model specialization.
+
+        Returns:
+            (task_type, complexity_level)
+        """
+        text = (user_text or "").strip()
+        if not text:
+            return "general_chat", "MODERATE"
+
+        complexity_level = await self._infer_complexity_level(text)
+
+        try:
+            from backend.api.query_handler import _infer_task_type
+
+            task_type = await asyncio.to_thread(
+                _infer_task_type, text, complexity_level
+            )
+            if isinstance(task_type, str) and task_type:
+                return task_type, complexity_level
+        except Exception as e:
+            logger.debug("[ConvPipeline] Task type inference fallback: %s", e)
+
+        return self._heuristic_task_type(text, complexity_level), complexity_level
+
+    async def _infer_complexity_level(self, text: str) -> str:
+        """Infer complexity level using QueryComplexityManager when available."""
+        manager = await self._get_query_complexity_manager()
+        if manager is not None and hasattr(manager, "process_query"):
+            try:
+                classified = await manager.process_query(text)
+                level = getattr(getattr(classified, "complexity", None), "level", None)
+                level_name = getattr(level, "name", None)
+                if isinstance(level_name, str) and level_name:
+                    return level_name.upper()
+            except Exception as e:
+                logger.debug("[ConvPipeline] Complexity manager inference failed: %s", e)
+
+        # Deterministic fallback when complexity manager is absent/unavailable.
+        word_count = len(text.split())
+        if word_count <= 6:
+            return "SIMPLE"
+        if word_count >= 20 or _COMPLEXITY_HINT_PATTERN.search(text):
+            return "COMPLEX"
+        return "MODERATE"
+
+    async def _get_query_complexity_manager(self):
+        """Return global QueryComplexityManager if initialized."""
+        if self._query_complexity_manager is not None:
+            return self._query_complexity_manager
+        if self._query_complexity_lookup_attempted:
+            return None
+
+        self._query_complexity_lookup_attempted = True
+        try:
+            from backend.context_intelligence.handlers.query_complexity_manager import (
+                get_query_complexity_manager,
+            )
+
+            self._query_complexity_manager = get_query_complexity_manager()
+        except Exception as e:
+            logger.debug("[ConvPipeline] QueryComplexityManager unavailable: %s", e)
+            self._query_complexity_manager = None
+
+        return self._query_complexity_manager
+
+    def _heuristic_task_type(self, text: str, complexity_level: str) -> str:
+        """Fallback task type inference when query_handler import is unavailable."""
+        lowered = text.lower()
+        if _MATH_HINT_PATTERN.search(lowered):
+            return (
+                "math_complex"
+                if complexity_level in {"COMPLEX", "ADVANCED", "EXPERT"}
+                else "math_simple"
+            )
+        if _CODE_HINT_PATTERN.search(lowered):
+            return (
+                "code_complex"
+                if complexity_level in {"COMPLEX", "ADVANCED", "EXPERT"}
+                else "code_simple"
+            )
+        if complexity_level in {"ADVANCED", "EXPERT"}:
+            return "reason_complex"
+        if complexity_level == "SIMPLE":
+            return "simple_chat"
+        return "general_chat"
+
+    def _map_task_type_hint_to_model_task(self, task_hint: str, task_type_enum):
+        """Map fine-grained task hints to UnifiedModelServing TaskType enum."""
+        hint = (task_hint or "").lower()
+        if hint.startswith("code_"):
+            return task_type_enum.CODE
+        if hint.startswith("math_") or hint.startswith("reason_"):
+            return task_type_enum.REASONING
+        return task_type_enum.CHAT
 
     async def _speak_sentence(
         self, sentence: str, cancel_event: asyncio.Event
@@ -649,14 +1135,14 @@ class ConversationPipeline:
         return False
 
     def _is_exit_command(self, text: str) -> bool:
-        """Check if the user wants to exit conversation mode."""
-        text_lower = text.lower().strip()
-        exit_phrases = [
-            "goodbye", "good bye", "bye", "stop", "exit",
-            "end conversation", "that's all", "i'm done",
-            "jarvis stop", "jarvis quit",
-        ]
-        return any(phrase in text_lower for phrase in exit_phrases)
+        """
+        Check if the user wants to exit conversation mode.
+
+        v258.3: Uses anchored regex (_EXIT_PATTERN) so the exit phrase
+        must be the ENTIRE utterance. "stop" exits, but "stop the server"
+        does NOT — it will be routed through the command processor instead.
+        """
+        return bool(_EXIT_PATTERN.match((text or "").strip()))
 
     # ---- Properties ----
 

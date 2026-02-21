@@ -1015,6 +1015,23 @@ class PrimeAPIClient(ModelClient):
         self._last_health_check = 0.0
         self._health_check_cache_ttl = 10.0
 
+    def _build_request_metadata(self, request: ModelRequest) -> Dict[str, Any]:
+        """Build JSON-safe metadata propagated to J-Prime routing layer."""
+        metadata = dict(request.context or {})
+        metadata.setdefault("model_task_type", request.task_type.value)
+        try:
+            json.dumps(metadata)
+            return metadata
+        except TypeError:
+            # v258.3: Log the fallback so developers can debug unexpected
+            # metadata stringification on the server side.
+            self.logger.warning(
+                "[PrimeAPI] Metadata contains non-serializable values, "
+                "stringifying: %s",
+                list(metadata.keys()),
+            )
+            return {str(key): str(value) for key, value in metadata.items()}
+
     async def _get_session(self):
         """Get or create aiohttp session."""
         if self._session is None:
@@ -1135,6 +1152,9 @@ class PrimeAPIClient(ModelClient):
                 "temperature": request.temperature,
                 "stream": False,
             }
+            # v258.3: Always include — _build_request_metadata guarantees
+            # at least model_task_type is present (setdefault).
+            payload["metadata"] = self._build_request_metadata(request)
 
             async with session.post(
                 f"{self.base_url}/v1/chat/completions",
@@ -1212,6 +1232,9 @@ class PrimeAPIClient(ModelClient):
                 "temperature": request.temperature,
                 "stream": True,  # Enable streaming
             }
+            # v258.3: Always include — _build_request_metadata guarantees
+            # at least model_task_type is present (setdefault).
+            payload["metadata"] = self._build_request_metadata(request)
 
             # Use longer timeout for streaming
             stream_timeout = aiohttp.ClientTimeout(
