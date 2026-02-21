@@ -1725,31 +1725,45 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # =====================================================================
 
         async def run_tier(tier_name: str, init_funcs: list, tier_timeout: float):
-            """Run a tier of initialization functions in parallel with timeout."""
+            """Run a tier of initialization functions in parallel with timeout.
+
+            v3.2: Log which specific components didn't finish on timeout.
+            """
             tier_tasks = [asyncio.create_task(fn(), name=fn.__name__) for fn in init_funcs]
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*tier_tasks, return_exceptions=True),
                     timeout=tier_timeout
                 )
-                logger.debug(f"[Init] {tier_name} completed")
+                logger.debug(f"[Init] {tier_name} completed ({tier_timeout:.1f}s budget)")
             except asyncio.TimeoutError:
-                logger.warning(f"[Init] {tier_name} timed out after {tier_timeout}s")
+                # v3.2: Identify which components are still running
+                _stalled = [t.get_name() for t in tier_tasks if not t.done()]
+                logger.warning(
+                    f"[Init] {tier_name} timed out after {tier_timeout:.1f}s — "
+                    f"stalled: {', '.join(_stalled) if _stalled else 'none'}"
+                )
                 for task in tier_tasks:
                     if not task.done():
                         task.cancel()
 
         # Tier 1: Foundation components (no dependencies)
         tier1_funcs = [init_ferrari_engine, init_watcher_manager, init_detector]
-        tier1_timeout = parallel_timeout * 0.4  # 40% of total timeout
+        # v3.2: Tier timeout = max of component timeouts within that tier + buffer.
+        # The old percentage-based allocation (0.4/0.3/0.3 of parallel_timeout)
+        # was mathematically broken: tier3 got 6s but its components need 15s.
+        # Since components run in parallel, the tier needs max(components), not sum.
+        tier1_timeout = max(ferrari_init_timeout, watcher_mgr_init_timeout,
+                           detector_init_timeout) + 3.0
 
         # Tier 2: Core services (depend on foundation being ready)
         tier2_funcs = [init_computer_use]
-        tier2_timeout = parallel_timeout * 0.3  # 30% of total timeout
+        tier2_timeout = computer_use_init_timeout + 3.0
 
         # Tier 3: Dependent services (depend on core services)
         tier3_funcs = [init_agentic_runner, init_spatial_agent]
-        tier3_timeout = parallel_timeout * 0.3  # 30% of total timeout
+        tier3_timeout = max(agentic_runner_init_timeout,
+                           spatial_agent_init_timeout) + 3.0
 
         # Execute tiers sequentially, components within each tier in parallel
         try:

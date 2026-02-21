@@ -55267,6 +55267,10 @@ class StartupWatchdog:
         "trinity": PhaseConfig("Trinity", 480.0, 65, 85, "restart"),
         # v236.1: enterprise progress_start fixed from 75→80 to match actual update_phase(80)
         "enterprise": PhaseConfig("Enterprise", 120.0, 80, 85, "diagnostic"),
+        # v3.2: Permissions phase — macOS Screen Recording TCC check (v264.0).
+        # Timeout 40s = 10s operational (JARVIS_PERMISSION_CHECK_TIMEOUT) + 30s buffer.
+        # Non-critical: diagnostic only, never restart for a permission check.
+        "permissions": PhaseConfig("Permissions", 40.0, 85, 85, "diagnostic"),
         # v258.3: Ghost Display moved before AGI OS to avoid CPU contention with ML loading
         # v240.0: Ghost Display — software-defined virtual display via BetterDisplay
         "ghost_display": PhaseConfig("Ghost Display", 45.0, 85, 86, "diagnostic"),
@@ -72106,25 +72110,57 @@ class JarvisSystemKernel:
                 except Exception as _cr_err:
                     self.logger.debug(f"[Zone6] Capability registration skipped: {_cr_err}")
 
-            # v238.0: Health Contract Enforcement — aggregate health from all components
-            # Uses SystemHealthAggregator to determine system-level health status
-            # from individual component health reports (Prime, Reactor, Body services).
+            # v238.0 / v3.2: Health Contract Enforcement — aggregate health from all
+            # components.  During the startup pipeline, UNKNOWN components are expected
+            # (they haven't finished initialising yet), so we distinguish "unhealthy
+            # because something broke" from "unhealthy because startup is still in
+            # progress".  Only the former deserves a WARNING.
             if ENTERPRISE_HEALTH_AVAILABLE and ENTERPRISE_REGISTRY_AVAILABLE:
                 try:
                     _reg = get_component_registry()
                     _aggregator = get_health_aggregator(_reg)
                     _system_health = await _aggregator.collect_all()
                     _overall = _system_health.overall
+
+                    # v3.2: Classify component statuses for startup-aware logging
+                    _unknown_count = sum(
+                        1 for r in _system_health.components.values()
+                        if r.status == EnterpriseHealthStatus.UNKNOWN
+                    )
+                    _unhealthy_count = sum(
+                        1 for r in _system_health.components.values()
+                        if r.status == EnterpriseHealthStatus.UNHEALTHY
+                    )
+                    _total = len(_system_health.components)
+
                     if _overall == EnterpriseHealthStatus.HEALTHY:
                         self.logger.info("[Zone6] Health contracts: system HEALTHY")
                     elif _overall == EnterpriseHealthStatus.DEGRADED:
-                        self.logger.warning(
+                        self.logger.info(
                             f"[Zone6] Health contracts: system DEGRADED — "
-                            f"{sum(1 for r in _system_health.components.values() if r.status != EnterpriseHealthStatus.HEALTHY)} "
-                            f"component(s) degraded/unhealthy"
+                            f"{sum(1 for r in _system_health.components.values() if r.status != EnterpriseHealthStatus.HEALTHY)}"
+                            f"/{_total} component(s) not fully healthy"
+                        )
+                    elif _unknown_count > 0 and _unhealthy_count == 0:
+                        # All "unhealthy" signals come from UNKNOWN (still starting) —
+                        # this is normal during the startup pipeline, not an alarm.
+                        self.logger.info(
+                            f"[Zone6] Health contracts: {_unknown_count}/{_total} "
+                            f"component(s) still initialising — system will be "
+                            f"re-evaluated after startup completes"
                         )
                     else:
-                        self.logger.warning(f"[Zone6] Health contracts: system {_overall.value}")
+                        # Genuine unhealthy components exist
+                        _bad = [
+                            f"{name}={r.status.value}"
+                            for name, r in _system_health.components.items()
+                            if r.status in (EnterpriseHealthStatus.UNHEALTHY,
+                                            EnterpriseHealthStatus.UNKNOWN)
+                        ]
+                        self.logger.warning(
+                            f"[Zone6] Health contracts: system {_overall.value} — "
+                            f"{', '.join(_bad[:5])}"
+                        )
                 except Exception as _hc_err:
                     self.logger.debug(f"[Zone6] Health contract check skipped: {_hc_err}")
 
