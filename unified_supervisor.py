@@ -64397,11 +64397,10 @@ class JarvisSystemKernel:
                         except Exception:
                             pass  # Metrics unavailable, proceed immediately
 
-                        ecapa_verify = await asyncio.wait_for(
-                            self._verify_ecapa_pipeline(
-                                skip_db_dependent=_skip_db_steps
-                            ),
-                            timeout=_ecapa_bg_timeout,
+                        _ecapa_deadline = time.monotonic() + _ecapa_bg_timeout
+                        ecapa_verify = await self._verify_ecapa_pipeline(
+                            skip_db_dependent=_skip_db_steps,
+                            deadline=_ecapa_deadline,
                         )
                         if ecapa_verify.get("verification_pipeline_ready"):
                             self.logger.info("[Kernel] ECAPA pipeline verified and ready")
@@ -64414,10 +64413,6 @@ class JarvisSystemKernel:
                                 )
                             except Exception:
                                 self.logger.warning("[Kernel] ECAPA verification incomplete (post-startup)")
-                    except asyncio.TimeoutError:
-                        self.logger.warning(
-                            f"[Kernel] ECAPA verification timed out ({_ecapa_bg_timeout:.0f}s) — skipping"
-                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as ev_err:
@@ -77302,7 +77297,10 @@ class JarvisSystemKernel:
     # =========================================================================
 
     async def _verify_ecapa_pipeline(
-        self, *, skip_db_dependent: bool = False
+        self,
+        *,
+        skip_db_dependent: bool = False,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         v223.0: Run 6-step ECAPA verification pipeline.
@@ -77327,6 +77325,7 @@ class JarvisSystemKernel:
             "embedding_shape": None,
             "verification_pipeline_ready": False,
             "db_steps_skipped": skip_db_dependent,
+            "deadline_exhausted": False,
             "errors": [],
         }
 
@@ -77338,12 +77337,48 @@ class JarvisSystemKernel:
         if str(backend_dir) not in sys.path:
             sys.path.insert(0, str(backend_dir))
 
+        def _remaining_budget(default_timeout: float, floor: float = 1.0) -> float:
+            """Compute deadline-aware timeout with a safety floor."""
+            if deadline is None:
+                return max(default_timeout, floor)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return 0.0
+            return max(min(default_timeout, remaining), floor)
+
+        def _ensure_budget(step_name: str, floor: float = 0.25) -> bool:
+            """Check whether shared ECAPA verification budget is exhausted."""
+            if deadline is None:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining > floor:
+                return True
+            result["deadline_exhausted"] = True
+            result["errors"].append(f"{step_name}: Budget exhausted")
+            self.logger.warning(
+                f"[ECAPA] Budget exhausted before {step_name} "
+                f"(remaining={max(remaining, 0.0):.2f}s)"
+            )
+            return False
+
         # Step 1/6: ML Engine Registry
+        if not _ensure_budget("Step 1/6"):
+            return result
         try:
             from voice_unlock.ml_engine_registry import get_ml_registry, ensure_ecapa_available
-            registry = await get_ml_registry()
+            _step_timeout = _remaining_budget(
+                _get_env_float("JARVIS_ECAPA_VERIFY_STEP1_TIMEOUT", 12.0)
+            )
+            registry = await asyncio.wait_for(
+                get_ml_registry(),
+                timeout=_step_timeout,
+            )
             result["ml_registry_tested"] = True
             self.logger.info("[ECAPA]   Step 1/6: ML Engine Registry ✓")
+        except asyncio.TimeoutError:
+            result["errors"].append("ML Registry: timeout")
+            self.logger.warning("[ECAPA]   Step 1/6: ML Engine Registry ✗ (timeout)")
+            return result
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -77352,11 +77387,15 @@ class JarvisSystemKernel:
             return result  # Can't continue without registry
 
         # Step 2/6: Cloud Run ECAPA readiness
+        if not _ensure_budget("Step 2/6"):
+            return result
         cloud_endpoint = os.environ.get("JARVIS_CLOUD_ML_ENDPOINT", "")
         if cloud_endpoint:
             try:
                 import aiohttp
-                timeout_s = float(os.environ.get("ECAPA_HEALTH_CHECK_TIMEOUT", "15"))
+                timeout_s = _remaining_budget(
+                    _get_env_float("ECAPA_HEALTH_CHECK_TIMEOUT", 15.0)
+                )
                 async with aiohttp.ClientSession() as sess:
                     async with sess.get(
                         f"{cloud_endpoint}/health",
@@ -77378,10 +77417,24 @@ class JarvisSystemKernel:
             self.logger.info("[ECAPA]   Step 2/6: Cloud Run ECAPA (skipped, no endpoint)")
 
         # Step 3/6: Local ECAPA via ML Engine
+        if not _ensure_budget("Step 3/6"):
+            return result
         try:
-            await ensure_ecapa_available()
-            result["local_ecapa_tested"] = True
-            self.logger.info("[ECAPA]   Step 3/6: Local ECAPA ✓")
+            _step3_timeout = _remaining_budget(
+                _get_env_float("JARVIS_ECAPA_VERIFY_STEP3_TIMEOUT", 25.0)
+            )
+            local_ok, local_msg, _ = await ensure_ecapa_available(
+                timeout=_step3_timeout,
+                allow_cloud=True,
+            )
+            result["local_ecapa_tested"] = bool(local_ok)
+            if local_ok:
+                self.logger.info("[ECAPA]   Step 3/6: Local ECAPA ✓")
+            else:
+                result["errors"].append(f"Local ECAPA: {local_msg}")
+                self.logger.info(
+                    f"[ECAPA]   Step 3/6: Local ECAPA ✗ ({local_msg})"
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -77389,6 +77442,9 @@ class JarvisSystemKernel:
             self.logger.info(f"[ECAPA]   Step 3/6: Local ECAPA ✗ ({e})")
 
         # Step 4/6: Embedding extraction test (synthetic audio)
+        if not _ensure_budget("Step 4/6"):
+            return result
+        audio_bytes = b""
         try:
             from voice_unlock.ml_engine_registry import extract_speaker_embedding
             import numpy as np
@@ -77406,7 +77462,13 @@ class JarvisSystemKernel:
                 wf.writeframes((samples * 32767).astype(np.int16).tobytes())
             audio_bytes = buf.getvalue()
 
-            embedding = await extract_speaker_embedding(audio_bytes)
+            _step4_timeout = _remaining_budget(
+                _get_env_float("JARVIS_ECAPA_VERIFY_STEP4_TIMEOUT", 15.0)
+            )
+            embedding = await asyncio.wait_for(
+                extract_speaker_embedding(audio_bytes),
+                timeout=_step4_timeout,
+            )
             if embedding is not None and hasattr(embedding, "shape"):
                 result["embedding_extraction_tested"] = True
                 result["embedding_shape"] = str(embedding.shape)
@@ -77415,6 +77477,9 @@ class JarvisSystemKernel:
                 )
             else:
                 self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (no result)")
+        except asyncio.TimeoutError:
+            result["errors"].append("Embedding extraction: timeout")
+            self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (timeout)")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -77430,13 +77495,37 @@ class JarvisSystemKernel:
                 "(skipped — Cloud SQL unavailable)"
             )
         else:
+            if not _ensure_budget("Step 5/6"):
+                return result
             try:
                 from voice.speaker_verification_service import SpeakerVerificationService
                 test_svc = SpeakerVerificationService()
                 try:
-                    await test_svc.initialize()
+                    # Use fast init for smoke-test integration to avoid heavyweight
+                    # retries/startup work in verification context.
+                    _step5_init_timeout = _remaining_budget(
+                        _get_env_float("JARVIS_ECAPA_VERIFY_STEP5_INIT_TIMEOUT", 20.0)
+                    )
+                    _init_method = (
+                        test_svc.initialize_fast
+                        if hasattr(test_svc, "initialize_fast")
+                        else test_svc.initialize
+                    )
+                    await asyncio.wait_for(
+                        _init_method(),
+                        timeout=_step5_init_timeout,
+                    )
+
                     # Quick embedding extraction through the service
-                    await test_svc._extract_speaker_embedding(audio_bytes)
+                    _step5_extract_timeout = _remaining_budget(
+                        _get_env_float("JARVIS_ECAPA_VERIFY_STEP5_EXTRACT_TIMEOUT", 8.0)
+                    )
+                    _svc_embedding = await asyncio.wait_for(
+                        test_svc._extract_speaker_embedding(audio_bytes),
+                        timeout=_step5_extract_timeout,
+                    )
+                    if _svc_embedding is None:
+                        raise RuntimeError("service extraction returned no embedding")
                 finally:
                     cleanup_exc: Optional[Exception] = None
                     cleanup_invoked = False
@@ -77462,6 +77551,11 @@ class JarvisSystemKernel:
                             "[ECAPA] Step 5 cleanup skipped (no lifecycle method found)"
                         )
                 self.logger.info("[ECAPA]   Step 5/6: SpeakerVerificationService ✓")
+            except asyncio.TimeoutError:
+                result["errors"].append("SpeakerVerification: timeout")
+                self.logger.info(
+                    "[ECAPA]   Step 5/6: SpeakerVerificationService ✗ (timeout)"
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
