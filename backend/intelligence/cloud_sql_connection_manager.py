@@ -2763,6 +2763,51 @@ class ProxyReadinessGate:
                 "Connection failed during operation"
             )
 
+    async def notify_proxy_recovery(self) -> bool:
+        """
+        v3.2: Called by ProxyWatchdog after successful proxy restart.
+
+        Acquires _check_lock to serialize with _trigger_recheck() and
+        _recheck_loop(), then verifies DB health before transitioning
+        state. This prevents the previous bug where ProxyWatchdog called
+        _signal_agent_registry_ready() directly — bypassing the gate's
+        state machine and creating a race with periodic_recheck.
+
+        Returns:
+            True if gate transitioned to READY, False otherwise.
+        """
+        await self._ensure_locks()
+        assert self._check_lock is not None
+
+        async with self._check_lock:
+            # Only act if currently UNAVAILABLE or CHECKING
+            if self._state == ReadinessState.READY:
+                logger.debug(
+                    "[ReadinessGate v3.2] notify_proxy_recovery: already READY"
+                )
+                return True
+
+            # Verify DB is actually reachable before transitioning
+            success, reason = await self._check_db_level()
+
+            if success:
+                logger.info(
+                    "[ReadinessGate v3.2] Proxy recovery confirmed — "
+                    "transitioning to READY via state machine"
+                )
+                await self._set_state(
+                    ReadinessState.READY,
+                    None,
+                    "ProxyWatchdog recovery verified"
+                )
+                return True
+            else:
+                logger.warning(
+                    f"[ReadinessGate v3.2] Proxy recovery notification "
+                    f"received but DB check failed: {reason}"
+                )
+                return False
+
     def _start_periodic_recheck(self) -> None:
         """Start periodic recheck task if configured."""
         if self._recheck_task and not self._recheck_task.done():
@@ -6258,7 +6303,7 @@ class ProxyWatchdog:
                 if not metrics.is_healthy:
                     await self._handle_failure(metrics)
                 else:
-                    self._handle_success(metrics)
+                    await self._handle_success(metrics)
 
                 # v1.1: Predictive restart if degraded (with cold start awareness)
                 # During cold start, we use relaxed thresholds - only warn on actual degradation
@@ -6496,21 +6541,24 @@ class ProxyWatchdog:
                 self._consecutive_failures = 0
                 self._aggressive_mode = False
 
-                # Verify with DB-level check
+                # v3.2: Notify gate through state machine (was bypassing _check_lock)
+                # The old code called gate._signal_agent_registry_ready(True) directly,
+                # racing with periodic_recheck and leaving gate._state as UNAVAILABLE
+                # while AgentRegistry thought CloudSQL was READY.
                 await asyncio.sleep(2.0)  # Brief settle time
-                verification = await self._check_health()
-                if verification.is_healthy:
+                gate = get_readiness_gate()
+                recovered = await gate.notify_proxy_recovery()
+                if recovered:
                     logger.info(
-                        f"[ProxyWatchdog] ✅ DB-level verification passed "
-                        f"(latency={verification.db_latency_ms:.0f}ms)"
+                        "[ProxyWatchdog v3.2] ✅ Gate transitioned to READY "
+                        "via state machine"
                     )
-                    # Notify the readiness gate
-                    gate = get_readiness_gate()
-                    await gate._signal_agent_registry_ready(True)
                 else:
+                    # Gate's DB check failed even though proxy restarted —
+                    # periodic_recheck will pick it up later
                     logger.warning(
-                        f"[ProxyWatchdog] ⚠️ DB-level verification failed: "
-                        f"{verification.failure_reason}"
+                        "[ProxyWatchdog v3.2] ⚠️ Proxy restarted but gate "
+                        "DB verification failed — periodic_recheck will retry"
                     )
             else:
                 logger.error("[ProxyWatchdog] ❌ Proxy recovery failed")
@@ -6520,11 +6568,21 @@ class ProxyWatchdog:
         except Exception as e:
             logger.error(f"[ProxyWatchdog] Recovery error: {e}", exc_info=True)
 
-    def _handle_success(self, metrics: ProxyHealthMetrics) -> None:
-        """Handle successful health check."""
-        if self._consecutive_failures > 0:
+    async def _handle_success(self, metrics: ProxyHealthMetrics) -> None:
+        """
+        Handle successful health check.
+
+        v3.2: Made async. When transitioning from failures→success, notifies
+        the ReadinessGate through its state machine so it can transition to
+        READY without waiting for periodic_recheck (which may be in a long
+        exponential backoff sleep).
+        """
+        was_failing = self._consecutive_failures > 0
+
+        if was_failing:
             logger.info(
-                f"[ProxyWatchdog] ✅ Health restored after {self._consecutive_failures} failures"
+                f"[ProxyWatchdog v3.2] ✅ Health restored after "
+                f"{self._consecutive_failures} failures"
             )
 
         self._consecutive_failures = 0
@@ -6535,6 +6593,20 @@ class ProxyWatchdog:
             if all(m.is_healthy for m in recent):
                 self._aggressive_mode = False
                 logger.debug("[ProxyWatchdog] Aggressive mode disabled (sustained health)")
+
+        # v3.2: On recovery transition, notify gate through state machine
+        if was_failing:
+            try:
+                gate = get_readiness_gate()
+                if gate._state == ReadinessState.UNAVAILABLE:
+                    recovered = await gate.notify_proxy_recovery()
+                    if recovered:
+                        logger.info(
+                            "[ProxyWatchdog v3.2] Gate recovered to READY "
+                            "on organic health restoration"
+                        )
+            except Exception as e:
+                logger.debug(f"[ProxyWatchdog v3.2] Gate notification failed: {e}")
 
     async def _update_cross_repo_health(self, metrics: ProxyHealthMetrics) -> None:
         """
