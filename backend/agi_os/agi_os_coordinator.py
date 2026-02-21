@@ -1093,11 +1093,15 @@ class AGIOSCoordinator:
         # peak RAM usage during init.
         if not _skip_optional:
             async def _get_notification_monitor():
-                from macos_helper.notification_monitor import get_notification_monitor
+                from backend.macos_helper.notification_monitor import (
+                    get_notification_monitor,
+                )
                 return await get_notification_monitor(auto_start=True)
 
             async def _get_system_event_monitor():
-                from macos_helper.system_event_monitor import get_system_event_monitor
+                from backend.macos_helper.system_event_monitor import (
+                    get_system_event_monitor,
+                )
                 return await get_system_event_monitor(auto_start=True)
 
             async def _get_ghost_hands():

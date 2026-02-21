@@ -85,6 +85,51 @@ class TestEndpointPaths:
         assert call_args[0][1] == "/api/v1/experiences/count"
         assert result == 42
 
+    async def test_get_experience_count_falls_back_on_404_and_pins_supported_path(
+        self,
+        client: ReactorCoreClient,
+    ):
+        calls = []
+
+        async def _fake_request(method, path, **_kwargs):
+            calls.append((method, path))
+            if path == "/api/v1/experiences/count":
+                client._last_http_status_by_path[path] = 404
+                return None
+            if path == "/api/v1/status":
+                client._last_http_status_by_path[path] = 200
+                return {"pending_experiences": 17}
+            client._last_http_status_by_path[path] = 500
+            return None
+
+        client._request = AsyncMock(side_effect=_fake_request)
+
+        result = await client.get_experience_count()
+        assert result == 17
+        assert "/api/v1/experiences/count" in client._unsupported_experience_count_paths
+        assert calls[0] == ("GET", "/api/v1/experiences/count")
+        assert calls[1] == ("GET", "/api/v1/status")
+
+        calls.clear()
+        result_2 = await client.get_experience_count()
+        assert result_2 == 17
+        # Preferred path should be pinned after first successful fallback.
+        assert calls[0] == ("GET", "/api/v1/status")
+        assert all(path != "/api/v1/experiences/count" for _, path in calls)
+
+    async def test_get_experience_count_uses_local_tracker_when_offline(
+        self,
+        client: ReactorCoreClient,
+    ):
+        client._is_online = False
+        client._request = AsyncMock()
+        client._experience_tracker._experience_count = 9
+
+        result = await client.get_experience_count()
+
+        assert result == 9
+        client._request.assert_not_called()
+
 
 # =========================================================================
 # Tests -- Other _request() paths (audit)

@@ -175,68 +175,92 @@ class CallbackRegistry:
 
 if PYOBJC_AVAILABLE:
 
-    class MenuBarDelegate(NSObject):
-        """Objective-C delegate for menu bar actions."""
+    def _resolve_menu_bar_delegate_class():
+        """
+        Resolve Objective-C delegate class idempotently.
 
-        def initWithIndicator_(self, indicator):
-            """Initialize with parent indicator."""
-            self = objc.super(MenuBarDelegate, self).init()
-            if self is None:
-                return None
-            self._indicator = weakref.ref(indicator)
-            return self
+        PyObjC registers Objective-C class names globally in the process.
+        If this module is imported through multiple package paths
+        (for example ``macos_helper`` and ``backend.macos_helper``),
+        re-defining the same Objective-C class causes:
+            "overriding existing Objective-C class"
+        """
+        objc_name = "JARVISMenuBarDelegate"
+        try:
+            existing = objc.lookUpClass(objc_name)
+            if existing is not None:
+                return existing
+        except Exception:
+            pass
 
-        @objc.python_method
-        def indicator(self):
-            """Get the parent indicator."""
-            ref = self._indicator
-            return ref() if ref else None
+        class _MenuBarDelegate(NSObject):
+            """Objective-C delegate for menu bar actions."""
 
-        def menuAction_(self, sender):
-            """Handle menu item action."""
-            indicator = self.indicator()
-            if indicator and hasattr(sender, 'representedObject'):
-                action_id = sender.representedObject()
-                if action_id:
-                    indicator._handle_action(action_id)
+            __objc_name__ = objc_name
 
-        def pauseAction_(self, sender):
-            """Handle pause action."""
-            indicator = self.indicator()
-            if indicator:
-                indicator._handle_action("pause")
+            def initWithIndicator_(self, indicator):
+                """Initialize with parent indicator."""
+                self = objc.super(_MenuBarDelegate, self).init()
+                if self is None:
+                    return None
+                self._indicator = weakref.ref(indicator)
+                return self
 
-        def resumeAction_(self, sender):
-            """Handle resume action."""
-            indicator = self.indicator()
-            if indicator:
-                indicator._handle_action("resume")
+            @objc.python_method
+            def indicator(self):
+                """Get the parent indicator."""
+                ref = self._indicator
+                return ref() if ref else None
 
-        def restartAction_(self, sender):
-            """Handle restart action."""
-            indicator = self.indicator()
-            if indicator:
-                indicator._handle_action("restart")
+            def menuAction_(self, sender):
+                """Handle menu item action."""
+                indicator = self.indicator()
+                if indicator and hasattr(sender, 'representedObject'):
+                    action_id = sender.representedObject()
+                    if action_id:
+                        indicator._handle_action(action_id)
 
-        def settingsAction_(self, sender):
-            """Handle settings action."""
-            indicator = self.indicator()
-            if indicator:
-                indicator._handle_action("settings")
+            def pauseAction_(self, sender):
+                """Handle pause action."""
+                indicator = self.indicator()
+                if indicator:
+                    indicator._handle_action("pause")
 
-        def quitAction_(self, sender):
-            """Handle quit action."""
-            indicator = self.indicator()
-            if indicator:
-                indicator._handle_action("quit")
+            def resumeAction_(self, sender):
+                """Handle resume action."""
+                indicator = self.indicator()
+                if indicator:
+                    indicator._handle_action("resume")
 
-        def permissionAction_(self, sender):
-            """Handle permission action."""
-            indicator = self.indicator()
-            if indicator and hasattr(sender, 'representedObject'):
-                permission_type = sender.representedObject()
-                if permission_type:
-                    indicator._handle_action(f"permission_{permission_type}")
+            def restartAction_(self, sender):
+                """Handle restart action."""
+                indicator = self.indicator()
+                if indicator:
+                    indicator._handle_action("restart")
+
+            def settingsAction_(self, sender):
+                """Handle settings action."""
+                indicator = self.indicator()
+                if indicator:
+                    indicator._handle_action("settings")
+
+            def quitAction_(self, sender):
+                """Handle quit action."""
+                indicator = self.indicator()
+                if indicator:
+                    indicator._handle_action("quit")
+
+            def permissionAction_(self, sender):
+                """Handle permission action."""
+                indicator = self.indicator()
+                if indicator and hasattr(sender, 'representedObject'):
+                    permission_type = sender.representedObject()
+                    if permission_type:
+                        indicator._handle_action(f"permission_{permission_type}")
+
+        return _MenuBarDelegate
+
+    MenuBarDelegate = _resolve_menu_bar_delegate_class()
 
 
 class MenuBarIndicator:

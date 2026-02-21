@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.clients.experience_scorer import WeightedExperienceTracker
 
@@ -137,6 +137,12 @@ class ReactorCoreConfig:
     )
     training_mode: str = field(
         default_factory=lambda: os.getenv("REACTOR_CORE_TRAINING_MODE", "nightshift").strip().lower()
+    )
+    experience_count_paths: str = field(
+        default_factory=lambda: os.getenv(
+            "REACTOR_CORE_EXPERIENCE_COUNT_PATHS",
+            "/api/v1/experiences/count,/api/v1/status",
+        )
     )
 
     # Connection Settings
@@ -353,6 +359,59 @@ class ReactorCoreClient:
 
         # v2.4: Map job_id -> start event_id for causation chaining
         self._job_start_event_ids: Dict[str, str] = {}
+
+        # API capability state (version drift tolerance)
+        self._last_http_status_by_path: Dict[str, int] = {}
+        self._experience_count_paths: List[str] = self._parse_experience_count_paths(
+            self.config.experience_count_paths
+        )
+        self._preferred_experience_count_path: str = (
+            self._experience_count_paths[0]
+            if self._experience_count_paths
+            else "/api/v1/experiences/count"
+        )
+        self._unsupported_experience_count_paths: Set[str] = set()
+
+    def _parse_experience_count_paths(self, raw_paths: str) -> List[str]:
+        """Parse and normalize experience-count endpoint candidates."""
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        defaults = ["/api/v1/experiences/count", self.config.status_path]
+        configured = [p.strip() for p in (raw_paths or "").split(",") if p.strip()]
+
+        for path in configured + defaults:
+            normalized = path if path.startswith("/") else f"/{path}"
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidates.append(normalized)
+
+        return candidates
+
+    def _extract_experience_count(self, path: str, payload: Dict[str, Any]) -> Optional[int]:
+        """Extract experience count from endpoint-specific payload shapes."""
+        if "count" in payload and isinstance(payload.get("count"), (int, float)):
+            return int(payload["count"])
+
+        # Compatibility fallback for older Reactor-Core versions that only expose status.
+        if path == self.config.status_path:
+            pending = payload.get("pending_experiences")
+            if isinstance(pending, (int, float)):
+                return int(pending)
+
+        return None
+
+    def _candidate_experience_count_paths(self) -> List[str]:
+        """Return endpoint candidates ordered by known-good preference."""
+        ordered: List[str] = []
+        for path in [self._preferred_experience_count_path, *self._experience_count_paths]:
+            if path and path not in ordered:
+                ordered.append(path)
+        return [
+            path for path in ordered
+            if path not in self._unsupported_experience_count_paths
+        ]
 
     async def initialize(self) -> bool:
         """
@@ -870,14 +929,46 @@ class ReactorCoreClient:
             Number of pending experiences
         """
         if not self._is_online:
-            return 0
+            return self._experience_tracker.experience_count
 
         try:
-            data = await self._request("GET", "/api/v1/experiences/count")
-            return data.get("count", 0) if data else 0
+            for path in self._candidate_experience_count_paths():
+                data = await self._request(
+                    "GET",
+                    path,
+                    suppress_404_warning=True,
+                )
+                status = self._last_http_status_by_path.get(path)
+
+                if isinstance(data, dict):
+                    count = self._extract_experience_count(path, data)
+                    if count is not None:
+                        if path != self._preferred_experience_count_path:
+                            logger.info(
+                                "[ReactorClient] Experience count endpoint selected: %s",
+                                path,
+                            )
+                        self._preferred_experience_count_path = path
+                        return count
+
+                if status == 404:
+                    if path not in self._unsupported_experience_count_paths:
+                        logger.info(
+                            "[ReactorClient] Experience count endpoint unsupported: %s",
+                            path,
+                        )
+                    self._unsupported_experience_count_paths.add(path)
+                    continue
+
+                # For non-404 transport/proxy failures, avoid endpoint thrash.
+                if status is None:
+                    break
+
+            # Graceful fallback to local tracker when remote count unavailable.
+            return self._experience_tracker.experience_count
         except Exception as e:
             logger.warning(f"[ReactorClient] Get experience count error: {e}")
-            return 0
+            return self._experience_tracker.experience_count
 
     # =========================================================================
     # JARVIS Prime Hot-Swap Integration (Phase 2)
@@ -1144,6 +1235,7 @@ class ReactorCoreClient:
         path: str,
         json: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
+        suppress_404_warning: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Make an HTTP request with retry logic.
@@ -1176,10 +1268,18 @@ class ReactorCoreClient:
                     params=params,
                     headers=headers,
                 ) as response:
+                    self._last_http_status_by_path[path] = response.status
                     if response.status == 200:
                         return await response.json()
                     elif response.status == 404:
-                        logger.warning(f"[ReactorClient] {method} {path}: 404 Not Found")
+                        if suppress_404_warning:
+                            logger.info(
+                                "[ReactorClient] %s %s: 404 Not Found (compatibility probe)",
+                                method,
+                                path,
+                            )
+                        else:
+                            logger.warning(f"[ReactorClient] {method} {path}: 404 Not Found")
                         return None
                     else:
                         text = await response.text()
@@ -1193,10 +1293,12 @@ class ReactorCoreClient:
                         return None
 
             except asyncio.TimeoutError:
+                self._last_http_status_by_path.pop(path, None)
                 logger.warning(f"[ReactorClient] Request timeout: {method} {path}")
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(self.config.retry_delay * (attempt + 1))
             except Exception as e:
+                self._last_http_status_by_path.pop(path, None)
                 logger.warning(f"[ReactorClient] Request error: {method} {path}: {e}")
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(self.config.retry_delay * (attempt + 1))

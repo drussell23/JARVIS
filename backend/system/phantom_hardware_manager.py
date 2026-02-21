@@ -38,7 +38,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,17 @@ class PhantomHardwareManager:
         self._last_status_check: Optional[datetime] = None
         self._status_cache_ttl = timedelta(seconds=30)
         self._ensure_inflight: Optional[asyncio.Task] = None
+        self._last_registration_state: Dict[str, Any] = {}
+        self._registration_latency_ema: Optional[float] = None
+        self._registration_latency_alpha = float(
+            os.getenv("JARVIS_GHOST_REGISTRATION_EMA_ALPHA", "0.35")
+        )
+        self._registration_wait_cap_seconds = float(
+            os.getenv("JARVIS_GHOST_REGISTRATION_WAIT_CAP_SECONDS", "45.0")
+        )
+        self._registration_stabilization_seconds = float(
+            os.getenv("JARVIS_GHOST_REGISTRATION_STABILIZATION_SECONDS", "4.0")
+        )
 
         # Stats
         self._stats = {
@@ -140,6 +151,71 @@ class PhantomHardwareManager:
         }
 
         logger.info("[v68.0] 👻 PHANTOM HARDWARE: Manager initialized")
+
+    def _effective_registration_wait_seconds(self, requested_wait_seconds: float) -> float:
+        """Compute dynamic wait budget from current request + observed registration latency."""
+        requested = max(2.0, float(requested_wait_seconds))
+        if self._registration_latency_ema is None:
+            return min(requested, self._registration_wait_cap_seconds)
+
+        adaptive_target = self._registration_latency_ema * 2.0
+        return min(
+            max(requested, adaptive_target),
+            self._registration_wait_cap_seconds,
+        )
+
+    def _update_registration_latency_ema(self, latency_seconds: float) -> None:
+        """Update EWMA of registration latency for dynamic timeout adaptation."""
+        latency = max(0.0, float(latency_seconds))
+        if self._registration_latency_ema is None:
+            self._registration_latency_ema = latency
+            return
+
+        alpha = min(max(self._registration_latency_alpha, 0.05), 0.95)
+        self._registration_latency_ema = (
+            alpha * latency + (1.0 - alpha) * self._registration_latency_ema
+        )
+
+    def _analyze_yabai_spaces_for_registration(
+        self,
+        spaces: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Analyze yabai spaces for ghost-display registration progress."""
+        display_ids: List[int] = []
+        ghost_candidates: List[Dict[str, int]] = []
+
+        for space in spaces:
+            try:
+                display_id = int(space.get("display", 1) or 1)
+            except (TypeError, ValueError):
+                display_id = 1
+            display_ids.append(display_id)
+
+            if (not space.get("is_current")) and bool(space.get("is_visible")):
+                ghost_candidates.append(
+                    {
+                        "space_id": int(space.get("space_id", 0) or 0),
+                        "display": display_id,
+                        "window_count": int(space.get("window_count", 0) or 0),
+                    }
+                )
+
+        ghost_space: Optional[int] = None
+        if ghost_candidates:
+            ghost_candidates.sort(key=lambda item: (-item["display"], item["window_count"]))
+            candidate_space = ghost_candidates[0]["space_id"]
+            ghost_space = candidate_space if candidate_space > 0 else None
+
+        unique_displays = sorted(set(display_ids))
+        display_count = len(unique_displays)
+        recognized_without_space = ghost_space is None and display_count >= 2
+
+        return {
+            "ghost_space": ghost_space,
+            "display_ids": unique_displays,
+            "display_count": display_count,
+            "recognized_without_space": recognized_without_space,
+        }
 
     # =========================================================================
     # PRIMARY API: Ensure Ghost Display Exists
@@ -286,15 +362,26 @@ class PhantomHardwareManager:
         # =================================================================
         if wait_for_registration:
             self._stats["registration_waits"] += 1
-            space_id = await self._wait_for_display_registration_async(
+            effective_wait_seconds = self._effective_registration_wait_seconds(
                 max_wait_seconds
+            )
+            space_id = await self._wait_for_display_registration_async(
+                effective_wait_seconds
             )
 
             if space_id is None:
-                logger.warning(
-                    "[v68.0] Display created but yabai hasn't recognized it "
-                    "yet. It may appear shortly."
-                )
+                registration_state = self._last_registration_state or {}
+                if registration_state.get("recognized_without_space"):
+                    logger.info(
+                        "[v68.0] Display recognized by yabai (display_count=%s), "
+                        "ghost space still stabilizing; continuing.",
+                        registration_state.get("display_count", "unknown"),
+                    )
+                else:
+                    logger.warning(
+                        "[v68.0] Display created but yabai hasn't recognized it "
+                        "yet. It may appear shortly."
+                    )
 
             if self._ghost_display_info:
                 self._ghost_display_info.space_id = space_id
@@ -672,20 +759,75 @@ class PhantomHardwareManager:
         yabai = get_yabai_detector()
         start_time = time.time()
         poll_interval = 0.5  # Start with 500ms
+        self._last_registration_state = {
+            "recognized_without_space": False,
+            "display_count": 0,
+            "ghost_space": None,
+            "elapsed_seconds": 0.0,
+        }
+        recognized_without_space_at: Optional[float] = None
+        last_analysis: Dict[str, Any] = {
+            "recognized_without_space": False,
+            "display_count": 0,
+            "ghost_space": None,
+        }
 
         while (time.time() - start_time) < max_wait_seconds:
-            ghost_space = yabai.get_ghost_display_space()
+            spaces = yabai.enumerate_all_spaces(include_display_info=True)
+            analysis = self._analyze_yabai_spaces_for_registration(spaces)
+            last_analysis = analysis
+            ghost_space = analysis.get("ghost_space")
 
             if ghost_space is not None:
                 elapsed = time.time() - start_time
+                self._update_registration_latency_ema(elapsed)
+                self._last_registration_state = {
+                    **analysis,
+                    "elapsed_seconds": elapsed,
+                }
                 logger.info(
                     f"[v68.0] ✅ Display registered with yabai (Space {ghost_space}) "
                     f"after {elapsed:.1f}s"
                 )
                 return ghost_space
 
+            if analysis.get("recognized_without_space"):
+                now = time.time()
+                if recognized_without_space_at is None:
+                    recognized_without_space_at = now
+                    logger.info(
+                        "[v68.0] Yabai now sees %s displays; waiting for ghost "
+                        "space stabilization.",
+                        analysis.get("display_count", "unknown"),
+                    )
+                elif (now - recognized_without_space_at) >= self._registration_stabilization_seconds:
+                    elapsed = now - start_time
+                    self._update_registration_latency_ema(elapsed)
+                    self._last_registration_state = {
+                        **analysis,
+                        "elapsed_seconds": elapsed,
+                    }
+                    logger.info(
+                        "[v68.0] Yabai display registration confirmed after %.1fs "
+                        "(ghost space pending).",
+                        elapsed,
+                    )
+                    return None
+
             await asyncio.sleep(poll_interval)
             poll_interval = min(poll_interval * 1.5, 2.0)  # Exponential backoff
+
+        self._last_registration_state = {
+            **last_analysis,
+            "elapsed_seconds": max_wait_seconds,
+        }
+        if last_analysis.get("recognized_without_space"):
+            logger.info(
+                "[v68.0] Yabai recognized display topology but ghost space "
+                "was not stable within %.1fs.",
+                max_wait_seconds,
+            )
+            return None
 
         logger.warning(
             f"[v68.0] ⚠️ Display not recognized by yabai after {max_wait_seconds}s"
