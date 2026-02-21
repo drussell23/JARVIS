@@ -1194,12 +1194,17 @@ class MLEngineRegistry:
         self._cloud_fallback_enabled: bool = MLConfig.CLOUD_FALLBACK_ENABLED
         self._cloud_verified: bool = False
         self._cloud_last_verified: float = 0.0
+        self._cloud_endpoint_source: str = "unset"
         self._cloud_readiness_probe_lock = LazyAsyncLock()
         self._cloud_api_failure_streak: int = 0
         self._cloud_api_last_failure_at: float = 0.0
         self._cloud_api_degraded_until: float = 0.0
         self._cloud_api_last_error: str = ""
         self._cloud_api_last_cooldown_log_at: float = 0.0
+        self._cloud_contract_verified: bool = False
+        self._cloud_contract_endpoint: Optional[str] = None
+        self._cloud_contract_last_checked: float = 0.0
+        self._cloud_contract_last_error: str = ""
 
         # v21.1.0: Cloud embedding circuit breaker
         self._cloud_embedding_cb = CloudEmbeddingCircuitBreaker()
@@ -1907,6 +1912,120 @@ class MLEngineRegistry:
         """Get the current cloud endpoint URL."""
         return self._cloud_endpoint
 
+    def _set_cloud_endpoint(self, endpoint: Optional[str], source: str) -> None:
+        """Set cloud endpoint and reset readiness/contract state if changed."""
+        normalized = (endpoint or "").strip().rstrip("/")
+        new_endpoint = normalized or None
+        old_endpoint = (self._cloud_endpoint or "").strip().rstrip("/") or None
+
+        changed = (new_endpoint != old_endpoint) or (source != self._cloud_endpoint_source)
+        self._cloud_endpoint = new_endpoint
+        self._cloud_endpoint_source = source
+
+        if changed:
+            self._cloud_verified = False
+            self._cloud_last_verified = 0.0
+            self._cloud_contract_verified = False
+            self._cloud_contract_endpoint = None
+            self._cloud_contract_last_checked = 0.0
+            self._cloud_contract_last_error = ""
+
+    async def _verify_cloud_endpoint_contract(
+        self,
+        endpoint: Optional[str] = None,
+        timeout: Optional[float] = None,
+        force: bool = False,
+    ) -> Tuple[bool, str]:
+        """Validate that endpoint implements the ECAPA ML API contract."""
+        import aiohttp
+
+        target = (endpoint or self._cloud_endpoint or "").strip().rstrip("/")
+        if not target:
+            return False, "Cloud endpoint not configured"
+
+        ttl = max(5.0, float(os.getenv("JARVIS_CLOUD_CONTRACT_VERIFY_TTL", "180.0")))
+        now = time.time()
+        if (
+            not force
+            and endpoint is None
+            and self._cloud_contract_verified
+            and self._cloud_contract_endpoint == target
+            and (now - self._cloud_contract_last_checked) <= ttl
+        ):
+            return True, "Contract verification cached"
+
+        req_timeout = max(1.0, float(timeout or os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0")))
+        health_url = f"{target}/api/ml/health"
+        embed_url = f"{target}/api/ml/speaker_embedding"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Contract requirement 1: /api/ml/health must exist and advertise ECAPA readiness.
+                async with session.get(
+                    health_url,
+                    timeout=aiohttp.ClientTimeout(total=req_timeout),
+                    headers={"Accept": "application/json"},
+                ) as response:
+                    if response.status != 200:
+                        reason = f"/api/ml/health returned HTTP {response.status}"
+                        self._cloud_contract_verified = False
+                        self._cloud_contract_endpoint = target
+                        self._cloud_contract_last_checked = time.time()
+                        self._cloud_contract_last_error = reason
+                        return False, reason
+
+                    payload = await response.json()
+                    ecapa_ready = payload.get("ecapa_ready")
+                    if not isinstance(ecapa_ready, bool):
+                        reason = "missing boolean ecapa_ready in /api/ml/health"
+                        self._cloud_contract_verified = False
+                        self._cloud_contract_endpoint = target
+                        self._cloud_contract_last_checked = time.time()
+                        self._cloud_contract_last_error = reason
+                        return False, reason
+
+                # Contract requirement 2: embedding path must be routable.
+                async with session.options(
+                    embed_url,
+                    timeout=aiohttp.ClientTimeout(total=req_timeout),
+                    headers={"Accept": "application/json"},
+                ) as response:
+                    if response.status == 404:
+                        reason = "/api/ml/speaker_embedding route missing (HTTP 404)"
+                        self._cloud_contract_verified = False
+                        self._cloud_contract_endpoint = target
+                        self._cloud_contract_last_checked = time.time()
+                        self._cloud_contract_last_error = reason
+                        return False, reason
+                    if response.status >= 500:
+                        reason = f"/api/ml/speaker_embedding options failed (HTTP {response.status})"
+                        self._cloud_contract_verified = False
+                        self._cloud_contract_endpoint = target
+                        self._cloud_contract_last_checked = time.time()
+                        self._cloud_contract_last_error = reason
+                        return False, reason
+
+        except asyncio.TimeoutError:
+            reason = f"contract probe timed out after {req_timeout:.1f}s"
+            self._cloud_contract_verified = False
+            self._cloud_contract_endpoint = target
+            self._cloud_contract_last_checked = time.time()
+            self._cloud_contract_last_error = reason
+            return False, reason
+        except Exception as e:
+            reason = f"contract probe error: {type(e).__name__}: {e}"
+            self._cloud_contract_verified = False
+            self._cloud_contract_endpoint = target
+            self._cloud_contract_last_checked = time.time()
+            self._cloud_contract_last_error = reason[:240]
+            return False, reason
+
+        self._cloud_contract_verified = True
+        self._cloud_contract_endpoint = target
+        self._cloud_contract_last_checked = time.time()
+        self._cloud_contract_last_error = ""
+        return True, "ECAPA contract verified"
+
     async def _activate_cloud_routing(self) -> bool:
         """
         Activate cloud routing for ML operations.
@@ -1918,80 +2037,99 @@ class MLEngineRegistry:
             True if cloud routing was successfully activated
         """
         try:
-            # Try to get cloud endpoint from MemoryAwareStartup
+            candidates: List[Tuple[str, str]] = []
+
+            # 1) MemoryAwareStartup candidate (if available).
             try:
                 from core.memory_aware_startup import get_startup_manager
                 startup_manager = await get_startup_manager()
 
                 if startup_manager.is_cloud_ml_active:
-                    # Get endpoint from active cloud backend
                     endpoint = await startup_manager.get_ml_endpoint("speaker_verify")
-                    self._cloud_endpoint = endpoint
-                    logger.info(f"   Cloud endpoint from MemoryAwareStartup: {endpoint}")
-                else:
-                    # Activate cloud backend
-                    if self._startup_decision:
-                        result = await startup_manager.activate_cloud_ml_backend()
-                        if result.get("success") and result.get("ip"):
-                            # Note: No /api/ml suffix - service routes are at root level
-                            _ecapa_port = int(os.getenv("JARVIS_ECAPA_PORT", "8015"))
-                            self._cloud_endpoint = f"http://{result.get('ip')}:{_ecapa_port}"
-                            logger.info(f"   Cloud backend activated: {self._cloud_endpoint}")
+                    if endpoint:
+                        candidates.append((endpoint, "memory_aware_active"))
+                elif self._startup_decision:
+                    result = await startup_manager.activate_cloud_ml_backend()
+                    if result.get("success") and result.get("ip"):
+                        _ecapa_port = int(os.getenv("JARVIS_ECAPA_PORT", "8015"))
+                        candidates.append(
+                            (f"http://{result.get('ip')}:{_ecapa_port}", "memory_aware_activated")
+                        )
             except ImportError:
                 logger.debug("MemoryAwareStartup not available")
+            except Exception as e:
+                logger.debug(f"MemoryAwareStartup endpoint discovery failed: {e}")
 
-            # v116.0 FIX: Cloud Run FIRST for ECAPA (local services don't have ECAPA API)
-            # ECAPA-TDNN speaker embedding is ONLY available on Cloud Run, NOT on JARVIS Prime or Reactor Core.
-            # The previous v113.1 logic was incorrect - preferring local endpoints that don't have ECAPA.
-            if not self._cloud_endpoint or "None" in str(self._cloud_endpoint):
-                # 1. FIRST: Always try Cloud Run for ECAPA (it's the ONLY place with ECAPA API)
-                cloud_run_url = os.getenv(
-                    "ECAPA_CLOUD_RUN_URL",
-                    os.getenv(
-                        "JARVIS_CLOUD_ML_ENDPOINT",
-                        "https://jarvis-ml-888774109345.us-central1.run.app"
-                    )
-                )
-                if cloud_run_url:
-                    self._cloud_endpoint = cloud_run_url
-                    logger.info(f"   ☁️  [v116.0] Cloud Run endpoint for ECAPA: {self._cloud_endpoint}")
+            # 2) Explicit cloud endpoint env vars (Cloud Run preferred).
+            cloud_run_url = os.getenv(
+                "ECAPA_CLOUD_RUN_URL",
+                os.getenv(
+                    "JARVIS_CLOUD_ML_ENDPOINT",
+                    "https://jarvis-ml-888774109345.us-central1.run.app",
+                ),
+            )
+            if cloud_run_url:
+                candidates.append((cloud_run_url, "cloud_run_env"))
 
-                # 2. FALLBACK ONLY: Local services (but they don't have ECAPA, just general health)
-                # This is kept for completeness but won't be used for ECAPA operations
-                if not self._cloud_endpoint:
-                    try:
-                        import socket
-                        # Check Reactor-Core first (specialized ML if available)
+            explicit_cloud_endpoint = os.getenv(
+                "JARVIS_CLOUD_ECAPA_ENDPOINT",
+                os.getenv("JARVIS_ML_CLOUD_ENDPOINT", ""),
+            )
+            if explicit_cloud_endpoint:
+                candidates.append((explicit_cloud_endpoint, "explicit_env"))
+
+            # 3) Optional localhost fallbacks, but only if explicitly allowed.
+            allow_local_fallback = os.getenv(
+                "JARVIS_CLOUD_ALLOW_LOCAL_ENDPOINTS", "false"
+            ).lower() in ("1", "true", "yes")
+            if allow_local_fallback:
+                try:
+                    import socket
+
+                    for host_port, source in (
+                        (("127.0.0.1", 8090), "local_reactor_core"),
+                        (("127.0.0.1", 8000), "local_jarvis_prime"),
+                    ):
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        result_8090 = sock.connect_ex(('127.0.0.1', 8090))
+                        sock.settimeout(0.3)
+                        result = sock.connect_ex(host_port)
                         sock.close()
-                        if result_8090 == 0:
-                            self._cloud_endpoint = "http://127.0.0.1:8090"
-                            logger.warning(f"   ⚠️ Using local Reactor-Core at {self._cloud_endpoint} (no Cloud Run available)")
-                        else:
-                            # Check JARVIS-Prime
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            result_8000 = sock.connect_ex(('127.0.0.1', 8000))
-                            sock.close()
-                            if result_8000 == 0:
-                                self._cloud_endpoint = "http://127.0.0.1:8000"
-                                logger.warning(f"   ⚠️ Using local JARVIS-Prime at {self._cloud_endpoint} (no Cloud Run available)")
-                    except Exception as e:
-                        logger.debug(f"Local endpoint discovery failed: {e}")
+                        if result == 0:
+                            candidates.append((f"http://{host_port[0]}:{host_port[1]}", source))
+                except Exception as e:
+                    logger.debug(f"Local endpoint discovery failed: {e}")
 
-            # v236.1: Only activate cloud mode if we actually found an endpoint.
-            # Previously this was unconditional, causing is_using_cloud == True
-            # with _cloud_endpoint == None — leading to spurious
-            # "Cloud endpoint not configured" warnings from
-            # _verify_cloud_backend_ready() called by ensure_ecapa_available().
-            if self._cloud_endpoint:
-                self._use_cloud = True
-                logger.info(f"☁️  Cloud routing activated for ML operations → {self._cloud_endpoint}")
-                return True
-            else:
-                self._use_cloud = False
-                logger.info("☁️  No cloud endpoint discovered — staying in local mode")
-                return False
+            # Deduplicate while preserving priority order.
+            seen: Set[str] = set()
+            deduped_candidates: List[Tuple[str, str]] = []
+            for endpoint, source in candidates:
+                normalized = endpoint.strip().rstrip("/")
+                if not normalized or normalized in seen or "None" in normalized:
+                    continue
+                seen.add(normalized)
+                deduped_candidates.append((normalized, source))
+
+            # Accept first endpoint that passes ECAPA contract checks.
+            for endpoint, source in deduped_candidates:
+                self._set_cloud_endpoint(endpoint, source)
+                contract_ok, contract_reason = await self._verify_cloud_endpoint_contract(
+                    force=True
+                )
+                if contract_ok:
+                    self._use_cloud = True
+                    logger.info(
+                        f"☁️  Cloud routing activated for ML operations → {self._cloud_endpoint} "
+                        f"(source={self._cloud_endpoint_source})"
+                    )
+                    return True
+                logger.warning(
+                    f"⚠️ Rejected cloud endpoint {endpoint} (source={source}): {contract_reason}"
+                )
+
+            self._set_cloud_endpoint(None, "none")
+            self._use_cloud = False
+            logger.info("☁️  No ECAPA-compatible cloud endpoint discovered — staying in local mode")
+            return False
 
         except Exception as e:
             logger.error(f"❌ Failed to activate cloud routing: {e}")
@@ -2056,6 +2194,26 @@ class MLEngineRegistry:
             return False, "Cloud endpoint not configured"
 
         base_url = self._cloud_endpoint.rstrip('/')
+        strict_contract = os.getenv("JARVIS_CLOUD_STRICT_CONTRACT", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+        contract_ok, contract_reason = await self._verify_cloud_endpoint_contract(
+            timeout=min(timeout, float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"))),
+            force=True,
+        )
+        if not contract_ok:
+            self._cloud_verified = False
+            if strict_contract:
+                self._use_cloud = False
+            reason = (
+                f"Cloud endpoint contract validation failed for {base_url} "
+                f"(source={self._cloud_endpoint_source}): {contract_reason}"
+            )
+            logger.warning(reason)
+            return False, reason
 
         # =====================================================================
         # v115.0: CHECK CROSS-REPO STATE FIRST (Trinity Coordination)
@@ -2071,13 +2229,19 @@ class MLEngineRegistry:
             cross_endpoint = cross_repo_state.get("cloud_endpoint", "")
             cross_source = cross_repo_state.get("source_repo", "unknown")
             cross_age = time.time() - cross_repo_state.get("timestamp", 0)
+            cross_contract_verified = cross_repo_state.get("cloud_contract_verified", True)
 
             # Only use cross-repo state if it's for the same endpoint
-            if cross_ready and cross_endpoint == self._cloud_endpoint:
+            if cross_ready and cross_endpoint == self._cloud_endpoint and cross_contract_verified:
                 logger.info(f"✅ [v115.0] Using cross-repo ECAPA state from {cross_source} ({cross_age:.1f}s ago)")
                 self._cloud_verified = True
                 self._cloud_last_verified = cross_repo_state.get("timestamp", time.time())
                 return True, f"Cross-repo verified by {cross_source}"
+            elif cross_ready and cross_endpoint == self._cloud_endpoint and not cross_contract_verified:
+                logger.info(
+                    f"ℹ️  [v115.0] Cross-repo state from {cross_source} rejected "
+                    f"(missing/failed contract verification)"
+                )
             elif not cross_ready:
                 logger.info(f"ℹ️  [v115.0] Cross-repo state from {cross_source}: ECAPA not ready")
                 # Continue with our own verification - the other repo might have timed out
@@ -2330,6 +2494,10 @@ class MLEngineRegistry:
                                 logger.info(f"✅ Cloud ECAPA extraction verified (embedding size: {embedding_size})")
                                 self._cloud_verified = True
                                 self._cloud_last_verified = time.time()
+                                await self._write_cross_repo_ecapa_state(
+                                    True,
+                                    "Cloud backend healthy (health + extraction test)",
+                                )
                                 return True, f"Cloud ECAPA verified (health + extraction test)"
                             else:
                                 reason = f"Cloud extraction returned no embedding: {result}"
@@ -2396,6 +2564,11 @@ class MLEngineRegistry:
                 "cloud_ecapa_ready": is_ready,
                 "cloud_ecapa_verified": self._cloud_verified,
                 "cloud_endpoint": endpoint or self._cloud_endpoint,
+                "cloud_endpoint_source": self._cloud_endpoint_source,
+                "cloud_contract_verified": self._cloud_contract_verified,
+                "cloud_contract_endpoint": self._cloud_contract_endpoint,
+                "cloud_contract_last_checked": self._cloud_contract_last_checked,
+                "cloud_contract_last_error": self._cloud_contract_last_error,
                 "timestamp": time.time(),
                 "timestamp_iso": datetime.now().isoformat(),
                 "reason": reason,
@@ -2515,36 +2688,32 @@ class MLEngineRegistry:
         logger.warning("   Cloud Run service will handle ECAPA embedding extraction")
         logger.warning("=" * 70)
 
-        # Ensure we have a cloud endpoint configured
-        if not self._cloud_endpoint:
-            # Try to get from environment variable
-            self._cloud_endpoint = os.getenv(
+        endpoint_candidate = self._cloud_endpoint
+        if not endpoint_candidate:
+            endpoint_candidate = os.getenv(
                 "JARVIS_CLOUD_ECAPA_ENDPOINT",
-                os.getenv("JARVIS_ML_CLOUD_ENDPOINT", None)
+                os.getenv("JARVIS_ML_CLOUD_ENDPOINT", None),
             )
 
-            if not self._cloud_endpoint:
-                # Try GCP Cloud Run default URL format
-                project_id = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
-                region = os.getenv("GCP_REGION", "us-central1")
-                service_name = os.getenv("GCP_ECAPA_SERVICE", "jarvis-ml")
+        if not endpoint_candidate:
+            region = os.getenv("GCP_REGION", "us-central1")
+            service_name = os.getenv("GCP_ECAPA_SERVICE", "jarvis-ml")
+            logger.warning("   No cloud endpoint configured - checking for Cloud Run URL...")
 
-                # GCP Cloud Run URL format: https://{service}-{random_suffix}.a.run.app
-                # We need to discover this or have it configured
-                logger.warning("   No cloud endpoint configured - checking for Cloud Run URL...")
+            cloud_run_urls = [
+                os.getenv("CLOUD_RUN_ECAPA_URL"),
+                f"https://{service_name}-pvalxny6iq-uc.a.run.app",
+                f"https://{service_name}-888774109345.{region}.run.app",
+            ]
 
-                # Common Cloud Run URL patterns to try
-                cloud_run_urls = [
-                    os.getenv("CLOUD_RUN_ECAPA_URL"),
-                    f"https://{service_name}-pvalxny6iq-uc.a.run.app",  # Known production URL
-                    f"https://{service_name}-888774109345.{region}.run.app",
-                ]
+            for url in cloud_run_urls:
+                if url:
+                    endpoint_candidate = url
+                    logger.info(f"   Trying cloud endpoint: {url}")
+                    break
 
-                for url in cloud_run_urls:
-                    if url:
-                        self._cloud_endpoint = url
-                        logger.info(f"   Trying cloud endpoint: {url}")
-                        break
+        if endpoint_candidate:
+            self._set_cloud_endpoint(endpoint_candidate, "fallback_to_cloud")
 
         if not self._cloud_endpoint:
             logger.error("❌ No cloud endpoint available for fallback")
@@ -2606,6 +2775,7 @@ class MLEngineRegistry:
             "cloud_mode": self._use_cloud,
             "cloud_verified": getattr(self, "_cloud_verified", False),
             "cloud_endpoint": self._cloud_endpoint,
+            "cloud_endpoint_source": self._cloud_endpoint_source,
             "local_loaded": False,
             "local_error": None,
             "diagnostics": {}
@@ -2635,6 +2805,10 @@ class MLEngineRegistry:
         status["diagnostics"]["cloud_api_degraded_until"] = self._cloud_api_degraded_until
         status["diagnostics"]["cloud_api_last_error"] = self._cloud_api_last_error
         status["diagnostics"]["cloud_api_cooldown_remaining"] = self._cloud_api_cooldown_remaining()
+        status["diagnostics"]["cloud_contract_verified"] = self._cloud_contract_verified
+        status["diagnostics"]["cloud_contract_endpoint"] = self._cloud_contract_endpoint
+        status["diagnostics"]["cloud_contract_last_checked"] = self._cloud_contract_last_checked
+        status["diagnostics"]["cloud_contract_last_error"] = self._cloud_contract_last_error
 
         # Final determination
         if not status["available"]:
@@ -2720,7 +2894,9 @@ class MLEngineRegistry:
         msg = (
             f"{context}; cooldown {remaining:.0f}s, "
             f"failure_streak={self._cloud_api_failure_streak}, "
-            f"last_error={self._cloud_api_last_error or 'n/a'}"
+            f"last_error={self._cloud_api_last_error or 'n/a'}, "
+            f"endpoint={self._cloud_endpoint or 'unset'}, "
+            f"source={self._cloud_endpoint_source}"
         )
         now = time.time()
         if (now - self._cloud_api_last_cooldown_log_at) >= MLConfig.CLOUD_COOLDOWN_LOG_INTERVAL:
@@ -2760,6 +2936,15 @@ class MLEngineRegistry:
                 self._log_cloud_cooldown("Cloud API in degraded state (post-lock), skipping readiness check")
                 return False
 
+            contract_ok, contract_reason = await self._verify_cloud_endpoint_contract(
+                timeout=float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0")),
+                force=False,
+            )
+            if not contract_ok:
+                self._mark_cloud_api_failure(f"Contract validation failed: {contract_reason}")
+                self._log_cloud_cooldown("Cloud endpoint contract invalid")
+                return False
+
             cloud_verified = self._cloud_verified
             cloud_last_verified = self._cloud_last_verified
             verification_stale = (
@@ -2773,7 +2958,7 @@ class MLEngineRegistry:
             quick_timeout = float(os.getenv("JARVIS_CLOUD_QUICK_HEALTH_TIMEOUT", "3.0"))
             try:
                 import aiohttp
-                health_url = f"{self._cloud_endpoint.rstrip('/')}/health"
+                health_url = f"{self._cloud_endpoint.rstrip('/')}/api/ml/health"
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
                         health_url,
@@ -2782,7 +2967,8 @@ class MLEngineRegistry:
                     ) as response:
                         if response.status == 200:
                             data = await response.json()
-                            if data.get("ecapa_ready", False):
+                            ecapa_ready = data.get("ecapa_ready")
+                            if isinstance(ecapa_ready, bool) and ecapa_ready:
                                 self._cloud_verified = True
                                 self._cloud_last_verified = time.time()
                                 logger.debug("Cloud ECAPA re-verified via quick health check")
@@ -2802,7 +2988,7 @@ class MLEngineRegistry:
                                 reason=f"health status={status}",
                             )
                             logger.warning(
-                                f"Cloud ECAPA not ready (status: {status}), "
+                                f"Cloud ECAPA not ready (status: {status}, endpoint={self._cloud_endpoint}), "
                                 "skipping cloud request"
                             )
                             return False
@@ -2828,7 +3014,7 @@ class MLEngineRegistry:
                             reason=f"health HTTP {response.status}",
                         )
                         logger.warning(
-                            f"Cloud health check returned {response.status}, "
+                            f"Cloud health check returned {response.status} for {self._cloud_endpoint}, "
                             "skipping cloud request"
                         )
                         return False
@@ -2872,6 +3058,11 @@ class MLEngineRegistry:
             import aiohttp
             import base64
             import numpy as np
+            strict_contract = os.getenv("JARVIS_CLOUD_STRICT_CONTRACT", "true").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
 
             # Encode audio as base64
             audio_b64 = base64.b64encode(audio_data).decode('utf-8')
@@ -2961,13 +3152,25 @@ class MLEngineRegistry:
 
                     else:
                         error_text = await response.text()
-                        # v251.2: Downgraded from ERROR → WARNING. The local
-                        # fallback handles this gracefully; a cloud 500 is an
-                        # operational issue, not a system failure. The circuit
-                        # breaker limits these to ≤3 before opening.
+                        if response.status in (404, 405):
+                            reason = (
+                                f"Embedding route unavailable (HTTP {response.status}) "
+                                f"at {endpoint}"
+                            )
+                            self._cloud_contract_verified = False
+                            self._cloud_contract_endpoint = self._cloud_endpoint.rstrip("/")
+                            self._cloud_contract_last_checked = time.time()
+                            self._cloud_contract_last_error = reason[:240]
+                            self._cloud_verified = False
+                            if strict_contract:
+                                self._use_cloud = False
+                            logger.warning(reason)
+                            self._cloud_embedding_cb.record_failure(reason[:100])
+                            return None
+
                         logger.warning(
-                            f"Cloud embedding request failed ({response.status}): "
-                            f"{error_text[:200]}"
+                            f"Cloud embedding request failed ({response.status}) on "
+                            f"{endpoint} (source={self._cloud_endpoint_source}): {error_text[:200]}"
                         )
                         self._cloud_embedding_cb.record_failure(
                             f"HTTP {response.status}: {error_text[:100]}"
@@ -2990,12 +3193,18 @@ class MLEngineRegistry:
             logger.error("aiohttp not available for cloud requests")
             return None
         except asyncio.TimeoutError:
-            logger.error(f"Cloud embedding request timed out ({timeout}s)")
+            logger.error(
+                f"Cloud embedding request timed out ({timeout}s) at "
+                f"{self._cloud_endpoint} (source={self._cloud_endpoint_source})"
+            )
             self._cloud_embedding_cb.record_failure(f"Timeout after {timeout}s")
             self._mark_cloud_api_failure(f"Timeout after {timeout}s")
             return None
         except Exception as e:
-            logger.error(f"Cloud embedding request failed: {e}")
+            logger.error(
+                f"Cloud embedding request failed at {self._cloud_endpoint} "
+                f"(source={self._cloud_endpoint_source}): {e}"
+            )
             self._cloud_embedding_cb.record_failure(str(e)[:100])
             self._mark_cloud_api_failure(str(e)[:100])
             return None
@@ -3037,6 +3246,11 @@ class MLEngineRegistry:
             import aiohttp
             import base64
             import numpy as np
+            strict_contract = os.getenv("JARVIS_CLOUD_STRICT_CONTRACT", "true").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
 
             # Encode audio as base64
             audio_b64 = base64.b64encode(audio_data).decode('utf-8')
@@ -3105,9 +3319,25 @@ class MLEngineRegistry:
 
                     else:
                         error_text = await response.text()
+                        if response.status in (404, 405):
+                            reason = (
+                                f"Speaker verification route unavailable (HTTP {response.status}) "
+                                f"at {endpoint}"
+                            )
+                            self._cloud_contract_verified = False
+                            self._cloud_contract_endpoint = self._cloud_endpoint.rstrip("/")
+                            self._cloud_contract_last_checked = time.time()
+                            self._cloud_contract_last_error = reason[:240]
+                            self._cloud_verified = False
+                            if strict_contract:
+                                self._use_cloud = False
+                            logger.warning(reason)
+                            self._cloud_embedding_cb.record_failure(reason[:100])
+                            return None
+
                         logger.warning(
-                            f"Cloud verification failed ({response.status}): "
-                            f"{error_text[:200]}"
+                            f"Cloud verification failed ({response.status}) on "
+                            f"{endpoint} (source={self._cloud_endpoint_source}): {error_text[:200]}"
                         )
                         self._cloud_embedding_cb.record_failure(
                             f"HTTP {response.status}: {error_text[:100]}"
@@ -3127,12 +3357,18 @@ class MLEngineRegistry:
             logger.error("aiohttp not available for cloud requests")
             return None
         except asyncio.TimeoutError:
-            logger.error(f"Cloud verification request timed out ({timeout}s)")
+            logger.error(
+                f"Cloud verification request timed out ({timeout}s) at "
+                f"{self._cloud_endpoint} (source={self._cloud_endpoint_source})"
+            )
             self._cloud_embedding_cb.record_failure(f"Timeout after {timeout}s")
             self._mark_cloud_api_failure(f"Timeout after {timeout}s")
             return None
         except Exception as e:
-            logger.error(f"Cloud verification request failed: {e}")
+            logger.error(
+                f"Cloud verification request failed at {self._cloud_endpoint} "
+                f"(source={self._cloud_endpoint_source}): {e}"
+            )
             self._cloud_embedding_cb.record_failure(str(e)[:100])
             self._mark_cloud_api_failure(str(e)[:100])
             return None
@@ -3144,9 +3380,9 @@ class MLEngineRegistry:
         Args:
             endpoint: Cloud ML API endpoint URL
         """
-        self._cloud_endpoint = endpoint
+        self._set_cloud_endpoint(endpoint, "manual")
         self._use_cloud = True
-        logger.info(f"☁️  Cloud endpoint set to: {endpoint}")
+        logger.info(f"☁️  Cloud endpoint set to: {self._cloud_endpoint}")
 
     async def switch_to_cloud(self, reason: str = "Manual switch") -> bool:
         """

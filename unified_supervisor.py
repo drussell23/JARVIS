@@ -21738,6 +21738,43 @@ class PersistentConversationMemoryAgent:
         self._boot_preference_limit = max(
             10, int(os.getenv("JARVIS_MEMORY_BOOT_PREFERENCES", "200"))
         )
+        default_stage1_interactions = min(self._boot_interaction_limit, 40)
+        default_stage1_preferences = min(self._boot_preference_limit, 40)
+        self._boot_stage1_interaction_limit = max(
+            5,
+            min(
+                self._boot_interaction_limit,
+                int(os.getenv("JARVIS_MEMORY_BOOT_STAGE1_INTERACTIONS", str(default_stage1_interactions))),
+            ),
+        )
+        self._boot_stage1_preference_limit = max(
+            5,
+            min(
+                self._boot_preference_limit,
+                int(os.getenv("JARVIS_MEMORY_BOOT_STAGE1_PREFERENCES", str(default_stage1_preferences))),
+            ),
+        )
+        default_stage1_timeout = max(1.0, min(self._boot_load_timeout, self._init_timeout * 0.4))
+        self._boot_stage1_timeout = max(
+            1.0,
+            min(
+                self._boot_load_timeout,
+                float(
+                    os.getenv(
+                        "JARVIS_MEMORY_BOOT_STAGE1_TIMEOUT",
+                        f"{default_stage1_timeout:.1f}",
+                    )
+                ),
+            ),
+        )
+        self._boot_query_timeout = max(
+            0.5,
+            float(os.getenv("JARVIS_MEMORY_BOOT_QUERY_TIMEOUT", "6.0")),
+        )
+        self._boot_cache_max_age = max(
+            30.0,
+            float(os.getenv("JARVIS_MEMORY_BOOT_CACHE_MAX_AGE", "1800.0")),
+        )
         self._min_preference_confidence = float(
             os.getenv("JARVIS_MEMORY_MIN_PREF_CONFIDENCE", "0.55")
         )
@@ -21757,6 +21794,8 @@ class PersistentConversationMemoryAgent:
         self._boot_load_task: Optional[asyncio.Task] = None
         self._boot_context_loaded: bool = False
         self._boot_load_error: Optional[str] = None
+        self._boot_context_stage: str = "empty"
+        self._boot_context_source: str = "none"
         self._boot_context: Dict[str, Any] = {
             "loaded_at": None,
             "interactions": [],
@@ -21764,6 +21803,8 @@ class PersistentConversationMemoryAgent:
             "stats": {
                 "interactions_loaded": 0,
                 "preferences_loaded": 0,
+                "stage": "empty",
+                "source": "none",
             },
         }
 
@@ -21782,35 +21823,62 @@ class PersistentConversationMemoryAgent:
         if self._running:
             return True
 
-        # v241.1: CPU-aware timeout band-aid REMOVED. The root cause was
-        # ECAPA verification running concurrently with Phase 4, starving
-        # DB queries. Now that ECAPA is sequenced after Phase 4, the base
-        # timeout is sufficient without CPU-conditional extensions.
-        boot_timeout = max(1.0, min(self._boot_load_timeout, self._init_timeout))
+        # Stage 0: recover the last valid snapshot immediately to avoid coupling
+        # startup readiness to a potentially cold database connection.
+        restored_cache = await asyncio.to_thread(self._restore_boot_context_from_state_cache_sync)
 
+        # Stage 1: deterministic, bounded DB load (small limits, strict budget).
+        stage1_timeout = max(1.0, min(self._boot_stage1_timeout, self._init_timeout))
         boot_task = create_safe_task(
-            self._load_boot_context(),
-            name="memory-agent-boot-load-initial",
+            self._load_boot_context(
+                interaction_limit=self._boot_stage1_interaction_limit,
+                preference_limit=self._boot_stage1_preference_limit,
+                stage="minimal",
+                source="database",
+            ),
+            name="memory-agent-boot-load-stage1",
         )
         try:
-            await asyncio.wait_for(asyncio.shield(boot_task), timeout=boot_timeout)
+            await asyncio.wait_for(asyncio.shield(boot_task), timeout=stage1_timeout)
             self._boot_context_loaded = True
             self._boot_load_error = None
         except asyncio.TimeoutError:
-            self._boot_context_loaded = False
-            self._boot_load_error = (
-                f"boot context timeout after {boot_timeout:.1f}s (continuing in background)"
-            )
             self._boot_load_task = boot_task
             self._boot_load_task.add_done_callback(self._on_deferred_boot_load_done)
-            self._logger.warning(f"[MemoryAgent] {self._boot_load_error}")
+            if restored_cache:
+                self._boot_context_loaded = True
+                self._boot_load_error = None
+                self._logger.info(
+                    "[MemoryAgent] Fresh boot context timed out after %.1fs; using cached snapshot "
+                    "while DB hydration continues in background",
+                    stage1_timeout,
+                )
+            else:
+                self._boot_context_loaded = False
+                self._boot_load_error = (
+                    f"boot context timeout after {stage1_timeout:.1f}s (continuing in background)"
+                )
+                self._logger.warning(f"[MemoryAgent] {self._boot_load_error}")
         except Exception as e:
-            self._boot_context_loaded = False
-            self._boot_load_error = f"boot context load failed: {e}"
-            self._logger.warning(
-                f"[MemoryAgent] {self._boot_load_error} (continuing in degraded mode)"
-            )
-            self._ensure_boot_context_background_load()
+            if restored_cache:
+                self._boot_context_loaded = True
+                self._boot_load_error = None
+                self._logger.warning(
+                    "[MemoryAgent] Fresh boot context load failed (%s); using cached snapshot and "
+                    "continuing DB hydration in background",
+                    e,
+                )
+                self._ensure_boot_context_background_load()
+            else:
+                self._boot_context_loaded = False
+                self._boot_load_error = f"boot context load failed: {e}"
+                self._logger.warning(
+                    f"[MemoryAgent] {self._boot_load_error} (continuing in degraded mode)"
+                )
+                self._ensure_boot_context_background_load()
+        else:
+            if self._needs_full_boot_hydration():
+                self._ensure_boot_context_background_load()
 
         self._running = True
         self._stats["started_at"] = datetime.now().isoformat()
@@ -22025,6 +22093,8 @@ class PersistentConversationMemoryAgent:
             "loaded_at": self._boot_context.get("loaded_at"),
             "boot_context_loaded": self._boot_context_loaded,
             "boot_load_error": self._boot_load_error,
+            "boot_context_stage": self._boot_context_stage,
+            "boot_context_source": self._boot_context_source,
         }
 
     def get_stats(self) -> Dict[str, Any]:
@@ -22034,6 +22104,8 @@ class PersistentConversationMemoryAgent:
         data["session_id"] = self.session_id
         data["boot_context_loaded"] = self._boot_context_loaded
         data["boot_load_error"] = self._boot_load_error
+        data["boot_context_stage"] = self._boot_context_stage
+        data["boot_context_source"] = self._boot_context_source
         return data
 
     def _on_deferred_boot_load_done(self, task: asyncio.Task) -> None:
@@ -22043,11 +22115,17 @@ class PersistentConversationMemoryAgent:
             self._boot_context_loaded = True
             self._boot_load_error = None
             self._logger.info("[MemoryAgent] Boot context load completed in background")
+            if self._needs_full_boot_hydration():
+                self._ensure_boot_context_background_load()
         except asyncio.CancelledError:
-            self._boot_context_loaded = False
-            self._boot_load_error = "boot context load cancelled"
+            if self._boot_context_stage == "empty":
+                self._boot_context_loaded = False
+                self._boot_load_error = "boot context load cancelled"
+            else:
+                self._boot_load_error = None
         except Exception as e:
-            self._boot_context_loaded = False
+            if self._boot_context_stage == "empty":
+                self._boot_context_loaded = False
             self._boot_load_error = f"boot context deferred load failed: {e}"
             self._logger.warning(
                 f"[MemoryAgent] {self._boot_load_error}; activating retry loop"
@@ -22070,17 +22148,34 @@ class PersistentConversationMemoryAgent:
         """Retry boot context load without blocking startup."""
         for attempt in range(1, self._boot_retry_attempts + 1):
             try:
-                await self._load_boot_context()
+                if not self._boot_context_loaded:
+                    await self._load_boot_context(
+                        interaction_limit=self._boot_stage1_interaction_limit,
+                        preference_limit=self._boot_stage1_preference_limit,
+                        stage="minimal",
+                        source="database",
+                    )
+                    self._boot_context_loaded = True
+
+                if self._needs_full_boot_hydration():
+                    await self._load_boot_context(
+                        interaction_limit=self._boot_interaction_limit,
+                        preference_limit=self._boot_preference_limit,
+                        stage="full",
+                        source="database",
+                    )
+
                 self._boot_context_loaded = True
                 self._boot_load_error = None
                 self._logger.info(
-                    f"[MemoryAgent] Boot context loaded in background (attempt {attempt})"
+                    f"[MemoryAgent] Boot context hydrated in background (attempt {attempt})"
                 )
                 return
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self._boot_context_loaded = False
+                if self._boot_context_stage == "empty":
+                    self._boot_context_loaded = False
                 self._boot_load_error = f"boot context retry {attempt} failed: {e}"
                 if attempt >= self._boot_retry_attempts:
                     self._logger.warning(
@@ -22235,74 +22330,21 @@ class PersistentConversationMemoryAgent:
             fast_mode=True,
         )
 
-    async def _load_boot_context(self) -> None:
-        """Load historical conversational context + preferences on startup.
+    def _needs_full_boot_hydration(self) -> bool:
+        """Return True when a fuller DB hydration pass is still required."""
+        if self._boot_context_stage in ("empty", "cached"):
+            return True
+        return (
+            self._boot_stage1_interaction_limit < self._boot_interaction_limit
+            or self._boot_stage1_preference_limit < self._boot_preference_limit
+        ) and self._boot_context_stage != "full"
 
-        v258.2: Parallelized DB queries via asyncio.gather() and added per-query
-        timeouts.  Under 99.2% CPU pressure, sequential queries exceeded the 8s
-        boot_load_timeout.  Since get_recent_interactions() and get_preferences()
-        are independent READ-ONLY SELECTs, they can safely run concurrently.
-        In PostgreSQL mode each gets its own pool connection; in SQLite mode they
-        serialize internally but still benefit from reduced Python overhead.
-        """
-        _per_query_timeout = float(
-            os.getenv("JARVIS_MEMORY_BOOT_QUERY_TIMEOUT", "6.0")
-        )
-
-        learning_db = await self._get_learning_db()
-
-        # v258.2: Parallel DB queries — independent read-only SELECTs
-        async def _fetch_interactions():
-            return await asyncio.wait_for(
-                learning_db.get_recent_interactions(
-                    limit=self._boot_interaction_limit,
-                    significant_only=True,
-                ),
-                timeout=_per_query_timeout,
-            )
-
-        async def _fetch_preferences():
-            return await asyncio.wait_for(
-                learning_db.get_preferences(
-                    category=None,
-                    min_confidence=self._min_preference_confidence,
-                    limit=self._boot_preference_limit,
-                ),
-                timeout=_per_query_timeout,
-            )
-
-        results = await asyncio.gather(
-            _fetch_interactions(),
-            _fetch_preferences(),
-            return_exceptions=True,
-        )
-
-        # Unpack results — treat per-query timeouts as empty results, not failures
-        if isinstance(results[0], BaseException):
-            # v3.2: Truncate exception text — DB errors can contain stored data
-            _err0 = str(results[0])
-            self._logger.warning(
-                "[MemoryAgent] Boot interactions query failed: %s (%s)",
-                type(results[0]).__name__,
-                _err0[:200] + ("..." if len(_err0) > 200 else ""),
-            )
-            interactions = []
-        else:
-            interactions = results[0]
-
-        if isinstance(results[1], BaseException):
-            # v3.2: Truncate exception text — DB errors can contain stored data
-            _err1 = str(results[1])
-            self._logger.warning(
-                "[MemoryAgent] Boot preferences query failed: %s (%s)",
-                type(results[1]).__name__,
-                _err1[:200] + ("..." if len(_err1) > 200 else ""),
-            )
-            preferences = []
-        else:
-            preferences = results[1]
-
-        # Keep payload bounded for cross-repo snapshot handoff.
+    def _build_boot_previews(
+        self,
+        interactions: List[Dict[str, Any]],
+        preferences: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Build bounded preview payload for cross-repo boot snapshots."""
         interaction_preview = [
             {
                 "interaction_id": i.get("interaction_id"),
@@ -22326,20 +22368,148 @@ class PersistentConversationMemoryAgent:
             }
             for p in preferences[:100]
         ]
+        return interaction_preview, preference_preview
 
+    def _apply_boot_context(
+        self,
+        interaction_preview: List[Dict[str, Any]],
+        preference_preview: List[Dict[str, Any]],
+        interactions_loaded: int,
+        preferences_loaded: int,
+        stage: str,
+        source: str,
+        loaded_at: Optional[str] = None,
+    ) -> None:
+        """Apply boot context payload and update explicit state machine fields."""
         self._boot_context = {
-            "loaded_at": datetime.now().isoformat(),
+            "loaded_at": loaded_at or datetime.now().isoformat(),
             "interactions": interaction_preview,
             "preferences": preference_preview,
             "stats": {
-                "interactions_loaded": len(interactions),
-                "preferences_loaded": len(preferences),
+                "interactions_loaded": int(interactions_loaded),
+                "preferences_loaded": int(preferences_loaded),
+                "stage": stage,
+                "source": source,
             },
         }
+        self._boot_context_stage = stage
+        self._boot_context_source = source
 
-        # v258.2: Fire-and-forget state snapshot — Trinity handoff is not
-        # boot-critical and should not consume the tight boot_load_timeout
-        # budget.  The snapshot will complete asynchronously.
+    def _restore_boot_context_from_state_cache_sync(self) -> bool:
+        """Restore recent boot context snapshot from local state file."""
+        if not self._state_file.exists():
+            return False
+
+        try:
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
+            timestamp = float(data.get("timestamp", 0.0))
+            if timestamp <= 0:
+                return False
+
+            age_seconds = max(0.0, time.time() - timestamp)
+            if age_seconds > self._boot_cache_max_age:
+                return False
+
+            cached_context = data.get("boot_context")
+            if not isinstance(cached_context, dict):
+                return False
+
+            interactions = cached_context.get("interactions")
+            preferences = cached_context.get("preferences")
+            if not isinstance(interactions, list) or not isinstance(preferences, list):
+                return False
+
+            stats = cached_context.get("stats") or {}
+            self._apply_boot_context(
+                interaction_preview=interactions[:100],
+                preference_preview=preferences[:100],
+                interactions_loaded=int(stats.get("interactions_loaded", len(interactions))),
+                preferences_loaded=int(stats.get("preferences_loaded", len(preferences))),
+                stage="cached",
+                source="state_cache",
+                loaded_at=cached_context.get("loaded_at"),
+            )
+            self._boot_context_loaded = True
+            self._boot_load_error = None
+            return True
+        except Exception as e:
+            self._logger.debug(f"[MemoryAgent] State cache restore skipped: {e}")
+            return False
+
+    async def _load_boot_context(
+        self,
+        interaction_limit: Optional[int] = None,
+        preference_limit: Optional[int] = None,
+        stage: str = "full",
+        source: str = "database",
+    ) -> None:
+        """Load historical conversational context + preferences from DB."""
+        per_query_timeout = self._boot_query_timeout
+        interaction_limit = max(1, int(interaction_limit or self._boot_interaction_limit))
+        preference_limit = max(1, int(preference_limit or self._boot_preference_limit))
+
+        learning_db = await self._get_learning_db()
+
+        async def _fetch_interactions():
+            return await asyncio.wait_for(
+                learning_db.get_recent_interactions(
+                    limit=interaction_limit,
+                    significant_only=True,
+                ),
+                timeout=per_query_timeout,
+            )
+
+        async def _fetch_preferences():
+            return await asyncio.wait_for(
+                learning_db.get_preferences(
+                    category=None,
+                    min_confidence=self._min_preference_confidence,
+                    limit=preference_limit,
+                ),
+                timeout=per_query_timeout,
+            )
+
+        interactions_result, preferences_result = await asyncio.gather(
+            _fetch_interactions(),
+            _fetch_preferences(),
+            return_exceptions=True,
+        )
+
+        if isinstance(interactions_result, BaseException):
+            err0 = str(interactions_result)
+            self._logger.warning(
+                "[MemoryAgent] Boot interactions query failed: %s (%s)",
+                type(interactions_result).__name__,
+                err0[:200] + ("..." if len(err0) > 200 else ""),
+            )
+            interactions: List[Dict[str, Any]] = []
+        else:
+            interactions = interactions_result
+
+        if isinstance(preferences_result, BaseException):
+            err1 = str(preferences_result)
+            self._logger.warning(
+                "[MemoryAgent] Boot preferences query failed: %s (%s)",
+                type(preferences_result).__name__,
+                err1[:200] + ("..." if len(err1) > 200 else ""),
+            )
+            preferences: List[Dict[str, Any]] = []
+        else:
+            preferences = preferences_result
+
+        interaction_preview, preference_preview = self._build_boot_previews(
+            interactions=interactions,
+            preferences=preferences,
+        )
+        self._apply_boot_context(
+            interaction_preview=interaction_preview,
+            preference_preview=preference_preview,
+            interactions_loaded=len(interactions),
+            preferences_loaded=len(preferences),
+            stage=stage,
+            source=source,
+        )
+
         create_safe_task(
             self._publish_state_snapshot(),
             name="memory-agent-boot-snapshot",
@@ -67199,6 +67369,8 @@ class JarvisSystemKernel:
             preferences_loaded = int(summary.get("preferences_loaded", 0))
             boot_context_loaded = bool(summary.get("boot_context_loaded", False))
             boot_load_error = summary.get("boot_load_error")
+            boot_context_stage = str(summary.get("boot_context_stage", "unknown"))
+            boot_context_source = str(summary.get("boot_context_source", "unknown"))
             status_message = (
                 f"Loaded {interactions_loaded} interactions, "
                 f"{preferences_loaded} preferences"
@@ -67209,6 +67381,11 @@ class JarvisSystemKernel:
                     self.logger.warning(
                         f"[Kernel] Memory agent boot context deferred: {boot_load_error}"
                     )
+            elif boot_context_stage != "full":
+                status_message += (
+                    f" (boot context stage={boot_context_stage}, source={boot_context_source}, "
+                    "hydrating in background)"
+                )
             self._update_component_status(
                 "conversation_memory",
                 "complete",
@@ -67271,6 +67448,8 @@ class JarvisSystemKernel:
                 interactions_loaded = int(summary.get("interactions_loaded", 0))
                 preferences_loaded = int(summary.get("preferences_loaded", 0))
                 boot_context_loaded = bool(summary.get("boot_context_loaded", False))
+                boot_context_stage = str(summary.get("boot_context_stage", "unknown"))
+                boot_context_source = str(summary.get("boot_context_source", "unknown"))
 
                 status_message = (
                     f"Loaded {interactions_loaded} interactions, "
@@ -67278,6 +67457,11 @@ class JarvisSystemKernel:
                 )
                 if not boot_context_loaded:
                     status_message += " (boot context loading in background)"
+                elif boot_context_stage != "full":
+                    status_message += (
+                        f" (boot context stage={boot_context_stage}, source={boot_context_source}, "
+                        "hydrating in background)"
+                    )
 
                 self._update_component_status(
                     "conversation_memory",
