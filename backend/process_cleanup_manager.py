@@ -3112,11 +3112,40 @@ class ProcessCleanupManager:
 
         # Compound stress: trigger memory relief (cache clearing, GC, progressive)
         if _compound:
-            logger.warning(
-                "Compound CPU+memory pressure (CPU=%.1f%%, mem=%.1f%%) — triggering relief",
-                cpu_percent, _memory_percent,
+            _startup_loading = os.getenv(
+                "JARVIS_SUPERVISOR_LOADING", "0"
+            ).lower() in ("1", "true", "yes")
+            _startup_grace_seconds = float(
+                os.getenv("JARVIS_CPU_STARTUP_COMPOUND_GRACE_SECONDS", "90.0")
             )
-            self._schedule_memory_relief(_memory_percent)
+            _defer_relief = False
+            if _startup_loading:
+                _first_ts = getattr(self, "_startup_compound_pressure_first_ts", 0.0)
+                if _first_ts <= 0.0:
+                    _first_ts = _now
+                    setattr(self, "_startup_compound_pressure_first_ts", _first_ts)
+                _elapsed = max(0.0, _now - _first_ts)
+                if _elapsed < _startup_grace_seconds:
+                    _defer_relief = True
+                    logger.warning(
+                        "Compound CPU+memory pressure during startup "
+                        "(CPU=%.1f%%, mem=%.1f%%, %.0fs/%.0fs grace) — deferring memory relief",
+                        cpu_percent,
+                        _memory_percent,
+                        _elapsed,
+                        _startup_grace_seconds,
+                    )
+            else:
+                setattr(self, "_startup_compound_pressure_first_ts", 0.0)
+
+            if not _defer_relief:
+                logger.warning(
+                    "Compound CPU+memory pressure (CPU=%.1f%%, mem=%.1f%%) — triggering relief",
+                    cpu_percent, _memory_percent,
+                )
+                self._schedule_memory_relief(_memory_percent)
+        else:
+            setattr(self, "_startup_compound_pressure_first_ts", 0.0)
 
     def _schedule_cpu_relief(self, cpu_percent: float) -> None:
         """v258.0: CPU-targeted relief with tiered throttle factors.

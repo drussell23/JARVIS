@@ -21827,12 +21827,122 @@ class PersistentConversationMemoryAgent:
         # startup readiness to a potentially cold database connection.
         restored_cache = await asyncio.to_thread(self._restore_boot_context_from_state_cache_sync)
 
+        # Stage 0.5: Capture startup pressure and dynamically shape stage-1 load.
+        _pressure_cpu_threshold = float(
+            os.getenv("JARVIS_MEMORY_BOOT_PRESSURE_CPU_THRESHOLD", "92.0")
+        )
+        _pressure_mem_threshold = float(
+            os.getenv("JARVIS_MEMORY_BOOT_PRESSURE_MEMORY_THRESHOLD", "84.0")
+        )
+        _stage1_limit_cap = max(
+            5,
+            int(
+                os.getenv(
+                    "JARVIS_MEMORY_BOOT_STAGE1_PRESSURE_LIMIT",
+                    "12",
+                )
+            ),
+        )
+        _stage1_timeout_scale = max(
+            1.0,
+            float(
+                os.getenv(
+                    "JARVIS_MEMORY_BOOT_STAGE1_PRESSURE_TIMEOUT_SCALE",
+                    "1.6",
+                )
+            ),
+        )
+        _stage1_timeout_cap = max(
+            1.0,
+            float(
+                os.getenv(
+                    "JARVIS_MEMORY_BOOT_STAGE1_TIMEOUT_CAP",
+                    str(max(self._init_timeout, self._boot_load_timeout)),
+                )
+            ),
+        )
+
+        _cpu_percent = 0.0
+        _memory_percent = 0.0
+        try:
+            import psutil
+
+            def _capture_pressure_sync() -> Tuple[float, float]:
+                return (
+                    float(psutil.cpu_percent(interval=0.1)),
+                    float(psutil.virtual_memory().percent),
+                )
+
+            _cpu_percent, _memory_percent = await asyncio.to_thread(
+                _capture_pressure_sync
+            )
+        except Exception:
+            pass
+
+        _compound_startup_pressure = (
+            _cpu_percent >= _pressure_cpu_threshold
+            and _memory_percent >= _pressure_mem_threshold
+        )
+
         # Stage 1: deterministic, bounded DB load (small limits, strict budget).
         stage1_timeout = max(1.0, min(self._boot_stage1_timeout, self._init_timeout))
+        stage1_interaction_limit = self._boot_stage1_interaction_limit
+        stage1_preference_limit = self._boot_stage1_preference_limit
+
+        if _compound_startup_pressure:
+            stage1_interaction_limit = min(stage1_interaction_limit, _stage1_limit_cap)
+            stage1_preference_limit = min(stage1_preference_limit, _stage1_limit_cap)
+            stage1_timeout = min(
+                _stage1_timeout_cap,
+                max(stage1_timeout, stage1_timeout * _stage1_timeout_scale),
+            )
+
+        # Under severe startup pressure, avoid blocking startup on a DB roundtrip.
+        _defer_under_compound_pressure = (
+            os.getenv(
+                "JARVIS_MEMORY_BOOT_DEFER_UNDER_COMPOUND_PRESSURE", "true"
+            ).lower()
+            in ("1", "true", "yes")
+        )
+        if (
+            _compound_startup_pressure
+            and not restored_cache
+            and _defer_under_compound_pressure
+        ):
+            self._apply_boot_context(
+                interaction_preview=[],
+                preference_preview=[],
+                interactions_loaded=0,
+                preferences_loaded=0,
+                stage="deferred",
+                source="startup_pressure",
+            )
+            self._boot_context_loaded = True
+            self._boot_load_error = None
+            self._logger.info(
+                "[MemoryAgent] Startup pressure detected (cpu=%.1f%%, mem=%.1f%%); "
+                "deferring DB boot context load to background",
+                _cpu_percent,
+                _memory_percent,
+            )
+            self._ensure_boot_context_background_load()
+            self._running = True
+            self._stats["started_at"] = datetime.now().isoformat()
+            for idx in range(self._worker_count):
+                task = create_safe_task(
+                    self._worker_loop(worker_id=idx),
+                    name=f"memory-agent-worker-{idx}",
+                )
+                self._workers.append(task)
+            self._logger.info(
+                f"[MemoryAgent] Started (session={self.session_id}, workers={self._worker_count})"
+            )
+            return True
+
         boot_task = create_safe_task(
             self._load_boot_context(
-                interaction_limit=self._boot_stage1_interaction_limit,
-                preference_limit=self._boot_stage1_preference_limit,
+                interaction_limit=stage1_interaction_limit,
+                preference_limit=stage1_preference_limit,
                 stage="minimal",
                 source="database",
             ),
@@ -21852,6 +21962,24 @@ class PersistentConversationMemoryAgent:
                     "[MemoryAgent] Fresh boot context timed out after %.1fs; using cached snapshot "
                     "while DB hydration continues in background",
                     stage1_timeout,
+                )
+            elif _compound_startup_pressure:
+                self._apply_boot_context(
+                    interaction_preview=[],
+                    preference_preview=[],
+                    interactions_loaded=0,
+                    preferences_loaded=0,
+                    stage="deferred",
+                    source="startup_pressure_timeout",
+                )
+                self._boot_context_loaded = True
+                self._boot_load_error = None
+                self._logger.info(
+                    "[MemoryAgent] Boot context stage-1 timed out after %.1fs under startup pressure "
+                    "(cpu=%.1f%%, mem=%.1f%%); continuing with deferred context",
+                    stage1_timeout,
+                    _cpu_percent,
+                    _memory_percent,
                 )
             else:
                 self._boot_context_loaded = False
@@ -22332,7 +22460,7 @@ class PersistentConversationMemoryAgent:
 
     def _needs_full_boot_hydration(self) -> bool:
         """Return True when a fuller DB hydration pass is still required."""
-        if self._boot_context_stage in ("empty", "cached"):
+        if self._boot_context_stage in ("empty", "cached", "deferred"):
             return True
         return (
             self._boot_stage1_interaction_limit < self._boot_interaction_limit
@@ -62946,62 +63074,118 @@ class JarvisSystemKernel:
         # =====================================================================
         _startup_mode_now = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
         self._gcp_probe_passed = False
+        self._gcp_probe_task = None
         if _startup_mode_now in ("cloud_first", "cloud_only"):
-            _gcp_probe_timeout = _get_env_float("JARVIS_GCP_PROBE_TIMEOUT", 5.0)
+            _gcp_probe_timeout_base = _get_env_float("JARVIS_GCP_PROBE_TIMEOUT", 5.0)
+            _gcp_probe_pressure_timeout = _get_env_float(
+                "JARVIS_GCP_PROBE_PRESSURE_TIMEOUT",
+                max(_gcp_probe_timeout_base * 2.0, 8.0),
+            )
+            _gcp_probe_pressure_cpu_threshold = _get_env_float(
+                "JARVIS_GCP_PROBE_PRESSURE_CPU_THRESHOLD", 90.0
+            )
+            _gcp_probe_pressure_memory_threshold = _get_env_float(
+                "JARVIS_GCP_PROBE_PRESSURE_MEMORY_THRESHOLD", 82.0
+            )
+            _probe_cpu_percent = 0.0
+            _probe_memory_percent = 0.0
             try:
-                async def _probe_gcp_availability() -> bool:
-                    """Quick GCP reachability probe. Tries invincible node, then project."""
+                import psutil
+
+                def _capture_probe_pressure_sync() -> Tuple[float, float]:
+                    return (
+                        float(psutil.cpu_percent(interval=0.1)),
+                        float(psutil.virtual_memory().percent),
+                    )
+
+                _probe_cpu_percent, _probe_memory_percent = await asyncio.to_thread(
+                    _capture_probe_pressure_sync
+                )
+            except Exception:
+                pass
+
+            _probe_under_pressure = (
+                _probe_cpu_percent >= _gcp_probe_pressure_cpu_threshold
+                and _probe_memory_percent >= _gcp_probe_pressure_memory_threshold
+            )
+            _gcp_probe_timeout = (
+                _gcp_probe_pressure_timeout
+                if _probe_under_pressure
+                else _gcp_probe_timeout_base
+            )
+            _gcp_strategy_timeout = max(
+                1.0,
+                min(
+                    _get_env_float("JARVIS_GCP_PROBE_STRATEGY_TIMEOUT", 3.0),
+                    _gcp_probe_timeout * 0.8,
+                ),
+            )
+            try:
+                async def _probe_via_node_ip(
+                    timeout_seconds: float,
+                ) -> bool:
+                    """Check invincible node health endpoint when IP is configured."""
                     # Strategy 1: Check invincible node IP if configured
                     _node_ip = os.environ.get("JARVIS_INVINCIBLE_NODE_IP")
-                    if _node_ip:
+                    if not _node_ip:
+                        return False
+                    try:
+                        import aiohttp
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(
+                                f"http://{_node_ip}:8002/health",
+                                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                            ) as resp:
+                                return resp.status in (200, 503)  # 503 = alive but warming
+                    except Exception:
+                        return False
+
+                async def _probe_via_credentials(
+                    timeout_seconds: float,
+                ) -> bool:
+                    """Check GCP credentials via google-auth (no subprocess)."""
+                    def _check_gcp_creds_sync() -> bool:
                         try:
-                            import aiohttp
-                            async with aiohttp.ClientSession() as session:
-                                async with session.get(
-                                    f"http://{_node_ip}:8002/health",
-                                    timeout=aiohttp.ClientTimeout(total=3.0),
-                                ) as resp:
-                                    if resp.status in (200, 503):
-                                        return True  # Reachable (503 = loading but alive)
+                            import google.auth
+                            import google.auth.transport.requests
+                            credentials, project = google.auth.default()
+                            if credentials and project:
+                                return True
+                            request = google.auth.transport.requests.Request()
+                            credentials.refresh(request)
+                            return credentials.valid
                         except Exception:
-                            pass  # Not reachable via IP
+                            return False
 
                     # Strategy 2: Pure-Python GCP credential check (v258.4)
                     # Replaces `gcloud auth print-access-token` subprocess to avoid
                     # fork pressure (the exact problem this probe detects).
                     try:
-                        def _check_gcp_creds_sync() -> bool:
-                            """Check GCP credentials via google-auth library (no subprocess)."""
-                            try:
-                                import google.auth
-                                import google.auth.transport.requests
-                                credentials, project = google.auth.default()
-                                if credentials and project:
-                                    return True
-                                # Try refreshing to confirm validity
-                                request = google.auth.transport.requests.Request()
-                                credentials.refresh(request)
-                                return credentials.valid
-                            except Exception:
-                                return False
-
-                        _gcp_cred_ok = await asyncio.wait_for(
+                        return await asyncio.wait_for(
                             asyncio.get_event_loop().run_in_executor(
                                 None, _check_gcp_creds_sync
                             ),
-                            timeout=3.0,
+                            timeout=timeout_seconds,
                         )
-                        if _gcp_cred_ok:
-                            return True
                     except asyncio.CancelledError:
                         raise
                     except (asyncio.TimeoutError, Exception):
-                        pass
+                        return False
 
-                    return False
+                async def _probe_gcp_availability(
+                    strategy_timeout: float,
+                ) -> bool:
+                    """Run independent GCP probes in parallel; succeed on first true signal."""
+                    checks = await asyncio.gather(
+                        _probe_via_node_ip(strategy_timeout),
+                        _probe_via_credentials(strategy_timeout),
+                        return_exceptions=True,
+                    )
+                    return any(result is True for result in checks)
 
                 _gcp_reachable = await asyncio.wait_for(
-                    _probe_gcp_availability(), timeout=_gcp_probe_timeout
+                    _probe_gcp_availability(_gcp_strategy_timeout),
+                    timeout=_gcp_probe_timeout,
                 )
 
                 if _gcp_reachable:
@@ -63022,12 +63206,80 @@ class JarvisSystemKernel:
                         f"GCP unreachable — fell back to {_fallback}", "WARNING"
                     )
             except asyncio.TimeoutError:
-                self.logger.warning(
-                    "[GCPProbe] Probe timed out (%.0fs) — assuming GCP unreachable, "
-                    "falling back to local_optimized", _gcp_probe_timeout
-                )
-                os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "local_optimized"
-                _startup_mode_now = "local_optimized"
+                if _probe_under_pressure:
+                    if _startup_mode_now == "cloud_only":
+                        os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "cloud_first"
+                        _startup_mode_now = "cloud_first"
+
+                    self.logger.warning(
+                        "[GCPProbe] Probe timed out under startup pressure "
+                        "(cpu=%.1f%%, mem=%.1f%%, timeout=%.0fs) — "
+                        "deferring final mode decision",
+                        _probe_cpu_percent,
+                        _probe_memory_percent,
+                        _gcp_probe_timeout,
+                    )
+
+                    async def _deferred_gcp_probe() -> None:
+                        _deferred_timeout = max(_gcp_probe_timeout * 2.0, 10.0)
+                        _deferred_strategy_timeout = max(
+                            _gcp_strategy_timeout,
+                            min(6.0, _deferred_timeout * 0.6),
+                        )
+                        try:
+                            _reachable = await asyncio.wait_for(
+                                _probe_gcp_availability(_deferred_strategy_timeout),
+                                timeout=_deferred_timeout,
+                            )
+                            if _reachable:
+                                self._gcp_probe_passed = True
+                                self.logger.info(
+                                    "[GCPProbe] Deferred probe succeeded — cloud mode confirmed"
+                                )
+                                return
+
+                            _current_mode = os.environ.get(
+                                "JARVIS_STARTUP_MEMORY_MODE", _startup_mode_now
+                            )
+                            if _current_mode in ("cloud_first", "cloud_only"):
+                                _fallback = (
+                                    "local_optimized"
+                                    if _current_mode == "cloud_first"
+                                    else "local_full"
+                                )
+                                os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _fallback
+                                self.logger.warning(
+                                    "[GCPProbe] Deferred probe unreachable — falling back from %s to %s",
+                                    _current_mode,
+                                    _fallback,
+                                )
+                                add_dashboard_log(
+                                    f"GCP deferred probe unreachable — fell back to {_fallback}",
+                                    "WARNING",
+                                )
+                        except asyncio.TimeoutError:
+                            self.logger.warning(
+                                "[GCPProbe] Deferred probe timed out after %.0fs — keeping %s",
+                                _deferred_timeout,
+                                os.environ.get("JARVIS_STARTUP_MEMORY_MODE", _startup_mode_now),
+                            )
+                        except Exception as _deferred_err:
+                            self.logger.debug(
+                                "[GCPProbe] Deferred probe failed: %s", _deferred_err
+                            )
+
+                    self._gcp_probe_task = create_safe_task(
+                        _deferred_gcp_probe(),
+                        name="gcp_probe_deferred",
+                    )
+                    self._background_tasks.append(self._gcp_probe_task)
+                else:
+                    self.logger.warning(
+                        "[GCPProbe] Probe timed out (%.0fs) — assuming GCP unreachable, "
+                        "falling back to local_optimized", _gcp_probe_timeout
+                    )
+                    os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "local_optimized"
+                    _startup_mode_now = "local_optimized"
             except Exception as _probe_err:
                 self.logger.debug("[GCPProbe] Probe failed: %s", _probe_err)
 
