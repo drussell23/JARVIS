@@ -63842,6 +63842,25 @@ class JarvisSystemKernel:
                     _ecapa_bg_timeout = _get_env_float("JARVIS_ECAPA_BG_TIMEOUT", 90.0)
 
                     try:
+                        # v3.0: Check Cloud SQL gate — if UNAVAILABLE, skip
+                        # DB-dependent steps (SpeakerVerificationService uses
+                        # learning_database which hangs on dead Cloud SQL).
+                        _skip_db_steps = False
+                        try:
+                            from intelligence.cloud_sql_connection_manager import (
+                                get_readiness_gate as _ecapa_get_gate,
+                                ReadinessState as _ecapaRS,
+                            )
+                            _ecapa_gate = _ecapa_get_gate()
+                            if _ecapa_gate.state == _ecapaRS.UNAVAILABLE:
+                                _skip_db_steps = True
+                                self.logger.info(
+                                    "[Kernel] ECAPA: Cloud SQL UNAVAILABLE — "
+                                    "skipping DB-dependent verification steps"
+                                )
+                        except (ImportError, Exception):
+                            pass
+
                         # CPU backpressure gate: wait for CPU to settle after Phase 4
                         # before starting another heavyweight operation.
                         _bp_threshold = 70.0
@@ -63869,7 +63888,10 @@ class JarvisSystemKernel:
                             pass  # Metrics unavailable, proceed immediately
 
                         ecapa_verify = await asyncio.wait_for(
-                            self._verify_ecapa_pipeline(), timeout=_ecapa_bg_timeout
+                            self._verify_ecapa_pipeline(
+                                skip_db_dependent=_skip_db_steps
+                            ),
+                            timeout=_ecapa_bg_timeout,
                         )
                         if ecapa_verify.get("verification_pipeline_ready"):
                             self.logger.info("[Kernel] ECAPA pipeline verified and ready")
@@ -76710,12 +76732,18 @@ class JarvisSystemKernel:
     # voice biometric pipeline after backend initialization.
     # =========================================================================
 
-    async def _verify_ecapa_pipeline(self) -> Dict[str, Any]:
+    async def _verify_ecapa_pipeline(
+        self, *, skip_db_dependent: bool = False
+    ) -> Dict[str, Any]:
         """
         v223.0: Run 6-step ECAPA verification pipeline.
 
         Non-blocking verification — failure logs warnings but doesn't abort
         startup (voice unlock degrades gracefully).
+
+        v3.0: skip_db_dependent skips steps that require Cloud SQL
+        (SpeakerVerificationService → learning_database) to avoid hanging
+        90s on dead infrastructure.
 
         Ported from start_system.py (lines 20160-20490).
 
@@ -76729,6 +76757,7 @@ class JarvisSystemKernel:
             "embedding_extraction_tested": False,
             "embedding_shape": None,
             "verification_pipeline_ready": False,
+            "db_steps_skipped": skip_db_dependent,
             "errors": [],
         }
 
@@ -76824,43 +76853,51 @@ class JarvisSystemKernel:
             self.logger.info(f"[ECAPA]   Step 4/6: Embedding extraction ✗ ({e})")
 
         # Step 5/6: SpeakerVerificationService integration test
-        try:
-            from voice.speaker_verification_service import SpeakerVerificationService
-            test_svc = SpeakerVerificationService()
+        # v3.0: Skip when Cloud SQL is UNAVAILABLE — SVS.initialize() calls
+        # get_learning_database() which hangs on dead Cloud SQL.
+        if skip_db_dependent:
+            self.logger.info(
+                "[ECAPA]   Step 5/6: SpeakerVerificationService "
+                "(skipped — Cloud SQL unavailable)"
+            )
+        else:
             try:
-                await test_svc.initialize()
-                # Quick embedding extraction through the service
-                await test_svc._extract_speaker_embedding(audio_bytes)
-            finally:
-                cleanup_exc: Optional[Exception] = None
-                cleanup_invoked = False
-                for method_name in ("cleanup", "shutdown", "stop", "close"):
-                    method = getattr(test_svc, method_name, None)
-                    if not callable(method):
-                        continue
-                    cleanup_invoked = True
-                    try:
-                        cleanup_result = method()
-                        if inspect.isawaitable(cleanup_result):
-                            await cleanup_result
-                    except Exception as e:
-                        cleanup_exc = e
-                    break
+                from voice.speaker_verification_service import SpeakerVerificationService
+                test_svc = SpeakerVerificationService()
+                try:
+                    await test_svc.initialize()
+                    # Quick embedding extraction through the service
+                    await test_svc._extract_speaker_embedding(audio_bytes)
+                finally:
+                    cleanup_exc: Optional[Exception] = None
+                    cleanup_invoked = False
+                    for method_name in ("cleanup", "shutdown", "stop", "close"):
+                        method = getattr(test_svc, method_name, None)
+                        if not callable(method):
+                            continue
+                        cleanup_invoked = True
+                        try:
+                            cleanup_result = method()
+                            if inspect.isawaitable(cleanup_result):
+                                await cleanup_result
+                        except Exception as e:
+                            cleanup_exc = e
+                        break
 
-                if cleanup_exc:
-                    self.logger.debug(
-                        f"[ECAPA] Step 5 cleanup warning: {cleanup_exc}"
-                    )
-                elif not cleanup_invoked:
-                    self.logger.debug(
-                        "[ECAPA] Step 5 cleanup skipped (no lifecycle method found)"
-                    )
-            self.logger.info("[ECAPA]   Step 5/6: SpeakerVerificationService ✓")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            result["errors"].append(f"SpeakerVerification: {e}")
-            self.logger.info(f"[ECAPA]   Step 5/6: SpeakerVerificationService ✗ ({e})")
+                    if cleanup_exc:
+                        self.logger.debug(
+                            f"[ECAPA] Step 5 cleanup warning: {cleanup_exc}"
+                        )
+                    elif not cleanup_invoked:
+                        self.logger.debug(
+                            "[ECAPA] Step 5 cleanup skipped (no lifecycle method found)"
+                        )
+                self.logger.info("[ECAPA]   Step 5/6: SpeakerVerificationService ✓")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                result["errors"].append(f"SpeakerVerification: {e}")
+                self.logger.info(f"[ECAPA]   Step 5/6: SpeakerVerificationService ✗ ({e})")
 
         # Step 6/6: Overall pipeline readiness
         if result["embedding_extraction_tested"]:
