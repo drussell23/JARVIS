@@ -2477,6 +2477,11 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
         v264.0: Exposed as public method (was _capture_screen). External consumers
         (MemoryAwareScreenAnalyzer, ScreenVisionSystem, etc.) depend on this name.
 
+        v259.0: Checks the continuous analyzer's recent capture cache first.
+        If a fresh screenshot (< 2s old by default) exists, returns it
+        immediately — saving 200-500ms of redundant macOS screencapture.
+        Configurable via VISION_CACHE_FRESHNESS_SECONDS env var.
+
         Args:
             multi_space: If True, capture all desktop spaces
             space_number: If provided, capture specific space
@@ -2487,6 +2492,18 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
         try:
             # Initialize vision manager if needed
             await self._ensure_vision_manager()
+
+            # v259.0: Check continuous analyzer cache for single-space
+            # captures.  Multi-space and specific-space requests always
+            # do a fresh capture since the cache only stores current space.
+            if not multi_space and space_number is None:
+                cached = self._get_cached_capture()
+                if cached is not None:
+                    logger.debug(
+                        "[VISION-CAPTURE] Using cached capture from "
+                        "continuous analyzer (saved ~200-500ms)"
+                    )
+                    return cached
 
             if (
                 self.vision_manager
@@ -2547,7 +2564,30 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
             logger.error(f"Screen capture error: {e}")
             
         return None
-        
+
+    def _get_cached_capture(self) -> Optional[Any]:
+        """v259.0: Check continuous analyzer for a recent cached capture.
+
+        Returns the most recent screenshot from the background monitoring
+        loop if it's fresh enough (default < 2s).  This avoids a redundant
+        macOS screencapture call for on-demand "can you see my screen?"
+        requests, saving 200-500ms.
+
+        Path: vision_manager → vision_analyzer → continuous_analyzer
+        """
+        try:
+            analyzer = getattr(self.vision_manager, 'vision_analyzer', None)
+            if analyzer is None:
+                return None
+            continuous = getattr(analyzer, 'continuous_analyzer', None)
+            if continuous is None:
+                return None
+            if not getattr(continuous, 'is_monitoring', False):
+                return None
+            return continuous.get_latest_capture()
+        except Exception:
+            return None
+
     async def _ensure_vision_manager(self):
         """Initialize vision manager if not already done"""
         if not self.vision_manager:

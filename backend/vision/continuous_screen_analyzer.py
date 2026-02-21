@@ -279,22 +279,40 @@ class MemoryAwareScreenAnalyzer:
         logger.info("Stopped continuous screen monitoring and cleaned up memory")
     
     async def _monitoring_loop(self):
-        """Main monitoring loop with dynamic interval adjustment"""
+        """Main monitoring loop with two-phase capture/analysis architecture.
+
+        v259.0 architectural fix — split into two phases:
+
+        Phase 1 (ALWAYS runs, ~7MB, never skipped):
+          - Screenshot capture
+          - Fingerprinting (SHA1 of 32×32 grayscale)
+          - Focused app detection (NSWorkspace, zero API cost)
+          - Frame-diff content change detection
+
+        Phase 2 (CONDITIONAL, memory-gated):
+          - Full Claude Vision / J-Prime LLaVA analysis
+          - Only runs when content changed AND memory allows
+          - Offloads to GCP when local memory tight but GCP VM ready
+
+        Previous design gated the entire cycle (including the cheap Phase 1
+        operations) behind a single memory check.  This caused captures to
+        stop entirely on a 16GB Mac under normal load — the OOM bridge was
+        told "I need 1500MB" when the actual capture cost is ~7MB.
+        """
         while self.is_monitoring:
             try:
-                # Check memory before capture (v255.1: async OOM bridge check)
-                mem_ok, gcp_endpoint = await self._check_memory_available_async()
-                if not mem_ok and not gcp_endpoint:
-                    logger.warning("Skipping capture due to low memory")
-                    await asyncio.sleep(self.current_interval * 2)  # Wait longer
+                # ── Phase 1: ALWAYS capture + lightweight analysis ─────
+                phase1 = await self._phase1_capture_and_detect()
+                if phase1 is None:
+                    # capture_screen() returned None (display off, etc.)
+                    await asyncio.sleep(self.current_interval)
                     continue
 
-                if gcp_endpoint:
-                    # v241.0: Offload capture to GCP VM when local memory is constrained
-                    await self._capture_via_cloud(gcp_endpoint)
-                else:
-                    # Capture and analyze screen locally
-                    await self._capture_and_analyze()
+                needs_full = phase1.get('needs_full_analysis', False)
+
+                # ── Phase 2: Full analysis (only when content changed) ─
+                if needs_full:
+                    await self._phase2_analyze_if_memory_allows(phase1)
 
                 # Adjust interval based on memory if enabled
                 if self.config['dynamic_interval_enabled']:
@@ -303,9 +321,334 @@ class MemoryAwareScreenAnalyzer:
                 # Wait for next update
                 await asyncio.sleep(self.current_interval)
 
+            except RuntimeError as e:
+                # v259.0: Detect vision-unavailable cooldown errors and
+                # sleep for the cooldown duration instead of retrying
+                # every 3 seconds (which generates 20 error logs in 60s).
+                err_msg = str(e).lower()
+                if 'temporarily unavailable' in err_msg or 'cooldown' in err_msg:
+                    cooldown_sleep = float(os.getenv(
+                        'VISION_COOLDOWN_SLEEP_SECONDS', '30.0'
+                    ))
+                    logger.info(
+                        "Vision temporarily unavailable — sleeping %.0fs "
+                        "(cooldown-aware, not retrying every cycle)",
+                        cooldown_sleep,
+                    )
+                    await asyncio.sleep(cooldown_sleep)
+                else:
+                    logger.error("Error in monitoring loop: %s", e)
+                    await asyncio.sleep(self.current_interval)
+
             except Exception as e:
-                logger.error(f"Error in monitoring loop: {e}")
+                logger.error("Error in monitoring loop: %s", e)
                 await asyncio.sleep(self.current_interval)
+
+    async def _phase1_capture_and_detect(self) -> Optional[Dict[str, Any]]:
+        """Phase 1: Lightweight capture + local detection (~7MB, never skip).
+
+        Returns dict with capture data and whether full analysis is needed,
+        or None if capture failed (display off, etc.).
+        """
+        capture_result = await self.vision_handler.capture_screen()
+        if capture_result is None:
+            return None
+
+        current_time = time.time()
+
+        # Convert to consistent format
+        if hasattr(capture_result, 'success'):
+            if not capture_result.success:
+                return None
+        screenshot = capture_result
+
+        # Store capture with size tracking
+        capture_data = {
+            'timestamp': current_time,
+            'result': screenshot,
+            'size_bytes': self._estimate_capture_size(screenshot),
+        }
+        self.capture_history.append(capture_data)
+
+        # Fingerprinting + signature for frame-diff
+        capture_fingerprint = self._compute_capture_fingerprint(screenshot)
+        previous_capture_signature = self.current_screen_state.get(
+            'capture_signature'
+        )
+        capture_signature = self._compute_capture_signature(screenshot)
+        if capture_signature is not None:
+            self.current_screen_state['capture_signature'] = capture_signature
+
+        await self._trigger_event('screen_captured', {
+            'timestamp': current_time,
+            'capture_size_bytes': capture_data['size_bytes'],
+            'capture_fingerprint': capture_fingerprint,
+            '_event_fingerprint': capture_fingerprint,
+            '_event_cooldown_seconds': max(
+                0.5, float(self.config['app_change_cooldown_seconds'])
+            ),
+        })
+
+        # Quick analysis — focused app detection (zero API cost)
+        quick_analysis = await self._quick_screen_analysis()
+        previous_quick_app = self.current_screen_state.get('quick_app')
+        current_quick_app = self._normalize_app_name(
+            quick_analysis.get('current_app')
+        )
+        if current_quick_app:
+            self.current_screen_state['quick_app'] = current_quick_app
+
+        if (
+            current_quick_app
+            and previous_quick_app
+            and current_quick_app != previous_quick_app
+        ):
+            await self._trigger_event('app_changed', {
+                'app_name': current_quick_app,
+                'previous_app': previous_quick_app,
+                'window_title': self.current_screen_state.get(
+                    'current_window', ''
+                ),
+                'analysis_source': 'quick_analysis',
+                '_event_fingerprint': (
+                    f"{previous_quick_app}->{current_quick_app}"
+                ),
+                '_event_cooldown_seconds': float(
+                    self.config['app_change_cooldown_seconds']
+                ),
+            })
+
+        # Frame-diff content change detection (lightweight, no API)
+        frame_diff_changed = False
+        if (
+            previous_capture_signature is not None
+            and capture_signature is not None
+        ):
+            capture_change_score = self._compute_capture_change_score(
+                previous_capture_signature, capture_signature
+            )
+            if capture_change_score >= float(
+                self.config['capture_change_threshold']
+            ):
+                frame_diff_changed = True
+                await self._trigger_event('content_changed', {
+                    'app': current_quick_app,
+                    'previous_app': previous_quick_app,
+                    'text': '',
+                    'visual_elements': [],
+                    'similarity': max(0.0, 1.0 - capture_change_score),
+                    'analysis_source': 'capture_signature_diff',
+                    'capture_change_score': capture_change_score,
+                    '_event_fingerprint': (
+                        f"capture_diff:{current_quick_app or 'unknown'}"
+                    ),
+                    '_event_cooldown_seconds': float(
+                        self.config['content_change_cooldown_seconds']
+                    ),
+                })
+
+        needs_full = self._needs_full_analysis(quick_analysis)
+
+        return {
+            'screenshot': screenshot,
+            'quick_analysis': quick_analysis,
+            'current_quick_app': current_quick_app,
+            'previous_quick_app': previous_quick_app,
+            'needs_full_analysis': needs_full or frame_diff_changed,
+            'timestamp': current_time,
+        }
+
+    async def _phase2_analyze_if_memory_allows(
+        self, phase1: Dict[str, Any]
+    ) -> None:
+        """Phase 2: Full analysis, gated by memory for analysis cost only.
+
+        Checks whether we can afford the analysis (~50MB for API payload +
+        processing).  If local memory is tight, offloads to GCP LLaVA
+        via PrimeClient.  If both are unavailable, skips analysis only —
+        Phase 1 data (capture, fingerprint, app detection) is already saved.
+        """
+        # v259.0: estimated_mb reflects ANALYSIS cost (~50MB), not the
+        # entire pipeline (was 1500MB — the process RSS limit).
+        _analysis_mb = int(os.getenv('VISION_ANALYSIS_ESTIMATED_MB', '50'))
+        mem_ok, gcp_endpoint = await self._check_analysis_memory(_analysis_mb)
+
+        if gcp_endpoint:
+            # GCP VM available — offload heavy analysis
+            await self._analyze_via_cloud(
+                phase1['screenshot'], gcp_endpoint, phase1
+            )
+        elif mem_ok:
+            # Local memory OK — run full Claude Vision analysis
+            await self._run_full_analysis(phase1)
+        else:
+            # Both unavailable — skip analysis, Phase 1 data is preserved
+            if not getattr(self, '_analysis_skip_logged', False):
+                logger.info(
+                    "Skipping full analysis (memory tight, GCP unavailable) "
+                    "— captures and lightweight detection continue normally"
+                )
+                self._analysis_skip_logged = True
+
+    async def _check_analysis_memory(
+        self, analysis_mb: int
+    ) -> tuple:
+        """Check memory specifically for the analysis phase.
+
+        v259.0: Separate from capture memory check.  Only gates the
+        expensive analysis operation, not the cheap capture.
+
+        Returns:
+            (can_proceed_locally: bool, gcp_endpoint: Optional[str])
+        """
+        _oom_timeout = float(
+            os.getenv("JARVIS_VISION_OOM_CHECK_TIMEOUT", "2.0")
+        )
+        try:
+            from core.gcp_oom_prevention_bridge import (
+                check_memory_before_heavy_init,
+            )
+            result = await asyncio.wait_for(
+                check_memory_before_heavy_init(
+                    component="vision_analysis",
+                    estimated_mb=analysis_mb,
+                    auto_offload=False,
+                ),
+                timeout=_oom_timeout,
+            )
+
+            if result.can_proceed_locally:
+                # Reset flags on recovery
+                self._analysis_skip_logged = False
+                self._memory_warned = False
+                return True, None
+
+            # Check if GCP VM can handle analysis
+            gcp_endpoint = None
+            if result.gcp_vm_ready and result.gcp_vm_ip:
+                gcp_endpoint = result.gcp_vm_ip  # Raw IP — PrimeClient handles port
+                if not getattr(self, '_cloud_offload_logged', False):
+                    logger.info(
+                        "OOM Bridge: offloading vision analysis to GCP VM at "
+                        "%s (avail=%.1fGB, tier=%s)",
+                        result.gcp_vm_ip,
+                        result.available_ram_gb,
+                        getattr(result, 'degradation_tier', 'unknown'),
+                    )
+                    self._cloud_offload_logged = True
+
+            if not gcp_endpoint and not getattr(self, '_memory_warned', False):
+                logger.warning(
+                    "OOM Bridge: analysis %s (avail=%.1fGB, tier=%s, "
+                    "gcp_ready=%s)",
+                    result.decision.value,
+                    result.available_ram_gb,
+                    getattr(result, 'degradation_tier', 'unknown'),
+                    result.gcp_vm_ready,
+                )
+                self._memory_warned = True
+
+            return False, gcp_endpoint
+
+        except (ImportError, asyncio.TimeoutError, Exception) as e:
+            logger.debug(
+                "OOM bridge unavailable: %s — using psutil fallback", e
+            )
+            # v259.0: Sync fallback uses analysis-specific check, not the
+            # process RSS limit that always fails on a loaded system.
+            return self._check_analysis_memory_sync(analysis_mb), None
+
+    def _check_analysis_memory_sync(self, analysis_mb: int) -> bool:
+        """Sync fallback for analysis memory check.
+
+        v259.0: Uses available system RAM vs analysis cost, NOT the
+        process RSS limit (which always exceeds 1500MB on a loaded
+        system and caused the old _check_memory_available to always
+        return False).
+
+        Also implements hysteresis: once we skip, only resume when
+        available RAM exceeds the threshold by a 200MB margin.
+        This prevents oscillation when RSS hovers near threshold.
+        """
+        available_mb = self._get_available_memory_mb()
+        # Minimum system RAM to run analysis: analysis cost + 500MB headroom
+        min_available = analysis_mb + 500
+        # Hysteresis: if we were skipping, require extra margin to resume
+        _hysteresis_mb = 200
+        if getattr(self, '_analysis_skip_logged', False):
+            min_available += _hysteresis_mb
+
+        return available_mb >= min_available
+
+    async def _run_full_analysis(self, phase1: Dict[str, Any]) -> None:
+        """Run full Claude Vision analysis locally (Phase 2 body).
+
+        Extracted from the old _capture_and_analyze so it can be called
+        independently after Phase 1 capture is already done.
+        """
+        previous_content_text = self.current_screen_state.get(
+            'content_text', ''
+        )
+        previous_fingerprint = self.current_screen_state.get(
+            'content_fingerprint'
+        )
+        previous_app = (
+            self.current_screen_state.get('current_app')
+            or phase1.get('previous_quick_app')
+        )
+
+        # Perform full Claude Vision analysis
+        analysis = await self._full_screen_analysis()
+
+        # Update screen state
+        self._update_screen_state(analysis)
+
+        content_text = self.current_screen_state.get('content_text', '')
+        content_fingerprint = self.current_screen_state.get(
+            'content_fingerprint'
+        )
+        current_app = (
+            self.current_screen_state.get('current_app')
+            or self.current_screen_state.get('quick_app')
+        )
+        similarity = self._compare_text_similarity(
+            previous_content_text, content_text
+        )
+        content_threshold = max(
+            0.1,
+            min(1.0, float(self.config['content_similarity_threshold']))
+        )
+        app_changed = bool(
+            previous_app and current_app and previous_app != current_app
+        )
+        content_changed = (
+            previous_fingerprint is None
+            or content_fingerprint != previous_fingerprint
+        )
+
+        if content_changed and (
+            app_changed or similarity < content_threshold
+        ):
+            await self._trigger_event('content_changed', {
+                'app': current_app,
+                'previous_app': previous_app,
+                'text': content_text,
+                'visual_elements': self.current_screen_state.get(
+                    'visible_elements', []
+                ),
+                'similarity': similarity,
+                'analysis': analysis,
+                '_event_fingerprint': content_fingerprint or '',
+                '_event_cooldown_seconds': float(
+                    self.config['content_change_cooldown_seconds']
+                ),
+            })
+
+        # Trigger relevant callbacks
+        await self._process_screen_events(analysis)
+
+        # Reset skip flag on successful analysis
+        self._analysis_skip_logged = False
     
     async def _memory_monitor_loop(self):
         """Monitor memory usage and trigger warnings"""
@@ -485,223 +828,196 @@ class MemoryAwareScreenAnalyzer:
         )
     
     async def _capture_and_analyze(self):
-        """Capture screen and analyze with memory management"""
-        try:
-            # Capture current screen
-            capture_result = await self.vision_handler.capture_screen()
-            if capture_result is None:
-                return
-            
-            current_time = time.time()
-            
-            # Convert to consistent format
-            if hasattr(capture_result, 'success'):
-                # It's a result object
-                if not capture_result.success:
-                    return
-                screenshot = capture_result
-            else:
-                # It's a raw image
-                screenshot = capture_result
-            
-            # Store capture with size tracking
-            capture_data = {
-                'timestamp': current_time,
-                'result': screenshot,
-                'size_bytes': self._estimate_capture_size(screenshot),
-            }
-            
-            # Add to history (circular buffer handles removal)
-            self.capture_history.append(capture_data)
+        """Legacy entry point — delegates to Phase 1 + Phase 2.
 
-            capture_fingerprint = self._compute_capture_fingerprint(screenshot)
-            previous_capture_signature = self.current_screen_state.get('capture_signature')
-            capture_signature = self._compute_capture_signature(screenshot)
-            if capture_signature is not None:
-                self.current_screen_state['capture_signature'] = capture_signature
-
-            await self._trigger_event('screen_captured', {
-                'timestamp': current_time,
-                'capture_size_bytes': capture_data['size_bytes'],
-                'capture_fingerprint': capture_fingerprint,
-                '_event_fingerprint': capture_fingerprint,
-                '_event_cooldown_seconds': max(
-                    0.5, float(self.config['app_change_cooldown_seconds'])
-                ),
-            })
-            
-            # Quick analysis to detect changes
-            quick_analysis = await self._quick_screen_analysis()
-            previous_quick_app = self.current_screen_state.get('quick_app')
-            current_quick_app = self._normalize_app_name(
-                quick_analysis.get('current_app')
-            )
-            if current_quick_app:
-                self.current_screen_state['quick_app'] = current_quick_app
-
-            if (
-                current_quick_app
-                and previous_quick_app
-                and current_quick_app != previous_quick_app
-            ):
-                await self._trigger_event('app_changed', {
-                    'app_name': current_quick_app,
-                    'previous_app': previous_quick_app,
-                    'window_title': self.current_screen_state.get('current_window', ''),
-                    'analysis_source': 'quick_analysis',
-                    '_event_fingerprint': f"{previous_quick_app}->{current_quick_app}",
-                    '_event_cooldown_seconds': float(
-                        self.config['app_change_cooldown_seconds']
-                    ),
-                })
-            
-            # Determine if we need full analysis
-            needs_full_analysis = self._needs_full_analysis(quick_analysis)
-
-            # Lightweight frame-diff fallback for content changes between full analyses.
-            if (
-                not needs_full_analysis
-                and previous_capture_signature is not None
-                and capture_signature is not None
-            ):
-                capture_change_score = self._compute_capture_change_score(
-                    previous_capture_signature, capture_signature
-                )
-                if capture_change_score >= float(self.config['capture_change_threshold']):
-                    await self._trigger_event('content_changed', {
-                        'app': current_quick_app,
-                        'previous_app': previous_quick_app,
-                        'text': '',
-                        'visual_elements': [],
-                        'similarity': max(0.0, 1.0 - capture_change_score),
-                        'analysis_source': 'capture_signature_diff',
-                        'capture_change_score': capture_change_score,
-                        '_event_fingerprint': f"capture_diff:{current_quick_app or 'unknown'}",
-                        '_event_cooldown_seconds': float(
-                            self.config['content_change_cooldown_seconds']
-                        ),
-                    })
-            
-            if needs_full_analysis:
-                previous_content_text = self.current_screen_state.get('content_text', '')
-                previous_fingerprint = self.current_screen_state.get('content_fingerprint')
-                previous_app = (
-                    self.current_screen_state.get('current_app')
-                    or previous_quick_app
-                )
-
-                # Perform full Claude Vision analysis
-                analysis = await self._full_screen_analysis()
-                
-                # Update screen state
-                self._update_screen_state(analysis)
-
-                content_text = self.current_screen_state.get('content_text', '')
-                content_fingerprint = self.current_screen_state.get('content_fingerprint')
-                current_app = (
-                    self.current_screen_state.get('current_app')
-                    or self.current_screen_state.get('quick_app')
-                )
-                similarity = self._compare_text_similarity(
-                    previous_content_text, content_text
-                )
-                content_threshold = max(
-                    0.1,
-                    min(1.0, float(self.config['content_similarity_threshold']))
-                )
-                app_changed = bool(
-                    previous_app and current_app and previous_app != current_app
-                )
-                content_changed = (
-                    previous_fingerprint is None
-                    or content_fingerprint != previous_fingerprint
-                )
-
-                if content_changed and (app_changed or similarity < content_threshold):
-                    await self._trigger_event('content_changed', {
-                        'app': current_app,
-                        'previous_app': previous_app,
-                        'text': content_text,
-                        'visual_elements': self.current_screen_state.get(
-                            'visible_elements', []
-                        ),
-                        'similarity': similarity,
-                        'analysis': analysis,
-                        '_event_fingerprint': content_fingerprint or '',
-                        '_event_cooldown_seconds': float(
-                            self.config['content_change_cooldown_seconds']
-                        ),
-                    })
-                
-                # Trigger relevant callbacks
-                await self._process_screen_events(analysis)
-            
-        except Exception as e:
-            logger.error(f"Error capturing/analyzing screen: {e}")
-
-    async def _capture_via_cloud(self, gcp_endpoint: str) -> None:
-        """v241.0: Offload screen capture + analysis to GCP VM.
-
-        When local memory is insufficient, capture a lightweight screenshot
-        locally (minimal RAM — just the raw PNG bytes) and POST it to the
-        GCP VM for heavy Claude Vision analysis. Results are fed back into
-        the local event pipeline so downstream consumers see no difference.
+        v259.0: Kept for backward compatibility.  New callers should use
+        _phase1_capture_and_detect() + _phase2_analyze_if_memory_allows().
         """
-        _cloud_timeout = float(os.getenv("JARVIS_VISION_CLOUD_TIMEOUT", "15.0"))
         try:
-            import aiohttp
+            phase1 = await self._phase1_capture_and_detect()
+            if phase1 is None:
+                return
+            if phase1.get('needs_full_analysis', False):
+                await self._phase2_analyze_if_memory_allows(phase1)
+        except Exception as e:
+            logger.error("Error capturing/analyzing screen: %s", e)
 
-            # Lightweight local capture — just the raw bytes, no analysis
-            capture_result = await self.vision_handler.capture_screen()
-            if capture_result is None:
+    async def _analyze_via_cloud(
+        self,
+        screenshot: Any,
+        gcp_vm_ip: str,
+        phase1: Dict[str, Any],
+    ) -> None:
+        """v259.0: Offload analysis to GCP LLaVA via PrimeClient.
+
+        Screenshot is already captured locally in Phase 1.  This method
+        encodes it as base64 JPEG and sends it to the J-Prime LLaVA
+        vision server (port 8001) using PrimeClient.send_vision_request(),
+        which produces OpenAI-compatible multimodal messages.
+
+        Previous implementation (v241.0 _capture_via_cloud) had three bugs:
+        - Wrong port (8010 instead of 8001)
+        - Wrong format (raw PNG bytes instead of base64 JSON)
+        - Re-captured screenshot (already done in Phase 1)
+
+        Results are fed back into the local event pipeline so downstream
+        consumers see no difference between local and cloud analysis.
+        """
+        _cloud_timeout = float(
+            os.getenv("JARVIS_VISION_CLOUD_TIMEOUT", "120.0")
+        )
+        try:
+            from backend.core.prime_client import get_prime_client
+
+            client = await get_prime_client()
+            if client is None:
+                logger.warning(
+                    "PrimeClient unavailable — cannot offload to GCP"
+                )
                 return
 
-            # Encode screenshot for transfer
-            img = capture_result
+            # Encode screenshot as base64 JPEG for PrimeClient
+            img = screenshot
             if isinstance(img, Image.Image):
                 buf = io.BytesIO()
-                img.save(buf, format="PNG", optimize=True)
-                img_bytes = buf.getvalue()
+                img.save(buf, format="JPEG", quality=85)
+                image_b64 = base64.b64encode(buf.getvalue()).decode('ascii')
             elif hasattr(img, 'tobytes'):
-                img_bytes = img.tobytes()
+                # numpy array — convert via PIL
+                pil_img = Image.fromarray(np.asarray(img))
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=85)
+                image_b64 = base64.b64encode(buf.getvalue()).decode('ascii')
             else:
-                logger.debug("Cloud capture: unsupported screenshot type %s", type(img))
+                logger.debug(
+                    "Cloud analysis: unsupported screenshot type %s",
+                    type(img),
+                )
                 return
 
-            # POST to GCP VM for analysis
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    gcp_endpoint,
-                    data=img_bytes,
-                    headers={"Content-Type": "image/png"},
-                    timeout=aiohttp.ClientTimeout(total=_cloud_timeout),
-                ) as resp:
-                    if resp.status == 200:
-                        analysis = await resp.json()
-                        # Feed cloud analysis back into local event pipeline
-                        current_time = time.time()
-                        await self._trigger_event('screen_captured', {
-                            'timestamp': current_time,
-                            'source': 'gcp_cloud',
-                            'gcp_endpoint': gcp_endpoint,
-                        })
-                        if analysis.get('content_changed'):
-                            await self._trigger_event('content_changed', {
-                                'app': analysis.get('current_app', ''),
-                                'text': analysis.get('text', ''),
-                                'analysis_source': 'gcp_cloud',
-                            })
-                        # Reset cloud offload log flag on success
-                        self._cloud_offload_logged = False
-                    else:
-                        logger.warning(
-                            "Cloud vision capture returned %d — falling back to skip",
-                            resp.status,
-                        )
+            # Send to J-Prime LLaVA vision server via PrimeClient
+            prompt = (
+                "Analyze the current screen and provide:\n"
+                "1. Currently active application\n"
+                "2. Key UI elements visible\n"
+                "3. Any error messages or dialogs\n"
+                "4. What the user appears to be doing\n"
+                "5. Any text content that might be relevant\n"
+                "Be concise but thorough."
+            )
+
+            response = await asyncio.wait_for(
+                client.send_vision_request(
+                    image_base64=image_b64,
+                    prompt=prompt,
+                    max_tokens=512,
+                    temperature=0.1,
+                    timeout=_cloud_timeout,
+                ),
+                timeout=_cloud_timeout + 5.0,
+            )
+
+            if not response or not response.content:
+                logger.warning("GCP vision analysis returned empty response")
+                return
+
+            # Build analysis dict matching local format
+            analysis = {
+                'success': True,
+                'description': response.content,
+                'timestamp': time.time(),
+                'raw_data': {
+                    'source': 'gcp_llava',
+                    'gcp_vm_ip': gcp_vm_ip,
+                    'latency_ms': getattr(response, 'latency_ms', 0),
+                    'model': getattr(response, 'model', 'llava'),
+                },
+            }
+
+            # Update screen state from cloud analysis
+            self._update_screen_state(analysis)
+
+            current_app = (
+                self.current_screen_state.get('current_app')
+                or phase1.get('current_quick_app', '')
+            )
+            previous_app = phase1.get('previous_quick_app', '')
+
+            await self._trigger_event('content_changed', {
+                'app': current_app,
+                'previous_app': previous_app,
+                'text': response.content,
+                'visual_elements': [],
+                'analysis_source': 'gcp_llava',
+                'analysis': analysis,
+                '_event_fingerprint': self._fingerprint_text(
+                    response.content
+                ),
+                '_event_cooldown_seconds': float(
+                    self.config['content_change_cooldown_seconds']
+                ),
+            })
+
+            # Process semantic events from analysis
+            await self._process_screen_events(analysis)
+
+            # Reset flags on success
+            self._cloud_offload_logged = False
+            self._analysis_skip_logged = False
+
         except ImportError:
-            logger.debug("aiohttp not available for cloud capture offload")
+            logger.debug(
+                "PrimeClient not available for cloud vision offload"
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "GCP vision analysis timed out after %.0fs", _cloud_timeout
+            )
         except Exception as e:
-            logger.warning("Cloud vision capture failed: %s — will retry next cycle", e)
+            logger.warning(
+                "GCP vision analysis failed: %s — will retry next cycle", e
+            )
+
+    # Legacy alias for backward compatibility
+    async def _capture_via_cloud(self, gcp_endpoint: str) -> None:
+        """Deprecated — use _analyze_via_cloud instead."""
+        logger.debug(
+            "_capture_via_cloud is deprecated; use _analyze_via_cloud"
+        )
+
+    # ── Public API for cache sharing (v259.0) ───────────────────
+
+    def get_latest_capture(
+        self, max_age_seconds: float = 2.0
+    ) -> Optional[Any]:
+        """Return the most recent screenshot if fresh enough.
+
+        v259.0: Allows VisionCommandHandler to reuse a recent capture
+        from the continuous monitoring loop instead of taking a new
+        screenshot.  This eliminates 200-500ms of redundant screen
+        capture for on-demand "can you see my screen?" requests.
+
+        Args:
+            max_age_seconds: Maximum age of the capture to consider
+                fresh.  Default 2.0s balances freshness vs cache hits
+                (monitoring loop runs every 3s).  Configurable via
+                VISION_CACHE_FRESHNESS_SECONDS.
+
+        Returns:
+            PIL Image / screenshot object if a fresh capture exists,
+            None otherwise (caller should capture a new one).
+        """
+        freshness = float(
+            os.getenv('VISION_CACHE_FRESHNESS_SECONDS', str(max_age_seconds))
+        )
+        if not self.capture_history:
+            return None
+
+        latest = self.capture_history[-1]
+        age = time.time() - latest.get('timestamp', 0)
+        if age <= freshness:
+            return latest.get('result')
+        return None
 
     def _normalize_app_name(self, app_name: Any) -> str:
         """Normalize app name from quick/full analyzers."""
