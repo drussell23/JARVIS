@@ -86,6 +86,14 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _env_int(key: str, default: int) -> int:
+    """Get int from environment variable with fallback."""
+    try:
+        return int(os.environ.get(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
 # v2.1.0: Startup grace period for component health assessment.
 # During this window, initialization failures (network not ready, model loading, etc.)
 # are capped at DEGRADED instead of escalating to UNHEALTHY/CRITICAL.
@@ -93,6 +101,12 @@ def _env_float(key: str, default: float) -> float:
 # moment as ECAPA's 60s timeout — causing immediate healthy → unhealthy.
 # 180s covers: ECAPA timeout (60s) + model loading + normal startup margin.
 VBI_COMPONENT_GRACE_PERIOD = _env_float("VBI_COMPONENT_GRACE_PERIOD", 180.0)
+
+# v2.2.0: Stabilized overall-health transitions to avoid healthy↔degraded flapping
+# from transient component spikes while still surfacing sustained failures.
+VBI_OVERALL_DEGRADE_STREAK = max(1, _env_int("VBI_OVERALL_DEGRADE_STREAK", 2))
+VBI_OVERALL_RECOVERY_STREAK = max(1, _env_int("VBI_OVERALL_RECOVERY_STREAK", 2))
+VBI_OVERALL_STICKY_SECONDS = max(0.0, _env_float("VBI_OVERALL_STICKY_SECONDS", 15.0))
 
 
 # Type variables for generic components
@@ -1352,6 +1366,15 @@ class VBIHealthMonitor:
         # Background tasks
         self._health_broadcast_task: Optional[asyncio.Task] = None
 
+        # v2.2.0: Stable overall-health state with hysteresis.
+        self._overall_health: HealthLevel = HealthLevel.UNKNOWN
+        self._overall_health_candidate: Optional[HealthLevel] = None
+        self._overall_health_candidate_streak: int = 0
+        self._overall_last_transition_at: float = time.time()
+        self._overall_degrade_streak_required = VBI_OVERALL_DEGRADE_STREAK
+        self._overall_recovery_streak_required = VBI_OVERALL_RECOVERY_STREAK
+        self._overall_sticky_seconds = VBI_OVERALL_STICKY_SECONDS
+
         logger.info("[VBIHealthMonitor] Initialized")
 
     @classmethod
@@ -1369,6 +1392,10 @@ class VBIHealthMonitor:
 
         self._running = True
         self._started_at = time.time()
+        self._overall_health = HealthLevel.UNKNOWN
+        self._overall_health_candidate = None
+        self._overall_health_candidate_streak = 0
+        self._overall_last_transition_at = self._started_at
 
         # v253.4: Reset component grace period start to NOW.
         # ComponentHealthState.created_at is set at __init__ time (construction),
@@ -1733,6 +1760,133 @@ class VBIHealthMonitor:
             return None
         return state
 
+    def _health_severity(self, level: HealthLevel) -> int:
+        """Convert health level to severity rank (higher is worse)."""
+        severity = {
+            HealthLevel.OPTIMAL: 0,
+            HealthLevel.HEALTHY: 1,
+            HealthLevel.DEGRADED: 2,
+            HealthLevel.UNHEALTHY: 3,
+            HealthLevel.CRITICAL: 4,
+            HealthLevel.UNKNOWN: 5,
+        }
+        return severity.get(level, 5)
+
+    def _best_level(self, levels: List[HealthLevel]) -> HealthLevel:
+        """Return the best (least severe) level from a non-empty list."""
+        return min(levels, key=self._health_severity)
+
+    def _worst_level(self, levels: List[HealthLevel]) -> HealthLevel:
+        """Return the worst (most severe) level from a non-empty list."""
+        return max(levels, key=self._health_severity)
+
+    def _aggregate_redundant_group(
+        self,
+        members: Set[ComponentType],
+        active: Dict[ComponentType, ComponentHealthState],
+    ) -> HealthLevel:
+        """Aggregate a redundant capability group by selecting healthiest active member."""
+        member_levels = [active[c].health_level for c in members if c in active]
+        if not member_levels:
+            return HealthLevel.UNKNOWN
+        return self._best_level(member_levels)
+
+    def _compute_overall_health_raw(
+        self,
+        active: Dict[ComponentType, ComponentHealthState],
+    ) -> Tuple[HealthLevel, Dict[str, str]]:
+        """Compute raw overall health using resilient capability groups."""
+        # Redundant capability groups. If any active path is healthy, the
+        # capability is considered healthy even if another path is degraded.
+        capability_groups: Dict[str, Set[ComponentType]] = {
+            "inference_path": {
+                ComponentType.VBI_ENGINE,
+                ComponentType.ECAPA_CLIENT,
+                ComponentType.CLOUD_RUN,
+                ComponentType.VM_SPOT,
+            },
+            "persistence_path": {
+                ComponentType.CLOUDSQL,
+                ComponentType.SQLITE,
+            },
+            "auth_runtime_path": {
+                ComponentType.PAVA,
+                ComponentType.VIBA,
+            },
+        }
+
+        capability_levels: Dict[str, str] = {}
+        effective_levels: List[HealthLevel] = []
+        grouped_members: Set[ComponentType] = set()
+
+        for capability_name, members in capability_groups.items():
+            level = self._aggregate_redundant_group(members, active)
+            capability_levels[capability_name] = level.value
+            if level != HealthLevel.UNKNOWN:
+                effective_levels.append(level)
+            grouped_members.update(members)
+
+        # Non-grouped active components still contribute directly.
+        for component, health_state in active.items():
+            if component not in grouped_members:
+                effective_levels.append(health_state.health_level)
+
+        if not effective_levels:
+            return HealthLevel.UNKNOWN, capability_levels
+
+        raw = self._worst_level(effective_levels)
+        return raw, capability_levels
+
+    def _apply_overall_hysteresis(self, raw: HealthLevel) -> HealthLevel:
+        """Stabilize overall health transitions with streak and sticky windows."""
+        now = time.time()
+
+        if self._overall_health == HealthLevel.UNKNOWN:
+            self._overall_health = raw
+            self._overall_last_transition_at = now
+            self._overall_health_candidate = None
+            self._overall_health_candidate_streak = 0
+            return self._overall_health
+
+        if raw == self._overall_health:
+            self._overall_health_candidate = None
+            self._overall_health_candidate_streak = 0
+            return self._overall_health
+
+        current_severity = self._health_severity(self._overall_health)
+        raw_severity = self._health_severity(raw)
+        getting_worse = raw_severity > current_severity
+
+        required_streak = (
+            self._overall_degrade_streak_required
+            if getting_worse
+            else self._overall_recovery_streak_required
+        )
+        if getting_worse and raw in (HealthLevel.UNHEALTHY, HealthLevel.CRITICAL):
+            required_streak = 1
+
+        if self._overall_health_candidate != raw:
+            self._overall_health_candidate = raw
+            self._overall_health_candidate_streak = 1
+            return self._overall_health
+
+        self._overall_health_candidate_streak += 1
+        if self._overall_health_candidate_streak < required_streak:
+            return self._overall_health
+
+        if (
+            not getting_worse
+            and self._overall_sticky_seconds > 0
+            and (now - self._overall_last_transition_at) < self._overall_sticky_seconds
+        ):
+            return self._overall_health
+
+        self._overall_health = raw
+        self._overall_last_transition_at = now
+        self._overall_health_candidate = None
+        self._overall_health_candidate_streak = 0
+        return self._overall_health
+
     # =========================================================================
     # Health Query API
     # =========================================================================
@@ -1744,33 +1898,21 @@ class VBIHealthMonitor:
         heartbeats) for overall health assessment. Dormant components that
         haven't been exercised yet don't drag down the system.
         """
-        # v2.1.0: Only consider active components for overall health
-        active_health_levels = [
-            h.health_level for h in self._component_health.values()
+        active_components = {
+            ct: h for ct, h in self._component_health.items()
             if h.is_active
-        ]
-
-        # If no components are active yet (very early startup), report UNKNOWN
-        if not active_health_levels:
-            overall = HealthLevel.UNKNOWN
-        elif HealthLevel.CRITICAL in active_health_levels:
-            overall = HealthLevel.CRITICAL
-        elif HealthLevel.UNHEALTHY in active_health_levels:
-            overall = HealthLevel.UNHEALTHY
-        elif HealthLevel.DEGRADED in active_health_levels:
-            overall = HealthLevel.DEGRADED
-        elif all(h == HealthLevel.OPTIMAL for h in active_health_levels):
-            overall = HealthLevel.OPTIMAL
-        elif all(h in (HealthLevel.OPTIMAL, HealthLevel.HEALTHY) for h in active_health_levels):
-            overall = HealthLevel.HEALTHY
-        else:
-            overall = HealthLevel.UNKNOWN
+        }
+        overall_raw, capability_levels = self._compute_overall_health_raw(active_components)
+        overall = self._apply_overall_hysteresis(overall_raw)
 
         health = {
             "overall_health": overall.value,
+            "overall_health_raw": overall_raw.value,
             "is_healthy": overall in (HealthLevel.OPTIMAL, HealthLevel.HEALTHY),
             "uptime_seconds": time.time() - (self._started_at or time.time()),
             "timestamp": datetime.utcnow().isoformat(),
+            "active_components_count": len(active_components),
+            "capability_health": capability_levels,
             "components": {
                 ct.value: health_state.to_dict()
                 for ct, health_state in self._component_health.items()

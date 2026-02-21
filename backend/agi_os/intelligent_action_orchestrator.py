@@ -54,10 +54,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import os
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -230,6 +231,29 @@ class IntelligentActionOrchestrator:
             ),
             'allow_proactive_auto_execute': _orch_env_bool(
                 'JARVIS_ORCH_PROACTIVE_AUTO_EXECUTE', False),
+            # v264.0: Dynamic startup budgets for core getter dependencies.
+            # `JARVIS_AGI_GETTER_TIMEOUT` remains backward-compatible as baseline.
+            'init_budget_seconds': max(
+                5.0, _orch_env_float('JARVIS_ORCH_INIT_BUDGET_SECONDS', 25.0)),
+            'getter_timeout_seconds': max(
+                2.0, _orch_env_float('JARVIS_AGI_GETTER_TIMEOUT', 15.0)),
+            'getter_timeout_min_seconds': max(
+                1.0, _orch_env_float('JARVIS_ORCH_GETTER_TIMEOUT_MIN_SECONDS', 4.0)),
+            'getter_timeout_headroom_seconds': max(
+                0.5, _orch_env_float('JARVIS_ORCH_GETTER_TIMEOUT_HEADROOM_SECONDS', 1.5)),
+            'getter_timeout_multiplier': max(
+                1.0, _orch_env_float('JARVIS_ORCH_GETTER_TIMEOUT_MULTIPLIER', 1.6)),
+            'getter_history_size': max(
+                3, _orch_env_int('JARVIS_ORCH_GETTER_HISTORY_SIZE', 12)),
+        }
+
+        # v264.0: Retain recent successful getter latencies so subsequent starts
+        # can auto-size timeouts from observed behavior instead of fixed constants.
+        getter_history_size = int(self._config.get('getter_history_size', 12))
+        self._core_getter_latency_s: Dict[str, deque] = {
+            "event_stream": deque(maxlen=getter_history_size),
+            "approval_manager": deque(maxlen=getter_history_size),
+            "voice_communicator": deque(maxlen=getter_history_size),
         }
 
         # Statistics
@@ -261,7 +285,7 @@ class IntelligentActionOrchestrator:
 
         logger.info("IntelligentActionOrchestrator initialized")
 
-    async def start(self) -> None:
+    async def start(self, init_budget_seconds: Optional[float] = None) -> None:
         """Start the orchestrator and all its components."""
         async with self._lifecycle_lock:
             if self._state in (OrchestratorState.RUNNING, OrchestratorState.STARTING):
@@ -272,7 +296,12 @@ class IntelligentActionOrchestrator:
 
             try:
                 # Initialize components
-                await self._init_components()
+                init_components_fn = self._init_components
+                init_params = inspect.signature(init_components_fn).parameters
+                if "init_budget_seconds" in init_params:
+                    await init_components_fn(init_budget_seconds=init_budget_seconds)
+                else:
+                    await init_components_fn()
 
                 # Subscribe to events
                 await self._setup_event_handlers()
@@ -363,22 +392,108 @@ class IntelligentActionOrchestrator:
         self._paused = False
         logger.info("Orchestrator resumed")
 
-    async def _init_components(self) -> None:
+    def _record_getter_latency(self, key: str, duration_s: float) -> None:
+        """Record successful getter latency for adaptive startup timeout sizing."""
+        history = self._core_getter_latency_s.get(key)
+        if history is not None:
+            history.append(max(0.0, float(duration_s)))
+
+    def _estimate_getter_timeout(self, key: str, init_budget_seconds: float) -> float:
+        """Estimate a dynamic timeout for one core getter."""
+        min_timeout = max(
+            1.0, float(self._config.get('getter_timeout_min_seconds', 4.0))
+        )
+        baseline_timeout = max(
+            min_timeout, float(self._config.get('getter_timeout_seconds', 15.0))
+        )
+        headroom = max(
+            0.5, float(self._config.get('getter_timeout_headroom_seconds', 1.5))
+        )
+        multiplier = max(
+            1.0, float(self._config.get('getter_timeout_multiplier', 1.6))
+        )
+        timeout_cap = max(min_timeout, float(init_budget_seconds) - headroom)
+
+        predicted = baseline_timeout
+        history = list(self._core_getter_latency_s.get(key, ()))
+        if history:
+            ordered = sorted(history)
+            p90_index = min(len(ordered) - 1, int(len(ordered) * 0.90))
+            p90 = ordered[p90_index]
+            predicted = max(predicted, p90 * multiplier)
+
+        return max(min_timeout, min(timeout_cap, predicted))
+
+    async def _resolve_core_dependency(
+        self,
+        key: str,
+        label: str,
+        getter: Callable[[], Any],
+        timeout_seconds: float,
+    ) -> Any:
+        """Resolve a core async dependency with timeout and telemetry."""
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(getter(), timeout=timeout_seconds)
+            elapsed = time.monotonic() - started
+            self._record_getter_latency(key, elapsed)
+            logger.info(
+                "%s ready in %.2fs (timeout %.1fs)",
+                label,
+                elapsed,
+                timeout_seconds,
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.warning("%s timed out after %.1fs", label, timeout_seconds)
+            return None
+        except Exception as e:
+            logger.warning("%s failed: %s", label, e)
+            return None
+
+    async def _init_components(self, init_budget_seconds: Optional[float] = None) -> None:
         """Initialize all components."""
-        # Core AGI OS components (v259.0: timeout to prevent indefinite hang)
-        _getter_timeout = float(os.environ.get("JARVIS_AGI_GETTER_TIMEOUT", "15"))
-        try:
-            self._event_stream = await asyncio.wait_for(get_event_stream(), timeout=_getter_timeout)
-        except asyncio.TimeoutError:
-            logger.warning("get_event_stream() timed out after %.0fs", _getter_timeout)
-        try:
-            self._approval_manager = await asyncio.wait_for(get_approval_manager(), timeout=_getter_timeout)
-        except asyncio.TimeoutError:
-            logger.warning("get_approval_manager() timed out after %.0fs", _getter_timeout)
-        try:
-            self._voice = await asyncio.wait_for(get_voice_communicator(), timeout=_getter_timeout)
-        except asyncio.TimeoutError:
-            logger.warning("get_voice_communicator() timed out after %.0fs", _getter_timeout)
+        # v264.0: Resolve core dependencies in parallel and size getter timeouts
+        # from init budget + observed startup latency instead of sequential 15s.
+        init_budget = max(
+            5.0,
+            float(
+                init_budget_seconds
+                if init_budget_seconds is not None
+                else self._config.get('init_budget_seconds', 25.0)
+            ),
+        )
+        core_specs = (
+            ("event_stream", "Event stream", get_event_stream),
+            ("approval_manager", "Approval manager", get_approval_manager),
+            ("voice_communicator", "Voice communicator", get_voice_communicator),
+        )
+        tasks = {
+            key: asyncio.create_task(
+                self._resolve_core_dependency(
+                    key=key,
+                    label=label,
+                    getter=getter,
+                    timeout_seconds=self._estimate_getter_timeout(
+                        key=key,
+                        init_budget_seconds=init_budget,
+                    ),
+                ),
+                name=f"orchestrator_init_{key}",
+            )
+            for key, label, getter in core_specs
+        }
+        core_results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        core_map: Dict[str, Any] = {}
+        for key, result in zip(tasks.keys(), core_results):
+            if isinstance(result, Exception):
+                logger.warning("%s initialization raised: %s", key, result)
+                continue
+            core_map[key] = result
+
+        self._event_stream = core_map.get("event_stream")
+        self._approval_manager = core_map.get("approval_manager")
+        self._voice = core_map.get("voice_communicator")
 
         # Existing JARVIS components (lazy load to avoid circular imports)
         try:
@@ -1500,11 +1615,13 @@ async def get_action_orchestrator() -> IntelligentActionOrchestrator:
     return _action_orchestrator
 
 
-async def start_action_orchestrator() -> IntelligentActionOrchestrator:
+async def start_action_orchestrator(
+    init_budget_seconds: Optional[float] = None,
+) -> IntelligentActionOrchestrator:
     """Get and start the global action orchestrator."""
     orchestrator = await get_action_orchestrator()
     if orchestrator._state != OrchestratorState.RUNNING:
-        await orchestrator.start()
+        await orchestrator.start(init_budget_seconds=init_budget_seconds)
     return orchestrator
 
 

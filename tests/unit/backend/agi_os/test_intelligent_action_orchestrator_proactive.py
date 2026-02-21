@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import sys
+import time
+import types
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -146,3 +150,61 @@ async def test_proactive_cycle_routes_goal_without_inbound_events():
     assert proposal["target"] == "workspace"
     assert "Proactive scheduler generated this action" in proposal["reason"]
     assert len(orchestrator._pending_issues) == 1
+
+
+async def test_init_components_fetches_core_dependencies_in_parallel(monkeypatch):
+    import backend.agi_os.intelligent_action_orchestrator as module
+
+    orchestrator = module.IntelligentActionOrchestrator()
+
+    async def _slow(value: str) -> str:
+        await asyncio.sleep(0.12)
+        return value
+
+    monkeypatch.setattr(module, "get_event_stream", lambda: _slow("event-stream"))
+    monkeypatch.setattr(module, "get_approval_manager", lambda: _slow("approval-manager"))
+    monkeypatch.setattr(module, "get_voice_communicator", lambda: _slow("voice-communicator"))
+
+    decision_mod = types.ModuleType("autonomy.autonomous_decision_engine")
+    decision_mod.AutonomousDecisionEngine = type("AutonomousDecisionEngine", (), {})
+    action_mod = types.ModuleType("autonomy.action_executor")
+    action_mod.ActionExecutor = type("ActionExecutor", (), {})
+    permission_mod = types.ModuleType("autonomy.permission_manager")
+    permission_mod.PermissionManager = type("PermissionManager", (), {})
+    intervention_mod = types.ModuleType("autonomy.intervention_decision_engine")
+    intervention_mod.get_intervention_engine = lambda: object()
+
+    monkeypatch.setitem(
+        sys.modules, "autonomy.autonomous_decision_engine", decision_mod
+    )
+    monkeypatch.setitem(sys.modules, "autonomy.action_executor", action_mod)
+    monkeypatch.setitem(sys.modules, "autonomy.permission_manager", permission_mod)
+    monkeypatch.setitem(
+        sys.modules, "autonomy.intervention_decision_engine", intervention_mod
+    )
+
+    started = time.perf_counter()
+    await orchestrator._init_components(init_budget_seconds=1.0)
+    elapsed = time.perf_counter() - started
+
+    assert orchestrator._event_stream == "event-stream"
+    assert orchestrator._approval_manager == "approval-manager"
+    assert orchestrator._voice == "voice-communicator"
+    # Sequential would be ~0.36s; parallel should be close to single-call latency.
+    assert elapsed < 0.30
+
+
+async def test_start_action_orchestrator_forwards_init_budget(monkeypatch):
+    import backend.agi_os.intelligent_action_orchestrator as module
+
+    orchestrator = module.IntelligentActionOrchestrator()
+    orchestrator._state = module.OrchestratorState.STOPPED
+    orchestrator.start = AsyncMock()  # type: ignore[method-assign]
+
+    async def _fake_get_action_orchestrator():
+        return orchestrator
+
+    monkeypatch.setattr(module, "get_action_orchestrator", _fake_get_action_orchestrator)
+
+    await module.start_action_orchestrator(init_budget_seconds=42.0)
+    orchestrator.start.assert_awaited_once_with(init_budget_seconds=42.0)

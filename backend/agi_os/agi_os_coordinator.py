@@ -214,6 +214,9 @@ class AGIOSCoordinator:
         self._health_task: Optional[asyncio.Task] = None
         # v251.2: Strong refs prevent GC of fire-and-forget tasks
         self._background_tasks: set = set()
+        # v264.0: Keep recent init durations for dynamic per-component timeouts.
+        # This adapts startup deadlines to observed behavior across restarts.
+        self._component_init_history: Dict[str, List[float]] = {}
 
         # v253.4: Track registered callbacks for cleanup on stop()
         self._agent_status_callback: Optional[Any] = None
@@ -963,7 +966,22 @@ class AGIOSCoordinator:
         except Exception:
             pass
 
-        _comp_timeout_base = _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT", 15.0)
+        # v264.0: Per-component timeout sizing is now budget-driven by default.
+        # `JARVIS_AGI_OS_COMPONENT_TIMEOUT` acts as an optional explicit cap;
+        # when unset or <=0, timeout auto-expands to phase_budget minus margin.
+        _comp_timeout_cap_env = _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT", 0.0)
+        _comp_timeout_min = max(
+            3.0, _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT_MIN", 3.0)
+        )
+        _comp_timeout_margin = max(
+            0.5, _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT_PHASE_MARGIN", 2.0)
+        )
+        _history_window = max(
+            3, int(_env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT_HISTORY", 10.0))
+        )
+        _history_multiplier = max(
+            1.0, _env_float("JARVIS_AGI_OS_COMPONENT_TIMEOUT_MULTIPLIER", 1.4)
+        )
 
         # v253.3: Read the scaled phase budget. When the supervisor passes a
         # tight startup_budget_seconds, the phase might be scaled from 45s
@@ -971,11 +989,33 @@ class AGIOSCoordinator:
         _phase_budget = getattr(self, '_phase_budgets', {}).get(
             "agi_os_components", 35.0
         )
-        # Leave 2s margin for gather() overhead and progress reporting
-        _comp_timeout = min(_comp_timeout_base, max(3.0, _phase_budget - 2.0))
+        _phase_timeout_cap = max(_comp_timeout_min, _phase_budget - _comp_timeout_margin)
+        _comp_timeout_auto = _phase_timeout_cap
+        if _comp_timeout_cap_env > 0:
+            _comp_timeout_auto = min(_comp_timeout_cap_env, _phase_timeout_cap)
+
+        def _record_init_duration(component_name: str, duration_seconds: float) -> None:
+            history = self._component_init_history.setdefault(component_name, [])
+            history.append(max(0.0, float(duration_seconds)))
+            if len(history) > _history_window:
+                del history[0 : len(history) - _history_window]
+
+        def _component_timeout_for(component_name: str) -> float:
+            history = list(self._component_init_history.get(component_name, []))
+            if history:
+                ordered = sorted(history)
+                p90_index = min(len(ordered) - 1, int(len(ordered) * 0.90))
+                predicted = ordered[p90_index] * _history_multiplier
+                return max(
+                    _comp_timeout_min,
+                    min(_phase_timeout_cap, max(_comp_timeout_auto, predicted)),
+                )
+            return max(_comp_timeout_min, _comp_timeout_auto)
+
         logger.info(
-            "Component init: phase_budget=%.1fs, per_component_timeout=%.1fs (parallel)",
-            _phase_budget, _comp_timeout,
+            "Component init: phase_budget=%.1fs, per_component_timeout=auto<=%.1fs (parallel)",
+            _phase_budget,
+            _phase_timeout_cap,
         )
 
         async def _init_one(
@@ -986,13 +1026,22 @@ class AGIOSCoordinator:
             is_async: bool = True,
         ):
             """Initialize a single component with timeout and error isolation."""
+            timeout_seconds = _component_timeout_for(name)
+            started = time.monotonic()
             try:
                 if is_async:
+                    kwargs: Dict[str, Any] = {}
+                    try:
+                        if "init_budget_seconds" in inspect.signature(factory).parameters:
+                            kwargs["init_budget_seconds"] = timeout_seconds
+                    except (TypeError, ValueError):
+                        pass
                     result = await asyncio.wait_for(
-                        factory(), timeout=_comp_timeout,
+                        factory(**kwargs), timeout=timeout_seconds,
                     )
                 else:
                     result = factory()
+                _record_init_duration(name, time.monotonic() - started)
                 self._component_status[name] = ComponentStatus(
                     name=name, available=True,
                 )
@@ -1000,18 +1049,20 @@ class AGIOSCoordinator:
                 await self._report_init_progress(name, f"{label} done")
                 return (name, result)
             except asyncio.TimeoutError:
+                _record_init_duration(name, timeout_seconds)
                 logger.warning(
-                    "%s timed out after %.1fs", label, _comp_timeout,
+                    "%s timed out after %.1fs", label, timeout_seconds,
                 )
                 self._component_status[name] = ComponentStatus(
                     name=name,
                     available=False,
                     healthy=False,
-                    error=f"timeout ({_comp_timeout:.1f}s)",
+                    error=f"timeout ({timeout_seconds:.1f}s)",
                 )
                 await self._report_init_progress(name, f"{label} timed out")
                 return (name, None)
             except Exception as e:
+                _record_init_duration(name, time.monotonic() - started)
                 logger.warning("%s failed: %s", label, e)
                 self._component_status[name] = ComponentStatus(
                     name=name,
