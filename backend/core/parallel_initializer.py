@@ -189,7 +189,9 @@ class AdaptiveThresholdCalculator:
         self._alpha = alpha
         self._safety_factor = safety_factor
         self._minimum_floor = minimum_floor
-        self._history: Dict[str, Dict[str, float]] = {}  # name → {ema, last, count}
+        # name → {ema, last, count, peak, ema_var}
+        # v3.1: Added 'peak' (all-time max) and 'ema_var' (EMA of variance)
+        self._history: Dict[str, Dict[str, float]] = {}
         self._load_history()
 
     def _load_history(self) -> None:
@@ -207,11 +209,15 @@ class AdaptiveThresholdCalculator:
             self._history = {}
 
     def _save_history(self) -> None:
-        """Persist EMA data to disk for next startup."""
+        """Persist EMA data to disk atomically (write-then-rename)."""
         try:
             _THRESHOLD_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(_THRESHOLD_HISTORY_PATH, "w") as f:
+            tmp_path = _THRESHOLD_HISTORY_PATH.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
                 json.dump(self._history, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.rename(_THRESHOLD_HISTORY_PATH)
         except OSError as e:
             logger.debug(f"[AdaptiveThreshold] Failed to save history: {e}")
 
@@ -240,8 +246,17 @@ class AdaptiveThresholdCalculator:
         if entry and entry.get("count", 0) >= 3:
             # Have enough samples — use EMA-based threshold
             ema = entry["ema"]
-            adaptive = max(ema * self._safety_factor, self._minimum_floor)
-            # Never go below 60% of static default (guard against corrupted history)
+            # v3.1: Incorporate variance — high-variance components get extra headroom.
+            # threshold = ema * safety_factor + 2 * stddev  (≈ 95th percentile)
+            ema_var = entry.get("ema_var", 0.0)
+            stddev = max(ema_var, 0.0) ** 0.5
+            adaptive = ema * self._safety_factor + 2.0 * stddev
+            # v3.1: Also respect peak — never set threshold below the all-time max
+            # (a component that once took 80s shouldn't be killed at 30s)
+            peak = entry.get("peak", 0.0)
+            adaptive = max(adaptive, peak * 1.1)  # 10% headroom above peak
+            # Floor guards
+            adaptive = max(adaptive, self._minimum_floor)
             adaptive = max(adaptive, static_default * 0.6)
             return adaptive
 
@@ -249,25 +264,36 @@ class AdaptiveThresholdCalculator:
 
     def record_duration(self, name: str, duration_seconds: float) -> None:
         """
-        Record a component's actual init duration and update EMA.
+        Record a component's actual init duration and update EMA + variance.
 
         Args:
             name: Component name
             duration_seconds: How long initialization took
         """
-        entry = self._history.get(name, {"ema": duration_seconds, "last": 0, "count": 0})
+        entry = self._history.get(name, {
+            "ema": duration_seconds, "last": 0, "count": 0,
+            "peak": 0.0, "ema_var": 0.0,
+        })
         old_ema = entry.get("ema", duration_seconds)
         count = entry.get("count", 0)
+        old_peak = entry.get("peak", 0.0)
+        old_var = entry.get("ema_var", 0.0)
 
         if count == 0:
             new_ema = duration_seconds
+            new_var = 0.0
         else:
             new_ema = self._alpha * duration_seconds + (1 - self._alpha) * old_ema
+            # v3.1: EMA of squared deviation — tracks variance over time
+            deviation_sq = (duration_seconds - old_ema) ** 2
+            new_var = self._alpha * deviation_sq + (1 - self._alpha) * old_var
 
         self._history[name] = {
             "ema": round(new_ema, 2),
             "last": round(duration_seconds, 2),
             "count": count + 1,
+            "peak": round(max(old_peak, duration_seconds), 2),
+            "ema_var": round(new_var, 4),
         }
 
     def save(self) -> None:
@@ -380,6 +406,11 @@ class ParallelInitializer:
 
         # v3.0: Adaptive threshold calculator — EMA-based self-tuning
         self._adaptive_calc = get_adaptive_calculator()
+
+        # v3.1: Phase transition lock — serializes _mark_complete, _mark_skipped,
+        # _mark_failed to prevent the race where watchdog sets SKIPPED between
+        # init_task completing and _mark_complete executing.
+        self._phase_lock = asyncio.Lock()
 
         # Register standard components
         self._register_components()
@@ -882,20 +913,21 @@ class ParallelInitializer:
         cancelled_count = 0
 
         for comp in self.components.values():
-            if comp.phase == InitPhase.PENDING:
-                await self._mark_skipped(
-                    comp.name,
-                    "Fast-forward skip (infrastructure failure)"
-                )
-                skipped_count += 1
-            elif comp.phase == InitPhase.RUNNING:
-                # v3.0: Also cancel running components — infrastructure is down,
-                # they're just burning timeout budget retrying failed connections.
-                await self._mark_skipped(
-                    comp.name,
-                    "Fast-forward cancel (infrastructure failure)"
-                )
-                cancelled_count += 1
+            async with self._phase_lock:
+                if comp.phase == InitPhase.PENDING:
+                    await self._mark_skipped(
+                        comp.name,
+                        "Fast-forward skip (infrastructure failure)"
+                    )
+                    skipped_count += 1
+                elif comp.phase == InitPhase.RUNNING:
+                    # v3.0: Also cancel running components — infrastructure is down,
+                    # they're just burning timeout budget retrying failed connections.
+                    await self._mark_skipped(
+                        comp.name,
+                        "Fast-forward cancel (infrastructure failure)"
+                    )
+                    cancelled_count += 1
 
         total = skipped_count + cancelled_count
         if total > 0:
@@ -957,21 +989,21 @@ class ParallelInitializer:
                     if comp.is_stale:
                         stale_components.append((name, comp.running_seconds))
 
-                # v3.0: Mark stale components as skipped AND cancel their tasks
+                # v3.1: Acquire phase lock for each stale component — prevents
+                # TOCTOU race where init finishes between is_stale check and _mark_skipped.
                 for name, running_secs in stale_components:
-                    comp = self.components.get(name)
-                    if comp and comp.phase == InitPhase.RUNNING:
-                        logger.warning(
-                            f"⚠️ Watchdog: {name} stale after {running_secs:.0f}s "
-                            f"(threshold: {comp.stale_threshold_seconds:.0f}s) — "
-                            f"CANCELLING task"
-                        )
-                        # _mark_skipped now also cancels the stored task
-                        # and signals dependency-failure events
-                        await self._mark_skipped(
-                            name,
-                            f"Stale after {running_secs:.0f}s (watchdog — task cancelled)"
-                        )
+                    async with self._phase_lock:
+                        comp = self.components.get(name)
+                        if comp and comp.phase == InitPhase.RUNNING:
+                            logger.warning(
+                                f"⚠️ Watchdog: {name} stale after {running_secs:.0f}s "
+                                f"(threshold: {comp.stale_threshold_seconds:.0f}s) — "
+                                f"CANCELLING task"
+                            )
+                            await self._mark_skipped(
+                                name,
+                                f"Stale after {running_secs:.0f}s (watchdog — task cancelled)"
+                            )
 
                 # Check for interactive readiness
                 if not self._get_interactive_ready_event().is_set():
@@ -1133,26 +1165,30 @@ class ParallelInitializer:
                         await self._mark_skipped(name, error_msg)
                         return
                 except asyncio.CancelledError:
-                    # v3.0: Watchdog or dependency cancelled us
-                    if comp.phase == InitPhase.SKIPPED:
-                        logger.debug(f"[{name}] Cancelled (already marked SKIPPED)")
-                    else:
-                        logger.info(f"[{name}] Cancelled by watchdog/dependency")
-                        await self._mark_skipped(name, "Cancelled (watchdog or dependency)")
+                    # v3.1: Acquire phase lock for atomic check+transition
+                    async with self._phase_lock:
+                        if comp.phase == InitPhase.SKIPPED:
+                            logger.debug(f"[{name}] Cancelled (already marked SKIPPED)")
+                        else:
+                            logger.info(f"[{name}] Cancelled by watchdog/dependency")
+                            await self._mark_skipped(name, "Cancelled (watchdog or dependency)")
                     return
                 finally:
                     self._component_tasks.pop(name, None)
             else:
                 logger.debug(f"No initializer for {name}, marking complete")
 
-            # v3.0: Guard — only mark complete if not already SKIPPED/FAILED by watchdog
-            if comp.phase == InitPhase.RUNNING:
-                await self._mark_complete(name)
+            # v3.1: Acquire phase lock THEN check+transition atomically.
+            # Without this, the watchdog can call _mark_skipped between our
+            # phase check and _mark_complete — a TOCTOU race.
+            async with self._phase_lock:
+                if comp.phase == InitPhase.RUNNING:
+                    await self._mark_complete(name)
 
-                # v3.0: Record actual duration for adaptive threshold learning
-                if comp.start_time and comp.end_time:
-                    actual = comp.end_time - comp.start_time
-                    self._adaptive_calc.record_duration(name, actual)
+                    # v3.0: Record actual duration for adaptive threshold learning
+                    if comp.start_time and comp.end_time:
+                        actual = comp.end_time - comp.start_time
+                        self._adaptive_calc.record_duration(name, actual)
 
         except Exception as e:
             error_context = str(e)
@@ -1160,7 +1196,8 @@ class ParallelInitializer:
                 logger.error(f"❌ Critical component {name} failed: {error_context}")
             else:
                 logger.warning(f"⚠️ Non-critical component {name} failed: {error_context}")
-            await self._mark_failed(name, error_context)
+            async with self._phase_lock:
+                await self._mark_failed(name, error_context)
 
     async def _race_init_vs_deps(
         self,
@@ -2299,6 +2336,16 @@ class ParallelInitializer:
                     self.app.state.learning_db = learning_db
                     logger.info("   ✅ Learning database ready (hybrid CloudSQL + SQLite)")
                     return
+
+                except asyncio.CancelledError:
+                    # v3.1: Cancellation-safe cleanup — close any partially-initialized
+                    # connections (asyncpg pools, SQLite handles) before propagating.
+                    # Without this, a watchdog cancel mid-initialize leaks DB connections.
+                    try:
+                        await asyncio.wait_for(learning_db.close(), timeout=3.0)
+                    except BaseException:
+                        pass
+                    raise
 
                 except asyncio.TimeoutError:
                     if attempt < max_retries - 1:
@@ -3482,6 +3529,13 @@ class ParallelInitializer:
                     logger.info("AI Loader shutdown complete")
             except Exception as e:
                 logger.warning(f"AI Loader shutdown error: {e}")
+
+        # v3.1: Persist adaptive threshold history on shutdown
+        try:
+            self._adaptive_calc.save()
+            logger.debug("[AdaptiveThreshold] History saved on shutdown")
+        except Exception as e:
+            logger.debug(f"[AdaptiveThreshold] Save on shutdown failed: {e}")
 
         logger.info("Parallel initializer shutdown complete")
         logger.info("=" * 60)
