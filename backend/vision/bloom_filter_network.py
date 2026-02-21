@@ -115,13 +115,19 @@ class AdaptiveBloomFilter:
         # Use different seed patterns for each level
         if level == BloomFilterLevel.GLOBAL:
             # Global uses prime multipliers for maximum diversity
-            self.hash_seeds = [2654435761 * (i + 1) for i in range(self.num_hashes)]
+            self.hash_seeds = [
+                (2654435761 * (i + 1)) & 0xFFFFFFFF
+                for i in range(self.num_hashes)
+            ]
         elif level == BloomFilterLevel.REGIONAL:
             # Regional uses Fibonacci-based seeds
             self.hash_seeds = [(11400714819323198485 * (i + 1)) & 0xFFFFFFFF for i in range(self.num_hashes)]
         else:
             # Element uses simple linear seeds
-            self.hash_seeds = [i * 2654435761 for i in range(self.num_hashes)]
+            self.hash_seeds = [
+                (i * 2654435761) & 0xFFFFFFFF
+                for i in range(self.num_hashes)
+            ]
         
         logger.info(f"Initialized {level.value} bloom filter: "
                    f"{size_mb}MB, {self.num_hashes} hash functions, "
@@ -395,6 +401,25 @@ class BloomFilterNetwork:
             self._add_to_appropriate_levels(element_key, check_level, context)
             
             return False, check_level
+
+    def check_duplicate(
+        self,
+        element_data: Any,
+        context: Optional[Dict[str, Any]] = None,
+        check_level: BloomFilterLevel = BloomFilterLevel.GLOBAL,
+    ) -> bool:
+        """
+        Backward-compatible duplicate check contract used by orchestrators.
+
+        Returns True when the element has been seen before at the selected
+        hierarchy level, otherwise records it and returns False.
+        """
+        is_duplicate, _ = self.check_and_add(
+            element_data=element_data,
+            context=context,
+            check_level=check_level,
+        )
+        return is_duplicate
     
     def _get_filter_for_level(self, level: BloomFilterLevel, quadrant: Optional[int] = None) -> Union[AdaptiveBloomFilter, List[AdaptiveBloomFilter]]:
         """Get bloom filter(s) for specific level"""
@@ -532,13 +557,20 @@ class BloomFilterNetwork:
             stats = self.get_network_stats()
             
             # Check if any filter needs attention
-            for filter_name in ['global_filter', 'regional_filter', 'element_filter']:
-                filter_stats = stats[filter_name]
-                
-                # Reset if saturation too high
-                if filter_stats['saturation_level'] > 0.85:
-                    level = BloomFilterLevel[filter_name.split('_')[0].upper()]
+            filter_map = {
+                'global_filter': BloomFilterLevel.GLOBAL,
+                'element_filter': BloomFilterLevel.ELEMENT,
+            }
+            for filter_name, level in filter_map.items():
+                filter_stats = stats.get(filter_name, {})
+                if filter_stats.get('saturation_level', 0.0) > 0.85:
                     self.reset_network(level)
+
+            # Regional filters are stored as a list of filter stats.
+            for regional_stats in stats.get('regional_filters', []):
+                if regional_stats.get('saturation_level', 0.0) > 0.85:
+                    self.reset_network(BloomFilterLevel.REGIONAL)
+                    break
                     
             logger.info("Bloom Filter Network optimization completed")
 

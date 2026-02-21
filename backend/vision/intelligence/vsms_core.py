@@ -470,9 +470,19 @@ class VisualStateManager:
                 logger.error(f"Failed to load state definitions: {e}")
 
     async def process_visual_observation(
-        self, screenshot: np.ndarray, app_id: Optional[str] = None
+        self,
+        screenshot: np.ndarray,
+        app_id: Optional[str] = None,
+        regions: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Process a visual observation and update state"""
+        context = context or {}
+        if app_id is None:
+            context_app_id = context.get("app_id")
+            if isinstance(context_app_id, str) and context_app_id:
+                app_id = context_app_id
+
         # Memory check
         if not self._check_memory_limits():
             logger.warning("Memory limits exceeded, cleaning up...")
@@ -517,9 +527,40 @@ class VisualStateManager:
                 "customization": app_identity.customization_level,
             },
             "detected_state": detected_state,
+            "state": detected_state or "unknown",
             "confidence": confidence,
             "timestamp": datetime.now(),
         }
+
+        if regions:
+            total_area = 0.0
+            high_importance_count = 0
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                total_area += float(region.get("area", 0.0) or 0.0)
+                if float(region.get("importance", 0.0) or 0.0) >= 0.7:
+                    high_importance_count += 1
+            result["regions"] = {
+                "count": len(regions),
+                "high_importance_count": high_importance_count,
+                "total_area": int(total_area),
+            }
+
+        if context:
+            # Keep context lightweight and serializable for downstream consumers.
+            result["context"] = {
+                key: value
+                for key, value in context.items()
+                if isinstance(value, (str, int, float, bool, list, dict, type(None)))
+            }
+
+        temporal_context: Dict[str, Any] = {}
+        try:
+            temporal_context = await self.temporal_engine.get_temporal_context(app_id)
+            result["temporal_context"] = temporal_context
+        except Exception as temporal_err:
+            logger.debug(f"Temporal context retrieval failed: {temporal_err}")
 
         # Update current state if confident
         if detected_state and confidence > 0.7:
@@ -604,7 +645,7 @@ class VisualStateManager:
                     content_features.get("text_content", []) if content_features else []
                 ),
                 "scene_graph": result.get("scene_graph", {}),
-                "temporal_context": await self.temporal_engine.get_temporal_context(app_id),
+                "temporal_context": temporal_context,
             }
 
             # Recognize activity

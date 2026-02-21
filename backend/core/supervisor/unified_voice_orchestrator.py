@@ -918,6 +918,9 @@ class UnifiedVoiceOrchestrator:
             pass
 
         prefer_unified_tts = _env_flag("JARVIS_VOICE_PREFER_UNIFIED_TTS", "true")
+        allow_direct_say_fallback = _env_flag(
+            "JARVIS_VOICE_ALLOW_DIRECT_SAY_FALLBACK", "false"
+        )
 
         # v266.0: Prefer UnifiedTTSEngine for both held and free device states.
         # This centralizes playback through one engine path and works with
@@ -935,6 +938,12 @@ class UnifiedVoiceOrchestrator:
                     logger.warning(
                         f"[UnifiedVoice] AudioBus TTS failed while device held: {e} "
                         f"— skipping speech to prevent static"
+                    )
+                    return
+                if prefer_unified_tts and not allow_direct_say_fallback:
+                    logger.warning(
+                        f"[UnifiedVoice] UnifiedTTSEngine failed: {e} "
+                        f"— skipping direct say fallback to keep startup audio deterministic"
                     )
                     return
                 logger.warning(

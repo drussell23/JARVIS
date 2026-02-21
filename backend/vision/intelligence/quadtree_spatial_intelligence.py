@@ -26,6 +26,7 @@ import cv2
 import json
 from enum import Enum
 import hashlib
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -136,6 +137,8 @@ class QuadtreeSpatialIntelligence:
         self.importance_maps: Dict[str, np.ndarray] = {}
         self.query_cache: Dict[str, QueryResult] = {}
         self.access_patterns: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        # Track last analyzed frame per stream id to avoid unnecessary rebuilds.
+        self._last_frame_hashes: Dict[str, str] = {}
         
         # Performance tracking
         self.stats = {
@@ -154,11 +157,22 @@ class QuadtreeSpatialIntelligence:
         # In production, this would load a trained model
         # For now, use heuristics
         self.importance_detector = self._heuristic_importance
+
+    def _ensure_rgb(self, region: np.ndarray) -> np.ndarray:
+        """Normalize input region to HxWx3 RGB for robust OpenCV operations."""
+        if region.ndim == 2:
+            return np.stack([region, region, region], axis=-1)
+        if region.ndim == 3 and region.shape[2] == 1:
+            return np.repeat(region, 3, axis=2)
+        if region.ndim == 3 and region.shape[2] >= 3:
+            return region[:, :, :3]
+        return np.asarray(region, dtype=np.uint8)
         
     def _heuristic_importance(self, region: np.ndarray) -> float:
         """Calculate importance using heuristics"""
         if region.size == 0:
             return 0.0
+        region = self._ensure_rgb(region)
             
         # Edge density (indicates UI elements)
         gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
@@ -269,6 +283,7 @@ class QuadtreeSpatialIntelligence:
         """Calculate visual complexity of region"""
         if region.size == 0:
             return 0.0
+        region = self._ensure_rgb(region)
             
         # Gradient magnitude
         gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
@@ -293,6 +308,7 @@ class QuadtreeSpatialIntelligence:
     
     def _calculate_hash(self, region: np.ndarray) -> str:
         """Calculate perceptual hash of region"""
+        region = self._ensure_rgb(region)
         # Resize to 8x8 for perceptual hashing
         small = cv2.resize(region, (8, 8), interpolation=cv2.INTER_AREA)
         
@@ -318,7 +334,10 @@ class QuadtreeSpatialIntelligence:
         cache_key = f"{image_id}_{importance_threshold}_{max_regions}_{query_bounds}"
         if cache_key in self.query_cache:
             cached = self.query_cache[cache_key]
-            if datetime.now() - cached.nodes[0].cache_timestamp < self.cache_duration:
+            cache_ts = None
+            if cached.nodes:
+                cache_ts = cached.nodes[0].cache_timestamp
+            if cache_ts and datetime.now() - cache_ts < self.cache_duration:
                 self.stats['cache_hits'] += 1
                 cached.from_cache = True
                 return cached
@@ -365,6 +384,71 @@ class QuadtreeSpatialIntelligence:
             self.access_patterns[image_id].append(node.center())
         
         return result
+
+    async def analyze_frame(
+        self,
+        frame: np.ndarray,
+        image_id: str = "live_stream",
+        importance_threshold: float = 0.5,
+        max_regions: int = 64,
+        focus_regions: Optional[List[Tuple[int, int, int, int]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Analyze a frame and return normalized region dictionaries.
+
+        This is the stable integration contract used by the vision orchestrator.
+        """
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return []
+
+        # Normalize grayscale input to RGB for OpenCV paths expecting 3 channels.
+        if frame.ndim == 2:
+            frame = np.stack([frame, frame, frame], axis=-1)
+
+        frame_hash = self._calculate_hash(frame)
+        known_hash = self._last_frame_hashes.get(image_id)
+
+        # Rebuild the quadtree when content changes to keep importance mapping accurate.
+        if image_id not in self.quadtrees or frame_hash != known_hash:
+            self._invalidate_cache(image_id)
+            await self.build_quadtree(frame, image_id, focus_regions=focus_regions)
+            self._last_frame_hashes[image_id] = frame_hash
+
+        query = await self.query_regions(
+            image_id=image_id,
+            importance_threshold=importance_threshold,
+            max_regions=max_regions,
+        )
+
+        regions: List[Dict[str, Any]] = []
+        for node in query.nodes:
+            x1, y1, x2, y2 = node.bounds()
+            regions.append(
+                {
+                    "x1": int(x1),
+                    "y1": int(y1),
+                    "x2": int(x2),
+                    "y2": int(y2),
+                    "width": int(node.width),
+                    "height": int(node.height),
+                    "bounds": (int(x1), int(y1), int(x2), int(y2)),
+                    "center": tuple(int(v) for v in node.center()),
+                    "importance": float(node.importance),
+                    "complexity": float(node.complexity),
+                    "change_frequency": float(node.change_frequency),
+                    "level": int(node.level),
+                    "area": int(node.area()),
+                    "hash": node.hash_value,
+                    "last_update": (
+                        node.last_update.isoformat() if node.last_update else None
+                    ),
+                    "source": "quadtree",
+                    "image_id": image_id,
+                    "analyzed_at": time.time(),
+                }
+            )
+
+        return regions
     
     def _collect_important_nodes(self, node: QuadNode, threshold: float,
                                result: List[QuadNode],

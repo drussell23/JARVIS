@@ -13222,6 +13222,10 @@ class AsyncVoiceNarrator:
             "JARVIS_SUPERVISOR_USE_UNIFIED_VOICE_ORCHESTRATOR",
             "true",
         )
+        allow_direct_say_fallback = self._env_flag(
+            "JARVIS_SUPERVISOR_ALLOW_DIRECT_SAY_FALLBACK",
+            "false",
+        )
         if use_unified_orchestrator:
             delegated = await self._speak_via_unified_orchestrator(
                 text=text,
@@ -13232,6 +13236,13 @@ class AsyncVoiceNarrator:
                 self._messages_spoken += 1
                 return
             if delegated is False:
+                self._messages_skipped += 1
+                return
+            if delegated is None and not allow_direct_say_fallback:
+                _unified_logger.debug(
+                    "[Voice] Unified orchestrator unavailable; "
+                    "skipping direct 'say' fallback for deterministic startup audio"
+                )
                 self._messages_skipped += 1
                 return
 

@@ -709,6 +709,13 @@ class UnifiedTTSEngine:
             if sr != sample_rate:
                 sample_rate = sr
 
+            # Normalize channel/layout contract for AudioBus/ring buffer:
+            # always 1-D mono float32 with finite samples.
+            if isinstance(data, np.ndarray) and data.ndim > 1:
+                data = np.mean(data, axis=1, dtype=np.float32)
+            data = np.asarray(data, dtype=np.float32).reshape(-1)
+            np.nan_to_num(data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Probe actual AudioBus singleton — is FullDuplexDevice holding
             # the audio device RIGHT NOW?
             _bus = None

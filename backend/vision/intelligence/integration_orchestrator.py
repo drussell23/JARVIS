@@ -11,6 +11,7 @@ import psutil
 import gc
 import os
 import logging
+import hashlib
 from typing import Dict, List, Optional, Any, Tuple, Union, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -395,6 +396,74 @@ class IntegrationOrchestrator:
         metrics.memory_usage['visual_input'] = frame.nbytes / 1024 / 1024  # MB
         
         return frame
+
+    def _normalize_spatial_regions(self, raw_regions: Any) -> List[Dict[str, Any]]:
+        """Normalize quadtree outputs into a stable list[dict] region contract."""
+        if isinstance(raw_regions, dict):
+            candidates = raw_regions.get('regions', [])
+        elif isinstance(raw_regions, list):
+            candidates = raw_regions
+        else:
+            candidates = []
+
+        normalized: List[Dict[str, Any]] = []
+        for region in candidates:
+            if isinstance(region, dict):
+                bounds = region.get('bounds')
+                if isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+                    x1, y1, x2, y2 = [int(v) for v in bounds]
+                else:
+                    x1 = int(region.get('x1', region.get('x', 0)))
+                    y1 = int(region.get('y1', region.get('y', 0)))
+                    if 'x2' in region and 'y2' in region:
+                        x2 = int(region['x2'])
+                        y2 = int(region['y2'])
+                    else:
+                        width = int(region.get('width', 0))
+                        height = int(region.get('height', 0))
+                        x2 = x1 + width
+                        y2 = y1 + height
+
+                width = max(0, x2 - x1)
+                height = max(0, y2 - y1)
+                area = float(region.get('area', width * height))
+                normalized.append({
+                    **region,
+                    'x1': x1,
+                    'y1': y1,
+                    'x2': x2,
+                    'y2': y2,
+                    'width': width,
+                    'height': height,
+                    'bounds': (x1, y1, x2, y2),
+                    'area': area,
+                    'importance': float(region.get('importance', 0.0)),
+                })
+                continue
+
+            if hasattr(region, 'bounds'):
+                try:
+                    x1, y1, x2, y2 = [int(v) for v in region.bounds()]
+                except Exception:
+                    continue
+                width = max(0, x2 - x1)
+                height = max(0, y2 - y1)
+                area = float(region.area() if callable(getattr(region, 'area', None)) else width * height)
+                normalized.append({
+                    'x1': x1,
+                    'y1': y1,
+                    'x2': x2,
+                    'y2': y2,
+                    'width': width,
+                    'height': height,
+                    'bounds': (x1, y1, x2, y2),
+                    'area': area,
+                    'importance': float(getattr(region, 'importance', 0.0)),
+                    'complexity': float(getattr(region, 'complexity', 0.0)),
+                    'level': int(getattr(region, 'level', 0)),
+                })
+
+        return normalized
     
     async def _analyze_spatial(self, frame: np.ndarray, metrics: ProcessingMetrics) -> Dict[str, Any]:
         """Stage 2: Spatial analysis using Quadtree"""
@@ -413,7 +482,25 @@ class IntegrationOrchestrator:
         # Analyze with quadtree
         try:
             quadtree = self.components['quadtree']
-            regions = await quadtree.analyze_frame(frame)
+            if hasattr(quadtree, 'analyze_frame'):
+                raw_regions = await quadtree.analyze_frame(frame)
+            elif hasattr(quadtree, 'build_quadtree') and hasattr(quadtree, 'query_regions'):
+                frame_id = hashlib.sha1(
+                    frame[:64, :64].tobytes(),  # small deterministic sample for id
+                    usedforsecurity=False,
+                ).hexdigest()
+                await quadtree.build_quadtree(frame, frame_id)
+                query_result = await quadtree.query_regions(
+                    frame_id,
+                    importance_threshold=0.3,
+                    max_regions=64,
+                )
+                raw_regions = query_result.nodes
+            else:
+                raise AttributeError(
+                    f"{type(quadtree).__name__} does not expose analyze_frame/build_quadtree contract"
+                )
+            regions = self._normalize_spatial_regions(raw_regions)
             
             # Filter by importance based on mode
             importance_threshold = {
@@ -423,12 +510,15 @@ class IntegrationOrchestrator:
                 SystemMode.EMERGENCY: 0.9
             }[self.system_mode]
             
-            important_regions = [r for r in regions if r['importance'] >= importance_threshold]
+            important_regions = [
+                r for r in regions if float(r.get('importance', 0.0)) >= importance_threshold
+            ]
+            total_area = max(1, frame.shape[0] * frame.shape[1])
             
             return {
                 'regions': important_regions,
                 'total_regions': len(regions),
-                'coverage_ratio': sum(r['area'] for r in important_regions) / (frame.shape[0] * frame.shape[1])
+                'coverage_ratio': sum(float(r.get('area', 0.0)) for r in important_regions) / total_area
             }
         except Exception as e:
             logger.error(f"Spatial analysis failed: {e}")
@@ -451,14 +541,32 @@ class IntegrationOrchestrator:
         
         try:
             vsms = self.components['vsms']
-            state_result = await vsms.process_visual_observation(
-                screenshot=frame,
-                regions=spatial.get('regions', []),
-                context=context
-            )
+            kwargs: Dict[str, Any] = {
+                'screenshot': frame,
+                'regions': spatial.get('regions', []),
+                'context': context or {},
+            }
+            app_id = (context or {}).get('app_id')
+            if isinstance(app_id, str) and app_id:
+                kwargs['app_id'] = app_id
+            try:
+                state_result = await vsms.process_visual_observation(**kwargs)
+            except TypeError as type_err:
+                # Compatibility fallback for older VSMS signatures.
+                if "unexpected keyword argument" in str(type_err):
+                    if 'app_id' in kwargs:
+                        state_result = await vsms.process_visual_observation(frame, kwargs['app_id'])
+                    else:
+                        state_result = await vsms.process_visual_observation(frame)
+                else:
+                    raise
             
             return {
-                'state': state_result.get('state', 'unknown'),
+                'state': (
+                    state_result.get('state')
+                    or state_result.get('detected_state')
+                    or 'unknown'
+                ),
                 'confidence': state_result.get('confidence', 0.0),
                 'scene_graph': state_result.get('scene_graph', {}),
                 'temporal_context': state_result.get('temporal_context', {})
@@ -527,7 +635,17 @@ class IntegrationOrchestrator:
 
         # Check bloom filter first
         if self.components['bloom_filter']:
-            if self.components['bloom_filter'].check_duplicate(cache_key):
+            bloom = self.components['bloom_filter']
+            is_duplicate = False
+            try:
+                if hasattr(bloom, 'check_duplicate'):
+                    is_duplicate = bool(bloom.check_duplicate(cache_key))
+                elif hasattr(bloom, 'check_and_add'):
+                    is_duplicate, _ = bloom.check_and_add(cache_key)
+            except Exception as bloom_err:
+                logger.debug(f"Bloom filter duplicate check failed: {bloom_err}")
+
+            if is_duplicate:
                 # Check semantic cache
                 if self.components['semantic_cache'] is None:
                     try:
