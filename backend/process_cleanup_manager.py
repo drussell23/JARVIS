@@ -1345,10 +1345,6 @@ class EventDrivenCleanupTrigger:
         if self._monitor_thread:
             self._monitor_thread.join(timeout=5.0)
             self._monitor_thread = None
-        cpu_offload_thread = getattr(self, "_cpu_offload_thread", None)
-        if cpu_offload_thread and cpu_offload_thread.is_alive():
-            cpu_offload_thread.join(timeout=2.0)
-            self._cpu_offload_thread = None
         logger.info("📡 Event-driven cleanup monitor stopped")
 
     def _monitor_loop(self) -> None:
@@ -3218,6 +3214,11 @@ class ProcessCleanupManager:
         worker thread that owns its own async runtime for offload operations.
         """
         if not gcp_recommended:
+            logger.debug(
+                "CPU cloud-shift skipped: gcp_recommended=False (cpu=%.1f%%, mem=%.1f%%)",
+                cpu_percent,
+                memory_percent,
+            )
             return
 
         cpu_threshold = float(os.getenv("JARVIS_CPU_CLOUD_SHIFT_THRESHOLD", "98.0"))
@@ -3232,12 +3233,25 @@ class ProcessCleanupManager:
             cpu_percent >= cpu_threshold and (compound or memory_percent >= compound_mem_threshold)
         )
         if not should_shift:
+            logger.debug(
+                "CPU cloud-shift skipped: below trigger thresholds "
+                "(cpu=%.1f%%, mem=%.1f%%, compound=%s, threshold=%.1f%%, emergency=%.1f%%)",
+                cpu_percent,
+                memory_percent,
+                compound,
+                cpu_threshold,
+                emergency_cpu_threshold,
+            )
             return
 
         now = time.time()
         cooldown = float(os.getenv("JARVIS_CPU_CLOUD_SHIFT_COOLDOWN", "180.0"))
         last_offload = getattr(self, "_last_cpu_offload_ts", 0.0)
         if now - last_offload < cooldown:
+            logger.debug(
+                "CPU cloud-shift skipped: cooldown active (remaining=%.1fs)",
+                cooldown - (now - last_offload),
+            )
             return
 
         lock = getattr(self, "_cpu_offload_lock", None)
@@ -3247,6 +3261,7 @@ class ProcessCleanupManager:
 
         with lock:
             if getattr(self, "_cpu_offload_inflight", False):
+                logger.debug("CPU cloud-shift skipped: offload worker already in flight")
                 return
             self._cpu_offload_inflight = True
             self._last_cpu_offload_ts = now
