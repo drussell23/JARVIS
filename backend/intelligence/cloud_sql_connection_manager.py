@@ -3176,6 +3176,20 @@ class ProxyReadinessGate:
             timeout, auto_start, max_start_attempts
         )
 
+        # v3.2: Post-TCP settling delay — proxy needs time after TCP port
+        # opens to complete GCP auth before it can handle DB queries.
+        # Without this, all 5 DB checks fire against an unauthenticated proxy.
+        proxy_settling_delay = float(os.environ.get(
+            "CLOUDSQL_PROXY_SETTLING_DELAY", "2.0"
+        ))
+        # v3.2: Increased timeout cap so all 5 DB retries can actually complete.
+        # Old cap of 10s only allowed ~2 retries (5s connect timeout + backoff each).
+        db_check_timeout_cap = float(os.environ.get(
+            "CLOUDSQL_DB_CHECK_TIMEOUT_CAP", "25.0"
+        ))
+
+        just_started_proxy = False
+
         while (time.time() - start_time) < timeout:
             attempts += 1
             elapsed = time.time() - start_time
@@ -3199,10 +3213,33 @@ class ProxyReadinessGate:
                     )
                     await asyncio.sleep(delay)
                     continue
+                just_started_proxy = True
+
+            # v3.2: Post-TCP settling delay — give proxy time to complete GCP
+            # authentication before attempting DB checks. The proxy opens its TCP
+            # port before GCP auth finishes, so immediate DB checks always fail.
+            if just_started_proxy:
+                just_started_proxy = False
+                remaining = timeout - (time.time() - start_time)
+                settle = min(proxy_settling_delay, remaining * 0.5)
+                if settle > 0:
+                    logger.debug(
+                        "[ReadinessGate v3.2] Post-TCP settling delay %.1fs "
+                        "(proxy needs time for GCP auth)", settle
+                    )
+                    await asyncio.sleep(settle)
+                elapsed = time.time() - start_time
+
+            # v3.2: Reset gate state before DB check attempt — if a previous
+            # _run_check() set UNAVAILABLE, we need a fresh check, not a stale result.
+            if self._state == ReadinessState.UNAVAILABLE:
+                async with self._state_lock:
+                    if self._state == ReadinessState.UNAVAILABLE:
+                        self._state = ReadinessState.UNKNOWN
 
             # Step 3: Check DB-level connectivity (the real test)
             result = await self.wait_for_ready(
-                timeout=min(10.0, timeout - elapsed),
+                timeout=min(db_check_timeout_cap, timeout - elapsed),
                 raise_on_timeout=False
             )
 

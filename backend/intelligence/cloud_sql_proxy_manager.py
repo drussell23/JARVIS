@@ -1883,8 +1883,34 @@ class CloudSQLProxyManager:
 
                     # Check if port is now in use (async - doesn't block)
                     if await self._is_port_in_use_async(port):
-                        logger.info(f"✅ Cloud SQL proxy ready on port {port} (took {i * 0.5:.1f}s)")
-                        return True
+                        # v3.2: Check proxy log for "ready for new connections" —
+                        # TCP port open alone doesn't mean proxy has completed GCP
+                        # auth. The proxy binary emits this line when fully initialized.
+                        try:
+                            def _check_log_ready():
+                                if self.log_path.exists():
+                                    content = self.log_path.read_text()
+                                    return "ready for new connections" in content.lower()
+                                return False
+                            log_ready = await asyncio.to_thread(_check_log_ready)
+                        except Exception:
+                            log_ready = False
+
+                        if log_ready:
+                            logger.info(
+                                f"✅ Cloud SQL proxy ready on port {port} "
+                                f"(took {i * 0.5:.1f}s, log confirmed)"
+                            )
+                            return True
+                        elif i >= 6:  # After 3s with TCP open but no log signal
+                            # Fall back to TCP-only readiness (proxy might not emit
+                            # this log line in all versions)
+                            logger.info(
+                                f"✅ Cloud SQL proxy ready on port {port} "
+                                f"(took {i * 0.5:.1f}s, TCP-only — log signal not found)"
+                            )
+                            return True
+                        # else: port open but log not ready yet — keep waiting
 
                 # If we got here, proxy didn't start in time
                 poll_result = await asyncio.to_thread(self.process.poll)
