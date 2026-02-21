@@ -78166,6 +78166,8 @@ class JarvisSystemKernel:
             _base_timeout = _get_env_float("JARVIS_VERIFY_BACKEND_TIMEOUT", 5.0)
             _max_retries = int(_get_env_float("JARVIS_VERIFY_BACKEND_RETRIES", 2.0))
             _check_timeout = _base_timeout
+            _saw_open_port = False
+            _hard_failure = False
 
             # v260.3: Extend timeout under memory pressure (swap-heavy 16GB systems)
             # Use async_system_metrics if available (non-blocking cached), else psutil
@@ -78188,6 +78190,7 @@ class JarvisSystemKernel:
                     port_open = await _async_port_check("localhost", port, timeout=_check_timeout)
 
                     if port_open:
+                        _saw_open_port = True
                         # HTTP health check
                         if AIOHTTP_AVAILABLE and aiohttp is not None:
                             async with aiohttp.ClientSession() as session:
@@ -78200,6 +78203,35 @@ class JarvisSystemKernel:
                                         if _attempt > 0:
                                             status["retries"] = _attempt
                                         return status
+                                    # Classify non-200 states so startup-warming does not
+                                    # get mislabeled as permanently unhealthy.
+                                    status["http_status"] = resp.status
+                                    response_text = await resp.text()
+                                    startup_state = ""
+                                    try:
+                                        payload = json.loads(response_text)
+                                        startup_state = str(payload.get("startup_state", "")).lower()
+                                    except Exception:
+                                        pass
+
+                                    warming_state = startup_state in {
+                                        "pending",
+                                        "starting",
+                                        "initializing",
+                                        "retrying",
+                                    }
+
+                                    if resp.status in (429, 503) and warming_state:
+                                        status["note"] = (
+                                            f"Backend warming (startup_state={startup_state}) "
+                                            f"on port {port}"
+                                        )
+                                    else:
+                                        _hard_failure = resp.status >= 500
+                                        status["error"] = (
+                                            f"/health returned HTTP {resp.status}"
+                                            + (f" (startup_state={startup_state})" if startup_state else "")
+                                        )
                         else:
                             status["healthy"] = True
                             status["note"] = "Port open (no HTTP check)"
@@ -78212,6 +78244,13 @@ class JarvisSystemKernel:
                 # v260.2: Retry with backoff if not last attempt
                 if _attempt < _max_retries - 1:
                     await asyncio.sleep(1.0 * (_attempt + 1))
+
+            if _saw_open_port and not status.get("healthy") and not _hard_failure:
+                status["note"] = (
+                    status.get("note")
+                    or f"Backend reachable on port {port} but health endpoint still stabilizing"
+                )
+                status.pop("error", None)
 
             return status
 
