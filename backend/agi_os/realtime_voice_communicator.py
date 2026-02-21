@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -311,8 +311,8 @@ class RealTimeVoiceCommunicator:
     async def speak(
         self,
         text: str,
-        mode: VoiceMode = VoiceMode.NORMAL,
-        priority: VoicePriority = VoicePriority.NORMAL,
+        mode: Union[VoiceMode, str] = VoiceMode.NORMAL,
+        priority: Union[VoicePriority, str] = VoicePriority.NORMAL,
         callback: Optional[Callable[[], None]] = None,
         context: Optional[Dict[str, Any]] = None,
         allow_repetition: bool = False
@@ -322,7 +322,7 @@ class RealTimeVoiceCommunicator:
 
         Args:
             text: Text to speak
-            mode: Voice mode for delivery
+            mode: Voice mode for delivery (enum or string value)
             priority: Message priority
             callback: Optional callback when speech completes
             context: Optional context data
@@ -334,6 +334,21 @@ class RealTimeVoiceCommunicator:
         if self._muted:
             logger.debug("Voice muted, skipping: %s", text[:50])
             return ""
+
+        # v3.2: Normalize string inputs to enum values.  Callers may pass
+        # either VoiceMode.NOTIFICATION or "notification" — both must work.
+        if isinstance(mode, str):
+            try:
+                mode = VoiceMode(mode)
+            except ValueError:
+                logger.debug("Unknown voice mode '%s', using NORMAL", mode)
+                mode = VoiceMode.NORMAL
+        if isinstance(priority, str):
+            try:
+                priority = VoicePriority[priority.upper()]
+            except (KeyError, AttributeError):
+                logger.debug("Unknown voice priority '%s', using NORMAL", priority)
+                priority = VoicePriority.NORMAL
 
         # Check for repetition
         text_hash = hashlib.md5(text.encode()).hexdigest()[:16]

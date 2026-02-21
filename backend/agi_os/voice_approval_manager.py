@@ -570,12 +570,12 @@ class VoiceApprovalManager:
             if timeout_decision:
                 await voice.speak(
                     "No response received. Proceeding with the action.",
-                    mode="notification"
+                    mode="notification"  # v3.2: speak() normalizes strings to VoiceMode enum
                 )
             else:
                 await voice.speak(
                     "No response received. Cancelling the action.",
-                    mode="notification"
+                    mode="notification"  # v3.2: speak() normalizes strings to VoiceMode enum
                 )
 
             return response
@@ -950,7 +950,7 @@ class VoiceApprovalManager:
                     voice = await self._get_voice()
                     await voice.speak(
                         "I can only accept approvals from the device owner. Please have them respond.",
-                        mode="notification"
+                        mode="notification"  # v3.2: speak() normalizes strings to VoiceMode enum
                     )
                     return None
 
