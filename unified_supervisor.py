@@ -65277,7 +65277,11 @@ class JarvisSystemKernel:
                     hook_coro = hook_factory()
                     await asyncio.wait_for(hook_coro, timeout=hook_timeout)
                 except asyncio.TimeoutError:
-                    self.logger.warning(
+                    # v258.3: INFO not WARNING — completion hooks are
+                    # best-effort by design (startup continues regardless).
+                    # Under CPU pressure, TTS/narration routinely exceeds
+                    # budget. A timeout here is expected, not actionable.
+                    self.logger.info(
                         "[Kernel] Completion hook '%s' timed out after %.1fs "
                         "(startup continues)",
                         name,
@@ -74031,9 +74035,9 @@ class JarvisSystemKernel:
         the "window terminated unexpectedly (reason: 'killed', code: '15')" error:
 
         1. v205.0: Send final progress (100%) to signal completion
-        2. Request graceful shutdown via HTTP POST /api/shutdown/graceful
-        3. The loading server waits for browser to naturally disconnect
-        4. Then auto-shuts down cleanly without killing active connections
+        2. v258.2: Request graceful shutdown via HTTP POST /api/shutdown
+        3. v258.3: Server schedules stop() internally on HTTP shutdown
+        4. Poll process exit (server closes WebSockets, drains requests, exits)
         5. Falls back to signal-based shutdown if HTTP fails
 
         Also cleans up the log file handle.
@@ -74165,10 +74169,18 @@ class JarvisSystemKernel:
 
             self.logger.info("[LoadingServer] Stopping via signal...")
 
-            # Try SIGINT first for graceful shutdown
+            # Try SIGINT first for graceful shutdown.
+            # v258.3: Loading server's stop() has 6s internal timeout
+            # (LOADING_SERVER_STOP_TIMEOUT). SIGINT triggers stop() via
+            # signal handler. Previous 3s timeout was shorter than stop(),
+            # causing premature escalation → force kill every time.
+            stop_timeout = float(os.getenv('LOADING_SERVER_STOP_TIMEOUT', '6.0'))
+            sigint_wait = stop_timeout + 2.0  # 8s: stop() budget + margin
             try:
                 self._loading_server_process.send_signal(signal.SIGINT)
-                await asyncio.wait_for(self._loading_server_process.wait(), timeout=3.0)
+                await asyncio.wait_for(
+                    self._loading_server_process.wait(), timeout=sigint_wait
+                )
                 self.logger.info("[LoadingServer] Terminated (SIGINT)")
                 self._cleanup_loading_server_log()
                 self._loading_server_process = None
@@ -74176,10 +74188,11 @@ class JarvisSystemKernel:
             except asyncio.TimeoutError:
                 pass
 
-            # Try SIGTERM
+            # Try SIGTERM (stop() already in progress from SIGINT — this
+            # is a last-resort nudge before SIGKILL)
             try:
                 self._loading_server_process.terminate()
-                await asyncio.wait_for(self._loading_server_process.wait(), timeout=2.0)
+                await asyncio.wait_for(self._loading_server_process.wait(), timeout=3.0)
                 self.logger.info("[LoadingServer] Terminated (SIGTERM)")
                 self._cleanup_loading_server_log()
                 self._loading_server_process = None

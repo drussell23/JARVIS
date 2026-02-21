@@ -1509,6 +1509,11 @@ class LoadingServer:
                     trace_id=self._trace_context.trace_id if self._trace_context else None,
                 )
             self._shutdown_requested = True
+            # v258.3: Schedule actual stop() — _shutdown_requested alone
+            # does NOT cause serve_forever() to unblock. Without this,
+            # the process never exits and the supervisor's 30s poll
+            # expires, forcing a signal-based kill cascade.
+            create_safe_task(self.stop(), name="http_shutdown_stop")
             return self._json_response({"status": "shutdown_initiated"})
 
         elif path == "/sse/progress":
