@@ -511,12 +511,17 @@ class UnifiedCommandProcessor:
         # TIER 2: Components depending on Tier 1 - PARALLEL
         # =======================================================================
         async def init_implicit_resolver():
-            """Initialize ImplicitReferenceResolver (requires context_graph)"""
+            """Initialize ImplicitReferenceResolver (requires context_graph).
+
+            v259.1: Fixed — was importing non-existent `initialize_implicit_resolver()`.
+            The correct API is `get_implicit_resolver()` which is a lazy singleton
+            that internally obtains context_graph from `get_multi_space_context_graph()`.
+            """
             if not self.context_graph:
                 return ("implicit_resolver", False, "no context_graph")
             try:
-                from core.nlp.implicit_reference_resolver import initialize_implicit_resolver
-                self.implicit_resolver = initialize_implicit_resolver(self.context_graph)
+                from core.nlp.implicit_reference_resolver import get_implicit_resolver
+                self.implicit_resolver = await asyncio.to_thread(get_implicit_resolver)
                 return ("implicit_resolver", True, "ImplicitReferenceResolver")
             except Exception as e:
                 logger.warning(f"[UNIFIED] ImplicitReferenceResolver not available: {e}")
@@ -1086,29 +1091,32 @@ class UnifiedCommandProcessor:
             # Mark as initialized
             self._resolvers_initialized = True
 
-            # v236.0: Late-bind implicit_resolver to all managers/handlers
-            # that were initialized before warmup completed. During tier-based
-            # parallel init, self.implicit_resolver is None because it depends
-            # on context_graph which initializes in a later tier. Now that
-            # warmup has set it, propagate to all 12+ managers that hold
-            # stale None snapshots.
+            # v259.1: Late-bind dependencies to all managers/handlers that were
+            # initialized before their upstream singletons completed. During
+            # tier-based parallel init, dependencies like implicit_resolver and
+            # ocr_manager may be None because their singletons initialize in
+            # earlier tiers via asyncio.to_thread. Now that all tiers are
+            # complete, propagate the live instances to all components that
+            # hold stale None snapshots.
+            _late_bind_targets = [
+                self.query_complexity_manager,
+                self.context_aware_manager,
+                self.multi_monitor_manager,
+                self.change_detection_manager,
+                self.proactive_suggestion_manager,
+                self.multi_space_handler,
+                self.multi_monitor_query_handler,
+                self.proactive_monitoring_manager,
+                self.temporal_handler,
+                self.display_reference_handler,
+                getattr(self, 'medium_complexity_handler', None),
+                getattr(self, 'complex_complexity_handler', None),
+            ]
+
+            # Late-bind implicit_resolver
             if self.implicit_resolver:
-                _rewire_targets = [
-                    self.query_complexity_manager,
-                    self.context_aware_manager,
-                    self.multi_monitor_manager,
-                    self.change_detection_manager,
-                    self.proactive_suggestion_manager,
-                    self.multi_space_handler,
-                    self.multi_monitor_query_handler,
-                    self.proactive_monitoring_manager,
-                    self.temporal_handler,
-                    self.display_reference_handler,
-                    getattr(self, 'medium_complexity_handler', None),
-                    getattr(self, 'complex_complexity_handler', None),
-                ]
                 _rewired = 0
-                for _target in _rewire_targets:
+                for _target in _late_bind_targets:
                     if _target is None:
                         continue
                     if hasattr(_target, 'set_implicit_resolver'):
@@ -1120,8 +1128,55 @@ class UnifiedCommandProcessor:
                             _rewired += 1
                 if _rewired > 0:
                     logger.info(
-                        f"[UNIFIED] v236.0: Late-bound implicit_resolver "
+                        f"[UNIFIED] v259.1: Late-bound implicit_resolver "
                         f"to {_rewired} component(s)"
+                    )
+
+            # v259.1: Late-bind ocr_manager — same pattern. The OCR singleton
+            # initializes in Tier 1 via asyncio.to_thread, but Tier 4 handlers
+            # may call get_ocr_strategy_manager() before the thread completes.
+            try:
+                from context_intelligence.managers import get_ocr_strategy_manager
+                _ocr = get_ocr_strategy_manager()
+            except Exception:
+                _ocr = None
+            if _ocr is not None:
+                _ocr_rewired = 0
+                for _target in _late_bind_targets:
+                    if _target is None:
+                        continue
+                    if hasattr(_target, 'set_ocr_manager'):
+                        _target.set_ocr_manager(_ocr)
+                        _ocr_rewired += 1
+                    elif hasattr(_target, 'ocr_manager'):
+                        if not _target.ocr_manager:
+                            _target.ocr_manager = _ocr
+                            _ocr_rewired += 1
+                if _ocr_rewired > 0:
+                    logger.info(
+                        f"[UNIFIED] v259.1: Late-bound ocr_manager "
+                        f"to {_ocr_rewired} component(s)"
+                    )
+
+            # v259.1: Late-bind capture_manager — same pattern
+            try:
+                from context_intelligence.managers import get_capture_strategy_manager
+                _capture = get_capture_strategy_manager()
+            except Exception:
+                _capture = None
+            if _capture is not None:
+                _cap_rewired = 0
+                for _target in _late_bind_targets:
+                    if _target is None:
+                        continue
+                    if hasattr(_target, 'capture_manager'):
+                        if not _target.capture_manager:
+                            _target.capture_manager = _capture
+                            _cap_rewired += 1
+                if _cap_rewired > 0:
+                    logger.info(
+                        f"[UNIFIED] v259.1: Late-bound capture_manager "
+                        f"to {_cap_rewired} component(s)"
                     )
 
             logger.info(
