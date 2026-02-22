@@ -456,9 +456,12 @@ async def route_command(request: Request, body: RouteCommandRequest) -> RouteCom
 
         # Execute if requested and allowed
         if body.execute and route_result.execution_allowed:
-            from core.tiered_command_router import CommandTier
+            try:
+                from core.tiered_command_router import CommandTier
+            except ImportError:
+                CommandTier = None
 
-            if route_result.tier == CommandTier.TIER2_AGENTIC and runner:
+            if CommandTier and route_result.tier == CommandTier.TIER2_AGENTIC and runner:
                 # Execute via runner
                 from core.agentic_task_runner import RunnerMode
                 exec_result = await runner.run(
@@ -474,7 +477,7 @@ async def route_command(request: Request, body: RouteCommandRequest) -> RouteCom
                     "time_ms": exec_result.execution_time_ms,
                 }
 
-            elif route_result.tier == CommandTier.TIER1_STANDARD:
+            elif CommandTier and route_result.tier == CommandTier.TIER1_STANDARD:
                 # Execute Tier 1 via router's handler
                 exec_result = await router_obj.execute_tier1(route_result.command)
                 response.executed = True
