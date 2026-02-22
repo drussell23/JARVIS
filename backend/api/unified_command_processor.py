@@ -1290,1084 +1290,86 @@ class UnifiedCommandProcessor:
             logger.info("[UNIFIED] No audio data provided for this command")
 
         # =========================================================================
-        # v251.6: TIERED ROUTING — Workspace & Agent-Aware Command Dispatch
+        # v242 SPINAL REFLEX ARC: Reflex check -> J-Prime call -> Action executor
         # =========================================================================
-        # ROOT FIX: "check my email" → QUERY → generic Claude (no agents)
-        # TieredCommandRouter detects workspace intent → GoogleWorkspaceAgent
-        # and agentic commands → Computer Use / Agent Runtime.
-        # Tier 0/1 fall through to existing specialized handlers below.
-        #
-        # SECURITY NOTE: VBIA auth is intentionally skipped for REST API commands.
-        # get_tiered_router() creates TieredCommandRouter with _vbia_callback=None.
-        # REST callers are physically authenticated (local machine access).
-        # Voice commands get VBIA via EnhancedSimpleContextHandler upstream.
+        # Replaces 5,000 lines of keyword classification with ~200 lines.
+        # 1. Check reflex manifest (local, sub-ms)
+        # 2. Call J-Prime for classification + generation
+        # 3. Execute action based on J-Prime's routing metadata
+        # 4. Brain vacuum fallback if J-Prime is unreachable
         # =========================================================================
-        try:
-            import os  # Ensure local binding — shadowed by `import os` in surveillance section below
-            from core.tiered_command_router import get_tiered_router, CommandTier
-
-            _tiered_router = get_tiered_router()
-            _route_decision = await asyncio.wait_for(
-                _tiered_router.route(command_text),
-                timeout=float(os.getenv("JARVIS_TIERED_ROUTE_TIMEOUT", "3.0")),
-            )
-
-            # BLOCKED → immediate denial
-            if not _route_decision.execution_allowed:
-                logger.warning(
-                    f"[UNIFIED] TieredRouter BLOCKED: {_route_decision.denial_reason}"
-                )
-                return {
-                    "success": False,
-                    "response": _route_decision.denial_reason or "Command blocked.",
-                    "command_type": "blocked",
-                    "tier": _route_decision.tier.value,
-                }
-
-            # Workspace intent → GoogleWorkspaceAgent
-            _workspace_intent = _route_decision.metadata.get("workspace_intent")
-            if _workspace_intent and getattr(_workspace_intent, "is_workspace_command", False):
-                logger.info(
-                    f"[UNIFIED] 📧 Workspace command → TieredRouter "
-                    f"(intent: {_workspace_intent.intent.value})"
-                )
-                _ws_result = await asyncio.wait_for(
-                    _tiered_router.execute_tier2(
-                        command_text,
-                        context={"workspace_intent": _workspace_intent},
-                    ),
-                    timeout=float(os.getenv("JARVIS_WORKSPACE_EXEC_TIMEOUT", "45.0")),
-                )
-                _ws_success = _ws_result.get("success", False)
-                _ws_response = _ws_result.get("response") or _ws_result.get("error")
-                if not _ws_response:
-                    # Generate response from structured data when none provided
-                    if _ws_success:
-                        _ws_response = self._summarize_workspace_result(
-                            _ws_result, _workspace_intent.intent.value
-                        )
-                    else:
-                        _ws_response = "Workspace command failed"
-                return {
-                    **_ws_result,
-                    "success": _ws_success,
-                    "response": _ws_response,
-                    "command_type": "workspace",
-                    "routed_via": "tiered_command_router",
-                }
-
-            # Tier 2 agentic (non-workspace) → Computer Use / Agent Runtime
-            if _route_decision.tier == CommandTier.TIER2_AGENTIC:
-                logger.info(
-                    f"[UNIFIED] 🤖 Agentic command → TieredRouter.execute_tier2()"
-                )
-                _ag_result = await asyncio.wait_for(
-                    _tiered_router.execute_tier2(command_text),
-                    timeout=float(os.getenv("JARVIS_AGENTIC_EXEC_TIMEOUT", "120.0")),
-                )
-                return {
-                    **_ag_result,
-                    "success": _ag_result.get("success", False),
-                    "response": _ag_result.get("response") or _ag_result.get("error", "Agentic command failed"),
-                    "command_type": "agentic",
-                    "routed_via": "tiered_command_router",
-                }
-
-            # Tier 0 / Tier 1 → fall through to existing handlers
-            logger.debug(
-                f"[UNIFIED] TieredRouter: {_route_decision.tier.value} "
-                f"→ existing classification pipeline"
-            )
-
-        except asyncio.TimeoutError:
-            logger.warning("[UNIFIED] TieredRouter timed out, falling through to standard pipeline")
-        except ImportError:
-            logger.debug("[UNIFIED] TieredCommandRouter not available, using standard pipeline")
-        except Exception as e:
-            logger.warning(f"[UNIFIED] TieredRouter error: {e}, falling through to standard pipeline")
-
-        # =========================================================================
-        # CRITICAL FIX v2.0: Classify command FIRST before ANY initialization!
-        # _classify_command is lightweight (no VBI/ECAPA) - safe to call early
-        # =========================================================================
-        try:
-            command_type, confidence = await self._classify_command(command_text)
-            logger.info(f"[UNIFIED] ✅ Classified as {command_type.value} (confidence: {confidence:.2f})")
-        except Exception as e:
-            logger.warning(f"[UNIFIED] Classification failed: {e} - defaulting to UNKNOWN")
-            command_type = CommandType.UNKNOWN
-            confidence = 0.0
 
         # Track command frequency
         self.command_stats[command_text.lower()] += 1
 
-        # =========================================================================
-        # 👁️ SURVEILLANCE INTENT DETECTION v9.0.0 - Pre-Classification Override
-        # =========================================================================
-        # ROOT CAUSE FIX: Surveillance commands were being misclassified as SYSTEM
-        # because apps like "Chrome" trigger app detection before vision detection.
-        # SOLUTION: Detect surveillance intent BEFORE routing to handlers, regardless
-        # of initial classification. This ensures "Watch all Chrome windows" routes
-        # to IntelligentCommandHandler, not generic SYSTEM/VISION handlers.
-        # =========================================================================
-        import re
-        import os
+        # === Step 1: Reflex manifest check (sub-ms, file-based) ===
+        reflex = await self._check_reflex_manifest(command_text)
+        if reflex:
+            logger.info(f"[v242] Reflex matched: {reflex.get('reflex_id')} for '{command_text[:60]}'")
+            result = await self._execute_reflex(reflex, command_text)
+            # Fire-and-forget telemetry notification
+            asyncio.create_task(self._notify_reflex_executed(command_text, reflex))
+            return result
 
-        command_lower = command_text.lower().strip()
-
-        # ─────────────────────────────────────────────────────────────────────────
-        # 1. Load Dynamic Surveillance Patterns (Environment-Configurable)
-        # ─────────────────────────────────────────────────────────────────────────
-        monitoring_keywords = os.getenv(
-            "JARVIS_MONITORING_KEYWORDS",
-            "watch,monitor,track,alert when,notify when,detect when,look for,scan for,observe"
-        ).split(",")
-        monitoring_keywords = [k.strip() for k in monitoring_keywords]
-
-        surveillance_patterns = os.getenv(
-            "JARVIS_SURVEILLANCE_PATTERNS",
-            "for,when,until,if,whenever,while"
-        ).split(",")
-        surveillance_patterns = [p.strip() for p in surveillance_patterns]
-
-        # ─────────────────────────────────────────────────────────────────────────
-        # 2. Grammar-Based Multi-Target Detection (God Mode) v6.1.0
-        # ─────────────────────────────────────────────────────────────────────────
-        # FIXED: Pattern now supports MULTI-WORD app names (e.g., "Google Chrome")
-        # Old pattern: (?:\w+\s*)? only matched SINGLE words like "Chrome"
-        # New pattern: .*? matches ANY text (including "Google Chrome")
-        #
-        # Matches: "all windows", "all chrome windows", "all Google Chrome windows",
-        #          "every arc tab", "each terminal instance", "all VS Code windows"
-        # Works for ANY app without hardcoding
-        # ─────────────────────────────────────────────────────────────────────────
-        god_mode_pattern = os.getenv(
-            "JARVIS_GOD_MODE_GRAMMAR_PATTERN",
-            r"\b(all|every|each)\s+.*?\s*(windows?|tabs?|instances?|spaces?)\b"
-        )
-
-        # Fallback patterns for edge cases (more flexible matching)
-        fallback_patterns = [
-            r"\ball\s+(?:\w+\s+)?windows?\b",   # "all windows" or "all APP windows"
-            r"\bevery\s+(?:\w+\s+)?windows?\b", # "every windows" or "every APP windows"
-            r"\beach\s+(?:\w+\s+)?windows?\b",  # "each windows" or "each APP windows"
-            r"\ball\s+(?:\w+\s+)?tabs?\b",      # "all tabs" or "all APP tabs"
-            r"\bevery\s+(?:\w+\s+)?tabs?\b",    # "every tabs" or "every APP tabs"
-            r"\ball\s+(?:\w+\s+)?instances?\b", # "all instances" or "all APP instances"
-        ]
-
-        # ─────────────────────────────────────────────────────────────────────────
-        # 3. Multi-Strategy Intent Detection
-        # ─────────────────────────────────────────────────────────────────────────
-        has_monitoring_keyword = any(k in command_lower for k in monitoring_keywords)
-        has_surveillance_structure = any(p in command_lower for p in surveillance_patterns)
-
-        # v242.0 Gap J: Negative patterns prevent misclassification.
-        # "look for information" is NOT surveillance. "watch all Chrome windows for changes" IS.
-        _non_surv_kw = os.getenv(
-            "JARVIS_NON_SURVEILLANCE_KEYWORDS",
-            "youtube,video,movie,show,episode,series,stream,play,recipe,flight,"
-            "hotel,restaurant,information,tutorial,guide,how to,what is,explain"
-        ).split(",")
-        _non_surv_kw = [k.strip() for k in _non_surv_kw if k.strip()]
-        _has_non_surv_context = any(k in command_lower for k in _non_surv_kw)
-
-        # Try main grammar pattern
-        has_multi_target = bool(re.search(god_mode_pattern, command_lower, re.IGNORECASE))
-        matched_pattern = god_mode_pattern if has_multi_target else None
-
-        # Try fallback patterns if main pattern failed
-        if not has_multi_target:
-            for fallback_pattern in fallback_patterns:
-                if re.search(fallback_pattern, command_lower, re.IGNORECASE):
-                    has_multi_target = True
-                    matched_pattern = fallback_pattern
-                    logger.debug(f"[SURVEILLANCE] Fallback pattern matched: {fallback_pattern}")
-                    break
-
-        # Determine if this is a surveillance command
-        is_surveillance_command = False
-        detection_reason = None
-
-        # v242.0: monitoring+structure requires non-surveillance context check
-        if has_monitoring_keyword and has_surveillance_structure and not _has_non_surv_context:
-            is_surveillance_command = True
-            detection_reason = "monitoring_keyword + surveillance_structure"
-        elif has_monitoring_keyword and has_multi_target:
-            # Multi-target (God Mode) is strong enough signal on its own
-            is_surveillance_command = True
-            detection_reason = "monitoring_keyword + multi_target (God Mode)"
-
-        # ─────────────────────────────────────────────────────────────────────────
-        # 4. Logging & Decision
-        # ─────────────────────────────────────────────────────────────────────────
-        if is_surveillance_command:
+        # === Step 2: J-Prime call (the brain) ===
+        logger.info(f"[v242] Sending to J-Prime: '{command_text[:80]}'")
+        response = await self._call_jprime(command_text, deadline=deadline)
+        if response:
             logger.info(
-                f"[SURVEILLANCE] 👁️ Detected surveillance intent: '{command_text}' | "
-                f"Reason: {detection_reason} | "
-                f"monitoring={has_monitoring_keyword}, structure={has_surveillance_structure}, "
-                f"multi_target={has_multi_target}, pattern='{matched_pattern}'"
+                f"[v242] J-Prime classified: intent={response.intent}, "
+                f"domain={response.domain}, confidence={response.confidence:.2f}, "
+                f"source={response.source}"
             )
-            logger.info(
-                f"[SURVEILLANCE] 🔄 Overriding classification from {command_type.value} to surveillance"
-            )
-
-            # ─────────────────────────────────────────────────────────────────────
-            # 5. Route to IntelligentCommandHandler (Surveillance System)
-            # ─────────────────────────────────────────────────────────────────────
-            try:
-                # =====================================================================
-                # ROOT CAUSE FIX v10.0.0: Dynamic Path Injection for Local Brain
-                # =====================================================================
-                # PROBLEM: Import fails because Python can't find 'voice' package
-                # - Causes fallback to expensive Claude API (401 error or cost)
-                # - User sees "Application window active" instead of surveillance
-                #
-                # SOLUTION: Dynamically inject backend path BEFORE import
-                # - Calculate paths relative to THIS file's location
-                # - No hardcoding - works regardless of installation location
-                # - Prevents cloud fallback by loading local handler
-                # =====================================================================
-                import sys
-
-                # Calculate paths dynamically from THIS file's location
-                _current_file = os.path.abspath(__file__)
-                _api_dir = os.path.dirname(_current_file)           # backend/api/
-                _backend_root = os.path.dirname(_api_dir)           # backend/
-                _project_root = os.path.dirname(_backend_root)      # project root
-
-                # Inject paths if not present (order matters: backend first)
-                for _inject_path in [_backend_root, _project_root]:
-                    if _inject_path not in sys.path:
-                        sys.path.insert(0, _inject_path)
-                        logger.debug(f"[SURVEILLANCE] Injected path: {_inject_path}")
-
-                # Now import the local handler (should find 'voice' package)
-                from voice.intelligent_command_handler import IntelligentCommandHandler
-
-                logger.info("[SURVEILLANCE] ✅ Local Handler Loaded Successfully")
-                logger.info("[SURVEILLANCE] Initializing IntelligentCommandHandler...")
-                intelligent_handler = IntelligentCommandHandler()
-
-                # v32.0: Execute with DYNAMIC timeout for surveillance
-                # Surveillance commands may need to:
-                # - Find windows across 9+ spaces
-                # - Teleport windows to Ghost Display (may exit fullscreen first)
-                # - Initialize 6+ video capture watchers with validation
-                # - Retry failed operations with exponential backoff
-                # Timeout chain: WebSocket(90s) → jarvis_voice_api(85s) → here(80s)
-                # This ensures clean timeout propagation at each layer
-                surveillance_timeout = float(os.getenv("JARVIS_SURVEILLANCE_HANDLER_TIMEOUT", "80"))
-                logger.info(f"[SURVEILLANCE] Using {surveillance_timeout}s timeout for handler")
-                
-                try:
-                    result = await asyncio.wait_for(
-                        intelligent_handler.handle_command(command_text),
-                        timeout=surveillance_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"[SURVEILLANCE] Timeout after {surveillance_timeout}s")
-                    return {
-                        "success": False,
-                        "response": f"Surveillance setup timed out after {surveillance_timeout:.0f} seconds. The system may be initializing multiple windows. Please try again.",
-                        "command_type": "surveillance",
-                        "error": "handler_timeout",
-                    }
-
-                # Unpack result (handles tuple, dict, or string)
-                response_text = None
-                handler_used = None
-
-                if isinstance(result, tuple) and len(result) == 2:
-                    response_text, handler_used = result
-                elif isinstance(result, dict):
-                    response_text = result.get("response", result.get("text", "Monitoring initiated"))
-                    handler_used = result.get("handler", "surveillance")
-                elif isinstance(result, str):
-                    response_text = result
-                    handler_used = "surveillance"
-                else:
-                    response_text = str(result) if result else "Monitoring initiated"
-                    handler_used = "unknown"
-
-                logger.info(f"[SURVEILLANCE] ✅ Success: {response_text[:100]}")
-
-                return {
-                    "success": True,
-                    "response": response_text,
-                    "command_type": "surveillance",
-                    "handler_used": handler_used,
-                    "detection_method": "pre_classification_v9.0.0",
-                    "detection_reason": detection_reason,
-                    "original_classification": command_type.value,
-                    "intent_disambiguation": {
-                        "detected_intent": "surveillance",
-                        "routed_to": "IntelligentCommandHandler->VisualMonitorAgent",
-                        "keywords_matched": [k for k in monitoring_keywords if k in command_lower],
-                        "patterns_matched": [p for p in surveillance_patterns if p in command_lower],
-                        "grammar_pattern": matched_pattern,
-                        "god_mode_detected": has_multi_target,
-                    }
-                }
-
-            except ImportError as e:
-                logger.error(f"[SURVEILLANCE] ❌ Failed to import IntelligentCommandHandler: {e}")
-                return {
-                    "success": False,
-                    "response": f"I couldn't load my surveillance system. The IntelligentCommandHandler is unavailable: {str(e)}",
-                    "command_type": "surveillance",
-                    "error": "import_error",
-                    "error_details": str(e),
-                }
-            except Exception as e:
-                logger.error(f"[SURVEILLANCE] ❌ Error executing surveillance: {e}", exc_info=True)
-                return {
-                    "success": False,
-                    "response": f"I encountered an error setting up monitoring: {str(e)}",
-                    "command_type": "surveillance",
-                    "error": "execution_error",
-                    "error_details": str(e),
-                }
-
-        # =========================================================================
-        # FAST PATH v3.0: SCREEN_LOCK commands COMPLETELY bypass everything
-        # Jump directly to lock execution without touching VBI/ECAPA/Context handlers
-        # =========================================================================
-        if command_type == CommandType.SCREEN_LOCK:
-            logger.info("[UNIFIED] 🔒 SCREEN_LOCK detected - ULTRA FAST PATH")
-            logger.info("[UNIFIED]    ⚡ Bypassing ALL heavyweight processing")
-            logger.info("[UNIFIED]    🚀 Executing lock directly...")
-
-            try:
-                # Get owner name for personalized response (fast, cached)
-                from api.simple_unlock_handler import _get_owner_name
-                speaker_name = await asyncio.wait_for(_get_owner_name(), timeout=1.0)
-            except Exception:
-                speaker_name = "there"
-
-            # Execute lock command directly
-            try:
-                from api.simple_unlock_handler import handle_unlock_command
-                result = await asyncio.wait_for(
-                    handle_unlock_command(command_text),
-                    timeout=5.0
-                )
-
-                logger.info(f"[UNIFIED] ✅ Lock executed successfully")
-
-                # Return immediately - don't continue through normal processing
-                return {
-                    "success": result.get("success", True),
-                    "response": result.get("response", f"Locking your screen now, {speaker_name}. See you soon!"),
-                    "command_type": "screen_lock",
-                    "fast_path": True,
-                    **result
-                }
-            except asyncio.TimeoutError:
-                logger.error("[UNIFIED] ❌ Lock command timed out")
-                return {
-                    "success": False,
-                    "response": "Lock command timed out. Please try again.",
-                    "command_type": "screen_lock",
-                    "error": "timeout"
-                }
-            except Exception as e:
-                logger.error(f"[UNIFIED] ❌ Lock failed: {e}")
-                return {
-                    "success": False,
-                    "response": f"Failed to lock screen: {str(e)}",
-                    "command_type": "screen_lock",
-                    "error": str(e)
-                }
-
-        # =========================================================================
-        # FAST PATH v5.0: SYSTEM commands with PROACTIVE UNLOCK support
-        # =========================================================================
-        # System commands (search, open, navigate) use fast path BUT:
-        # - First check if screen is locked (fast Quartz check)
-        # - If locked → trigger proactive unlock with voice verification
-        # - After unlock → continue with the command
-        # This maintains the autonomous workflow while being fast when unlocked.
-        # =========================================================================
-        if command_type == CommandType.SYSTEM:
-            logger.info("[UNIFIED] 🚀 SYSTEM command detected - FAST PATH v5.0")
-            logger.info(f"[UNIFIED]    📝 Command: '{command_text}'")
-
-            try:
-                # ─────────────────────────────────────────────────────────────
-                # Step 1: FAST Screen Lock Check (Quartz-based, <10ms)
-                # ─────────────────────────────────────────────────────────────
-                is_locked = False
-                try:
-                    from Quartz import CGSessionCopyCurrentDictionary
-                    session_dict = CGSessionCopyCurrentDictionary()
-                    if session_dict:
-                        is_locked = session_dict.get("CGSSessionScreenIsLocked", False)
-                        if not is_locked:
-                            # Also check screensaver
-                            is_locked = session_dict.get("CGSSessionScreenSaverIsRunning", False)
-                    logger.info(f"[UNIFIED]    🔒 Screen locked: {is_locked}")
-                except ImportError:
-                    logger.debug("[UNIFIED] Quartz not available for lock check")
-                except Exception as e:
-                    logger.debug(f"[UNIFIED] Lock check error: {e}")
-
-                # ─────────────────────────────────────────────────────────────
-                # Step 2: If LOCKED → Proactive Unlock Flow
-                # ─────────────────────────────────────────────────────────────
-                if is_locked:
-                    logger.info("[UNIFIED] 🔐 Screen is LOCKED - triggering proactive unlock")
-                    
-                    # Determine what action we'll do after unlock (for acknowledgment)
-                    continuation_action = "searching" if "search" in command_text.lower() else "executing your command"
-                    
-                    # Speak acknowledgment (non-blocking)
-                    try:
-                        ack_message = f"Screen is locked. Verifying your voice, then {continuation_action}."
-                        logger.info(f"[UNIFIED] 🎤 Acknowledgment: '{ack_message}'")
-                        ack_process = await asyncio.create_subprocess_exec(
-                            "say", "-v", "Daniel", "-r", "180", ack_message,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
-                        )
-                        # Don't wait - let it speak in background
-                        asyncio.create_task(ack_process.wait())
-                    except Exception:
-                        pass
-                    
-                    # Trigger unlock via simple_unlock_handler (has VBI integration)
-                    try:
-                        from api.simple_unlock_handler import handle_unlock_command
-                        
-                        # Create audio container for voice verification
-                        class AudioContainer:
-                            def __init__(self, audio_data, speaker_name):
-                                self.last_audio_data = audio_data
-                                self.last_speaker_name = speaker_name
-                        
-                        jarvis_instance = AudioContainer(
-                            audio_data=audio_data,
-                            speaker_name=speaker_name
-                        ) if audio_data else None
-                        
-                        if jarvis_instance and audio_data:
-                            logger.info(f"[UNIFIED] 🎤 Passing {len(audio_data)} bytes for voice verification")
-                        
-                        unlock_result = await asyncio.wait_for(
-                            handle_unlock_command("unlock my screen", jarvis_instance=jarvis_instance),
-                            timeout=20.0
-                        )
-                        
-                        if not unlock_result.get("success", False):
-                            logger.warning(f"[UNIFIED] ❌ Unlock failed: {unlock_result.get('response')}")
-                            return {
-                                "success": False,
-                                "response": unlock_result.get("response", "Could not unlock screen. Please try again."),
-                                "command_type": "system",
-                                "unlock_failed": True,
-                            }
-                        
-                        logger.info("[UNIFIED] ✅ Screen unlocked successfully!")
-                        
-                        # Brief pause for screen to fully unlock
-                        await asyncio.sleep(0.3)
-                        
-                    except asyncio.TimeoutError:
-                        logger.error("[UNIFIED] ❌ Unlock timed out")
-                        return {
-                            "success": False,
-                            "response": "Screen unlock timed out. Please try again.",
-                            "command_type": "system",
-                            "error": "unlock_timeout"
-                        }
-                    except ImportError:
-                        logger.warning("[UNIFIED] simple_unlock_handler not available")
-                    except Exception as e:
-                        logger.error(f"[UNIFIED] ❌ Unlock error: {e}")
-                        return {
-                            "success": False,
-                            "response": f"Could not unlock screen: {str(e)}",
-                            "command_type": "system",
-                            "error": str(e)
-                        }
-
-                # ─────────────────────────────────────────────────────────────
-                # Step 3: Execute the System Command (screen is now unlocked)
-                # ─────────────────────────────────────────────────────────────
-                logger.info("[UNIFIED]    ⚡ Executing system command...")
-                result = await asyncio.wait_for(
-                    self._execute_system_command(command_text),
-                    timeout=20.0
-                )
-
-                logger.info(f"[UNIFIED] ✅ System command executed: success={result.get('success')}")
-
-                return {
-                    "success": result.get("success", False),
-                    "response": result.get("response", ""),
-                    "command_type": "system",
-                    "fast_path": True,
-                    "proactive_unlock": is_locked,  # Track if we unlocked
-                    **result
-                }
-            except asyncio.TimeoutError:
-                logger.error(f"[UNIFIED] ❌ System command timed out: '{command_text}'")
-                return {
-                    "success": False,
-                    "response": "The command timed out. Please try again.",
-                    "command_type": "system",
-                    "error": "timeout"
-                }
-            except Exception as e:
-                logger.error(f"[UNIFIED] ❌ System command failed: {e}", exc_info=True)
-                # CRITICAL FIX: Return error instead of falling through to heavy normal processing
-                # Falling through caused "Processing..." hang because normal path is very heavyweight
-                return {
-                    "success": False,
-                    "response": f"Sorry, I had trouble executing that command. Error: {str(e)}",
-                    "command_type": "system",
-                    "error": str(e),
-                    "fast_path_failed": True,
-                }
-
-        # NORMAL PATH: For all non-SCREEN_LOCK and non-SYSTEM commands
-        else:
-            # =================================================================
-            # FAST QUERY PATH v3.2: Skip resolver init for simple queries
-            # =================================================================
-            # _classify_command() returned (command_type, confidence) at line 1193.
-            # High-confidence QUERY commands (>= 0.7) can skip resolvers because
-            # handle_query() → PrimeRouter → Cloud Claude doesn't use VBI, ECAPA,
-            # ContextGraph, OCR, Yabai, or any resolver output.
-            #
-            # Low-confidence queries (0.5 = default fallback for unrecognized input)
-            # might be misclassified system/vision commands — those still get full
-            # resolver init to maximize correct routing.
-            # =================================================================
-            _fast_query_eligible = (
-                command_type == CommandType.QUERY
-                and confidence >= 0.7
+            result = await self._execute_action(
+                response, command_text, websocket, audio_data, speaker_name
             )
 
-            if _fast_query_eligible and not self._resolvers_initialized:
-                self._fast_query_eligible = True  # Signal downstream to skip screen context
-                logger.info(
-                    f"[UNIFIED] ⚡ FAST QUERY PATH: Skipping resolver init "
-                    f"(type={command_type.value}, confidence={confidence:.2f}, "
-                    f"text='{command_text[:50]}')"
-                )
-            elif not self._resolvers_initialized:
-                self._fast_query_eligible = False
-                logger.info("[UNIFIED] 📦 Non-lock command - initializing resolvers (VBI, ECAPA, etc.)")
-                try:
-                    # Increased timeout to 30s for 6-tier parallel initialization
-                    await asyncio.wait_for(self._initialize_resolvers(), timeout=30.0)
-                    logger.info("[UNIFIED] ✅ Resolvers initialized successfully")
-                except asyncio.TimeoutError:
-                    logger.error("[UNIFIED] ❌ Resolver initialization timed out (30s)")
-                    logger.warning("[UNIFIED] Continuing without resolvers - degraded functionality")
-                    self._resolvers_initialized = False  # Mark as failed
-                except Exception as e:
-                    logger.error(f"[UNIFIED] ❌ Resolver initialization failed: {e}")
-                    self._resolvers_initialized = False
-            else:
-                self._fast_query_eligible = False
-
-        # NEW: Use speaker-aware command handler with CAI/SAI if audio provided
-        # OPTIMIZATION: Skip heavy VBI for screen lock commands to avoid "Processing..." hang
-        if audio_data and command_type != CommandType.SCREEN_LOCK:
+            # === Telemetry: Emit interaction to Reactor-Core for training ===
             try:
-                from voice.speaker_aware_command_handler import get_speaker_aware_handler
+                from core.telemetry_emitter import get_telemetry_emitter
 
-                speaker_handler = await get_speaker_aware_handler()
+                emitter = await get_telemetry_emitter()
+                _resp_meta = result.get("metadata", {})
+                _model_id = _resp_meta.get("model_id") if isinstance(_resp_meta, dict) else None
 
-                # Process command with full speaker verification + CAI/SAI
-                async def command_executor(transcription, context):
-                    """Execute the actual command with context"""
-                    # Continue with normal command processing below
-                    # We'll return results after classification
-                    return {"executed_via": "unified_processor"}
-
-                speaker_result = await speaker_handler.process_voice_command(
-                    audio_data=audio_data,
-                    transcription=command_text,
-                    command_handler=command_executor,
-                )
-
-                # Store speaker verification for later use
-                self.current_speaker_verification = speaker_result.get("speaker")
-                speaker_verification_result = speaker_result.get("speaker")
-
-                logger.info(
-                    f"[SPEAKER-AWARE] {speaker_result.get('speaker', {}).get('name', 'Unknown')}: "
-                    f"verified={speaker_result.get('speaker', {}).get('verified', False)}, "
-                    f"confidence={speaker_result.get('speaker', {}).get('confidence', 0.0):.1%}"
-                )
-
-                # If unlock was performed, note it
-                if speaker_result.get("unlock", {}).get("success"):
-                    logger.info(f"🔓 Auto-unlocked screen for {speaker_result['speaker']['name']}")
-
-                # Add greeting to response if present
-                self._speaker_greeting = speaker_result.get("greeting", "")
-
-            except Exception as e:
-                logger.warning(
-                    f"[SPEAKER-AWARE] Handler failed, falling back to basic verification: {e}"
-                )
-                speaker_verification_result = None
-        else:
-            # Fallback to basic speaker verification if no audio
-            # Also skipped if command is explicit screen lock to avoid blocking
-            speaker_verification_result = None
-            if self.speaker_verification and command_type != CommandType.SCREEN_LOCK:
-                try:
-                    speaker_verification_result = await self.speaker_verification.verify_speaker(
-                        audio_data, speaker_name
-                    )
-
-                    logger.info(
-                        f"[VOICE-AUTH] Speaker: {speaker_verification_result['speaker_name']}, "
-                        f"Verified: {speaker_verification_result['verified']}, "
-                        f"Confidence: {speaker_verification_result['confidence']:.1%}, "
-                        f"Owner: {speaker_verification_result['is_owner']}"
-                    )
-
-                    # Store verification result for security-sensitive operations
-                    self.current_speaker_verification = speaker_verification_result
-
-                except Exception as e:
-                    logger.warning(f"[VOICE-AUTH] Speaker verification failed: {e}")
-                    speaker_verification_result = None
-
-        # NEW: Get context-aware handler for ALL commands
-        from context_intelligence.handlers.context_aware_handler import get_context_aware_handler
-
-        context_handler = get_context_aware_handler()
-
-        # Step 1: Classify query complexity (if available)
-        classified_query = None
-        if self.query_complexity_manager:
-            try:
-                context = {"recent_commands": list(self.context.conversation_history)[-5:]}
-                classified_query = await self.query_complexity_manager.process_query(
-                    command_text, context=context
-                )
-                logger.info(
-                    f"[UNIFIED] Query complexity: {classified_query.complexity.level.name} "
-                    f"(type={classified_query.query_type}, intent={classified_query.intent}, "
-                    f"latency={classified_query.complexity.estimated_latency[0]:.1f}-"
-                    f"{classified_query.complexity.estimated_latency[1]:.1f}s, "
-                    f"api_calls={classified_query.complexity.estimated_api_calls[0]}-"
-                    f"{classified_query.complexity.estimated_api_calls[1]})"
-                )
-            except Exception as e:
-                logger.warning(f"[UNIFIED] Query complexity classification failed: {e}")
-
-        # v236.0: Store classified_query on self for downstream use by
-        # _execute_command_internal() which runs in a different method scope.
-        self._classified_query = classified_query
-
-        # Step 2: Classify command intent (Already done above)
-        # command_type, confidence = await self._classify_command(command_text)
-        # logger.info(f"[UNIFIED] Classified as {command_type.value} (confidence: {confidence})")
-
-        # Step 3: Check system context FIRST (screen lock, active apps, etc.)
-        # IMPORTANT: Use fast non-blocking system context retrieval
-        # _get_full_system_context can be slow if it queries window servers or accessibility APIs
-        # We'll use a lighter version for initial command routing
-        system_context = await self._get_fast_system_context()
-        logger.info(
-            f"[UNIFIED] System context: screen_locked={system_context.get('screen_locked')}, active_apps={len(system_context.get('active_apps', []))}"
-        )
-
-        # Step 3.5: Goal Inference + Autonomous Decision Integration
-        if self.goal_autonomous_integration:
-            try:
-                # Build integration context
-                integration_context = {
-                    "command": command_text,
-                    "active_applications": system_context.get("active_apps", []),
-                    "recent_actions": (
-                        list(self.context.conversation_history)[-5:]
-                        if self.context.conversation_history
-                        else []
+                _telemetry_task = asyncio.create_task(
+                    emitter.emit_interaction(
+                        user_input=command_text,
+                        response=result.get("response", ""),
+                        success=result.get("success", False),
+                        confidence=response.confidence,
+                        latency_ms=result.get("latency_ms", 0.0),
+                        source=result.get("source", response.source),
+                        metadata={
+                            "command_type": result.get("command_type", "UNKNOWN"),
+                            "intent": response.intent,
+                            "domain": response.domain,
+                        },
+                        model_id=_model_id,
+                        task_type=result.get("task_type"),
                     ),
-                    "workspace_state": system_context,
-                    "windows": [],  # Would be populated from window manager if available
-                    "time_context": {
-                        "current_time": datetime.now().strftime("%I:%M %p"),
-                        "day_of_week": "weekday" if datetime.now().weekday() < 5 else "weekend",
-                    },
-                }
-
-                # Check for predictive display connection if relevant
-                if any(
-                    keyword in command_text.lower()
-                    for keyword in ["tv", "display", "screen", "monitor", "living room"]
-                ):
-                    display_decision = (
-                        await self.goal_autonomous_integration.predict_display_connection(
-                            integration_context
-                        )
-                    )
-
-                    if display_decision and display_decision.integrated_confidence > 0.85:
-                        logger.info(
-                            f"[GOAL-INFERENCE] High-confidence display prediction: {display_decision.reasoning}"
-                        )
-
-                        # Send proactive suggestion if websocket available
-                        if websocket:
-                            await websocket.send_json(
-                                {
-                                    "type": "proactive_suggestion",
-                                    "message": f"I've noticed {display_decision.reasoning}. Shall I connect to {display_decision.action.target}?",
-                                    "confidence": display_decision.integrated_confidence,
-                                    "action": "connect_display",
-                                }
-                            )
-
-                # Process through full integration for goal-based decisions
-                decisions = await self.goal_autonomous_integration.process_context(
-                    integration_context
+                    name="telemetry_emit_interaction",
                 )
-
-                if decisions:
-                    logger.info(f"[GOAL-INFERENCE] Generated {len(decisions)} autonomous decisions")
-
-                    # Log high-confidence decisions for proactive suggestions
-                    for decision in decisions:
-                        if decision.integrated_confidence > 0.8:
-                            logger.info(
-                                f"[GOAL-INFERENCE] Suggestion: {decision.action.action_type} - {decision.reasoning}"
-                            )
-
-                            # Could auto-execute or suggest based on confidence
-                            if (
-                                decision.integrated_confidence > 0.95
-                                and decision.action.action_type == "connect_display"
-                            ):
-                                # Pre-load resources for faster execution
-                                logger.info(
-                                    "[GOAL-INFERENCE] Pre-loading display connection resources"
-                                )
-
+                _telemetry_task.add_done_callback(
+                    lambda t: logger.warning(f"[UNIFIED] Telemetry emission failed: {t.exception()}")
+                    if not t.cancelled() and t.exception() else None
+                )
+            except ImportError:
+                pass  # Telemetry not available
             except Exception as e:
-                logger.error(f"[GOAL-INFERENCE] Error in integration: {e}")
-                # Continue with normal processing if integration fails
+                logger.debug(f"[UNIFIED] Telemetry emission setup failed: {e}")
 
-        # Step 4: Route to Medium Complexity Handler if appropriate
-        if (
-            classified_query
-            and classified_query.complexity.level.name == "MODERATE"
-            and self.medium_complexity_handler
-            and classified_query.entities.get("spaces")
-        ):
+            return result
 
-            try:
-                from context_intelligence.handlers import MediumQueryType
-
-                # Determine medium query type
-                if classified_query.query_type == "comparison":
-                    medium_type = MediumQueryType.COMPARISON
-                elif classified_query.intent == "find":
-                    medium_type = MediumQueryType.CROSS_SPACE_SEARCH
-                else:
-                    medium_type = MediumQueryType.MULTI_SPACE
-
-                logger.info(f"[UNIFIED] Routing to MediumComplexityHandler ({medium_type.value})")
-
-                # Execute medium complexity query
-                result = await self.medium_complexity_handler.process_query(
-                    query=command_text,
-                    space_ids=classified_query.entities["spaces"],
-                    query_type=medium_type,
-                    context={"system_context": system_context},
-                )
-
-                # Return formatted result
-                return {
-                    "success": result.success,
-                    "response": result.synthesis,
-                    "command_type": "medium_complexity_query",
-                    "query_complexity": {
-                        "level": "MODERATE",
-                        "query_type": classified_query.query_type,
-                        "spaces_processed": result.spaces_processed,
-                        "execution_time": result.execution_time,
-                        "api_calls": result.total_api_calls,
-                    },
-                    "captures": [
-                        {
-                            "space_id": c.space_id,
-                            "success": c.success,
-                            "text_length": len(c.ocr_text) if c.ocr_text else 0,
-                            "confidence": c.ocr_confidence,
-                            "method": f"{c.capture_method} + {c.ocr_method}",
-                        }
-                        for c in result.captures
-                    ],
-                }
-
-            except Exception as e:
-                logger.error(f"[UNIFIED] Medium complexity handler failed: {e}")
-                # Fall through to regular processing
-
-        # Step 4.5: Route to Complex Complexity Handler if appropriate
-        if (
-            classified_query
-            and classified_query.complexity.level.name == "COMPLEX"
-            and self.complex_complexity_handler
-        ):
-
-            try:
-                from context_intelligence.handlers import ComplexQueryType
-
-                # Determine complex query type
-                if any(
-                    word in command_text.lower()
-                    for word in ["changed", "change", "different", "history"]
-                ):
-                    complex_type = ComplexQueryType.TEMPORAL
-                elif any(
-                    word in command_text.lower()
-                    for word in ["find", "search", "all", "across", "every"]
-                ):
-                    complex_type = ComplexQueryType.CROSS_SPACE
-                elif any(
-                    word in command_text.lower()
-                    for word in ["progress", "predict", "will", "going"]
-                ):
-                    complex_type = ComplexQueryType.PREDICTIVE
-                else:
-                    complex_type = ComplexQueryType.ANALYTICAL
-
-                logger.info(f"[UNIFIED] Routing to ComplexComplexityHandler ({complex_type.value})")
-
-                # Determine space IDs (all spaces if not specified)
-                space_ids = (
-                    classified_query.entities.get("spaces") if classified_query.entities else None
-                )
-
-                # Determine time range for temporal queries
-                time_range = None
-                if complex_type == ComplexQueryType.TEMPORAL:
-                    # Extract time range from query
-                    import re
-
-                    minutes_match = re.search(r"(\d+)\s*minute", command_text.lower())
-                    hours_match = re.search(r"(\d+)\s*hour", command_text.lower())
-                    if minutes_match:
-                        time_range = {"minutes": int(minutes_match.group(1))}
-                    elif hours_match:
-                        time_range = {"hours": int(hours_match.group(1))}
-                    else:
-                        time_range = {"minutes": 5}  # Default to 5 minutes
-
-                # Execute complex query
-                result = await self.complex_complexity_handler.process_query(
-                    query=command_text,
-                    query_type=complex_type,
-                    space_ids=space_ids,
-                    time_range=time_range,
-                    context={"system_context": system_context},
-                )
-
-                # Return formatted result
-                response_parts = [result.synthesis]
-
-                # Add temporal analysis if available
-                if result.temporal_analysis:
-                    ta = result.temporal_analysis
-                    response_parts.append(f"\n\n**Temporal Analysis:**")
-                    response_parts.append(f"- Changes detected: {ta.changes_detected}")
-                    response_parts.append(
-                        f"- Changed spaces: {', '.join(map(str, ta.changed_spaces)) if ta.changed_spaces else 'none'}"
-                    )
-
-                # Add cross-space analysis if available
-                if result.cross_space_analysis:
-                    csa = result.cross_space_analysis
-                    response_parts.append(f"\n\n**Cross-Space Analysis:**")
-                    response_parts.append(f"- Spaces scanned: {csa.total_spaces_scanned}")
-                    response_parts.append(f"- Matches found: {csa.matches_found}")
-
-                # Add predictive analysis if available
-                if result.predictive_analysis:
-                    pa = result.predictive_analysis
-                    response_parts.append(f"\n\n**Confidence:** {pa.confidence:.1%}")
-
-                return {
-                    "success": result.success,
-                    "response": "\n".join(response_parts),
-                    "command_type": "complex_complexity_query",
-                    "query_complexity": {
-                        "level": "COMPLEX",
-                        "query_type": complex_type.value,
-                        "spaces_processed": result.spaces_processed,
-                        "execution_time": result.execution_time,
-                        "api_calls": result.api_calls,
-                    },
-                    "snapshots": [
-                        {
-                            "space_id": s.space_id,
-                            "success": s.ocr_text is not None and not s.error,
-                            "text_length": len(s.ocr_text) if s.ocr_text else 0,
-                            "confidence": s.ocr_confidence,
-                            "error": s.error,
-                        }
-                        for s in result.snapshots
-                    ],
-                }
-
-            except Exception as e:
-                logger.error(f"[UNIFIED] Complex complexity handler failed: {e}")
-                # Fall through to regular processing
-
-        # Step 5: Resolve references with context (use resolved query if available)
-        resolved_text = classified_query.resolved_query if classified_query else command_text
-        reference, ref_confidence = self.context.resolve_reference(resolved_text)
-        if reference and ref_confidence > 0.5:
-            # Replace reference with resolved entity
-            for word in ["it", "that", "this"]:
-                if word in resolved_text.lower():
-                    resolved_text = resolved_text.lower().replace(word, reference)
-                    logger.info(f"[UNIFIED] Resolved '{word}' to '{reference}'")
-                    break
-
-        # Step 6: Define command execution callback
-        async def execute_with_context(cmd: str, context: Dict[str, Any] = None):
-            """Execute command with full context awareness"""
-            if command_type == CommandType.COMPOUND:
-                return await self._handle_compound_command(cmd, context=context)
-            else:
-                return await self._execute_command(command_type, cmd, websocket, context=context, deadline=deadline)
-
-        # Step 7: Process through context-aware handler with voice authentication
-        logger.info(f"[UNIFIED] Processing through context-aware handler...")
-        result = await context_handler.handle_command_with_context(
-            resolved_text,
-            execute_callback=execute_with_context,
-            audio_data=audio_data,
-            speaker_name=speaker_name,
-        )
-
-        # Step 8: Extract actual result from context handler response
-        if result.get("result"):
-            # Use the nested result from context handler
-            actual_result = result["result"]
-        else:
-            # Fallback to the full result
-            actual_result = result
-
-        # Step 9: Learn from the result
-        if actual_result.get("success", False):
-            self.pattern_learner.learn_pattern(command_text, command_type.value, True)
-            self.success_patterns[command_type.value].append(
-                {
-                    "command": command_text,
-                    "timestamp": datetime.now().isoformat(),
-                    "context": system_context,  # Store context for learning
-                }
-            )
-            # Keep only recent patterns
-            if len(self.success_patterns[command_type.value]) > 100:
-                self.success_patterns[command_type.value] = self.success_patterns[
-                    command_type.value
-                ][-100:]
-
-        # Step 10: Update context with result
-        self.context.update_from_command(command_type, actual_result)
-        self.context.system_state = system_context  # Update system state
-
-        # Save learned data periodically (every 10 commands)
-        if sum(self.command_stats.values()) % 10 == 0:
-            self._save_learned_data()
-
-        # Return the formatted result with complexity information
-        response_text = result.get("summary", actual_result.get("response", ""))
-
-        # Prepend personalized greeting if speaker was verified
-        if hasattr(self, "_speaker_greeting") and self._speaker_greeting:
-            response_text = f"{self._speaker_greeting} {response_text}"
-            # Clear greeting for next command
-            self._speaker_greeting = ""
-
-        result_dict = {
-            "success": actual_result.get("success", False),
-            "response": response_text,
-            "command_type": command_type.value,
-            "context_aware": True,
-            "system_context": system_context,
-            **actual_result,
+        # === Step 3: Brain vacuum fallback ===
+        logger.warning("[v242] J-Prime unreachable and no reflex match. Brain vacuum fallback.")
+        return {
+            "success": False,
+            "response": "I'm having trouble connecting to my brain. Please try again in a moment.",
+            "command_type": "UNKNOWN",
+            "source": "brain_vacuum",
         }
 
-        # Add speaker verification info if available
-        if speaker_verification_result:
-            result_dict["speaker_verified"] = speaker_verification_result
-
-        # Add query complexity information if available
-        if classified_query:
-            result_dict["query_complexity"] = {
-                "level": classified_query.complexity.level.name,
-                "query_type": classified_query.query_type,
-                "intent": classified_query.intent,
-                "estimated_latency": classified_query.complexity.estimated_latency,
-                "estimated_api_calls": classified_query.complexity.estimated_api_calls,
-                "spaces_involved": classified_query.complexity.spaces_involved,
-                "confidence": classified_query.complexity.confidence,
-                "resolved_query": classified_query.resolved_query,
-            }
-
-        # =========================================================================
-        # TRINITY TELEMETRY: Emit interaction to Reactor-Core for training
-        # =========================================================================
-        # This enables the continuous learning loop:
-        # JARVIS (interactions) → Reactor-Core (training) → JARVIS-Prime (better model)
-        # =========================================================================
-        try:
-            from core.telemetry_emitter import get_telemetry_emitter
-
-            emitter = await get_telemetry_emitter()
-
-            # Calculate processing time if we tracked it
-            processing_time_ms = result_dict.get("latency_ms", 0.0)
-
-            # v242.0: Extract model_id from Prime response metadata
-            _resp_meta = result_dict.get("metadata", {})
-            _model_id = _resp_meta.get("model_id") if isinstance(_resp_meta, dict) else None
-            _task_type = result_dict.get("task_type")
-
-            _telemetry_task = asyncio.create_task(
-                emitter.emit_interaction(
-                    user_input=command_text,
-                    response=result_dict.get("response", ""),
-                    success=result_dict.get("success", False),
-                    confidence=result_dict.get("confidence", classified_query.complexity.confidence if classified_query else 1.0),
-                    latency_ms=processing_time_ms,
-                    source=result_dict.get("source", "jarvis_agent"),
-                    metadata={
-                        "command_type": command_type.value,
-                        "speaker_verified": speaker_verification_result is not None,
-                        "context_aware": True,
-                    },
-                    model_id=_model_id,
-                    task_type=_task_type,
-                ),
-                name="telemetry_emit_interaction",
-            )
-            # v242.0: Log errors instead of silently swallowing them
-            _telemetry_task.add_done_callback(
-                lambda t: logger.warning(f"[UNIFIED] Telemetry emission failed: {t.exception()}")
-                if not t.cancelled() and t.exception() else None
-            )
-        except ImportError:
-            pass  # Telemetry not available
-        except Exception as e:
-            logger.warning(f"[UNIFIED] Telemetry emission setup failed: {e}")
-
-        return result_dict
 
     @staticmethod
     def _summarize_workspace_result(result: dict, intent: str) -> str:
@@ -2402,232 +1404,448 @@ class UnifiedCommandProcessor:
         else:
             return "Workspace command completed successfully."
 
-    async def _classify_command(self, command_text: str) -> Tuple[CommandType, float]:
-        """Dynamically classify command using learned patterns"""
-        command_lower = command_text.lower().strip()
-        words = command_lower.split()
+    # =========================================================================
+    # v242 SPINAL REFLEX ARC — New methods for reflex + J-Prime routing
+    # =========================================================================
 
-        # Manual screen lock/unlock detection (HIGHEST PRIORITY - check first!)
-        # CRITICAL: Distinguish between LOCK and UNLOCK commands - they are different!
-        
-        # Check for LOCK commands first (no voice verification needed)
-        lock_commands = [
-            "lock my screen", "lock screen", "lock the screen",
-            "lock my mac", "lock the mac", "lock my computer",
-            "lock it", "lock this", "secure my screen", "secure the screen"
-        ]
-        if command_lower in lock_commands or (
-            "lock" in command_lower and "unlock" not in command_lower and "screen" in command_lower
-        ):
-            logger.info(f"[CLASSIFY] 🔒 LOCK command detected: '{command_lower}'")
-            return (CommandType.SCREEN_LOCK, 0.99)  # Route to screen lock handler
-        
-        # Check for UNLOCK commands (requires voice verification)
-        unlock_commands = [
-            "unlock my screen", "unlock screen", "unlock the screen",
-            "unlock my mac", "unlock the mac", "unlock my computer"
-        ]
-        if command_lower in unlock_commands or (
-            "unlock" in command_lower and "screen" in command_lower
-        ):
-            logger.info(f"[CLASSIFY] 🔓 UNLOCK command detected: '{command_lower}'")
-            return (CommandType.VOICE_UNLOCK, 0.99)  # Route to voice unlock handler
+    async def _check_reflex_manifest(self, command_text: str) -> Optional[Dict[str, Any]]:
+        """Check if command matches a reflex in the J-Prime-published manifest.
 
-        # Voice unlock detection FIRST (highest priority to catch "enable voice unlock")
-        voice_patterns = self._detect_voice_unlock_patterns(command_lower)
-        if voice_patterns > 0:
-            logger.info(
-                f"Voice unlock command detected: '{command_lower}' with patterns={voice_patterns}"
+        Returns reflex dict if matched, None otherwise.
+        Checks inhibition signals before executing.
+        """
+        manifest_path = Path.home() / ".jarvis" / "trinity" / "reflex_manifest.json"
+        inhibition_path = Path.home() / ".jarvis" / "trinity" / "reflex_inhibition.json"
+
+        if not manifest_path.exists():
+            return None
+
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        # Check each reflex for pattern match
+        normalized = command_text.lower().strip()
+        for reflex_id, reflex in manifest.get("reflexes", {}).items():
+            patterns = reflex.get("patterns", [])
+            if any(normalized == p.lower() for p in patterns):
+                # Check inhibition before executing
+                if inhibition_path.exists():
+                    try:
+                        inhibition = json.loads(inhibition_path.read_text())
+                        inhibited = inhibition.get("inhibit_reflexes", [])
+                        published = inhibition.get("published_at", "")
+                        ttl = inhibition.get("ttl_seconds", 0)
+                        if reflex_id in inhibited:
+                            from datetime import timezone
+                            pub_time = datetime.fromisoformat(published)
+                            if (datetime.now(timezone.utc) - pub_time).total_seconds() < ttl:
+                                logger.info(
+                                    f"[v242] Reflex '{reflex_id}' inhibited: "
+                                    f"{inhibition.get('reason')}"
+                                )
+                                return None  # Inhibited -- send to J-Prime instead
+                    except (json.JSONDecodeError, OSError, ValueError):
+                        pass  # Inhibition check failed -- execute reflex anyway
+
+                return {"reflex_id": reflex_id, **reflex}
+
+        return None
+
+    async def _call_jprime(
+        self, command_text: str, deadline: Optional[float] = None,
+    ) -> Optional[Any]:
+        """Send query to J-Prime for classification and response.
+
+        Returns StructuredResponse or None on failure.
+        """
+        try:
+            from core.jarvis_prime_client import get_jarvis_prime_client
+
+            client = get_jarvis_prime_client()
+            if client is None:
+                return None
+
+            import time as _time
+            timeout = 30.0
+            if deadline:
+                remaining = deadline - _time.monotonic()
+                timeout = max(2.0, remaining - 1.0)
+
+            return await asyncio.wait_for(
+                client.classify_and_complete(
+                    query=command_text,
+                    max_tokens=512,
+                ),
+                timeout=timeout,
             )
-            return CommandType.VOICE_UNLOCK, 0.85 + (voice_patterns * 0.05)
+        except asyncio.TimeoutError:
+            logger.warning("[v242] J-Prime call timed out")
+            return None
+        except Exception as e:
+            logger.warning(f"[v242] J-Prime call failed: {e}")
+            return None
 
-        # Display/Screen mirroring detection (HIGH PRIORITY - before vision to avoid confusion)
-        display_score = self._calculate_display_score(words, command_lower)
-        if display_score > 0.7:
-            logger.info(f"Display command detected: '{command_lower}' with score={display_score}")
-            return CommandType.DISPLAY, display_score
+    async def _execute_action(
+        self, response: Any, command_text: str,
+        websocket=None, audio_data: bytes = None, speaker_name: str = None,
+    ) -> Dict[str, Any]:
+        """Execute the action determined by J-Prime's classification.
 
-        # Check for implicit compound commands (app + action without connector)
-        # Example: "open safari search for cats"
-        if len(words) >= 3:
-            # Look for patterns like "verb app verb"
-            potential_app_indices = []
-            for i, word in enumerate(words):
-                if self.pattern_learner.is_learned_app(word):
-                    potential_app_indices.append(i)
+        Maps intent + domain to existing execution handlers.
+        Returns the standard process_command() response dict.
+        """
+        intent = response.intent
+        domain = response.domain
 
-            # Check if there are verbs before and after an app name
-            for app_idx in potential_app_indices:
-                if app_idx > 0 and app_idx < len(words) - 1:
-                    # Check if word before app is a verb
-                    before_verb = words[app_idx - 1] in self.pattern_learner.app_verbs
-                    # Check if there's a verb or action after the app
-                    after_has_action = any(
-                        word
-                        in self.pattern_learner.app_verbs | {"search", "navigate", "go", "type"}
-                        for word in words[app_idx + 1 :]
-                    )
+        # Intent: answer / conversation -- just return the text
+        if intent in ("answer", "conversation"):
+            return {
+                "success": True,
+                "response": response.content,
+                "command_type": "QUERY",
+                "source": response.source,
+                "x_jarvis_routing": {
+                    "intent": intent, "domain": domain,
+                    "confidence": response.confidence,
+                },
+            }
 
-                    if before_verb and after_has_action:
-                        # This is an implicit compound command
-                        logger.info(
-                            f"[CLASSIFY] Detected implicit compound: verb-app-action pattern"
-                        )
-                        return CommandType.COMPOUND, 0.9
+        # Intent: action -- execute a system command
+        if intent == "action":
+            if domain == "surveillance":
+                return await self._handle_surveillance_action(command_text, websocket)
+            elif domain == "system":
+                return await self._handle_system_action_via_jprime(
+                    command_text, response.suggested_actions
+                )
+            elif domain == "screen_lock":
+                return await self._handle_screen_lock_action(command_text)
+            elif domain == "voice_unlock":
+                return await self._handle_voice_unlock_action(
+                    command_text, websocket, audio_data, speaker_name
+                )
+            else:
+                return {
+                    "success": True,
+                    "response": response.content,
+                    "command_type": "SYSTEM",
+                    "source": response.source,
+                }
 
-        # Dynamic compound detection - learn from connectors
-        compound_indicators = {" and ", " then ", ", and ", ", then ", " && ", " ; "}
-        for indicator in compound_indicators:
-            if indicator in command_lower:
-                # Check if this is truly compound by analyzing both sides
-                parts = command_lower.split(indicator)
-                if len(parts) >= 2 and all(len(p.strip()) > 0 for p in parts):
-                    # Both sides have content - likely compound
-                    # But exclude if it's part of a single concept
-                    if not self._is_single_concept(command_lower, indicator):
-                        return CommandType.COMPOUND, 0.95
+        # Intent: vision_needed -- use existing vision handler
+        if intent == "vision_needed":
+            return await self._handle_vision_action(command_text, websocket)
 
-        # Dynamic system command detection using learned patterns
-        first_word = words[0] if words else ""
+        # Intent: multi_step_action -- execute step by step
+        if intent == "multi_step_action":
+            return await self._handle_compound_command(
+                command_text, context={"suggested_actions": response.suggested_actions}
+            )
 
-        # Check for web search commands explicitly (FAST PATH check)
-        if first_word in {"search", "google", "find", "lookup"} or (
-            first_word == "look" and len(words) > 1 and words[1] == "up"
-        ):
-            return CommandType.SYSTEM, 0.95
+        # Intent: clarify -- ask user to clarify
+        if intent == "clarify":
+            return {
+                "success": True,
+                "response": response.content or "Could you clarify what you'd like me to do?",
+                "command_type": "QUERY",
+                "source": response.source,
+            }
 
-        # Check if first word is a learned verb
-        if (
-            first_word in self.pattern_learner.app_verbs
-            or first_word in self.pattern_learner.system_verbs
-        ):
-            # Check if any word is a learned app
-            for word in words[1:]:
-                if self.pattern_learner.is_learned_app(word):
-                    return CommandType.SYSTEM, 0.9
-
-            # Check for system settings patterns
-            system_indicators = self._detect_system_indicators(words)
-            if system_indicators > 0:
-                return CommandType.SYSTEM, 0.85 + (system_indicators * 0.05)
-
-        # Dynamic app detection - if any learned app is mentioned
-        mentioned_apps = [word for word in words if self.pattern_learner.is_learned_app(word)]
-        if mentioned_apps:
-            # Check for action context
-            has_action = any(word in self.pattern_learner.app_verbs for word in words)
-            if has_action:
-                return CommandType.SYSTEM, 0.9
-
-        # Document creation detection (high priority - before vision)
-        # Use root words that will match variations (write/writing/writes, create/creating, etc.)
-        document_keywords = [
-            "writ",
-            "creat",
-            "draft",
-            "compos",
-            "generat",
-        ]  # Root forms
-        document_types = [
-            "essay",
-            "report",
-            "paper",
-            "article",
-            "document",
-            "blog",
-            "letter",
-            "story",
-        ]
-
-        # Check if any word starts with a document keyword (handles write/writing/writes, etc.)
-        has_document_keyword = any(
-            any(word.startswith(kw) for word in words) for kw in document_keywords
-        )
-        has_document_type = any(dtype in words for dtype in document_types)
-
-        if has_document_keyword and has_document_type:
-            logger.info(f"[CLASSIFY] Document creation command detected: '{command_text}'")
-            return CommandType.DOCUMENT, 0.95
-
-        # Vision detection through semantic analysis (CHECK BEFORE QUERY!)
-        # This must come before query detection to catch vision questions
-        vision_score = self._calculate_vision_score(words, command_lower)
-        if vision_score > 0.7:
-            return CommandType.VISION, vision_score
-
-        # Weather detection - simple but effective
-        if "weather" in words:
-            return CommandType.WEATHER, 0.95
-
-        # Autonomy detection
-        autonomy_score = self._calculate_autonomy_score(words)
-        if autonomy_score > 0.7:
-            return CommandType.AUTONOMY, autonomy_score
-
-        # Meta command detection
-        meta_indicators = {
-            "cancel",
-            "stop",
-            "undo",
-            "never",
-            "not",
-            "wait",
-            "hold",
-            "performance",
-            "stats",
+        # Fallback: treat as answer
+        return {
+            "success": True,
+            "response": response.content,
+            "command_type": "QUERY",
+            "source": response.source,
         }
-        meta_count = sum(1 for word in words if word in meta_indicators)
-        if meta_count > 0 and len(words) < 5:
-            return CommandType.META, 0.8 + (meta_count * 0.05)
 
-        # Performance/stats queries
-        if (
-            "performance" in command_lower
-            or "vision performance" in command_lower
-            or "show stats" in command_lower
-        ):
-            return CommandType.META, 0.95
+    async def _handle_surveillance_action(
+        self, command_text: str, websocket=None,
+    ) -> Dict[str, Any]:
+        """Route surveillance commands to IntelligentCommandHandler."""
+        import os
+        import sys
 
-        # Wake word detection
-        if command_lower.strip() in {
-            "hey",
-            "hi",
-            "hello",
-            "jarvis",
-            "hey jarvis",
-            "activate",
-            "wake",
-            "wake up",
-        }:
-            return CommandType.META, 0.9
+        try:
+            _current_file = os.path.abspath(__file__)
+            _api_dir = os.path.dirname(_current_file)
+            _backend_root = os.path.dirname(_api_dir)
+            _project_root = os.path.dirname(_backend_root)
 
-        # Query detection through linguistic analysis
-        # NOTE: This comes AFTER vision detection to allow vision questions
-        is_question = self._is_question_pattern(words)
-        if is_question:
-            # Check again if this might be a vision question
-            if vision_score > 0.5:  # Lower threshold for questions
-                return CommandType.VISION, vision_score
-            return CommandType.QUERY, 0.8
+            for _inject_path in [_backend_root, _project_root]:
+                if _inject_path not in sys.path:
+                    sys.path.insert(0, _inject_path)
 
-        # URL/Web detection
-        if self._contains_url_pattern(command_lower):
-            return CommandType.SYSTEM, 0.85
+            from voice.intelligent_command_handler import IntelligentCommandHandler
 
-        # Navigation patterns
-        nav_patterns = {"go", "navigate", "browse", "visit", "open", "search"}
-        if any(word in words for word in nav_patterns) and len(words) > 1:
-            return CommandType.SYSTEM, 0.75
+            intelligent_handler = IntelligentCommandHandler()
+            surveillance_timeout = float(
+                os.getenv("JARVIS_SURVEILLANCE_HANDLER_TIMEOUT", "80")
+            )
 
-        # Short commands default to system if they contain verbs
-        if len(words) <= 3 and any(
-            word in self.pattern_learner.app_verbs | self.pattern_learner.system_verbs
-            for word in words
-        ):
-            return CommandType.SYSTEM, 0.7
+            result = await asyncio.wait_for(
+                intelligent_handler.handle_command(command_text),
+                timeout=surveillance_timeout,
+            )
 
-        # Default to query with lower confidence
-        return CommandType.QUERY, 0.5
+            # Unpack result (handles tuple, dict, or string)
+            if isinstance(result, tuple) and len(result) == 2:
+                response_text, handler_used = result
+            elif isinstance(result, dict):
+                response_text = result.get("response", result.get("text", "Monitoring initiated"))
+                handler_used = result.get("handler", "surveillance")
+            elif isinstance(result, str):
+                response_text = result
+                handler_used = "surveillance"
+            else:
+                response_text = str(result) if result else "Monitoring initiated"
+                handler_used = "unknown"
+
+            return {
+                "success": True,
+                "response": response_text,
+                "command_type": "surveillance",
+                "handler_used": handler_used,
+            }
+
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "response": "Surveillance setup timed out. Please try again.",
+                "command_type": "surveillance",
+                "error": "handler_timeout",
+            }
+        except Exception as e:
+            logger.error(f"[v242] Surveillance action failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "response": f"I encountered an error setting up monitoring: {str(e)}",
+                "command_type": "surveillance",
+                "error": str(e),
+            }
+
+    async def _handle_system_action_via_jprime(
+        self, command_text: str, suggested_actions: list,
+    ) -> Dict[str, Any]:
+        """Execute system commands using existing _execute_system_command."""
+        try:
+            result = await asyncio.wait_for(
+                self._execute_system_command(command_text),
+                timeout=20.0,
+            )
+            return {
+                "success": result.get("success", False),
+                "response": result.get("response", ""),
+                "command_type": "SYSTEM",
+                **result,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "response": "The command timed out. Please try again.",
+                "command_type": "SYSTEM",
+                "error": "timeout",
+            }
+        except Exception as e:
+            logger.error(f"[v242] System action failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "response": f"Sorry, I had trouble executing that command: {str(e)}",
+                "command_type": "SYSTEM",
+                "error": str(e),
+            }
+
+    async def _handle_screen_lock_action(self, command_text: str) -> Dict[str, Any]:
+        """Execute screen lock via transport handler."""
+        try:
+            from api.simple_unlock_handler import _get_owner_name
+            try:
+                owner_name = await asyncio.wait_for(_get_owner_name(), timeout=1.0)
+            except Exception:
+                owner_name = "there"
+
+            from api.simple_unlock_handler import handle_unlock_command
+            result = await asyncio.wait_for(
+                handle_unlock_command(command_text),
+                timeout=5.0,
+            )
+            return {
+                "success": result.get("success", True),
+                "response": result.get(
+                    "response",
+                    f"Locking your screen now, {owner_name}. See you soon!",
+                ),
+                "command_type": "screen_lock",
+                "fast_path": True,
+                **result,
+            }
+        except Exception as e:
+            logger.error(f"[v242] Screen lock failed: {e}")
+            return {
+                "success": False,
+                "response": f"Failed to lock screen: {str(e)}",
+                "command_type": "screen_lock",
+                "error": str(e),
+            }
+
+    async def _handle_voice_unlock_action(
+        self, command_text: str, websocket=None,
+        audio_data: bytes = None, speaker_name: str = None,
+    ) -> Dict[str, Any]:
+        """Execute voice unlock via voice_unlock_handler."""
+        try:
+            handler = await self._get_handler(CommandType.VOICE_UNLOCK)
+            if not handler:
+                return {
+                    "success": False,
+                    "response": "Voice unlock handler not available.",
+                    "command_type": "voice_unlock",
+                }
+
+            jarvis_instance = type(
+                "obj", (object,),
+                {
+                    "last_audio_data": audio_data or self.current_audio_data,
+                    "last_speaker_name": speaker_name or self.current_speaker_name,
+                },
+            )()
+
+            result = await handler.handle_command(command_text, websocket, jarvis_instance)
+            return {
+                "success": result.get("success", result.get("type") == "voice_unlock"),
+                "response": result.get("message", result.get("response", "")),
+                "command_type": "voice_unlock",
+                **result,
+            }
+        except Exception as e:
+            logger.error(f"[v242] Voice unlock failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "response": f"Voice unlock failed: {str(e)}",
+                "command_type": "voice_unlock",
+                "error": str(e),
+            }
+
+    async def _handle_vision_action(
+        self, command_text: str, websocket=None,
+    ) -> Dict[str, Any]:
+        """Execute vision queries using existing vision infrastructure."""
+        try:
+            # Use Intelligent Vision Router if available
+            if self.vision_router and self._vision_router_initialized:
+                import pyautogui
+                loop = asyncio.get_running_loop()
+                screenshot = await loop.run_in_executor(None, pyautogui.screenshot)
+
+                result = await self.vision_router.execute_query(
+                    query=command_text,
+                    screenshot=screenshot,
+                    context={
+                        "conversation_history": self.context.conversation_history[-5:],
+                        "original_query": command_text,
+                    },
+                )
+                return {
+                    "success": result.get("success", result.get("handled", False)),
+                    "response": result.get("response", ""),
+                    "command_type": "VISION",
+                    **result,
+                }
+
+            # Fallback: use _execute_command_internal via _execute_command
+            return await self._execute_command(
+                CommandType.VISION, command_text, websocket,
+            )
+        except Exception as e:
+            logger.error(f"[v242] Vision action failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "response": f"I encountered an error analyzing your screen: {str(e)}",
+                "command_type": "VISION",
+                "error": str(e),
+            }
+
+    async def _execute_reflex(
+        self, reflex: dict, command_text: str,
+    ) -> Dict[str, Any]:
+        """Execute a matched reflex immediately."""
+        import random
+
+        reflex_id = reflex.get("reflex_id", "unknown")
+        action = reflex.get("action", "")
+
+        if action == "canned_response":
+            pool = reflex.get("response_pool", ["Done."])
+            return {
+                "success": True,
+                "response": random.choice(pool),
+                "command_type": "REFLEX",
+                "reflex_id": reflex_id,
+            }
+
+        if action == "system_command":
+            executor_path = reflex.get("executor", "")
+            try:
+                result = await self._execute_system_reflex(executor_path)
+                return {
+                    "success": True,
+                    "response": result or f"Done: {reflex_id}",
+                    "command_type": "REFLEX",
+                    "reflex_id": reflex_id,
+                }
+            except Exception as e:
+                logger.error(f"[v242] Reflex execution failed: {e}")
+                return {
+                    "success": False,
+                    "response": str(e),
+                    "command_type": "REFLEX",
+                }
+
+        return {
+            "success": False,
+            "response": "Unknown reflex action",
+            "command_type": "REFLEX",
+        }
+
+    async def _execute_system_reflex(self, executor_path: str) -> Optional[str]:
+        """Execute a system reflex by its executor path (e.g., 'macos_controller.lock_screen')."""
+        parts = executor_path.split(".")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid executor path: {executor_path}")
+
+        controller_name, method_name = parts
+
+        # Map controller names to actual instances
+        if controller_name == "macos_controller":
+            from system_control.macos_controller import MacOSController
+
+            controller = MacOSController()
+            if hasattr(controller, method_name):
+                method = getattr(controller, method_name)
+                if asyncio.iscoroutinefunction(method):
+                    return await method()
+                else:
+                    return method()
+
+        raise ValueError(f"Unknown controller: {controller_name}")
+
+    async def _notify_reflex_executed(
+        self, command_text: str, reflex: dict,
+    ) -> None:
+        """Fire-and-forget: notify J-Prime that a reflex was executed (for learning)."""
+        try:
+            logger.debug(
+                f"[v242] Reflex executed: {reflex.get('reflex_id')} "
+                f"for '{command_text}'"
+            )
+        except Exception:
+            pass  # Non-critical
+
+    # =========================================================================
+    # END v242 SPINAL REFLEX ARC
+    # =========================================================================
 
     def _is_single_concept(self, text: str, connector: str) -> bool:
         """Check if connector is part of a single concept rather than joining commands"""
