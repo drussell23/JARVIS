@@ -550,6 +550,32 @@ class HealthStatus:
     last_check: float = field(default_factory=time.time)
 
 
+@dataclass
+class StructuredResponse:
+    """Response from J-Prime with routing metadata (Trinity v242).
+
+    Carries both the generated content and classification metadata
+    produced by the Phi classifier on J-Prime. The Body uses these
+    fields to decide whether to act, speak, escalate, or delegate.
+    """
+    content: str
+    intent: str = "answer"
+    domain: str = "general"
+    complexity: str = "simple"
+    confidence: float = 0.0
+    requires_vision: bool = False
+    requires_action: bool = False
+    escalated: bool = False
+    escalation_reason: str = ""
+    suggested_actions: list = field(default_factory=list)
+    classifier_model: str = ""
+    generator_model: str = ""
+    classification_ms: int = 0
+    generation_ms: int = 0
+    schema_version: int = 1
+    source: str = "jprime"  # "jprime", "claude_fallback", "claude_escalation", "local_fallback", "error"
+
+
 # =============================================================================
 # Circuit Breaker
 # =============================================================================
@@ -1218,6 +1244,222 @@ class JarvisPrimeClient:
             order = [RoutingMode.GEMINI_API]
 
         return order
+
+    # =========================================================================
+    # Trinity v242: Classified Completion (Body integration)
+    # =========================================================================
+
+    async def classify_and_complete(
+        self,
+        query: str,
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        context_metadata: Optional[Dict[str, Any]] = None,
+    ) -> StructuredResponse:
+        """Send query to J-Prime, get classified + generated response.
+
+        J-Prime's Phi classifier determines intent/domain. The specialist
+        model generates content. Returns StructuredResponse with routing
+        metadata that the Body can act on.
+
+        Falls back to Claude/Gemini API if J-Prime is unreachable
+        (brain vacuum scenario).
+
+        Args:
+            query: The user's natural language query.
+            system_prompt: Optional system prompt for the generator.
+            max_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature for generation.
+            context_metadata: Optional dict of context (e.g. active app,
+                time-of-day) forwarded to J-Prime for classification.
+
+        Returns:
+            StructuredResponse with content and routing metadata.
+        """
+        start_time = time.time()
+
+        # Try J-Prime first (normal path via complete())
+        try:
+            response = await self.complete(
+                prompt=query,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[ChatMessage(role="user", content=query)],
+                enrich_with_repo_map=False,  # Body handles its own enrichment
+            )
+
+            total_ms = int((time.time() - start_time) * 1000)
+
+            if not response.success:
+                logger.warning(
+                    f"[v242] J-Prime complete() failed: {response.error}. "
+                    f"Brain vacuum fallback."
+                )
+                return await self._brain_vacuum_fallback(
+                    query=query,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                )
+
+            # Parse x_jarvis_routing from response metadata.
+            # J-Prime injects this as a top-level key in the JSON response
+            # body, which complete() stores in response.metadata.
+            routing: Dict[str, Any] = {}
+            if isinstance(response.metadata, dict):
+                routing = response.metadata.get("x_jarvis_routing", {})
+
+            # Check for escalation signal from J-Prime classifier
+            if routing.get("escalate_to_claude"):
+                return await self._escalate_to_claude(
+                    query=query,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                    routing=routing,
+                )
+
+            return StructuredResponse(
+                content=response.content or "",
+                intent=routing.get("intent", "answer"),
+                domain=routing.get("domain", "general"),
+                complexity=routing.get("complexity", "simple"),
+                confidence=float(routing.get("confidence", 0.0)),
+                requires_vision=bool(routing.get("requires_vision", False)),
+                requires_action=bool(routing.get("requires_action", False)),
+                escalated=False,
+                suggested_actions=routing.get("suggested_actions", []),
+                classifier_model=routing.get("classifier_model", ""),
+                generator_model=routing.get("generator_model", response.backend),
+                classification_ms=int(routing.get("classification_ms", 0)),
+                generation_ms=int(routing.get("generation_ms", total_ms)),
+                schema_version=int(routing.get("schema_version", 1)),
+                source="jprime",
+            )
+
+        except Exception as e:
+            logger.warning(
+                f"[v242] J-Prime unreachable: {e}. Brain vacuum fallback to API."
+            )
+            return await self._brain_vacuum_fallback(
+                query=query,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+            )
+
+    async def _escalate_to_claude(
+        self,
+        query: str,
+        system_prompt: Optional[str],
+        max_tokens: int,
+        routing: Dict[str, Any],
+    ) -> StructuredResponse:
+        """Route to Claude/Gemini API when J-Prime signals escalation.
+
+        J-Prime's classifier may decide the query is too complex for
+        the local specialist model and flag ``escalate_to_claude``.
+        This method honours that signal and calls the API fallback
+        directly, bypassing the local/Cloud Run tiers.
+        """
+        logger.info(
+            f"[v242] Escalation requested: reason={routing.get('escalation_reason', 'unspecified')}"
+        )
+        try:
+            # Build messages for the API backend
+            messages: List[ChatMessage] = []
+            if system_prompt:
+                messages.append(ChatMessage(role="system", content=system_prompt))
+            messages.append(ChatMessage(role="user", content=query))
+
+            response = await self._execute_completion(
+                mode=RoutingMode.GEMINI_API,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+
+            if response.success:
+                return StructuredResponse(
+                    content=response.content or "",
+                    intent=routing.get("intent", "answer"),
+                    domain=routing.get("domain", "general"),
+                    complexity=routing.get("complexity", "complex"),
+                    confidence=float(routing.get("confidence", 0.0)),
+                    requires_vision=bool(routing.get("requires_vision", False)),
+                    requires_action=bool(routing.get("requires_action", False)),
+                    escalated=True,
+                    escalation_reason=routing.get("escalation_reason", ""),
+                    suggested_actions=routing.get("suggested_actions", []),
+                    classifier_model=routing.get("classifier_model", ""),
+                    generator_model=response.backend,
+                    classification_ms=int(routing.get("classification_ms", 0)),
+                    generation_ms=int(response.latency_ms),
+                    schema_version=int(routing.get("schema_version", 1)),
+                    source="claude_escalation",
+                )
+
+            logger.error(f"[v242] Escalation API call failed: {response.error}")
+        except Exception as e:
+            logger.error(f"[v242] Claude escalation exception: {e}")
+
+        # All escalation paths failed -- return a graceful error
+        return StructuredResponse(
+            content="I'm having trouble processing that right now.",
+            intent=routing.get("intent", "answer"),
+            domain=routing.get("domain", "general"),
+            escalated=True,
+            escalation_reason=routing.get("escalation_reason", "escalation_failed"),
+            source="error",
+        )
+
+    async def _brain_vacuum_fallback(
+        self,
+        query: str,
+        system_prompt: Optional[str],
+        max_tokens: int,
+    ) -> StructuredResponse:
+        """Fallback when J-Prime is completely unreachable.
+
+        This covers startup windows, network failures, and circuit-breaker
+        open states.  Routes directly to the Gemini API (cheapest) to
+        maintain responsiveness while the Brain is offline.
+        """
+        try:
+            messages: List[ChatMessage] = []
+            effective_system = (
+                system_prompt or "You are JARVIS, a helpful AI assistant."
+            )
+            messages.append(ChatMessage(role="system", content=effective_system))
+            messages.append(ChatMessage(role="user", content=query))
+
+            response = await self._execute_completion(
+                mode=RoutingMode.GEMINI_API,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+
+            if response.success:
+                return StructuredResponse(
+                    content=response.content or "",
+                    intent="answer",  # Conservative default
+                    domain="general",
+                    generator_model=response.backend,
+                    generation_ms=int(response.latency_ms),
+                    source="claude_fallback",
+                )
+
+            logger.error(
+                f"[v242] Brain vacuum: API fallback also failed: {response.error}"
+            )
+        except Exception as e:
+            logger.error(f"[v242] Brain vacuum: all backends failed: {e}")
+
+        return StructuredResponse(
+            content="I'm still starting up. Please try again in a moment.",
+            intent="answer",
+            source="error",
+        )
 
     async def _execute_completion(
         self,
