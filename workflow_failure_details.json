@@ -1,0 +1,83 @@
+{
+  "workflow_name": "Unlock Integration E2E Testing",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19203325139",
+  "branch": "main",
+  "commit_sha": "091f42e",
+  "run_number": 70,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/unlock-integration-e2e-testing-run70-20251109-042727",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Unlock Integration E2E Testing (Run #70)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 52,
+              "content": "2025-11-09T04:26:46.7952670Z ERROR: Cannot install psutil==5.9.6 and psutil==5.9.8 because these package versions have conflicting dependencies.",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 65,
+              "content": "2025-11-09T04:26:46.7960780Z ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 66,
+              "content": "2025-11-09T04:26:47.2797040Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 3
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 97,
+              "content": "2025-11-09T04:26:47.7749490Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 72,
+              "content": "2025-11-09T04:26:47.2869360Z   if-no-files-found: warn",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 86,
+              "content": "2025-11-09T04:26:47.4760360Z ##[warning]No files were found with the provided path: test-results/unlock-e2e. No artifacts will be uploaded.",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            },
+            {
+              "line_number": 97,
+              "content": "2025-11-09T04:26:47.7749490Z ##[warning]The process '/opt/homebrew/bin/git' failed with exit code 128",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 3
+        }
+      ],
+      "suggested_fixes": [
+        "Consider increasing timeout values or optimizing slow operations"
+      ],
+      "severity": "high",
+      "category": "timeout",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-11-09T04:27:27.024010"
+}
