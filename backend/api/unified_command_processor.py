@@ -1455,11 +1455,15 @@ class UnifiedCommandProcessor:
 
     async def _call_jprime(
         self, command_text: str, deadline: Optional[float] = None,
+        source_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Any]:
         """Send query to J-Prime for classification and response.
 
         Returns StructuredResponse or None on failure.
+        v242.1: On J-Prime failure, attempts brain vacuum fallback via client
+        before returning None.
         """
+        client = None
         try:
             from core.jarvis_prime_client import get_jarvis_prime_client
 
@@ -1482,10 +1486,20 @@ class UnifiedCommandProcessor:
             )
         except asyncio.TimeoutError:
             logger.warning("[v242] J-Prime call timed out")
-            return None
         except Exception as e:
             logger.warning(f"[v242] J-Prime call failed: {e}")
-            return None
+
+        # v242.1: J-Prime failed — try brain vacuum fallback via existing client
+        if client is not None:
+            try:
+                logger.info("[v242] Attempting brain vacuum fallback via client")
+                return await client._brain_vacuum_fallback(
+                    query=command_text, system_prompt=None, max_tokens=512,
+                )
+            except Exception as fallback_err:
+                logger.error(f"[v242] Brain vacuum fallback also failed: {fallback_err}")
+
+        return None
 
     async def _execute_action(
         self, response: Any, command_text: str,
