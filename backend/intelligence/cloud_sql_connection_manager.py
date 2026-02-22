@@ -50,6 +50,7 @@ import asyncio
 import atexit
 import logging
 import os
+import sys
 import time
 import traceback
 import threading
@@ -136,6 +137,15 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Canonicalize module identity so both import styles share singleton gate/manager
+# state instead of creating split process-level instances.
+_this_module = sys.modules.get(__name__)
+if _this_module is not None:
+    if __name__.startswith("backend."):
+        sys.modules.setdefault("intelligence.cloud_sql_connection_manager", _this_module)
+    elif __name__ == "intelligence.cloud_sql_connection_manager":
+        sys.modules.setdefault("backend.intelligence.cloud_sql_connection_manager", _this_module)
 
 # Type variable for generic async operations
 T = TypeVar('T')

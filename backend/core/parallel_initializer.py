@@ -2412,215 +2412,107 @@ class ParallelInitializer:
 
     async def _init_learning_database(self):
         """
-        Initialize learning database with ProxyReadinessGate coordination.
+        Initialize the process-wide learning database singleton.
 
-        v86.0 Enhancements:
-        - Checks ProxyReadinessGate state before attempting CloudSQL connections
-        - No redundant retries if gate already knows CloudSQL is unavailable
-        - Gracefully falls back to SQLite based on gate's determination
-        - Respects credential vs proxy failure distinction from gate
+        Root-cause fixes:
+        - Enforces a canonical module identity to avoid split singletons
+          (`intelligence.*` vs `backend.intelligence.*`)
+        - Uses singleton initialization path instead of ad-hoc per-component
+          instances, preventing duplicate cold-start work and lock contention
+        - Uses startup-aware fast mode by default for deterministic readiness
         """
         try:
-            from intelligence.learning_database import JARVISLearningDatabase
+            import importlib
+            import sys
 
-            learning_db = JARVISLearningDatabase()
-            _learning_db_stored = False  # v3.2: Track if DB was stored in app.state
+            backend_mod_name = "backend.intelligence.learning_database"
+            legacy_mod_name = "intelligence.learning_database"
+            learning_db_module = None
 
-            # v86.0: Check ProxyReadinessGate state for smarter initialization
-            try:
-                from intelligence.cloud_sql_connection_manager import (
-                    get_readiness_gate,
-                    ReadinessState
+            for module_name in (backend_mod_name, legacy_mod_name):
+                try:
+                    learning_db_module = importlib.import_module(module_name)
+                    break
+                except ImportError:
+                    continue
+
+            if learning_db_module is None:
+                raise ImportError(
+                    "Learning database module unavailable "
+                    "(tried backend.intelligence.learning_database, intelligence.learning_database)"
                 )
+
+            # Canonicalize aliases to prevent split singleton state.
+            sys.modules.setdefault(backend_mod_name, learning_db_module)
+            sys.modules.setdefault(legacy_mod_name, learning_db_module)
+
+            get_learning_database = getattr(learning_db_module, "get_learning_database")
+
+            existing = getattr(self.app.state, "learning_db", None)
+            if existing is not None and getattr(existing, "_initialized", False):
+                logger.debug("   Learning database already initialized on app.state")
+                return
+
+            # Startup policy: fast mode by default for deterministic readiness.
+            fast_mode = os.getenv("JARVIS_LEARNING_DB_FAST_MODE", "true").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if os.getenv("JARVIS_LEARNING_DB_FORCE_STANDARD", "false").lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                fast_mode = False
+
+            gate_state_value = "unknown"
+            try:
+                try:
+                    from intelligence.cloud_sql_connection_manager import (
+                        get_readiness_gate,
+                        ReadinessState,
+                    )
+                except ImportError:
+                    from backend.intelligence.cloud_sql_connection_manager import (
+                        get_readiness_gate,
+                        ReadinessState,
+                    )
 
                 gate = get_readiness_gate()
                 gate_state = gate.state
+                gate_state_value = gate_state.value
 
-                # If gate already determined CloudSQL is unavailable, skip retries
-                if gate_state == ReadinessState.DEGRADED_SQLITE:
-                    logger.info("   ProxyReadinessGate indicates credentials invalid - using SQLite only")
-                    await asyncio.wait_for(learning_db.initialize(), timeout=20.0)
-                    self.app.state.learning_db = learning_db
-                    _learning_db_stored = True
-                    logger.info("   ✅ Learning database ready (SQLite fallback mode)")
-                    return
+                # If Cloud SQL is known degraded/unavailable, bias startup to fast
+                # local readiness and let cloud services recover asynchronously.
+                if gate_state in (ReadinessState.UNAVAILABLE, ReadinessState.DEGRADED_SQLITE):
+                    fast_mode = True
+            except Exception:
+                pass
 
-                elif gate_state == ReadinessState.UNAVAILABLE:
-                    logger.info("   ProxyReadinessGate indicates proxy unavailable - using SQLite only")
-                    await asyncio.wait_for(learning_db.initialize(), timeout=20.0)
-                    self.app.state.learning_db = learning_db
-                    _learning_db_stored = True
-                    logger.info("   ✅ Learning database ready (SQLite fallback, proxy may recover)")
-                    return
+            logger.info(
+                "   Learning DB bootstrap policy: module=%s, mode=%s, gate=%s",
+                learning_db_module.__name__,
+                "fast" if fast_mode else "standard",
+                gate_state_value,
+            )
 
-                elif gate_state == ReadinessState.READY:
-                    # CloudSQL verified ready - initialize with confidence
-                    logger.info("   ProxyReadinessGate confirmed DB-level ready - initializing with CloudSQL")
-                    await asyncio.wait_for(learning_db.initialize(), timeout=20.0)
-                    self.app.state.learning_db = learning_db
-                    _learning_db_stored = True
-                    logger.info("   ✅ Learning database ready (hybrid CloudSQL + SQLite)")
-                    return
-
-                # Gate state is UNKNOWN or CHECKING - wait briefly then proceed
-                elif gate_state in (ReadinessState.UNKNOWN, ReadinessState.CHECKING):
-                    logger.info(f"   ProxyReadinessGate state is {gate_state.value} - waiting for DB-level verification...")
-
-                    # Wait for gate to reach a final state (max 15s)
-                    try:
-                        result = await gate.wait_for_ready(timeout=15.0)
-
-                        if result.state == ReadinessState.READY:
-                            logger.info(f"   Gate confirmed ready")
-                            # Fall through to retry loop with CloudSQL available
-                        elif result.state in (ReadinessState.UNAVAILABLE, ReadinessState.DEGRADED_SQLITE):
-                            # v238.0: Gate gave definitive non-READY answer — skip retries,
-                            # initialize with SQLite fallback immediately. This eliminates
-                            # the 3×20s retry cascade when Cloud SQL is confirmed unavailable.
-                            logger.info(
-                                f"   Gate determined {result.state.value} after wait — "
-                                f"fast-falling to SQLite (skipping {3}×{20}s retries)"
-                            )
-                            await asyncio.wait_for(learning_db.initialize(), timeout=20.0)
-                            self.app.state.learning_db = learning_db
-                            _learning_db_stored = True
-                            logger.info("   ✅ Learning database ready (SQLite fallback, gate-directed)")
-                            return
-                        else:
-                            logger.info(f"   Gate determined state: {result.state.value} ({result.failure_reason or 'no details'})")
-
-                    except asyncio.TimeoutError:
-                        logger.warning("   Gate verification timeout - proceeding with initialization anyway")
-
-            except ImportError:
-                # ProxyReadinessGate not available - use legacy behavior
-                logger.debug("   ProxyReadinessGate not available - using legacy initialization")
-
-            # Try initialization with retries (only if gate didn't give definitive answer)
-            max_retries = 3
-            retry_delay = 2.0
-            # v3.2: Track component elapsed time so per-attempt timeouts don't
-            # exceed the component's stale_threshold. Without this, worst case
-            # is 3×20s + 15s gate wait = 75s, which exceeds the 60s stale_threshold
-            # and gets killed by the watchdog before retries complete.
-            _comp = self.components.get("learning_database")
-            _comp_budget = (_comp.stale_threshold_seconds - 5.0) if _comp else 55.0  # 5s safety margin
-            _comp_start = (_comp.start_time if _comp else None) or time.time()
-
-            for attempt in range(max_retries):
-                try:
-                    # v3.2: Check remaining time budget before each attempt
-                    _elapsed = time.time() - _comp_start
-                    _remaining = _comp_budget - _elapsed
-                    if _remaining < 5.0:
-                        logger.warning(
-                            f"   Learning DB: only {_remaining:.1f}s remaining in component budget "
-                            f"(elapsed {_elapsed:.1f}s) — aborting retries, using SQLite"
-                        )
-                        await asyncio.wait_for(learning_db.initialize(), timeout=min(max(_remaining, 3.0), 10.0))
-                        self.app.state.learning_db = learning_db
-                        _learning_db_stored = True
-                        logger.info("   ✅ Learning database ready (SQLite fallback, budget exhausted)")
-                        return
-
-                    # v238.0: Before each retry, re-check gate state — if it transitioned
-                    # to UNAVAILABLE since we started, bail immediately instead of wasting
-                    # another 20s timeout.
-                    if attempt > 0:
-                        try:
-                            from intelligence.cloud_sql_connection_manager import (
-                                get_readiness_gate as _get_gate,
-                                ReadinessState as _RS,
-                            )
-                            _gate = _get_gate()
-                            _gs = _gate.state
-                            if _gs in (_RS.UNAVAILABLE, _RS.DEGRADED_SQLITE):
-                                logger.info(
-                                    f"   Gate now {_gs.value} — aborting retry {attempt+1}, "
-                                    f"falling to SQLite"
-                                )
-                                await asyncio.wait_for(learning_db.initialize(), timeout=min(_remaining, 20.0))
-                                self.app.state.learning_db = learning_db
-                                _learning_db_stored = True
-                                logger.info("   ✅ Learning database ready (SQLite fallback, mid-retry gate check)")
-                                return
-                        except (ImportError, Exception):
-                            pass  # Gate unavailable — continue with retry
-
-                    # v226.1: Create fresh instance per attempt to avoid partial-state
-                    # reuse. A timed-out initialize() may leave SQLite connections open,
-                    # partial schema, or half-initialized ChromaDB. Retrying on the same
-                    # instance leaks resources and risks inconsistent state.
-                    if attempt > 0:
-                        try:
-                            await learning_db.close()
-                        except BaseException:
-                            pass
-                        learning_db = JARVISLearningDatabase()
-
-                    # v3.2: Per-attempt timeout bounded by remaining budget
-                    _per_attempt_timeout = min(20.0, _remaining - 2.0)  # 2s buffer
-                    await asyncio.wait_for(learning_db.initialize(), timeout=_per_attempt_timeout)
-                    self.app.state.learning_db = learning_db
-                    _learning_db_stored = True
-                    logger.info("   ✅ Learning database ready (hybrid CloudSQL + SQLite)")
-                    return
-
-                except asyncio.CancelledError:
-                    # v3.1: Cancellation-safe cleanup — close any partially-initialized
-                    # connections (asyncpg pools, SQLite handles) before propagating.
-                    # Without this, a watchdog cancel mid-initialize leaks DB connections.
-                    try:
-                        await asyncio.wait_for(learning_db.close(), timeout=3.0)
-                    except BaseException:
-                        pass
-                    raise
-
-                except asyncio.TimeoutError:
-                    if attempt < max_retries - 1:
-                        logger.info(f"   Learning DB init timeout (attempt {attempt+1}/{max_retries}) - retrying in {retry_delay}s...")
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        raise RuntimeError(f"Learning DB initialization timeout after {max_retries} attempts")
-
-                except Exception as e:
-                    error_str = str(e).lower()
-                    # Check if it's a connection error (proxy not ready)
-                    if any(err in error_str for err in ['connection', 'proxy', 'refused', 'timeout']):
-                        if attempt < max_retries - 1:
-                            logger.info(f"   CloudSQL not ready (attempt {attempt+1}/{max_retries}) - retrying in {retry_delay}s...")
-                            await asyncio.sleep(retry_delay)
-                            continue
-                        else:
-                            logger.warning(f"   ⚠️ CloudSQL unavailable after {max_retries} attempts - using SQLite only")
-                            # Still store the DB instance - it will fall back to SQLite
-                            self.app.state.learning_db = learning_db
-                            _learning_db_stored = True
-                            return
-                    else:
-                        # Non-connection error - raise immediately
-                        raise
+            learning_db = await get_learning_database(fast_mode=fast_mode)
+            self.app.state.learning_db = learning_db
+            self.app.state.learning_db_fast_mode = fast_mode
+            self.app.state.learning_db_module = learning_db_module.__name__
+            logger.info(
+                "   ✅ Learning database ready (singleton=%s, mode=%s)",
+                learning_db_module.__name__,
+                "fast" if fast_mode else "standard",
+            )
 
         except asyncio.CancelledError:
-            # v3.2: Clean up partially-initialized DB before propagating cancellation.
-            # Without this, CancelledError skips the Exception handler below and
-            # leaks SQLite/asyncpg connections held by learning_db.
-            if not locals().get('_learning_db_stored', True):
-                try:
-                    await asyncio.wait_for(learning_db.close(), timeout=3.0)
-                except BaseException:
-                    pass
             raise
 
         except Exception as e:
             logger.warning(f"⚠️ Learning database initialization failed: {e}")
             logger.info("   System will operate without persistent learning (memory only)")
-            # v3.2: Close partially-initialized DB if it wasn't stored in app.state.
-            if not locals().get('_learning_db_stored', True):
-                try:
-                    await asyncio.wait_for(learning_db.close(), timeout=3.0)
-                except BaseException:
-                    pass
             # Don't raise - system can operate without learning DB
 
     async def _init_gcp_vm_manager(self):

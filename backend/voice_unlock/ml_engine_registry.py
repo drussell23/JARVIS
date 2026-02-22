@@ -2004,23 +2004,27 @@ class MLEngineRegistry:
                 if normalized:
                     candidates.append((normalized, f"{env_key.lower()}"))
 
-        # 3) Single endpoint env vars (Cloud Run preferred).
-        cloud_run_url = os.getenv(
-            "ECAPA_CLOUD_RUN_URL",
-            os.getenv(
-                "JARVIS_CLOUD_ML_ENDPOINT",
-                "https://jarvis-ml-888774109345.us-central1.run.app",
-            ),
-        )
-        if cloud_run_url:
-            candidates.append((cloud_run_url, "cloud_run_env"))
+        # 3) Single endpoint env vars (operator-configured only; no hardcoded URL).
+        for env_key, source in (
+            ("ECAPA_CLOUD_RUN_URL", "cloud_run_env"),
+            ("JARVIS_CLOUD_ML_ENDPOINT", "jarvis_cloud_ml_endpoint"),
+            ("JARVIS_CLOUD_ECAPA_ENDPOINT", "jarvis_cloud_ecapa_endpoint"),
+            ("JARVIS_ML_CLOUD_ENDPOINT", "jarvis_ml_cloud_endpoint"),
+        ):
+            endpoint = os.getenv(env_key, "").strip()
+            if endpoint:
+                candidates.append((endpoint, source))
 
-        explicit_cloud_endpoint = os.getenv(
-            "JARVIS_CLOUD_ECAPA_ENDPOINT",
-            os.getenv("JARVIS_ML_CLOUD_ENDPOINT", ""),
-        )
-        if explicit_cloud_endpoint:
-            candidates.append((explicit_cloud_endpoint, "explicit_env"))
+        # 3.5) Cross-repo endpoint sharing (JARVIS Prime / Reactor Core).
+        try:
+            shared_state = await self._read_cross_repo_ecapa_state()
+            if shared_state:
+                shared_endpoint = str(shared_state.get("cloud_endpoint", "")).strip()
+                shared_source_repo = str(shared_state.get("source_repo", "unknown")).strip()
+                if shared_endpoint:
+                    candidates.append((shared_endpoint, f"cross_repo_state:{shared_source_repo}"))
+        except Exception as e:
+            logger.debug(f"Cross-repo endpoint discovery failed: {e}")
 
         # 4) Optional localhost fallbacks, but only if explicitly allowed.
         allow_local_fallback = os.getenv(
@@ -2203,70 +2207,96 @@ class MLEngineRegistry:
             return True, "Contract verification cached"
 
         req_timeout = max(1.0, float(timeout or os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0")))
+        probe_attempts = max(1, int(os.getenv("JARVIS_CLOUD_CONTRACT_ATTEMPTS", "2")))
+        probe_backoff = max(0.1, float(os.getenv("JARVIS_CLOUD_CONTRACT_BACKOFF_SECONDS", "0.35")))
+        connect_timeout = max(
+            0.5,
+            min(
+                req_timeout,
+                float(os.getenv("JARVIS_CLOUD_CONTRACT_CONNECT_TIMEOUT", "2.0")),
+            ),
+        )
+        read_timeout = max(
+            0.5,
+            float(os.getenv("JARVIS_CLOUD_CONTRACT_READ_TIMEOUT", str(req_timeout))),
+        )
         health_url = f"{target}/api/ml/health"
         embed_url = f"{target}/api/ml/speaker_embedding"
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Contract requirement 1: /api/ml/health must exist and advertise ECAPA readiness.
-                async with session.get(
-                    health_url,
-                    timeout=aiohttp.ClientTimeout(total=req_timeout),
-                    headers={"Accept": "application/json"},
-                ) as response:
-                    if response.status != 200:
-                        reason = f"/api/ml/health returned HTTP {response.status}"
-                        self._cloud_contract_verified = False
-                        self._cloud_contract_endpoint = target
-                        self._cloud_contract_last_checked = time.time()
-                        self._cloud_contract_last_error = reason
-                        return False, reason
-
-                    payload = await response.json()
-                    ecapa_ready = payload.get("ecapa_ready")
-                    if not isinstance(ecapa_ready, bool):
-                        reason = "missing boolean ecapa_ready in /api/ml/health"
-                        self._cloud_contract_verified = False
-                        self._cloud_contract_endpoint = target
-                        self._cloud_contract_last_checked = time.time()
-                        self._cloud_contract_last_error = reason
-                        return False, reason
-
-                # Contract requirement 2: embedding path must be routable.
-                async with session.options(
-                    embed_url,
-                    timeout=aiohttp.ClientTimeout(total=req_timeout),
-                    headers={"Accept": "application/json"},
-                ) as response:
-                    if response.status == 404:
-                        reason = "/api/ml/speaker_embedding route missing (HTTP 404)"
-                        self._cloud_contract_verified = False
-                        self._cloud_contract_endpoint = target
-                        self._cloud_contract_last_checked = time.time()
-                        self._cloud_contract_last_error = reason
-                        return False, reason
-                    if response.status >= 500:
-                        reason = f"/api/ml/speaker_embedding options failed (HTTP {response.status})"
-                        self._cloud_contract_verified = False
-                        self._cloud_contract_endpoint = target
-                        self._cloud_contract_last_checked = time.time()
-                        self._cloud_contract_last_error = reason
-                        return False, reason
-
-        except asyncio.TimeoutError:
-            reason = f"contract probe timed out after {req_timeout:.1f}s"
-            self._cloud_contract_verified = False
-            self._cloud_contract_endpoint = target
-            self._cloud_contract_last_checked = time.time()
-            self._cloud_contract_last_error = reason
-            return False, reason
-        except Exception as e:
-            reason = f"contract probe error: {type(e).__name__}: {e}"
+        def _record_contract_failure(reason: str) -> Tuple[bool, str]:
             self._cloud_contract_verified = False
             self._cloud_contract_endpoint = target
             self._cloud_contract_last_checked = time.time()
             self._cloud_contract_last_error = reason[:240]
             return False, reason
+
+        last_transient_reason = ""
+        timeout_cfg = aiohttp.ClientTimeout(
+            total=req_timeout,
+            connect=connect_timeout,
+            sock_read=read_timeout,
+        )
+
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(1, probe_attempts + 1):
+                try:
+                    # Contract requirement 1: /api/ml/health must exist and advertise ECAPA readiness.
+                    async with session.get(
+                        health_url,
+                        timeout=timeout_cfg,
+                        headers={"Accept": "application/json"},
+                    ) as response:
+                        if response.status != 200:
+                            reason = f"/api/ml/health returned HTTP {response.status}"
+                            return _record_contract_failure(reason)
+
+                        payload = await response.json()
+                        ecapa_ready = payload.get("ecapa_ready")
+                        if not isinstance(ecapa_ready, bool):
+                            reason = "missing boolean ecapa_ready in /api/ml/health"
+                            return _record_contract_failure(reason)
+
+                    # Contract requirement 2: embedding path must be routable.
+                    async with session.options(
+                        embed_url,
+                        timeout=timeout_cfg,
+                        headers={"Accept": "application/json"},
+                    ) as response:
+                        if response.status == 404:
+                            reason = "/api/ml/speaker_embedding route missing (HTTP 404)"
+                            return _record_contract_failure(reason)
+                        if response.status >= 500:
+                            # 5xx during startup is usually transient (cold start/redeploy).
+                            last_transient_reason = (
+                                f"/api/ml/speaker_embedding options failed (HTTP {response.status})"
+                            )
+                            if attempt < probe_attempts:
+                                await asyncio.sleep(min(2.0, probe_backoff * (2 ** (attempt - 1))))
+                                continue
+                            return _record_contract_failure(last_transient_reason)
+
+                    # Success
+                    last_transient_reason = ""
+                    break
+
+                except asyncio.TimeoutError:
+                    last_transient_reason = (
+                        f"contract probe timed out after {req_timeout:.1f}s "
+                        f"(attempt {attempt}/{probe_attempts})"
+                    )
+                except aiohttp.ClientError as e:
+                    last_transient_reason = (
+                        f"contract probe connection error: {type(e).__name__}: {e}"
+                    )
+                except Exception as e:
+                    last_transient_reason = (
+                        f"contract probe error: {type(e).__name__}: {e}"
+                    )
+
+                if attempt < probe_attempts:
+                    await asyncio.sleep(min(2.0, probe_backoff * (2 ** (attempt - 1))))
+                else:
+                    return _record_contract_failure(last_transient_reason)
 
         self._cloud_contract_verified = True
         self._cloud_contract_endpoint = target
@@ -2394,21 +2424,6 @@ class MLEngineRegistry:
             "yes",
         )
 
-        contract_ok, contract_reason = await self._verify_cloud_endpoint_contract(
-            timeout=min(timeout, float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"))),
-            force=True,
-        )
-        if not contract_ok:
-            self._cloud_verified = False
-            if strict_contract:
-                self._use_cloud = False
-            reason = (
-                f"Cloud endpoint contract validation failed for {base_url} "
-                f"(source={self._cloud_endpoint_source}): {contract_reason}"
-            )
-            logger.warning(reason)
-            return False, reason
-
         # =====================================================================
         # v115.0: CHECK CROSS-REPO STATE FIRST (Trinity Coordination)
         # =====================================================================
@@ -2439,6 +2454,21 @@ class MLEngineRegistry:
             elif not cross_ready:
                 logger.info(f"ℹ️  [v115.0] Cross-repo state from {cross_source}: ECAPA not ready")
                 # Continue with our own verification - the other repo might have timed out
+
+        contract_ok, contract_reason = await self._verify_cloud_endpoint_contract(
+            timeout=min(timeout, float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"))),
+            force=True,
+        )
+        if not contract_ok:
+            self._cloud_verified = False
+            if strict_contract:
+                self._use_cloud = False
+            reason = (
+                f"Cloud endpoint contract validation failed for {base_url} "
+                f"(source={self._cloud_endpoint_source}): {contract_reason}"
+            )
+            logger.warning(reason)
+            return False, reason
 
         logger.info(f"🔍 [v115.0] Verifying cloud backend: {base_url}")
         logger.info(f"   Wait for ECAPA: {wait_for_ecapa}, Max wait: {ecapa_wait_timeout}s")

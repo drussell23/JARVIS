@@ -21993,11 +21993,24 @@ class PersistentConversationMemoryAgent:
                     _memory_percent,
                 )
             else:
-                self._boot_context_loaded = False
-                self._boot_load_error = (
-                    f"boot context timeout after {stage1_timeout:.1f}s (continuing in background)"
+                # Stage-1 timeout is an expected non-fatal condition during cold
+                # startup. Represent it as explicit deferred state so callers can
+                # proceed deterministically while hydration continues in background.
+                self._apply_boot_context(
+                    interaction_preview=[],
+                    preference_preview=[],
+                    interactions_loaded=0,
+                    preferences_loaded=0,
+                    stage="deferred",
+                    source="startup_timeout",
                 )
-                self._logger.warning(f"[MemoryAgent] {self._boot_load_error}")
+                self._boot_context_loaded = True
+                self._boot_load_error = None
+                self._logger.info(
+                    "[MemoryAgent] Boot context stage-1 timed out after %.1fs; "
+                    "continuing with deferred context hydration",
+                    stage1_timeout,
+                )
         except Exception as e:
             if restored_cache:
                 self._boot_context_loaded = True

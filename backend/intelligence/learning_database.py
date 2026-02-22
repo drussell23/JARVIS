@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Awaitable, Dict, List, Optional, Set, Tuple, Union
 
 import aiosqlite
 
@@ -70,6 +71,15 @@ except Exception:
     ROBUST_FILE_LOCK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# Canonicalize module identity so `intelligence.learning_database` and
+# `backend.intelligence.learning_database` share one singleton state.
+_this_module = sys.modules.get(__name__)
+if _this_module is not None:
+    if __name__.startswith("backend."):
+        sys.modules.setdefault("intelligence.learning_database", _this_module)
+    elif __name__ == "intelligence.learning_database":
+        sys.modules.setdefault("backend.intelligence.learning_database", _this_module)
 
 # v18.0: Database operation configuration
 DB_QUERY_TIMEOUT = float(os.getenv("DB_QUERY_TIMEOUT_SECONDS", "30.0"))
@@ -2470,6 +2480,27 @@ class JARVISLearningDatabase:
 
         logger.info(f"Advanced JARVIS Learning Database initializing at {self.db_dir}")
 
+    def _schedule_background_task(self, name: str, coro: "Awaitable[Any]") -> None:
+        """
+        Track non-critical initialization work as managed background tasks.
+
+        Fast startup paths should never block on optional subsystems.
+        """
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.append(task)
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            if done_task in self._background_tasks:
+                self._background_tasks.remove(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                logger.debug(f"[LearningDB] Background task cancelled: {name}")
+            except Exception as bg_err:
+                logger.warning(f"[LearningDB] Background task failed ({name}): {bg_err}")
+
+        task.add_done_callback(_on_done)
+
     async def initialize(self, fast_mode: bool = False):
         """
         Async initialization - call this after creating instance.
@@ -2523,47 +2554,44 @@ class JARVISLearningDatabase:
         self.db = await create_sqlite_connection(str(self.sqlite_path))
         await self._ensure_schema_created()
 
-        # Phase 2: Parallel initialization of independent components
-        logger.info("🚀 Fast mode: Parallel component initialization...")
-        parallel_tasks = []
+        # Phase 2: Critical fast-mode work only.
+        # Keep this path deterministic and bounded for startup-critical callers
+        # (voice unlock, memory boot context, supervisor bring-up).
+        logger.info("🚀 Fast mode: Loading critical metadata...")
+        try:
+            await self._load_metrics()
+        except Exception as metrics_error:
+            logger.warning(f"⚠️  Fast mode: metrics initialization failed: {metrics_error}")
 
-        # ChromaDB is independent - can init in parallel
+        # Phase 3: Optional subsystems initialize in managed background tasks.
+        # They should enhance capability without delaying readiness.
         if CHROMADB_AVAILABLE:
-            parallel_tasks.append(("chromadb", self._init_chromadb()))
+            self._schedule_background_task(
+                "learning-db-chromadb-init",
+                self._init_chromadb(),
+            )
 
-        # Metrics load depends on sqlite (now ready)
-        parallel_tasks.append(("metrics", self._load_metrics()))
-
-        # Hybrid sync depends on sqlite (now ready)
         if self._sync_enabled:
-            parallel_tasks.append(("hybrid_sync", self._init_hybrid_sync()))
-
-        # Run all parallel tasks with individual error handling
-        if parallel_tasks:
-            results = await asyncio.gather(
-                *[task[1] for task in parallel_tasks],
-                return_exceptions=True
+            self._schedule_background_task(
+                "learning-db-hybrid-sync-init",
+                self._init_hybrid_sync(),
             )
 
-            # Log any failures (non-fatal in fast mode)
-            for (name, _), result in zip(parallel_tasks, results):
-                if isinstance(result, Exception):
-                    logger.warning(f"⚠️  Fast mode: {name} initialization failed: {result}")
-
-        # Phase 3: Background enhancement (non-blocking)
-        # Cloud SQL adapter starts in background - doesn't block startup
         if self._cloud_adapter_enabled and CLOUD_ADAPTER_AVAILABLE:
-            _task = asyncio.create_task(
+            self._schedule_background_task(
+                "learning-db-cloud-sql-upgrade",
                 self._background_cloud_sql_upgrade(),
-                name="learning-db-cloud-sql-upgrade",
             )
-            self._background_tasks.append(_task)
-            _task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
 
         # Phase 4: Start background maintenance tasks
-        flush_task = asyncio.create_task(self._auto_flush_batches())
-        optimize_task = asyncio.create_task(self._auto_optimize_task())
-        self._background_tasks.extend([flush_task, optimize_task])
+        self._schedule_background_task(
+            "learning-db-auto-flush",
+            self._auto_flush_batches(),
+        )
+        self._schedule_background_task(
+            "learning-db-auto-optimize",
+            self._auto_optimize_task(),
+        )
 
         self._initialized = True
 
