@@ -682,8 +682,11 @@ class ConversationPipeline:
         return ""
 
     async def _classify_turn_intent(self, user_text: str) -> Dict[str, Any]:
-        """
-        Classify conversational intent into deterministic route buckets.
+        """Classify intent using lightweight heuristics. No ML classifier.
+
+        v242.1: Removed CAI dependency. J-Prime handles deep classification
+        via UCP for the 'execute' route. ConversationPipeline only needs to
+        distinguish commands from conversation.
 
         Routes:
             - discuss: normal conversational LLM response
@@ -691,6 +694,8 @@ class ConversationPipeline:
             - authenticate: security-sensitive execution flow
         """
         lowered = (user_text or "").strip().lower()
+
+        # Protected local op: voice biometric authentication
         if _AUTHENTICATE_PATTERN.search(lowered):
             return {
                 "route": "authenticate",
@@ -699,39 +704,65 @@ class ConversationPipeline:
                 "source": "heuristic",
             }
 
-        prediction = await self._predict_intent(user_text)
-        intent = str(prediction.get("intent", "conversation")).lower()
-        confidence = float(prediction.get("confidence", 0.0) or 0.0)
-        route = "discuss"
+        # Imperative verb heuristic — fast, no ML overhead
+        if _EXECUTE_IMPERATIVE_PATTERN.search(lowered):
+            return {
+                "route": "execute",
+                "intent": "system_command",
+                "confidence": 0.8,
+                "source": "heuristic",
+            }
 
-        execute_intents = {
-            "display_control",
-            "system_command",
-            "automation_request",
-            "preference_setting",
-        }
+        # v242.1 CAI rollback gate: if explicitly enabled, use ML classification
+        if os.environ.get("JARVIS_CONV_PIPELINE_USE_CAI", "").lower() in (
+            "true",
+            "1",
+            "yes",
+        ):
+            prediction = await self._predict_intent(user_text)
+            intent = str(prediction.get("intent", "conversation")).lower()
+            confidence = float(prediction.get("confidence", 0.0) or 0.0)
+            execute_intents = {
+                "display_control",
+                "system_command",
+                "automation_request",
+                "preference_setting",
+            }
+            if intent in execute_intents and confidence >= _EXECUTE_INTENT_CONFIDENCE:
+                return {
+                    "route": "execute",
+                    "intent": intent,
+                    "confidence": confidence,
+                    "source": prediction.get("source", "cai"),
+                }
+            return {
+                "route": "discuss",
+                "intent": intent,
+                "confidence": confidence,
+                "source": prediction.get("source", "fallback"),
+            }
 
-        if intent in execute_intents and confidence >= _EXECUTE_INTENT_CONFIDENCE:
-            route = "execute"
-        elif _EXECUTE_IMPERATIVE_PATTERN.search(lowered):
-            # v258.3: Imperative verb pattern is a FALLBACK heuristic, not
-            # an override. Only fire when CAI was unavailable (source=fallback)
-            # or returned low confidence. If CAI confidently classified as
-            # "conversation", trust it — "run a thought experiment" is NOT a
-            # command even though it starts with "run".
-            source = prediction.get("source", "fallback")
-            if source == "fallback" or confidence < _EXECUTE_INTENT_CONFIDENCE:
-                route = "execute"
-
+        # Default: conversational (stay in discuss path for fast local LLM)
         return {
-            "route": route,
-            "intent": intent,
-            "confidence": confidence,
-            "source": prediction.get("source", "fallback"),
+            "route": "discuss",
+            "intent": "conversation",
+            "confidence": 0.8,
+            "source": "heuristic",
         }
 
     async def _predict_intent(self, user_text: str) -> Dict[str, Any]:
-        """Predict intent using CAI when available; fall back safely when unavailable."""
+        """Predict intent using CAI when available; fall back safely when unavailable.
+
+        v242.1: Gated behind JARVIS_CONV_PIPELINE_USE_CAI=true (default: false).
+        CAI classification is redundant with J-Prime's Phi classifier.
+        """
+        if not os.environ.get("JARVIS_CONV_PIPELINE_USE_CAI", "").lower() in (
+            "true",
+            "1",
+            "yes",
+        ):
+            return {"intent": "conversation", "confidence": 0.0, "source": "cai_disabled"}
+
         if self._intent_classifier is None and not self._intent_classifier_init_failed:
             try:
                 from backend.intelligence.context_awareness_intelligence import (
