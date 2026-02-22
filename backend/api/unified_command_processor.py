@@ -292,6 +292,19 @@ class UnifiedCommandProcessor:
             os.getenv("JARVIS_REFLEX_CACHE_INTERVAL", "5.0")
         )
 
+        # v242.1: Observability counters for routing diagnostics
+        self._v242_metrics = {
+            "reflex_hits": 0,
+            "reflex_cache_hits": 0,
+            "jprime_calls": 0,
+            "jprime_timeouts": 0,
+            "jprime_503_retries": 0,
+            "brain_vacuum_activations": 0,
+            "vision_requests": 0,
+            "workspace_requests": 0,
+            "classifications": {},  # domain -> count
+        }
+
     async def _initialize_resolvers(self):
         """
         Initialize resolver systems using robust parallel tiered initialization.
@@ -1315,6 +1328,7 @@ class UnifiedCommandProcessor:
         # === Step 1: Reflex manifest check (sub-ms, file-based) ===
         reflex = await self._check_reflex_manifest(command_text)
         if reflex:
+            self._v242_metrics["reflex_hits"] += 1
             logger.info(f"[v242] Reflex matched: {reflex.get('reflex_id')} for '{command_text[:60]}'")
             result = await self._execute_reflex(reflex, command_text)
             # Fire-and-forget telemetry notification
@@ -1360,6 +1374,11 @@ class UnifiedCommandProcessor:
                 f"[v242] J-Prime classified: intent={response.intent}, "
                 f"domain={response.domain}, confidence={response.confidence:.2f}, "
                 f"source={response.source}"
+            )
+            # v242.1: Track classification domain distribution
+            _cls_domain = response.domain or "unknown"
+            self._v242_metrics["classifications"][_cls_domain] = (
+                self._v242_metrics["classifications"].get(_cls_domain, 0) + 1
             )
             result = await self._execute_action(
                 response, command_text, websocket, audio_data, speaker_name
@@ -1449,6 +1468,10 @@ class UnifiedCommandProcessor:
     # v242 SPINAL REFLEX ARC — New methods for reflex + J-Prime routing
     # =========================================================================
 
+    def get_routing_metrics(self) -> Dict[str, Any]:
+        """Return v242 routing metrics for observability."""
+        return dict(self._v242_metrics)
+
     async def _check_reflex_manifest(self, command_text: str) -> Optional[Dict[str, Any]]:
         """Check if command matches a reflex in the J-Prime-published manifest.
 
@@ -1494,6 +1517,9 @@ class UnifiedCommandProcessor:
                     self._reflex_inhibition_hash = ""
             except (OSError, json.JSONDecodeError):
                 pass  # Keep stale cache on read error
+        else:
+            # v242.1: Cache was fresh — no disk read needed
+            self._v242_metrics["reflex_cache_hits"] += 1
 
         manifest = self._reflex_manifest_cache
         if not manifest:
@@ -1538,6 +1564,7 @@ class UnifiedCommandProcessor:
         before returning None.
         v242.1: Retries once after 2s on 503 model-swap (source='model_swapping').
         """
+        self._v242_metrics["jprime_calls"] += 1
         client = None
         try:
             from core.jarvis_prime_client import get_jarvis_prime_client
@@ -1563,6 +1590,7 @@ class UnifiedCommandProcessor:
 
             # v242.1: Detect model-swap 503 and retry once after 2s
             if response and getattr(response, 'source', '') == 'model_swapping':
+                self._v242_metrics["jprime_503_retries"] += 1
                 # Only retry if we have enough time left
                 retry_timeout = timeout
                 if deadline:
@@ -1611,6 +1639,7 @@ class UnifiedCommandProcessor:
                 return response
 
         except asyncio.TimeoutError:
+            self._v242_metrics["jprime_timeouts"] += 1
             logger.warning("[v242] J-Prime call timed out")
         except Exception as e:
             logger.warning(f"[v242] J-Prime call failed: {e}")
@@ -1618,6 +1647,7 @@ class UnifiedCommandProcessor:
         # v242.1: J-Prime failed — try brain vacuum fallback via existing client
         if client is not None:
             try:
+                self._v242_metrics["brain_vacuum_activations"] += 1
                 logger.info("[v242] Attempting brain vacuum fallback via client")
                 return await client._brain_vacuum_fallback(
                     query=command_text, system_prompt=None, max_tokens=512,
@@ -1878,6 +1908,7 @@ class UnifiedCommandProcessor:
         v242.1: Uses Neural Mesh agent registry singleton if available,
         falls back to lazy singleton to avoid expensive re-initialization.
         """
+        self._v242_metrics["workspace_requests"] += 1
         try:
             # Prefer existing agent instance from Neural Mesh coordinator
             agent = None
@@ -1939,6 +1970,7 @@ class UnifiedCommandProcessor:
 
         This ensures no unnecessary screenshots are taken for non-vision intents.
         """
+        self._v242_metrics["vision_requests"] += 1
         try:
             # Phase 2: Capture screenshot and analyze
             if self.vision_router and self._vision_router_initialized:
