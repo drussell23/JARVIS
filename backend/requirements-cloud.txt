@@ -55,7 +55,7 @@ wikipedia-api==0.6.0
 python-dotenv==1.0.0
 
 # Cloud AI APIs
-anthropic==0.72.0
+anthropic==0.83.0
 huggingface-hub==0.19.4  # For Claude API integration
 
 # Weather and location services
