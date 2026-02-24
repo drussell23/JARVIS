@@ -2773,6 +2773,204 @@ def _read_available_memory_gb() -> Optional[float]:
     except Exception:
         return None
 
+
+# =========================================================================
+# v270.1: CENTRALIZED STARTUP MODE MANAGEMENT
+# =========================================================================
+# Single source of truth for mode severity, ideal mode computation, and
+# monotonic degradation. Previously duplicated 6x across _startup_impl,
+# _phase_resources, _phase_backend, and ENOMEM/MemoryError handlers.
+# All callers now delegate to these module-level functions.
+# =========================================================================
+
+_MODE_SEVERITY: Dict[str, int] = {
+    "local_full": 0, "local_optimized": 1, "sequential": 2,
+    "cloud_first": 3, "cloud_only": 4, "minimal": 5,
+}
+
+
+def _mode_severity(mode: str) -> int:
+    """Return severity level for a startup mode (higher = more degraded)."""
+    return _MODE_SEVERITY.get((mode or "local_full").strip().lower(), 0)
+
+
+def _compute_ideal_mode(avail_gb: float) -> str:
+    """Compute the ideal startup mode from current available memory.
+
+    Uses the same thresholds as IntelligentResourceOrchestrator.
+    Clamps cloud modes to 'sequential' when OOMBridge is unavailable.
+    """
+    critical = _get_env_float("JARVIS_CRITICAL_THRESHOLD_GB", 2.0)
+    cloud = _get_env_float("JARVIS_CLOUD_THRESHOLD_GB", 6.0)
+    optimize = _get_env_float("JARVIS_OPTIMIZE_THRESHOLD_GB", 4.0)
+    planned_ml = _get_env_float("JARVIS_PLANNED_ML_GB", 4.6)
+    predicted = max(0.0, avail_gb - planned_ml)
+
+    if avail_gb < critical:
+        ideal = "cloud_only"
+    elif predicted < critical or avail_gb < cloud:
+        ideal = "cloud_first"
+    elif predicted < optimize:
+        ideal = "local_optimized"
+    else:
+        ideal = "local_full"
+
+    # If OOMBridge is broken, cloud modes can't execute reliably.
+    if (
+        os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE") == "0"
+        and ideal in ("cloud_first", "cloud_only")
+    ):
+        ideal = "sequential"
+
+    return ideal
+
+
+def _apply_mode_degradation(new_mode: str, reason: str) -> str:
+    """Apply monotonic mode degradation during startup.
+
+    Returns the effective mode after the call. Only degrades — never recovers
+    upward during startup. Sets JARVIS_STARTUP_MEMORY_MODE only (not
+    EFFECTIVE_MODE — that's set by _reevaluate_mode_at_boundary at phase
+    boundaries).
+    """
+    _log = logging.getLogger(__name__)
+    current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
+    cur_sev = _mode_severity(current)
+    new_sev = _mode_severity(new_mode)
+    if new_sev > cur_sev:
+        desired = os.environ.get("JARVIS_STARTUP_DESIRED_MODE", current)
+        _log.warning(
+            "[ModeControl] degrade desired=%s effective=%s→%s reason=%s",
+            desired, current, new_mode, reason,
+        )
+        os.environ["JARVIS_STARTUP_MEMORY_MODE"] = new_mode
+        return new_mode
+    else:
+        _log.info(
+            "[ModeControl] keep desired=%s effective=%s candidate=%s reason=%s",
+            os.environ.get("JARVIS_STARTUP_DESIRED_MODE", current),
+            current, new_mode, reason,
+        )
+        return current
+
+
+def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
+    """Re-evaluate startup mode at a phase boundary.
+
+    Returns (effective_mode, available_gb). During startup, mode can only
+    degrade (never recover upward). After startup completes, recovery is
+    allowed.
+
+    v270.1: Canonical implementation — replaces inline duplicates in
+    _phase_resources and _phase_backend.
+    """
+    _log = logging.getLogger(__name__)
+    try:
+        avail_gb = _read_available_memory_gb()
+        if avail_gb is None:
+            current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
+            os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = current
+            return current, 0.0
+
+        ideal = _compute_ideal_mode(avail_gb)
+        current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
+        cur_sev = _mode_severity(current)
+        ideal_sev = _mode_severity(ideal)
+        startup_complete = os.environ.get("JARVIS_STARTUP_COMPLETE", "") == "true"
+        is_degradation = ideal_sev > cur_sev
+
+        _predicted = max(0.0, avail_gb - _get_env_float("JARVIS_PLANNED_ML_GB", 4.6))
+
+        if ideal != current and (is_degradation or startup_complete):
+            direction = "upgraded" if ideal_sev < cur_sev else "downgraded"
+            desired = os.environ.get("JARVIS_STARTUP_DESIRED_MODE", current)
+            _log.info(
+                "[ModeControl] %s: %s desired=%s effective=%s→%s (avail=%.1fGB, predicted=%.1fGB)",
+                phase_label, direction, desired, current, ideal, avail_gb, _predicted,
+            )
+            os.environ["JARVIS_STARTUP_MEMORY_MODE"] = ideal
+            os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = ideal
+            os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{avail_gb:.2f}"
+            try:
+                add_dashboard_log(
+                    f"Mode {direction}: {current} → {ideal} "
+                    f"(avail={avail_gb:.1f}GB)", "INFO"
+                )
+            except Exception:
+                pass  # Dashboard may not be initialized yet
+            return ideal, avail_gb
+        else:
+            _log.debug(
+                "[ModeControl] %s: mode %s still correct (avail=%.1fGB)",
+                phase_label, current, avail_gb,
+            )
+            os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = current
+            os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{avail_gb:.2f}"
+            return current, avail_gb
+    except Exception as err:
+        _log.debug("[ModeControl] %s reevaluation error: %s", phase_label, err)
+        current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
+        return current, 0.0
+
+
+def _check_spawn_admission(component: str, min_gb: float = 1.5) -> Tuple[bool, str]:
+    """Pre-spawn admission check — verify enough memory before launching
+    a heavy subprocess.
+
+    Returns (admitted, reason). If not admitted, the caller should skip
+    the subprocess launch and degrade gracefully.
+
+    v270.1: Prevents OOM from launching backend/model subprocesses when
+    memory is already critically low.
+    """
+    mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
+    avail = _read_available_memory_gb()
+
+    # Mode-based rejection: minimal mode means no heavy local work
+    if mode == "minimal":
+        return False, f"mode=minimal — {component} deferred"
+
+    # Memory-based rejection: below floor. Use _compute_ideal_mode for
+    # accurate degradation target instead of hardcoded cloud_first.
+    if avail is not None and avail < min_gb:
+        ideal = _compute_ideal_mode(avail)
+        _apply_mode_degradation(
+            ideal,
+            reason=f"spawn_admission:{component}:avail={avail:.1f}GB<{min_gb}GB",
+        )
+        return False, f"avail={avail:.1f}GB < {min_gb}GB floor for {component}"
+
+    return True, "admitted"
+
+
+async def _kill_orphaned_subprocess(
+    proc: "Optional[asyncio.subprocess.Process]",
+    label: str,
+    timeout: float = 3.0,
+) -> None:
+    """Kill an orphaned subprocess left behind by asyncio.wait_for cancellation.
+
+    v270.1: asyncio.wait_for() cancels the wrapped task on timeout. If that
+    task had spawned a subprocess, the subprocess is orphaned — still running,
+    consuming RAM/ports, invisible to future startups.  This helper is called
+    from CancelledError/TimeoutError handlers to ensure cleanup.
+    """
+    if proc is None or proc.returncode is not None:
+        return  # Already dead or never spawned
+    _log = logging.getLogger(__name__)
+    _log.warning("[SubprocessCleanup] Killing orphaned %s (pid=%s)", label, proc.pid)
+    try:
+        proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        _log.info("[SubprocessCleanup] %s (pid=%s) terminated", label, proc.pid)
+    except asyncio.TimeoutError:
+        _log.error("[SubprocessCleanup] %s (pid=%s) did not exit in %.0fs", label, proc.pid, timeout)
+    except ProcessLookupError:
+        pass  # Already gone
+    except Exception as err:
+        _log.debug("[SubprocessCleanup] %s cleanup error: %s", label, err)
+
+
 def _resolve_local_startup_mode_on_cloud_unavailable(
     current_mode: str,
     available_gb: Optional[float] = None,
@@ -63645,85 +63843,10 @@ class JarvisSystemKernel:
         # RAM, or conversely ML models eating RAM). This helper re-measures and
         # upgrades/downgrades the mode at strategic phase boundaries.
         # =====================================================================
-        _REEVAL_SEVERITY = {
-            "local_full": 0, "local_optimized": 1, "sequential": 2,
-            "cloud_first": 3, "cloud_only": 4, "minimal": 5,
-        }
-
+        # v270.1: Thin wrapper — delegates to module-level _reevaluate_mode_at_boundary.
+        # Kept as nested function so existing call sites within _startup_impl don't change.
         async def _reevaluate_startup_mode(phase_label: str) -> None:
-            """Re-evaluate startup mode at a phase boundary.
-
-            Only changes mode if the measured memory significantly differs from
-            the original decision. Uses the same thresholds as ResourceOrchestrator.
-            """
-            try:
-                import psutil
-                _mem = psutil.virtual_memory()
-                _avail_gb = _mem.available / (1024**3)
-                _current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-                _current_sev = _REEVAL_SEVERITY.get(_current, 0)
-
-                # Same thresholds as IntelligentResourceOrchestrator
-                _critical = float(os.getenv("JARVIS_CRITICAL_THRESHOLD_GB", "2.0"))
-                _cloud = float(os.getenv("JARVIS_CLOUD_THRESHOLD_GB", "6.0"))
-                _optimize = float(os.getenv("JARVIS_OPTIMIZE_THRESHOLD_GB", "4.0"))
-                _planned_ml = float(os.getenv("JARVIS_PLANNED_ML_GB", "4.6"))
-                _predicted = max(0.0, _avail_gb - _planned_ml)
-
-                # Determine what mode SHOULD be based on current conditions
-                if _avail_gb < _critical:
-                    _ideal = "cloud_only"
-                elif _predicted < _critical or _avail_gb < _cloud:
-                    _ideal = "cloud_first"
-                elif _predicted < _optimize:
-                    _ideal = "local_optimized"
-                else:
-                    _ideal = "local_full"
-
-                # If OOM bridge is unavailable, cloud execution cannot be trusted
-                # during startup. Clamp cloud candidates to deterministic sequential.
-                if (
-                    os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE") == "0"
-                    and _ideal in ("cloud_first", "cloud_only")
-                ):
-                    _ideal = "sequential"
-
-                _ideal_sev = _REEVAL_SEVERITY.get(_ideal, 0)
-
-                # Only change if significantly different (at least 1 severity level)
-                # v266.2: During startup, mode can only degrade (never recover upward).
-                # Upward recovery only after startup completes.
-                _startup_complete = os.environ.get("JARVIS_STARTUP_COMPLETE", "") == "true"
-                _is_degradation = _ideal_sev > _current_sev
-                _can_change = _is_degradation or _startup_complete
-                if abs(_ideal_sev - _current_sev) >= 1 and _ideal != _current and _can_change:
-                    _direction = "upgraded" if _ideal_sev < _current_sev else "downgraded"
-                    self.logger.info(
-                        "[ModeReeval] %s: %s desired=%s effective=%s→%s (avail=%.1fGB, predicted=%.1fGB)",
-                        phase_label,
-                        _direction,
-                        os.environ.get("JARVIS_STARTUP_DESIRED_MODE", _current),
-                        _current,
-                        _ideal,
-                        _avail_gb,
-                        _predicted,
-                    )
-                    os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _ideal
-                    os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _ideal
-                    # Update shared measurement for downstream consumers
-                    os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{_avail_gb:.2f}"
-                    add_dashboard_log(
-                        f"Mode {_direction}: {_current} → {_ideal} "
-                        f"(avail={_avail_gb:.1f}GB)", "INFO"
-                    )
-                else:
-                    self.logger.debug(
-                        "[ModeReeval] %s: mode %s still correct (avail=%.1fGB)",
-                        phase_label, _current, _avail_gb,
-                    )
-                    os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _current
-            except Exception as _reeval_err:
-                self.logger.debug("[ModeReeval] %s failed: %s", phase_label, _reeval_err)
+            _reevaluate_mode_at_boundary(phase_label)
 
         # =====================================================================
         # v258.4 (P1-7): LOADED COMPONENTS REGISTRY
@@ -64072,40 +64195,12 @@ class JarvisSystemKernel:
         _oom_succeeded = False  # v266.3: Read by GCP probe to log bridge status
         os.environ.setdefault("JARVIS_OOMBRIDGE_AVAILABLE", "1")
 
+        # v270.1: Thin wrappers — delegate to module-level _mode_severity / _apply_mode_degradation.
         def _startup_mode_severity(mode: str) -> int:
-            # Higher number = more degraded / restrictive.
-            _severity = {
-                "local_full": 0,
-                "local_optimized": 1,
-                "sequential": 2,
-                "cloud_first": 3,
-                "cloud_only": 4,
-                "minimal": 5,
-            }
-            return _severity.get((mode or "local_full").strip().lower(), 0)
+            return _mode_severity(mode)
 
         def _apply_effective_mode_degradation(new_mode: str, reason: str) -> None:
-            current_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-            current_sev = _startup_mode_severity(current_mode)
-            new_sev = _startup_mode_severity(new_mode)
-            # Startup mode is monotonic during boot: never recover to less-severe mode here.
-            if new_sev > current_sev:
-                os.environ["JARVIS_STARTUP_MEMORY_MODE"] = new_mode
-                self.logger.warning(
-                    "[StartupMode] degrade desired=%s effective=%s→%s reason=%s",
-                    os.environ.get("JARVIS_STARTUP_DESIRED_MODE", current_mode),
-                    current_mode,
-                    new_mode,
-                    reason,
-                )
-            else:
-                self.logger.info(
-                    "[StartupMode] keep desired=%s effective=%s candidate=%s reason=%s",
-                    os.environ.get("JARVIS_STARTUP_DESIRED_MODE", current_mode),
-                    current_mode,
-                    new_mode,
-                    reason,
-                )
+            _apply_mode_degradation(new_mode, reason)
 
         for _oom_attempt_idx, _oom_timeout in enumerate(_oom_attempts):
             try:
@@ -64376,8 +64471,11 @@ class JarvisSystemKernel:
                         "[GCPProbe] GCP unreachable — falling back from %s to %s",
                         _startup_mode_now, _fallback,
                     )
-                    os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _fallback
-                    _startup_mode_now = _fallback
+                    # v270.1: Route through monotonic degradation.
+                    _apply_mode_degradation(
+                        _fallback, reason=f"gcp_probe:unreachable:{_startup_mode_now}→{_fallback}"
+                    )
+                    _startup_mode_now = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", _fallback)
                     issue_collector.add_warning(
                         f"GCP probe unreachable during {_previous_mode}; fell back to {_fallback}",
                         IssueCategory.GCP,
@@ -64427,11 +64525,17 @@ class JarvisSystemKernel:
                                     _current_mode,
                                     available_gb=_read_available_memory_gb(),
                                 )
-                                os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _fallback
+                                # v270.1: Route through centralized monotonic degradation
+                                # instead of direct os.environ write. Prevents race where
+                                # a phase gate has already degraded beyond _fallback.
+                                _apply_mode_degradation(
+                                    _fallback,
+                                    reason=f"deferred_gcp_probe:unreachable:{_current_mode}→{_fallback}",
+                                )
                                 self.logger.warning(
                                     "[GCPProbe] Deferred probe unreachable — falling back from %s to %s",
                                     _current_mode,
-                                    _fallback,
+                                    os.environ.get("JARVIS_STARTUP_MEMORY_MODE", _fallback),
                                 )
                                 issue_collector.add_warning(
                                     "Deferred GCP probe unreachable; falling back to local mode",
@@ -64470,10 +64574,13 @@ class JarvisSystemKernel:
                         _gcp_probe_timeout,
                         _fallback,
                     )
-                    os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _fallback
-                    _startup_mode_now = _fallback
+                    # v270.1: Route through monotonic degradation.
+                    _apply_mode_degradation(
+                        _fallback, reason=f"gcp_probe:timeout:{_previous_mode}→{_fallback}"
+                    )
+                    _startup_mode_now = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", _fallback)
                     issue_collector.add_warning(
-                        f"GCP probe timed out during {_previous_mode}; switched to {_fallback}",
+                        f"GCP probe timed out during {_previous_mode}; switched to {_startup_mode_now}",
                         IssueCategory.GCP,
                         suggestion="Increase JARVIS_GCP_PROBE_TIMEOUT if network latency is expected",
                     )
@@ -67631,63 +67738,16 @@ class JarvisSystemKernel:
         # GCP/Docker init often takes 2-4 minutes, 60s was causing premature timeouts
         resource_timeout = float(os.environ.get("JARVIS_RESOURCE_TIMEOUT", "300.0"))
 
-        # v266.2: Memory gate — re-evaluate mode at phase boundary
-        try:
-            import psutil as _ps2
-            _mem2 = _ps2.virtual_memory()
-            _avail_gb2 = _mem2.available / (1024**3)
-            _current_mode2 = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-            # NOTE: Mirrors _REEVAL_SEVERITY / _reevaluate_startup_mode() threshold logic.
-            _sev_map = {
-                "local_full": 0, "local_optimized": 1, "sequential": 2,
-                "cloud_first": 3, "cloud_only": 4, "minimal": 5,
-            }
-            _critical2 = float(os.getenv("JARVIS_CRITICAL_THRESHOLD_GB", "2.0"))
-            _cloud2 = float(os.getenv("JARVIS_CLOUD_THRESHOLD_GB", "6.0"))
-            _optimize2 = float(os.getenv("JARVIS_OPTIMIZE_THRESHOLD_GB", "4.0"))
-            _planned_ml2 = float(os.getenv("JARVIS_PLANNED_ML_GB", "4.6"))
-            _predicted2 = max(0.0, _avail_gb2 - _planned_ml2)
-
-            if _avail_gb2 < _critical2:
-                _ideal2 = "cloud_only"
-            elif _predicted2 < _critical2 or _avail_gb2 < _cloud2:
-                _ideal2 = "cloud_first"
-            elif _predicted2 < _optimize2:
-                _ideal2 = "local_optimized"
-            else:
-                _ideal2 = "local_full"
-
-            # v266.3: If OOMBridge is broken, cloud modes can't execute.
-            # Clamp to best available local mode instead.
-            if os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE") == "0":
-                if _ideal2 in ("cloud_first", "cloud_only"):
-                    _ideal2 = "sequential"
-
-            _cur_sev2 = _sev_map.get(_current_mode2, 0)
-            _ideal_sev2 = _sev_map.get(_ideal2, 0)
-            # Monotonic: only degrade during startup (never recover upward)
-            if _ideal_sev2 > _cur_sev2:
-                _desired_mode2 = os.environ.get("JARVIS_STARTUP_DESIRED_MODE", _current_mode2)
-                self.logger.info(
-                    "[v266.2] Phase 2 gate: desired=%s effective=%s→%s (avail=%.1fGB)",
-                    _desired_mode2, _current_mode2, _ideal2, _avail_gb2,
-                )
-                os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _ideal2
-                os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _ideal2
-                os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{_avail_gb2:.2f}"
-                _current_mode2 = _ideal2
-            else:
-                os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _current_mode2
-
-            if _current_mode2 in ("cloud_only", "minimal"):
-                self.logger.warning(
-                    "[v266.2] Phase 2: mode=%s — deferring heavy local resources",
-                    _current_mode2,
-                )
-                os.environ["JARVIS_CAPABILITY_DOCKER"] = "deferred"
-                os.environ["JARVIS_CAPABILITY_LOCAL_STORAGE"] = "deferred"
-        except Exception as _gate2_err:
-            self.logger.debug("[v266.2] Phase 2 memory gate error: %s", _gate2_err)
+        # v270.1: Phase 2 memory gate — delegates to centralized _reevaluate_mode_at_boundary.
+        # Phase-specific post-action: defer Docker/storage in cloud_only/minimal.
+        _current_mode2, _avail_gb2 = _reevaluate_mode_at_boundary("phase_resources")
+        if _current_mode2 in ("cloud_only", "minimal"):
+            self.logger.warning(
+                "[ModeControl] Phase 2: mode=%s — deferring heavy local resources",
+                _current_mode2,
+            )
+            os.environ["JARVIS_CAPABILITY_DOCKER"] = "deferred"
+            os.environ["JARVIS_CAPABILITY_LOCAL_STORAGE"] = "deferred"
 
         # Voice sidecar control-plane bootstrap (optional, config-driven).
         # v270.0: Add timeout — sidecar IPC/health handshake can stall.
@@ -67701,8 +67761,15 @@ class JarvisSystemKernel:
                 self.logger.warning(
                     "[VoiceSidecar] v270.0: Sidecar start timed out (%.0fs)", _sidecar_timeout
                 )
+                # v270.1: Kill orphaned sidecar subprocess on timeout.
+                await _kill_orphaned_subprocess(
+                    getattr(self, "_voice_sidecar_process", None), "voice_sidecar"
+                )
                 sidecar_ready = False
             except asyncio.CancelledError:
+                await _kill_orphaned_subprocess(
+                    getattr(self, "_voice_sidecar_process", None), "voice_sidecar"
+                )
                 raise
             if not sidecar_ready and self.config.voice_sidecar_required:
                 self.logger.error(
@@ -68731,64 +68798,26 @@ class JarvisSystemKernel:
         """
         self._state = KernelState.STARTING_BACKEND
 
-        # v266.2: Memory gate — re-evaluate mode at phase boundary
-        try:
-            import psutil as _ps3
-            _mem3 = _ps3.virtual_memory()
-            _avail_gb3 = _mem3.available / (1024**3)
-            _current_mode3 = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-            # NOTE: Mirrors _REEVAL_SEVERITY / _reevaluate_startup_mode() threshold logic.
-            _sev_map3 = {
-                "local_full": 0, "local_optimized": 1, "sequential": 2,
-                "cloud_first": 3, "cloud_only": 4, "minimal": 5,
-            }
-            _critical3 = float(os.getenv("JARVIS_CRITICAL_THRESHOLD_GB", "2.0"))
-            _cloud3 = float(os.getenv("JARVIS_CLOUD_THRESHOLD_GB", "6.0"))
-            _optimize3 = float(os.getenv("JARVIS_OPTIMIZE_THRESHOLD_GB", "4.0"))
-            _planned_ml3 = float(os.getenv("JARVIS_PLANNED_ML_GB", "4.6"))
-            _predicted3 = max(0.0, _avail_gb3 - _planned_ml3)
-
-            if _avail_gb3 < _critical3:
-                _ideal3 = "cloud_only"
-            elif _predicted3 < _critical3 or _avail_gb3 < _cloud3:
-                _ideal3 = "cloud_first"
-            elif _predicted3 < _optimize3:
-                _ideal3 = "local_optimized"
-            else:
-                _ideal3 = "local_full"
-
-            # v266.3: If OOMBridge is broken, cloud modes can't execute.
-            # Clamp to best available local mode instead.
-            if os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE") == "0":
-                if _ideal3 in ("cloud_first", "cloud_only"):
-                    _ideal3 = "sequential"
-
-            _cur_sev3 = _sev_map3.get(_current_mode3, 0)
-            _ideal_sev3 = _sev_map3.get(_ideal3, 0)
-            # Monotonic: only degrade during startup (never recover upward)
-            if _ideal_sev3 > _cur_sev3:
-                _desired_mode3 = os.environ.get("JARVIS_STARTUP_DESIRED_MODE", _current_mode3)
-                self.logger.info(
-                    "[v266.2] Phase 3 gate: desired=%s effective=%s→%s (avail=%.1fGB)",
-                    _desired_mode3, _current_mode3, _ideal3, _avail_gb3,
+        # v270.1: Phase 3 memory gate — delegates to centralized _reevaluate_mode_at_boundary.
+        # Phase-specific post-action: set BACKEND_MINIMAL when critically low.
+        _current_mode3, _avail_gb3 = _reevaluate_mode_at_boundary("phase_backend")
+        if _current_mode3 in ("cloud_first", "cloud_only", "minimal"):
+            if _avail_gb3 < 2.0:
+                self.logger.warning(
+                    "[ModeControl] Phase 3: mode=%s, available=%.1fGB "
+                    "— setting JARVIS_BACKEND_MINIMAL=true",
+                    _current_mode3, _avail_gb3,
                 )
-                os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _ideal3
-                os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _ideal3
-                os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{_avail_gb3:.2f}"
-                _current_mode3 = _ideal3
-            else:
-                os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _current_mode3
+                os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
 
-            if _current_mode3 in ("cloud_first", "cloud_only", "minimal"):
-                if _avail_gb3 < 2.0:
-                    self.logger.warning(
-                        "[v266.2] Phase 3: mode=%s, available=%.1fGB "
-                        "— setting JARVIS_BACKEND_MINIMAL=true",
-                        _current_mode3, _avail_gb3,
-                    )
-                    os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
-        except Exception as _gate3_err:
-            self.logger.debug("[v266.2] Phase 3 memory gate error: %s", _gate3_err)
+        # v270.1: Pre-spawn admission check — verify enough memory before
+        # launching the backend subprocess (the heaviest single allocation).
+        _be_admitted, _be_admit_reason = _check_spawn_admission("backend", min_gb=1.5)
+        if not _be_admitted:
+            self.logger.warning(
+                "[ModeControl] Backend spawn rejected: %s", _be_admit_reason
+            )
+            os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
 
         # Voice sidecar deterministic worker admission before backend startup.
         # v270.0: Add timeout to sidecar gate and worker start.
@@ -68854,8 +68883,15 @@ class JarvisSystemKernel:
                     self.logger.warning(
                         "[Kernel] v270.0: In-process backend timed out (%.0fs)", _be_launch_timeout
                     )
+                    # v270.1: Kill orphaned backend subprocess on timeout.
+                    await _kill_orphaned_subprocess(
+                        getattr(self, "_backend_process", None), "backend_in_process"
+                    )
                     success = False
                 except asyncio.CancelledError:
+                    await _kill_orphaned_subprocess(
+                        getattr(self, "_backend_process", None), "backend_in_process"
+                    )
                     raise
                 if not success:
                     self.logger.warning(
@@ -68870,8 +68906,14 @@ class JarvisSystemKernel:
                             "[Kernel] v270.0: Backend subprocess fallback timed out (%.0fs)",
                             _be_launch_timeout,
                         )
+                        await _kill_orphaned_subprocess(
+                            getattr(self, "_backend_process", None), "backend_subprocess"
+                        )
                         success = False
                     except asyncio.CancelledError:
+                        await _kill_orphaned_subprocess(
+                            getattr(self, "_backend_process", None), "backend_subprocess"
+                        )
                         raise
             else:
                 try:
@@ -68882,8 +68924,14 @@ class JarvisSystemKernel:
                     self.logger.error(
                         "[Kernel] v270.0: Backend subprocess timed out (%.0fs)", _be_launch_timeout
                     )
+                    await _kill_orphaned_subprocess(
+                        getattr(self, "_backend_process", None), "backend_subprocess"
+                    )
                     success = False
                 except asyncio.CancelledError:
+                    await _kill_orphaned_subprocess(
+                        getattr(self, "_backend_process", None), "backend_subprocess"
+                    )
                     raise
 
             if success:
@@ -69168,54 +69216,40 @@ class JarvisSystemKernel:
                 f"(cwd={project_root}, port={self.config.backend_port})"
             )
 
-            # v266.2: Pre-spawn admission gate — check available RAM
+            # v270.1: Pre-spawn admission gate — delegates severity to module-level
+            # _mode_severity/_apply_mode_degradation. Keeps subprocess-specific
+            # policy: 1000MB floor, 256MB fail-closed, cloud-mode preservation.
             try:
-                import psutil as _ps_adm
-                _adm_mem = _ps_adm.virtual_memory()
-                _adm_avail_mb = _adm_mem.available / (1024 ** 2)
+                _adm_avail_gb = _read_available_memory_gb()
+                _adm_avail_mb = (_adm_avail_gb or 0.0) * 1024
                 _adm_needed_mb = 500 + 500  # 500MB estimated + 500MB safety margin
-                if _adm_avail_mb < _adm_needed_mb:
-                    _cur_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-                    _desired_mode = os.environ.get("JARVIS_STARTUP_DESIRED_MODE", _cur_mode)
-                    _sev_map_adm = {
-                        "local_full": 0,
-                        "local_optimized": 1,
-                        "sequential": 2,
-                        "cloud_first": 3,
-                        "cloud_only": 4,
-                        "minimal": 5,
-                    }
-                    if _sev_map_adm.get(_cur_mode, 0) < _sev_map_adm["sequential"]:
-                        os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "sequential"
-                        os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = "sequential"
+                if _adm_avail_gb is not None and _adm_avail_mb < _adm_needed_mb:
+                    _apply_mode_degradation(
+                        "sequential",
+                        reason=f"subprocess_admission:avail={_adm_avail_mb:.0f}MB<{_adm_needed_mb}MB",
+                    )
                     self.logger.warning(
-                        "[v266.2] Backend admission low memory "
-                        "(desired=%s effective=%s avail=%.0fMB need=%.0fMB) "
-                        "— forcing minimal control-plane backend",
-                        _desired_mode,
-                        os.environ.get("JARVIS_STARTUP_MEMORY_MODE", _cur_mode),
-                        _adm_avail_mb,
-                        _adm_needed_mb,
+                        "[ModeControl] Backend subprocess low memory "
+                        "(avail=%.0fMB need=%.0fMB) — forcing minimal backend",
+                        _adm_avail_mb, _adm_needed_mb,
                     )
                     os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
                     # Fail-closed for non-cloud startup if memory is critically low.
                     if _adm_avail_mb < 256:
-                        _mode_now = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", _cur_mode)
+                        _mode_now = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
                         if _mode_now not in ("cloud_first", "cloud_only"):
                             self.logger.error(
-                                "[v266.2] Backend admission denied: %.0fMB available in %s mode",
-                                _adm_avail_mb,
-                                _mode_now,
+                                "[ModeControl] Backend subprocess denied: %.0fMB in %s mode",
+                                _adm_avail_mb, _mode_now,
                             )
                             return False
                         self.logger.warning(
-                            "[v266.2] Backend admission kept for cloud mode (%s) with %.0fMB "
-                            "to preserve control-plane essentials",
-                            _mode_now,
-                            _adm_avail_mb,
+                            "[ModeControl] Backend subprocess kept for cloud mode (%s) "
+                            "with %.0fMB — preserving control-plane essentials",
+                            _mode_now, _adm_avail_mb,
                         )
             except Exception as _adm_err:
-                self.logger.debug(f"[v266.2] Admission gate error: {_adm_err}")
+                self.logger.debug("[ModeControl] Subprocess admission error: %s", _adm_err)
 
             self._backend_process = await asyncio.create_subprocess_exec(
                 *command,
@@ -69273,21 +69307,8 @@ class JarvisSystemKernel:
                     "[v266.2] Backend subprocess OOM (Cannot allocate memory). "
                     "Escalating startup mode."
                 )
-                # Inline mode escalation (can't access nested _reevaluate_startup_mode)
-                try:
-                    _cur_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-                    _sev_map_oom = {
-                        "local_full": 0, "local_optimized": 1, "sequential": 2,
-                        "cloud_first": 3, "cloud_only": 4, "minimal": 5,
-                    }
-                    _cur_sev_oom = _sev_map_oom.get(_cur_mode, 0)
-                    if _cur_sev_oom < 4:  # Not yet cloud_only
-                        os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "cloud_only"
-                        self.logger.warning(
-                            "[v266.2] ENOMEM: mode escalated %s → cloud_only", _cur_mode
-                        )
-                except Exception:
-                    pass
+                # v270.1: Delegate to centralized mode degradation.
+                _apply_mode_degradation("cloud_only", reason="ENOMEM:backend_subprocess")
                 os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
                 return False
             raise  # Non-ENOMEM OSErrors propagate to caller for loud failure
@@ -69295,20 +69316,8 @@ class JarvisSystemKernel:
             self.logger.error(
                 "[v266.2] Backend subprocess MemoryError. Escalating startup mode."
             )
-            try:
-                _cur_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-                _sev_map_mem = {
-                    "local_full": 0, "local_optimized": 1, "sequential": 2,
-                    "cloud_first": 3, "cloud_only": 4, "minimal": 5,
-                }
-                _cur_sev_mem = _sev_map_mem.get(_cur_mode, 0)
-                if _cur_sev_mem < 4:
-                    os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "cloud_only"
-                    self.logger.warning(
-                        "[v266.2] MemoryError: mode escalated %s → cloud_only", _cur_mode
-                    )
-            except Exception:
-                pass
+            # v270.1: Delegate to centralized mode degradation.
+            _apply_mode_degradation("cloud_only", reason="MemoryError:backend_subprocess")
             return False
         except Exception as e:
             self.logger.error(f"[Kernel] Subprocess backend failed: {e}")
