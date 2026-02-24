@@ -191,6 +191,17 @@ class StartupStateMachine:
         self.register_component("reactor_core", is_critical=False, load_order=15,
                                 dependencies=["trinity"])
 
+        # v270.2: Register components the supervisor tracks that were previously
+        # undeclared.  Without explicit registration, update_component_sync()
+        # auto-registers them as load_order=100 with no dependencies — breaking
+        # wave ordering and dependency enforcement.
+        self.register_component("loading_server", is_critical=False, load_order=2,
+                                dependencies=["clean_slate"])
+        self.register_component("jarvis_prime", is_critical=False, load_order=13,
+                                dependencies=["trinity"])
+        self.register_component("jarvis_body", is_critical=False, load_order=6,
+                                dependencies=["backend"])
+
     def register_component(
         self,
         name: str,

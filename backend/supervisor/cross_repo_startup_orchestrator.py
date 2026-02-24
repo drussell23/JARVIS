@@ -376,6 +376,50 @@ from enum import auto as enum_auto
 
 
 # =============================================================================
+# v270.2: Supervisor Authority Gate
+# =============================================================================
+# When True, autonomous destructive actions (process kills, VM reprovisioning,
+# cascade restarts, cloud fallback switches) are allowed. When False (default),
+# these actions are logged but NOT executed. The unified_supervisor sets this
+# to True after it has established control of the startup sequence.
+# =============================================================================
+
+_SUPERVISOR_AUTHORITY_GRANTED: bool = False
+_SUPERVISOR_AUTHORITY_REASON: str = "not_yet_granted"
+
+
+def grant_supervisor_authority(reason: str = "supervisor_startup_complete") -> None:
+    """Grant authority for cross_repo to take autonomous destructive actions."""
+    global _SUPERVISOR_AUTHORITY_GRANTED, _SUPERVISOR_AUTHORITY_REASON
+    _SUPERVISOR_AUTHORITY_GRANTED = True
+    _SUPERVISOR_AUTHORITY_REASON = reason
+    logging.getLogger(__name__).info(
+        "[AuthGate] Supervisor authority GRANTED: %s", reason
+    )
+
+
+def revoke_supervisor_authority(reason: str = "supervisor_shutdown") -> None:
+    """Revoke authority -- cross_repo will only log, not act."""
+    global _SUPERVISOR_AUTHORITY_GRANTED, _SUPERVISOR_AUTHORITY_REASON
+    _SUPERVISOR_AUTHORITY_GRANTED = False
+    _SUPERVISOR_AUTHORITY_REASON = reason
+    logging.getLogger(__name__).info(
+        "[AuthGate] Supervisor authority REVOKED: %s", reason
+    )
+
+
+def check_supervisor_authority(action: str) -> bool:
+    """Check if a destructive action is authorized. Logs and returns False if not."""
+    if _SUPERVISOR_AUTHORITY_GRANTED:
+        return True
+    logging.getLogger(__name__).warning(
+        "[AuthGate] BLOCKED %s -- supervisor authority not granted (%s)",
+        action, _SUPERVISOR_AUTHORITY_REASON,
+    )
+    return False
+
+
+# =============================================================================
 # v200.0: Startup Lock Error - Pillar 1: Lock-Guarded Single-Owner Startup
 # =============================================================================
 
@@ -3588,6 +3632,10 @@ async def _gcp_vm_health_monitor_loop(
                         )
                         await asyncio.sleep(delay)
                     
+                    # v270.2: Supervisor authority gate — block reprovision if not authorized
+                    if not check_supervisor_authority("gcp_vm_reprovision"):
+                        continue
+
                     # Try to re-provision
                     try:
                         # v192.0: Use dynamic timeout from GCP_VM_STARTUP_TIMEOUT (no hardcode)
@@ -16122,6 +16170,10 @@ echo "=== JARVIS Prime started ==="
         """
         service_name = managed.definition.name
 
+        # v270.2: Supervisor authority gate — block process kill/rescue if not authorized
+        if not check_supervisor_authority(f"proactive_rescue:{service_name}"):
+            return
+
         logger.info(
             f"[v147.0] 🚀 Proactive Rescue Handler: Provisioning GCP for {service_name}..."
         )
@@ -16241,6 +16293,10 @@ echo "=== JARVIS Prime started ==="
         This handler provisions the cloud alternative and signals the system to use it.
         """
         service_name = managed.definition.name
+
+        # v270.2: Supervisor authority gate — block cloud fallback switch if not authorized
+        if not check_supervisor_authority("cloud_fallback_switch"):
+            return
 
         logger.info(
             f"[v149.0] ☁️ Cloud Fallback Handler: Routing {service_name} to cloud..."
@@ -17656,6 +17712,9 @@ echo "=== JARVIS Prime started ==="
                         break
 
                     if health_status["needs_recovery"]:
+                        # v270.2: Supervisor authority gate — block cascade restart if not authorized
+                        if not check_supervisor_authority(f"cascade_restart:{service_name}"):
+                            continue
                         await self._initiate_intelligent_recovery(
                             service_name,
                             health_status["reason"]

@@ -2817,6 +2817,91 @@ def _read_available_memory_gb() -> Optional[float]:
 
 
 # =========================================================================
+# v270.2: STRUCTURED STARTUP ENVIRONMENT WRITER
+# =========================================================================
+# All startup env var mutations route through _set_startup_env() for:
+#   1. Structured logging (observability) — every write is traceable
+#   2. Write guards — mode vars enforce monotonic, BACKEND_MINIMAL is
+#      write-only-true, PRIME_URL is last-writer-wins with provenance
+#   3. Event emission — mode transitions fire structured events
+#
+# Within a single asyncio event loop, synchronous code between await
+# points is atomic. The real race hazard is read-check-write sequences
+# across await points. This writer serializes the write + log as one
+# synchronous operation.
+# =========================================================================
+
+# Startup env var write log (ring buffer for diagnostics)
+_ENV_WRITE_LOG: List[Dict[str, str]] = []
+_ENV_WRITE_LOG_MAX = 200
+
+
+def _set_startup_env(
+    key: str,
+    value: str,
+    reason: str,
+    *,
+    write_only_true: bool = False,
+    caller: str = "",
+) -> bool:
+    """Set a startup environment variable with structured logging.
+
+    Returns True if the write was performed, False if it was suppressed
+    (e.g. write_only_true guard prevented overwriting "true" with something
+    else).
+
+    This function is synchronous — within the asyncio event loop it executes
+    atomically between await points. No lock needed for in-loop callers.
+    """
+    _log = logging.getLogger(__name__)
+    old_value = os.environ.get(key, "")
+
+    # Guard: write_only_true prevents clearing a flag once set
+    if write_only_true and old_value == "true" and value != "true":
+        _log.debug(
+            "[EnvWrite] SUPPRESSED %s=%s→%s (write_only_true) caller=%s reason=%s",
+            key, old_value, value, caller, reason,
+        )
+        return False
+
+    # Perform the write
+    os.environ[key] = value
+
+    # Structured log entry
+    entry = {
+        "key": key,
+        "old": old_value,
+        "new": value,
+        "reason": reason,
+        "caller": caller,
+        "ts": f"{time.time():.3f}",
+    }
+
+    # Ring buffer for diagnostic dump
+    _ENV_WRITE_LOG.append(entry)
+    if len(_ENV_WRITE_LOG) > _ENV_WRITE_LOG_MAX:
+        _ENV_WRITE_LOG.pop(0)
+
+    # Log at appropriate level
+    if old_value != value:
+        _log.info(
+            "[EnvWrite] %s=%s→%s caller=%s reason=%s",
+            key, old_value or "(unset)", value, caller, reason,
+        )
+    else:
+        _log.debug(
+            "[EnvWrite] %s=%s (unchanged) caller=%s reason=%s",
+            key, value, caller, reason,
+        )
+    return True
+
+
+def _get_env_write_log() -> List[Dict[str, str]]:
+    """Return the env var write log for diagnostics (e.g. health endpoints)."""
+    return list(_ENV_WRITE_LOG)
+
+
+# =========================================================================
 # v270.1: CENTRALIZED STARTUP MODE MANAGEMENT
 # =========================================================================
 # Single source of truth for mode severity, ideal mode computation, and
@@ -2875,22 +2960,18 @@ def _apply_mode_degradation(new_mode: str, reason: str) -> str:
     EFFECTIVE_MODE — that's set by _reevaluate_mode_at_boundary at phase
     boundaries).
     """
-    _log = logging.getLogger(__name__)
     current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
     cur_sev = _mode_severity(current)
     new_sev = _mode_severity(new_mode)
     if new_sev > cur_sev:
-        desired = os.environ.get("JARVIS_STARTUP_DESIRED_MODE", current)
-        _log.warning(
-            "[ModeControl] degrade desired=%s effective=%s→%s reason=%s",
-            desired, current, new_mode, reason,
+        _set_startup_env(
+            "JARVIS_STARTUP_MEMORY_MODE", new_mode, reason,
+            caller="_apply_mode_degradation",
         )
-        os.environ["JARVIS_STARTUP_MEMORY_MODE"] = new_mode
         return new_mode
     else:
-        _log.info(
-            "[ModeControl] keep desired=%s effective=%s candidate=%s reason=%s",
-            os.environ.get("JARVIS_STARTUP_DESIRED_MODE", current),
+        logging.getLogger(__name__).debug(
+            "[ModeControl] keep effective=%s candidate=%s reason=%s",
             current, new_mode, reason,
         )
         return current
@@ -2911,7 +2992,7 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
         avail_gb = _read_available_memory_gb()
         if avail_gb is None:
             current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-            os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = current
+            _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", current, f"boundary:{phase_label}:memprobe_failed", caller="_reevaluate_mode_at_boundary")
             return current, 0.0
 
         ideal = _compute_ideal_mode(avail_gb)
@@ -2930,9 +3011,9 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
                 "[ModeControl] %s: %s desired=%s effective=%s→%s (avail=%.1fGB, predicted=%.1fGB)",
                 phase_label, direction, desired, current, ideal, avail_gb, _predicted,
             )
-            os.environ["JARVIS_STARTUP_MEMORY_MODE"] = ideal
-            os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = ideal
-            os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{avail_gb:.2f}"
+            _set_startup_env("JARVIS_STARTUP_MEMORY_MODE", ideal, f"boundary:{phase_label}:{direction}", caller="_reevaluate_mode_at_boundary")
+            _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", ideal, f"boundary:{phase_label}:{direction}", caller="_reevaluate_mode_at_boundary")
+            _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{avail_gb:.2f}", f"boundary:{phase_label}:measured", caller="_reevaluate_mode_at_boundary")
             try:
                 add_dashboard_log(
                     f"Mode {direction}: {current} → {ideal} "
@@ -2946,8 +3027,8 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
                 "[ModeControl] %s: mode %s still correct (avail=%.1fGB)",
                 phase_label, current, avail_gb,
             )
-            os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = current
-            os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{avail_gb:.2f}"
+            _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", current, f"boundary:{phase_label}:unchanged", caller="_reevaluate_mode_at_boundary")
+            _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{avail_gb:.2f}", f"boundary:{phase_label}:measured", caller="_reevaluate_mode_at_boundary")
             return current, avail_gb
     except Exception as err:
         _log.debug("[ModeControl] %s reevaluation error: %s", phase_label, err)
@@ -61570,17 +61651,18 @@ class JarvisSystemKernel:
         prime_url = f"http://{node_ip}:{port}"
         
         # Set the primary Prime URL - this is the single source of truth
-        os.environ["JARVIS_PRIME_URL"] = prime_url
-        
+        _src = f"invincible_node_ready:{source}"
+        _set_startup_env("JARVIS_PRIME_URL", prime_url, _src, caller="_propagate_invincible_node_url")
+
         # Also set cloud-specific URLs for components that use them
-        os.environ["GCP_PRIME_ENDPOINT"] = prime_url
-        os.environ["JARVIS_PRIME_CLOUD_RUN_URL"] = prime_url
+        _set_startup_env("GCP_PRIME_ENDPOINT", prime_url, _src, caller="_propagate_invincible_node_url")
+        _set_startup_env("JARVIS_PRIME_CLOUD_RUN_URL", prime_url, _src, caller="_propagate_invincible_node_url")
         # v234.0: Also set for UnifiedModelServing's PrimeAPIClient
-        os.environ["JARVIS_PRIME_API_URL"] = prime_url
-        
+        _set_startup_env("JARVIS_PRIME_API_URL", prime_url, _src, caller="_propagate_invincible_node_url")
+
         # Set a flag indicating hollow client is active (for dynamic behavior)
-        os.environ["JARVIS_HOLLOW_CLIENT_ACTIVE"] = "true"
-        os.environ["JARVIS_INVINCIBLE_NODE_IP"] = node_ip
+        _set_startup_env("JARVIS_HOLLOW_CLIENT_ACTIVE", "true", _src, caller="_propagate_invincible_node_url")
+        _set_startup_env("JARVIS_INVINCIBLE_NODE_IP", node_ip, _src, caller="_propagate_invincible_node_url")
         os.environ["JARVIS_INVINCIBLE_NODE_PORT"] = str(port)
         
         self.logger.info(
@@ -62679,6 +62761,14 @@ class JarvisSystemKernel:
             self.logger.debug("[Kernel] v266.1: StartupStateMachine singleton reset")
         except Exception as _ssm_err:
             self.logger.debug(f"[Kernel] v266.1: SSM reset error: {_ssm_err}")
+
+        # v270.2: Revoke cross_repo authority during shutdown — prevent autonomous
+        # destructive actions while the supervisor is tearing down.
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import revoke_supervisor_authority
+            revoke_supervisor_authority("supervisor_shutdown")
+        except Exception as _auth_err:
+            self.logger.debug("[Kernel] v270.2: AuthGate revoke error: %s", _auth_err)
 
         # v270.2: Reset GCP controller singleton — stale budget counters, effectiveness
         # rates, stall tracking, and VM lifecycle state from previous run would persist.
@@ -63826,11 +63916,11 @@ class JarvisSystemKernel:
                 _current_mode,
                 available_gb=_available_gb,
             )
-            os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _fallback_mode
+            _set_startup_env("JARVIS_STARTUP_MEMORY_MODE", _fallback_mode, f"preflight_fallback:{reason}", caller="_apply_resource_preflight_fallback")
             if not os.environ.get("JARVIS_STARTUP_DESIRED_MODE", "").strip():
-                os.environ["JARVIS_STARTUP_DESIRED_MODE"] = _fallback_mode
+                _set_startup_env("JARVIS_STARTUP_DESIRED_MODE", _fallback_mode, f"preflight_fallback:{reason}:initial_desired", caller="_apply_resource_preflight_fallback")
             if _available_gb is not None:
-                os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{_available_gb:.2f}"
+                _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{_available_gb:.2f}", f"preflight_fallback:{reason}:measured", caller="_apply_resource_preflight_fallback")
 
             _msg = (
                 f"Resource preflight {reason}; startup mode set to {_fallback_mode}"
@@ -63854,12 +63944,12 @@ class JarvisSystemKernel:
             )
             self._startup_resource_status = _rs
             _startup_mem_mode = _rs.startup_mode or "local_full"
-            os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _startup_mem_mode
+            _set_startup_env("JARVIS_STARTUP_MEMORY_MODE", _startup_mem_mode, "resource_orchestrator:validated", caller="_startup_impl:phase_resources")
             if not os.environ.get("JARVIS_STARTUP_DESIRED_MODE", "").strip():
-                os.environ["JARVIS_STARTUP_DESIRED_MODE"] = _startup_mem_mode
+                _set_startup_env("JARVIS_STARTUP_DESIRED_MODE", _startup_mem_mode, "resource_orchestrator:initial_desired", caller="_startup_impl:phase_resources")
             # v258.3 (GCP-5): Share measured memory snapshot with OOM bridge
             # so it doesn't re-measure (race condition between two psutil calls).
-            os.environ["JARVIS_MEASURED_AVAILABLE_GB"] = f"{_rs.memory_available_gb:.2f}"
+            _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{_rs.memory_available_gb:.2f}", "resource_orchestrator:measured", caller="_startup_impl:phase_resources")
             if _rs.is_cloud_mode:
                 self._update_component_status(
                     "resources", "cloud_mode",
@@ -64356,7 +64446,7 @@ class JarvisSystemKernel:
         # operator intended cloud — GCP probe should still run for background recovery.
         _startup_desired_mode = os.environ.get("JARVIS_STARTUP_DESIRED_MODE", "local_full")
         _startup_effective_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-        os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _startup_effective_mode
+        _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", _startup_effective_mode, "gcp_probe:initial_effective", caller="_startup_impl:gcp_probe")
         _cloud_recovery_candidate = (
             os.environ.get("JARVIS_CLOUD_RECOVERY_CANDIDATE", "false").strip().lower()
             in {"1", "true", "yes", "on"}
@@ -64542,7 +64632,7 @@ class JarvisSystemKernel:
                         # This intentionally bypasses monotonic degradation because the
                         # deferred probe gives us a second chance at cloud — we WANT to
                         # soften cloud_only to cloud_first so the deferred probe can run.
-                        os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "cloud_first"
+                        _set_startup_env("JARVIS_STARTUP_MEMORY_MODE", "cloud_first", "gcp_probe:cloud_only_softened_under_pressure", caller="_startup_impl:gcp_probe")
                         _startup_mode_now = "cloud_first"
 
                     self.logger.warning(
@@ -65891,7 +65981,7 @@ class JarvisSystemKernel:
                     f"[TwoTier] Init timed out ({_two_tier_init_timeout:.0f}s) — "
                     "continuing without Two-Tier Security"
                 )
-                self._update_component_status("two_tier", "degraded", "Timed out")
+                self._update_component_status("two_tier_security", "degraded", "Timed out")
                 issue_collector.add_warning(
                     f"Two-Tier Security timed out ({_two_tier_init_timeout:.0f}s)",
                     IssueCategory.INTELLIGENCE,
@@ -67691,7 +67781,7 @@ class JarvisSystemKernel:
                 )
                 return True
 
-            os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
+            _set_startup_env("JARVIS_BACKEND_MINIMAL", "true", f"voice_sidecar_gate_closed:{phase_label}", write_only_true=True, caller="_enforce_voice_sidecar_gate")
             os.environ["JARVIS_VOICE_SIDECAR_GATE"] = "closed"
             self._update_component_status(
                 "voice_sidecar",
@@ -68863,7 +68953,7 @@ class JarvisSystemKernel:
                     "— setting JARVIS_BACKEND_MINIMAL=true",
                     _current_mode3, _avail_gb3,
                 )
-                os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
+                _set_startup_env("JARVIS_BACKEND_MINIMAL", "true", f"phase_backend:mode={_current_mode3}:avail={_avail_gb3:.1f}GB", write_only_true=True, caller="_startup_impl")
 
         # v270.1: Pre-spawn admission check — verify enough memory before
         # launching the backend subprocess (the heaviest single allocation).
@@ -68872,7 +68962,7 @@ class JarvisSystemKernel:
             self.logger.warning(
                 "[ModeControl] Backend spawn rejected: %s", _be_admit_reason
             )
-            os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
+            _set_startup_env("JARVIS_BACKEND_MINIMAL", "true", f"spawn_rejected:{_be_admit_reason}", write_only_true=True, caller="_startup_impl")
 
         # Voice sidecar deterministic worker admission before backend startup.
         # v270.0: Add timeout to sidecar gate and worker start.
@@ -68890,7 +68980,7 @@ class JarvisSystemKernel:
                 self.logger.warning(
                     "[VoiceSidecar] Gate closed in backend phase — continuing in minimal backend mode"
                 )
-                os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
+                _set_startup_env("JARVIS_BACKEND_MINIMAL", "true", "voice_sidecar_gate_closed:phase_backend", write_only_true=True, caller="_startup_impl")
 
             _be_sidecar_timeout = _get_env_float("JARVIS_VOICE_SIDECAR_TIMEOUT", 30.0)
             try:
@@ -69288,7 +69378,7 @@ class JarvisSystemKernel:
                         "(avail=%.0fMB need=%.0fMB) — forcing minimal backend",
                         _adm_avail_mb, _adm_needed_mb,
                     )
-                    os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
+                    _set_startup_env("JARVIS_BACKEND_MINIMAL", "true", f"subprocess_low_memory:avail={_adm_avail_mb:.0f}MB", write_only_true=True, caller="_start_backend_subprocess")
                     # Fail-closed for non-cloud startup if memory is critically low.
                     if _adm_avail_mb < 256:
                         _mode_now = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
@@ -69364,7 +69454,7 @@ class JarvisSystemKernel:
                 )
                 # v270.1: Delegate to centralized mode degradation.
                 _apply_mode_degradation("cloud_only", reason="ENOMEM:backend_subprocess")
-                os.environ["JARVIS_BACKEND_MINIMAL"] = "true"
+                _set_startup_env("JARVIS_BACKEND_MINIMAL", "true", "ENOMEM:backend_subprocess", write_only_true=True, caller="_start_backend_subprocess")
                 return False
             raise  # Non-ENOMEM OSErrors propagate to caller for loud failure
         except MemoryError:
@@ -70490,10 +70580,10 @@ class JarvisSystemKernel:
 
         if not self.config.two_tier_security_enabled:
             self.logger.info("[Integration] Integration components disabled via config")
-            self._update_component_status("two_tier", "skipped", "Disabled via config")
+            self._update_component_status("two_tier_security", "skipped", "Disabled via config")
             return True
 
-        self._update_component_status("two_tier", "running", "Initializing integration components...")
+        self._update_component_status("two_tier_security", "running", "Initializing integration components...")
         await self._broadcast_progress(55, "integration_init", "Initializing integration components...")
 
         with self.logger.section_start(LogSection.BOOT, "Zone 4.5 | Integration Components"):
@@ -70739,7 +70829,7 @@ class JarvisSystemKernel:
                 # v260.0: Shutdown gate before expensive runner creation
                 if self._state in (KernelState.SHUTTING_DOWN, KernelState.FAILED):
                     self.logger.info("[Integration] Step 3 skipped — kernel shutting down")
-                    self._update_component_status("two_tier", "cancelled", "Shutdown during init")
+                    self._update_component_status("two_tier_security", "cancelled", "Shutdown during init")
                     return False
 
                 # v265.4: Infra-degraded pre-check — skip runner when infrastructure
@@ -70895,7 +70985,7 @@ class JarvisSystemKernel:
                             wait=False,
                         )
 
-                    self._update_component_status("two_tier", "complete", "Integration components active")
+                    self._update_component_status("two_tier_security", "complete", "Integration components active")
                     self.logger.success(
                         f"[Integration] Components initialized "
                         f"(Watchdog: {'✓' if watchdog_ok else '✗'}, "
@@ -70904,13 +70994,13 @@ class JarvisSystemKernel:
                     )
                     return True
                 else:
-                    self._update_component_status("two_tier", "error", "All components failed")
+                    self._update_component_status("two_tier_security", "error", "All components failed")
                     self.logger.warning("[Integration] All integration components failed")
                     return False
 
             except Exception as e:
                 self.logger.warning(f"[Integration] Integration components initialization failed: {e}")
-                self._update_component_status("two_tier", "error", f"Error: {e}")
+                self._update_component_status("two_tier_security", "error", f"Error: {e}")
                 return False  # Graceful degradation - don't crash kernel
 
     # =========================================================================
@@ -76335,7 +76425,7 @@ class JarvisSystemKernel:
                 f"[Zone6] Initializing 5 enterprise services "
                 f"(parallel, base timeout={service_timeout:.1f}s)"
             )
-            self._update_component_status("enterprise", "running", "Initializing enterprise services")
+            self._update_component_status("enterprise_services", "running", "Initializing enterprise services")
 
             # Service definitions with display names
             services = [
@@ -78025,8 +78115,15 @@ class JarvisSystemKernel:
 
         # Step 3: Mark startup as complete (before redirect)
         # This signals the loading server to allow graceful Chrome disconnect
-        os.environ["JARVIS_STARTUP_COMPLETE"] = "true"
+        _set_startup_env("JARVIS_STARTUP_COMPLETE", "true", "all_phases_done", caller="_finalize_startup")
         self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true")
+
+        # v270.2: Grant cross_repo authority now that supervisor controls startup.
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import grant_supervisor_authority
+            grant_supervisor_authority("startup_complete")
+        except Exception as _auth_err:
+            self.logger.debug("[Kernel] v270.2: AuthGate grant error: %s", _auth_err)
 
         # Step 3: Redirect Chrome to the main frontend
         # v119.0: Use browser lock for cross-process safety
