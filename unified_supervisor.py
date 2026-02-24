@@ -64487,6 +64487,10 @@ class JarvisSystemKernel:
             except asyncio.TimeoutError:
                 if _probe_under_pressure:
                     if _startup_mode_now == "cloud_only":
+                        # v270.1: cloud_only→cloud_first is an UPGRADE (less severe).
+                        # This intentionally bypasses monotonic degradation because the
+                        # deferred probe gives us a second chance at cloud — we WANT to
+                        # soften cloud_only to cloud_first so the deferred probe can run.
                         os.environ["JARVIS_STARTUP_MEMORY_MODE"] = "cloud_first"
                         _startup_mode_now = "cloud_first"
 
