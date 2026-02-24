@@ -1617,6 +1617,15 @@ def _start_background_gcp_retry_if_needed() -> None:
                 _background_gcp_retry_for_hollow_client(),
                 name="background-gcp-retry"
             )
+            # v270.4: Register with TaskLifecycleManager for lifecycle ownership
+            try:
+                from backend.core.task_lifecycle_manager import get_task_manager, TaskPriority
+                get_task_manager().register_task(
+                    "background_gcp_retry", _background_gcp_retry_task,
+                    priority=TaskPriority.HIGH, is_monitor=True,
+                )
+            except (ImportError, Exception):
+                pass
             logger.info("[v193.2] Started background GCP retry task")
         except RuntimeError as e:
             # No event loop running
@@ -1673,6 +1682,15 @@ def start_trinity_gcp_prewarm() -> Optional[asyncio.Task]:
             _background_gcp_prewarm_task(),  # Uses GCP_VM_STARTUP_TIMEOUT env var
             name="trinity_gcp_prewarm"
         )
+        # v270.4: Register with TaskLifecycleManager for lifecycle ownership
+        try:
+            from backend.core.task_lifecycle_manager import get_task_manager, TaskPriority
+            get_task_manager().register_task(
+                "trinity_gcp_prewarm", _trinity_gcp_prewarm_task,
+                priority=TaskPriority.HIGH, is_monitor=True,
+            )
+        except (ImportError, Exception):
+            pass
         logger.info("[v146.0] 🚀 TRINITY PROTOCOL: GCP pre-warm task started (background)")
         return _trinity_gcp_prewarm_task
     except RuntimeError as e:
@@ -3500,12 +3518,21 @@ async def start_gcp_vm_health_monitor(
         _gcp_vm_health_monitor_loop(check_interval, validate_inference),
         name="gcp-vm-health-monitor-v148"
     )
-    
+    # v270.4: Register with TaskLifecycleManager for lifecycle ownership
+    try:
+        from backend.core.task_lifecycle_manager import get_task_manager, TaskPriority
+        get_task_manager().register_task(
+            "gcp_vm_health_monitor", _gcp_vm_health_monitor_task,
+            priority=TaskPriority.MONITORING, is_monitor=True,
+        )
+    except (ImportError, Exception):
+        pass
+
     logger.info(
         f"[v148.0] 🔍 GCP VM health monitor started "
         f"(interval={check_interval}s, inference_validation={validate_inference})"
     )
-    
+
     return _gcp_vm_health_monitor_task
 
 

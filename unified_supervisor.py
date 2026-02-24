@@ -62785,6 +62785,18 @@ class JarvisSystemKernel:
         except Exception as _auth_err:
             self.logger.debug("[Kernel] v270.2: AuthGate revoke error: %s", _auth_err)
 
+        # v270.4: Shutdown all tasks tracked by TaskLifecycleManager
+        try:
+            from backend.core.task_lifecycle_manager import get_task_manager
+            _tlm = get_task_manager()
+            if _tlm.get_active_count() > 0:
+                _tlm_result = await _tlm.shutdown_all(timeout=15.0)
+                self.logger.info("[Kernel] v270.4: TLM shutdown: %s", _tlm_result)
+        except ImportError:
+            pass
+        except Exception as _tlm_err:
+            self.logger.debug("[Kernel] v270.4: TLM shutdown error: %s", _tlm_err)
+
         # v270.2: Reset GCP controller singleton — stale budget counters, effectiveness
         # rates, stall tracking, and VM lifecycle state from previous run would persist.
         try:

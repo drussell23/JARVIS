@@ -2490,26 +2490,48 @@ class GCPVMManager:
         self._quota_cooldown_seconds: int = 300  # 5 minute cooldown
 
         # Circuit breakers for fault tolerance
+        # v270.4: Pull thresholds from unified recovery policy to prevent conflicts
+        _vm_ft = self.config.circuit_failure_threshold
+        _vm_rt = self.config.circuit_recovery_timeout
+        _cost_ft, _cost_rt = 5, 30.0
+        _quota_ft, _quota_rt = 3, 60.0
+        try:
+            from backend.core.recovery_policy import get_recovery_params
+            _rp_ops = get_recovery_params("gcp_vm_ops")
+            if _rp_ops:
+                _vm_ft = _rp_ops.circuit_failure_threshold
+                _vm_rt = _rp_ops.circuit_recovery_seconds
+                self._quota_cooldown_seconds = int(_rp_ops.cooldown_seconds)
+            _rp_cost = get_recovery_params("gcp_cost_tracker")
+            if _rp_cost:
+                _cost_ft = _rp_cost.circuit_failure_threshold
+                _cost_rt = _rp_cost.circuit_recovery_seconds
+            _rp_quota = get_recovery_params("gcp_quota_check")
+            if _rp_quota:
+                _quota_ft = _rp_quota.circuit_failure_threshold
+                _quota_rt = _rp_quota.circuit_recovery_seconds
+        except ImportError:
+            pass
         self._circuit_breakers = {
             "vm_create": CircuitBreaker(
                 name="vm_create",
-                failure_threshold=self.config.circuit_failure_threshold,
-                recovery_timeout=self.config.circuit_recovery_timeout,
+                failure_threshold=_vm_ft,
+                recovery_timeout=_vm_rt,
             ),
             "vm_delete": CircuitBreaker(
                 name="vm_delete",
-                failure_threshold=self.config.circuit_failure_threshold,
-                recovery_timeout=self.config.circuit_recovery_timeout,
+                failure_threshold=_vm_ft,
+                recovery_timeout=_vm_rt,
             ),
             "cost_tracker": CircuitBreaker(
                 name="cost_tracker",
-                failure_threshold=5,  # More lenient for non-critical operations
-                recovery_timeout=30.0,
+                failure_threshold=_cost_ft,
+                recovery_timeout=_cost_rt,
             ),
             "quota_check": CircuitBreaker(
                 name="quota_check",
-                failure_threshold=3,
-                recovery_timeout=60.0,
+                failure_threshold=_quota_ft,
+                recovery_timeout=_quota_rt,
             ),
         }
 

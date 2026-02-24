@@ -124,9 +124,15 @@ CLAUDE_DEFAULT_MODEL = os.getenv("CLAUDE_DEFAULT_MODEL", "claude-sonnet-4-202505
 CLAUDE_TIMEOUT_SECONDS = float(os.getenv("CLAUDE_TIMEOUT_SECONDS", "120.0"))
 CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "4096"))
 
-# Circuit breaker configuration
-CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_FAILURES", "3"))
-CIRCUIT_BREAKER_RECOVERY_SECONDS = float(os.getenv("CIRCUIT_BREAKER_RECOVERY", "30.0"))
+# Circuit breaker configuration — v270.4: unified via recovery_policy
+try:
+    from backend.core.recovery_policy import get_recovery_params as _get_rp
+    _ms_params = _get_rp("model_serving")
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = _ms_params.circuit_failure_threshold if _ms_params else int(os.getenv("CIRCUIT_BREAKER_FAILURES", "3"))
+    CIRCUIT_BREAKER_RECOVERY_SECONDS = _ms_params.circuit_recovery_seconds if _ms_params else float(os.getenv("CIRCUIT_BREAKER_RECOVERY", "30.0"))
+except ImportError:
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_FAILURES", "3"))
+    CIRCUIT_BREAKER_RECOVERY_SECONDS = float(os.getenv("CIRCUIT_BREAKER_RECOVERY", "30.0"))
 
 # Cost tracking
 COST_TRACKING_ENABLED = os.getenv("COST_TRACKING_ENABLED", "true").lower() == "true"
@@ -2288,11 +2294,22 @@ class UnifiedModelServing:
         self.logger.info(f"UnifiedModelServing ready ({len(self._clients)} providers)")
 
         # v235.1: Start memory pressure monitor (Fix C4)
+        # v270.4: Track via TaskLifecycleManager for proper shutdown
         self._memory_monitor_task: Optional[asyncio.Task] = None
         if ModelProvider.PRIME_LOCAL in self._clients:
             self._memory_monitor_task = asyncio.create_task(
                 self._start_memory_monitor()
             )
+            try:
+                from backend.core.task_lifecycle_manager import get_task_manager, TaskPriority
+                get_task_manager().register_task(
+                    "ums_memory_pressure_monitor",
+                    self._memory_monitor_task,
+                    priority=TaskPriority.MONITORING,
+                    is_monitor=True,
+                )
+            except (ImportError, Exception):
+                pass
             self.logger.info("[v235.1] Memory pressure monitor started")
 
         # v266.0: Register for thrash detection
@@ -2637,9 +2654,13 @@ class UnifiedModelServing:
         """
         self._running = False
 
-        # v235.1: Stop memory pressure monitor
+        # v235.1: Stop memory pressure monitor (v270.4: properly await cancellation)
         if hasattr(self, '_memory_monitor_task') and self._memory_monitor_task:
             self._memory_monitor_task.cancel()
+            try:
+                await self._memory_monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
             self._memory_monitor_task = None
 
         # v234.1: Clean up PrimeLocalClient resources

@@ -464,6 +464,58 @@ class TaskLifecycleManager:
             **results,
         }
 
+    def register_task(
+        self,
+        name: str,
+        task: asyncio.Task,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        is_monitor: bool = False,
+    ) -> None:
+        """
+        Register an externally-created asyncio.Task for lifecycle tracking.
+
+        Use this when the task is created via asyncio.create_task() in sync code
+        (e.g., module-level functions inside a running event loop) and cannot
+        use the async spawn() API.
+
+        v270.4: Added for Disease 1 — task lifecycle ownership.
+        """
+        if self._shutdown_started:
+            logger.warning(f"Cannot register task '{name}' - shutdown in progress")
+            return
+
+        managed = ManagedTask(
+            name=name,
+            task=task,
+            priority=priority,
+            state=TaskState.RUNNING,
+            is_monitor=is_monitor,
+        )
+        self._tasks[name] = managed
+        self._stats["total_spawned"] += 1
+
+        def _on_done(t: asyncio.Task, _name: str = name) -> None:
+            if t.cancelled():
+                managed.state = TaskState.CANCELLED
+                managed.completed_at = time.time()
+                self._stats["total_cancelled"] += 1
+            elif t.exception():
+                managed.state = TaskState.FAILED
+                managed.error = str(t.exception())
+                managed.completed_at = time.time()
+                self._stats["total_failed"] += 1
+                logger.error(
+                    "[TaskLifecycle] Registered task '%s' failed: %s",
+                    _name, managed.error,
+                )
+            else:
+                managed.state = TaskState.COMPLETED
+                managed.completed_at = time.time()
+                self._stats["total_completed"] += 1
+
+        task.add_done_callback(_on_done)
+        logger.debug(f"Registered external task '{name}' (priority={priority.name})")
+
     async def cancel_task(self, name: str, timeout: float = 5.0) -> bool:
         """
         Cancel a specific task by name.

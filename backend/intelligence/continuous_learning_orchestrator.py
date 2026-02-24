@@ -783,12 +783,29 @@ class ContinuousLearningOrchestrator:
             self._metrics["experiences_collected"] += 1
 
             # Trigger experience callbacks (non-blocking)
+            # v270.4: Track fire-and-forget tasks for proper lifecycle ownership
             exp_dict = experience.to_dict()
-            asyncio.create_task(self._fire_experience_callbacks(exp_dict))
+            _cb_task = asyncio.create_task(self._fire_experience_callbacks(exp_dict))
+            try:
+                from backend.core.task_lifecycle_manager import get_task_manager, TaskPriority
+                get_task_manager().register_task(
+                    f"experience_callbacks_{experience.experience_id[:8]}",
+                    _cb_task, priority=TaskPriority.LOW,
+                )
+            except (ImportError, Exception):
+                pass
 
             # Forward to cross-repo (non-blocking)
             if self._experience_forwarder:
-                asyncio.create_task(self._forward_to_cross_repo(experience))
+                _fwd_task = asyncio.create_task(self._forward_to_cross_repo(experience))
+                try:
+                    from backend.core.task_lifecycle_manager import get_task_manager, TaskPriority
+                    get_task_manager().register_task(
+                        f"experience_forward_{experience.experience_id[:8]}",
+                        _fwd_task, priority=TaskPriority.LOW,
+                    )
+                except (ImportError, Exception):
+                    pass
 
         return experience.experience_id
 

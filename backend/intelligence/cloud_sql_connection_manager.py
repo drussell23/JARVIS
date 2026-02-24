@@ -1693,10 +1693,19 @@ class IntelligentCredentialResolver:
             try:
                 loop = asyncio.get_running_loop()
                 # We're in an async context - schedule task on THIS loop
-                asyncio.create_task(
+                # v270.4: Track for proper lifecycle ownership
+                _inv_task = asyncio.create_task(
                     cls._safe_pool_invalidation(),
                     name="credential_pool_invalidation"
                 )
+                try:
+                    from backend.core.task_lifecycle_manager import get_task_manager, TaskPriority
+                    get_task_manager().register_task(
+                        "credential_pool_invalidation", _inv_task,
+                        priority=TaskPriority.LOW,
+                    )
+                except (ImportError, Exception):
+                    pass
             except RuntimeError:
                 # Not in an event loop - signal file will handle it
                 pass

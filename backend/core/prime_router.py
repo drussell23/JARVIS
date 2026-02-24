@@ -84,6 +84,15 @@ class _EndpointAwareCircuitBreaker:
     """v242.0: Endpoint-aware circuit breaker. Resets on endpoint change."""
 
     def __init__(self, threshold: int = 2, recovery_s: float = 30.0):
+        # v270.4: Pull from unified recovery policy (was threshold=2, too aggressive)
+        try:
+            from backend.core.recovery_policy import get_recovery_params
+            _rp = get_recovery_params("prime_router")
+            if _rp is not None:
+                threshold = _rp.circuit_failure_threshold
+                recovery_s = _rp.circuit_recovery_seconds
+        except ImportError:
+            pass
         self._threshold = threshold
         self._recovery_s = recovery_s
         self._failures = 0
