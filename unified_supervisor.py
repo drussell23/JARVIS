@@ -1189,6 +1189,48 @@ except ImportError as _ie:
     ReadinessPredicate = None  # type: ignore
     ReadinessResult = None  # type: ignore
 
+# ============================================================================
+# v270.2: CONTROL-PLANE AUTHORITY HIERARCHY
+# ============================================================================
+# unified_supervisor.py is the SOLE kernel for startup orchestration.
+# All other orchestrators are delegates controlled by this kernel.
+#
+# Authority chain (strict hierarchy — lower levels NEVER act independently):
+#
+#   unified_supervisor.py                          [KERNEL - owns phases, modes, timeouts]
+#     ├─ startup_state_machine.py                  [DAG engine + component status sink]
+#     │     • Kahn's algorithm wave execution
+#     │     • Component registration & dependency resolution
+#     │     • Event-based completion notification
+#     │     • Fed by _update_component_status() at line ~79279
+#     │
+#     ├─ cross_repo_startup_orchestrator.py        [Trinity process lifecycle delegate]
+#     │     • ProcessOrchestrator: spawn/monitor J-Prime & Reactor-Core
+#     │     • _trinity_gcp_ready_event: cross-repo VM coordination
+#     │     • write_claude_api_fallback_signal: fallback signaling
+#     │     • shutdown_orchestrator: graceful termination
+#     │
+#     ├─ infrastructure_orchestrator.py            [Cloud resource lifecycle delegate]
+#     │     • OnDemandResource provisioning/cleanup
+#     │     • GCPReconciler session tracking
+#     │     • Periodic orphan detection loop
+#     │
+#     └─ supervisor_gcp_controller.py              [VM decision delegate (via routers)]
+#           • Budget, cooldown, effectiveness gates
+#           • Stall recovery tracking
+#           • Used by hybrid_router / gcp_hybrid_prime_router
+#
+# DEPRECATED — do NOT import from:
+#   • intelligent_startup_orchestrator.py  (dead code, no active consumers)
+#   • trinity_startup_orchestrator.py      (superseded by cross_repo_startup_orchestrator)
+#
+# The backend subprocess (backend/main.py) has its OWN micro-startup via
+# supervisor_orchestrator_bridge.py → advanced_startup_orchestrator.py.
+# That is correct architecture: the kernel tracks macro phases, the backend
+# tracks its own internal initialization. They communicate via health
+# endpoints, NOT shared in-memory state.
+# ============================================================================
+
 # v181.0: Cross-Repo Startup Orchestrator - GCP/Hollow Client/Trinity Protocol
 # v200.0: Added ProcessOrchestrator and StartupLockError for Pillar 1 lock-guarded startup
 try:
@@ -62637,6 +62679,15 @@ class JarvisSystemKernel:
             self.logger.debug("[Kernel] v266.1: StartupStateMachine singleton reset")
         except Exception as _ssm_err:
             self.logger.debug(f"[Kernel] v266.1: SSM reset error: {_ssm_err}")
+
+        # v270.2: Reset GCP controller singleton — stale budget counters, effectiveness
+        # rates, stall tracking, and VM lifecycle state from previous run would persist.
+        try:
+            from backend.core.supervisor_gcp_controller import reset_supervisor_gcp_controller
+            reset_supervisor_gcp_controller()
+            self.logger.debug("[Kernel] v270.2: SupervisorGCPController singleton reset")
+        except Exception as _gcp_ctrl_err:
+            self.logger.debug(f"[Kernel] v270.2: GCPController reset error: {_gcp_ctrl_err}")
 
         try:
             from backend.intelligence.cloud_sql_connection_manager import reset_readiness_gate

@@ -1,7 +1,26 @@
 #!/usr/bin/env python3
 """
-JARVIS Intelligent Startup Orchestrator v1.0.0
-==============================================
+DEPRECATED — v270.2 (2026-02-24)
+=================================
+This module is NOT imported by any active code path.  Its only consumer
+was ``_deprecated_run_supervisor.py``.
+
+Canonical authority chain for startup orchestration:
+  unified_supervisor.py  (kernel — phases, timeouts, mode management)
+    → startup_state_machine.py  (DAG wave execution, component status)
+    → cross_repo_startup_orchestrator.py  (Trinity process lifecycle)
+    → infrastructure_orchestrator.py  (cloud resource lifecycle)
+
+If you need progressive readiness tracking, use
+``startup_state_machine.StartupStateMachine`` which already provides
+component registration, dependency resolution, wave execution, and
+event-based completion notification.
+
+Do NOT add new imports of this module.  It will be removed in a future
+version.
+
+JARVIS Intelligent Startup Orchestrator v1.0.0 (DEPRECATED)
+============================================================
 
 Production-grade, async, parallel startup system that:
 - Uses progressive readiness levels for faster startup

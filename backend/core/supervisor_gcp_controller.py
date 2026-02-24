@@ -921,6 +921,21 @@ def get_supervisor_gcp_controller() -> SupervisorAwareGCPController:
     return _controller
 
 
+def reset_supervisor_gcp_controller() -> None:
+    """
+    v270.2: Reset singleton for clean in-process restart.
+
+    Without this, stale budget counters, effectiveness rates, stall
+    tracking, and VM lifecycle state from a previous run bleed into
+    the next startup — identical root cause to the startup_state_machine
+    persistence bug fixed in v266.1.
+
+    Must be called during shutdown BEFORE the next startup cycle begins.
+    """
+    global _controller
+    _controller = None
+
+
 async def request_vm(
     memory_percent: float,
     trigger: str,

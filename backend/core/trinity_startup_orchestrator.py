@@ -1,6 +1,21 @@
 """
-Trinity Unified Startup Orchestrator v79.0
-==========================================
+DEPRECATED — v270.2 (2026-02-24)
+=================================
+This module is NOT imported by ``unified_supervisor.py``.  Trinity
+process lifecycle is managed by
+``backend.supervisor.cross_repo_startup_orchestrator.ProcessOrchestrator``
+under the supervisor kernel's authority.
+
+Canonical authority chain for Trinity startup:
+  unified_supervisor.py  (kernel)
+    → cross_repo_startup_orchestrator.ProcessOrchestrator  (spawn/monitor)
+    → startup_state_machine.py  (DAG status tracking)
+
+Do NOT add new imports of this module.  It will be removed in a future
+version.
+
+Trinity Unified Startup Orchestrator v79.0 (DEPRECATED)
+========================================================
 
 Coordinates startup across all three Trinity repos:
 - JARVIS (Body) - Main AI agent

@@ -6988,12 +6988,16 @@ async def trinity_status():
         else:
             components[name] = {"status": "offline"}
 
-    # Get v80.0 health monitor status if available
+    # v270.2: get_health_monitor never existed in advanced_startup_orchestrator.
+    # Use startup_state_machine component summary instead (canonical status source).
     health_monitor_status = None
     try:
-        from core.advanced_startup_orchestrator import get_health_monitor
-        monitor = await get_health_monitor()
-        health_monitor_status = await monitor.get_aggregate_health()
+        from core.startup_state_machine import get_startup_state_machine_sync
+        _ssm = get_startup_state_machine_sync()
+        if _ssm is not None:
+            health_monitor_status = _ssm.get_component_summary()
+        else:
+            health_monitor_status = {"phase": "unknown", "components": {}}
     except Exception as e:
         health_monitor_status = {"error": str(e)}
 
@@ -7037,43 +7041,47 @@ async def trinity_health():
 
     v118.0: Supports HEAD method for efficient health checking.
     """
+    # v270.2: get_health_monitor never existed in advanced_startup_orchestrator.
+    # Use startup_state_machine as the canonical component status source.
     try:
-        from core.advanced_startup_orchestrator import get_health_monitor
+        from core.startup_state_machine import get_startup_state_machine_sync
 
-        monitor = await get_health_monitor()
+        _ssm = get_startup_state_machine_sync()
+        if _ssm is None:
+            return {
+                "healthy": False,
+                "error": "Startup state machine not initialized",
+                "v80_enabled": False,
+            }
 
-        # Get aggregate health with all metrics
-        aggregate = await monitor.get_aggregate_health()
+        summary = _ssm.get_component_summary()
+        components = summary.get("components", {})
 
-        # Get individual component status
+        # Map SSM component statuses to trinity health format
         component_health = {}
-        for component in ["jarvis", "j_prime", "reactor_core"]:
-            if component in monitor._health_cache:
-                cached = monitor._health_cache[component]
-                breaker = monitor._circuit_breakers.get(component, {})
-                component_health[component] = {
-                    "status": cached.get("status", "unknown"),
-                    "latency_ms": cached.get("latency_ms", 0),
-                    "circuit_breaker": {
-                        "state": breaker.get("state", "closed"),
-                        "failures": breaker.get("failures", 0),
-                        "last_failure": breaker.get("last_failure"),
-                    },
-                }
-            else:
-                component_health[component] = {"status": "not_checked"}
+        for component in ["jarvis", "jarvis_prime", "reactor_core"]:
+            comp_data = components.get(component, {})
+            status = comp_data.get("status", "unknown")
+            component_health[component] = {
+                "status": status,
+                "is_critical": comp_data.get("is_critical", False),
+                "duration_ms": comp_data.get("duration_ms"),
+                "error": comp_data.get("error"),
+            }
+
+        phase = summary.get("phase", "unknown")
+        is_healthy = phase in ("full_mode", "degraded")
 
         return {
-            "healthy": aggregate.get("overall_status") == "healthy",
-            "overall_status": aggregate.get("overall_status", "unknown"),
+            "healthy": is_healthy,
+            "overall_status": phase,
             "components": component_health,
-            "aggregate": aggregate,
             "v80_enabled": True,
         }
-    except ImportError:
+    except Exception as _e:
         return {
             "healthy": False,
-            "error": "v80.0 health monitor not available",
+            "error": f"Health check error: {_e}",
             "v80_enabled": False,
         }
     except Exception as e:
