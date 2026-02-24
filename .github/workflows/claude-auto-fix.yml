@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.ref || github.event.issue.pull_request.head.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
