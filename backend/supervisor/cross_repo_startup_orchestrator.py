@@ -16073,13 +16073,15 @@ echo "=== JARVIS Prime started ==="
 
                             # Fire off GCP provisioning in background (don't block log streaming)
                             if is_jarvis_prime:
-                                asyncio.create_task(
+                                _rescue_task = asyncio.create_task(
                                     self._proactive_rescue_handler(
                                         managed,
                                         matched_pattern or "UNKNOWN_PATTERN",
                                         is_severe,
-                                    )
+                                    ),
+                                    name="proactive_rescue_handler",
                                 )
+                                self._track_background_task(_rescue_task)
 
                             await _emit_event(
                                 "PROACTIVE_RESCUE_TRIGGERED",
@@ -16113,12 +16115,14 @@ echo "=== JARVIS Prime started ==="
                                 )
 
                                 if is_jarvis_prime:
-                                    asyncio.create_task(
+                                    _fallback_task = asyncio.create_task(
                                         self._cloud_fallback_handler(
                                             managed,
                                             pattern,
-                                        )
+                                        ),
+                                        name="cloud_fallback_handler",
                                     )
+                                    self._track_background_task(_fallback_task)
 
                                 await _emit_event(
                                     "CLOUD_FALLBACK_TRIGGERED",
@@ -16242,6 +16246,9 @@ echo "=== JARVIS Prime started ==="
                     details={"reason": "GCP VM provisioning failed or timed out"}
                 )
 
+        except asyncio.CancelledError:
+            logger.debug("[v270.3] Proactive Rescue Handler cancelled during shutdown")
+            raise
         except Exception as e:
             logger.error(f"[v147.0] Proactive Rescue Handler error: {e}")
 
@@ -16402,6 +16409,9 @@ echo "=== JARVIS Prime started ==="
                     }
                 )
 
+        except asyncio.CancelledError:
+            logger.debug("[v270.3] Cloud Fallback Handler cancelled during shutdown")
+            raise
         except Exception as e:
             logger.error(f"[v149.0] Cloud Fallback Handler error: {e}")
 
@@ -22292,6 +22302,28 @@ echo "=== JARVIS Prime started ==="
 
         # v95.1: Stop recovery coordinator first (prevent restart during shutdown)
         await self.stop_recovery_coordinator()
+
+        # v270.3: Cancel module-level global tasks (not tracked in self._background_tasks).
+        # These are created at module scope and outlive the orchestrator instance.
+        try:
+            await stop_gcp_vm_health_monitor()
+        except Exception as _e:
+            logger.debug("[shutdown] GCP VM health monitor stop error: %s", _e)
+
+        global _background_gcp_retry_task, _trinity_gcp_prewarm_task
+        for _task_name, _task_ref in [
+            ("background_gcp_retry", _background_gcp_retry_task),
+            ("trinity_gcp_prewarm", _trinity_gcp_prewarm_task),
+        ]:
+            if _task_ref is not None and not _task_ref.done():
+                _task_ref.cancel()
+                try:
+                    await asyncio.wait_for(_task_ref, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                logger.info("[shutdown] Cancelled module-level task: %s", _task_name)
+        _background_gcp_retry_task = None
+        _trinity_gcp_prewarm_task = None
 
         # v95.1: Calculate reverse dependency order for shutdown
         # Services that depend on others should shutdown FIRST

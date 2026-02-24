@@ -10438,7 +10438,11 @@ class DynamicPortManager(ResourceManagerBase):
         # v233.1: Harmonize port default with backend/main.py and frontend (8010).
         # Previous default (8000) caused DynamicPortManager to select 8000 before
         # assign_all_ports() could apply DEFAULT_BACKEND_PORT = 8010.
-        self.primary_port = int(os.getenv("JARVIS_PORT", os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010"))))
+        try:
+            from backend.core.config_constants import BACKEND_PORT as _cfg_backend_port
+            self.primary_port = _cfg_backend_port
+        except ImportError:
+            self.primary_port = int(os.getenv("JARVIS_PORT", os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010"))))
 
         fallback_str = os.getenv("JARVIS_FALLBACK_PORTS", "8000,8011,8012")
         self.fallback_ports = [int(p.strip()) for p in fallback_str.split(",") if p.strip()]
@@ -10818,10 +10822,21 @@ async def assign_all_ports(
     # v233.0: Harmonize with backend/main.py and frontend DynamicConfigService
     # Both default to 8010 via BACKEND_PORT env var. Previous mismatch (8000 vs 8010)
     # caused frontend connection failures when Docker occupied 8010.
-    DEFAULT_BACKEND_PORT = int(os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010")))
-    DEFAULT_WEBSOCKET_PORT = 8765
-    DEFAULT_LOADING_PORT = 3000
-    DEFAULT_FRONTEND_PORT = 3001
+    # v270.3: Use canonical config_constants with inline fallback for import safety.
+    try:
+        from backend.core.config_constants import (
+            BACKEND_PORT as _cc_bp, WEBSOCKET_PORT as _cc_wsp,
+            LOADING_SERVER_PORT as _cc_lsp, FRONTEND_PORT as _cc_fp,
+        )
+        DEFAULT_BACKEND_PORT = _cc_bp
+        DEFAULT_WEBSOCKET_PORT = _cc_wsp
+        DEFAULT_LOADING_PORT = _cc_lsp
+        DEFAULT_FRONTEND_PORT = _cc_fp
+    except ImportError:
+        DEFAULT_BACKEND_PORT = int(os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010")))
+        DEFAULT_WEBSOCKET_PORT = 8765
+        DEFAULT_LOADING_PORT = 3001
+        DEFAULT_FRONTEND_PORT = 3000
 
     # Minimum separation between services
     MIN_PORT_SEPARATION = 10
@@ -64056,6 +64071,21 @@ class JarvisSystemKernel:
             severity=SupervisorEventSeverity.SUCCESS, phase="clean_slate",
             duration_ms=(time.time() - _t0_cs) * 1000, correlation_id=_cid_cs,
         )
+
+        # =====================================================================
+        # v270.3: CONTRACT VALIDATION (non-blocking, advisory only)
+        # =====================================================================
+        try:
+            from backend.core.startup_contracts import validate_contracts_at_boot
+            _contract_warnings = validate_contracts_at_boot()
+            for _cw in _contract_warnings:
+                self.logger.warning("[Contract] %s", _cw)
+            if not _contract_warnings:
+                self.logger.debug("[Contract] All %d env var contracts valid", 16)
+        except ImportError:
+            pass  # Module not yet available — non-fatal
+        except Exception as _ce:
+            self.logger.debug("[Contract] Validation error (non-fatal): %s", _ce)
 
         # =====================================================================
         # v186.0: ENTERPRISE STARTUP BANNER (with Rich CLI support)

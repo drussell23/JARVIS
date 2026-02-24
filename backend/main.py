@@ -4933,7 +4933,12 @@ logger.info("🔒 Configuring CORS security...")
 # Detect environment
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
 IS_DOCKER = os.path.exists("/.dockerenv")
-BACKEND_PORT = os.getenv("BACKEND_PORT", "8010")
+# v270.3: Use canonical config_constants for port (handles BACKEND_PORT/JARVIS_BACKEND_PORT/JARVIS_PORT).
+try:
+    from core.config_constants import BACKEND_PORT as _cc_port
+    BACKEND_PORT = str(_cc_port)
+except ImportError:
+    BACKEND_PORT = os.getenv("BACKEND_PORT", "8010")
 
 def build_cors_origins():
     """
