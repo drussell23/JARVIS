@@ -25,6 +25,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+try:
+    from backend.core.trace_envelope import TraceEnvelope
+    _TRACE_ENVELOPE_AVAILABLE = True
+except ImportError:
+    _TRACE_ENVELOPE_AVAILABLE = False
+    TraceEnvelope = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,10 +74,11 @@ class DecisionRecord:
     timestamp: float = field(default_factory=time.time)
     component: str = ""          # Which module made the decision
     metadata: Dict[str, Any] = field(default_factory=dict)
+    envelope: Optional[Any] = None  # TraceEnvelope when available
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for inspection/export."""
-        return {
+        d = {
             "decision_type": self.decision_type,
             "reason": self.reason,
             "inputs": self.inputs,
@@ -79,6 +87,12 @@ class DecisionRecord:
             "component": self.component,
             "metadata": self.metadata,
         }
+        if self.envelope is not None:
+            try:
+                d["envelope"] = self.envelope.to_dict()
+            except Exception:
+                pass
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +114,7 @@ class DecisionLog:
         self._buffer: collections.deque = collections.deque(maxlen=max(1, max_entries))
         self._lock = threading.Lock()
         self._counters: Dict[str, int] = {}  # decision_type -> cumulative count
+        self._last_flushed_index: int = 0
 
     @classmethod
     def get_instance(cls) -> "DecisionLog":
@@ -123,6 +138,7 @@ class DecisionLog:
         outcome: str,
         component: str = "",
         metadata: Optional[Dict[str, Any]] = None,
+        envelope: Optional[Any] = None,
     ) -> DecisionRecord:
         """
         Record a decision. Thread-safe.
@@ -136,6 +152,7 @@ class DecisionLog:
             outcome=outcome,
             component=component,
             metadata=metadata or {},
+            envelope=envelope,
         )
         with self._lock:
             self._buffer.append(rec)
@@ -197,6 +214,39 @@ class DecisionLog:
         """Current number of entries in the buffer."""
         return len(self._buffer)
 
+    # -----------------------------------------------------------------------
+    # Persistence API
+    # -----------------------------------------------------------------------
+
+    def flush_to_jsonl(self, decisions_dir) -> int:
+        """Flush new records to date-partitioned JSONL. Returns count flushed."""
+        from pathlib import Path
+        try:
+            from backend.core.trace_store import JSONLWriter
+        except ImportError:
+            logger.debug("trace_store not available, skipping JSONL flush")
+            return 0
+
+        decisions_dir = Path(decisions_dir)
+        with self._lock:
+            records = list(self._buffer)
+            current_size = len(records)
+
+        new_records = records[self._last_flushed_index:]
+        if not new_records:
+            return 0
+
+        try:
+            import time as _time
+            writer = JSONLWriter(decisions_dir / f"{_time.strftime('%Y%m%d')}.jsonl")
+            for rec in new_records:
+                writer.append(rec.to_dict())
+            self._last_flushed_index = current_size
+            return len(new_records)
+        except Exception:
+            logger.debug("Failed to flush decisions to JSONL", exc_info=True)
+            return 0
+
 
 # ---------------------------------------------------------------------------
 # Module-level convenience functions
@@ -214,6 +264,7 @@ def record_decision(
     outcome: str,
     component: str = "",
     metadata: Optional[Dict[str, Any]] = None,
+    envelope: Optional[Any] = None,
 ) -> Optional[DecisionRecord]:
     """
     Module-level convenience function. Safe to call from anywhere.
@@ -227,6 +278,7 @@ def record_decision(
             outcome=outcome,
             component=component,
             metadata=metadata,
+            envelope=envelope,
         )
     except Exception:
         return None
