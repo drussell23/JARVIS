@@ -66219,9 +66219,23 @@ class JarvisSystemKernel:
             if _ssm: await _ssm.start_component("intelligence")
             _intel_ok = False
             try:
-                _intel_ok = await asyncio.wait_for(
-                    self._phase_intelligence(),
-                    timeout=intelligence_timeout,
+                if _BUDGET_AVAILABLE:
+                    async with _execution_budget(
+                        "phase_intelligence", intelligence_timeout,
+                        phase_id="4", phase_name="intelligence",
+                        priority=_BudgetCriticality.HIGH,
+                        request_kind=_BudgetRequestKind.STARTUP,
+                    ):
+                        _intel_ok = await self._phase_intelligence()
+                else:
+                    _intel_ok = await asyncio.wait_for(
+                        self._phase_intelligence(),
+                        timeout=intelligence_timeout,
+                    )
+            except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                self.logger.warning(
+                    f"[Kernel] Intelligence budget/cap exceeded ({intelligence_timeout:.0f}s) "
+                    f"— continuing without ML features"
                 )
             except asyncio.TimeoutError:
                 self.logger.warning(
@@ -66841,9 +66855,33 @@ class JarvisSystemKernel:
                     effective_trinity_timeout + 60.0,
                 )
                 try:
-                    await asyncio.wait_for(
-                        self._phase_trinity(),
-                        timeout=_trinity_outer_timeout,
+                    if _BUDGET_AVAILABLE:
+                        async with _execution_budget(
+                            "phase_trinity", _trinity_outer_timeout,
+                            phase_id="5", phase_name="trinity",
+                            priority=_BudgetCriticality.HIGH,
+                            request_kind=_BudgetRequestKind.STARTUP,
+                        ):
+                            await self._phase_trinity()
+                    else:
+                        await asyncio.wait_for(
+                            self._phase_trinity(),
+                            timeout=_trinity_outer_timeout,
+                        )
+                except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                    self.logger.error(
+                        f"[Kernel] Trinity budget/cap exceeded after "
+                        f"{_trinity_outer_timeout:.0f}s — continuing without Trinity"
+                    )
+                    self._update_component_status(
+                        "trinity", "error",
+                        f"Budget/cap exceeded ({_trinity_outer_timeout:.0f}s)",
+                    )
+                    issue_collector.add_warning(
+                        f"Trinity phase budget/cap exceeded ({_trinity_outer_timeout:.0f}s) — "
+                        "continuing without cross-repo integration",
+                        IssueCategory.GENERAL,
+                        suggestion="Check J-Prime and Reactor-Core availability"
                     )
                 except asyncio.TimeoutError:
                     self.logger.error(
@@ -66983,9 +67021,27 @@ class JarvisSystemKernel:
             # with 30s each.
             _enterprise_outer_timeout = enterprise_timeout + 30.0
             try:
-                await asyncio.wait_for(
-                    self._phase_enterprise_services(),
-                    timeout=_enterprise_outer_timeout,
+                if _BUDGET_AVAILABLE:
+                    async with _execution_budget(
+                        "phase_enterprise", _enterprise_outer_timeout,
+                        phase_id="6", phase_name="enterprise",
+                        priority=_BudgetCriticality.NORMAL,
+                        request_kind=_BudgetRequestKind.STARTUP,
+                    ):
+                        await self._phase_enterprise_services()
+                else:
+                    await asyncio.wait_for(
+                        self._phase_enterprise_services(),
+                        timeout=_enterprise_outer_timeout,
+                    )
+            except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                self.logger.error(
+                    f"[Kernel] Enterprise budget/cap exceeded "
+                    f"after {_enterprise_outer_timeout:.0f}s — continuing"
+                )
+                self._update_component_status(
+                    "enterprise", "degraded",
+                    f"Budget/cap exceeded ({_enterprise_outer_timeout:.0f}s)",
                 )
             except asyncio.TimeoutError:
                 self.logger.error(
@@ -67464,9 +67520,28 @@ class JarvisSystemKernel:
             if _ssm: await _ssm.start_component("frontend")
             _fe_ok = True
             try:
-                await asyncio.wait_for(
-                    self._phase_frontend_transition(),
-                    timeout=_fe_outer_timeout,
+                if _BUDGET_AVAILABLE:
+                    async with _execution_budget(
+                        "phase_frontend", _fe_outer_timeout,
+                        phase_id="7", phase_name="frontend",
+                        priority=_BudgetCriticality.NORMAL,
+                        request_kind=_BudgetRequestKind.STARTUP,
+                    ):
+                        await self._phase_frontend_transition()
+                else:
+                    await asyncio.wait_for(
+                        self._phase_frontend_transition(),
+                        timeout=_fe_outer_timeout,
+                    )
+            except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                self.logger.error(
+                    f"[Kernel] Frontend budget/cap exceeded "
+                    f"after {_fe_outer_timeout:.0f}s"
+                )
+                _fe_ok = False
+                self._update_component_status(
+                    "frontend", "error",
+                    f"Budget/cap exceeded ({_fe_outer_timeout:.0f}s)",
                 )
             except asyncio.TimeoutError:
                 self.logger.error(
