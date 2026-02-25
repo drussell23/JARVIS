@@ -294,10 +294,7 @@ class GCPLifecycleStateMachine:
             )
 
         # Step 3: Find and release orphaned budget reservations
-        await self._release_orphaned_budgets(
-            reconciled_op_ids + failed_op_ids,
-            failed_op_ids,
-        )
+        await self._release_orphaned_budgets()
 
         # Step 4: Recover in-memory state from journal
         await self.recover_from_journal()
@@ -310,11 +307,7 @@ class GCPLifecycleStateMachine:
             len(failed_op_ids),
         )
 
-    async def _release_orphaned_budgets(
-        self,
-        all_op_ids: List[str],
-        failed_op_ids: List[str],
-    ) -> None:
+    async def _release_orphaned_budgets(self) -> None:
         """Release pending budget reservations that have no matching commit/release.
 
         A budget reservation is orphaned if:
