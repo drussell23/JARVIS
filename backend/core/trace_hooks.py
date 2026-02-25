@@ -103,6 +103,23 @@ def on_phase_fail(phase: str, error: str, evidence: Optional[Dict[str, Any]] = N
         logger.debug(f"Failed to emit phase_fail({phase})", exc_info=True)
 
 
+def on_boot_failed(
+    error: str, phase: str = "", duration_s: float = 0.0,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Call when startup fails (exception or abort)."""
+    emitter = _get_emitter()
+    if emitter is None:
+        return
+    try:
+        meta = {"phase": phase, "duration_s": duration_s}
+        if metadata:
+            meta.update(metadata)
+        emitter.boot_failed(error=error, metadata=meta)
+    except Exception:
+        logger.debug("Failed to emit boot_failed", exc_info=True)
+
+
 def on_shutdown(reason: str = "") -> None:
     """Call at the start of shutdown."""
     emitter = _get_emitter()

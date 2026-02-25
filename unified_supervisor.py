@@ -1596,6 +1596,7 @@ try:
     from backend.core.trace_hooks import (
         on_boot_start as _trace_boot_start,
         on_boot_complete as _trace_boot_complete,
+        on_boot_failed as _trace_boot_failed,
         on_phase_enter as _trace_phase_enter,
         on_phase_exit as _trace_phase_exit,
         on_phase_fail as _trace_phase_fail,
@@ -1608,7 +1609,7 @@ except ImportError:
     _TRACE_HOOKS_AVAILABLE = False
     _trace_initialize = None
     _trace_shutdown = None
-    _trace_boot_start = _trace_boot_complete = None
+    _trace_boot_start = _trace_boot_complete = _trace_boot_failed = None
     _trace_phase_enter = _trace_phase_exit = _trace_phase_fail = None
     _trace_on_shutdown = _trace_recovery_start = _trace_recovery_complete = None
 
@@ -15101,9 +15102,25 @@ class IntelligentResourceOrchestrator:
         ports_task = create_safe_task(self._check_ports_intelligent())
         cpu_task = create_safe_task(self._check_cpu())
 
+        # v278.0: return_exceptions=True prevents one failed check from cancelling siblings
         memory_result, disk_result, ports_result, cpu_result = await asyncio.gather(
-            memory_task, disk_task, ports_task, cpu_task
+            memory_task, disk_task, ports_task, cpu_task,
+            return_exceptions=True,
         )
+
+        # v278.0: If any resource check raised an exception, provide safe defaults
+        if isinstance(memory_result, BaseException):
+            logger.warning(f"[ResourceOrch] Memory check failed: {memory_result}")
+            memory_result = {"available_gb": 8.0, "total_gb": 16.0, "pressure": "nominal"}
+        if isinstance(disk_result, BaseException):
+            logger.warning(f"[ResourceOrch] Disk check failed: {disk_result}")
+            disk_result = {"available_gb": 50.0, "total_gb": 500.0}
+        if isinstance(ports_result, BaseException):
+            logger.warning(f"[ResourceOrch] Ports check failed: {ports_result}")
+            ports_result = {"available": True, "conflicts": []}
+        if isinstance(cpu_result, BaseException):
+            logger.warning(f"[ResourceOrch] CPU check failed: {cpu_result}")
+            cpu_result = (os.cpu_count() or 4, None)
 
         # Phase 2: Intelligent analysis and action
         warnings: List[str] = []
@@ -57146,6 +57163,12 @@ class StartupWatchdog:
         if self._recovery_mode == "passive":
             # Passive mode: only log, never take action
             self._logger.info(f"[DMS] Passive mode - would take action: {action}")
+            # v278.0: Trace recovery outcome — passive skip
+            if _TRACE_HOOKS_AVAILABLE and _trace_recovery_complete:
+                try:
+                    _trace_recovery_complete(phase, f"passive_skip:{action}")
+                except Exception:
+                    pass
             return
         
         # Graduated mode: escalate through actions
@@ -57222,20 +57245,40 @@ class StartupWatchdog:
                         self._last_stall_action_time.pop(phase, None)
                         self._warnings_issued.pop(phase, None)
                         self._diagnostics_dumped.pop(phase, None)
+                        # v278.0: Trace recovery outcome — restart success
+                        if _TRACE_HOOKS_AVAILABLE and _trace_recovery_complete:
+                            try:
+                                _trace_recovery_complete(phase, "restart_success")
+                            except Exception:
+                                pass
                     else:
                         self._logger.warning(f"[DMS] Restart failed for phase '{phase}'")
+                        # v278.0: Trace recovery outcome — restart failed
+                        if _TRACE_HOOKS_AVAILABLE and _trace_recovery_complete:
+                            try:
+                                _trace_recovery_complete(phase, "restart_failed")
+                            except Exception:
+                                pass
                 except Exception as e:
                     self._logger.error(f"[DMS] Restart callback error: {e}")
+                    # v278.0: Trace recovery outcome — restart error
+                    if _TRACE_HOOKS_AVAILABLE and _trace_recovery_complete:
+                        try:
+                            _trace_recovery_complete(phase, f"restart_error:{type(e).__name__}")
+                        except Exception:
+                            pass
         
         elif action == "rollback":
             self._logger.error(f"[DMS] 🚨 ROLLBACK triggered for phase '{phase}'")
-            
+            _rollback_outcome = "rollback_complete"
+
             if self._rollback_callback:
                 try:
                     await self._rollback_callback()
                 except Exception as e:
                     self._logger.error(f"[DMS] Rollback callback error: {e}")
-            
+                    _rollback_outcome = f"rollback_error:{type(e).__name__}"
+
             # Log critical diagnostic
             if DIAGNOSTICS_AVAILABLE and log_shutdown_trigger:
                 try:
@@ -57245,7 +57288,13 @@ class StartupWatchdog:
                     )
                 except Exception:
                     pass
-    
+            # v278.0: Trace recovery outcome — rollback
+            if _TRACE_HOOKS_AVAILABLE and _trace_recovery_complete:
+                try:
+                    _trace_recovery_complete(phase, _rollback_outcome)
+                except Exception:
+                    pass
+
     def _get_escalated_action(self, phase: str, base_action: str) -> str:
         """Get the escalated action based on previous attempts."""
         warnings = self._warnings_issued.get(phase, 0)
@@ -63605,6 +63654,18 @@ class JarvisSystemKernel:
                 await get_startup_transaction().abort_with_cleanup("progress_controller_timeout")
             except Exception:
                 pass
+            # v278.0: Trace failure path — progress controller timeout
+            if _TRACE_HOOKS_AVAILABLE:
+                try:
+                    _timeout_phase = getattr(self, "_current_startup_phase", "unknown")
+                    if _trace_phase_fail:
+                        _trace_phase_fail(_timeout_phase, error=f"progress_controller_timeout: {e}")
+                    if _trace_phase_exit:
+                        _trace_phase_exit(_timeout_phase, success=False)
+                    if _trace_boot_failed:
+                        _trace_boot_failed(error=f"progress_controller_timeout: {e}", phase=_timeout_phase)
+                except Exception:
+                    pass
             self._state = KernelState.FAILED
             return 1
 
@@ -64581,6 +64642,15 @@ class JarvisSystemKernel:
                 if _txn:
                     try:
                         await _txn.abort_with_cleanup("dms_required_failed")
+                    except Exception:
+                        pass
+                # v278.0: Trace failure path — DMS required but failed
+                if _TRACE_HOOKS_AVAILABLE:
+                    try:
+                        if _trace_phase_fail:
+                            _trace_phase_fail("dms_init", error="dms_required_failed")
+                        if _trace_boot_failed:
+                            _trace_boot_failed(error="dms_required_failed", phase="dms_init")
                     except Exception:
                         pass
                 return 1
@@ -65720,6 +65790,15 @@ class JarvisSystemKernel:
                         await _txn.abort_with_cleanup("preflight_failed")
                     except Exception:
                         pass
+                # v278.0: Trace failure path — preflight failed
+                if _TRACE_HOOKS_AVAILABLE:
+                    try:
+                        if _trace_phase_fail:
+                            _trace_phase_fail("preflight", error="preflight_failed")
+                        if _trace_phase_exit:
+                            _trace_phase_exit("preflight", progress=15, success=False, duration_s=time.time() - _t0_pf)
+                    except Exception:
+                        pass
                 issue_collector.print_health_report()
                 return 1
             if _ssm: await _ssm.complete_component("preflight")
@@ -65818,6 +65897,15 @@ class JarvisSystemKernel:
                         await _txn.abort_with_cleanup("resources_failed")
                     except Exception:
                         pass
+                # v278.0: Trace failure path — resources failed
+                if _TRACE_HOOKS_AVAILABLE:
+                    try:
+                        if _trace_phase_fail:
+                            _trace_phase_fail("resources", error="resources_failed")
+                        if _trace_phase_exit:
+                            _trace_phase_exit("resources", progress=25, success=False, duration_s=time.time() - _t0_rs)
+                    except Exception:
+                        pass
                 issue_collector.print_health_report()
                 return 1
             if _ssm: await _ssm.complete_component("resources")
@@ -65904,6 +65992,15 @@ class JarvisSystemKernel:
                 if _txn:
                     try:
                         await _txn.abort_with_cleanup("backend_failed")
+                    except Exception:
+                        pass
+                # v278.0: Trace failure path — backend failed
+                if _TRACE_HOOKS_AVAILABLE:
+                    try:
+                        if _trace_phase_fail:
+                            _trace_phase_fail("backend", error="backend_failed")
+                        if _trace_phase_exit:
+                            _trace_phase_exit("backend", progress=45, success=False, duration_s=time.time() - _t0_be)
                     except Exception:
                         pass
                 issue_collector.print_health_report()
@@ -67674,6 +67771,22 @@ class JarvisSystemKernel:
             if _txn:
                 try:
                     await _txn.abort_with_cleanup(f"exception:{type(e).__name__}")
+                except Exception:
+                    pass
+            # v278.0: Trace failure path — unhandled exception
+            if _TRACE_HOOKS_AVAILABLE:
+                try:
+                    _exc_phase = getattr(self, "_current_startup_phase", "unknown")
+                    if _trace_phase_fail:
+                        _trace_phase_fail(_exc_phase, error=f"{type(e).__name__}: {e!r}")
+                    if _trace_phase_exit:
+                        _trace_phase_exit(_exc_phase, success=False)
+                    if _trace_boot_failed:
+                        _trace_boot_failed(
+                            error=f"{type(e).__name__}: {e!r}",
+                            phase=_exc_phase,
+                            metadata={"traceback": traceback.format_exc()[-500:]},
+                        )
                 except Exception:
                     pass
             self._state = KernelState.FAILED

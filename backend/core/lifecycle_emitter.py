@@ -159,6 +159,12 @@ class LifecycleEmitter:
         """Emit boot_complete event."""
         return self._emit("boot_complete", **(metadata or {}))
 
+    def boot_failed(self, error: str = "", metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Emit boot_failed event. Auto-flushes to capture failure before crash."""
+        event = self._emit("boot_failed", error=error, **(metadata or {}))
+        self.flush()
+        return event
+
     def shutdown_start(self, reason: str = "") -> Dict[str, Any]:
         """Emit shutdown_start event."""
         return self._emit("shutdown_start", reason=reason)
