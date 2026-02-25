@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import struct
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -144,13 +145,12 @@ class ControlPlaneSubscriber:
             self._reader, self._writer = await asyncio.open_unix_connection(
                 self._sock_path
             )
-            subscribe_msg = json.dumps({
+            # Use length-prefixed JSON wire protocol (matching EventFabric)
+            await self._send_frame({
                 "type": "subscribe",
                 "subscriber_id": self._subscriber_id,
                 "last_seen_seq": self._last_seen_seq,
             })
-            self._writer.write((subscribe_msg + "\n").encode())
-            await self._writer.drain()
             self._connected = True
             self._receive_task = asyncio.create_task(self._receive_loop())
             logger.info(
@@ -189,26 +189,43 @@ class ControlPlaneSubscriber:
 
         logger.info("Subscriber %s disconnected", self._subscriber_id)
 
+    # -- Wire protocol helpers ------------------------------------------------
+
+    async def _send_frame(self, payload: dict) -> None:
+        """Send a length-prefixed JSON frame."""
+        assert self._writer is not None
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        header = struct.pack(">I", len(data))
+        self._writer.write(header + data)
+        await self._writer.drain()
+
+    async def _recv_frame(self) -> dict:
+        """Read a length-prefixed JSON frame."""
+        assert self._reader is not None
+        header = await self._reader.readexactly(4)
+        (length,) = struct.unpack(">I", header)
+        data = await self._reader.readexactly(length)
+        return json.loads(data)
+
     async def _receive_loop(self) -> None:
         """Background task that reads events from the UDS connection."""
         assert self._reader is not None
         try:
             while self._connected:
-                line = await self._reader.readline()
-                if not line:
+                try:
+                    event = await self._recv_frame()
+                    self._dispatch_event(event)
+                except asyncio.IncompleteReadError:
                     logger.info(
                         "UDS connection closed for subscriber %s",
                         self._subscriber_id,
                     )
                     break
-                try:
-                    event = json.loads(line.decode().strip())
-                    self._dispatch_event(event)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as exc:
                     logger.warning(
-                        "Received malformed event on subscriber %s: %r",
+                        "Received malformed event on subscriber %s: %s",
                         self._subscriber_id,
-                        line,
+                        exc,
                     )
         except asyncio.CancelledError:
             raise

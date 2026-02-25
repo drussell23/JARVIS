@@ -16,7 +16,7 @@ Design doc: docs/plans/2026-02-24-cross-repo-control-plane-design.md
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import (
     Awaitable, Callable, Dict, List, Optional, Protocol, Set, Tuple,
@@ -84,11 +84,11 @@ class ComponentDeclaration:
 
 @runtime_checkable
 class LocalityDriver(Protocol):
-    """How to start/stop/health-check by locality."""
-    async def start(self, comp: ComponentDeclaration) -> int: ...
-    async def stop(self, comp: ComponentDeclaration) -> None: ...
-    async def health_check(self, comp: ComponentDeclaration) -> dict: ...
-    async def send_drain(self, comp: ComponentDeclaration, timeout_s: float) -> None: ...
+    """How to start/stop/health-check a component by locality."""
+    async def start(self, component_name: str, config: Optional[dict] = None) -> bool: ...
+    async def stop(self, component_name: str) -> bool: ...
+    async def health_check(self, component_name: str) -> dict: ...
+    async def send_drain(self, component_name: str, timeout_s: float = 30.0) -> bool: ...
 
 
 # ── Wave Computation ────────────────────────────────────────────────
@@ -337,7 +337,7 @@ class LifecycleEngine:
             driver = self._drivers.get(comp.locality)
             if driver:
                 await asyncio.wait_for(
-                    driver.start(comp),
+                    driver.start(comp.name),
                     timeout=comp.start_timeout_s,
                 )
 
@@ -430,7 +430,7 @@ class LifecycleEngine:
         driver = self._drivers.get(comp.locality)
         if driver:
             try:
-                await asyncio.wait_for(driver.stop(comp), timeout=10.0)
+                await asyncio.wait_for(driver.stop(comp.name), timeout=10.0)
             except Exception as e:
                 logger.warning("[Engine] %s stop error: %s", comp.name, e)
 

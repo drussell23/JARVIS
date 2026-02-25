@@ -5,15 +5,13 @@ Provides a short ``tmp_path`` override so that Unix Domain Socket paths
 stay within the macOS AF_UNIX 104-byte sun_path limit.
 """
 
-import os
-import sys
 import tempfile
 
 import pytest
 
 
 @pytest.fixture
-def tmp_path(request, tmp_path_factory):
+def tmp_path(request):
     """Override built-in ``tmp_path`` with a short base directory.
 
     macOS limits AF_UNIX sun_path to 104 bytes.  The default pytest
@@ -21,10 +19,9 @@ def tmp_path(request, tmp_path_factory):
     exceeds that.  This fixture creates the temp directory under ``/tmp``
     which keeps paths well within the limit.
     """
-    short_base = tempfile.mkdtemp(prefix="jt_", dir="/tmp")
-    path = type(tmp_path_factory)  # just get Path type
     from pathlib import Path
 
+    short_base = tempfile.mkdtemp(prefix="jt_", dir="/tmp")
     p = Path(short_base)
     # Register cleanup
     request.addfinalizer(lambda: _rmtree_safe(p))

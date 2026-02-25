@@ -11,7 +11,7 @@ via structured proposals and responses.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -278,7 +278,8 @@ class HandshakeManager:
         """Best-effort fetch of ``/health`` from the component."""
         try:
             url = f"{endpoint.rstrip('/')}/health"
-            async with session.get(url, timeout=5) as resp:
+            import aiohttp
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     return await resp.json()
         except Exception:
@@ -297,13 +298,15 @@ class HandshakeManager:
             return
         try:
             ok, reason = result
-            self._journal.record(
-                event="handshake",
-                component=component,
-                success=ok,
-                reason=reason,
-                proposal_epoch=proposal.supervisor_epoch,
-                response_id=response.component_instance_id if response else None,
+            self._journal.fenced_write(
+                action="handshake",
+                target=component,
+                payload={
+                    "success": ok,
+                    "reason": reason,
+                    "proposal_epoch": proposal.supervisor_epoch,
+                    "response_id": response.component_instance_id if response else None,
+                },
             )
         except Exception:
             logger.debug("Failed to record handshake journal entry", exc_info=True)
