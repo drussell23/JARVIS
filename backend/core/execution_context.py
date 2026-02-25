@@ -519,7 +519,7 @@ async def budget_aware_wait_for(
     if remaining is None:
         # No budget context — use local_cap, log the unscoped usage
         effective = local_cap
-        _log.debug(
+        _log.warning(
             "budget_aware_wait_for label=%s unscoped_local_timeout=true local_cap=%.2f",
             label, local_cap,
         )
@@ -669,9 +669,16 @@ def propagate_to_task(
 ) -> asyncio.Task[_T]:
     """Create an ``asyncio.Task`` that inherits the current context.
 
-    In Python 3.9+, ``asyncio.create_task`` already copies the current
-    ``contextvars.Context``.  This helper exists for consistency and to
-    make the intent explicit at call sites.
+    Uses ``contextvars.copy_context()`` to explicitly snapshot and
+    propagate the execution context.  On Python 3.11+ this passes the
+    context to ``loop.create_task(context=...)``.  On earlier versions
+    ``asyncio.create_task`` already copies the context implicitly, so
+    the helper ensures consistent behavior across versions.
     """
     loop = asyncio.get_running_loop()
-    return loop.create_task(coro, name=name)
+    ctx = contextvars.copy_context()
+    import sys
+    if sys.version_info >= (3, 11):
+        return loop.create_task(coro, name=name, context=ctx)  # type: ignore[arg-type]
+    # Python 3.9-3.10: create_task copies context implicitly
+    return loop.create_task(coro, name=name)  # type: ignore[arg-type]
