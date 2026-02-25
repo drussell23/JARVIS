@@ -5,9 +5,7 @@ All 3 tests must pass for the gate to be satisfied.
 """
 
 import asyncio
-import json
 import os
-import struct
 import time
 
 import pytest

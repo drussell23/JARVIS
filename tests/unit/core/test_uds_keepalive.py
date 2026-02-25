@@ -2,12 +2,10 @@
 """Tests for UDS keepalive — server-side ping/pong mechanism."""
 
 import asyncio
-import json
 import os
-import struct
 import time
 
-import pytest
+import pytest  # noqa: F401 — used by pytest collection
 
 from backend.core.orchestration_journal import OrchestrationJournal
 from backend.core.uds_event_fabric import (

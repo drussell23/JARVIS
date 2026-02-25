@@ -304,17 +304,17 @@ class EventFabric:
             self._subscribers[subscriber_id] = sub
 
             # Determine earliest available journal sequence for the ack
+            earliest_seq = 0
             try:
-                earliest_row = self._journal._conn.execute(
-                    "SELECT MIN(seq) FROM journal"
-                ).fetchone()
-                earliest_seq = (
-                    earliest_row[0]
-                    if earliest_row and earliest_row[0] is not None
-                    else 0
-                )
+                conn = self._journal._conn
+                if conn is not None:
+                    earliest_row = conn.execute(
+                        "SELECT MIN(seq) FROM journal"
+                    ).fetchone()
+                    if earliest_row and earliest_row[0] is not None:
+                        earliest_seq = earliest_row[0]
             except Exception:
-                earliest_seq = 0
+                pass
 
             # Send ack with earliest_available_seq
             ack_msg = {
