@@ -635,3 +635,43 @@ def bridge_timeout_error(
             elapsed=elapsed,
             timeout_origin="local_cap",
         )
+
+
+# ---------------------------------------------------------------------------
+# Context propagation helpers
+# ---------------------------------------------------------------------------
+
+
+def propagate_to_executor(fn: Callable[..., _T]) -> Callable[..., _T]:
+    """Wrap a synchronous function so that it carries the current
+    ``contextvars.Context`` into a thread executor.
+
+    Usage::
+
+        wrapped = propagate_to_executor(sync_fn)
+        await loop.run_in_executor(None, wrapped)
+
+    Without this wrapper, ``ContextVar`` values (including the execution
+    budget) are invisible inside ``run_in_executor`` threads.
+    """
+    ctx = contextvars.copy_context()
+
+    def _wrapper(*args: Any, **kwargs: Any) -> _T:
+        return ctx.run(fn, *args, **kwargs)
+
+    return _wrapper
+
+
+def propagate_to_task(
+    coro: Awaitable[_T],
+    *,
+    name: Optional[str] = None,
+) -> asyncio.Task[_T]:
+    """Create an ``asyncio.Task`` that inherits the current context.
+
+    In Python 3.9+, ``asyncio.create_task`` already copies the current
+    ``contextvars.Context``.  This helper exists for consistency and to
+    make the intent explicit at call sites.
+    """
+    loop = asyncio.get_running_loop()
+    return loop.create_task(coro, name=name)

@@ -500,3 +500,71 @@ class TestExceptionBridging:
             local_cap=5.0, owner="phase_test", phase="test",
         )
         assert isinstance(err, LocalCapExceededError)
+
+
+class TestContextPropagation:
+    """Verify context propagation through await, tasks, and thread executors."""
+
+    @pytest.mark.asyncio
+    async def test_context_propagates_through_await(self):
+        from backend.core.execution_context import execution_budget, current_context
+
+        async def nested_fn():
+            ctx = current_context()
+            assert ctx is not None
+            assert ctx.owner_id == "test_propagate"
+            return ctx.remaining
+
+        async with execution_budget("test_propagate", 60.0):
+            remaining = await nested_fn()
+        assert remaining > 50.0
+
+    @pytest.mark.asyncio
+    async def test_context_propagates_to_created_task(self):
+        from backend.core.execution_context import execution_budget, current_context, propagate_to_task
+        result_holder = {}
+
+        async def task_fn():
+            ctx = current_context()
+            result_holder["has_ctx"] = ctx is not None
+            result_holder["owner"] = ctx.owner_id if ctx else None
+
+        async with execution_budget("test_task", 60.0):
+            task = propagate_to_task(task_fn())
+            await task
+        assert result_holder["has_ctx"] is True
+        assert result_holder["owner"] == "test_task"
+
+    @pytest.mark.asyncio
+    async def test_context_propagates_to_thread_executor(self):
+        from backend.core.execution_context import execution_budget, propagate_to_executor, _current_ctx
+        result_holder = {}
+
+        def sync_fn():
+            ctx = _current_ctx.get()
+            result_holder["has_ctx"] = ctx is not None
+            result_holder["owner"] = ctx.owner_id if ctx else None
+            return "done"
+
+        async with execution_budget("test_thread", 60.0):
+            loop = asyncio.get_running_loop()
+            wrapped = propagate_to_executor(sync_fn)
+            await loop.run_in_executor(None, wrapped)
+        assert result_holder["has_ctx"] is True
+        assert result_holder["owner"] == "test_thread"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_sibling_context_isolation(self):
+        from backend.core.execution_context import execution_budget, current_context
+        results = {}
+
+        async def sibling(name, timeout):
+            async with execution_budget(name, timeout):
+                await asyncio.sleep(0.05)
+                ctx = current_context()
+                results[name] = ctx.owner_id if ctx else None
+
+        async with execution_budget("supervisor", 60.0):
+            await asyncio.gather(sibling("svc_a", 10.0), sibling("svc_b", 20.0))
+        assert results["svc_a"] == "svc_a"
+        assert results["svc_b"] == "svc_b"
