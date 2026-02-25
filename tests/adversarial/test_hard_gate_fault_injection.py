@@ -13,20 +13,16 @@ import os
 import sqlite3
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
-from backend.core.orchestration_journal import (
-    OrchestrationJournal,
-    StaleEpochError,
-)
+from backend.core.orchestration_journal import OrchestrationJournal
 from backend.core.uds_event_fabric import EventFabric, send_frame, recv_frame
 from backend.core.recovery_protocol import (
     HealthCategory,
     ProbeResult,
-    RecoveryProber,
     RecoveryReconciler,
-    RecoveryOrchestrator,
 )
 from backend.core.control_plane_client import ControlPlaneSubscriber
 from backend.core.lifecycle_engine import (
@@ -59,38 +55,6 @@ async def _raw_subscribe(sock_path, subscriber_id, last_seen_seq=0):
     ack = await asyncio.wait_for(recv_frame(reader), timeout=5.0)
     assert ack["type"] == "subscribe_ack"
     return reader, writer, ack
-
-
-async def _send_pong(writer, ping_msg):
-    """Send a pong response to a ping frame."""
-    await send_frame(writer, {
-        "type": "pong",
-        "ping_id": ping_msg.get("ping_id", ""),
-        "ts": ping_msg.get("ts"),
-    })
-
-
-async def _read_events_with_pongs(reader, writer, count, timeout=5.0):
-    """Read `count` event frames, responding to pings along the way."""
-    events = []
-    deadline = time.monotonic() + timeout
-    while len(events) < count and time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        try:
-            frame = await asyncio.wait_for(
-                recv_frame(reader), timeout=min(remaining, 2.0),
-            )
-            if frame.get("type") == "event":
-                events.append(frame)
-            elif frame.get("type") == "ping":
-                await _send_pong(writer, frame)
-        except asyncio.TimeoutError:
-            continue
-        except asyncio.IncompleteReadError:
-            break
-    return events
 
 
 def _make_engine_with_components(journal, component_names):
@@ -209,7 +173,7 @@ class TestHardGateFaultInjection:
         """Subscriber dies, events emitted, reconnect replays correctly."""
         # Use a short path under /tmp to avoid macOS AF_UNIX 104-byte limit
         _td = tempfile.mkdtemp(prefix="jt_")
-        sock_path = os.path.join(_td, "c.sock")
+        sock_path = Path(os.path.join(_td, "c.sock"))
         fabric = EventFabric(
             journal,
             keepalive_interval_s=5.0,
@@ -295,7 +259,7 @@ class TestHardGateFaultInjection:
         """Component stops responding, keepalive detects, removes subscriber."""
         # Use a short path under /tmp to avoid macOS AF_UNIX 104-byte limit
         _td = tempfile.mkdtemp(prefix="jt_")
-        sock_path = os.path.join(_td, "c.sock")
+        sock_path = Path(os.path.join(_td, "c.sock"))
         fabric = EventFabric(
             journal,
             keepalive_interval_s=0.3,

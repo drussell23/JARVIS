@@ -115,11 +115,14 @@ class FaultInjector:
 
 
 async def apply_fault(
-    fault: FaultSpec,
+    fault: Optional[FaultSpec],
     coro: Any,
     timeout: float = 5.0,
 ) -> Any:
     """Apply fault semantics to an async operation."""
+    if fault is None:
+        return await asyncio.wait_for(coro, timeout=timeout)
+
     if fault.fault_type == FaultType.NETWORK_PARTITION:
         raise ConnectionError("Simulated network partition")
 
