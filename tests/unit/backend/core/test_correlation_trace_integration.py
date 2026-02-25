@@ -41,12 +41,17 @@ class TestCorrelationContextEnvelopeIntegration(unittest.TestCase):
         )
         ctx = CorrelationContext.create(operation="test")
         set_current_context(ctx)
-        data = {}
-        data = inject_correlation(data)
-        assert "_trace_envelope" in data
-        extracted = extract_correlation(data)
-        assert extracted is not None
-        assert extracted.envelope.trace_id == ctx.envelope.trace_id
+        try:
+            data = {}
+            data = inject_correlation(data)
+            # Envelope is embedded inside _correlation via to_dict()
+            assert "_correlation" in data
+            assert "_trace_envelope" in data["_correlation"]
+            extracted = extract_correlation(data)
+            assert extracted is not None
+            assert extracted.envelope.trace_id == ctx.envelope.trace_id
+        finally:
+            set_current_context(None)
 
     def test_backward_compat_without_envelope_headers(self):
         """Existing callers that only send X-Correlation-ID still work."""

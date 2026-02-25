@@ -23,6 +23,7 @@ import functools
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -46,23 +47,36 @@ except ImportError:
     _TRACE_ENVELOPE_AVAILABLE = False
 
 _envelope_factory: Optional["TraceEnvelopeFactory"] = None
+_envelope_factory_lock = threading.Lock()
 
 
 def _get_envelope_factory() -> Optional["TraceEnvelopeFactory"]:
-    """Lazy-init the envelope factory.  Returns None if trace_envelope not available."""
+    """Lazy-init the envelope factory (thread-safe, double-checked locking).
+
+    Returns None if trace_envelope module is not available.
+    """
     global _envelope_factory
     if _envelope_factory is not None:
         return _envelope_factory
     if not _TRACE_ENVELOPE_AVAILABLE:
         return None
-    _envelope_factory = TraceEnvelopeFactory(
-        repo="jarvis",
-        boot_id=os.environ.get("JARVIS_BOOT_ID", uuid.uuid4().hex[:16]),
-        runtime_epoch_id=os.environ.get("JARVIS_RUNTIME_EPOCH_ID", uuid.uuid4().hex[:16]),
-        node_id=os.environ.get("JARVIS_NODE_ID", os.uname().nodename),
-        producer_version=os.environ.get("JARVIS_VERSION", "dev"),
-    )
-    return _envelope_factory
+    with _envelope_factory_lock:
+        if _envelope_factory is not None:
+            return _envelope_factory
+        _envelope_factory = TraceEnvelopeFactory(
+            repo="jarvis",
+            boot_id=os.environ.get("JARVIS_BOOT_ID", uuid.uuid4().hex[:16]),
+            runtime_epoch_id=os.environ.get("JARVIS_RUNTIME_EPOCH_ID", uuid.uuid4().hex[:16]),
+            node_id=os.environ.get("JARVIS_NODE_ID", os.uname().nodename),
+            producer_version=os.environ.get("JARVIS_VERSION", "dev"),
+        )
+        return _envelope_factory
+
+
+def _reset_envelope_factory() -> None:
+    """Reset the factory singleton. For testing only."""
+    global _envelope_factory
+    _envelope_factory = None
 
 # Context variable for current correlation context
 _current_context: contextvars.ContextVar[Optional["CorrelationContext"]] = contextvars.ContextVar(
@@ -212,7 +226,7 @@ class CorrelationContext:
                         operation=operation or "",
                     )
             except Exception:
-                pass  # Never break context creation on envelope failure
+                logger.debug("Failed to create TraceEnvelope for context", exc_info=True)
 
         return ctx
 
@@ -245,7 +259,7 @@ class CorrelationContext:
             try:
                 ctx.envelope = TraceEnvelope.from_dict(data["_trace_envelope"])
             except Exception:
-                pass
+                logger.debug("Failed to restore TraceEnvelope from dict", exc_info=True)
 
         return ctx
 
@@ -265,7 +279,7 @@ class CorrelationContext:
             try:
                 result["_trace_envelope"] = self.envelope.to_dict()
             except Exception:
-                pass
+                logger.debug("Failed to serialize TraceEnvelope in to_dict", exc_info=True)
         return result
 
     def to_headers(self) -> Dict[str, str]:
@@ -293,7 +307,7 @@ class CorrelationContext:
             try:
                 headers.update(self.envelope.to_headers())
             except Exception:
-                pass  # Never break on envelope serialization
+                logger.debug("Failed to serialize TraceEnvelope to headers", exc_info=True)
 
         return headers
 
@@ -337,7 +351,7 @@ class CorrelationContext:
                             operation="",
                         )
             except Exception:
-                pass
+                logger.debug("Failed to restore TraceEnvelope from headers", exc_info=True)
 
         return ctx
 
@@ -568,15 +582,12 @@ def inject_correlation(data: Dict[str, Any]) -> Dict[str, Any]:
     Inject correlation context into RPC request data.
 
     Use this when writing file-based RPC requests.
+    The envelope is embedded inside _correlation via to_dict().
     """
     ctx = _current_context.get()
     if ctx:
+        # to_dict() includes _trace_envelope when envelope is present
         data["_correlation"] = ctx.to_dict()
-        if ctx.envelope is not None:
-            try:
-                data["_trace_envelope"] = ctx.envelope.to_dict()
-            except Exception:
-                pass
     return data
 
 
@@ -585,19 +596,11 @@ def extract_correlation(data: Dict[str, Any]) -> Optional[CorrelationContext]:
     Extract correlation context from RPC request data.
 
     Use this when reading file-based RPC requests.
+    The envelope is restored inside from_dict() from _trace_envelope.
     """
     if "_correlation" not in data:
         return None
-    ctx = CorrelationContext.from_dict(data["_correlation"])
-
-    # Try to restore envelope from top-level data (injected by inject_correlation)
-    if _TRACE_ENVELOPE_AVAILABLE and "_trace_envelope" in data:
-        try:
-            ctx.envelope = TraceEnvelope.from_dict(data["_trace_envelope"])
-        except Exception:
-            pass
-
-    return ctx
+    return CorrelationContext.from_dict(data["_correlation"])
 
 
 def apply_correlation(data: Dict[str, Any]) -> contextvars.Token:
