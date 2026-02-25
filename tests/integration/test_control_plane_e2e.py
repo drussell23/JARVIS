@@ -1,7 +1,6 @@
 # tests/integration/test_control_plane_e2e.py
 """Integration test: full control plane bootstrap → lifecycle → shutdown."""
 
-import asyncio
 import os
 import tempfile
 import pytest
