@@ -52,3 +52,12 @@ class TestFaultInjector:
         assert fault is not None
         clock.apply_fault(fault)
         assert clock.wall_offset == 60
+
+    def test_clear_removes_all_faults(self):
+        from tests.adversarial.fault_injector import FaultInjector, FaultType
+        injector = FaultInjector()
+        injector.register("a", FaultType.NETWORK_PARTITION)
+        injector.register_probabilistic("b.*", FaultType.CRASH_MID_COMMIT, probability=1.0)
+        injector.clear()
+        assert injector.check("a") is None
+        assert injector.check("b.foo") is None
