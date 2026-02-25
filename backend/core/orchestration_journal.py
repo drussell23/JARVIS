@@ -21,10 +21,9 @@ import random
 import sqlite3
 import threading
 import time
-import uuid
-from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger("jarvis.orchestration_journal")
 
@@ -163,7 +162,8 @@ class OrchestrationJournal:
                 last_heartbeat  REAL,
                 heartbeat_ttl   REAL NOT NULL DEFAULT 30.0,
                 drain_deadline  REAL,
-                instance_id     TEXT
+                instance_id     TEXT,
+                FOREIGN KEY (last_seq) REFERENCES journal(seq)
             );
 
             CREATE TABLE IF NOT EXISTS lease (
@@ -420,7 +420,6 @@ class OrchestrationJournal:
         payload: Optional[dict] = None,
     ) -> int:
         now = time.time()
-        from datetime import datetime, timezone
         wall = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
 
         cursor = self._conn.execute(
@@ -441,14 +440,16 @@ class OrchestrationJournal:
         return seq
 
     def mark_result(self, seq: int, result: str) -> None:
-        """Mark a journal entry's result."""
+        """Mark a journal entry's result. Verifies epoch fence."""
         if result not in VALID_RESULTS:
             raise ValueError(
                 f"Invalid result {result!r}. Must be one of {VALID_RESULTS}"
             )
         with self._write_lock:
+            self._verify_epoch()
             self._conn.execute(
-                "UPDATE journal SET result=? WHERE seq=?", (result, seq)
+                "UPDATE journal SET result=? WHERE seq=? AND epoch=?",
+                (result, seq, self._epoch),
             )
             self._conn.commit()
 
@@ -487,7 +488,8 @@ class OrchestrationJournal:
             query += f" AND action IN ({placeholders})"
             params.extend(action_filter)
 
-        query += f" ORDER BY seq ASC LIMIT {MAX_REPLAY_ENTRIES}"
+        query += " ORDER BY seq ASC LIMIT ?"
+        params.append(MAX_REPLAY_ENTRIES)
 
         rows = self._conn.execute(query, params).fetchall()
         return [

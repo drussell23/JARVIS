@@ -1,12 +1,9 @@
 # tests/unit/core/test_orchestration_journal.py
 """Tests for OrchestrationJournal — SQLite schema, journal writes, reads, lease, fencing."""
 
-import asyncio
-import json
 import os
 import sqlite3
 import time
-from pathlib import Path
 
 import pytest
 
@@ -350,3 +347,72 @@ class TestEpochFencing:
         ok = await j.renew_lease()
         assert ok is False
         assert j.lease_held is False
+
+
+class TestComponentState:
+    @pytest.fixture
+    async def journal(self, tmp_path):
+        from backend.core.orchestration_journal import OrchestrationJournal
+        db_path = tmp_path / "orchestration.db"
+        j = OrchestrationJournal()
+        await j.initialize(db_path)
+        await j.acquire_lease(f"test:{os.getpid()}:abc123")
+        yield j
+        await j.close()
+
+    async def test_insert_and_retrieve(self, journal):
+        seq = journal.fenced_write("start", "jarvis_prime")
+        journal.update_component_state("jarvis_prime", "STARTING", seq)
+        state = journal.get_component_state("jarvis_prime")
+        assert state is not None
+        assert state["component"] == "jarvis_prime"
+        assert state["status"] == "STARTING"
+        assert state["last_seq"] == seq
+
+    async def test_upsert_updates_existing(self, journal):
+        seq1 = journal.fenced_write("start", "jarvis_prime")
+        journal.update_component_state("jarvis_prime", "STARTING", seq1)
+        seq2 = journal.fenced_write("state_transition", "jarvis_prime")
+        journal.update_component_state("jarvis_prime", "READY", seq2)
+        state = journal.get_component_state("jarvis_prime")
+        assert state["status"] == "READY"
+        assert state["last_seq"] == seq2
+
+    async def test_get_all_component_states(self, journal):
+        seq1 = journal.fenced_write("start", "comp_a")
+        journal.update_component_state("comp_a", "STARTING", seq1)
+        seq2 = journal.fenced_write("start", "comp_b")
+        journal.update_component_state("comp_b", "READY", seq2)
+        states = journal.get_all_component_states()
+        assert "comp_a" in states
+        assert "comp_b" in states
+        assert states["comp_a"]["status"] == "STARTING"
+        assert states["comp_b"]["status"] == "READY"
+
+    async def test_optional_kwargs(self, journal):
+        seq = journal.fenced_write("start", "jarvis_prime")
+        journal.update_component_state(
+            "jarvis_prime", "READY", seq,
+            pid=12345, endpoint="http://localhost:8001",
+            instance_id="prime:8001:xyz",
+        )
+        state = journal.get_component_state("jarvis_prime")
+        assert state["pid"] == 12345
+        assert state["endpoint"] == "http://localhost:8001"
+        assert state["instance_id"] == "prime:8001:xyz"
+
+    async def test_capabilities_json_roundtrip(self, journal):
+        seq = journal.fenced_write("start", "jarvis_prime")
+        journal.update_component_state(
+            "jarvis_prime", "READY", seq,
+            capabilities=["inference", "embedding"],
+        )
+        state = journal.get_component_state("jarvis_prime")
+        import json
+        caps = json.loads(state["capabilities"])
+        assert "inference" in caps
+        assert "embedding" in caps
+
+    async def test_nonexistent_component_returns_none(self, journal):
+        state = journal.get_component_state("does_not_exist")
+        assert state is None
