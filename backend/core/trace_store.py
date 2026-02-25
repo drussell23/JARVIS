@@ -42,12 +42,13 @@ class JSONLWriter:
 
     def append(self, record: Dict[str, Any]) -> None:
         """Append a record as a single JSONL line with checksum."""
-        # Compute checksum of the payload (before adding checksum)
+        # Strip any pre-existing _checksum so it doesn't affect the hash
+        clean_record = {k: v for k, v in record.items() if k != "_checksum"}
         payload_bytes = json.dumps(
-            record, sort_keys=True, separators=(",", ":")
+            clean_record, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         checksum = zlib.crc32(payload_bytes) & 0xFFFFFFFF
-        record_with_checksum = dict(record)
+        record_with_checksum = dict(clean_record)
         record_with_checksum["_checksum"] = checksum
 
         line = json.dumps(record_with_checksum, separators=(",", ":")) + "\n"
@@ -65,6 +66,18 @@ class JSONLWriter:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    @staticmethod
+    def verify_checksum(record: Dict[str, Any]) -> bool:
+        """Verify the CRC32 checksum of a record read back from JSONL."""
+        stored = record.get("_checksum")
+        if stored is None:
+            return False
+        clean = {k: v for k, v in record.items() if k != "_checksum"}
+        payload_bytes = json.dumps(
+            clean, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return (zlib.crc32(payload_bytes) & 0xFFFFFFFF) == stored
+
     @property
     def path(self) -> Path:
         return self._path
@@ -79,7 +92,9 @@ class SpanBuffer:
 
     - At >80% capacity: sample success spans at 50%
     - At >95% capacity: keep only errors/timeouts
-    - Never drops records with idempotency_key
+    - Hard cap at 2x max_size to prevent unbounded growth from
+      error/idempotency records that bypass backpressure
+    - Never drops records with idempotency_key (unless hard cap hit)
 
     Thread-safe via threading.Lock.
     """
@@ -95,9 +110,14 @@ class SpanBuffer:
     def add(self, record: Dict[str, Any]) -> bool:
         """Add a record to the buffer. Returns True if kept, False if dropped."""
         with self._lock:
+            # Hard cap: prevent unbounded growth even for priority records
+            if len(self._buffer) >= self._max_size * 2:
+                self._drop_count += 1
+                return False
+
             fill_ratio = len(self._buffer) / self._max_size
 
-            # Never drop records with idempotency_key
+            # Never drop records with idempotency_key (below hard cap)
             has_idem_key = bool(record.get("idempotency_key"))
             status = record.get("status", "")
             is_error = status in ("error", "timeout", "failure")
@@ -107,9 +127,9 @@ class SpanBuffer:
                 return False
 
             if fill_ratio >= 0.80 and not has_idem_key and not is_error:
-                # Sample at 50% -- use hash of event_id for determinism
+                # Sample at 50% -- use crc32 for cross-process determinism
                 eid = record.get("event_id", "")
-                if hash(eid) % 2 == 0:
+                if zlib.crc32(eid.encode("utf-8")) % 2 == 0:
                     self._drop_count += 1
                     return False
 
@@ -130,7 +150,8 @@ class SpanBuffer:
 
     @property
     def drop_count(self) -> int:
-        return self._drop_count
+        with self._lock:
+            return self._drop_count
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +175,7 @@ class TraceStreamManager:
         self._base_dir = Path(base_dir)
         self._epoch_id = runtime_epoch_id
         self._span_buffer = SpanBuffer(max_size=span_buffer_size)
+        self._decision_writers: Dict[str, JSONLWriter] = {}
 
         # Create stream directories
         for subdir in ("lifecycle", "decisions", "spans"):
@@ -170,12 +192,20 @@ class TraceStreamManager:
         """Write a lifecycle event. Never dropped."""
         self._lifecycle_writer.append(record)
 
+    def _get_decision_writer(self) -> JSONLWriter:
+        """Get or create a cached decision writer for today's date."""
+        date_key = time.strftime("%Y%m%d")
+        writer = self._decision_writers.get(date_key)
+        if writer is None:
+            writer = JSONLWriter(
+                self._base_dir / "decisions" / f"{date_key}.jsonl"
+            )
+            self._decision_writers[date_key] = writer
+        return writer
+
     def write_decision(self, record: Dict[str, Any]) -> None:
         """Write a decision event. Date-partitioned."""
-        writer = JSONLWriter(
-            self._base_dir / "decisions" / f"{time.strftime('%Y%m%d')}.jsonl"
-        )
-        writer.append(record)
+        self._get_decision_writer().append(record)
 
     def write_span(self, record: Dict[str, Any]) -> None:
         """Buffer a span record (subject to backpressure)."""
