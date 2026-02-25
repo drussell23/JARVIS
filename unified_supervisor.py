@@ -64443,7 +64443,7 @@ class JarvisSystemKernel:
                     priority=_BudgetCriticality.CRITICAL,
                     request_kind=_BudgetRequestKind.STARTUP,
                 ):
-                    await self._phase_clean_slate()
+                    await asyncio.wait_for(self._phase_clean_slate(), timeout=_clean_slate_timeout)
             else:
                 await asyncio.wait_for(self._phase_clean_slate(), timeout=_clean_slate_timeout)
         except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
@@ -65816,7 +65816,9 @@ class JarvisSystemKernel:
                         priority=_BudgetCriticality.CRITICAL,
                         request_kind=_BudgetRequestKind.STARTUP,
                     ):
-                        _preflight_ok = await self._phase_preflight()
+                        _preflight_ok = await asyncio.wait_for(
+                            self._phase_preflight(), timeout=_preflight_timeout
+                        )
                 else:
                     _preflight_ok = await asyncio.wait_for(
                         self._phase_preflight(), timeout=_preflight_timeout
@@ -65938,7 +65940,9 @@ class JarvisSystemKernel:
                         priority=_BudgetCriticality.CRITICAL,
                         request_kind=_BudgetRequestKind.STARTUP,
                     ):
-                        _resources_ok = await self._phase_resources()
+                        _resources_ok = await asyncio.wait_for(
+                            self._phase_resources(), timeout=resource_timeout
+                        )
                 else:
                     _resources_ok = await asyncio.wait_for(
                         self._phase_resources(), timeout=resource_timeout
@@ -66051,7 +66055,9 @@ class JarvisSystemKernel:
                         priority=_BudgetCriticality.CRITICAL,
                         request_kind=_BudgetRequestKind.STARTUP,
                     ):
-                        _backend_ok = await self._phase_backend()
+                        _backend_ok = await asyncio.wait_for(
+                            self._phase_backend(), timeout=backend_timeout
+                        )
                 else:
                     _backend_ok = await asyncio.wait_for(
                         self._phase_backend(), timeout=backend_timeout
@@ -66226,7 +66232,10 @@ class JarvisSystemKernel:
                         priority=_BudgetCriticality.HIGH,
                         request_kind=_BudgetRequestKind.STARTUP,
                     ):
-                        _intel_ok = await self._phase_intelligence()
+                        _intel_ok = await asyncio.wait_for(
+                            self._phase_intelligence(),
+                            timeout=intelligence_timeout,
+                        )
                 else:
                     _intel_ok = await asyncio.wait_for(
                         self._phase_intelligence(),
@@ -66862,7 +66871,10 @@ class JarvisSystemKernel:
                             priority=_BudgetCriticality.HIGH,
                             request_kind=_BudgetRequestKind.STARTUP,
                         ):
-                            await self._phase_trinity()
+                            await asyncio.wait_for(
+                                self._phase_trinity(),
+                                timeout=_trinity_outer_timeout,
+                            )
                     else:
                         await asyncio.wait_for(
                             self._phase_trinity(),
@@ -67028,7 +67040,10 @@ class JarvisSystemKernel:
                         priority=_BudgetCriticality.NORMAL,
                         request_kind=_BudgetRequestKind.STARTUP,
                     ):
-                        await self._phase_enterprise_services()
+                        await asyncio.wait_for(
+                            self._phase_enterprise_services(),
+                            timeout=_enterprise_outer_timeout,
+                        )
                 else:
                     await asyncio.wait_for(
                         self._phase_enterprise_services(),
@@ -67527,7 +67542,10 @@ class JarvisSystemKernel:
                         priority=_BudgetCriticality.NORMAL,
                         request_kind=_BudgetRequestKind.STARTUP,
                     ):
-                        await self._phase_frontend_transition()
+                        await asyncio.wait_for(
+                            self._phase_frontend_transition(),
+                            timeout=_fe_outer_timeout,
+                        )
                 else:
                     await asyncio.wait_for(
                         self._phase_frontend_transition(),
