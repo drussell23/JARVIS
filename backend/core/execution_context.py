@@ -20,14 +20,15 @@ Key design decisions
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import enum
+import logging
 import os
+import sys
 import threading
 import time
 import uuid
-import asyncio
-import contextvars
-import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import (
@@ -35,6 +36,7 @@ from typing import (
     AsyncGenerator,
     Awaitable,
     Callable,
+    Final,
     Mapping,
     Optional,
     TypeVar,
@@ -60,16 +62,16 @@ __all__ = [
     # Cancel scope
     "CancelScope",
     "CancelScopeHandle",
-    # Execution context (Task 2)
+    # Execution context
     "ExecutionContext",
     "current_context",
     "remaining_budget",
-    # Budget context manager (Task 3)
+    # Budget context manager
     "execution_budget",
-    # Budget-aware wait (Task 4)
+    # Budget-aware wait
     "budget_aware_wait_for",
     "bridge_timeout_error",
-    # Propagation helpers (Task 5)
+    # Propagation helpers
     "propagate_to_executor",
     "propagate_to_task",
 ]
@@ -490,7 +492,7 @@ async def execution_budget(
 async def budget_aware_wait_for(
     coro: Awaitable[_T],
     *,
-    local_cap: float = 0.0,
+    local_cap: float,
     label: str = "",
 ) -> _T:
     """Run *coro* with a timeout derived from the budget and *local_cap*.
@@ -562,7 +564,7 @@ async def budget_aware_wait_for(
 
     t0 = time.monotonic()
     try:
-        return await asyncio.wait_for(coro, timeout=max(effective, 0.0))
+        result = await asyncio.wait_for(coro, timeout=max(effective, 0.0))
     except asyncio.TimeoutError as exc:
         elapsed = time.monotonic() - t0
         raise bridge_timeout_error(
@@ -583,6 +585,16 @@ async def budget_aware_wait_for(
                 detail=scope.detail,
             )
         raise  # Re-raise untyped CancelledError
+    else:
+        elapsed = time.monotonic() - t0
+        remaining_out = ctx.remaining if ctx is not None else None
+        _log.debug(
+            "budget_aware_wait_for COMPLETED label=%s elapsed=%.3fs "
+            "remaining=%.2fs",
+            label, elapsed,
+            remaining_out if remaining_out is not None else -1.0,
+        )
+        return result
 
 
 def bridge_timeout_error(
@@ -604,13 +616,21 @@ def bridge_timeout_error(
     LocalCapExceededError
         When the local cap was tighter than the remaining budget.
     """
-    # Determine which constraint was binding
-    budget_was_binding = (
-        remaining_at_entry <= 0
-        or (local_cap > 0 and remaining_at_entry < local_cap)
-        or local_cap <= 0
-    )
+    # Determine which constraint was binding.
+    # Three cases, handled explicitly for clarity:
+    if local_cap <= 0:
+        # No local cap — budget was the only constraint
+        budget_was_binding = True
+    elif remaining_at_entry <= 0:
+        # Budget already exhausted at entry
+        budget_was_binding = True
+    else:
+        # Both constraints present — budget binds when it was tighter
+        budget_was_binding = remaining_at_entry < local_cap
+
     effective = min(remaining_at_entry, local_cap) if local_cap > 0 else remaining_at_entry
+    # Note: actual wall-clock elapsed is not available here; we approximate
+    # with the effective timeout, which equals elapsed when wait_for fires.
     elapsed = max(effective, 0.0)
 
     if budget_was_binding:
@@ -677,7 +697,6 @@ def propagate_to_task(
     """
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
-    import sys
     if sys.version_info >= (3, 11):
         return loop.create_task(coro, name=name, context=ctx)  # type: ignore[arg-type]
     # Python 3.9-3.10: create_task copies context implicitly
