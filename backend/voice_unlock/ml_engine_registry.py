@@ -4246,39 +4246,44 @@ async def ensure_ecapa_available(
         logger.info("✅ [ENSURE_ECAPA] Local ECAPA already loaded")
         return True, "Local ECAPA available", ecapa_wrapper.get_engine()
 
-    # Step 4: Need to load ECAPA - trigger prewarm if not already running
-    logger.info("🔄 [ENSURE_ECAPA] ECAPA not loaded, triggering load...")
+    # Step 4: Load ECAPA directly — don't defer to background prewarm.
+    # v266.5: The previous approach passively polled when background prewarm
+    # was running, but the prewarm loads ALL engines (Whisper, SpeechBrain,
+    # ECAPA) in parallel. Slow engines consumed the entire timeout budget.
+    # Fix: call ecapa_wrapper.load() directly. The internal asyncio.Lock
+    # ensures idempotency — if prewarm is already loading ECAPA, this
+    # awaits the same lock and returns immediately once it finishes.
+    remaining = timeout - (time.time() - start_time)
+    if ecapa_wrapper and remaining > 2.0:
+        if registry.is_warming_up:
+            logger.info(
+                "🔄 [ENSURE_ECAPA] Prewarm running, but loading ECAPA directly "
+                f"(remaining budget: {remaining:.1f}s)"
+            )
+        else:
+            logger.info(
+                f"🔄 [ENSURE_ECAPA] Loading ECAPA directly (budget: {remaining:.1f}s)"
+            )
+        try:
+            loaded = await asyncio.wait_for(
+                ecapa_wrapper.load(), timeout=remaining - 1.0,
+            )
+            if loaded:
+                elapsed = time.time() - start_time
+                logger.info(f"✅ [ENSURE_ECAPA] ECAPA loaded successfully in {elapsed:.1f}s")
+                return True, f"Local ECAPA loaded in {elapsed:.1f}s", ecapa_wrapper.get_engine()
+        except asyncio.TimeoutError:
+            pass  # Fall through to timeout handling below
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"   ECAPA direct load failed: {e}")
 
-    # Check if prewarm is already running
-    if registry.is_warming_up:
-        logger.info("   Prewarm already in progress, waiting...")
-    else:
-        # Trigger ECAPA load specifically
-        if ecapa_wrapper:
-            try:
-                # Load ECAPA engine directly
-                load_task = asyncio.create_task(ecapa_wrapper.load())
-                # Don't await here, we'll wait in the loop below
-            except Exception as e:
-                logger.warning(f"   Failed to trigger ECAPA load: {e}")
-
-    # Step 5: Wait for ECAPA to become available
-    poll_interval = 0.5
-    while (time.time() - start_time) < timeout:
-        # Check local ECAPA (use get_wrapper for safe access)
-        ecapa_wrapper = registry.get_wrapper("ecapa_tdnn")
-        if ecapa_wrapper and ecapa_wrapper.is_loaded:
-            elapsed = time.time() - start_time
-            logger.info(f"✅ [ENSURE_ECAPA] ECAPA loaded successfully in {elapsed:.1f}s")
-            return True, f"Local ECAPA loaded in {elapsed:.1f}s", ecapa_wrapper.get_engine()
-
-        # Check if cloud mode became available
-        if registry.is_using_cloud and getattr(registry, '_cloud_verified', False):
-            elapsed = time.time() - start_time
-            logger.info(f"✅ [ENSURE_ECAPA] Cloud ECAPA became available in {elapsed:.1f}s")
-            return True, f"Cloud ECAPA available in {elapsed:.1f}s", None
-
-        await asyncio.sleep(poll_interval)
+    # Check if cloud mode became available while we were loading
+    if registry.is_using_cloud and getattr(registry, '_cloud_verified', False):
+        elapsed = time.time() - start_time
+        logger.info(f"✅ [ENSURE_ECAPA] Cloud ECAPA became available in {elapsed:.1f}s")
+        return True, f"Cloud ECAPA available in {elapsed:.1f}s", None
 
     # Timeout reached
     elapsed = time.time() - start_time
