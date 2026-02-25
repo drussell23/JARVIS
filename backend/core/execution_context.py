@@ -480,3 +480,158 @@ async def execution_budget(
             "execution_budget EXIT owner=%s remaining=%.2f",
             owner, ctx.remaining,
         )
+
+
+# ---------------------------------------------------------------------------
+# budget_aware_wait_for() — replaces raw asyncio.wait_for() with typed errors
+# ---------------------------------------------------------------------------
+
+
+async def budget_aware_wait_for(
+    coro: Awaitable[_T],
+    *,
+    local_cap: float = 0.0,
+    label: str = "",
+) -> _T:
+    """Run *coro* with a timeout derived from the budget and *local_cap*.
+
+    Raises
+    ------
+    RuntimeError
+        If there is **no** budget and ``local_cap <= 0`` — fail closed.
+    BudgetExhaustedError
+        If the remaining budget is the binding constraint and it expired.
+    LocalCapExceededError
+        If *local_cap* is the binding constraint and it expired.
+    ExternalCancellationError
+        If the task is cancelled and the cancel scope has a typed cause.
+    """
+    ctx = _current_ctx.get()
+    remaining = ctx.remaining if ctx is not None else None
+
+    # -- Determine effective timeout --
+    if remaining is None and local_cap <= 0:
+        raise RuntimeError(
+            f"No budget and no local_cap for {label!r} — fail closed. "
+            "Wrap in execution_budget() or supply a local_cap."
+        )
+
+    if remaining is None:
+        # No budget context — use local_cap, log the unscoped usage
+        effective = local_cap
+        _log.debug(
+            "budget_aware_wait_for label=%s unscoped_local_timeout=true local_cap=%.2f",
+            label, local_cap,
+        )
+    elif BUDGET_ENFORCE:
+        if local_cap > 0:
+            effective = min(remaining, local_cap)
+        else:
+            effective = remaining
+    else:
+        # Shadow mode: use local_cap if available, else remaining
+        effective = local_cap if local_cap > 0 else remaining
+        if BUDGET_SHADOW and remaining is not None and local_cap > 0:
+            if remaining < local_cap:
+                _log.warning(
+                    "budget_aware_wait_for SHADOW label=%s "
+                    "budget_remaining=%.2f < local_cap=%.2f "
+                    "(would have enforced budget)",
+                    label, remaining, local_cap,
+                )
+
+    # -- Pre-flight: if budget is already exhausted, fail immediately --
+    if BUDGET_ENFORCE and remaining is not None and remaining <= 0:
+        raise BudgetExhaustedError(
+            owner=ctx.owner_id if ctx else "unknown",
+            phase=ctx.phase_name if ctx else "",
+            deadline_mono=ctx.deadline_mono if ctx else 0.0,
+            remaining_at_entry=remaining if remaining is not None else 0.0,
+            local_cap=local_cap,
+            effective_timeout=0.0,
+            elapsed=0.0,
+            timeout_origin="budget",
+        )
+
+    remaining_at_entry = remaining if remaining is not None else effective
+
+    _log.debug(
+        "budget_aware_wait_for ENTER label=%s effective=%.2f remaining=%.2f local_cap=%.2f",
+        label, effective, remaining_at_entry, local_cap,
+    )
+
+    t0 = time.monotonic()
+    try:
+        return await asyncio.wait_for(coro, timeout=max(effective, 0.0))
+    except asyncio.TimeoutError as exc:
+        elapsed = time.monotonic() - t0
+        raise bridge_timeout_error(
+            exc,
+            label=label,
+            remaining_at_entry=remaining_at_entry,
+            local_cap=local_cap,
+            owner=ctx.owner_id if ctx else "unknown",
+            phase=ctx.phase_name if ctx else "",
+        ) from exc
+    except asyncio.CancelledError:
+        # Check cancel scope for typed cause
+        if ctx is not None and ctx.cancel_scope.scope is not None:
+            scope = ctx.cancel_scope.scope
+            raise ExternalCancellationError(
+                cause=scope.cause,
+                scope_id=scope.scope_id,
+                detail=scope.detail,
+            )
+        raise  # Re-raise untyped CancelledError
+
+
+def bridge_timeout_error(
+    timeout_error: BaseException,
+    *,
+    label: str,
+    remaining_at_entry: float,
+    local_cap: float,
+    owner: str,
+    phase: str,
+) -> Exception:
+    """Convert a raw ``asyncio.TimeoutError`` into a typed budget error.
+
+    Returns
+    -------
+    BudgetExhaustedError
+        When the budget was the binding constraint (remaining_at_entry <= 0
+        or remaining_at_entry was tighter than local_cap).
+    LocalCapExceededError
+        When the local cap was tighter than the remaining budget.
+    """
+    # Determine which constraint was binding
+    budget_was_binding = (
+        remaining_at_entry <= 0
+        or (local_cap > 0 and remaining_at_entry < local_cap)
+        or local_cap <= 0
+    )
+    effective = min(remaining_at_entry, local_cap) if local_cap > 0 else remaining_at_entry
+    elapsed = max(effective, 0.0)
+
+    if budget_was_binding:
+        return BudgetExhaustedError(
+            owner=owner,
+            phase=phase,
+            deadline_mono=0.0,
+            remaining_at_entry=remaining_at_entry,
+            local_cap=local_cap,
+            effective_timeout=max(effective, 0.0),
+            elapsed=elapsed,
+            timeout_origin="budget",
+        )
+    else:
+        return LocalCapExceededError(
+            owner=owner,
+            phase=phase,
+            deadline_mono=0.0,
+            remaining_at_entry=remaining_at_entry,
+            local_cap=local_cap,
+            effective_timeout=effective,
+            elapsed=elapsed,
+            timeout_origin="local_cap",
+        )

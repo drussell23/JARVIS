@@ -387,3 +387,116 @@ class TestExecutionBudget:
             assert ctx.phase_name == "preflight"
             assert ctx.priority == Criticality.CRITICAL
             assert ctx.tags["zone"] == "5"
+
+
+class TestBudgetAwareWaitFor:
+    """Verify budget_aware_wait_for() timeout and error behavior."""
+
+    @pytest.mark.asyncio
+    async def test_completes_within_budget(self):
+        from backend.core.execution_context import execution_budget, budget_aware_wait_for
+
+        async def fast_op():
+            await asyncio.sleep(0.01)
+            return "done"
+
+        async with execution_budget("test", 5.0):
+            result = await budget_aware_wait_for(fast_op(), local_cap=2.0, label="fast_op")
+        assert result == "done"
+
+    @pytest.mark.asyncio
+    async def test_local_cap_exceeded_raises_typed_error(self):
+        from backend.core.execution_context import execution_budget, budget_aware_wait_for, LocalCapExceededError
+
+        async def slow_op():
+            await asyncio.sleep(10.0)
+
+        async with execution_budget("test", 60.0):
+            with pytest.raises(LocalCapExceededError) as exc_info:
+                await budget_aware_wait_for(slow_op(), local_cap=0.1, label="slow_op")
+            assert exc_info.value.timeout_origin == "local_cap"
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_raises_typed_error(self):
+        from backend.core.execution_context import execution_budget, budget_aware_wait_for, BudgetExhaustedError
+
+        async def slow_op():
+            await asyncio.sleep(10.0)
+
+        async with execution_budget("test", 0.15):
+            with pytest.raises(BudgetExhaustedError) as exc_info:
+                await budget_aware_wait_for(slow_op(), local_cap=5.0, label="slow_op")
+            assert exc_info.value.timeout_origin == "budget"
+
+    @pytest.mark.asyncio
+    async def test_no_budget_no_cap_fails_closed(self):
+        from backend.core.execution_context import budget_aware_wait_for
+
+        async def some_op():
+            return "done"
+
+        with pytest.raises(RuntimeError, match="No budget and no local_cap"):
+            await budget_aware_wait_for(some_op(), local_cap=0.0, label="test")
+
+    @pytest.mark.asyncio
+    async def test_no_budget_with_cap_uses_local(self):
+        from backend.core.execution_context import budget_aware_wait_for
+
+        async def fast_op():
+            await asyncio.sleep(0.01)
+            return "ok"
+
+        result = await budget_aware_wait_for(fast_op(), local_cap=5.0, label="unscoped")
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_effective_timeout_is_min(self):
+        from backend.core.execution_context import execution_budget, budget_aware_wait_for, LocalCapExceededError
+
+        async def slow_op():
+            await asyncio.sleep(10.0)
+
+        async with execution_budget("test", 0.5):
+            with pytest.raises(LocalCapExceededError):
+                await budget_aware_wait_for(slow_op(), local_cap=0.1, label="test")
+
+    @pytest.mark.asyncio
+    async def test_shadow_mode_logs_without_enforcing(self):
+        import backend.core.execution_context as ec
+        original_enforce = ec.BUDGET_ENFORCE
+        original_shadow = ec.BUDGET_SHADOW
+        try:
+            ec.BUDGET_ENFORCE = False
+            ec.BUDGET_SHADOW = True
+            from backend.core.execution_context import execution_budget, budget_aware_wait_for
+
+            async def fast_op():
+                await asyncio.sleep(0.01)
+                return "ok"
+
+            async with execution_budget("test", 0.05):
+                result = await budget_aware_wait_for(fast_op(), local_cap=5.0, label="shadow_test")
+            assert result == "ok"
+        finally:
+            ec.BUDGET_ENFORCE = original_enforce
+            ec.BUDGET_SHADOW = original_shadow
+
+
+class TestExceptionBridging:
+    """Verify bridge_timeout_error() produces correct typed errors."""
+
+    def test_bridge_with_budget_context(self):
+        from backend.core.execution_context import bridge_timeout_error, BudgetExhaustedError
+        err = bridge_timeout_error(
+            asyncio.TimeoutError(), label="test", remaining_at_entry=0.0,
+            local_cap=30.0, owner="phase_test", phase="test",
+        )
+        assert isinstance(err, BudgetExhaustedError)
+
+    def test_bridge_with_remaining_budget(self):
+        from backend.core.execution_context import bridge_timeout_error, LocalCapExceededError
+        err = bridge_timeout_error(
+            asyncio.TimeoutError(), label="test", remaining_at_entry=20.0,
+            local_cap=5.0, owner="phase_test", phase="test",
+        )
+        assert isinstance(err, LocalCapExceededError)
