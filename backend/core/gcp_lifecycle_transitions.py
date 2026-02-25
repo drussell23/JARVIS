@@ -11,8 +11,8 @@ Wildcard transitions (None, event) match any state not covered by an exact match
 Design doc: docs/plans/2026-02-25-journal-backed-gcp-lifecycle-design.md
 Section 2: Detailed Transition Matrix.
 """
-from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from backend.core.gcp_lifecycle_schema import State, Event
 
