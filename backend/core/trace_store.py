@@ -236,7 +236,11 @@ class TraceStreamManager:
 
 
 class TraceIndex:
-    """SQLite-backed trace lookup index. Rebuildable from JSONL files."""
+    """SQLite-backed trace lookup index. Rebuildable from JSONL files.
+
+    Not thread-safe — callers must serialize access or use one instance per thread.
+    Supports context manager protocol for safe cleanup.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = Path(db_path)
@@ -244,6 +248,12 @@ class TraceIndex:
         self._conn = sqlite3.connect(str(self._db_path))
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def _create_tables(self) -> None:
         self._conn.execute("""
@@ -322,43 +332,46 @@ class TraceIndex:
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
     def rebuild_from_directory(self, dir_path: Path, stream: str) -> int:
-        """Rebuild index from JSONL files in a directory. Returns count of indexed events."""
+        """Rebuild index from JSONL files in a directory. Returns count of indexed events.
+
+        Uses a single transaction for performance (avoids per-record fsync).
+        """
         import json as _json
 
         dir_path = Path(dir_path)
         count = 0
-        for jsonl_file in sorted(dir_path.glob("*.jsonl")):
-            with open(jsonl_file, "r") as f:
-                offset = 0
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = _json.loads(line)
-                        envelope = record.get("envelope", {})
-                        trace_id = envelope.get("trace_id", "")
-                        event_id = envelope.get("event_id", "")
-                        ts = envelope.get("ts_wall_utc", 0.0)
-                        operation = record.get("event_type", "")
-                        if trace_id and event_id:
-                            self.index_event(
-                                trace_id=trace_id,
-                                event_id=event_id,
-                                stream=stream,
-                                file_path=str(jsonl_file),
-                                byte_offset=offset,
-                                ts_wall_utc=ts,
-                                operation=operation,
-                                status=record.get("status", ""),
+        self._conn.execute("BEGIN")
+        try:
+            for jsonl_file in sorted(dir_path.glob("*.jsonl")):
+                with open(jsonl_file, "rb") as f:
+                    for raw_line in f:
+                        offset = f.tell() - len(raw_line)
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            record = _json.loads(line)
+                            envelope = record.get("envelope", {})
+                            trace_id = envelope.get("trace_id", "")
+                            event_id = envelope.get("event_id", "")
+                            ts = envelope.get("ts_wall_utc", 0.0)
+                            operation = record.get("event_type", "")
+                            if trace_id and event_id:
+                                self._conn.execute(
+                                    "INSERT OR REPLACE INTO trace_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (event_id, trace_id, stream, str(jsonl_file),
+                                     offset, ts, operation, record.get("status", "")),
+                                )
+                                count += 1
+                        except Exception:
+                            logger.debug(
+                                "Failed to parse JSONL line for indexing",
+                                exc_info=True,
                             )
-                            count += 1
-                    except Exception:
-                        logger.debug(
-                            "Failed to parse JSONL line for indexing",
-                            exc_info=True,
-                        )
-                    offset += len(line) + 1
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return count
 
     def close(self) -> None:
@@ -371,7 +384,11 @@ class TraceIndex:
 
 
 class CausalityIndex:
-    """SQLite-backed causality DAG with cycle detection."""
+    """SQLite-backed causality DAG with cycle detection.
+
+    Not thread-safe — callers must serialize access or use one instance per thread.
+    Supports context manager protocol for safe cleanup.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = Path(db_path)
@@ -379,6 +396,12 @@ class CausalityIndex:
         self._conn = sqlite3.connect(str(self._db_path))
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     def _create_tables(self) -> None:
         self._conn.execute("""
@@ -437,7 +460,10 @@ class CausalityIndex:
         return None
 
     def detect_cycles(self) -> List[List[str]]:
-        """DFS-based cycle detection. Returns list of cycles found."""
+        """Iterative DFS-based cycle detection. Returns list of cycles found.
+
+        Uses explicit stack to avoid recursion depth limits on deep DAGs.
+        """
         cursor = self._conn.execute(
             "SELECT event_id, caused_by_event_id FROM causality_edges"
         )
@@ -456,30 +482,38 @@ class CausalityIndex:
         visited: set = set()
         in_stack: set = set()
 
-        def dfs(node: str, path: List[str]) -> None:
-            if node in in_stack:
-                cycle_start = path.index(node)
-                cycles.append(path[cycle_start:])
-                return
-            if node in visited:
-                return
-            visited.add(node)
-            in_stack.add(node)
-            path.append(node)
-            for child in children_map.get(node, []):
-                dfs(child, path)
-            path.pop()
-            in_stack.remove(node)
-
-        # Also check self-references
+        # Check self-references first
         for event_id, caused_by in edges.items():
             if caused_by == event_id:
                 cycles.append([event_id])
                 visited.add(event_id)
 
-        for node in edges:
-            if node not in visited:
-                dfs(node, [])
+        # Iterative DFS with explicit stack
+        for start in edges:
+            if start in visited:
+                continue
+            # Stack entries: (node, child_index, path)
+            stack: List[tuple] = [(start, 0, [start])]
+            visited.add(start)
+            in_stack.add(start)
+
+            while stack:
+                node, ci, path = stack[-1]
+                node_children = children_map.get(node, [])
+
+                if ci < len(node_children):
+                    stack[-1] = (node, ci + 1, path)
+                    child = node_children[ci]
+                    if child in in_stack:
+                        cycle_start = path.index(child) if child in path else 0
+                        cycles.append(list(path[cycle_start:]))
+                    elif child not in visited:
+                        visited.add(child)
+                        in_stack.add(child)
+                        stack.append((child, 0, path + [child]))
+                else:
+                    in_stack.discard(node)
+                    stack.pop()
 
         return cycles
 

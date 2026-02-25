@@ -4,13 +4,14 @@ Async context manager for recording operation spans with TraceEnvelopes.
 Spans are buffered via SpanBuffer (backpressure-aware) and flushed to
 date-partitioned JSONL via TraceStreamManager.
 
-Thread-safe.
+Thread-safe (recent spans list guarded by lock).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -47,6 +48,7 @@ class SpanRecorder:
         )
         self._recent: List[Dict[str, Any]] = []
         self._recent_max = 64
+        self._recent_lock = threading.Lock()
 
     @asynccontextmanager
     async def span(
@@ -103,13 +105,15 @@ class SpanRecorder:
 
             self._stream_mgr.write_span(span_dict)
 
-            if len(self._recent) >= self._recent_max:
-                self._recent = self._recent[-(self._recent_max // 2):]
-            self._recent.append(span_dict)
+            with self._recent_lock:
+                if len(self._recent) >= self._recent_max:
+                    self._recent = self._recent[-(self._recent_max // 2):]
+                self._recent.append(span_dict)
 
     def get_recent(self, n: int = 10) -> List[Dict[str, Any]]:
         """Return the last N recorded spans."""
-        return self._recent[-n:]
+        with self._recent_lock:
+            return list(self._recent[-n:])
 
     def flush(self) -> int:
         """Flush buffered spans to JSONL. Returns count flushed."""

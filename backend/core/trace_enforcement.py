@@ -78,6 +78,13 @@ def get_violation_count() -> int:
         return _violation_count
 
 
+def reset_violation_count() -> None:
+    """Reset the violation counter (primarily for testing)."""
+    global _violation_count
+    with _violation_lock:
+        _violation_count = 0
+
+
 def _increment_violations() -> None:
     global _violation_count
     with _violation_lock:
