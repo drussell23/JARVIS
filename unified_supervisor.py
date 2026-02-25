@@ -64504,6 +64504,48 @@ class JarvisSystemKernel:
 
         self._started_at = time.time()
         # =====================================================================
+        # v270.0: NUMBA / NATIVE LIBRARY PRELOAD (before AudioBus)
+        # =====================================================================
+        # MUST run before AudioBus init. AudioBus starts a CoreAudio IO thread
+        # via FullDuplexDevice. If numba/torch/BLAS native extensions are loaded
+        # while the CoreAudio IO thread is running, the concurrent native C
+        # initializations collide — corrupting memory and causing SIGSEGV on
+        # the audio callback thread (KERN_INVALID_ADDRESS at 0x4).
+        #
+        # By pre-loading numba here (before CoreAudio starts), the native
+        # extensions are fully initialized. Later imports find them already in
+        # sys.modules and skip native init, eliminating the collision window.
+        # =====================================================================
+        try:
+            _loop = asyncio.get_running_loop()
+
+            def _preload_numba_sync():
+                """Pre-import numba native extensions in isolation."""
+                import os as _os
+                _os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
+                _os.environ.setdefault("NUMBA_NUM_THREADS", "1")
+                _os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
+                try:
+                    import numba  # noqa: F401 — triggers LLVM native ext load
+                    return f"numba {numba.__version__} preloaded"
+                except ImportError:
+                    return "numba not installed (optional)"
+                except Exception as _e:
+                    return f"numba preload warning: {_e}"
+
+            _preload_msg = await asyncio.wait_for(
+                _loop.run_in_executor(None, _preload_numba_sync),
+                timeout=30.0,
+            )
+            self.logger.info("[Kernel] %s", _preload_msg)
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "[Kernel] numba preload timed out (30s) — continuing without preload"
+            )
+        except Exception as _npe:
+            self.logger.debug("[Kernel] numba preload non-fatal: %s", _npe)
+
+        # =====================================================================
         # v238.0: AUDIO BUS EARLY INIT (before narrator)
         # =====================================================================
         # Initialize AudioBus BEFORE narrator starts speaking so that TTS

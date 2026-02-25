@@ -8,8 +8,6 @@ import os
 import logging
 from typing import Dict, Any, Optional
 from functools import lru_cache
-import torch
-import whisper
 from threading import Lock
 
 logger = logging.getLogger(__name__)
@@ -40,13 +38,15 @@ class CentralizedModelManager:
     @lru_cache(maxsize=1)
     def get_whisper_model(self, model_size: str = "base") -> Any:
         """Get or load Whisper model (cached)"""
+        import whisper
+
         key = f"whisper_{model_size}"
-        
+
         if key not in self._models:
             logger.info(f"Loading Whisper model: {model_size}")
             self._models[key] = whisper.load_model(model_size)
             logger.info(f"Whisper model {model_size} loaded successfully")
-        
+
         return self._models[key]
     
     @lru_cache(maxsize=1)
@@ -77,6 +77,7 @@ class CentralizedModelManager:
         if key not in self._models:
             if os.path.exists(model_path):
                 try:
+                    import torch
                     self._models[key] = torch.load(model_path, map_location='cpu')
                     logger.info(f"Loaded custom model: {key}")
                 except Exception as e:
@@ -85,7 +86,7 @@ class CentralizedModelManager:
             else:
                 logger.warning(f"Model file not found: {model_path}")
                 return None
-        
+
         return self._models.get(key)
     
     def get_spacy_model(self, model_name: str = "en_core_web_sm") -> Optional[Any]:

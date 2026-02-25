@@ -1,9 +1,5 @@
 import numpy as np
 from typing import Optional, Dict, List, Tuple, Union, BinaryIO
-import sounddevice as sd
-import soundfile as sf
-from pydub import AudioSegment
-from pydub.playback import play
 import io
 import tempfile
 import os
@@ -13,33 +9,130 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 import wave
-import pyaudio
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 import queue
-from gtts import gTTS
-import pyttsx3
-import edge_tts
+import logging
 
 # Fix TensorFlow before importing transformers
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['USE_TORCH'] = '1'
 os.environ['USE_TF'] = '0'
 
-# Import centralized model manager
-from utils.centralized_model_manager import model_manager
+_logger = logging.getLogger(__name__)
 
-# Try to import whisper and torch
-try:
-    import whisper
-    WHISPER_AVAILABLE = True
-except ImportError:
-    WHISPER_AVAILABLE = False
-    
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
+# =============================================================================
+# LAZY NATIVE LIBRARY LOADING (v270.0)
+# =============================================================================
+# Native C extension libraries (sounddevice/PortAudio, torch/BLAS, whisper/numba,
+# pyaudio, pyttsx3) must NOT be imported at module level. Module-level import
+# triggers native extension loading (Pa_Initialize, LLVM JIT, BLAS init) which
+# collides with CoreAudio's IO thread when this module is imported during
+# parallel_import_components(), causing SIGSEGV on the audio callback thread.
+#
+# Root cause: AudioBus starts FullDuplexDevice (CoreAudio IO thread) BEFORE
+# Phase 3 backend startup. Phase 3 runs parallel_import_components() which
+# imports this module in a thread pool worker. The concurrent native C extension
+# loading (PortAudio + BLAS + LLVM) corrupts memory accessible by the CoreAudio
+# IO thread → NULL+4 dereference → segfault.
+#
+# Fix: All native imports deferred to _ensure_native_libs(). The module-level
+# names (sd, sf, pyaudio, pyttsx3, edge_tts, gTTS, AudioSegment, play, whisper,
+# torch, model_manager) are injected into the module globals on first call so
+# existing code continues to work without modification.
+# =============================================================================
+
+_native_init_lock = Lock()
+_native_init_done = False
+
+# Availability flags (safe to read after _ensure_native_libs)
+WHISPER_AVAILABLE = False
+TORCH_AVAILABLE = False
+
+
+def _ensure_native_libs():
+    """Lazy-load ALL native libraries, injecting into module globals.
+
+    Thread-safe, idempotent. Called once at first real use (class __init__,
+    method entry, etc.). After return, bare names like ``sd``, ``sf``,
+    ``model_manager``, ``whisper``, ``torch`` etc. are available at module
+    scope — existing code does NOT need to change.
+    """
+    global _native_init_done, WHISPER_AVAILABLE, TORCH_AVAILABLE
+    if _native_init_done:
+        return
+    with _native_init_lock:
+        if _native_init_done:
+            return
+
+        g = globals()
+
+        # --- Audio I/O natives ---
+        try:
+            import sounddevice as _sd
+            g["sd"] = _sd
+        except ImportError:
+            _logger.warning("sounddevice not available")
+
+        try:
+            import soundfile as _sf
+            g["sf"] = _sf
+        except ImportError:
+            _logger.warning("soundfile not available")
+
+        try:
+            import pyaudio as _pa
+            g["pyaudio"] = _pa
+        except ImportError:
+            _logger.warning("pyaudio not available")
+
+        try:
+            import pyttsx3 as _p3
+            g["pyttsx3"] = _p3
+        except ImportError:
+            _logger.warning("pyttsx3 not available")
+
+        try:
+            import edge_tts as _et
+            g["edge_tts"] = _et
+        except ImportError:
+            _logger.warning("edge_tts not available")
+
+        try:
+            from gtts import gTTS as _gt
+            g["gTTS"] = _gt
+        except ImportError:
+            _logger.warning("gtts not available")
+
+        try:
+            from pydub import AudioSegment as _AS
+            from pydub.playback import play as _pp
+            g["AudioSegment"] = _AS
+            g["play"] = _pp
+        except ImportError:
+            _logger.warning("pydub not available")
+
+        # --- ML natives (torch, whisper, numba via whisper→librosa) ---
+        try:
+            import whisper as _wh
+            g["whisper"] = _wh
+            WHISPER_AVAILABLE = True
+        except ImportError:
+            WHISPER_AVAILABLE = False
+
+        try:
+            import torch as _th
+            g["torch"] = _th
+            TORCH_AVAILABLE = True
+        except ImportError:
+            TORCH_AVAILABLE = False
+
+        try:
+            from utils.centralized_model_manager import model_manager as _mm
+            g["model_manager"] = _mm
+        except ImportError:
+            _logger.warning("centralized_model_manager not available")
+
+        _native_init_done = True
 
 # Try to import transformers with TF fix
 try:
@@ -112,14 +205,15 @@ class TTSResult:
 
 class WhisperSTT:
     """Speech-to-Text using OpenAI Whisper"""
-    
+
     def __init__(self, model_size: str = "base"):
         """
         Initialize Whisper STT
-        
+
         Args:
             model_size: Size of Whisper model (tiny, base, small, medium, large)
         """
+        _ensure_native_libs()
         self.model_size = model_size
         self.model = None
         self._model_loaded = False
@@ -212,9 +306,10 @@ class WhisperSTT:
 
 class NaturalTTS:
     """Text-to-Speech with multiple engine support"""
-    
+
     def __init__(self, config: VoiceConfig):
         """Initialize TTS with specified configuration"""
+        _ensure_native_libs()
         self.config = config
         self.engines = self._initialize_engines()
         
@@ -379,9 +474,10 @@ class NaturalTTS:
 
 class WakeWordDetector:
     """Wake word detection for hands-free activation"""
-    
+
     def __init__(self, config: VoiceConfig):
         """Initialize wake word detector"""
+        _ensure_native_libs()
         self.config = config
         self.wake_word = config.wake_word.lower()
         self.is_listening = False
@@ -506,9 +602,10 @@ class WakeWordDetector:
 
 class VoiceCommandProcessor:
     """Process voice commands with context awareness"""
-    
+
     def __init__(self, stt: WhisperSTT, tts: NaturalTTS, config: VoiceConfig):
         """Initialize voice command processor"""
+        _ensure_native_libs()
         self.stt = stt
         self.tts = tts
         self.config = config
@@ -627,9 +724,10 @@ class VoiceCommandProcessor:
 
 class VoiceAssistant:
     """Complete voice assistant integrating all components"""
-    
+
     def __init__(self, config: Optional[VoiceConfig] = None):
         """Initialize voice assistant"""
+        _ensure_native_libs()
         self.config = config or VoiceConfig()
         
         # Initialize components
