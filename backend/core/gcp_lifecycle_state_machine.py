@@ -8,6 +8,7 @@ State can be recovered from journal replay after crash.
 Design doc: docs/plans/2026-02-25-journal-backed-gcp-lifecycle-design.md
 """
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -17,6 +18,15 @@ from backend.core.gcp_lifecycle_schema import State, Event, validate_state
 from backend.core.gcp_lifecycle_transitions import get_transition
 
 logger = logging.getLogger("jarvis.gcp_lifecycle")
+
+# Feature flag: when True, the state machine intercepts all GCP lifecycle decisions.
+# When False, the existing legacy path is used (six independent decision-makers).
+GCP_LIFECYCLE_V2_ENABLED = os.environ.get("JARVIS_GCP_LIFECYCLE_V2", "false").lower() == "true"
+
+if GCP_LIFECYCLE_V2_ENABLED:
+    logger.info("GCP Lifecycle V2: ENABLED")
+else:
+    logger.info("GCP Lifecycle V2: DISABLED (legacy path)")
 
 
 class SideEffectAdapter(ABC):
@@ -110,6 +120,7 @@ class GCPLifecycleStateMachine:
 
         Returns TransitionResult with success=False if no valid transition exists.
         """
+        t0 = time.monotonic()
         from_state = self._state
 
         # Look up transition
@@ -182,6 +193,20 @@ class GCPLifecycleStateMachine:
             to_state.value,
             seq=seq,
             **component_kwargs,
+        )
+
+        duration_ms = (time.monotonic() - t0) * 1000
+        op_id = f"{self._target}:{event.value}:{self._journal.epoch}:{seq}"
+        logger.info(
+            "gcp_lifecycle_transition",
+            extra={
+                "from_state": from_state.value,
+                "to_state": to_state.value,
+                "event": event.value,
+                "op_id": op_id,
+                "seq": seq,
+                "duration_ms": round(duration_ms, 2),
+            },
         )
 
         return TransitionResult(
