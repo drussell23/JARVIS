@@ -4,7 +4,7 @@ Emits structured lifecycle events (boot, phase, recovery, shutdown) with
 causal chaining via TraceEnvelopes.  Events are buffered in-memory and
 persisted to JSONL via TraceStreamManager.
 
-Thread-safe.  Singleton via get_instance().
+Thread-safe.  Auto-flushes every 2 seconds and on phase transitions.
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ class LifecycleEmitter:
 
     Each event gets a TraceEnvelope, with caused_by_event_id linking
     to the previous event (boot_start -> phase_enter -> phase_exit -> ...).
+
+    Auto-flushes buffered events to JSONL every 2 seconds and on phase
+    transitions.  Call close() to cancel the timer and do a final flush.
     """
 
     def __init__(
@@ -34,49 +37,95 @@ class LifecycleEmitter:
         trace_dir: Path,
         envelope_factory: TraceEnvelopeFactory,
         buffer_max: int = 64,
+        auto_flush_interval: float = 2.0,
     ) -> None:
         self._factory = envelope_factory
         self._stream_mgr = TraceStreamManager(
             base_dir=trace_dir,
-            runtime_epoch_id=envelope_factory._runtime_epoch_id,
+            runtime_epoch_id=envelope_factory.runtime_epoch_id,
         )
         self._buffer: collections.deque = collections.deque(maxlen=buffer_max)
+        self._flush_pending: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
 
         # Causality tracking
         self._last_event_id: Optional[str] = None
         self._boot_envelope: Optional[TraceEnvelope] = None
 
-    def _emit(self, event_type: str, **kwargs: Any) -> Dict[str, Any]:
-        """Core emit method. Creates envelope, builds event dict, buffers it."""
-        # Create envelope with causality link
-        caused_by = self._last_event_id
+        # Auto-flush timer
+        self._auto_flush_interval = auto_flush_interval
+        self._flush_timer: Optional[threading.Timer] = None
+        self._closed = False
+        if auto_flush_interval > 0:
+            self._start_auto_flush()
 
+    def _start_auto_flush(self) -> None:
+        """Schedule the next auto-flush tick."""
+        if self._closed:
+            return
+        self._flush_timer = threading.Timer(self._auto_flush_interval, self._auto_flush_tick)
+        self._flush_timer.daemon = True
+        self._flush_timer.start()
+
+    def _auto_flush_tick(self) -> None:
+        """Auto-flush callback.  Reschedules itself."""
+        try:
+            self.flush()
+        except Exception:
+            logger.debug("Auto-flush failed", exc_info=True)
+        finally:
+            self._start_auto_flush()
+
+    def close(self) -> None:
+        """Cancel auto-flush timer and do a final flush."""
+        self._closed = True
+        if self._flush_timer is not None:
+            self._flush_timer.cancel()
+        try:
+            self.flush()
+        except Exception:
+            logger.debug("Final flush on close failed", exc_info=True)
+
+    def _emit(
+        self,
+        event_type: str,
+        caused_by_override: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Core emit method. Creates envelope, builds event dict, buffers it.
+
+        Thread-safe: holds lock for entire envelope creation + buffer append
+        to prevent causality chain forks.
+        """
         component = kwargs.pop("component", "supervisor")
         operation = f"lifecycle.{event_type}"
 
-        if self._boot_envelope is not None:
-            envelope = self._factory.create_child(
-                parent=self._boot_envelope,
-                component=component,
-                operation=operation,
-                caused_by_event_id=caused_by,
-            )
-        else:
-            envelope = self._factory.create_root(
-                component=component,
-                operation=operation,
-            )
-
-        event = {
-            "event_type": event_type,
-            "ts": time.time(),
-            "envelope": envelope.to_dict(),
-            **kwargs,
-        }
-
         with self._lock:
+            caused_by = caused_by_override if caused_by_override is not None else self._last_event_id
+
+            if self._boot_envelope is not None:
+                envelope = self._factory.create_child(
+                    parent=self._boot_envelope,
+                    component=component,
+                    operation=operation,
+                    caused_by_event_id=caused_by,
+                )
+            else:
+                envelope = self._factory.create_root(
+                    component=component,
+                    operation=operation,
+                )
+
+            event = {
+                "event_type": event_type,
+                "ts": time.time(),
+                "component": component,
+                "envelope": envelope.to_dict(),
+                **kwargs,
+            }
+
             self._buffer.append(event)
+            self._flush_pending.append(event)
             self._last_event_id = envelope.event_id
 
         return event
@@ -89,17 +138,19 @@ class LifecycleEmitter:
             component="supervisor",
             operation="lifecycle.boot_start",
         )
-        self._boot_envelope = root
 
         event = {
             "event_type": "boot_start",
             "ts": time.time(),
+            "component": "supervisor",
             "envelope": root.to_dict(),
             **(metadata or {}),
         }
 
         with self._lock:
+            self._boot_envelope = root
             self._buffer.append(event)
+            self._flush_pending.append(event)
             self._last_event_id = root.event_id
 
         return event
@@ -115,32 +166,41 @@ class LifecycleEmitter:
     # -- Phase lifecycle ------------------------------------------------------
 
     def phase_enter(self, phase: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Emit phase_enter event."""
-        return self._emit("phase_enter", phase=phase, **(metadata or {}))
+        """Emit phase_enter event. Auto-flushes pending events."""
+        event = self._emit("phase_enter", phase=phase, **(metadata or {}))
+        self.flush()
+        return event
 
     def phase_exit(self, phase: str, success: bool = True, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Emit phase_exit event."""
+        """Emit phase_exit event. Auto-flushes pending events."""
         to_state = "success" if success else "failure"
-        return self._emit("phase_exit", phase=phase, to_state=to_state, **(metadata or {}))
+        event = self._emit("phase_exit", phase=phase, to_state=to_state, **(metadata or {}))
+        self.flush()
+        return event
 
     def phase_fail(
         self, phase: str, error: str = "", evidence: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Emit phase_fail event."""
-        return self._emit(
+        """Emit phase_fail event. Auto-flushes pending events."""
+        event = self._emit(
             "phase_fail", phase=phase, error=error,
             evidence=evidence or {}, **(metadata or {}),
         )
+        self.flush()
+        return event
 
     # -- Recovery lifecycle ---------------------------------------------------
 
     def recovery_start(
         self, component: str, reason: str, caused_by_event_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Emit recovery_start event."""
+        """Emit recovery_start event. Optionally links to the failure that triggered it."""
         return self._emit(
-            "recovery_start", component=component, reason=reason,
+            "recovery_start",
+            caused_by_override=caused_by_event_id,
+            component=component,
+            reason=reason,
         )
 
     def recovery_complete(self, component: str, outcome: str) -> Dict[str, Any]:
@@ -162,9 +222,13 @@ class LifecycleEmitter:
     # -- Persistence ----------------------------------------------------------
 
     def flush(self) -> int:
-        """Flush all buffered events to JSONL. Returns count of flushed events."""
+        """Flush pending events to JSONL. Returns count of flushed events."""
         with self._lock:
-            events = list(self._buffer)
+            events = list(self._flush_pending)
+            self._flush_pending.clear()
+
+        if not events:
+            return 0
 
         for event in events:
             try:

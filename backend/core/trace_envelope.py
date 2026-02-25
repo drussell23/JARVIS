@@ -331,6 +331,10 @@ class TraceEnvelopeFactory:
         self._producer_version = producer_version
         self._clock = LamportClock()
 
+    @property
+    def runtime_epoch_id(self) -> str:
+        return self._runtime_epoch_id
+
     def _base_kwargs(self, component: str, operation: str, boundary_type: BoundaryType) -> Dict[str, Any]:
         """Common fields shared across all envelope creation methods."""
         return {
