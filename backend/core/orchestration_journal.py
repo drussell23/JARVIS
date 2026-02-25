@@ -28,7 +28,7 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger("jarvis.orchestration_journal")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Configurable sync mode: NORMAL (dev) or FULL (production)
 _SYNC_MODE = os.environ.get("JARVIS_SQLITE_SYNC_MODE", "NORMAL").upper()
@@ -134,100 +134,141 @@ class OrchestrationJournal:
 
     def _apply_schema(self) -> None:
         c = self._conn
-        # Check if schema already applied
+        current_version = 0
         try:
             row = c.execute(
                 "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
             ).fetchone()
-            if row and row[0] >= SCHEMA_VERSION:
-                return  # Already at current version
+            if row:
+                current_version = row[0]
         except sqlite3.OperationalError:
             pass  # Table doesn't exist yet
 
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS journal (
-                seq             INTEGER PRIMARY KEY AUTOINCREMENT,
-                epoch           INTEGER NOT NULL,
-                timestamp       REAL NOT NULL,
-                wall_clock      TEXT NOT NULL,
-                actor           TEXT NOT NULL,
-                action          TEXT NOT NULL,
-                target          TEXT NOT NULL,
-                idempotency_key TEXT,
-                payload         TEXT,
-                result          TEXT NOT NULL DEFAULT 'pending',
-                fence_token     INTEGER NOT NULL
-            );
+        if current_version >= SCHEMA_VERSION:
+            return  # Already at current version
 
-            CREATE INDEX IF NOT EXISTS idx_journal_epoch ON journal(epoch);
-            CREATE INDEX IF NOT EXISTS idx_journal_target ON journal(target, seq);
-            CREATE INDEX IF NOT EXISTS idx_journal_idemp
-                ON journal(idempotency_key) WHERE idempotency_key IS NOT NULL;
+        if current_version < 1:
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS journal (
+                    seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    epoch           INTEGER NOT NULL,
+                    timestamp       REAL NOT NULL,
+                    wall_clock      TEXT NOT NULL,
+                    actor           TEXT NOT NULL,
+                    action          TEXT NOT NULL,
+                    target          TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    payload         TEXT,
+                    result          TEXT NOT NULL DEFAULT 'pending',
+                    fence_token     INTEGER NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS component_state (
-                component       TEXT PRIMARY KEY,
-                status          TEXT NOT NULL,
-                epoch           INTEGER NOT NULL,
-                last_seq        INTEGER NOT NULL,
-                pid             INTEGER,
-                endpoint        TEXT,
-                api_version     TEXT,
-                capabilities    TEXT,
-                last_heartbeat  REAL,
-                heartbeat_ttl   REAL NOT NULL DEFAULT 30.0,
-                drain_deadline  REAL,
-                instance_id     TEXT,
-                FOREIGN KEY (last_seq) REFERENCES journal(seq)
-            );
+                CREATE INDEX IF NOT EXISTS idx_journal_epoch ON journal(epoch);
+                CREATE INDEX IF NOT EXISTS idx_journal_target ON journal(target, seq);
+                CREATE INDEX IF NOT EXISTS idx_journal_idemp
+                    ON journal(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
-            CREATE TABLE IF NOT EXISTS lease (
-                id              INTEGER PRIMARY KEY CHECK (id = 1),
-                holder          TEXT NOT NULL,
-                epoch           INTEGER NOT NULL,
-                acquired_at     REAL NOT NULL,
-                ttl             REAL NOT NULL DEFAULT 15.0,
-                last_renewed    REAL NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS component_state (
+                    component       TEXT PRIMARY KEY,
+                    status          TEXT NOT NULL,
+                    epoch           INTEGER NOT NULL,
+                    last_seq        INTEGER NOT NULL,
+                    pid             INTEGER,
+                    endpoint        TEXT,
+                    api_version     TEXT,
+                    capabilities    TEXT,
+                    last_heartbeat  REAL,
+                    heartbeat_ttl   REAL NOT NULL DEFAULT 30.0,
+                    drain_deadline  REAL,
+                    instance_id     TEXT,
+                    FOREIGN KEY (last_seq) REFERENCES journal(seq)
+                );
 
-            CREATE TABLE IF NOT EXISTS contracts (
-                component       TEXT NOT NULL,
-                contract_type   TEXT NOT NULL,
-                contract_key    TEXT NOT NULL,
-                schema_hash     TEXT NOT NULL,
-                min_version     TEXT,
-                max_version     TEXT,
-                registered_at   REAL NOT NULL,
-                epoch           INTEGER NOT NULL,
-                PRIMARY KEY (component, contract_type, contract_key)
-            );
+                CREATE TABLE IF NOT EXISTS lease (
+                    id              INTEGER PRIMARY KEY CHECK (id = 1),
+                    holder          TEXT NOT NULL,
+                    epoch           INTEGER NOT NULL,
+                    acquired_at     REAL NOT NULL,
+                    ttl             REAL NOT NULL DEFAULT 15.0,
+                    last_renewed    REAL NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS journal_archive (
-                seq             INTEGER PRIMARY KEY,
-                epoch           INTEGER NOT NULL,
-                timestamp       REAL NOT NULL,
-                wall_clock      TEXT NOT NULL,
-                actor           TEXT NOT NULL,
-                action          TEXT NOT NULL,
-                target          TEXT NOT NULL,
-                idempotency_key TEXT,
-                payload         TEXT,
-                result          TEXT,
-                fence_token     INTEGER NOT NULL,
-                archived_at     REAL NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS contracts (
+                    component       TEXT NOT NULL,
+                    contract_type   TEXT NOT NULL,
+                    contract_key    TEXT NOT NULL,
+                    schema_hash     TEXT NOT NULL,
+                    min_version     TEXT,
+                    max_version     TEXT,
+                    registered_at   REAL NOT NULL,
+                    epoch           INTEGER NOT NULL,
+                    PRIMARY KEY (component, contract_type, contract_key)
+                );
 
-            CREATE TABLE IF NOT EXISTS schema_version (
-                version     INTEGER PRIMARY KEY,
-                applied_at  TEXT NOT NULL,
-                description TEXT
-            );
-        """)
+                CREATE TABLE IF NOT EXISTS journal_archive (
+                    seq             INTEGER PRIMARY KEY,
+                    epoch           INTEGER NOT NULL,
+                    timestamp       REAL NOT NULL,
+                    wall_clock      TEXT NOT NULL,
+                    actor           TEXT NOT NULL,
+                    action          TEXT NOT NULL,
+                    target          TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    payload         TEXT,
+                    result          TEXT,
+                    fence_token     INTEGER NOT NULL,
+                    archived_at     REAL NOT NULL
+                );
 
-        c.execute(
-            "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
-            "VALUES (?, datetime('now'), ?)",
-            (SCHEMA_VERSION, "Initial schema: journal, component_state, lease, contracts"),
-        )
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version     INTEGER PRIMARY KEY,
+                    applied_at  TEXT NOT NULL,
+                    description TEXT
+                );
+            """)
+
+            c.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+                "VALUES (?, datetime('now'), ?)",
+                (1, "Initial schema: journal, component_state, lease, contracts"),
+            )
+
+        if current_version < 2:
+            # V2: event_outbox table + component_state extensions for hysteresis
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS event_outbox (
+                    seq             INTEGER NOT NULL,
+                    event_type      TEXT NOT NULL,
+                    target          TEXT NOT NULL,
+                    payload         TEXT,
+                    published       INTEGER NOT NULL DEFAULT 0,
+                    published_at    REAL,
+                    FOREIGN KEY (seq) REFERENCES journal(seq)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_outbox_unpublished
+                    ON event_outbox(published, seq) WHERE published = 0;
+            """)
+
+            # Add new columns to component_state (idempotent — ignore if exists)
+            for col_def in [
+                ("start_timestamp", "REAL"),
+                ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_probe_category", "TEXT"),
+            ]:
+                try:
+                    c.execute(
+                        f"ALTER TABLE component_state ADD COLUMN {col_def[0]} {col_def[1]}"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+            c.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+                "VALUES (?, datetime('now'), ?)",
+                (2, "Add event_outbox table and component_state hysteresis columns"),
+            )
+
         c.commit()
 
     def _load_current_seq(self) -> None:
