@@ -241,3 +241,60 @@ class TestErrorMessages:
         )
         msg = str(err)
         assert "scope-abc" in msg or "OWNER_SHUTDOWN" in msg
+
+
+class TestExecutionContext:
+    """Verify ExecutionContext dataclass and ContextVar query functions."""
+
+    def test_context_is_frozen(self):
+        from backend.core.execution_context import ExecutionContext, CancelScopeHandle
+        ctx = ExecutionContext(
+            deadline_mono=time.monotonic() + 60.0, trace_id="test",
+            owner_id="test", cancel_scope=CancelScopeHandle(owner_id="test"),
+            mode_snapshot="normal",
+        )
+        with pytest.raises(AttributeError):
+            ctx.deadline_mono = 999.0
+
+    def test_context_uses_monotonic_clock(self):
+        from backend.core.execution_context import ExecutionContext, CancelScopeHandle
+        before = time.monotonic()
+        ctx = ExecutionContext(
+            deadline_mono=time.monotonic() + 60.0, trace_id="test",
+            owner_id="test", cancel_scope=CancelScopeHandle(owner_id="test"),
+            mode_snapshot="normal",
+        )
+        after = time.monotonic()
+        assert before <= ctx.created_at_mono <= after
+
+    def test_context_parent_chain(self):
+        from backend.core.execution_context import ExecutionContext, CancelScopeHandle
+        parent = ExecutionContext(
+            deadline_mono=time.monotonic() + 60.0, trace_id="parent",
+            owner_id="phase_preflight", cancel_scope=CancelScopeHandle(owner_id="p"),
+            mode_snapshot="normal",
+        )
+        child = ExecutionContext(
+            deadline_mono=time.monotonic() + 30.0, trace_id="parent",
+            owner_id="svc_cloudsql", cancel_scope=CancelScopeHandle(owner_id="s"),
+            mode_snapshot="normal", parent_ctx=parent,
+        )
+        assert child.parent_ctx is parent
+        assert child.parent_ctx.owner_id == "phase_preflight"
+
+    def test_contextvar_default_is_none(self):
+        from backend.core.execution_context import current_context
+        assert current_context() is None
+
+    def test_remaining_budget_none_when_no_context(self):
+        from backend.core.execution_context import remaining_budget
+        assert remaining_budget() is None
+
+    def test_remaining_property(self):
+        from backend.core.execution_context import ExecutionContext, CancelScopeHandle
+        ctx = ExecutionContext(
+            deadline_mono=time.monotonic() + 10.0, trace_id="test",
+            owner_id="test", cancel_scope=CancelScopeHandle(owner_id="test"),
+            mode_snapshot="normal",
+        )
+        assert 9.0 < ctx.remaining < 10.1

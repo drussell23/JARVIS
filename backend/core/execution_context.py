@@ -25,8 +25,24 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Optional
+import asyncio
+import contextvars
+import logging
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Mapping,
+    Optional,
+    TypeVar,
+)
+
+_T = TypeVar("_T")
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     # Feature flags
@@ -44,6 +60,18 @@ __all__ = [
     # Cancel scope
     "CancelScope",
     "CancelScopeHandle",
+    # Execution context (Task 2)
+    "ExecutionContext",
+    "current_context",
+    "remaining_budget",
+    # Budget context manager (Task 3)
+    "execution_budget",
+    # Budget-aware wait (Task 4)
+    "budget_aware_wait_for",
+    "bridge_timeout_error",
+    # Propagation helpers (Task 5)
+    "propagate_to_executor",
+    "propagate_to_task",
 ]
 
 # ---------------------------------------------------------------------------
@@ -279,3 +307,73 @@ class CancelScopeHandle:
         assignment atomic, and ``CancelScope`` is frozen/immutable.
         """
         return self._scope
+
+
+# ---------------------------------------------------------------------------
+# ExecutionContext — frozen dataclass carrying the budget through the call tree
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecutionContext:
+    """Immutable execution context that carries a deadline and metadata
+    through the entire call tree.
+
+    The ``deadline_mono`` is a *monotonic* clock timestamp.  Callers use the
+    ``remaining`` property to know how many seconds are left without worrying
+    about wall-clock adjustments.
+
+    Frozen so that contexts can be shared across tasks/threads without locks.
+    """
+
+    # -- Core fields --
+    deadline_mono: float
+    trace_id: str
+    owner_id: str
+    cancel_scope: CancelScopeHandle
+    mode_snapshot: str
+
+    # -- Nesting --
+    parent_ctx: Optional[ExecutionContext] = None
+    created_at_mono: float = field(default_factory=time.monotonic)
+
+    # -- Phase 2 fields --
+    phase_id: str = ""
+    phase_name: str = ""
+    mode_epoch: int = 0
+    budget_policy_version: int = 1
+
+    # -- Phase 3 fields --
+    priority: Criticality = Criticality.NORMAL
+    request_kind: RequestKind = RequestKind.STARTUP
+    tags: Mapping[str, str] = field(default_factory=dict)
+
+    # -- Root fields --
+    root_reason: Optional[RootReason] = None
+
+    @property
+    def remaining(self) -> float:
+        """Seconds remaining until deadline.  May be negative."""
+        return self.deadline_mono - time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# ContextVar — thread/task-local storage for the current ExecutionContext
+# ---------------------------------------------------------------------------
+
+_current_ctx: contextvars.ContextVar[Optional[ExecutionContext]] = (
+    contextvars.ContextVar("_current_ctx", default=None)
+)
+
+
+def current_context() -> Optional[ExecutionContext]:
+    """Return the active ``ExecutionContext``, or ``None`` outside a budget."""
+    return _current_ctx.get()
+
+
+def remaining_budget() -> Optional[float]:
+    """Return remaining seconds (clamped to >= 0), or ``None`` if no budget."""
+    ctx = _current_ctx.get()
+    if ctx is None:
+        return None
+    return max(0.0, ctx.remaining)
