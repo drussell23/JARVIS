@@ -377,3 +377,106 @@ def remaining_budget() -> Optional[float]:
     if ctx is None:
         return None
     return max(0.0, ctx.remaining)
+
+
+# ---------------------------------------------------------------------------
+# execution_budget() — async context manager for budget scoping
+# ---------------------------------------------------------------------------
+
+from typing import Final
+
+_ROOT_SCOPE_ALLOWLIST: Final[frozenset] = frozenset({
+    "supervisor",
+    "phase_manager",
+    "recovery_coordinator",
+    "background_health_monitor",
+})
+
+
+@asynccontextmanager
+async def execution_budget(
+    owner: str,
+    timeout: float,
+    *,
+    root: bool = False,
+    root_reason: Optional[RootReason] = None,
+    mode_snapshot: Optional[str] = None,
+    phase_id: str = "",
+    phase_name: str = "",
+    mode_epoch: int = 0,
+    priority: Criticality = Criticality.NORMAL,
+    request_kind: RequestKind = RequestKind.STARTUP,
+    tags: Optional[Mapping[str, str]] = None,
+) -> AsyncGenerator[ExecutionContext, None]:
+    """Create a scoped execution budget.
+
+    When ``root=True``, a fresh top-level deadline is created (requires
+    ``root_reason`` and ``owner`` in ``_ROOT_SCOPE_ALLOWLIST``).
+
+    When ``root=False`` (the default), the deadline is the *minimum* of
+    the parent's deadline and ``now + timeout`` — the child can never
+    extend the parent's budget.
+
+    The ``ContextVar`` token is **always** reset in the ``finally`` block
+    to prevent context leaks, even if the body raises.
+    """
+    # -- Validate root scope requests --
+    if root:
+        if root_reason is None:
+            raise ValueError(
+                "execution_budget(root=True) requires root_reason to be set"
+            )
+        if owner not in _ROOT_SCOPE_ALLOWLIST:
+            raise ValueError(
+                f"Owner {owner!r} is not authorized for root budget scopes. "
+                f"Allowed: {sorted(_ROOT_SCOPE_ALLOWLIST)}"
+            )
+
+    parent = _current_ctx.get()
+    now = time.monotonic()
+
+    # -- Compute deadline --
+    if root:
+        deadline = now + timeout
+    elif parent is not None:
+        deadline = min(parent.deadline_mono, now + timeout)
+    else:
+        deadline = now + timeout
+
+    # -- Inherit trace ID from parent unless root --
+    if parent is not None and not root:
+        trace_id = parent.trace_id
+    else:
+        trace_id = uuid.uuid4().hex
+
+    # -- Build context --
+    ctx = ExecutionContext(
+        deadline_mono=deadline,
+        trace_id=trace_id,
+        owner_id=owner,
+        cancel_scope=CancelScopeHandle(owner_id=owner),
+        mode_snapshot=mode_snapshot or (parent.mode_snapshot if parent else "normal"),
+        parent_ctx=parent,
+        phase_id=phase_id,
+        phase_name=phase_name,
+        mode_epoch=mode_epoch,
+        priority=priority,
+        request_kind=request_kind,
+        tags=tags if tags is not None else {},
+        root_reason=root_reason,
+    )
+
+    _log.debug(
+        "execution_budget ENTER owner=%s timeout=%.2f deadline_in=%.2f root=%s",
+        owner, timeout, ctx.remaining, root,
+    )
+
+    token = _current_ctx.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _current_ctx.reset(token)
+        _log.debug(
+            "execution_budget EXIT owner=%s remaining=%.2f",
+            owner, ctx.remaining,
+        )

@@ -298,3 +298,92 @@ class TestExecutionContext:
             mode_snapshot="normal",
         )
         assert 9.0 < ctx.remaining < 10.1
+
+
+class TestExecutionBudget:
+    """Verify execution_budget() context manager behavior."""
+
+    @pytest.mark.asyncio
+    async def test_budget_sets_context(self):
+        from backend.core.execution_context import execution_budget, current_context
+        assert current_context() is None
+        async with execution_budget("test_owner", 60.0) as ctx:
+            assert current_context() is ctx
+            assert ctx.owner_id == "test_owner"
+            assert ctx.remaining > 50.0
+        assert current_context() is None
+
+    @pytest.mark.asyncio
+    async def test_budget_shrinks_with_nesting(self):
+        from backend.core.execution_context import execution_budget
+        async with execution_budget("parent", 60.0) as parent_ctx:
+            async with execution_budget("child", 30.0) as child_ctx:
+                assert child_ctx.deadline_mono <= parent_ctx.deadline_mono
+                assert child_ctx.parent_ctx is parent_ctx
+
+    @pytest.mark.asyncio
+    async def test_budget_never_extends(self):
+        from backend.core.execution_context import execution_budget
+        async with execution_budget("parent", 10.0) as parent_ctx:
+            async with execution_budget("child", 60.0) as child_ctx:
+                assert abs(child_ctx.deadline_mono - parent_ctx.deadline_mono) < 0.1
+
+    @pytest.mark.asyncio
+    async def test_root_scope_creates_fresh_deadline(self):
+        from backend.core.execution_context import execution_budget, RootReason
+        async with execution_budget("parent", 10.0) as parent_ctx:
+            async with execution_budget(
+                "supervisor", 120.0, root=True, root_reason=RootReason.RECOVERY_WORKER,
+            ) as child_ctx:
+                assert child_ctx.deadline_mono > parent_ctx.deadline_mono
+                assert child_ctx.root_reason == RootReason.RECOVERY_WORKER
+
+    @pytest.mark.asyncio
+    async def test_root_scope_requires_reason(self):
+        from backend.core.execution_context import execution_budget
+        with pytest.raises(ValueError, match="root_reason"):
+            async with execution_budget("supervisor", 60.0, root=True):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_root_scope_blocked_for_unauthorized_owner(self):
+        from backend.core.execution_context import execution_budget, RootReason
+        with pytest.raises(ValueError, match="not authorized"):
+            async with execution_budget(
+                "random_service", 60.0, root=True, root_reason=RootReason.DETACHED_BACKGROUND,
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_context_leak_prevention(self):
+        from backend.core.execution_context import execution_budget, current_context
+        try:
+            async with execution_budget("test", 60.0):
+                raise RuntimeError("simulated failure")
+        except RuntimeError:
+            pass
+        assert current_context() is None
+
+    @pytest.mark.asyncio
+    async def test_context_leak_prevention_nested(self):
+        from backend.core.execution_context import execution_budget, current_context
+        async with execution_budget("outer", 60.0) as outer:
+            try:
+                async with execution_budget("inner", 30.0):
+                    raise RuntimeError("inner failure")
+            except RuntimeError:
+                pass
+            assert current_context() is outer
+        assert current_context() is None
+
+    @pytest.mark.asyncio
+    async def test_phase_fields_propagated(self):
+        from backend.core.execution_context import execution_budget, Criticality, RequestKind
+        async with execution_budget(
+            "phase_preflight", 90.0, phase_id="1", phase_name="preflight",
+            priority=Criticality.CRITICAL, request_kind=RequestKind.STARTUP, tags={"zone": "5"},
+        ) as ctx:
+            assert ctx.phase_id == "1"
+            assert ctx.phase_name == "preflight"
+            assert ctx.priority == Criticality.CRITICAL
+            assert ctx.tags["zone"] == "5"
