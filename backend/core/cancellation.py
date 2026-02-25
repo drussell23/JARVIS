@@ -168,6 +168,25 @@ class CancellationToken:
         if self._propagate_ipc:
             self._write_ipc()
 
+        # v280.0: Set typed cause on active ExecutionContext cancel scope
+        try:
+            from backend.core.execution_context import (
+                _current_ctx, CancellationCause,
+            )
+            ctx = _current_ctx.get(None)
+            if ctx is not None and ctx.cancel_scope is not None:
+                ctx.cancel_scope.set_cause(
+                    CancellationCause.OWNER_SHUTDOWN,
+                    reason or f"CancellationToken '{self.name}' cancelled",
+                )
+        except ImportError:
+            pass  # execution_context module not yet available
+        except Exception as _scope_err:
+            logger.debug(
+                "[Cancel] Failed to set scope cause on '%s': %s",
+                self.name, _scope_err,
+            )
+
     def throw_if_cancelled(self) -> None:
         """Raise CancelledError if this token is cancelled."""
         if self._cancelled:

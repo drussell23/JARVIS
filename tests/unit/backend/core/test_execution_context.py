@@ -614,3 +614,26 @@ class TestCancellationPrecedence:
             )
             assert ctx.cancel_scope.scope.cause == CancellationCause.DEPENDENCY_LOST
             assert "database" in ctx.cancel_scope.scope.detail
+
+
+class TestCancellationTokenIntegration:
+    """Verify CancellationToken.cancel() sets scope cause."""
+
+    @pytest.mark.asyncio
+    async def test_cancellation_token_sets_scope_cause(self):
+        from backend.core.execution_context import (
+            execution_budget, CancellationCause, current_context,
+        )
+        from backend.core.cancellation import CancellationToken
+
+        token = CancellationToken("test-token")
+
+        async with execution_budget("test", 60.0) as ctx:
+            assert ctx.cancel_scope.scope is None
+            token.cancel(reason="Supervisor shutting down")
+            # After token cancel, current scope should have OWNER_SHUTDOWN
+            ctx_now = current_context()
+            assert ctx_now is not None
+            assert ctx_now.cancel_scope.scope is not None
+            assert ctx_now.cancel_scope.scope.cause == CancellationCause.OWNER_SHUTDOWN
+            assert "Supervisor shutting down" in ctx_now.cancel_scope.scope.detail
