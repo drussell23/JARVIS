@@ -61597,6 +61597,58 @@ class JarvisSystemKernel:
         # v200.1: Voice Orchestrator for cross-repo TTS coordination
         self._voice_orchestrator: Optional["VoiceOrchestrator"] = None
         self._ecapa_verification_task: Optional[asyncio.Task] = None
+        # v279.0: ECAPA control-plane policy state (single owner, hysteresis, deduped logging)
+        _ecapa_retry_base = max(1.0, _get_env_float("ECAPA_REPROBE_BASE_DELAY", 5.0))
+        _ecapa_retry_max = max(
+            _ecapa_retry_base, _get_env_float("ECAPA_REPROBE_MAX_DELAY", 90.0)
+        )
+        _ecapa_retry_budget = max(0, _get_env_int("ECAPA_REPROBE_RETRY_BUDGET", 12))
+        self._ecapa_policy_lock = asyncio.Lock()
+        self._ecapa_reprobe_task: Optional[asyncio.Task] = None
+        self._ecapa_cloud_warmup_task: Optional[asyncio.Task] = None
+        self._ecapa_policy: Dict[str, Any] = {
+            "mode": "unknown",  # unknown | healthy | degraded
+            "active_backend": None,
+            "active_endpoint": None,
+            "last_transition_ts": 0.0,
+            "last_success_ts": 0.0,
+            "last_failure_category": None,
+            "consecutive_failures": 0,
+            "consecutive_successes": 0,
+            "pending_switch_backend": None,
+            "pending_switch_successes": 0,
+            "failure_threshold": max(
+                1, _get_env_int("ECAPA_POLICY_FAILURE_THRESHOLD", 2)
+            ),
+            "recovery_threshold": max(
+                1, _get_env_int("ECAPA_POLICY_RECOVERY_THRESHOLD", 2)
+            ),
+            "switch_threshold": max(
+                1, _get_env_int("ECAPA_POLICY_SWITCH_THRESHOLD", 2)
+            ),
+            "transition_cooldown_s": max(
+                0.0, _get_env_float("ECAPA_POLICY_COOLDOWN", 10.0)
+            ),
+            "backend_ttl_s": max(
+                0.0, _get_env_float("ECAPA_POLICY_BACKEND_TTL", 90.0)
+            ),
+            "retry_budget_default": _ecapa_retry_budget,
+            "retry_budget_remaining": _ecapa_retry_budget,
+            "retry_base_delay_s": _ecapa_retry_base,
+            "retry_max_delay_s": _ecapa_retry_max,
+            "retry_jitter_ratio": min(
+                0.5, max(0.0, _get_env_float("ECAPA_REPROBE_JITTER", 0.2))
+            ),
+            "next_retry_delay_s": _ecapa_retry_base,
+            "suppressed_degraded_warnings": 0,
+            "metrics": {
+                "probe_failures": 0,
+                "degraded_transitions": 0,
+                "recoveries": 0,
+                "backend_switches": 0,
+                "last_policy_source": "init",
+            },
+        }
 
         # v186.0: Dead Man's Switch for startup phase monitoring
         self._startup_watchdog: Optional[StartupWatchdog] = None
@@ -81870,6 +81922,27 @@ class JarvisSystemKernel:
             "backend_minimal": os.environ.get("JARVIS_BACKEND_MINIMAL", "false"),
         }
 
+        # v279.0: ECAPA control-plane observability
+        try:
+            async with self._ecapa_policy_lock:
+                _ep = dict(self._ecapa_policy)
+            _metrics = dict(_ep.get("metrics", {}))
+            status["ecapa_policy"] = {
+                "mode": _ep.get("mode"),
+                "active_backend": _ep.get("active_backend"),
+                "last_failure_category": _ep.get("last_failure_category"),
+                "consecutive_failures": _ep.get("consecutive_failures", 0),
+                "consecutive_successes": _ep.get("consecutive_successes", 0),
+                "retry_budget_remaining": _ep.get("retry_budget_remaining", 0),
+                "next_retry_delay_s": _ep.get("next_retry_delay_s", 0.0),
+                "suppressed_degraded_warnings": _ep.get(
+                    "suppressed_degraded_warnings", 0
+                ),
+                "metrics": _metrics,
+            }
+        except Exception as _ecapa_status_err:
+            status["ecapa_policy"] = {"error": str(_ecapa_status_err)}
+
         try:
             _pressure_signal_file = (
                 Path.home() / ".jarvis" / "cross_repo" / "memory_pressure.json"
@@ -82337,6 +82410,278 @@ class JarvisSystemKernel:
 
         return result
 
+    def _classify_ecapa_failure(self, probes: Dict[str, Dict[str, Any]]) -> str:
+        """
+        Classify ECAPA backend failure into actionable categories.
+
+        Categories:
+        - UNREACHABLE
+        - TIMEOUT
+        - CONTRACT_MISMATCH
+        - MEMORY_BLOCKED
+        - MODEL_NOT_LOADED
+        """
+        valid_categories = {
+            "UNREACHABLE",
+            "TIMEOUT",
+            "CONTRACT_MISMATCH",
+            "MEMORY_BLOCKED",
+            "MODEL_NOT_LOADED",
+        }
+
+        # Respect explicit probe classification first.
+        for probe_name in ("docker", "cloud_run", "local"):
+            category = str(
+                (probes.get(probe_name) or {}).get("failure_category", "")
+            ).upper()
+            if category in valid_categories:
+                return category
+
+        local_probe = probes.get("local") or {}
+        if local_probe.get("memory_ok") is False:
+            return "MEMORY_BLOCKED"
+
+        errors: List[str] = []
+        for probe_name in ("docker", "cloud_run", "local"):
+            err = (probes.get(probe_name) or {}).get("error")
+            if err:
+                errors.append(str(err).lower())
+
+        joined = " | ".join(errors)
+        if any(token in joined for token in ("timeout", "timed out", "deadline")):
+            return "TIMEOUT"
+        if any(
+            token in joined
+            for token in ("schema", "contract", "invalid json", "content-type", "parse")
+        ):
+            return "CONTRACT_MISMATCH"
+        if any(
+            token in joined
+            for token in ("speechbrain", "ecapa_ready", "model not loaded", "not installed")
+        ):
+            return "MODEL_NOT_LOADED"
+        if joined:
+            return "UNREACHABLE"
+        return "UNREACHABLE"
+
+    def _apply_ecapa_backend_environment(
+        self,
+        backend: str,
+        endpoint: Optional[str],
+    ) -> None:
+        """Set canonical ECAPA backend environment variables."""
+        if backend == "docker":
+            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = endpoint or ""
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "true"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "docker"
+        elif backend == "cloud_run":
+            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = endpoint or ""
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "cloud_run"
+        elif backend == "local":
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "local"
+
+    async def _apply_ecapa_policy(
+        self,
+        *,
+        candidate_backend: Optional[str],
+        candidate_endpoint: Optional[str],
+        probes: Dict[str, Dict[str, Any]],
+        decision_reason: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        """
+        Apply stateful ECAPA backend policy with hysteresis and transition logging.
+
+        This is the control-plane owner for ECAPA routing state.
+        """
+        now = asyncio.get_running_loop().time()
+        async with self._ecapa_policy_lock:
+            policy = self._ecapa_policy
+            metrics = policy.setdefault("metrics", {})
+            metrics["last_policy_source"] = source
+
+            failure_threshold = int(policy.get("failure_threshold", 2))
+            recovery_threshold = int(policy.get("recovery_threshold", 2))
+            switch_threshold = int(policy.get("switch_threshold", 2))
+            cooldown_s = float(policy.get("transition_cooldown_s", 10.0))
+            backend_ttl_s = float(policy.get("backend_ttl_s", 90.0))
+            last_transition_ts = float(policy.get("last_transition_ts", 0.0) or 0.0)
+            since_transition = (
+                now - last_transition_ts if last_transition_ts > 0 else float("inf")
+            )
+            in_cooldown = since_transition < cooldown_s
+
+            # -----------------------------------------------------------------
+            # Success path (candidate backend available)
+            # -----------------------------------------------------------------
+            if candidate_backend:
+                previous_mode = str(policy.get("mode", "unknown"))
+                previous_backend = policy.get("active_backend")
+
+                policy["consecutive_failures"] = 0
+                policy["consecutive_successes"] = int(
+                    policy.get("consecutive_successes", 0)
+                ) + 1
+                policy["last_failure_category"] = None
+
+                # Recovery hysteresis while degraded.
+                if previous_mode == "degraded":
+                    if policy["consecutive_successes"] < recovery_threshold:
+                        return {
+                            "selected_backend": None,
+                            "endpoint": None,
+                            "decision_reason": (
+                                f"Recovery hold: {policy['consecutive_successes']}/"
+                                f"{recovery_threshold} healthy probe(s)"
+                            ),
+                            "policy_state": "degraded_hysteresis",
+                            "failure_category": None,
+                        }
+                    if in_cooldown:
+                        remaining = max(0.0, cooldown_s - since_transition)
+                        return {
+                            "selected_backend": None,
+                            "endpoint": None,
+                            "decision_reason": (
+                                f"Recovery cooldown active ({remaining:.1f}s remaining)"
+                            ),
+                            "policy_state": "degraded_cooldown",
+                            "failure_category": None,
+                        }
+
+                # Backend-switch hysteresis while healthy.
+                if (
+                    previous_mode == "healthy"
+                    and previous_backend
+                    and previous_backend != candidate_backend
+                ):
+                    pending_backend = policy.get("pending_switch_backend")
+                    if pending_backend == candidate_backend:
+                        policy["pending_switch_successes"] = int(
+                            policy.get("pending_switch_successes", 0)
+                        ) + 1
+                    else:
+                        policy["pending_switch_backend"] = candidate_backend
+                        policy["pending_switch_successes"] = 1
+
+                    if policy["pending_switch_successes"] < switch_threshold:
+                        return {
+                            "selected_backend": previous_backend,
+                            "endpoint": policy.get("active_endpoint"),
+                            "decision_reason": (
+                                f"Switch hold {policy['pending_switch_successes']}/"
+                                f"{switch_threshold}: keeping {previous_backend}, "
+                                f"candidate={candidate_backend}"
+                            ),
+                            "policy_state": "switch_hysteresis",
+                            "failure_category": None,
+                        }
+
+                # Commit healthy state.
+                policy["mode"] = "healthy"
+                policy["active_backend"] = candidate_backend
+                policy["active_endpoint"] = candidate_endpoint
+                policy["last_success_ts"] = now
+                if previous_mode != "healthy" or previous_backend != candidate_backend:
+                    policy["last_transition_ts"] = now
+                policy["retry_budget_remaining"] = int(policy.get("retry_budget_default", 0))
+                policy["next_retry_delay_s"] = float(policy.get("retry_base_delay_s", 5.0))
+                policy["pending_switch_backend"] = None
+                policy["pending_switch_successes"] = 0
+
+                if previous_mode == "degraded":
+                    metrics["recoveries"] = int(metrics.get("recoveries", 0)) + 1
+                    self.logger.info(
+                        f"[ECAPA] Recovered from degraded mode via {candidate_backend}"
+                    )
+                elif previous_backend != candidate_backend:
+                    if previous_backend:
+                        metrics["backend_switches"] = int(
+                            metrics.get("backend_switches", 0)
+                        ) + 1
+                        self.logger.info(
+                            f"[ECAPA] Backend switch: {previous_backend} -> "
+                            f"{candidate_backend} ({decision_reason})"
+                        )
+                    else:
+                        self.logger.info(
+                            f"[ECAPA] Backend selected: {candidate_backend} — "
+                            f"{decision_reason}"
+                        )
+
+                return {
+                    "selected_backend": candidate_backend,
+                    "endpoint": candidate_endpoint,
+                    "decision_reason": decision_reason,
+                    "policy_state": "healthy",
+                    "failure_category": None,
+                }
+
+            # -----------------------------------------------------------------
+            # Failure path (no backend candidate available)
+            # -----------------------------------------------------------------
+            failure_category = self._classify_ecapa_failure(probes)
+            metrics["probe_failures"] = int(metrics.get("probe_failures", 0)) + 1
+            policy["consecutive_successes"] = 0
+            policy["consecutive_failures"] = int(policy.get("consecutive_failures", 0)) + 1
+            policy["last_failure_category"] = failure_category
+
+            # Hold last known-good backend for a bounded TTL to avoid thrash.
+            active_backend = policy.get("active_backend")
+            active_endpoint = policy.get("active_endpoint")
+            last_success_ts = float(policy.get("last_success_ts", 0.0) or 0.0)
+            if active_backend and backend_ttl_s > 0.0 and last_success_ts > 0.0:
+                age = now - last_success_ts
+                if age <= backend_ttl_s:
+                    ttl_remaining = max(0.0, backend_ttl_s - age)
+                    return {
+                        "selected_backend": active_backend,
+                        "endpoint": active_endpoint,
+                        "decision_reason": (
+                            f"Policy hold: retaining {active_backend} for "
+                            f"{ttl_remaining:.1f}s (cause={failure_category})"
+                        ),
+                        "policy_state": "hold_last_backend",
+                        "failure_category": failure_category,
+                    }
+
+            # Transition to degraded once, after threshold, with cooldown.
+            if (
+                policy["consecutive_failures"] >= failure_threshold
+                and policy.get("mode") != "degraded"
+                and not in_cooldown
+            ):
+                policy["mode"] = "degraded"
+                policy["last_transition_ts"] = now
+                metrics["degraded_transitions"] = int(
+                    metrics.get("degraded_transitions", 0)
+                ) + 1
+                self.logger.warning(
+                    "[ECAPA] Entering degraded mode: "
+                    f"no backend (cause={failure_category}, "
+                    f"failures={policy['consecutive_failures']}/{failure_threshold})"
+                )
+            elif policy.get("mode") == "degraded":
+                policy["suppressed_degraded_warnings"] = int(
+                    policy.get("suppressed_degraded_warnings", 0)
+                ) + 1
+            else:
+                self.logger.info(
+                    "[ECAPA] Probe failure before degrade: "
+                    f"{policy['consecutive_failures']}/{failure_threshold} "
+                    f"(cause={failure_category})"
+                )
+
+            return {
+                "selected_backend": None,
+                "endpoint": None,
+                "decision_reason": f"No ECAPA backend available ({failure_category})",
+                "policy_state": str(policy.get("mode", "unknown")),
+                "failure_category": failure_category,
+            }
+
     # =========================================================================
     # v223.0: ECAPA BACKEND ORCHESTRATOR
     # =========================================================================
@@ -82388,9 +82733,18 @@ class JarvisSystemKernel:
 
         async def probe_docker() -> Dict[str, Any]:
             """Probe Docker ECAPA backend (non-blocking, never auto-starts)."""
-            probe = {"available": False, "healthy": False, "endpoint": None, "latency_ms": 0}
+            probe = {
+                "available": False,
+                "healthy": False,
+                "endpoint": None,
+                "latency_ms": 0,
+                "failure_category": None,
+                "error": None,
+                "status_code": None,
+            }
             skip_docker = os.environ.get("JARVIS_SKIP_DOCKER", "false").lower() == "true"
             if skip_docker:
+                probe["error"] = "docker probe skipped by configuration"
                 return probe
             try:
                 from intelligence.docker_daemon_manager import get_docker_daemon_manager
@@ -82423,7 +82777,26 @@ class JarvisSystemKernel:
                                     probe["latency_ms"] = (
                                         asyncio.get_running_loop().time() - t0
                                     ) * 1000
+                                else:
+                                    probe["status_code"] = resp.status
+                                    probe["failure_category"] = (
+                                        "CONTRACT_MISMATCH"
+                                        if resp.status in (400, 404, 405, 422)
+                                        else "UNREACHABLE"
+                                    )
+                                    probe["error"] = f"docker health returned HTTP {resp.status}"
+                    else:
+                        probe["failure_category"] = "UNREACHABLE"
+                        probe["error"] = "docker container not running"
+                else:
+                    probe["failure_category"] = "UNREACHABLE"
+                    probe["error"] = "docker daemon unhealthy"
+            except asyncio.TimeoutError:
+                probe["failure_category"] = "TIMEOUT"
+                probe["error"] = "docker probe timed out"
             except Exception as e:
+                probe["failure_category"] = "UNREACHABLE"
+                probe["error"] = str(e)
                 self.logger.debug(f"[ECAPA] Docker probe: {e}")
             return probe
 
@@ -82441,9 +82814,18 @@ class JarvisSystemKernel:
 
             If Cloud Run is cold-starting, background warmup handles it.
             """
-            probe = {"available": False, "healthy": False, "endpoint": None, "latency_ms": 0}
+            probe = {
+                "available": False,
+                "healthy": False,
+                "endpoint": None,
+                "latency_ms": 0,
+                "failure_category": None,
+                "error": None,
+                "status_code": None,
+            }
             cloud_endpoint = os.environ.get("JARVIS_CLOUD_ML_ENDPOINT", "")
             if not cloud_endpoint:
+                probe["error"] = "cloud endpoint not configured"
                 return probe
             probe["available"] = True
             try:
@@ -82469,30 +82851,63 @@ class JarvisSystemKernel:
                     health_paths = ["/health", "/api/ml/health", "/status"]
                     t0 = asyncio.get_running_loop().time()
 
-                    async def _check_path(path: str) -> Optional[Dict[str, Any]]:
+                    async def _check_path(path: str) -> Dict[str, Any]:
                         try:
                             async with sess.get(
                                 f"{cloud_endpoint}{path}",
                                 timeout=aiohttp.ClientTimeout(total=3.0),
                             ) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    if data.get("ecapa_ready", False):
-                                        return {
-                                            "healthy": True,
-                                            "endpoint": cloud_endpoint,
-                                            "latency_ms": (
-                                                asyncio.get_running_loop().time() - t0
-                                            ) * 1000,
-                                        }
-                        except Exception:
-                            pass
-                        return None
+                                if resp.status != 200:
+                                    return {
+                                        "healthy": False,
+                                        "status_code": resp.status,
+                                        "failure_category": (
+                                            "CONTRACT_MISMATCH"
+                                            if resp.status in (400, 404, 405, 422)
+                                            else "UNREACHABLE"
+                                        ),
+                                        "error": f"{path} returned HTTP {resp.status}",
+                                    }
+
+                                data = await resp.json()
+                                if data.get("ecapa_ready", False):
+                                    return {
+                                        "healthy": True,
+                                        "endpoint": cloud_endpoint,
+                                        "latency_ms": (
+                                            asyncio.get_running_loop().time() - t0
+                                        ) * 1000,
+                                    }
+
+                                return {
+                                    "healthy": False,
+                                    "failure_category": "MODEL_NOT_LOADED",
+                                    "error": f"{path} responded but ecapa_ready=false",
+                                }
+                        except asyncio.TimeoutError:
+                            return {
+                                "healthy": False,
+                                "failure_category": "TIMEOUT",
+                                "error": f"{path} timed out",
+                            }
+                        except aiohttp.ContentTypeError:
+                            return {
+                                "healthy": False,
+                                "failure_category": "CONTRACT_MISMATCH",
+                                "error": f"{path} returned non-JSON health response",
+                            }
+                        except Exception as e:
+                            return {
+                                "healthy": False,
+                                "failure_category": "UNREACHABLE",
+                                "error": f"{path} error: {e}",
+                            }
 
                     # Launch all path checks concurrently
                     path_tasks = [
                         asyncio.create_task(_check_path(p)) for p in health_paths
                     ]
+                    first_failure: Optional[Dict[str, Any]] = None
                     try:
                         # Wait for first successful result or all to fail
                         done, pending = await asyncio.wait(
@@ -82501,22 +82916,29 @@ class JarvisSystemKernel:
                         # Check completed tasks for a healthy result
                         for task in done:
                             result_data = task.result()
-                            if result_data and result_data.get("healthy"):
+                            if result_data.get("healthy"):
                                 probe.update(result_data)
                                 # Cancel remaining path checks
                                 for p in pending:
                                     p.cancel()
                                 return probe
+                            if first_failure is None:
+                                first_failure = result_data
                         # First completion wasn't healthy — wait for rest
                         if pending:
                             done2, pending2 = await asyncio.wait(pending)
                             for task in done2:
                                 result_data = task.result()
-                                if result_data and result_data.get("healthy"):
+                                if result_data.get("healthy"):
                                     probe.update(result_data)
                                     for p in pending2:
                                         p.cancel()
                                     return probe
+                                if first_failure is None:
+                                    first_failure = result_data
+
+                        if first_failure:
+                            probe.update(first_failure)
                     finally:
                         # Cleanup any remaining tasks
                         for t in path_tasks:
@@ -82526,6 +82948,8 @@ class JarvisSystemKernel:
                         if prewarm and _prewarm_task and not _prewarm_task.done():
                             _prewarm_task.cancel()
             except Exception as e:
+                probe["failure_category"] = "UNREACHABLE"
+                probe["error"] = str(e)
                 self.logger.debug(f"[ECAPA] Cloud Run probe: {e}")
             return probe
 
@@ -82542,7 +82966,12 @@ class JarvisSystemKernel:
             import check (and gc.collect) in a thread executor so the event
             loop stays responsive and timeout mechanisms work correctly.
             """
-            probe = {"available": False, "memory_ok": False, "error": None}
+            probe = {
+                "available": False,
+                "memory_ok": False,
+                "error": None,
+                "failure_category": None,
+            }
             try:
                 import psutil
                 mem = psutil.virtual_memory()
@@ -82568,6 +82997,12 @@ class JarvisSystemKernel:
                     mem2 = psutil.virtual_memory()
                     if mem2.available / (1024 ** 3) >= required_gb * 0.75:
                         probe["memory_ok"] = True
+                else:
+                    probe["failure_category"] = "MEMORY_BLOCKED"
+                    probe["error"] = (
+                        f"available memory {available_gb:.2f}GB below required "
+                        f"{required_gb:.2f}GB"
+                    )
 
                 # v268.0: Check speechbrain availability in SUBPROCESS.
                 # ROOT CAUSE FIX (v268.0): v265.2 ran the import in a thread
@@ -82578,7 +83013,7 @@ class JarvisSystemKernel:
                 # thread with <no Python frame> (segfault).  Running the check
                 # in a subprocess completely isolates native code and makes the
                 # segfault impossible.
-                def _check_speechbrain_subprocess() -> bool:
+                def _check_speechbrain_subprocess() -> Tuple[bool, Optional[str], str]:
                     try:
                         _result = subprocess.run(
                             [sys.executable, "-c", "import speechbrain; print('ok')"],
@@ -82587,20 +83022,42 @@ class JarvisSystemKernel:
                             timeout=10,
                             start_new_session=True,
                         )
-                        return _result.returncode == 0 and "ok" in _result.stdout
-                    except Exception:
-                        return False
+                        if _result.returncode == 0 and "ok" in _result.stdout:
+                            return True, None, ""
+
+                        _stderr = (_result.stderr or "").strip().lower()
+                        _stdout = (_result.stdout or "").strip().lower()
+                        if "no module named" in _stderr or "speechbrain" in _stderr:
+                            return (
+                                False,
+                                "speechbrain module not installed",
+                                "MODEL_NOT_LOADED",
+                            )
+                        return (
+                            False,
+                            _stderr or _stdout or "speechbrain import failed",
+                            "MODEL_NOT_LOADED",
+                        )
+                    except subprocess.TimeoutExpired:
+                        return False, "speechbrain import timed out", "TIMEOUT"
+                    except Exception as exc:
+                        return False, str(exc), "UNREACHABLE"
 
                 _loop = asyncio.get_running_loop()
-                _sb_ok = await _loop.run_in_executor(None, _check_speechbrain_subprocess)
+                _sb_ok, _sb_error, _sb_category = await _loop.run_in_executor(
+                    None, _check_speechbrain_subprocess
+                )
                 if _sb_ok:
                     probe["available"] = True
                 else:
-                    probe["error"] = "speechbrain not installed"
+                    probe["error"] = _sb_error or "speechbrain unavailable"
+                    probe["failure_category"] = _sb_category or "MODEL_NOT_LOADED"
             except ImportError:
                 probe["error"] = "psutil not available"
+                probe["failure_category"] = "UNREACHABLE"
             except Exception as e:
                 probe["error"] = str(e)
+                probe["failure_category"] = "UNREACHABLE"
             return probe
 
         # v261.0: Hard per-probe deadline wrapper. Each probe gets exactly
@@ -82611,16 +83068,46 @@ class JarvisSystemKernel:
                 return await asyncio.wait_for(probe_coro, timeout=_probe_deadline)
             except asyncio.TimeoutError:
                 self.logger.debug(f"[ECAPA] {name} probe exceeded {_probe_deadline}s deadline")
-                return fallback
+                timed_out = dict(fallback)
+                timed_out.setdefault("failure_category", "TIMEOUT")
+                timed_out.setdefault("error", f"{name} probe timeout")
+                return timed_out
             except Exception as e:
                 self.logger.debug(f"[ECAPA] {name} probe error: {e}")
-                return fallback
+                failed = dict(fallback)
+                failed.setdefault("failure_category", "UNREACHABLE")
+                failed.setdefault("error", str(e))
+                return failed
 
         # Run all probes concurrently with hard per-probe deadlines
         docker_probe, cloud_probe, local_probe = await asyncio.gather(
-            _timed_probe(probe_docker(), "Docker", {"available": False, "healthy": False}),
-            _timed_probe(probe_cloud_run(), "Cloud Run", {"available": False, "healthy": False}),
-            _timed_probe(probe_local(), "Local", {"available": False, "memory_ok": False}),
+            _timed_probe(
+                probe_docker(),
+                "Docker",
+                {
+                    "available": False,
+                    "healthy": False,
+                    "failure_category": "UNREACHABLE",
+                },
+            ),
+            _timed_probe(
+                probe_cloud_run(),
+                "Cloud Run",
+                {
+                    "available": False,
+                    "healthy": False,
+                    "failure_category": "UNREACHABLE",
+                },
+            ),
+            _timed_probe(
+                probe_local(),
+                "Local",
+                {
+                    "available": False,
+                    "memory_ok": False,
+                    "failure_category": "UNREACHABLE",
+                },
+            ),
         )
 
         result["probes"] = {
@@ -82698,42 +83185,47 @@ class JarvisSystemKernel:
                     create_safe_task(_bg_docker_start(), name="bg-docker-ecapa-start")
 
         # =====================================================================
-        # Phase 3: Configure Selected Backend
+        # Phase 3: Policy Decision + Configure Selected Backend
         # =====================================================================
+        _policy_result = await self._apply_ecapa_policy(
+            candidate_backend=result.get("selected_backend"),
+            candidate_endpoint=result.get("endpoint"),
+            probes=result["probes"],
+            decision_reason=result.get("decision_reason", ""),
+            source="startup_probe",
+        )
+        result["selected_backend"] = _policy_result.get("selected_backend")
+        result["endpoint"] = _policy_result.get("endpoint")
+        result["decision_reason"] = _policy_result.get(
+            "decision_reason", result.get("decision_reason", "")
+        )
+        result["policy_state"] = _policy_result.get("policy_state")
+        result["failure_category"] = _policy_result.get("failure_category")
+
         backend = result["selected_backend"]
-        if backend == "docker":
-            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = result["endpoint"] or ""
-            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "true"
-            os.environ["JARVIS_ECAPA_BACKEND"] = "docker"
-        elif backend == "cloud_run":
-            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = result["endpoint"] or ""
-            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
-            os.environ["JARVIS_ECAPA_BACKEND"] = "cloud_run"
-        elif backend == "local":
-            os.environ["JARVIS_ECAPA_BACKEND"] = "local"
-            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
-
         if backend:
-            self.logger.info(
-                f"[ECAPA] Backend selected: {backend} — {result['decision_reason']}"
-            )
-        else:
-            result["decision_reason"] = "No ECAPA backend available"
-            self.logger.warning("[ECAPA] No backend available — voice biometrics degraded")
+            self._apply_ecapa_backend_environment(backend, result.get("endpoint"))
 
-            # v265.2: Background re-probe for total failure recovery.
-            # If all probes failed at startup, periodically re-check and
-            # enable voice biometrics when a backend becomes available
-            # (e.g., Docker daemon starts 30s after JARVIS, or speechbrain
-            # finishes its cold import in the background thread).
-            _reprobe_interval = float(os.environ.get("ECAPA_REPROBE_INTERVAL", "30"))
+            # ECAPA is healthy again — stop background re-probe loop.
+            if self._ecapa_reprobe_task is not None and not self._ecapa_reprobe_task.done():
+                self._ecapa_reprobe_task.cancel()
+            self._ecapa_reprobe_task = None
+
+            self._update_component_status("ecapa_backend", "running", f"ECAPA: {backend}")
+        else:
+            self._update_component_status(
+                "ecapa_backend",
+                "degraded",
+                f"ECAPA degraded: {result.get('failure_category', 'UNREACHABLE')}",
+            )
+
+            # Budgeted background re-probe for deterministic recovery.
             _reprobe_max_wait = float(os.environ.get("ECAPA_REPROBE_MAX_WAIT", "300"))
 
             async def _background_ecapa_reprobe() -> None:
                 _t0 = asyncio.get_running_loop().time()
-                _deadline = _probe_deadline
                 try:
-                    while True:
+                    while not self._shutdown_event.is_set():
                         elapsed = asyncio.get_running_loop().time() - _t0
                         if elapsed > _reprobe_max_wait:
                             self.logger.info(
@@ -82741,19 +83233,83 @@ class JarvisSystemKernel:
                             )
                             return
 
-                        await asyncio.sleep(_reprobe_interval)
+                        async with self._ecapa_policy_lock:
+                            _policy = self._ecapa_policy
+                            _budget = int(_policy.get("retry_budget_remaining", 0))
+                            _delay = float(
+                                _policy.get(
+                                    "next_retry_delay_s",
+                                    _policy.get("retry_base_delay_s", 5.0),
+                                )
+                            )
+                            _jitter_ratio = float(_policy.get("retry_jitter_ratio", 0.2))
+
+                        if _budget <= 0:
+                            self.logger.info(
+                                f"[ECAPA] Background re-probe budget exhausted "
+                                f"after {elapsed:.0f}s"
+                            )
+                            return
+
+                        _jitter_factor = 1.0 + random.uniform(-_jitter_ratio, _jitter_ratio)
+                        await asyncio.sleep(max(1.0, _delay * _jitter_factor))
+
+                        async with self._ecapa_policy_lock:
+                            _policy = self._ecapa_policy
+                            _policy["retry_budget_remaining"] = max(
+                                0,
+                                int(_policy.get("retry_budget_remaining", 0)) - 1,
+                            )
 
                         # Re-probe all backends with same deadline
                         try:
                             _d, _c, _l = await asyncio.gather(
-                                _timed_probe(probe_docker(), "Docker", {"available": False, "healthy": False}),
-                                _timed_probe(probe_cloud_run(), "Cloud Run", {"available": False, "healthy": False}),
-                                _timed_probe(probe_local(), "Local", {"available": False, "memory_ok": False}),
+                                _timed_probe(
+                                    probe_docker(),
+                                    "Docker",
+                                    {
+                                        "available": False,
+                                        "healthy": False,
+                                        "failure_category": "UNREACHABLE",
+                                    },
+                                ),
+                                _timed_probe(
+                                    probe_cloud_run(),
+                                    "Cloud Run",
+                                    {
+                                        "available": False,
+                                        "healthy": False,
+                                        "failure_category": "UNREACHABLE",
+                                    },
+                                ),
+                                _timed_probe(
+                                    probe_local(),
+                                    "Local",
+                                    {
+                                        "available": False,
+                                        "memory_ok": False,
+                                        "failure_category": "UNREACHABLE",
+                                    },
+                                ),
                             )
-                        except Exception:
-                            continue
+                        except Exception as reprobe_err:
+                            self.logger.debug(f"[ECAPA] Re-probe gather error: {reprobe_err}")
+                            _d = {
+                                "available": False,
+                                "healthy": False,
+                                "failure_category": "UNREACHABLE",
+                            }
+                            _c = {
+                                "available": False,
+                                "healthy": False,
+                                "failure_category": "UNREACHABLE",
+                            }
+                            _l = {
+                                "available": False,
+                                "memory_ok": False,
+                                "failure_category": "UNREACHABLE",
+                            }
 
-                        # Check if any backend is now available
                         _selected = None
                         _endpoint = None
                         if _d.get("healthy"):
@@ -82763,36 +83319,65 @@ class JarvisSystemKernel:
                         elif _l.get("available") and _l.get("memory_ok"):
                             _selected, _endpoint = "local", None
 
-                        if _selected:
-                            if _selected == "docker":
-                                os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = _endpoint or ""
-                                os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "true"
-                            elif _selected == "cloud_run":
-                                os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = _endpoint or ""
-                                os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
-                            else:
-                                os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
-                            os.environ["JARVIS_ECAPA_BACKEND"] = _selected
-                            self.logger.info(
-                                f"[ECAPA] Background re-probe found {_selected} after "
-                                f"{elapsed + _reprobe_interval:.0f}s — voice biometrics now active"
+                        _policy_result = await self._apply_ecapa_policy(
+                            candidate_backend=_selected,
+                            candidate_endpoint=_endpoint,
+                            probes={"docker": _d, "cloud_run": _c, "local": _l},
+                            decision_reason=f"background re-probe selected {_selected}",
+                            source="background_reprobe",
+                        )
+
+                        _active_backend = _policy_result.get("selected_backend")
+                        if _active_backend:
+                            _active_endpoint = _policy_result.get("endpoint")
+                            self._apply_ecapa_backend_environment(
+                                _active_backend,
+                                _active_endpoint,
                             )
-                            # v265.5: Update component status on recovery
+                            self.logger.info(
+                                f"[ECAPA] Background re-probe activated {_active_backend} "
+                                f"after {asyncio.get_running_loop().time() - _t0:.0f}s"
+                            )
                             self._update_component_status(
                                 "ecapa_backend",
                                 "running",
-                                f"ECAPA: {_selected} (recovered via re-probe)",
+                                f"ECAPA: {_active_backend} (recovered via re-probe)",
                             )
                             return
+
+                        _failure = _policy_result.get("failure_category", "UNREACHABLE")
+                        async with self._ecapa_policy_lock:
+                            _policy = self._ecapa_policy
+                            _next_delay = min(
+                                float(_policy.get("retry_max_delay_s", 90.0)),
+                                max(
+                                    float(_policy.get("retry_base_delay_s", 5.0)),
+                                    float(_policy.get("next_retry_delay_s", 5.0)) * 2.0,
+                                ),
+                            )
+                            _policy["next_retry_delay_s"] = _next_delay
+                            _budget_left = int(_policy.get("retry_budget_remaining", 0))
+
+                        if _budget_left == 0 or _budget_left % 3 == 0:
+                            self.logger.info(
+                                "[ECAPA] Re-probe pending "
+                                f"(cause={_failure}, budget={_budget_left}, "
+                                f"next={_next_delay:.1f}s)"
+                            )
                 except asyncio.CancelledError:
                     return
                 except Exception as e:
                     self.logger.debug(f"[ECAPA] Background re-probe error: {e}")
+                finally:
+                    self._ecapa_reprobe_task = None
 
-            create_safe_task(
-                _background_ecapa_reprobe(),
-                name="bg-ecapa-reprobe",
-            )
+            if self._ecapa_reprobe_task is None or self._ecapa_reprobe_task.done():
+                self._ecapa_reprobe_task = create_safe_task(
+                    _background_ecapa_reprobe(),
+                    name="bg-ecapa-reprobe",
+                )
+            else:
+                self.logger.debug("[ECAPA] Background re-probe already running")
 
         # =====================================================================
         # v261.0: BACKGROUND CLOUD RUN WARMUP + HOT-SWAP
@@ -82813,64 +83398,148 @@ class JarvisSystemKernel:
             and not cloud_probe.get("healthy")
             and backend != "cloud_run"
         ):
-            self.logger.info(
-                "[ECAPA] Cloud Run not ready yet — starting background warmup "
-                f"(current: {backend or 'none'})"
-            )
+            if (
+                self._ecapa_cloud_warmup_task is None
+                or self._ecapa_cloud_warmup_task.done()
+            ):
+                self.logger.info(
+                    "[ECAPA] Cloud Run not ready yet — starting background warmup "
+                    f"(current: {backend or 'none'})"
+                )
 
-            async def _background_cloud_run_ecapa_warmup() -> None:
-                """
-                v261.0: Background Cloud Run warmup with hot-swap.
-                Retries with backoff until Cloud Run responds, then
-                switches ECAPA backend to cloud_run transparently.
-                """
-                _max_wait = float(os.environ.get("CLOUD_RUN_BG_WARMUP_MAX_WAIT", "120"))
-                _poll_interval = float(os.environ.get("CLOUD_RUN_BG_WARMUP_POLL", "5"))
-                _request_timeout = float(os.environ.get("CLOUD_RUN_BG_WARMUP_REQ_TIMEOUT", "10"))
-                _health_paths = ["/health", "/api/ml/health", "/status"]
-                _t_start = asyncio.get_running_loop().time()
+                async def _background_cloud_run_ecapa_warmup() -> None:
+                    """
+                    v261.0+: Background Cloud Run warmup with policy-governed activation.
+                    """
+                    _max_wait = float(
+                        os.environ.get("CLOUD_RUN_BG_WARMUP_MAX_WAIT", "120")
+                    )
+                    _poll_interval = float(
+                        os.environ.get("CLOUD_RUN_BG_WARMUP_POLL", "5")
+                    )
+                    _request_timeout = float(
+                        os.environ.get("CLOUD_RUN_BG_WARMUP_REQ_TIMEOUT", "10")
+                    )
+                    _health_paths = ["/health", "/api/ml/health", "/status"]
+                    _t_start = asyncio.get_running_loop().time()
 
-                try:
-                    import aiohttp
-                    async with aiohttp.ClientSession() as sess:
-                        while True:
-                            elapsed = asyncio.get_running_loop().time() - _t_start
-                            if elapsed > _max_wait:
-                                self.logger.info(
-                                    f"[ECAPA] Cloud Run warmup gave up after {elapsed:.0f}s"
-                                )
-                                return
+                    try:
+                        import aiohttp
 
-                            for _path in _health_paths:
-                                try:
-                                    async with sess.get(
-                                        f"{cloud_endpoint}{_path}",
-                                        timeout=aiohttp.ClientTimeout(total=_request_timeout),
-                                    ) as resp:
-                                        if resp.status == 200:
+                        async with aiohttp.ClientSession() as sess:
+                            while not self._shutdown_event.is_set():
+                                elapsed = asyncio.get_running_loop().time() - _t_start
+                                if elapsed > _max_wait:
+                                    self.logger.info(
+                                        "[ECAPA] Cloud Run warmup gave up after "
+                                        f"{elapsed:.0f}s"
+                                    )
+                                    return
+
+                                _cloud_ready = False
+                                _cloud_failure: Dict[str, Any] = {
+                                    "failure_category": "UNREACHABLE"
+                                }
+                                for _path in _health_paths:
+                                    try:
+                                        async with sess.get(
+                                            f"{cloud_endpoint}{_path}",
+                                            timeout=aiohttp.ClientTimeout(
+                                                total=_request_timeout
+                                            ),
+                                        ) as resp:
+                                            if resp.status != 200:
+                                                _cloud_failure = {
+                                                    "failure_category": (
+                                                        "CONTRACT_MISMATCH"
+                                                        if resp.status
+                                                        in (400, 404, 405, 422)
+                                                        else "UNREACHABLE"
+                                                    ),
+                                                    "error": (
+                                                        f"{_path} returned HTTP "
+                                                        f"{resp.status}"
+                                                    ),
+                                                }
+                                                continue
+
                                             data = await resp.json()
                                             if data.get("ecapa_ready", False):
-                                                # Hot-swap to Cloud Run
-                                                os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = cloud_endpoint
-                                                os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
-                                                os.environ["JARVIS_ECAPA_BACKEND"] = "cloud_run"
-                                                self.logger.info(
-                                                    f"[ECAPA] Cloud Run ready after "
-                                                    f"{elapsed:.1f}s — hot-swapped from "
-                                                    f"{backend or 'none'} to cloud_run"
-                                                )
-                                                return
-                                except Exception:
-                                    continue
+                                                _cloud_ready = True
+                                                break
 
-                            await asyncio.sleep(_poll_interval)
-                except Exception as e:
-                    self.logger.debug(f"[ECAPA] Background Cloud Run warmup error: {e}")
+                                            _cloud_failure = {
+                                                "failure_category": "MODEL_NOT_LOADED",
+                                                "error": f"{_path} ecapa_ready=false",
+                                            }
+                                    except asyncio.TimeoutError:
+                                        _cloud_failure = {
+                                            "failure_category": "TIMEOUT",
+                                            "error": f"{_path} timed out",
+                                        }
+                                    except aiohttp.ContentTypeError:
+                                        _cloud_failure = {
+                                            "failure_category": "CONTRACT_MISMATCH",
+                                            "error": f"{_path} non-JSON response",
+                                        }
+                                    except Exception as cloud_err:
+                                        _cloud_failure = {
+                                            "failure_category": "UNREACHABLE",
+                                            "error": str(cloud_err),
+                                        }
 
-            create_safe_task(
-                _background_cloud_run_ecapa_warmup(),
-                name="bg-cloud-run-ecapa-warmup",
-            )
+                                _policy_result = await self._apply_ecapa_policy(
+                                    candidate_backend="cloud_run" if _cloud_ready else None,
+                                    candidate_endpoint=cloud_endpoint if _cloud_ready else None,
+                                    probes={
+                                        "docker": docker_probe,
+                                        "cloud_run": _cloud_failure,
+                                        "local": local_probe,
+                                    },
+                                    decision_reason=(
+                                        f"Cloud Run warmup ready after {elapsed:.1f}s"
+                                    ),
+                                    source="background_cloud_warmup",
+                                )
+
+                                _active_backend = _policy_result.get("selected_backend")
+                                if _active_backend == "cloud_run":
+                                    _active_endpoint = _policy_result.get("endpoint")
+                                    self._apply_ecapa_backend_environment(
+                                        _active_backend, _active_endpoint
+                                    )
+                                    self._update_component_status(
+                                        "ecapa_backend",
+                                        "running",
+                                        f"ECAPA: {_active_backend} (cloud warmup)",
+                                    )
+                                    self.logger.info(
+                                        "[ECAPA] Cloud warmup activated "
+                                        f"{_active_backend} after {elapsed:.1f}s"
+                                    )
+                                    return
+
+                                await asyncio.sleep(_poll_interval)
+                    except Exception as e:
+                        self.logger.debug(
+                            f"[ECAPA] Background Cloud Run warmup error: {e}"
+                        )
+                    finally:
+                        self._ecapa_cloud_warmup_task = None
+
+                self._ecapa_cloud_warmup_task = create_safe_task(
+                    _background_cloud_run_ecapa_warmup(),
+                    name="bg-cloud-run-ecapa-warmup",
+                )
+            else:
+                self.logger.debug("[ECAPA] Background Cloud Run warmup already running")
+        elif (
+            backend == "cloud_run"
+            and self._ecapa_cloud_warmup_task is not None
+            and not self._ecapa_cloud_warmup_task.done()
+        ):
+            self._ecapa_cloud_warmup_task.cancel()
+            self._ecapa_cloud_warmup_task = None
 
         return result
 
