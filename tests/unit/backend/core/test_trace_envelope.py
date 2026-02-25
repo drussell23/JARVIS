@@ -8,7 +8,6 @@ import os
 import threading
 import time
 import unittest
-from unittest import mock
 
 
 def _make_valid_envelope_dict() -> dict:
@@ -234,6 +233,39 @@ class TestTraceEnvelope(unittest.TestCase):
         env = TraceEnvelope.from_dict(d)
         self.assertEqual(env.extra["unknown_field_xyz"], "surprise")
 
+    def test_from_dict_missing_required_fields(self):
+        from backend.core.trace_envelope import TraceEnvelope
+
+        d = {"trace_id": "abc", "extra": {}}  # Missing most required fields
+        with self.assertRaises(ValueError) as ctx:
+            TraceEnvelope.from_dict(d)
+        self.assertIn("missing required fields", str(ctx.exception))
+
+    def test_from_headers_malformed_sequence(self):
+        """Malformed numeric header values default gracefully."""
+        from backend.core.trace_envelope import TraceEnvelope
+
+        d = _make_valid_envelope_dict()
+        env = TraceEnvelope.from_dict(d)
+        headers = env.to_headers()
+        # Corrupt the sequence header
+        headers["X-Trace-Sequence"] = "not-a-number"
+        env2 = TraceEnvelope.from_headers(headers)
+        self.assertIsNotNone(env2)
+        self.assertEqual(env2.sequence, 0)  # Falls back to 0
+
+    def test_from_headers_invalid_boundary_type(self):
+        """Invalid boundary type string defaults to internal."""
+        from backend.core.trace_envelope import BoundaryType, TraceEnvelope
+
+        d = _make_valid_envelope_dict()
+        env = TraceEnvelope.from_dict(d)
+        headers = env.to_headers()
+        headers["X-Trace-Boundary"] = "grpc_nonexistent"
+        env2 = TraceEnvelope.from_headers(headers)
+        self.assertIsNotNone(env2)
+        self.assertEqual(env2.boundary_type, BoundaryType.internal)
+
     def test_env_var_size_limit(self):
         """Serialized envelope should be under 4KB for env var transport."""
         from backend.core.trace_envelope import TraceEnvelope
@@ -336,6 +368,16 @@ class TestTraceEnvelopeValidation(unittest.TestCase):
         env = TraceEnvelope.from_dict(d)
         errors = validate_envelope(env)
         self.assertTrue(any("ts_mono" in e for e in errors))
+
+    def test_accepts_zero_ts_mono_from_wire(self):
+        """ts_mono_local=0.0 is a valid sentinel for cross-boundary envelopes."""
+        from backend.core.trace_envelope import TraceEnvelope, validate_envelope
+
+        d = _make_valid_envelope_dict()
+        d["ts_mono_local"] = 0.0
+        env = TraceEnvelope.from_dict(d)
+        errors = validate_envelope(env)
+        self.assertFalse(any("ts_mono" in e for e in errors))
 
     def test_rejects_bad_schema_version(self):
         from backend.core.trace_envelope import TraceEnvelope, validate_envelope

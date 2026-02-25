@@ -28,8 +28,10 @@ TRACE_SCHEMA_VERSION: int = 1
 TRACE_SCHEMA_MIN_SUPPORTED: int = 1
 TRACE_SCHEMA_MAX_SUPPORTED: int = 1
 
-KNOWN_REPOS: set = {"jarvis", "jarvis-prime", "reactor-core"}
+KNOWN_REPOS: frozenset = frozenset({"jarvis", "jarvis-prime", "reactor-core"})
 
+# Read once at import time.  Tests should patch the module attribute
+# directly rather than setting the env var after import.
 CLOCK_SKEW_TOLERANCE_S: float = float(
     os.environ.get("JARVIS_TRACE_CLOCK_SKEW_TOLERANCE", "300.0")
 )
@@ -97,6 +99,9 @@ class LamportClock:
 _HEADER_PREFIX = "X-Trace-"
 
 # Mapping: field name -> header suffix (without prefix).
+# ts_mono_local and extra are intentionally excluded:
+# - ts_mono_local is process-local and meaningless across boundaries
+# - extra requires structured serialisation (not a flat header)
 _FIELD_TO_HEADER_SUFFIX: Dict[str, str] = {
     "trace_id": "ID",
     "span_id": "Span-ID",
@@ -180,6 +185,7 @@ class TraceEnvelope:
         """Deserialise from a plain dict.
 
         Unknown keys are folded into ``extra``.
+        Raises ``ValueError`` if required fields are missing.
         """
         known = _ENVELOPE_FIELD_NAMES
         extra = dict(d.get("extra", {}))
@@ -193,10 +199,21 @@ class TraceEnvelope:
             else:
                 extra[key] = val
 
+        # Validate required fields before construction.
+        required = _ENVELOPE_FIELD_NAMES - {"extra"}
+        missing = required - set(kwargs.keys())
+        if missing:
+            raise ValueError(
+                f"TraceEnvelope.from_dict missing required fields: {sorted(missing)}"
+            )
+
         # Coerce boundary_type from string.
         bt = kwargs.get("boundary_type")
         if bt is not None and not isinstance(bt, BoundaryType):
-            kwargs["boundary_type"] = BoundaryType(bt)
+            try:
+                kwargs["boundary_type"] = BoundaryType(bt)
+            except ValueError:
+                kwargs["boundary_type"] = BoundaryType.internal
 
         kwargs["extra"] = extra
         return cls(**kwargs)
@@ -244,15 +261,26 @@ class TraceEnvelope:
                 kwargs[field_name] = None
                 continue
             if field_name in _INT_HEADER_FIELDS:
-                kwargs[field_name] = int(raw) if raw else 0
+                try:
+                    kwargs[field_name] = int(raw) if raw else 0
+                except (ValueError, TypeError):
+                    kwargs[field_name] = 0
             elif field_name in _FLOAT_HEADER_FIELDS:
-                kwargs[field_name] = float(raw) if raw else 0.0
+                try:
+                    kwargs[field_name] = float(raw) if raw else 0.0
+                except (ValueError, TypeError):
+                    kwargs[field_name] = 0.0
             elif field_name == "boundary_type":
-                kwargs[field_name] = BoundaryType(raw) if raw else BoundaryType.internal
+                try:
+                    kwargs[field_name] = BoundaryType(raw) if raw else BoundaryType.internal
+                except ValueError:
+                    kwargs[field_name] = BoundaryType.internal
             else:
                 kwargs[field_name] = raw
 
         # Fields not transported via headers get sensible defaults.
+        # ts_mono_local is process-local; 0.0 is a sentinel meaning
+        # "received from wire, no local monotonic available".
         kwargs.setdefault("ts_mono_local", 0.0)
         kwargs.setdefault("extra", {})
 
@@ -414,9 +442,12 @@ def validate_envelope(env: TraceEnvelope) -> List[str]:
             f"{CLOCK_SKEW_TOLERANCE_S:.1f}s"
         )
 
-    # Monotonic must be positive.
-    if env.ts_mono_local <= 0:
-        errors.append(f"ts_mono_local must be > 0 (got {env.ts_mono_local})")
+    # Monotonic must be positive for locally-created envelopes.
+    # 0.0 is a valid sentinel for cross-boundary envelopes received via
+    # headers (from_headers defaults to 0.0 since monotonic time is
+    # process-local and cannot be transmitted).  Negative is always invalid.
+    if env.ts_mono_local < 0:
+        errors.append(f"ts_mono_local must be >= 0 (got {env.ts_mono_local})")
 
     # Schema version in supported range.
     if env.schema_version < TRACE_SCHEMA_MIN_SUPPORTED:
