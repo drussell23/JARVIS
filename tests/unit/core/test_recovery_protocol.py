@@ -445,6 +445,8 @@ class TestRecoveryReconciler:
         assert actions[2]["to"] == "READY"
 
     def test_starting_unreachable_becomes_failed(self):
+        """STARTING + unreachable with an old start_timestamp -> FAILED (startup crashed)."""
+        import time
         journal = _make_journal()
         engine = _make_engine()
         reconciler = RecoveryReconciler(journal, engine)
@@ -454,11 +456,15 @@ class TestRecoveryReconciler:
             category=HealthCategory.UNREACHABLE,
             probe_epoch=1,
         )
-        actions = _run(reconciler.reconcile("svc_a", "STARTING", probe))
+        # Provide a start_timestamp > 60s ago so the reconciler marks it as crashed
+        actions = _run(reconciler.reconcile(
+            "svc_a", "STARTING", probe,
+            start_timestamp=time.time() - 120,
+        ))
 
         assert len(actions) == 1
         assert actions[0]["to"] == "FAILED"
-        assert actions[0]["reason"] == "reconcile_mark_failed"
+        assert actions[0]["reason"] == "reconcile_startup_crashed"
 
     def test_handshaking_unreachable_becomes_failed(self):
         journal = _make_journal()

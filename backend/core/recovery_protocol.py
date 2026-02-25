@@ -51,6 +51,56 @@ class ProbeResult:
     probe_seq: int = 0
 
 
+# ── Health Hysteresis Buffer ──────────────────────────────────────
+
+class HealthBuffer:
+    """Hysteresis buffer for health probe results.
+
+    Prevents single-failure route flaps by requiring k consecutive
+    failures before marking a component as lost or degraded.
+
+    Design doc: docs/plans/2026-02-25-journal-backed-gcp-lifecycle-design.md
+    Section: Probe Hysteresis.
+    """
+
+    def __init__(self, k_unreachable: int = 3, k_degraded: int = 5) -> None:
+        self._k_unreachable = k_unreachable
+        self._k_degraded = k_degraded
+        self._consecutive_unreachable: int = 0
+        self._consecutive_degraded: int = 0
+
+    @property
+    def consecutive_unreachable(self) -> int:
+        return self._consecutive_unreachable
+
+    @property
+    def consecutive_degraded(self) -> int:
+        return self._consecutive_degraded
+
+    def record_failure(self, category: "HealthCategory") -> None:
+        """Record a probe failure. TIMEOUT counts as UNREACHABLE."""
+        if category in (HealthCategory.UNREACHABLE,):
+            self._consecutive_unreachable += 1
+        elif category in (
+            HealthCategory.SERVICE_DEGRADED,
+            HealthCategory.DEPENDENCY_DEGRADED,
+        ):
+            self._consecutive_degraded += 1
+
+    def record_success(self) -> None:
+        """Record a successful probe. Resets all counters."""
+        self._consecutive_unreachable = 0
+        self._consecutive_degraded = 0
+
+    def should_mark_lost(self) -> bool:
+        """True if consecutive unreachable failures have reached threshold."""
+        return self._consecutive_unreachable >= self._k_unreachable
+
+    def should_mark_degraded(self) -> bool:
+        """True if consecutive degraded failures have reached threshold."""
+        return self._consecutive_degraded >= self._k_degraded
+
+
 # ── States that need probing vs. those that don't ─────────────────
 
 _SKIP_PROBE_STATES = frozenset({"STOPPED", "REGISTERED"})
@@ -274,6 +324,7 @@ class RecoveryReconciler:
         component: str,
         projected: str,
         probe: ProbeResult,
+        start_timestamp: Optional[float] = None,
     ) -> List[dict]:
         """Reconcile a single component.
 
@@ -327,13 +378,35 @@ class RecoveryReconciler:
             )
             actions.extend(recovery_actions)
 
-        # ── STARTING/HANDSHAKING + unreachable → FAILED ────────
+        # ── STARTING/HANDSHAKING + unreachable ───────────────
         elif projected in ("STARTING", "HANDSHAKING") and category == HealthCategory.UNREACHABLE:
-            actions.append(await self._apply_transition(
-                component, "FAILED",
-                reason="reconcile_mark_failed",
-                idemp_key=idemp_base,
-            ))
+            if projected == "STARTING" and start_timestamp is None:
+                # Never launched — request start, don't mark failed
+                actions.append(await self._apply_transition(
+                    component, "STARTING",
+                    reason="reconcile_start_requested",
+                    idemp_key=idemp_base,
+                ))
+            elif projected == "STARTING" and start_timestamp is not None:
+                import time as _time
+                elapsed = _time.time() - start_timestamp
+                if elapsed > 60:
+                    # Started > 60s ago but still unreachable — crashed
+                    actions.append(await self._apply_transition(
+                        component, "FAILED",
+                        reason="reconcile_startup_crashed",
+                        idemp_key=idemp_base,
+                    ))
+                else:
+                    # Still within startup window — don't fail yet
+                    pass
+            else:
+                # HANDSHAKING + unreachable → FAILED
+                actions.append(await self._apply_transition(
+                    component, "FAILED",
+                    reason="reconcile_mark_failed",
+                    idemp_key=idemp_base,
+                ))
 
         # ── DRAINING/STOPPING + unreachable → STOPPED ──────────
         elif projected in ("DRAINING", "STOPPING") and category == HealthCategory.UNREACHABLE:
