@@ -67814,7 +67814,11 @@ class JarvisSystemKernel:
             except Exception:
                 pass
 
-            # Send final 100% progress to loading page
+            # v270.1: The primary 100% broadcast now happens INSIDE
+            # _phase_frontend_transition, before the loading server is stopped.
+            # This redundant broadcast is kept for safety (idempotent) and adds
+            # startup_duration metadata. If the loading server is already stopped,
+            # _safe_broadcast will timeout harmlessly (5s max).
             await self._safe_broadcast(
                 stage="complete",
                 message="JARVIS startup complete!",
@@ -78997,14 +79001,30 @@ class JarvisSystemKernel:
                 if browser_lock_acquired:
                     self._release_browser_lock()
 
-            # Step 4: Gracefully stop the loading server
+            # Step 4: Broadcast 100% completion BEFORE stopping loading server
+            # v270.1: The 100% broadcast MUST arrive while the loading server is
+            # still alive. Previously, the loading server was killed here (inside
+            # the phase), but the 100% broadcast was sent AFTER the phase returned
+            # (in _startup_impl). By then the server was dead — StartupGate never
+            # received the completion signal and stayed at 98% forever.
+            self._current_startup_phase = "complete"
+            self._current_startup_progress = 100
+            await self._safe_broadcast(
+                stage="complete",
+                message="JARVIS startup complete!",
+                progress=100,
+                metadata={
+                    "icon": "check",
+                    "phase": "complete",
+                }
+            )
+
+            # Step 5: Gracefully stop the loading server (AFTER 100% is sent)
             # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
-            # The loading server also has transition grace period protection
             redirect_stabilization_delay = float(
                 os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "1.0")
             )
             await asyncio.sleep(redirect_stabilization_delay)
-            # The graceful shutdown will wait for Chrome to naturally disconnect
             await self._stop_loading_server()
 
             # Voice narration for transition

@@ -1130,19 +1130,27 @@ class MacOSSayEngine(TTSEngine):
         """Speak using macOS say command.
 
         v236.6: Defense-in-depth — refuse to open raw `say` subprocess when
-        FullDuplexDevice holds the audio device.  The primary guard is in
-        UnifiedVoiceOrchestrator._execute_say(), but this prevents contention
-        if the engine is called from any other path.
+        FullDuplexDevice holds the audio device.
+        v270.1: When device IS held, use the safe path: `say -o tempfile`
+        (writes to file, does NOT touch audio device) then feed audio data
+        to AudioBus.play_audio() which routes through the PlaybackRingBuffer
+        of the already-running FullDuplexDevice. Previously, ALL `say` calls
+        were blocked when device was held — including the safe file-output
+        mode — causing "All engines failed" when Trinity tried to speak.
         """
-        if _is_audio_device_held():
-            self.last_error = "FullDuplexDevice holds audio device"
-            return False
+        device_held = _is_audio_device_held()
 
         try:
             async with self._lock:
                 resolved_voice = await self._resolve_voice_name(personality.voice_name)
 
-                # Build say command with personality
+                if device_held:
+                    # Safe path: say -o tempfile (no audio device access)
+                    return await self._speak_via_audiobus(
+                        message, resolved_voice, personality.rate, timeout
+                    )
+
+                # Normal path: direct say (plays to speakers)
                 cmd = [
                     "say",
                     "-v", resolved_voice,
@@ -1150,7 +1158,6 @@ class MacOSSayEngine(TTSEngine):
                     message
                 ]
 
-                # Execute with timeout
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -1161,7 +1168,6 @@ class MacOSSayEngine(TTSEngine):
                     await asyncio.wait_for(process.wait(), timeout=timeout)
 
                     if process.returncode == 0:
-                        # Clean up zombie processes
                         await self._cleanup_processes()
                         return True
                     else:
@@ -1178,6 +1184,74 @@ class MacOSSayEngine(TTSEngine):
         except Exception as e:
             self.last_error = str(e)
             return False
+
+    async def _speak_via_audiobus(
+        self,
+        message: str,
+        voice: str,
+        rate: int,
+        timeout: float,
+    ) -> bool:
+        """Speak using say -o tempfile + AudioBus playback (device-safe).
+
+        v270.1: `say -o file` writes audio to a file WITHOUT opening the
+        audio device. The file is then loaded and fed to AudioBus.play_audio()
+        which routes through the PlaybackRingBuffer of the existing
+        FullDuplexDevice stream — no device contention, no static.
+        """
+        import tempfile
+
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".aiff", delete=False, prefix="jarvis_tts_"
+            ) as f:
+                tmp = f.name
+
+            # say -o writes to file (no audio device access)
+            cmd = ["say", "-o", tmp, "-v", voice, "-r", str(rate), message]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+
+            if proc.returncode != 0:
+                stderr = await proc.stderr.read()
+                self.last_error = f"say -o failed: {stderr.decode().strip()}"
+                return False
+
+            # Read audio file and play through AudioBus
+            import soundfile as sf
+            import numpy as np
+
+            audio_data, sample_rate = sf.read(tmp, dtype="float32")
+            if audio_data.ndim == 2:
+                audio_data = np.mean(audio_data, axis=1)  # Mono mixdown
+
+            from backend.audio.audio_bus import AudioBus
+
+            bus = AudioBus.get_instance_safe()
+            if bus is None or not bus.is_running:
+                self.last_error = "AudioBus not available for playback"
+                return False
+
+            await bus.play_audio(audio_data, sample_rate, wait_for_drain=True)
+            return True
+
+        except asyncio.TimeoutError:
+            self.last_error = f"AudioBus TTS timeout after {timeout}s"
+            return False
+        except Exception as e:
+            self.last_error = f"AudioBus TTS error: {e}"
+            return False
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     async def _cleanup_processes(self):
         """Clean up completed processes to prevent zombies."""
@@ -1260,10 +1334,17 @@ class Pyttsx3Engine(TTSEngine):
                     await tts.speak(message, play_audio=True)
                     return True
             except Exception:
-                if _device_held:
-                    # Cannot fall through to pyttsx3 — would cause static
-                    self.last_error = "FullDuplexDevice holds audio device"
-                    return False
+                pass  # Fall through to AudioBus TTS below
+
+            if _device_held:
+                # v270.1: UnifiedTTSEngine unavailable but device is held —
+                # use `say -o tempfile` + AudioBus (same path as MacOSSayEngine).
+                # pyttsx3.runAndWait() CANNOT be used here — it opens a
+                # conflicting audio stream → static.
+                return await self._speak_via_audiobus(
+                    message, personality.voice_name or "Daniel",
+                    personality.rate, timeout,
+                )
 
         if not self._engine:
             return False
@@ -1365,6 +1446,75 @@ class Pyttsx3Engine(TTSEngine):
             self.last_error = str(e)
             return False
 
+    async def _speak_via_audiobus(
+        self,
+        message: str,
+        voice: str,
+        rate: int,
+        timeout: float,
+    ) -> bool:
+        """Speak using say -o tempfile + AudioBus playback (device-safe).
+
+        v270.1: Identical to MacOSSayEngine._speak_via_audiobus(). When
+        FullDuplexDevice holds the audio device, pyttsx3.runAndWait() would
+        open a conflicting audio stream. Instead we use macOS `say -o file`
+        (no device) then route through AudioBus PlaybackRingBuffer.
+        """
+        import tempfile
+
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".aiff", delete=False, prefix="jarvis_tts_"
+            ) as f:
+                tmp = f.name
+
+            # Resolve voice name (best-effort for say command)
+            resolved_voice = (voice or "Daniel").strip()
+
+            cmd = ["say", "-o", tmp, "-v", resolved_voice, "-r", str(rate), message]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+
+            if proc.returncode != 0:
+                stderr = await proc.stderr.read()
+                self.last_error = f"say -o failed: {stderr.decode().strip()}"
+                return False
+
+            import soundfile as sf
+            import numpy as np
+
+            audio_data, sample_rate = sf.read(tmp, dtype="float32")
+            if audio_data.ndim == 2:
+                audio_data = np.mean(audio_data, axis=1)
+
+            from backend.audio.audio_bus import AudioBus
+
+            bus = AudioBus.get_instance_safe()
+            if bus is None or not bus.is_running:
+                self.last_error = "AudioBus not available for playback"
+                return False
+
+            await bus.play_audio(audio_data, sample_rate, wait_for_drain=True)
+            return True
+
+        except asyncio.TimeoutError:
+            self.last_error = f"AudioBus TTS timeout after {timeout}s"
+            return False
+        except Exception as e:
+            self.last_error = f"AudioBus TTS error: {e}"
+            return False
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
 
 class EdgeTTSEngine(TTSEngine):
     """Edge TTS engine (cloud-based, high quality)."""
@@ -1391,13 +1541,15 @@ class EdgeTTSEngine(TTSEngine):
 
         v236.6: Defense-in-depth — refuse to launch `afplay`/`mpg123` when
         FullDuplexDevice holds the audio device.
+        v270.1: When device IS held, route synthesized audio through AudioBus
+        instead of blocking entirely. Edge TTS already saves to a temp file —
+        instead of playing with afplay (opens device), load the file and feed
+        to AudioBus.play_audio() (uses existing FullDuplexDevice stream).
         """
         if not EDGE_TTS_AVAILABLE:
             return False
 
-        if _is_audio_device_held():
-            self.last_error = "FullDuplexDevice holds audio device"
-            return False
+        device_held = _is_audio_device_held()
 
         try:
             # Map personality voice to Edge TTS voice
@@ -1425,7 +1577,28 @@ class EdgeTTSEngine(TTSEngine):
                     timeout=timeout
                 )
 
-                # Play using afplay (macOS) or mpg123 (Linux)
+                if device_held:
+                    # v270.1: Route through AudioBus (no device contention)
+                    import soundfile as sf
+                    import numpy as np
+
+                    audio_data, sample_rate = sf.read(temp_path, dtype="float32")
+                    if audio_data.ndim == 2:
+                        audio_data = np.mean(audio_data, axis=1)
+
+                    from backend.audio.audio_bus import AudioBus
+
+                    bus = AudioBus.get_instance_safe()
+                    if bus is None or not bus.is_running:
+                        self.last_error = "AudioBus not available for playback"
+                        return False
+
+                    await bus.play_audio(
+                        audio_data, sample_rate, wait_for_drain=True
+                    )
+                    return True
+
+                # Normal path: play using afplay (macOS) or mpg123 (Linux)
                 if os.path.exists("/usr/bin/afplay"):
                     play_cmd = ["afplay", temp_path]
                 else:
