@@ -743,6 +743,36 @@ class PrimeClient:
             new_status = await self._check_health()
 
             if new_status in (PrimeStatus.AVAILABLE, PrimeStatus.DEGRADED):
+                # v276.0 Phase 12: Validate health response schema + version
+                # before completing hot-swap. Fail-open: allows on error.
+                try:
+                    from backend.core.protocol_version_gate import validate_health_before_swap
+                    _vok, _vreason = validate_health_before_swap(
+                        "prime:/health",
+                        getattr(self, "_last_health_data", {}) or {},
+                    )
+                    if not _vok:
+                        logger.warning(
+                            "[PrimeClient] v276.0: Hot-swap blocked by version gate: %s",
+                            _vreason,
+                        )
+                        # Revert — same as unhealthy path
+                        self._config.prime_host = old_host
+                        self._config.prime_port = old_port
+                        try:
+                            await self._pool.close()
+                        except Exception:
+                            pass
+                        self._pool = PrimeConnectionPool(self._config)
+                        await self._pool.initialize()
+                        self._circuit = PrimeCircuitBreaker(self._config)
+                        await self._check_health()
+                        self._endpoint_source = "local"
+                        self._fallback_host = None
+                        self._fallback_port = None
+                        return False
+                except ImportError:
+                    pass
                 logger.info(
                     f"[PrimeClient] v232.0: GCP endpoint healthy ({new_status.value}), "
                     f"promotion complete: {host}:{port}"
@@ -963,12 +993,36 @@ class PrimeClient:
                         self._status = PrimeStatus.UNAVAILABLE
 
             self._last_health_check = time.time()
+            # v276.0 Phase 12: Record forward reachability for partition detection
+            try:
+                from backend.core.partition_aware_health import PartitionDetector
+                _det = getattr(self, "_partition_detector", None)
+                if _det is None:
+                    _det = PartitionDetector("prime_client")
+                    self._partition_detector = _det
+                _det.record_forward(
+                    self._status != PrimeStatus.UNAVAILABLE,
+                    latency_ms=(time.time() - self._last_health_check) * 1000
+                        if self._last_health_check else 0.0,
+                )
+            except ImportError:
+                pass
             return self._status
 
         except Exception as e:
             logger.debug(f"[PrimeClient] Health check failed: {e}")
             self._status = PrimeStatus.UNAVAILABLE
             self._last_health_check = time.time()
+            # v276.0 Phase 12: Record forward failure
+            try:
+                from backend.core.partition_aware_health import PartitionDetector
+                _det = getattr(self, "_partition_detector", None)
+                if _det is None:
+                    _det = PartitionDetector("prime_client")
+                    self._partition_detector = _det
+                _det.record_forward(False, error=str(e))
+            except ImportError:
+                pass
             return self._status
 
     async def generate(

@@ -437,6 +437,18 @@ class PrimeRouter:
 
         logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
 
+        # v276.0 Phase 12: Partition-aware promotion gate
+        try:
+            from backend.core.partition_aware_health import is_partition_detected as _is_part
+            _partitioned, _part_reason = _is_part()
+            if _partitioned:
+                logger.warning(
+                    "[PrimeRouter] v276.0: Promotion blocked — %s", _part_reason
+                )
+                return False
+        except ImportError:
+            pass
+
         success = await self._prime_client.update_endpoint(host, port)
 
         if success:

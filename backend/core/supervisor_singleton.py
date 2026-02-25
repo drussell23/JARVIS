@@ -299,6 +299,12 @@ class SupervisorHeartbeat:
                 "timestamp": time.time(),
                 "iso_time": datetime.now().isoformat(),
             }
+            # v276.0 Phase 12: Include protocol version for cross-repo compatibility
+            try:
+                _pv = os.environ.get("JARVIS_PROTOCOL_VERSION", "1.0.0")
+                data["protocol_version"] = _pv
+            except Exception:
+                pass
             # Atomic write
             temp_file = SUPERVISOR_HEARTBEAT_FILE.with_suffix(".tmp")
             with open(temp_file, "w") as f:
@@ -377,7 +383,22 @@ class ParentDeathDetector:
             
             supervisor_pid = data.get("supervisor_pid")
             timestamp = data.get("timestamp", 0)
-            
+
+            # v276.0 Phase 12: Advisory version compatibility check
+            try:
+                _remote_pv = data.get("protocol_version")
+                if _remote_pv:
+                    from backend.core.protocol_version_gate import version_check_for_hotswap
+                    _vok, _vreason = version_check_for_hotswap(_remote_pv)
+                    if not _vok:
+                        logger.warning(
+                            "[v276.0] Supervisor version mismatch: %s", _vreason
+                        )
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
             # Check 1: Is heartbeat recent?
             # v276.0 Phase 11: Scale stale threshold by system pressure.
             # During CPU/GC pressure, filesystem writes stall → heartbeat file

@@ -61819,6 +61819,13 @@ class JarvisSystemKernel:
             f"JARVIS_PRIME_URL={prime_url}"
         )
 
+        # v276.0 Phase 12: Update AtomicEndpointState (single source of truth)
+        try:
+            from backend.core.partition_aware_health import AtomicEndpointState as _AES
+            _AES.update(node_ip, port, is_gcp=True, source=source)
+        except ImportError:
+            pass
+
         # v232.0: Notify PrimeRouter singleton of GCP endpoint promotion
         try:
             create_safe_task(
@@ -61962,6 +61969,13 @@ class JarvisSystemKernel:
         os.environ.pop("JARVIS_HOLLOW_CLIENT_ACTIVE", None)
         os.environ.pop("JARVIS_INVINCIBLE_NODE_IP", None)
         os.environ.pop("JARVIS_INVINCIBLE_NODE_PORT", None)
+
+        # v276.0 Phase 12: Reset AtomicEndpointState to local
+        try:
+            from backend.core.partition_aware_health import AtomicEndpointState as _AES
+            _AES.update(None, 8000, is_gcp=False, source=f"cleared:{reason}")
+        except ImportError:
+            pass
         
         # Note: We don't clear JARVIS_PRIME_URL here because local Prime
         # might still be running. The client should check JARVIS_HOLLOW_CLIENT_ACTIVE

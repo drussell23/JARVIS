@@ -7864,6 +7864,19 @@ class GCPVMManager:
                             elif (data.get("model_load_progress_pct", 0) >= 100
                                   and not data.get("model_loading_in_progress", True)):
                                 is_ready = True
+                        # v276.0 Phase 12: Validate health schema + version on GCP VM
+                        if is_ready:
+                            try:
+                                from backend.core.protocol_version_gate import validate_health_before_swap
+                                _vok, _vreason = validate_health_before_swap("prime:/health", data)
+                                if not _vok:
+                                    logger.warning(
+                                        "[GCPVMManager] v276.0: VM health validation warning: %s",
+                                        _vreason,
+                                    )
+                                    # Advisory only — don't block readiness (fail-open)
+                            except ImportError:
+                                pass
                         return is_ready, data
                     return False, {"status": resp.status}
         except asyncio.TimeoutError:
