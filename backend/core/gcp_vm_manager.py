@@ -7007,6 +7007,22 @@ class GCPVMManager:
                         logger.info(
                             f"⏰ VM {vm_name} exceeded max lifetime ({self.config.max_vm_lifetime_hours}h)"
                         )
+                        # v271.0: Log max-lifetime termination decision
+                        try:
+                            from backend.core.decision_log import record_decision, DECISION_VM_TERMINATION
+                            record_decision(
+                                decision_type=DECISION_VM_TERMINATION,
+                                reason=f"Max lifetime exceeded ({self.config.max_vm_lifetime_hours}h)",
+                                inputs={
+                                    "vm_name": vm_name,
+                                    "uptime_hours": round(vm.uptime_hours, 2),
+                                    "max_lifetime_hours": self.config.max_vm_lifetime_hours,
+                                },
+                                outcome="terminated",
+                                component="gcp_vm_manager",
+                            )
+                        except ImportError:
+                            pass
                         await self.terminate_vm(vm_name, reason="Max lifetime exceeded")
                         continue
 
@@ -7037,6 +7053,24 @@ class GCPVMManager:
                             f"efficiency score: {vm.cost_efficiency_score:.1f}% "
                             f"(confidence: {vm.score_confidence:.2f})"
                         )
+                        # v271.0: Log cost-waste termination decision
+                        try:
+                            from backend.core.decision_log import record_decision, DECISION_VM_TERMINATION
+                            record_decision(
+                                decision_type=DECISION_VM_TERMINATION,
+                                reason=f"Cost waste: idle {vm.idle_time_minutes:.1f}m, efficiency {vm.cost_efficiency_score:.1f}%",
+                                inputs={
+                                    "vm_name": vm_name,
+                                    "idle_time_minutes": round(vm.idle_time_minutes, 1),
+                                    "idle_limit_minutes": round(idle_limit, 1),
+                                    "cost_efficiency_score": round(vm.cost_efficiency_score, 1),
+                                    "score_confidence": round(vm.score_confidence, 2),
+                                },
+                                outcome="terminated",
+                                component="gcp_vm_manager",
+                            )
+                        except ImportError:
+                            pass
                         await self.terminate_vm(
                             vm_name,
                             reason=(
@@ -7057,6 +7091,22 @@ class GCPVMManager:
                                 f"📉 Local RAM normalized ({local_mem_percent:.1f}%) - "
                                 f"VM {vm_name} no longer needed"
                             )
+                            # v271.0: Log memory-pressure termination decision
+                            try:
+                                from backend.core.decision_log import record_decision, DECISION_VM_TERMINATION
+                                record_decision(
+                                    decision_type=DECISION_VM_TERMINATION,
+                                    reason=f"Memory pressure resolved (local RAM: {local_mem_percent:.1f}%)",
+                                    inputs={
+                                        "vm_name": vm_name,
+                                        "local_mem_percent": round(local_mem_percent, 1),
+                                        "threshold_percent": 70,
+                                    },
+                                    outcome="terminated",
+                                    component="gcp_vm_manager",
+                                )
+                            except ImportError:
+                                pass
                             await self.terminate_vm(
                                 vm_name,
                                 reason=f"Memory pressure resolved (local RAM: {local_mem_percent:.1f}%)"

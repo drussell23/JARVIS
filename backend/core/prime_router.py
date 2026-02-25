@@ -296,6 +296,11 @@ class PrimeRouter:
         self._gcp_port: Optional[int] = None
         # v242.0: Endpoint-aware circuit breaker (resets on endpoint change)
         self._local_circuit = _EndpointAwareCircuitBreaker()
+        # v271.0: Flapping protection — minimum cooldown between promote/demote transitions
+        self._last_transition_time: float = 0.0
+        self._transition_cooldown_s: float = float(
+            os.environ.get("JARVIS_ROUTING_TRANSITION_COOLDOWN_S", "30.0")
+        )
 
     async def initialize(self) -> None:
         """Initialize the router and its clients."""
@@ -377,6 +382,26 @@ class PrimeRouter:
         return RoutingDecision.LOCAL_PRIME
 
     # -----------------------------------------------------------------
+    # v271.0: Flapping protection
+    # -----------------------------------------------------------------
+
+    def _check_transition_cooldown(self, transition_name: str) -> bool:
+        """
+        v271.0: Returns True if transition is allowed (cooldown elapsed).
+        Returns False if within cooldown window (flapping protection).
+        """
+        now = time.monotonic()
+        elapsed = now - self._last_transition_time
+        if self._last_transition_time > 0 and elapsed < self._transition_cooldown_s:
+            logger.warning(
+                "[PrimeRouter] v271.0: %s blocked by flapping protection "
+                "(%.1fs < %.0fs cooldown)",
+                transition_name, elapsed, self._transition_cooldown_s,
+            )
+            return False
+        return True
+
+    # -----------------------------------------------------------------
     # v232.0: Late-arriving GCP VM promotion
     # -----------------------------------------------------------------
 
@@ -397,6 +422,10 @@ class PrimeRouter:
             logger.warning("[PrimeRouter] Cannot promote GCP endpoint: no prime client")
             return False
 
+        # v271.0: Flapping protection
+        if not self._check_transition_cooldown("promote_gcp_endpoint"):
+            return False
+
         logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
 
         success = await self._prime_client.update_endpoint(host, port)
@@ -405,6 +434,7 @@ class PrimeRouter:
             self._gcp_promoted = True
             self._gcp_host = host
             self._gcp_port = port
+            self._last_transition_time = time.monotonic()
             # v242.0: Reset circuit for health-checked GCP endpoint (skips cold probe)
             self._local_circuit.reset_for_endpoint(
                 endpoint_id=f"gcp:{host}:{port}", health_checked=True
@@ -417,6 +447,18 @@ class PrimeRouter:
                     logger.info("[PrimeRouter] v242.0 Cancelled orphan prime_router task on GCP promotion")
             except Exception:
                 pass  # Never break promotion for cleanup
+            # v271.0: Log promotion decision
+            try:
+                from backend.core.decision_log import record_decision, DECISION_ROUTING_PROMOTE
+                record_decision(
+                    decision_type=DECISION_ROUTING_PROMOTE,
+                    reason=f"GCP VM endpoint promoted: {host}:{port}",
+                    inputs={"host": host, "port": port},
+                    outcome="promoted",
+                    component="prime_router",
+                )
+            except ImportError:
+                pass
             logger.info("[PrimeRouter] v232.0: GCP VM promotion successful, routing updated")
         else:
             self._gcp_promoted = False
@@ -434,15 +476,34 @@ class PrimeRouter:
         if self._prime_client is None:
             return False
 
+        # v271.0: Flapping protection
+        if not self._check_transition_cooldown("demote_gcp_endpoint"):
+            return False
+
+        _prev_host = self._gcp_host
+        _prev_port = self._gcp_port
         success = await self._prime_client.demote_to_fallback()
         if success:
             self._gcp_promoted = False
             self._gcp_host = None
             self._gcp_port = None
+            self._last_transition_time = time.monotonic()
             # v242.0: Reset circuit for local endpoint (cold probe for unverified local)
             self._local_circuit.reset_for_endpoint(
                 endpoint_id="local", health_checked=False
             )
+            # v271.0: Log demotion decision
+            try:
+                from backend.core.decision_log import record_decision, DECISION_ROUTING_DEMOTE
+                record_decision(
+                    decision_type=DECISION_ROUTING_DEMOTE,
+                    reason="GCP VM endpoint demoted back to local",
+                    inputs={"previous_host": _prev_host, "previous_port": _prev_port},
+                    outcome="demoted",
+                    component="prime_router",
+                )
+            except ImportError:
+                pass
             logger.info("[PrimeRouter] v232.0: Demoted from GCP VM to local Prime")
         return success
 

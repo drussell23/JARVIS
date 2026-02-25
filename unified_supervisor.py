@@ -3014,6 +3014,25 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
             _set_startup_env("JARVIS_STARTUP_MEMORY_MODE", ideal, f"boundary:{phase_label}:{direction}", caller="_reevaluate_mode_at_boundary")
             _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", ideal, f"boundary:{phase_label}:{direction}", caller="_reevaluate_mode_at_boundary")
             _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{avail_gb:.2f}", f"boundary:{phase_label}:measured", caller="_reevaluate_mode_at_boundary")
+            # v271.0: Log mode transition decision
+            try:
+                from backend.core.decision_log import record_decision, DECISION_MODE_TRANSITION
+                record_decision(
+                    decision_type=DECISION_MODE_TRANSITION,
+                    reason=f"Memory {direction}: {current} -> {ideal} at {phase_label}",
+                    inputs={
+                        "phase": phase_label,
+                        "previous_mode": current,
+                        "new_mode": ideal,
+                        "available_gb": round(avail_gb, 2),
+                        "predicted_gb": round(_predicted, 2),
+                        "desired_mode": desired,
+                    },
+                    outcome=direction,
+                    component="startup_mode_control",
+                )
+            except ImportError:
+                pass
             try:
                 add_dashboard_log(
                     f"Mode {direction}: {current} → {ideal} "
@@ -64098,6 +64117,21 @@ class JarvisSystemKernel:
             pass  # Module not yet available — non-fatal
         except Exception as _ce:
             self.logger.debug("[Contract] Validation error (non-fatal): %s", _ce)
+
+        # =====================================================================
+        # v271.0: STATE AUTHORITY VALIDATION (non-blocking, advisory only)
+        # =====================================================================
+        try:
+            from backend.core.state_authority import validate_consistency_at_boot
+            _state_warnings = validate_consistency_at_boot(supervisor=self)
+            for _sw in _state_warnings:
+                self.logger.warning("[StateAuthority] %s", _sw)
+            if not _state_warnings:
+                self.logger.debug("[StateAuthority] All state concepts consistent at boot")
+        except ImportError:
+            pass  # Module not yet available — non-fatal
+        except Exception as _se:
+            self.logger.debug("[StateAuthority] Validation error (non-fatal): %s", _se)
 
         # =====================================================================
         # v186.0: ENTERPRISE STARTUP BANNER (with Rich CLI support)
