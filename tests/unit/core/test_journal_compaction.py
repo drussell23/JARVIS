@@ -2,7 +2,6 @@
 """Tests for journal compaction -- archival of old entries."""
 
 import asyncio
-import os
 import sqlite3
 import time
 
