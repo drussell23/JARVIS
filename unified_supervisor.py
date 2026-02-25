@@ -77065,13 +77065,51 @@ class JarvisSystemKernel:
         service_task: "asyncio.Task[Any]" = asyncio.create_task(coro, name=task_name)
 
         try:
-            result = await asyncio.wait_for(
-                asyncio.shield(service_task),
-                timeout=timeout_seconds,
-            )
+            if _BUDGET_AVAILABLE:
+                result = await _budget_wait(
+                    asyncio.shield(service_task),
+                    local_cap=timeout_seconds,
+                    label=f"zone6/{service_key or name}",
+                )
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.shield(service_task),
+                    timeout=timeout_seconds,
+                )
             elapsed = (time.time() - start_time) * 1000
             self.logger.info(f"[Zone6/{name}] Completed in {elapsed:.0f}ms")
             return result
+
+        except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+            elapsed = (time.time() - start_time) * 1000
+            if continue_on_timeout:
+                if service_key:
+                    self._track_enterprise_service_continuation(
+                        service_key=service_key,
+                        display_name=name,
+                        task=service_task,
+                        start_time=start_time,
+                    )
+                else:
+                    if service_task not in self._background_tasks:
+                        self._background_tasks.append(service_task)
+                self.logger.warning(
+                    f"[Zone6/{name}] Budget/cap exceeded after {timeout_seconds}s - "
+                    f"continuing in background"
+                )
+            else:
+                if not service_task.done():
+                    service_task.cancel()
+                    await asyncio.gather(service_task, return_exceptions=True)
+                self.logger.warning(
+                    f"[Zone6/{name}] Budget/cap exceeded after {timeout_seconds}s - cancelled"
+                )
+            return {
+                "error": f"Budget/cap exceeded after {timeout_seconds}s",
+                "timed_out": True,
+                "elapsed_ms": elapsed,
+                "background_continuation": bool(continue_on_timeout),
+            }
 
         except asyncio.TimeoutError:
             elapsed = (time.time() - start_time) * 1000
