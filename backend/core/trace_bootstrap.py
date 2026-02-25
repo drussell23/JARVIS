@@ -115,17 +115,27 @@ def get_envelope_factory() -> Optional["TraceEnvelopeFactory"]:
 
 
 def shutdown() -> None:
-    """Flush and close the traceability subsystem."""
-    if _emitter is not None:
-        try:
-            _emitter.close()
-        except Exception:
-            logger.debug("Error closing lifecycle emitter", exc_info=True)
-    if _recorder is not None:
-        try:
-            _recorder.flush()
-        except Exception:
-            logger.debug("Error flushing span recorder", exc_info=True)
+    """Flush, close, and reset the traceability subsystem.
+
+    After shutdown(), initialize() can be called again to re-create
+    the subsystem (e.g., for hot-restart or test isolation).
+    """
+    global _factory, _emitter, _recorder, _initialized
+    with _lock:
+        if _emitter is not None:
+            try:
+                _emitter.close()
+            except Exception:
+                logger.debug("Error closing lifecycle emitter", exc_info=True)
+        if _recorder is not None:
+            try:
+                _recorder.flush()
+            except Exception:
+                logger.debug("Error flushing span recorder", exc_info=True)
+        _factory = None
+        _emitter = None
+        _recorder = None
+        _initialized = False
 
 
 def _reset() -> None:

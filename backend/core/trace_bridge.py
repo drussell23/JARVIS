@@ -41,6 +41,9 @@ try:
     from backend.core.resilience.correlation_context import (
         CorrelationContext,
         get_current_context,
+        # Private access required: set_current_context() does not return a
+        # Token for later reset.  We need the raw ContextVar to call
+        # .set()/.reset() for proper nesting in unified_trace().
         _current_context,
     )
 

@@ -56,6 +56,21 @@ class TestTraceBootstrap(unittest.TestCase):
             shutdown()
             assert emitter._closed is True
 
+    def test_shutdown_allows_reinitialize(self):
+        from backend.core.trace_bootstrap import (
+            initialize, shutdown, get_lifecycle_emitter,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            initialize(trace_dir=Path(tmp), boot_id="b1", runtime_epoch_id="e1")
+            emitter1 = get_lifecycle_emitter()
+            shutdown()
+            assert get_lifecycle_emitter() is None  # Cleared after shutdown
+            # Re-initialize should work
+            initialize(trace_dir=Path(tmp), boot_id="b2", runtime_epoch_id="e2")
+            emitter2 = get_lifecycle_emitter()
+            assert emitter2 is not None
+            assert emitter2 is not emitter1  # Fresh instance
+
     def test_env_var_driven_config(self):
         from backend.core.trace_bootstrap import initialize, get_envelope_factory
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,10 +82,8 @@ class TestTraceBootstrap(unittest.TestCase):
                 initialize()
                 factory = get_envelope_factory()
                 assert factory is not None
-                # runtime_epoch_id has a public property
                 assert factory.runtime_epoch_id == "env-epoch"
-                # boot_id is stored as _boot_id (private via __slots__)
-                assert factory._boot_id == "env-boot"
+                assert factory.boot_id == "env-boot"
 
 
 if __name__ == "__main__":
