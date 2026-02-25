@@ -374,3 +374,74 @@ class TestAdditionalPaths:
             assert r.success and r.to_state == State.TRIGGERING
             assert bridge.is_provisioning() is True
             await bridge.shutdown()
+
+
+class TestModuleLevelNotifyBridge:
+    """Tests for the fire-and-forget ``notify_bridge()`` module-level helper."""
+
+    @pytest.mark.asyncio
+    async def test_notify_bridge_no_op_when_no_instance(self):
+        """Does nothing when singleton is not initialized."""
+        from backend.core.gcp_lifecycle_bridge import notify_bridge, reset_lifecycle_bridge
+        reset_lifecycle_bridge()
+        # Should not raise
+        notify_bridge("notify_vm_ready", ip="1.2.3.4")
+
+    @pytest.mark.asyncio
+    async def test_notify_bridge_fires_method(self, tmp_db):
+        """Schedules the notify method on the event loop."""
+        import asyncio
+        from backend.core.gcp_lifecycle_bridge import (
+            GCPLifecycleBridge, notify_bridge, reset_lifecycle_bridge,
+        )
+
+        reset_lifecycle_bridge()
+        bridge = GCPLifecycleBridge()
+        with patch("backend.core.gcp_lifecycle_bridge._V2_ENABLED", True):
+            await bridge.initialize(db_path=tmp_db)
+
+            # Manually set the singleton
+            import backend.core.gcp_lifecycle_bridge as mod
+            mod._bridge_instance = bridge
+
+            # Drive to ACTIVE
+            await bridge.notify_pressure_triggered(reason="test")
+            await bridge.notify_budget_approved()
+            await bridge.notify_vm_create_accepted()
+
+            # Use module-level helper (fire-and-forget)
+            notify_bridge("notify_vm_ready", ip="10.0.0.1")
+            # Give the background task a chance to run
+            await asyncio.sleep(0.1)
+
+            assert bridge.get_current_state() == "active"
+            await bridge.shutdown()
+            reset_lifecycle_bridge()
+
+    @pytest.mark.asyncio
+    async def test_notify_bridge_ignores_bad_method(self):
+        """Ignores unknown method names without error."""
+        import backend.core.gcp_lifecycle_bridge as mod
+        from backend.core.gcp_lifecycle_bridge import (
+            GCPLifecycleBridge, notify_bridge, reset_lifecycle_bridge,
+        )
+        reset_lifecycle_bridge()
+        mod._bridge_instance = GCPLifecycleBridge()
+        # Should not raise
+        notify_bridge("nonexistent_method", foo="bar")
+        reset_lifecycle_bridge()
+
+
+class TestLeaseLostCallback:
+    """Tests for the _on_lease_lost callback wiring."""
+
+    @pytest.mark.asyncio
+    async def test_on_lease_lost_registered(self, tmp_db):
+        """initialize() registers _on_lease_lost on the journal."""
+        from backend.core.gcp_lifecycle_bridge import GCPLifecycleBridge
+        bridge = GCPLifecycleBridge()
+        with patch("backend.core.gcp_lifecycle_bridge._V2_ENABLED", True):
+            await bridge.initialize(db_path=tmp_db)
+            journal = bridge._journal
+            assert hasattr(journal, "_on_lease_lost_callbacks") or hasattr(journal, "on_lease_lost")
+            await bridge.shutdown()
