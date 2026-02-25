@@ -14,6 +14,7 @@ import fcntl
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import zlib
@@ -227,6 +228,263 @@ class TraceStreamManager:
     def span_buffer(self) -> SpanBuffer:
         """Access span buffer for inspection."""
         return self._span_buffer
+
+
+# ---------------------------------------------------------------------------
+# TraceIndex -- SQLite-backed trace lookup index
+# ---------------------------------------------------------------------------
+
+
+class TraceIndex:
+    """SQLite-backed trace lookup index. Rebuildable from JSONL files."""
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._db_path))
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._create_tables()
+
+    def _create_tables(self) -> None:
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS trace_events (
+                event_id TEXT PRIMARY KEY,
+                trace_id TEXT NOT NULL,
+                stream TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                byte_offset INTEGER NOT NULL,
+                ts_wall_utc REAL NOT NULL,
+                operation TEXT,
+                status TEXT
+            )
+        """)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trace_id ON trace_events(trace_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ts ON trace_events(ts_wall_utc)"
+        )
+        self._conn.commit()
+
+    def index_event(
+        self,
+        trace_id: str,
+        event_id: str,
+        stream: str,
+        file_path: str,
+        byte_offset: int,
+        ts_wall_utc: float,
+        operation: str,
+        status: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO trace_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                trace_id,
+                stream,
+                str(file_path),
+                byte_offset,
+                ts_wall_utc,
+                operation,
+                status,
+            ),
+        )
+        self._conn.commit()
+
+    def query_by_trace(self, trace_id: str) -> List[Dict[str, Any]]:
+        cursor = self._conn.execute(
+            "SELECT * FROM trace_events WHERE trace_id = ? ORDER BY ts_wall_utc",
+            (trace_id,),
+        )
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def query_by_time(
+        self,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        conditions: List[str] = []
+        params: List[float] = []
+        if since is not None:
+            conditions.append("ts_wall_utc >= ?")
+            params.append(since)
+        if until is not None:
+            conditions.append("ts_wall_utc <= ?")
+            params.append(until)
+        where = " AND ".join(conditions) if conditions else "1=1"
+        cursor = self._conn.execute(
+            f"SELECT * FROM trace_events WHERE {where} ORDER BY ts_wall_utc",
+            params,
+        )
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def rebuild_from_directory(self, dir_path: Path, stream: str) -> int:
+        """Rebuild index from JSONL files in a directory. Returns count of indexed events."""
+        import json as _json
+
+        dir_path = Path(dir_path)
+        count = 0
+        for jsonl_file in sorted(dir_path.glob("*.jsonl")):
+            with open(jsonl_file, "r") as f:
+                offset = 0
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = _json.loads(line)
+                        envelope = record.get("envelope", {})
+                        trace_id = envelope.get("trace_id", "")
+                        event_id = envelope.get("event_id", "")
+                        ts = envelope.get("ts_wall_utc", 0.0)
+                        operation = record.get("event_type", "")
+                        if trace_id and event_id:
+                            self.index_event(
+                                trace_id=trace_id,
+                                event_id=event_id,
+                                stream=stream,
+                                file_path=str(jsonl_file),
+                                byte_offset=offset,
+                                ts_wall_utc=ts,
+                                operation=operation,
+                                status=record.get("status", ""),
+                            )
+                            count += 1
+                    except Exception:
+                        logger.debug(
+                            "Failed to parse JSONL line for indexing",
+                            exc_info=True,
+                        )
+                    offset += len(line) + 1
+        return count
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CausalityIndex -- SQLite-backed causality DAG with cycle detection
+# ---------------------------------------------------------------------------
+
+
+class CausalityIndex:
+    """SQLite-backed causality DAG with cycle detection."""
+
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self._db_path))
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._create_tables()
+
+    def _create_tables(self) -> None:
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS causality_edges (
+                event_id TEXT PRIMARY KEY,
+                caused_by_event_id TEXT,
+                parent_span_id TEXT,
+                trace_id TEXT NOT NULL,
+                operation TEXT,
+                ts_wall_utc REAL
+            )
+        """)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_caused_by ON causality_edges(caused_by_event_id)"
+        )
+        self._conn.commit()
+
+    def add_edge(
+        self,
+        event_id: str,
+        caused_by_event_id: Optional[str],
+        parent_span_id: Optional[str],
+        trace_id: str,
+        operation: str,
+        ts_wall_utc: float,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO causality_edges VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                caused_by_event_id,
+                parent_span_id,
+                trace_id,
+                operation,
+                ts_wall_utc,
+            ),
+        )
+        self._conn.commit()
+
+    def get_children(self, event_id: str) -> List[Dict[str, Any]]:
+        cursor = self._conn.execute(
+            "SELECT * FROM causality_edges WHERE caused_by_event_id = ? ORDER BY ts_wall_utc",
+            (event_id,),
+        )
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def get_parent(self, event_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self._conn.execute(
+            "SELECT caused_by_event_id FROM causality_edges WHERE event_id = ?",
+            (event_id,),
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            return {"caused_by_event_id": row[0]}
+        return None
+
+    def detect_cycles(self) -> List[List[str]]:
+        """DFS-based cycle detection. Returns list of cycles found."""
+        cursor = self._conn.execute(
+            "SELECT event_id, caused_by_event_id FROM causality_edges"
+        )
+        edges: Dict[str, Optional[str]] = {}
+        for row in cursor.fetchall():
+            event_id, caused_by = row
+            edges[event_id] = caused_by
+
+        # Build adjacency: caused_by -> children
+        children_map: Dict[str, List[str]] = {}
+        for event_id, caused_by in edges.items():
+            if caused_by is not None:
+                children_map.setdefault(caused_by, []).append(event_id)
+
+        cycles: List[List[str]] = []
+        visited: set = set()
+        in_stack: set = set()
+
+        def dfs(node: str, path: List[str]) -> None:
+            if node in in_stack:
+                cycle_start = path.index(node)
+                cycles.append(path[cycle_start:])
+                return
+            if node in visited:
+                return
+            visited.add(node)
+            in_stack.add(node)
+            path.append(node)
+            for child in children_map.get(node, []):
+                dfs(child, path)
+            path.pop()
+            in_stack.remove(node)
+
+        # Also check self-references
+        for event_id, caused_by in edges.items():
+            if caused_by == event_id:
+                cycles.append([event_id])
+                visited.add(event_id)
+
+        for node in edges:
+            if node not in visited:
+                dfs(node, [])
+
+        return cycles
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 # ---------------------------------------------------------------------------
