@@ -32,7 +32,9 @@ logger = logging.getLogger("jarvis.gcp_lifecycle_bridge")
 # ── Module-level singleton ────────────────────────────────────────────
 
 _bridge_instance: Optional["GCPLifecycleBridge"] = None
-_bridge_lock = asyncio.Lock()
+# NOTE: asyncio.Lock() cannot be created at module level on Python 3.9
+# because it binds to the running event loop. Lazy-init in get_lifecycle_bridge().
+_bridge_lock: Optional[asyncio.Lock] = None
 
 _V2_ENABLED = GCP_LIFECYCLE_V2_ENABLED
 
@@ -52,11 +54,17 @@ async def get_lifecycle_bridge() -> "GCPLifecycleBridge":
     bridge whose methods are all no-ops (no journal or state machine
     is created).
     """
-    global _bridge_instance
+    global _bridge_instance, _bridge_lock
     if _bridge_instance is not None:
         return _bridge_instance
 
-    async with _bridge_lock:
+    # Lazy-init the lock on first use (Python 3.9 safe — avoids binding
+    # to the wrong event loop at module import time).
+    if _bridge_lock is None:
+        _bridge_lock = asyncio.Lock()
+
+    lock = _bridge_lock
+    async with lock:
         if _bridge_instance is not None:
             return _bridge_instance
         _bridge_instance = GCPLifecycleBridge()
@@ -75,8 +83,9 @@ def get_lifecycle_bridge_sync() -> Optional["GCPLifecycleBridge"]:
 
 def reset_lifecycle_bridge() -> None:
     """Reset the singleton (for testing only)."""
-    global _bridge_instance
+    global _bridge_instance, _bridge_lock
     _bridge_instance = None
+    _bridge_lock = None
 
 
 class GCPLifecycleBridge:
@@ -250,7 +259,12 @@ class GCPLifecycleBridge:
     async def notify_vm_ready(
         self, *, ip: Optional[str] = None, **kwargs,
     ) -> TransitionResult:
-        """VM is healthy and ready to serve traffic."""
+        """VM is healthy and ready to serve traffic.
+
+        Maps to HEALTH_PROBE_OK (not VM_READY) because the transition
+        table uses HEALTH_PROBE_OK as the event that moves BOOTING -> ACTIVE.
+        Event.VM_READY exists in the schema but has no defined transitions.
+        """
         return await self._emit(
             Event.HEALTH_PROBE_OK,
             payload={"ip": ip, **kwargs},

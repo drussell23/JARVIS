@@ -63925,6 +63925,7 @@ class JarvisSystemKernel:
 
         No-op when bridge not initialized or V2 disabled.
         Never raises — all exceptions are silently logged.
+        2s timeout prevents blocking the supervisor if journal write hangs.
         """
         bridge = self._lifecycle_bridge
         if bridge is None:
@@ -63932,7 +63933,9 @@ class JarvisSystemKernel:
         try:
             method = getattr(bridge, method_name, None)
             if method is not None:
-                await method(**kwargs)
+                await asyncio.wait_for(method(**kwargs), timeout=2.0)
+        except asyncio.TimeoutError:
+            self.logger.debug(f"[Lifecycle] Bridge {method_name} timed out (2s)")
         except Exception as _bridge_err:
             self.logger.debug(f"[Lifecycle] Bridge {method_name} error: {_bridge_err}")
 
