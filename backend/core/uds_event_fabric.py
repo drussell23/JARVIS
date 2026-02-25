@@ -255,6 +255,26 @@ class EventFabric:
         for sub_id in dead_subs:
             self._remove_subscriber(sub_id)
 
+    async def publish_outbox_once(self) -> int:
+        """Publish all unpublished outbox entries via emit().
+
+        Returns the number of entries published.
+        """
+        entries = self._journal.get_unpublished_outbox()
+        published = 0
+
+        for entry in entries:
+            await self.emit(
+                entry["seq"],
+                entry["event_type"],
+                entry["target"],
+                entry.get("payload") or {},
+            )
+            self._journal.mark_outbox_published(entry["seq"])
+            published += 1
+
+        return published
+
     # ── Connection handling ──────────────────────────────────────────
 
     async def _handle_client(

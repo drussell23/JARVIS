@@ -646,6 +646,56 @@ class OrchestrationJournal:
 
         return daily_budget - committed_total - reserved_total
 
+    # ── Outbox ───────────────────────────────────────────────────────
+
+    def write_outbox(
+        self,
+        seq: int,
+        event_type: str,
+        target: str,
+        *,
+        payload: Optional[dict] = None,
+    ) -> None:
+        """Write an event to the outbox (same transaction as journal entry).
+
+        The outbox entry references the journal seq via FK.
+        Events remain unpublished until the outbox publisher picks them up.
+        """
+        with self._write_lock:
+            self._conn.execute(
+                "INSERT INTO event_outbox (seq, event_type, target, payload, published) "
+                "VALUES (?, ?, ?, ?, 0)",
+                (seq, event_type, target,
+                 json.dumps(payload) if payload else None),
+            )
+            self._conn.commit()
+
+    def get_unpublished_outbox(self) -> list:
+        """Read unpublished outbox entries, ordered by seq."""
+        rows = self._conn.execute(
+            "SELECT seq, event_type, target, payload "
+            "FROM event_outbox WHERE published = 0 ORDER BY seq ASC"
+        ).fetchall()
+        return [
+            {
+                "seq": r[0],
+                "event_type": r[1],
+                "target": r[2],
+                "payload": json.loads(r[3]) if r[3] else None,
+            }
+            for r in rows
+        ]
+
+    def mark_outbox_published(self, seq: int) -> None:
+        """Mark an outbox entry as published."""
+        import time as _time
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE event_outbox SET published = 1, published_at = ? WHERE seq = ?",
+                (_time.time(), seq),
+            )
+            self._conn.commit()
+
     # ── Compaction ───────────────────────────────────────────────────
 
     def compact(self) -> "CompactionResult":
