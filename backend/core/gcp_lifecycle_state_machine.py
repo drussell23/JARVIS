@@ -74,6 +74,24 @@ class GCPLifecycleStateMachine:
         self._target = target
         self._state = initial_state
 
+        # Register in component_state table with a sentinel journal entry.
+        # Uses "gcp_lifecycle_init" action (not "gcp_lifecycle") so recovery
+        # replay does not confuse this with a real state transition.
+        init_seq = self._journal.fenced_write(
+            "gcp_lifecycle_init",
+            self._target,
+            payload={
+                "initial_state": initial_state.value,
+                "timestamp": time.time(),
+            },
+        )
+        self._journal.update_component_state(
+            self._target,
+            initial_state.value,
+            seq=init_seq,
+            instance_id=target,
+        )
+
     @property
     def state(self) -> State:
         return self._state
@@ -147,6 +165,25 @@ class GCPLifecycleStateMachine:
         # Update in-memory state AFTER journal commit
         self._state = to_state
 
+        # Update component_state projection
+        component_kwargs: Dict[str, Any] = {}
+        if to_state == State.BOOTING:
+            component_kwargs["start_timestamp"] = time.time()
+        if event == Event.HEALTH_PROBE_OK:
+            component_kwargs["consecutive_failures"] = 0
+            component_kwargs["last_probe_category"] = "healthy"
+        elif event == Event.HEALTH_UNREACHABLE_CONSECUTIVE:
+            component_kwargs["last_probe_category"] = "unreachable"
+        elif event == Event.HEALTH_DEGRADED_CONSECUTIVE:
+            component_kwargs["last_probe_category"] = "degraded"
+
+        self._journal.update_component_state(
+            self._target,
+            to_state.value,
+            seq=seq,
+            **component_kwargs,
+        )
+
         return TransitionResult(
             success=True,
             from_state=from_state,
@@ -180,6 +217,12 @@ class GCPLifecycleStateMachine:
                 try:
                     recovered_state = validate_state(entry_payload["to_state"])
                     self._state = recovered_state
+                    # Update component_state to reflect recovered state
+                    self._journal.update_component_state(
+                        self._target,
+                        recovered_state.value,
+                        seq=entry["seq"],
+                    )
                     logger.info(
                         "[GCPLifecycle] Recovered %s to state=%s from seq=%d",
                         self._target, recovered_state.value, entry["seq"],

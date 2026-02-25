@@ -885,7 +885,8 @@ class OrchestrationJournal:
 
             for key in ("pid", "endpoint", "api_version", "capabilities",
                         "last_heartbeat", "heartbeat_ttl", "drain_deadline",
-                        "instance_id"):
+                        "instance_id",
+                        "start_timestamp", "consecutive_failures", "last_probe_category"):
                 if key in kwargs:
                     fields.append(key)
                     val = kwargs[key]
@@ -910,7 +911,8 @@ class OrchestrationJournal:
         row = self._conn.execute(
             "SELECT component, status, epoch, last_seq, pid, endpoint, "
             "api_version, capabilities, last_heartbeat, heartbeat_ttl, "
-            "drain_deadline, instance_id "
+            "drain_deadline, instance_id, "
+            "start_timestamp, consecutive_failures, last_probe_category "
             "FROM component_state WHERE component=?",
             (component,),
         ).fetchone()
@@ -920,6 +922,7 @@ class OrchestrationJournal:
             "component", "status", "epoch", "last_seq", "pid", "endpoint",
             "api_version", "capabilities", "last_heartbeat", "heartbeat_ttl",
             "drain_deadline", "instance_id",
+            "start_timestamp", "consecutive_failures", "last_probe_category",
         ]
         return dict(zip(cols, row))
 
@@ -928,13 +931,15 @@ class OrchestrationJournal:
         rows = self._conn.execute(
             "SELECT component, status, epoch, last_seq, pid, endpoint, "
             "api_version, capabilities, last_heartbeat, heartbeat_ttl, "
-            "drain_deadline, instance_id "
+            "drain_deadline, instance_id, "
+            "start_timestamp, consecutive_failures, last_probe_category "
             "FROM component_state"
         ).fetchall()
         cols = [
             "component", "status", "epoch", "last_seq", "pid", "endpoint",
             "api_version", "capabilities", "last_heartbeat", "heartbeat_ttl",
             "drain_deadline", "instance_id",
+            "start_timestamp", "consecutive_failures", "last_probe_category",
         ]
         return {r[0]: dict(zip(cols, r)) for r in rows}
 
