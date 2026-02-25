@@ -2691,17 +2691,46 @@ class GCPVMManager:
             reason: Why cloud offloading was activated (e.g., "High CPU", "Low memory")
         """
         import time
+        was_active = self._cloud_offload_active
+        prior_reason = self._cloud_offload_reason
+
         self._cloud_offload_active = True
         self._cloud_offload_reason = reason
         self._cloud_offload_triggered_at = time.time()
-        logger.info(f"☁️ [GCPVMManager] Cloud offloading marked ACTIVE: {reason}")
 
-    def mark_cloud_offload_inactive(self) -> None:
-        """Mark cloud offloading as inactive."""
+        if not was_active:
+            logger.info(f"☁️ [GCPVMManager] Cloud offloading marked ACTIVE: {reason}")
+        elif reason != prior_reason:
+            logger.info(
+                f"☁️ [GCPVMManager] Cloud offloading reason updated: "
+                f"{prior_reason or 'none'} -> {reason}"
+            )
+        else:
+            logger.debug("☁️ [GCPVMManager] Cloud offloading already ACTIVE")
+
+    def mark_cloud_offload_inactive(self, cause: Optional[str] = None) -> None:
+        """
+        Mark cloud offloading as inactive.
+
+        Args:
+            cause: Optional cause for transition to inactive
+        """
+        was_active = self._cloud_offload_active
         self._cloud_offload_active = False
         self._cloud_offload_reason = ""
         self._cloud_offload_triggered_at = None
-        logger.info("☁️ [GCPVMManager] Cloud offloading marked INACTIVE")
+        if was_active:
+            if cause:
+                logger.info(
+                    f"☁️ [GCPVMManager] Cloud offloading marked INACTIVE "
+                    f"(cause={cause})"
+                )
+            else:
+                logger.info("☁️ [GCPVMManager] Cloud offloading marked INACTIVE")
+        else:
+            logger.debug(
+                "☁️ [GCPVMManager] Cloud offloading already INACTIVE"
+            )
 
     # =========================================================================
     # Activity recording for efficiency tracking
@@ -10029,4 +10058,3 @@ def record_vm_activity(ip_address: str = "", vm_name: str = "") -> bool:
     except Exception:
         pass
     return False
-

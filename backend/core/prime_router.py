@@ -422,6 +422,22 @@ class PrimeRouter:
             logger.warning("[PrimeRouter] Cannot promote GCP endpoint: no prime client")
             return False
 
+        # v273.0: Idempotent steady-state promotion should bypass cooldown checks.
+        # When the router is already promoted to this endpoint, return success
+        # instead of treating repeated notifications as flapping.
+        if (
+            self._gcp_promoted
+            and self._gcp_host == host
+            and self._gcp_port == port
+        ):
+            logger.info(
+                "[PrimeRouter] v273.0: GCP endpoint already active (%s:%s) — "
+                "promotion treated as successful",
+                host,
+                port,
+            )
+            return True
+
         # v271.0: Flapping protection
         if not self._check_transition_cooldown("promote_gcp_endpoint"):
             return False

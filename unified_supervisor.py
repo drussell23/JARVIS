@@ -62038,24 +62038,162 @@ class JarvisSystemKernel:
         except Exception as e:
             self.logger.debug(f"[InvincibleNode] Trinity event sync failed: {e}")
 
-    async def _notify_prime_router_of_gcp(self, host: str, port: int) -> None:
+    async def _confirm_prime_router_gcp_promotion(
+        self,
+        host: str,
+        port: int,
+        *,
+        source: str = "startup",
+        max_attempts: Optional[int] = None,
+        max_wait_s: Optional[float] = None,
+    ) -> bool:
+        """
+        Deterministically confirm PrimeRouter promotion to a specific GCP endpoint.
+
+        Uses bounded retries with backoff/jitter and deduplicates concurrent
+        callers so multiple startup paths do not race each other.
+        """
+        endpoint = (str(host), int(port))
+        inflight_task = getattr(self, "_prime_router_gcp_promotion_task", None)
+        inflight_endpoint = getattr(self, "_prime_router_gcp_promotion_endpoint", None)
+        if (
+            inflight_task is not None
+            and not inflight_task.done()
+            and inflight_endpoint == endpoint
+        ):
+            try:
+                return bool(await asyncio.shield(inflight_task))
+            except Exception:
+                return False
+
+        async def _attempt_promotion() -> bool:
+            try:
+                from backend.core.prime_router import notify_gcp_vm_ready
+            except ImportError:
+                self.logger.debug("[InvincibleNode] PrimeRouter not available in this process")
+                return False
+
+            attempts_limit = max(
+                1,
+                int(
+                    max_attempts
+                    if max_attempts is not None
+                    else os.environ.get("JARVIS_GCP_PROMOTION_MAX_ATTEMPTS", "6")
+                ),
+            )
+            wait_limit = max(
+                0.0,
+                float(
+                    max_wait_s
+                    if max_wait_s is not None
+                    else os.environ.get("JARVIS_GCP_PROMOTION_MAX_WAIT_S", "35.0")
+                ),
+            )
+            backoff_s = max(
+                0.1,
+                float(os.environ.get("JARVIS_GCP_PROMOTION_BACKOFF_INITIAL_S", "0.75")),
+            )
+            max_backoff_s = max(
+                backoff_s,
+                float(os.environ.get("JARVIS_GCP_PROMOTION_BACKOFF_MAX_S", "5.0")),
+            )
+            log_suppress_s = max(
+                1.0,
+                float(os.environ.get("JARVIS_GCP_PROMOTION_FAIL_LOG_SUPPRESS_S", "30.0")),
+            )
+
+            start = time.monotonic()
+            attempt = 0
+            while attempt < attempts_limit:
+                attempt += 1
+                try:
+                    if await notify_gcp_vm_ready(host, port):
+                        self._prime_router_gcp_last_failed_endpoint = None
+                        self._prime_router_gcp_last_failed_at = 0.0
+                        if attempt > 1:
+                            self.logger.info(
+                                "[InvincibleNode] PrimeRouter promotion confirmed for %s:%s "
+                                "(source=%s, attempts=%d)",
+                                host,
+                                port,
+                                source,
+                                attempt,
+                            )
+                        return True
+                except Exception as exc:
+                    self.logger.debug(
+                        "[InvincibleNode] PrimeRouter promotion attempt error (%s:%s, source=%s, attempt=%d): %s",
+                        host,
+                        port,
+                        source,
+                        attempt,
+                        exc,
+                    )
+
+                elapsed = time.monotonic() - start
+                if attempt >= attempts_limit or elapsed >= wait_limit:
+                    break
+
+                remaining = max(0.0, wait_limit - elapsed)
+                sleep_s = min(backoff_s, remaining)
+                jitter_s = 0.0
+                if sleep_s > 0:
+                    jitter_s = random.uniform(0.0, min(0.25, sleep_s * 0.2))
+                await asyncio.sleep(sleep_s + jitter_s)
+                backoff_s = min(backoff_s * 2.0, max_backoff_s)
+
+            now = time.monotonic()
+            failed_endpoint = f"{host}:{port}"
+            last_failed_endpoint = getattr(self, "_prime_router_gcp_last_failed_endpoint", None)
+            last_failed_at = float(getattr(self, "_prime_router_gcp_last_failed_at", 0.0) or 0.0)
+            if (
+                last_failed_endpoint != failed_endpoint
+                or (now - last_failed_at) >= log_suppress_s
+            ):
+                self.logger.warning(
+                    "[InvincibleNode] PrimeRouter GCP promotion not confirmed "
+                    "(endpoint=%s, source=%s, attempts=%d, wait_limit=%.1fs)",
+                    failed_endpoint,
+                    source,
+                    attempt,
+                    wait_limit,
+                )
+                self._prime_router_gcp_last_failed_endpoint = failed_endpoint
+                self._prime_router_gcp_last_failed_at = now
+            else:
+                self.logger.debug(
+                    "[InvincibleNode] PrimeRouter promotion still pending "
+                    "(endpoint=%s, source=%s)",
+                    failed_endpoint,
+                    source,
+                )
+            return False
+
+        promotion_task = create_safe_task(
+            _attempt_promotion(),
+            name=f"prime-router-gcp-promotion-{endpoint[0]}-{endpoint[1]}",
+        )
+        self._prime_router_gcp_promotion_task = promotion_task
+        self._prime_router_gcp_promotion_endpoint = endpoint
+
+        try:
+            return bool(await asyncio.shield(promotion_task))
+        finally:
+            if getattr(self, "_prime_router_gcp_promotion_task", None) is promotion_task:
+                self._prime_router_gcp_promotion_task = None
+                self._prime_router_gcp_promotion_endpoint = None
+
+    async def _notify_prime_router_of_gcp(self, host: str, port: int) -> bool:
         """v232.0: Notify PrimeRouter that GCP VM is ready for routing."""
         try:
-            from backend.core.prime_router import notify_gcp_vm_ready
-            success = await notify_gcp_vm_ready(host, port)
-            if success:
-                self.logger.info(
-                    f"[InvincibleNode] v232.0: PrimeRouter notified of GCP promotion: {host}:{port}"
-                )
-            else:
-                self.logger.warning(
-                    f"[InvincibleNode] v232.0: PrimeRouter GCP promotion failed "
-                    f"(endpoint may be unhealthy)"
-                )
-        except ImportError:
-            self.logger.debug("[InvincibleNode] PrimeRouter not available in this process")
+            return await self._confirm_prime_router_gcp_promotion(
+                host,
+                port,
+                source="invincible_node_notify",
+            )
         except Exception as e:
             self.logger.warning(f"[InvincibleNode] PrimeRouter notification failed: {e}")
+            return False
 
     async def _notify_prime_router_demote(self) -> None:
         """v232.0: Notify PrimeRouter to demote from GCP back to local."""
@@ -69214,24 +69352,42 @@ class JarvisSystemKernel:
                         # v219.0: ROOT CAUSE FIX - Propagate URL so all Prime clients
                         # know where to send requests (hollow client actually works now)
                         self._propagate_invincible_node_url(node_ip, source="quick_check")
-                        
-                        # v229.0: CLOUD TAKEOVER — terminate redundant local Early Prime
-                        _early_prime_pid_str = os.environ.get("JARVIS_EARLY_PRIME_PID")
-                        if _early_prime_pid_str:
-                            try:
-                                _early_pid = int(_early_prime_pid_str)
-                                import signal
-                                os.kill(_early_pid, signal.SIGTERM)
-                                self.logger.info(
-                                    f"[InvincibleNode] v229.0 ☁️ Terminated local Early Prime (PID: {_early_pid}) "
-                                    f"— cloud VM ready via quick check"
+                        _promotion_confirmed = await self._confirm_prime_router_gcp_promotion(
+                            node_ip,
+                            self.config.invincible_node_port,
+                            source="quick_check",
+                            max_wait_s=float(
+                                os.environ.get(
+                                    "JARVIS_GCP_PROMOTION_CONFIRM_QUICK_WAIT_S",
+                                    "12.0",
                                 )
-                                if "JARVIS_EARLY_PRIME_PID" in os.environ:
-                                    del os.environ["JARVIS_EARLY_PRIME_PID"]
-                                if "JARVIS_EARLY_PRIME_PORT" in os.environ:
-                                    del os.environ["JARVIS_EARLY_PRIME_PORT"]
-                            except (ValueError, ProcessLookupError, OSError):
-                                pass
+                            ),
+                        )
+
+                        # v229.0: CLOUD TAKEOVER — terminate redundant local Early Prime
+                        # only after PrimeRouter promotion is confirmed.
+                        if _promotion_confirmed:
+                            _early_prime_pid_str = os.environ.get("JARVIS_EARLY_PRIME_PID")
+                            if _early_prime_pid_str:
+                                try:
+                                    _early_pid = int(_early_prime_pid_str)
+                                    import signal
+                                    os.kill(_early_pid, signal.SIGTERM)
+                                    self.logger.info(
+                                        f"[InvincibleNode] v229.0 ☁️ Terminated local Early Prime (PID: {_early_pid}) "
+                                        f"— cloud VM ready via quick check"
+                                    )
+                                    if "JARVIS_EARLY_PRIME_PID" in os.environ:
+                                        del os.environ["JARVIS_EARLY_PRIME_PID"]
+                                    if "JARVIS_EARLY_PRIME_PORT" in os.environ:
+                                        del os.environ["JARVIS_EARLY_PRIME_PORT"]
+                                except (ValueError, ProcessLookupError, OSError):
+                                    pass
+                        else:
+                            self.logger.warning(
+                                "[InvincibleNode] Quick check GCP VM ready but promotion is "
+                                "not confirmed yet; keeping local Early Prime alive"
+                            )
                         
                         # v229.0: Update Prime dashboard to cloud-ready
                         try:
@@ -69417,33 +69573,49 @@ class JarvisSystemKernel:
                                     progress=100,
                                     status="healthy"
                                 )
-                                
+
                                 # v219.0: ROOT CAUSE FIX - Propagate URL when background monitor succeeds
                                 # This allows late-ready node to still be used by all Prime clients
                                 self._propagate_invincible_node_url(node_ip, source="background_monitor")
-                                
+                                _promotion_confirmed = await self._confirm_prime_router_gcp_promotion(
+                                    node_ip,
+                                    self.config.invincible_node_port,
+                                    source="background_monitor",
+                                    max_wait_s=float(
+                                        os.environ.get(
+                                            "JARVIS_GCP_PROMOTION_CONFIRM_BACKGROUND_WAIT_S",
+                                            "20.0",
+                                        )
+                                    ),
+                                )
+
                                 # v229.0: CLOUD TAKEOVER - Stop local Early Prime if still running
-                                # When GCP VM becomes ready, local LLM loading is redundant.
-                                # Kill the local process to free RAM and avoid confusion.
-                                _early_prime_pid_str = os.environ.get("JARVIS_EARLY_PRIME_PID")
-                                if _early_prime_pid_str:
-                                    try:
-                                        _early_pid = int(_early_prime_pid_str)
-                                        import signal
-                                        os.kill(_early_pid, signal.SIGTERM)
-                                        self.logger.info(
-                                            f"[InvincibleNode] v229.0 ☁️ Terminated local Early Prime (PID: {_early_pid}) "
-                                            f"— cloud VM is ready, local LLM loading no longer needed"
-                                        )
-                                        # Clear env vars so Trinity doesn't adopt the dead process
-                                        if "JARVIS_EARLY_PRIME_PID" in os.environ:
-                                            del os.environ["JARVIS_EARLY_PRIME_PID"]
-                                        if "JARVIS_EARLY_PRIME_PORT" in os.environ:
-                                            del os.environ["JARVIS_EARLY_PRIME_PORT"]
-                                    except (ValueError, ProcessLookupError, OSError) as kill_err:
-                                        self.logger.debug(
-                                            f"[InvincibleNode] Early Prime already stopped: {kill_err}"
-                                        )
+                                # only after PrimeRouter promotion is confirmed.
+                                if _promotion_confirmed:
+                                    _early_prime_pid_str = os.environ.get("JARVIS_EARLY_PRIME_PID")
+                                    if _early_prime_pid_str:
+                                        try:
+                                            _early_pid = int(_early_prime_pid_str)
+                                            import signal
+                                            os.kill(_early_pid, signal.SIGTERM)
+                                            self.logger.info(
+                                                f"[InvincibleNode] v229.0 ☁️ Terminated local Early Prime (PID: {_early_pid}) "
+                                                f"— cloud VM is ready, local LLM loading no longer needed"
+                                            )
+                                            # Clear env vars so Trinity doesn't adopt the dead process
+                                            if "JARVIS_EARLY_PRIME_PID" in os.environ:
+                                                del os.environ["JARVIS_EARLY_PRIME_PID"]
+                                            if "JARVIS_EARLY_PRIME_PORT" in os.environ:
+                                                del os.environ["JARVIS_EARLY_PRIME_PORT"]
+                                        except (ValueError, ProcessLookupError, OSError) as kill_err:
+                                            self.logger.debug(
+                                                f"[InvincibleNode] Early Prime already stopped: {kill_err}"
+                                            )
+                                else:
+                                    self.logger.warning(
+                                        "[InvincibleNode] Background GCP VM ready but promotion "
+                                        "is not confirmed yet; keeping local Early Prime alive"
+                                    )
                                 
                                 # v229.0: Update Prime component status to reflect cloud readiness
                                 try:
@@ -74639,72 +74811,96 @@ class JarvisSystemKernel:
                 # turns a 660s timeout into a ~300s success.
                 # =============================================================
                 _vm_just_became_ready = False
-                if not getattr(self, '_gcp_late_arrival_handled', False):
-                    _inv_ready = getattr(self, '_invincible_node_ready', False)
-                    _inv_ip = getattr(self, '_invincible_node_ip', None)
+                if not getattr(self, "_gcp_late_arrival_handled", False):
+                    _inv_ready = getattr(self, "_invincible_node_ready", False)
+                    _inv_ip = getattr(self, "_invincible_node_ip", None)
                     if _inv_ready and _inv_ip:
-                        self.logger.info(
-                            f"[{integrator_name}] v265.2: GCP VM LATE ARRIVAL detected! "
-                            f"VM ready at {_inv_ip} — activating Hollow Client routing "
-                            f"(local Prime still loading after golden image wait expired)"
+                        _promotion_confirmed = await self._confirm_prime_router_gcp_promotion(
+                            _inv_ip,
+                            self.config.invincible_node_port,
+                            source="late_arrival_v265.2",
+                            max_wait_s=float(
+                                os.environ.get(
+                                    "JARVIS_GCP_PROMOTION_CONFIRM_LATE_WAIT_S",
+                                    "8.0",
+                                )
+                            ),
                         )
-                        self._gcp_late_arrival_handled = True
-                        _vm_just_became_ready = True
-
-                        # Set up Hollow Client routing
-                        _gcp_url = f"http://{_inv_ip}:8001"
-                        os.environ["GCP_PRIME_ENDPOINT"] = _gcp_url
-                        os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
-
-                        # Propagate to PrimeClient + PrimeRouter for hot-swap
-                        try:
-                            self._propagate_invincible_node_url(
-                                _inv_ip, source="late_arrival_v265.2"
+                        if not _promotion_confirmed:
+                            _now = time.monotonic()
+                            _last_log = float(
+                                getattr(self, "_gcp_late_arrival_promotion_pending_log_ts", 0.0) or 0.0
                             )
-                        except Exception as _prop_err:
-                            self.logger.debug(
-                                f"[{integrator_name}] URL propagation error: {_prop_err}"
+                            if (_now - _last_log) >= 20.0:
+                                self.logger.warning(
+                                    f"[{integrator_name}] v273.0: GCP VM late arrival detected "
+                                    f"({_inv_ip}) but PrimeRouter promotion is not confirmed yet; "
+                                    f"keeping local Prime active"
+                                )
+                                self._gcp_late_arrival_promotion_pending_log_ts = _now
+                        else:
+                            self.logger.info(
+                                f"[{integrator_name}] v265.2: GCP VM LATE ARRIVAL confirmed at {_inv_ip} "
+                                f"— activating Hollow Client routing"
                             )
+                            self._gcp_late_arrival_handled = True
+                            _vm_just_became_ready = True
 
-                        # Mark Prime as effectively "done" via Hollow Client.
-                        # The startup task continues (Reactor-Core may still be
-                        # starting) but inference is now routed to GCP.
-                        try:
-                            if hasattr(self, '_trinity') and self._trinity:
-                                _jprime = getattr(self._trinity, '_jprime', None)
-                                if _jprime and getattr(_jprime, 'state', '') == 'starting':
-                                    _jprime.state = 'hollow_client'
-                                    self.logger.info(
-                                        f"[{integrator_name}] Local Prime demoted to "
-                                        f"hollow_client — GCP routing active"
-                                    )
-                                    # Kill local Prime process (it's wasting resources)
-                                    _prime_proc = getattr(_jprime, 'process', None)
-                                    if _prime_proc and _prime_proc.returncode is None:
-                                        try:
-                                            _prime_proc.terminate()
-                                            self.logger.info(
-                                                f"[{integrator_name}] Terminated local Prime "
-                                                f"process (PID {_prime_proc.pid}) — GCP VM "
-                                                f"will handle inference"
-                                            )
-                                        except Exception:
-                                            pass
-                        except Exception as _kill_err:
-                            self.logger.debug(
-                                f"[{integrator_name}] Local Prime cleanup: {_kill_err}"
-                            )
+                            # Set up Hollow Client routing.
+                            _gcp_url = f"http://{_inv_ip}:{self.config.invincible_node_port}"
+                            os.environ["GCP_PRIME_ENDPOINT"] = _gcp_url
+                            os.environ["JARVIS_GCP_OFFLOAD_ACTIVE"] = "true"
 
-                        # Update dashboard
-                        try:
-                            _dashboard = get_live_dashboard()
-                            _dashboard.update_component(
-                                "jarvis-prime",
-                                status="healthy",
-                                detail=f"Hollow Client → GCP {_inv_ip} (late arrival)",
-                            )
-                        except Exception:
-                            pass
+                            # Propagate to PrimeClient + PrimeRouter for hot-swap.
+                            try:
+                                self._propagate_invincible_node_url(
+                                    _inv_ip, source="late_arrival_v265.2"
+                                )
+                            except Exception as _prop_err:
+                                self.logger.debug(
+                                    f"[{integrator_name}] URL propagation error: {_prop_err}"
+                                )
+
+                            # Mark Prime as effectively "done" via Hollow Client.
+                            # The startup task continues (Reactor-Core may still be
+                            # starting) but inference is now routed to GCP.
+                            try:
+                                if hasattr(self, "_trinity") and self._trinity:
+                                    _jprime = getattr(self._trinity, "_jprime", None)
+                                    if _jprime and getattr(_jprime, "state", "") == "starting":
+                                        _jprime.state = "hollow_client"
+                                        self.logger.info(
+                                            f"[{integrator_name}] Local Prime demoted to "
+                                            f"hollow_client — GCP routing active"
+                                        )
+                                        # Kill local Prime process (it's wasting resources)
+                                        # only after routing is confirmed.
+                                        _prime_proc = getattr(_jprime, "process", None)
+                                        if _prime_proc and _prime_proc.returncode is None:
+                                            try:
+                                                _prime_proc.terminate()
+                                                self.logger.info(
+                                                    f"[{integrator_name}] Terminated local Prime "
+                                                    f"process (PID {_prime_proc.pid}) — GCP VM "
+                                                    f"confirmed for inference"
+                                                )
+                                            except Exception:
+                                                pass
+                            except Exception as _kill_err:
+                                self.logger.debug(
+                                    f"[{integrator_name}] Local Prime cleanup: {_kill_err}"
+                                )
+
+                            # Update dashboard
+                            try:
+                                _dashboard = get_live_dashboard()
+                                _dashboard.update_component(
+                                    "jarvis-prime",
+                                    status="healthy",
+                                    detail=f"Hollow Client → GCP {_inv_ip} (late arrival)",
+                                )
+                            except Exception:
+                                pass
 
                 # Check model loading progress
                 # v223.0: Dashboard fallback — ensure progress is observable even

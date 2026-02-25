@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import psutil
+import random
 import time
 from typing import Dict, List, Optional, Any, Callable, Set, Tuple
 from dataclasses import dataclass, field
@@ -1245,6 +1246,58 @@ class DynamicComponentManager:
             'preload_wasted': 0      # Preloaded but never used
         }
 
+        # v279.0: Cloud offload control-plane policy (single owner + hysteresis)
+        _co_retry_base = max(
+            5.0, float(os.getenv("JARVIS_CLOUD_OFFLOAD_RETRY_BASE", "20.0"))
+        )
+        _co_retry_max = max(
+            _co_retry_base,
+            float(os.getenv("JARVIS_CLOUD_OFFLOAD_RETRY_MAX", "300.0")),
+        )
+        _co_retry_budget = max(
+            0, int(os.getenv("JARVIS_CLOUD_OFFLOAD_RETRY_BUDGET", "10"))
+        )
+        self._cloud_offload_lock = asyncio.Lock()
+        self._cloud_offload_task: Optional[asyncio.Task] = None
+        self._cloud_offload_policy: Dict[str, Any] = {
+            "state": "inactive",  # inactive | provisioning | active | cooldown | blocked
+            "current_reason": "",
+            "last_error": None,
+            "last_failure_category": None,
+            "consecutive_failures": 0,
+            "consecutive_successes": 0,
+            "retry_budget_default": _co_retry_budget,
+            "retry_budget_remaining": _co_retry_budget,
+            "retry_base_delay_s": _co_retry_base,
+            "retry_max_delay_s": _co_retry_max,
+            "retry_jitter_ratio": min(
+                0.5,
+                max(
+                    0.0,
+                    float(os.getenv("JARVIS_CLOUD_OFFLOAD_RETRY_JITTER", "0.20")),
+                ),
+            ),
+            "next_retry_delay_s": _co_retry_base,
+            "cooldown_until": 0.0,
+            "persistent_failure_cooldown_s": max(
+                _co_retry_base,
+                float(os.getenv("JARVIS_CLOUD_OFFLOAD_PERSISTENT_COOLDOWN", "900.0")),
+            ),
+            "budget_refill_after_s": max(
+                _co_retry_base,
+                float(os.getenv("JARVIS_CLOUD_OFFLOAD_BUDGET_REFILL_AFTER", "900.0")),
+            ),
+            "last_attempt_ts": 0.0,
+            "last_success_ts": 0.0,
+            "suppressed_attempts": 0,
+            "metrics": {
+                "attempts": 0,
+                "failures": 0,
+                "recoveries": 0,
+                "blocked_attempts": 0,
+            },
+        }
+
         # Load configuration
         if config_path and os.path.exists(config_path):
             self._load_config(config_path)
@@ -1934,6 +1987,235 @@ class DynamicComponentManager:
         if pressure in cloud_trigger_pressure:
             await self._trigger_cloud_offloading(pressure)
 
+    def _set_cloud_offload_routing_env(
+        self,
+        *,
+        active: bool,
+        reason: str = "",
+        cloud_ip: Optional[str] = None,
+    ) -> None:
+        """Set cloud routing environment based on deterministic offload state."""
+        if active:
+            os.environ["JARVIS_PREFER_CLOUD_RUN"] = "true"
+            os.environ["JARVIS_USE_CLOUD_ML"] = "true"
+            if reason:
+                os.environ["JARVIS_CLOUD_OFFLOAD_REASON"] = reason
+            if cloud_ip:
+                os.environ["JARVIS_CLOUD_OFFLOAD_IP"] = cloud_ip
+        else:
+            os.environ["JARVIS_PREFER_CLOUD_RUN"] = "false"
+            os.environ["JARVIS_USE_CLOUD_ML"] = "false"
+            os.environ.pop("JARVIS_CLOUD_OFFLOAD_REASON", None)
+            os.environ.pop("JARVIS_CLOUD_OFFLOAD_IP", None)
+
+    def _classify_cloud_offload_failure(self, error_detail: str) -> str:
+        """
+        Classify cloud-offload failure into actionable categories.
+
+        Categories:
+        - CONFIG_DISABLED
+        - CONFIG_INVALID
+        - FIREWALL_BLOCKED
+        - QUOTA_EXCEEDED
+        - TIMEOUT
+        - PROVISIONING_FAILED
+        - API_UNREACHABLE
+        """
+        msg = (error_detail or "").strip().lower()
+        if not msg:
+            return "PROVISIONING_FAILED"
+        if "gcp_disabled" in msg or "disabled" in msg:
+            return "CONFIG_DISABLED"
+        if "config_invalid" in msg:
+            return "CONFIG_INVALID"
+        if "firewall_rule_missing" in msg or "firewall rule" in msg:
+            return "FIREWALL_BLOCKED"
+        if "quota" in msg or "resource_exhausted" in msg:
+            return "QUOTA_EXCEEDED"
+        if "timeout" in msg or "timed out" in msg:
+            return "TIMEOUT"
+        if "exception:" in msg:
+            return "API_UNREACHABLE"
+        if "vm_create_failed" in msg or "vm_not_running" in msg:
+            return "PROVISIONING_FAILED"
+        return "PROVISIONING_FAILED"
+
+    def _is_persistent_cloud_failure(self, category: str) -> bool:
+        """Whether a failure category should block aggressive retries."""
+        return category in {
+            "CONFIG_DISABLED",
+            "CONFIG_INVALID",
+            "FIREWALL_BLOCKED",
+        }
+
+    async def _begin_cloud_offload_attempt(self, offload_reason: str) -> Tuple[bool, str]:
+        """
+        Acquire cloud-offload attempt ownership if policy allows it.
+
+        Returns:
+            (allowed, reason_if_denied)
+        """
+        now = time.time()
+        async with self._cloud_offload_lock:
+            policy = self._cloud_offload_policy
+            metrics = policy.setdefault("metrics", {})
+            task_running = (
+                self._cloud_offload_task is not None
+                and not self._cloud_offload_task.done()
+            )
+            if task_running:
+                metrics["blocked_attempts"] = int(metrics.get("blocked_attempts", 0)) + 1
+                return False, "provisioning_in_progress"
+
+            if policy.get("state") == "active":
+                metrics["blocked_attempts"] = int(metrics.get("blocked_attempts", 0)) + 1
+                return False, "already_active"
+
+            cooldown_until = float(policy.get("cooldown_until", 0.0) or 0.0)
+            if now < cooldown_until:
+                metrics["blocked_attempts"] = int(metrics.get("blocked_attempts", 0)) + 1
+                policy["suppressed_attempts"] = int(policy.get("suppressed_attempts", 0)) + 1
+                suppressed = policy["suppressed_attempts"]
+                remaining = cooldown_until - now
+                if suppressed in (1, 5) or suppressed % 10 == 0:
+                    logger.info(
+                        "☁️ Cloud offload cooldown active "
+                        f"({remaining:.0f}s remaining, state={policy.get('state')})"
+                    )
+                return False, f"cooldown:{remaining:.1f}s"
+
+            budget = int(policy.get("retry_budget_remaining", 0))
+            if budget <= 0:
+                refill_after = float(policy.get("budget_refill_after_s", 900.0))
+                cooldown_until = float(policy.get("cooldown_until", 0.0) or 0.0)
+                if now >= cooldown_until and (now - float(policy.get("last_attempt_ts", 0.0) or 0.0)) >= refill_after:
+                    refill_budget = max(1, int(policy.get("retry_budget_default", 1)))
+                    policy["retry_budget_remaining"] = refill_budget
+                    budget = refill_budget
+                    policy["state"] = "inactive"
+                    logger.info(
+                        f"☁️ Cloud offload retry budget refilled to {refill_budget} "
+                        f"after cooldown ({refill_after:.0f}s)"
+                    )
+                else:
+                    policy["state"] = "blocked"
+                    metrics["blocked_attempts"] = int(metrics.get("blocked_attempts", 0)) + 1
+                    return False, "retry_budget_exhausted"
+
+            policy["state"] = "provisioning"
+            policy["current_reason"] = offload_reason
+            policy["last_attempt_ts"] = now
+            policy["suppressed_attempts"] = 0
+            metrics["attempts"] = int(metrics.get("attempts", 0)) + 1
+            return True, ""
+
+    async def _record_cloud_offload_success(
+        self,
+        offload_reason: str,
+        cloud_ip: str,
+    ) -> None:
+        """Update cloud-offload policy after successful VM provisioning."""
+        now = time.time()
+        async with self._cloud_offload_lock:
+            policy = self._cloud_offload_policy
+            metrics = policy.setdefault("metrics", {})
+            previous_state = str(policy.get("state", "inactive"))
+            if previous_state in ("cooldown", "blocked"):
+                metrics["recoveries"] = int(metrics.get("recoveries", 0)) + 1
+
+            policy["state"] = "active"
+            policy["current_reason"] = offload_reason
+            policy["last_error"] = None
+            policy["last_failure_category"] = None
+            policy["consecutive_failures"] = 0
+            policy["consecutive_successes"] = int(policy.get("consecutive_successes", 0)) + 1
+            policy["retry_budget_remaining"] = int(policy.get("retry_budget_default", 0))
+            policy["next_retry_delay_s"] = float(policy.get("retry_base_delay_s", 20.0))
+            policy["cooldown_until"] = 0.0
+            policy["last_success_ts"] = now
+            policy["cloud_ip"] = cloud_ip
+
+    async def _record_cloud_offload_failure(
+        self,
+        failure_category: str,
+        error_detail: str,
+    ) -> Dict[str, Any]:
+        """
+        Update cloud-offload policy after a failed provisioning attempt.
+
+        Returns:
+            Summary dict with state, retry_after_s, and retry_budget_remaining.
+        """
+        now = time.time()
+        async with self._cloud_offload_lock:
+            policy = self._cloud_offload_policy
+            metrics = policy.setdefault("metrics", {})
+            metrics["failures"] = int(metrics.get("failures", 0)) + 1
+
+            policy["consecutive_failures"] = int(policy.get("consecutive_failures", 0)) + 1
+            policy["consecutive_successes"] = 0
+            policy["last_error"] = error_detail
+            policy["last_failure_category"] = failure_category
+            policy["cloud_ip"] = None
+
+            persistent = self._is_persistent_cloud_failure(failure_category)
+            if persistent:
+                retry_delay = float(policy.get("persistent_failure_cooldown_s", 900.0))
+                policy["retry_budget_remaining"] = max(
+                    1,
+                    int(policy.get("retry_budget_remaining", 1)),
+                )
+                policy["state"] = "cooldown"
+            else:
+                retry_budget = max(0, int(policy.get("retry_budget_remaining", 0)) - 1)
+                policy["retry_budget_remaining"] = retry_budget
+                base = float(policy.get("retry_base_delay_s", 20.0))
+                max_delay = float(policy.get("retry_max_delay_s", 300.0))
+                prev_delay = float(policy.get("next_retry_delay_s", base))
+                raw_next = min(max_delay, max(base, prev_delay * 2.0))
+                jitter_ratio = float(policy.get("retry_jitter_ratio", 0.20))
+                jittered = raw_next * (1.0 + random.uniform(-jitter_ratio, jitter_ratio))
+                retry_delay = max(base, min(max_delay, jittered))
+                policy["next_retry_delay_s"] = raw_next
+                if retry_budget <= 0:
+                    policy["state"] = "blocked"
+                    retry_delay = max(
+                        retry_delay,
+                        float(policy.get("budget_refill_after_s", 900.0)),
+                    )
+                else:
+                    policy["state"] = "cooldown"
+
+            policy["cooldown_until"] = now + retry_delay
+            return {
+                "state": policy.get("state"),
+                "retry_after_s": retry_delay,
+                "retry_budget_remaining": policy.get("retry_budget_remaining", 0),
+            }
+
+    async def _should_emit_cloud_failure(self) -> bool:
+        """
+        Check whether a new failure event should be emitted now.
+
+        Used for persistent config failures that can be detected before
+        provisioning attempts; suppresses duplicate failure emission while
+        cooldown is active.
+        """
+        now = time.time()
+        async with self._cloud_offload_lock:
+            policy = self._cloud_offload_policy
+            cooldown_until = float(policy.get("cooldown_until", 0.0) or 0.0)
+            if now < cooldown_until:
+                policy["suppressed_attempts"] = int(policy.get("suppressed_attempts", 0)) + 1
+                suppressed = policy["suppressed_attempts"]
+                if suppressed in (1, 5) or suppressed % 10 == 0:
+                    logger.debug(
+                        "☁️ Suppressing duplicate cloud-offload failure "
+                        f"(cooldown {cooldown_until - now:.0f}s remaining)"
+                    )
+                return False
+            return True
+
     async def _trigger_cloud_offloading(self, pressure: MemoryPressure) -> None:
         """
         v86.0: Trigger cloud offloading with proper state tracking.
@@ -1956,52 +2238,104 @@ class DynamicComponentManager:
             # v86.0: Use enhanced property accessor
             if not vm_manager.enabled:
                 logger.debug("GCP VM Manager disabled - skipping cloud offloading")
+                if not await self._should_emit_cloud_failure():
+                    return
+                _failure = "CONFIG_DISABLED"
+                _summary = await self._record_cloud_offload_failure(
+                    _failure,
+                    "GCP VM Manager disabled",
+                )
+                self._set_cloud_offload_routing_env(active=False)
+                await self._publish_cloud_state_to_trinity(
+                    None,
+                    "Cloud offload unavailable",
+                    active=False,
+                    failure_category=_failure,
+                    error_detail="GCP VM Manager disabled",
+                    retry_after_seconds=float(_summary.get("retry_after_s", 0.0)),
+                )
                 return
 
             # Check if cloud offloading is already active
             if vm_manager.cloud_offload_active:
                 logger.debug(f"Cloud offloading already active: {vm_manager.cloud_offload_reason}")
+                async with self._cloud_offload_lock:
+                    self._cloud_offload_policy["state"] = "active"
+                    self._cloud_offload_policy["current_reason"] = vm_manager.cloud_offload_reason
                 return
 
             # Check if we already have an active VM
             active_vm = await vm_manager.get_active_vm()
+            offload_reason = f"Memory pressure: {pressure.value}"
 
-            if not active_vm:
-                # Determine reason for offloading
-                offload_reason = f"Memory pressure: {pressure.value}"
-
-                logger.info(f"🌩️ {offload_reason} - Initiating Hybrid Cloud Protocol...")
-                logger.info("   Requesting GCP Spot Instance for compute offloading...")
-
-                # v86.0: Mark cloud offloading as active with reason
-                vm_manager.mark_cloud_offload_active(offload_reason)
-
-                # Set environment variables for ML routers to pick up
-                os.environ["JARVIS_PREFER_CLOUD_RUN"] = "true"
-                os.environ["JARVIS_USE_CLOUD_ML"] = "true"
-                os.environ["JARVIS_CLOUD_OFFLOAD_REASON"] = offload_reason
-
-                # Trigger async provisioning (fire and forget to not block main thread)
-                asyncio.create_task(self._provision_cloud_resources(vm_manager, offload_reason))
-
-            else:
+            if active_vm:
                 # VM already exists, just ensure cloud offload is marked active
                 # v132.1: VMInstance is a dataclass, not dict - use attribute access
                 vm_name = active_vm.name if hasattr(active_vm, 'name') else "unknown"
                 if not vm_manager.cloud_offload_active:
                     vm_manager.mark_cloud_offload_active(f"Existing VM: {vm_name}")
+                self._set_cloud_offload_routing_env(
+                    active=True,
+                    reason=f"Existing VM: {vm_name}",
+                    cloud_ip=getattr(active_vm, "ip_address", None),
+                )
+                await self._record_cloud_offload_success(
+                    f"Existing VM: {vm_name}",
+                    getattr(active_vm, "ip_address", "") or "unknown",
+                )
                 logger.debug(f"Using existing cloud VM: {vm_name}")
+                return
+
+            # Policy gate (cooldown/budget/in-flight dedupe)
+            allowed, deny_reason = await self._begin_cloud_offload_attempt(offload_reason)
+            if not allowed:
+                logger.debug(f"Cloud offload attempt skipped: {deny_reason}")
+                return
+
+            logger.info(f"🌩️ {offload_reason} - Initiating Hybrid Cloud Protocol...")
+            logger.info("   Requesting GCP Spot Instance for compute offloading...")
+
+            # Trigger async provisioning and track task handle
+            task = asyncio.create_task(
+                self._provision_cloud_resources(vm_manager, offload_reason),
+                name="cloud-offload-provision",
+            )
+            async with self._cloud_offload_lock:
+                self._cloud_offload_task = task
 
         except ImportError as e:
             logger.debug(f"GCP VM Manager not available for offloading: {e}")
         except AttributeError as e:
             # This catches the case where enabled property might be missing
             logger.warning(f"GCP VM Manager interface issue: {e}")
-            # Fallback: try to set env vars anyway for ML routers
-            os.environ["JARVIS_PREFER_CLOUD_RUN"] = "true"
-            os.environ["JARVIS_USE_CLOUD_ML"] = "true"
+            if not await self._should_emit_cloud_failure():
+                return
+            _failure = "CONFIG_INVALID"
+            _summary = await self._record_cloud_offload_failure(_failure, str(e))
+            self._set_cloud_offload_routing_env(active=False)
+            await self._publish_cloud_state_to_trinity(
+                None,
+                "Cloud offload unavailable",
+                active=False,
+                failure_category=_failure,
+                error_detail=str(e),
+                retry_after_seconds=float(_summary.get("retry_after_s", 0.0)),
+            )
         except Exception as e:
             logger.warning(f"Failed to trigger cloud offloading: {e}")
+            if not await self._should_emit_cloud_failure():
+                return
+            _failure = self._classify_cloud_offload_failure(str(e))
+            _summary = await self._record_cloud_offload_failure(_failure, str(e))
+            self._set_cloud_offload_routing_env(active=False)
+            await self._publish_cloud_state_to_trinity(
+                None,
+                "Cloud offload trigger failure",
+                active=False,
+                failure_category=_failure,
+                error_detail=str(e),
+                retry_after_seconds=float(_summary.get("retry_after_s", 0.0)),
+            )
 
         if pressure == MemoryPressure.HIGH:
             # Unload LOW priority idle components
@@ -2035,11 +2369,19 @@ class DynamicComponentManager:
         """
         try:
             # Start VM
-            success, ip_address = await vm_manager.start_spot_vm()
+            success, result_detail = await vm_manager.start_spot_vm()
 
-            if success and ip_address:
+            if success and result_detail:
+                ip_address = result_detail
                 logger.info(f"✅ Hybrid Cloud Active: Spot VM running at {ip_address}")
                 logger.info(f"   Triggered by: {offload_reason}")
+                vm_manager.mark_cloud_offload_active(offload_reason)
+                self._set_cloud_offload_routing_env(
+                    active=True,
+                    reason=offload_reason,
+                    cloud_ip=ip_address,
+                )
+                await self._record_cloud_offload_success(offload_reason, ip_address)
 
                 # Update ML Registry with new cloud endpoint
                 try:
@@ -2060,23 +2402,82 @@ class DynamicComponentManager:
 
                 # v86.0: Publish state to Trinity Protocol for cross-repo coordination
                 try:
-                    await self._publish_cloud_state_to_trinity(ip_address, offload_reason)
+                    await self._publish_cloud_state_to_trinity(
+                        ip_address,
+                        offload_reason,
+                        active=True,
+                    )
                 except Exception as e:
                     logger.debug(f"Trinity state publish (non-critical): {e}")
 
             else:
-                logger.warning("❌ Failed to provision GCP Spot VM")
+                failure_detail = result_detail or "Unknown provisioning failure"
+                failure_category = self._classify_cloud_offload_failure(failure_detail)
+                summary = await self._record_cloud_offload_failure(
+                    failure_category,
+                    failure_detail,
+                )
+                logger.warning(
+                    "❌ Failed to provision GCP Spot VM "
+                    f"(category={failure_category}, detail={failure_detail}, "
+                    f"retry_after={summary.get('retry_after_s', 0.0):.1f}s, "
+                    f"budget={summary.get('retry_budget_remaining', 0)})"
+                )
                 # Reset cloud offload state on failure
                 if hasattr(vm_manager, 'mark_cloud_offload_inactive'):
-                    vm_manager.mark_cloud_offload_inactive()
+                    vm_manager.mark_cloud_offload_inactive(cause=failure_category)
+                self._set_cloud_offload_routing_env(active=False)
+                try:
+                    await self._publish_cloud_state_to_trinity(
+                        None,
+                        offload_reason or "Cloud offload failed",
+                        active=False,
+                        failure_category=failure_category,
+                        error_detail=failure_detail,
+                        retry_after_seconds=float(summary.get("retry_after_s", 0.0)),
+                    )
+                except Exception as publish_err:
+                    logger.debug(f"Cloud failure state publish (non-critical): {publish_err}")
 
         except Exception as e:
             logger.error(f"Cloud provisioning task failed: {e}")
+            failure_detail = str(e)
+            failure_category = self._classify_cloud_offload_failure(failure_detail)
+            summary = await self._record_cloud_offload_failure(
+                failure_category,
+                failure_detail,
+            )
             # Reset cloud offload state on error
             if hasattr(vm_manager, 'mark_cloud_offload_inactive'):
-                vm_manager.mark_cloud_offload_inactive()
+                vm_manager.mark_cloud_offload_inactive(cause=failure_category)
+            self._set_cloud_offload_routing_env(active=False)
+            try:
+                await self._publish_cloud_state_to_trinity(
+                    None,
+                    offload_reason or "Cloud offload failed",
+                    active=False,
+                    failure_category=failure_category,
+                    error_detail=failure_detail,
+                    retry_after_seconds=float(summary.get("retry_after_s", 0.0)),
+                )
+            except Exception as publish_err:
+                logger.debug(f"Cloud error state publish (non-critical): {publish_err}")
+        finally:
+            current_task = asyncio.current_task()
+            async with self._cloud_offload_lock:
+                if self._cloud_offload_task is current_task:
+                    self._cloud_offload_task = None
 
-    async def _publish_cloud_state_to_trinity(self, cloud_ip: str, reason: str) -> None:
+    async def _publish_cloud_state_to_trinity(
+        self,
+        cloud_ip: Optional[str],
+        reason: str,
+        *,
+        active: bool,
+        failure_category: Optional[str] = None,
+        error_detail: Optional[str] = None,
+        retry_after_seconds: Optional[float] = None,
+    ) -> None:
         """
         v86.0: Publish cloud offloading state to Trinity Protocol.
 
@@ -2084,8 +2485,12 @@ class DynamicComponentManager:
         the cloud offloading status and coordinate ML routing.
 
         Args:
-            cloud_ip: IP address of the cloud VM
+            cloud_ip: IP address of the cloud VM (if active)
             reason: Reason for cloud offloading
+            active: Whether cloud offloading is active
+            failure_category: Optional failure category when inactive
+            error_detail: Optional failure detail when inactive
+            retry_after_seconds: Optional retry delay hint when inactive
         """
         import json
         import time
@@ -2095,15 +2500,33 @@ class DynamicComponentManager:
         trinity_state_dir.mkdir(parents=True, exist_ok=True)
 
         cloud_state_file = trinity_state_dir / "cloud_offload_state.json"
+        _now = time.time()
+        _policy_state = "unknown"
+        _retry_budget = None
+        try:
+            _policy = dict(getattr(self, "_cloud_offload_policy", {}) or {})
+            _policy_state = str(_policy.get("state", "unknown"))
+            _retry_budget = _policy.get("retry_budget_remaining")
+        except Exception:
+            pass
 
         state = {
-            "cloud_offload_active": True,
-            "cloud_ip": cloud_ip,
-            "cloud_url": f"http://{cloud_ip}:8010",
+            "schema_version": "2.0",
+            "source_repo": "jarvis",
+            "controller": "dynamic_component_manager",
+            "cloud_offload_active": active,
+            "cloud_ip": cloud_ip if active else None,
+            "cloud_url": f"http://{cloud_ip}:8010" if (active and cloud_ip) else None,
             "reason": reason,
-            "activated_at": time.time(),
+            "activated_at": _now if active else None,
+            "deactivated_at": _now if not active else None,
             "activated_by": "jarvis-body",
-            "timestamp": time.time(),
+            "policy_state": _policy_state,
+            "retry_budget_remaining": _retry_budget,
+            "failure_category": failure_category,
+            "error_detail": error_detail,
+            "retry_after_seconds": retry_after_seconds,
+            "timestamp": _now,
         }
 
         # Atomic write
@@ -2112,7 +2535,10 @@ class DynamicComponentManager:
             json.dump(state, f, indent=2)
         temp_file.rename(cloud_state_file)
 
-        logger.info(f"☁️ Published cloud state to Trinity: {cloud_state_file}")
+        logger.info(
+            f"☁️ Published cloud state to Trinity: {cloud_state_file} "
+            f"(active={active})"
+        )
 
     async def _unload_idle_components(self, priority: ComponentPriority, idle_seconds: float):
         """Unload idle components of given priority"""
@@ -2218,6 +2644,25 @@ class DynamicComponentManager:
         # Get ML predictor statistics
         ml_stats = self.intent_analyzer.get_ml_stats() if self.intent_analyzer else {}
 
+        # Cloud offload policy snapshot
+        policy = dict(getattr(self, "_cloud_offload_policy", {}) or {})
+        policy_metrics = dict(policy.get("metrics", {}) or {})
+        cloud_offload_status = {
+            "state": policy.get("state", "unknown"),
+            "current_reason": policy.get("current_reason", ""),
+            "last_failure_category": policy.get("last_failure_category"),
+            "last_error": policy.get("last_error"),
+            "retry_budget_remaining": policy.get("retry_budget_remaining", 0),
+            "next_retry_delay_s": policy.get("next_retry_delay_s", 0.0),
+            "cooldown_until": policy.get("cooldown_until", 0.0),
+            "consecutive_failures": policy.get("consecutive_failures", 0),
+            "consecutive_successes": policy.get("consecutive_successes", 0),
+            "task_in_flight": bool(
+                self._cloud_offload_task and not self._cloud_offload_task.done()
+            ),
+            "metrics": policy_metrics,
+        }
+
         return {
             'total_components': len(self.components),
             'loaded_components': len(loaded),
@@ -2264,6 +2709,7 @@ class DynamicComponentManager:
                     1
                 )
             },
+            'cloud_offload_policy': cloud_offload_status,
             'stats': self.stats
         }
 
