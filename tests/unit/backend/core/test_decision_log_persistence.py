@@ -1,7 +1,5 @@
 """Tests for DecisionLog persistence and envelope integration."""
-import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -96,6 +94,25 @@ class TestDecisionLogFlusher(unittest.TestCase):
         assert flushed == 0
         # Records still in memory
         assert log.size == 1
+
+    def test_flush_after_ring_buffer_eviction(self):
+        """Records added after buffer wraps should still be flushed."""
+        from backend.core.decision_log import DecisionLog
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            log = DecisionLog(max_entries=5)
+            # Fill buffer and flush
+            for i in range(5):
+                log.record(decision_type="test", reason=f"r{i}", inputs={}, outcome="o")
+            log.flush_to_jsonl(tmp_path / "decisions")
+
+            # Add 3 more (evicts oldest 3 from deque)
+            for i in range(3):
+                log.record(decision_type="test", reason=f"new{i}", inputs={}, outcome="o")
+
+            # These 3 new records MUST be flushed
+            flushed = log.flush_to_jsonl(tmp_path / "decisions")
+            assert flushed == 3
 
 
 if __name__ == "__main__":

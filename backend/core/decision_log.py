@@ -114,7 +114,8 @@ class DecisionLog:
         self._buffer: collections.deque = collections.deque(maxlen=max(1, max_entries))
         self._lock = threading.Lock()
         self._counters: Dict[str, int] = {}  # decision_type -> cumulative count
-        self._last_flushed_index: int = 0
+        self._total_appended: int = 0    # cumulative count of all appends (survives eviction)
+        self._last_flushed_total: int = 0  # cumulative count at last successful flush
 
     @classmethod
     def get_instance(cls) -> "DecisionLog":
@@ -156,6 +157,7 @@ class DecisionLog:
         )
         with self._lock:
             self._buffer.append(rec)
+            self._total_appended += 1
             self._counters[decision_type] = self._counters.get(decision_type, 0) + 1
         logger.debug(
             "[DecisionLog] %s: %s -> %s (%s)",
@@ -219,7 +221,11 @@ class DecisionLog:
     # -----------------------------------------------------------------------
 
     def flush_to_jsonl(self, decisions_dir) -> int:
-        """Flush new records to date-partitioned JSONL. Returns count flushed."""
+        """Flush new records to date-partitioned JSONL. Returns count flushed.
+
+        Uses cumulative counters to survive ring buffer eviction correctly.
+        On error, returns 0 and records remain available for retry.
+        """
         from pathlib import Path
         try:
             from backend.core.trace_store import JSONLWriter
@@ -230,18 +236,24 @@ class DecisionLog:
         decisions_dir = Path(decisions_dir)
         with self._lock:
             records = list(self._buffer)
-            current_size = len(records)
+            total_now = self._total_appended
+            last_flushed = self._last_flushed_total
 
-        new_records = records[self._last_flushed_index:]
+        # How many new records since last flush?
+        unflushed_count = total_now - last_flushed
+        # But we can only flush what's still in the buffer (eviction may have dropped some)
+        available = min(unflushed_count, len(records))
+        new_records = records[-available:] if available > 0 else []
+
         if not new_records:
             return 0
 
         try:
-            import time as _time
-            writer = JSONLWriter(decisions_dir / f"{_time.strftime('%Y%m%d')}.jsonl")
+            writer = JSONLWriter(decisions_dir / f"{time.strftime('%Y%m%d')}.jsonl")
             for rec in new_records:
                 writer.append(rec.to_dict())
-            self._last_flushed_index = current_size
+            with self._lock:
+                self._last_flushed_total = total_now
             return len(new_records)
         except Exception:
             logger.debug("Failed to flush decisions to JSONL", exc_info=True)
