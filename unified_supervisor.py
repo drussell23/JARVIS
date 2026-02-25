@@ -61419,6 +61419,7 @@ class JarvisSystemKernel:
         # v199.0: Invincible Node (Static IP Spot VM) state
         self._invincible_node_ready: bool = False
         self._invincible_node_ip: Optional[str] = None
+        self._lifecycle_bridge = None  # GCP lifecycle V2 bridge (lazy init)
         # v266.0: _early_invincible_task removed — VM prewarm now pressure-driven
         self._model_serving = None  # v234.0: UnifiedModelServing instance
         self._pending_gcp_endpoint: Optional[str] = None  # v236.0: Deferred GCP URL
@@ -62501,6 +62502,14 @@ class JarvisSystemKernel:
             pass
         except Exception as e:
             self.logger.debug(f"[Kernel] GCP cleanup error: {e}")
+
+        # GCP Lifecycle V2 bridge shutdown
+        if self._lifecycle_bridge is not None:
+            try:
+                await asyncio.wait_for(self._lifecycle_bridge.shutdown(), timeout=5.0)
+                self.logger.info("[Kernel] GCP lifecycle bridge shutdown complete")
+            except Exception as _bridge_err:
+                self.logger.debug(f"[Kernel] Lifecycle bridge shutdown error: {_bridge_err}")
 
         # v207.0: Stop startup resilience coordinator (stops background recovery tasks)
         if self._startup_resilience:
@@ -63911,6 +63920,22 @@ class JarvisSystemKernel:
         except Exception as _bc_err:
             self.logger.debug(f"[Broadcast] {stage}/{progress}% error: {_bc_err}")
 
+    async def _notify_bridge(self, method_name: str, **kwargs) -> None:
+        """Fire-and-forget notification to GCP lifecycle bridge (V2).
+
+        No-op when bridge not initialized or V2 disabled.
+        Never raises — all exceptions are silently logged.
+        """
+        bridge = self._lifecycle_bridge
+        if bridge is None:
+            return
+        try:
+            method = getattr(bridge, method_name, None)
+            if method is not None:
+                await method(**kwargs)
+        except Exception as _bridge_err:
+            self.logger.debug(f"[Lifecycle] Bridge {method_name} error: {_bridge_err}")
+
     async def _startup_impl(self) -> int:
         """
         Internal startup implementation (wrapped by timeout in startup()).
@@ -63928,6 +63953,13 @@ class JarvisSystemKernel:
         # v258.4: Also publish to Trinity IPC for cross-repo consumers.
         _publish_system_phase_to_trinity("startup", {"started_at": time.time()})
         os.environ["JARVIS_STARTUP_TIMESTAMP"] = str(time.time())
+
+        # GCP Lifecycle V2 bridge: lazy init (no-op when JARVIS_GCP_LIFECYCLE_V2 != true)
+        try:
+            from backend.core.gcp_lifecycle_bridge import get_lifecycle_bridge
+            self._lifecycle_bridge = await get_lifecycle_bridge()
+        except Exception as _bridge_init_err:
+            self.logger.debug(f"[Lifecycle] Bridge init skipped: {_bridge_init_err}")
 
         # v272.0 Phase 9: Initialize startup transaction coordinator
         _txn = None
@@ -65428,6 +65460,7 @@ class JarvisSystemKernel:
                             os.environ["INVINCIBLE_NODE_READY"] = "true"
                             self._invincible_node_ip = ip
                             self._invincible_node_ready = True
+                            await self._notify_bridge("notify_vm_ready", ip=ip)
 
                             # Propagate to routing layer
                             try:
@@ -68646,7 +68679,8 @@ class JarvisSystemKernel:
                         self.logger.success(f"[InvincibleNode] Cloud Node READY at {node_ip}")
                         self._invincible_node_ip = node_ip
                         self._invincible_node_ready = True
-                        
+                        await self._notify_bridge("notify_vm_ready", ip=node_ip)
+
                         # v219.0: ROOT CAUSE FIX - Propagate URL so all Prime clients
                         # know where to send requests (hollow client actually works now)
                         self._propagate_invincible_node_url(node_ip, source="quick_check")
@@ -68844,7 +68878,8 @@ class JarvisSystemKernel:
                                 self.logger.success(f"[InvincibleNode] Cloud Node READY (background): {node_ip}")
                                 self._invincible_node_ip = node_ip
                                 self._invincible_node_ready = True
-                                
+                                await self._notify_bridge("notify_vm_ready", ip=node_ip)
+
                                 # v220.1: Update dashboard with success
                                 update_dashboard_gcp_progress(
                                     phase=5, phase_name="Ready",
@@ -75396,6 +75431,7 @@ class JarvisSystemKernel:
                                                                     invincible_ip = _std_ip
                                                                     self._invincible_node_ready = True
                                                                     self._invincible_node_ip = _std_ip
+                                                                    await self._notify_bridge("notify_vm_ready", ip=_std_ip)
                                                                 else:
                                                                     self.logger.warning(
                                                                         f"[Trinity] Standard GCP fallback did not produce "
@@ -75659,6 +75695,7 @@ class JarvisSystemKernel:
                                                                 invincible_ip = _std_ip_t
                                                                 self._invincible_node_ready = True
                                                                 self._invincible_node_ip = _std_ip_t
+                                                                await self._notify_bridge("notify_vm_ready", ip=_std_ip_t)
                                                             else:
                                                                 self.logger.warning(
                                                                     f"[Trinity] Standard GCP fallback did not produce "
