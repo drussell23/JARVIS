@@ -34,6 +34,36 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# ---------------------------------------------------------------------------
+# TraceEnvelope integration (optional — never breaks if module unavailable)
+# ---------------------------------------------------------------------------
+try:
+    from backend.core.trace_envelope import (
+        TraceEnvelope, TraceEnvelopeFactory, LamportClock, BoundaryType,
+    )
+    _TRACE_ENVELOPE_AVAILABLE = True
+except ImportError:
+    _TRACE_ENVELOPE_AVAILABLE = False
+
+_envelope_factory: Optional["TraceEnvelopeFactory"] = None
+
+
+def _get_envelope_factory() -> Optional["TraceEnvelopeFactory"]:
+    """Lazy-init the envelope factory.  Returns None if trace_envelope not available."""
+    global _envelope_factory
+    if _envelope_factory is not None:
+        return _envelope_factory
+    if not _TRACE_ENVELOPE_AVAILABLE:
+        return None
+    _envelope_factory = TraceEnvelopeFactory(
+        repo="jarvis",
+        boot_id=os.environ.get("JARVIS_BOOT_ID", uuid.uuid4().hex[:16]),
+        runtime_epoch_id=os.environ.get("JARVIS_RUNTIME_EPOCH_ID", uuid.uuid4().hex[:16]),
+        node_id=os.environ.get("JARVIS_NODE_ID", os.uname().nodename),
+        producer_version=os.environ.get("JARVIS_VERSION", "dev"),
+    )
+    return _envelope_factory
+
 # Context variable for current correlation context
 _current_context: contextvars.ContextVar[Optional["CorrelationContext"]] = contextvars.ContextVar(
     "correlation_context",
@@ -99,6 +129,9 @@ class CorrelationContext:
     # Timing
     request_deadline: Optional[float] = None  # Unix timestamp when request times out
 
+    # TraceEnvelope backing store (None if trace_envelope module unavailable)
+    envelope: Optional[Any] = None  # Type is TraceEnvelope but uses Any for import safety
+
     @classmethod
     def generate_id(cls, prefix: str = "") -> str:
         """Generate a unique correlation ID."""
@@ -163,17 +196,40 @@ class CorrelationContext:
             )
             ctx.current_span = ctx.root_span
 
+        # Attach TraceEnvelope if available
+        factory = _get_envelope_factory()
+        if factory is not None:
+            try:
+                if parent and parent.envelope is not None:
+                    ctx.envelope = factory.create_child(
+                        parent=parent.envelope,
+                        component=source_component or "",
+                        operation=operation or "",
+                    )
+                else:
+                    ctx.envelope = factory.create_root(
+                        component=source_component or "",
+                        operation=operation or "",
+                    )
+            except Exception:
+                pass  # Never break context creation on envelope failure
+
         return ctx
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CorrelationContext":
         """Deserialize context from dictionary."""
-        # Handle root_span
+        # Handle root_span — filter out computed properties like duration_ms
         root_span = None
         if data.get("root_span"):
-            root_span = SpanInfo(**data["root_span"])
+            span_data = {
+                k: v for k, v in data["root_span"].items()
+                if k in ("span_id", "operation", "start_time", "end_time",
+                         "status", "error_message", "metadata", "children")
+            }
+            root_span = SpanInfo(**span_data)
 
-        return cls(
+        ctx = cls(
             correlation_id=data["correlation_id"],
             parent_id=data.get("parent_id"),
             source_repo=data.get("source_repo", "jarvis"),
@@ -184,9 +240,18 @@ class CorrelationContext:
             request_deadline=data.get("request_deadline"),
         )
 
+        # Restore envelope if present
+        if _TRACE_ENVELOPE_AVAILABLE and "_trace_envelope" in data:
+            try:
+                ctx.envelope = TraceEnvelope.from_dict(data["_trace_envelope"])
+            except Exception:
+                pass
+
+        return ctx
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize context to dictionary."""
-        return {
+        result = {
             "correlation_id": self.correlation_id,
             "parent_id": self.parent_id,
             "source_repo": self.source_repo,
@@ -196,6 +261,12 @@ class CorrelationContext:
             "baggage": self.baggage,
             "request_deadline": self.request_deadline,
         }
+        if self.envelope is not None:
+            try:
+                result["_trace_envelope"] = self.envelope.to_dict()
+            except Exception:
+                pass
+        return result
 
     def to_headers(self) -> Dict[str, str]:
         """Convert context to headers for HTTP/RPC propagation."""
@@ -217,6 +288,13 @@ class CorrelationContext:
         for key, value in self.baggage.items():
             headers[f"X-Baggage-{key}"] = value
 
+        # Add TraceEnvelope headers (alongside existing correlation headers)
+        if self.envelope is not None:
+            try:
+                headers.update(self.envelope.to_headers())
+            except Exception:
+                pass  # Never break on envelope serialization
+
         return headers
 
     @classmethod
@@ -235,7 +313,7 @@ class CorrelationContext:
 
         deadline = headers.get("X-Request-Deadline")
 
-        return cls(
+        ctx = cls(
             correlation_id=correlation_id,
             parent_id=headers.get("X-Parent-Correlation-ID"),
             source_repo=headers.get("X-Source-Repo", "unknown"),
@@ -243,6 +321,25 @@ class CorrelationContext:
             baggage=baggage,
             request_deadline=float(deadline) if deadline else None,
         )
+
+        # Try to restore TraceEnvelope from headers
+        if _TRACE_ENVELOPE_AVAILABLE:
+            try:
+                envelope = TraceEnvelope.from_headers(headers)
+                if envelope is not None:
+                    ctx.envelope = envelope
+                else:
+                    # Backward compat: auto-generate envelope for old-style headers
+                    factory = _get_envelope_factory()
+                    if factory:
+                        ctx.envelope = factory.create_root(
+                            component=ctx.source_component or "",
+                            operation="",
+                        )
+            except Exception:
+                pass
+
+        return ctx
 
     @property
     def remaining_time(self) -> Optional[float]:
@@ -475,6 +572,11 @@ def inject_correlation(data: Dict[str, Any]) -> Dict[str, Any]:
     ctx = _current_context.get()
     if ctx:
         data["_correlation"] = ctx.to_dict()
+        if ctx.envelope is not None:
+            try:
+                data["_trace_envelope"] = ctx.envelope.to_dict()
+            except Exception:
+                pass
     return data
 
 
@@ -486,7 +588,16 @@ def extract_correlation(data: Dict[str, Any]) -> Optional[CorrelationContext]:
     """
     if "_correlation" not in data:
         return None
-    return CorrelationContext.from_dict(data["_correlation"])
+    ctx = CorrelationContext.from_dict(data["_correlation"])
+
+    # Try to restore envelope from top-level data (injected by inject_correlation)
+    if _TRACE_ENVELOPE_AVAILABLE and "_trace_envelope" in data:
+        try:
+            ctx.envelope = TraceEnvelope.from_dict(data["_trace_envelope"])
+        except Exception:
+            pass
+
+    return ctx
 
 
 def apply_correlation(data: Dict[str, Any]) -> contextvars.Token:
