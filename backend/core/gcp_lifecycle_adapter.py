@@ -88,6 +88,28 @@ class GCPLifecycleAdapter(SideEffectAdapter):
             )
             return {"error": str(exc), "action": action, "op_id": op_id}
 
+    async def query_vm_state(self, op_id: str) -> str:
+        """Query actual VM state for reconciliation.
+
+        Delegates to the GCP VM manager to check if a VM associated
+        with the given op_id exists and what state it's in.
+
+        Returns one of: 'running', 'stopped', 'not_found'.
+        """
+        try:
+            result = await self._gcp.query_vm_state(op_id=op_id)
+            if isinstance(result, str):
+                return result
+            # If the manager returns a dict, extract state
+            return result.get("state", "not_found")
+        except Exception as exc:
+            logger.error(
+                "Failed to query VM state for op_id=%s: %s",
+                op_id, exc,
+                exc_info=True,
+            )
+            return "not_found"
+
     @staticmethod
     def generate_op_id(target: str, event: str, epoch: int) -> str:
         """Generate a stable, unique op_id for tracking."""

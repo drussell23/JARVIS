@@ -29,6 +29,9 @@ class MockGCPVMManager:
     async def switch_routing(self, direction: str, op_id: str, **kwargs):
         return {"direction": direction}
 
+    async def query_vm_state(self, op_id: str, **kwargs):
+        return "not_found"
+
 
 @pytest.fixture
 async def journal(tmp_path):

@@ -21,6 +21,9 @@ class NoOpAdapter(SideEffectAdapter):
         self.calls.append({"action": action, "op_id": op_id, **kwargs})
         return {"status": "simulated"}
 
+    async def query_vm_state(self, op_id: str) -> str:
+        return "not_found"
+
 
 @pytest.fixture
 async def journal(tmp_path):

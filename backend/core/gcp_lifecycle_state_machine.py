@@ -11,7 +11,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.core.gcp_lifecycle_schema import State, Event, validate_state
 from backend.core.gcp_lifecycle_transitions import get_transition
@@ -29,6 +29,16 @@ class SideEffectAdapter(ABC):
     @abstractmethod
     async def execute(self, action: str, op_id: str, **kwargs) -> Dict[str, Any]:
         """Execute a side effect. Returns result dict."""
+        ...
+
+    @abstractmethod
+    async def query_vm_state(self, op_id: str) -> str:
+        """Query actual VM state for reconciliation.
+
+        Returns one of: 'running', 'stopped', 'not_found'.
+        Used during leader takeover to resolve pending journal entries
+        by checking whether a side effect actually completed.
+        """
         ...
 
 
@@ -185,3 +195,175 @@ class GCPLifecycleStateMachine:
             "[GCPLifecycle] No valid state found in %d journal entries for %s",
             len(entries), self._target,
         )
+
+    async def reconcile_on_takeover(self) -> None:
+        """Reconcile pending journal entries after leader takeover.
+
+        When a leader crashes and a new leader takes over, there may be
+        journal entries with result="pending" whose side effects were
+        never confirmed. This method:
+
+        1. Replays gcp_lifecycle entries for this target
+        2. For each pending entry with has_side_effect=True:
+           - Extracts op_id and queries actual VM state via adapter
+           - Marks entry as "committed" (running/stopped) or "failed" (not_found)
+           - Journals the reconciliation result
+        3. Finds orphaned budget reservations and releases them
+        4. Recovers in-memory state from journal via recover_from_journal()
+        """
+        logger.info(
+            "[GCPLifecycle] Reconciling pending entries for %s on leader takeover",
+            self._target,
+        )
+
+        # Step 1: Replay gcp_lifecycle entries for this target
+        lifecycle_entries = await self._journal.replay_from(
+            0,
+            target_filter=[self._target],
+            action_filter=["gcp_lifecycle"],
+        )
+
+        pending_with_side_effects: List[dict] = [
+            e for e in lifecycle_entries
+            if e.get("result") == "pending"
+            and e.get("payload", {}).get("has_side_effect") is True
+        ]
+
+        # Step 2: Resolve each pending side-effect entry
+        reconciled_op_ids: List[str] = []
+        failed_op_ids: List[str] = []
+
+        for entry in pending_with_side_effects:
+            seq = entry["seq"]
+            epoch = entry["epoch"]
+            payload = entry.get("payload", {})
+            event = payload.get("event", "unknown")
+
+            # Reconstruct op_id: {target}:{event}:{epoch}:{seq}
+            op_id = f"{self._target}:{event}:{epoch}:{seq}"
+
+            try:
+                vm_state = await self._adapter.query_vm_state(op_id)
+            except Exception as exc:
+                logger.error(
+                    "[GCPLifecycle] Failed to query VM state for op_id=%s: %s",
+                    op_id, exc,
+                )
+                continue
+
+            # Determine result based on actual VM state
+            if vm_state == "running":
+                result = "committed"
+            elif vm_state == "stopped":
+                result = "committed"
+            elif vm_state == "not_found":
+                result = "failed"
+            else:
+                logger.warning(
+                    "[GCPLifecycle] Unknown VM state %r for op_id=%s, skipping",
+                    vm_state, op_id,
+                )
+                continue
+
+            # Mark the journal entry
+            self._journal.mark_result(seq, result)
+
+            # Journal the reconciliation
+            self._journal.fenced_write(
+                "gcp_lifecycle",
+                self._target,
+                payload={
+                    "reconcile_action": "resolve_pending",
+                    "original_seq": seq,
+                    "op_id": op_id,
+                    "vm_state": vm_state,
+                    "resolved_as": result,
+                    "original_event": event,
+                    "timestamp": time.time(),
+                },
+            )
+
+            if result == "committed":
+                reconciled_op_ids.append(op_id)
+            else:
+                failed_op_ids.append(op_id)
+
+            logger.info(
+                "[GCPLifecycle] Reconciled seq=%d op_id=%s: vm_state=%s -> %s",
+                seq, op_id, vm_state, result,
+            )
+
+        # Step 3: Find and release orphaned budget reservations
+        await self._release_orphaned_budgets(
+            reconciled_op_ids + failed_op_ids,
+            failed_op_ids,
+        )
+
+        # Step 4: Recover in-memory state from journal
+        await self.recover_from_journal()
+
+        logger.info(
+            "[GCPLifecycle] Reconciliation complete for %s: "
+            "committed=%d, failed=%d",
+            self._target,
+            len(reconciled_op_ids),
+            len(failed_op_ids),
+        )
+
+    async def _release_orphaned_budgets(
+        self,
+        all_op_ids: List[str],
+        failed_op_ids: List[str],
+    ) -> None:
+        """Release pending budget reservations that have no matching commit/release.
+
+        A budget reservation is orphaned if:
+        - action="budget_reserved", result="pending"
+        - Its op_id starts with this target's name
+        - No corresponding budget_committed or budget_released entry exists
+        """
+        # Get all budget_reserved entries
+        budget_entries = await self._journal.replay_from(
+            0,
+            action_filter=["budget_reserved"],
+        )
+
+        pending_budgets = [
+            e for e in budget_entries
+            if e.get("result") == "pending"
+            and e.get("payload", {}).get("op_id", "").startswith(f"{self._target}:")
+        ]
+
+        if not pending_budgets:
+            return
+
+        # Get all budget_committed and budget_released entries
+        committed_entries = await self._journal.replay_from(
+            0,
+            action_filter=["budget_committed"],
+        )
+        released_entries = await self._journal.replay_from(
+            0,
+            action_filter=["budget_released"],
+        )
+
+        # Build set of op_ids that already have a commit or release
+        resolved_budget_op_ids = set()
+        for e in committed_entries:
+            op = e.get("payload", {}).get("op_id")
+            if op:
+                resolved_budget_op_ids.add(op)
+        for e in released_entries:
+            op = e.get("payload", {}).get("op_id")
+            if op:
+                resolved_budget_op_ids.add(op)
+
+        # Release any pending budget that hasn't been committed or released
+        for budget_entry in pending_budgets:
+            budget_op_id = budget_entry["payload"]["op_id"]
+            if budget_op_id not in resolved_budget_op_ids:
+                self._journal.release_budget(budget_op_id)
+                logger.info(
+                    "[GCPLifecycle] Released orphaned budget for op_id=%s",
+                    budget_op_id,
+                )
