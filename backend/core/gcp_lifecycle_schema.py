@@ -8,7 +8,6 @@ Design doc: docs/plans/2026-02-25-journal-backed-gcp-lifecycle-design.md
 Section 1B: Canonical Schema.
 """
 from enum import Enum
-from typing import Optional
 
 
 class State(str, Enum):
