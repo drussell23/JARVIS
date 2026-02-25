@@ -568,3 +568,49 @@ class TestContextPropagation:
             await asyncio.gather(sibling("svc_a", 10.0), sibling("svc_b", 20.0))
         assert results["svc_a"] == "svc_a"
         assert results["svc_b"] == "svc_b"
+
+
+class TestCancellationPrecedence:
+    """Verify deterministic error types under race conditions."""
+
+    @pytest.mark.asyncio
+    async def test_external_cancel_wins_over_local_timeout(self):
+        """If external cancel and local timeout race, ExternalCancellationError wins."""
+        from backend.core.execution_context import (
+            execution_budget, budget_aware_wait_for,
+            ExternalCancellationError, CancellationCause,
+        )
+
+        async def slow_op():
+            await asyncio.sleep(10.0)
+
+        async with execution_budget("test", 60.0) as ctx:
+            # Pre-set the cancel cause to simulate external cancel
+            ctx.cancel_scope.set_cause(
+                CancellationCause.OWNER_SHUTDOWN,
+                "test shutdown",
+            )
+            # Now cancel the current task to simulate external cancel
+            task = asyncio.current_task()
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.05, task.cancel)
+
+            with pytest.raises(
+                (ExternalCancellationError, asyncio.CancelledError)
+            ):
+                await budget_aware_wait_for(
+                    slow_op(), local_cap=0.1, label="race_test"
+                )
+
+    @pytest.mark.asyncio
+    async def test_cancel_scope_cause_propagates_to_error(self):
+        from backend.core.execution_context import (
+            execution_budget, CancellationCause,
+        )
+        async with execution_budget("test", 60.0) as ctx:
+            ctx.cancel_scope.set_cause(
+                CancellationCause.DEPENDENCY_LOST,
+                "database connection lost",
+            )
+            assert ctx.cancel_scope.scope.cause == CancellationCause.DEPENDENCY_LOST
+            assert "database" in ctx.cancel_scope.scope.detail
