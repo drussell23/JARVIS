@@ -21,6 +21,8 @@ import os
 import struct
 import sys
 import tempfile
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
@@ -36,6 +38,11 @@ MAX_SUBSCRIBER_QUEUE = 500
 
 # macOS AF_UNIX sun_path limit is 104 bytes; Linux is 108.
 _MAX_UNIX_PATH = 104 if sys.platform == "darwin" else 108
+
+# ── Keepalive constants (configurable via environment) ───────────────────
+KEEPALIVE_INTERVAL_S = float(os.environ.get("JARVIS_UDS_KEEPALIVE_INTERVAL", "10.0"))
+KEEPALIVE_TIMEOUT_S = float(os.environ.get("JARVIS_UDS_KEEPALIVE_TIMEOUT", "30.0"))
+PONG_WRITE_TIMEOUT_S = 2.0
 
 
 # ── Exceptions ───────────────────────────────────────────────────────────
@@ -87,6 +94,10 @@ class _Subscriber:
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=MAX_SUBSCRIBER_QUEUE))
     writer: Optional[asyncio.StreamWriter] = None
     task: Optional[asyncio.Task] = None
+    keepalive_task: Optional[asyncio.Task] = None
+    last_pong_received: float = field(default_factory=time.monotonic)
+    last_seen_any: float = field(default_factory=time.monotonic)
+    disconnect_reason: str = ""
 
 
 # ── EventFabric ──────────────────────────────────────────────────────────
@@ -102,7 +113,12 @@ class EventFabric:
         await fabric.stop()
     """
 
-    def __init__(self, journal: OrchestrationJournal) -> None:
+    def __init__(
+        self,
+        journal: OrchestrationJournal,
+        keepalive_interval_s: float = KEEPALIVE_INTERVAL_S,
+        keepalive_timeout_s: float = KEEPALIVE_TIMEOUT_S,
+    ) -> None:
         self._journal = journal
         self._subscribers: Dict[str, _Subscriber] = {}
         self._server: Optional[asyncio.AbstractServer] = None
@@ -112,6 +128,8 @@ class EventFabric:
         self._real_sock_path: Optional[Path] = None
         self._owns_real_sock: bool = False
         self._client_tasks: list[asyncio.Task] = []
+        self._keepalive_interval_s = keepalive_interval_s
+        self._keepalive_timeout_s = keepalive_timeout_s
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -164,11 +182,13 @@ class EventFabric:
             await self._server.wait_closed()
             self._server = None
 
-        # Cancel all per-subscriber sender tasks and client handler tasks
+        # Cancel all per-subscriber sender tasks, keepalive tasks, and client handler tasks
         all_tasks: list[asyncio.Task] = list(self._client_tasks)
         for sub in self._subscribers.values():
             if sub.task is not None:
                 all_tasks.append(sub.task)
+            if sub.keepalive_task is not None:
+                all_tasks.append(sub.keepalive_task)
             if sub.writer is not None:
                 try:
                     sub.writer.close()
@@ -245,8 +265,8 @@ class EventFabric:
         """Handle a newly connected client.
 
         The first frame MUST be a subscribe request.  After acknowledgement,
-        the client enters receive-only mode and events are pushed via a
-        dedicated sender task.
+        events are pushed via a dedicated sender task while this handler
+        stays alive reading pong (and other) frames from the client.
         """
         task = asyncio.current_task()
         if task is not None:
@@ -283,12 +303,27 @@ class EventFabric:
             sub = _Subscriber(subscriber_id=subscriber_id, writer=writer)
             self._subscribers[subscriber_id] = sub
 
-            # Send ack
-            await send_frame(writer, {
+            # Determine earliest available journal sequence for the ack
+            earliest_seq = 0
+            try:
+                conn = self._journal._conn
+                if conn is not None:
+                    earliest_row = conn.execute(
+                        "SELECT MIN(seq) FROM journal"
+                    ).fetchone()
+                    if earliest_row and earliest_row[0] is not None:
+                        earliest_seq = earliest_row[0]
+            except Exception:
+                pass
+
+            # Send ack with earliest_available_seq
+            ack_msg = {
                 "type": "subscribe_ack",
                 "subscriber_id": subscriber_id,
                 "status": "ok",
-            })
+                "earliest_available_seq": earliest_seq,
+            }
+            await send_frame(writer, ack_msg)
 
             # Replay missed events from journal
             try:
@@ -315,8 +350,23 @@ class EventFabric:
             )
             sub.task = sender
 
-            # Wait until sender exits (connection closed, error, or cancellation)
-            await sender
+            # Start keepalive task
+            sub.keepalive_task = asyncio.create_task(
+                self._keepalive_loop(sub),
+                name=f"fabric-keepalive-{subscriber_id}",
+            )
+
+            # Read loop: receive pong frames (and any other client→server frames)
+            try:
+                while True:
+                    frame = await recv_frame(reader)
+                    sub.last_seen_any = time.monotonic()
+                    if frame.get("type") == "pong":
+                        self._handle_pong(sub, frame)
+            except (asyncio.IncompleteReadError, ProtocolError):
+                sub.disconnect_reason = sub.disconnect_reason or "eof"
+            except asyncio.CancelledError:
+                pass
 
         except asyncio.CancelledError:
             pass
@@ -331,6 +381,77 @@ class EventFabric:
                 pass
             if task is not None and task in self._client_tasks:
                 self._client_tasks.remove(task)
+
+    async def _keepalive_loop(self, sub: _Subscriber) -> None:
+        """Send periodic pings and remove subscriber on timeout."""
+        try:
+            while sub.subscriber_id in self._subscribers:
+                await asyncio.sleep(self._keepalive_interval_s)
+
+                # Check if subscriber is still registered
+                if sub.subscriber_id not in self._subscribers:
+                    break
+
+                # Check liveness deadline
+                last_activity = max(sub.last_pong_received, sub.last_seen_any)
+                deadline = last_activity + self._keepalive_timeout_s
+                now = time.monotonic()
+
+                if now > deadline:
+                    logger.info(
+                        "[EventFabric] Keepalive timeout for subscriber %s "
+                        "(last activity %.1fs ago, timeout %.1fs)",
+                        sub.subscriber_id,
+                        now - last_activity,
+                        self._keepalive_timeout_s,
+                    )
+                    sub.disconnect_reason = "timeout"
+                    self._remove_subscriber(sub.subscriber_id)
+                    return
+
+                # Send ping
+                ping_frame = {
+                    "type": "ping",
+                    "ping_id": uuid.uuid4().hex[:12],
+                    "ts": time.monotonic(),
+                }
+                try:
+                    if sub.writer is not None and not sub.writer.is_closing():
+                        await asyncio.wait_for(
+                            send_frame(sub.writer, ping_frame),
+                            timeout=PONG_WRITE_TIMEOUT_S,
+                        )
+                    else:
+                        sub.disconnect_reason = "write_error"
+                        self._remove_subscriber(sub.subscriber_id)
+                        return
+                except (
+                    ConnectionResetError,
+                    BrokenPipeError,
+                    OSError,
+                    asyncio.TimeoutError,
+                ) as exc:
+                    logger.info(
+                        "[EventFabric] Ping write failed for subscriber %s: %s",
+                        sub.subscriber_id, exc,
+                    )
+                    sub.disconnect_reason = "write_error"
+                    self._remove_subscriber(sub.subscriber_id)
+                    return
+
+        except asyncio.CancelledError:
+            pass
+
+    def _handle_pong(self, sub: _Subscriber, msg: dict) -> None:
+        """Update liveness timestamps from a received pong frame."""
+        now = time.monotonic()
+        sub.last_pong_received = now
+        sub.last_seen_any = now
+        logger.debug(
+            "[EventFabric] Pong received from subscriber %s (ping_id=%s)",
+            sub.subscriber_id,
+            msg.get("ping_id", "?"),
+        )
 
     async def _subscriber_sender(self, sub: _Subscriber) -> None:
         """Continuously drain *sub.queue* and write frames to the client."""
@@ -357,6 +478,8 @@ class EventFabric:
             return
         if sub.task is not None and not sub.task.done():
             sub.task.cancel()
+        if sub.keepalive_task is not None and not sub.keepalive_task.done():
+            sub.keepalive_task.cancel()
         if sub.writer is not None:
             try:
                 sub.writer.close()
