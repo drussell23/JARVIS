@@ -523,6 +523,129 @@ class OrchestrationJournal:
             )
             self._conn.commit()
 
+    # ── Budget Reservation ───────────────────────────────────────────
+
+    def reserve_budget(
+        self,
+        estimated_cost: float,
+        op_id: str,
+        *,
+        daily_budget: float,
+    ) -> int:
+        """Atomically reserve budget via journal entry.
+
+        Returns the journal seq number if reservation succeeds.
+        Returns the existing seq if op_id was already reserved (idempotent).
+        Returns 0 if budget would be exceeded.
+        """
+        idemp_key = f"budget_reserve:{op_id}"
+
+        with self._write_lock:
+            self._verify_epoch()
+
+            # Idempotency check
+            existing = self._conn.execute(
+                "SELECT seq FROM journal "
+                "WHERE idempotency_key=? AND result != 'failed'",
+                (idemp_key,),
+            ).fetchone()
+            if existing:
+                return existing[0]
+
+            # Calculate available budget under the write lock
+            available = self._calculate_available_sync(daily_budget)
+            if estimated_cost > available:
+                return 0
+
+            # Reserve
+            seq = self._write_journal_entry_sync(
+                "budget_reserved", "budget",
+                idempotency_key=idemp_key,
+                payload={
+                    "op_id": op_id,
+                    "estimated_cost": estimated_cost,
+                    "daily_budget": daily_budget,
+                },
+            )
+            return seq
+
+    def commit_budget(self, op_id: str, actual_cost: float) -> int:
+        """Record actual cost for a previously reserved budget entry.
+
+        Returns the journal seq of the commit entry.
+        """
+        idemp_key = f"budget_commit:{op_id}"
+        return self.fenced_write(
+            "budget_committed", "budget",
+            idempotency_key=idemp_key,
+            payload={"op_id": op_id, "actual_cost": actual_cost},
+        )
+
+    def release_budget(self, op_id: str) -> int:
+        """Release a previously reserved budget (VM creation failed, etc.).
+
+        Returns the journal seq of the release entry.
+        """
+        idemp_key = f"budget_release:{op_id}"
+        return self.fenced_write(
+            "budget_released", "budget",
+            idempotency_key=idemp_key,
+            payload={"op_id": op_id},
+        )
+
+    def calculate_available_budget(self, daily_budget: float) -> float:
+        """Calculate remaining budget for today.
+
+        Thread-safe: acquires write lock for consistent read.
+        """
+        with self._write_lock:
+            return self._calculate_available_sync(daily_budget)
+
+    def _calculate_available_sync(self, daily_budget: float) -> float:
+        """Internal: calculate available budget (must hold _write_lock).
+
+        Available = daily_budget - committed_costs - reserved_but_uncommitted
+        """
+        import time as _time
+        from datetime import datetime, timezone
+
+        # Today's midnight (UTC) as epoch seconds
+        now = _time.time()
+        today_start = datetime.fromtimestamp(now, tz=timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp()
+
+        # Sum committed costs today
+        committed_row = self._conn.execute(
+            "SELECT COALESCE(SUM(json_extract(payload, '$.actual_cost')), 0) "
+            "FROM journal WHERE action='budget_committed' AND timestamp >= ?",
+            (today_start,),
+        ).fetchone()
+        committed_total = committed_row[0] if committed_row else 0.0
+
+        # Sum reserved-but-not-committed costs today
+        # A reservation is "outstanding" if there's a budget_reserved entry
+        # with no corresponding budget_committed or budget_released entry
+        reserved_row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(json_extract(j.payload, '$.estimated_cost')), 0)
+            FROM journal j
+            WHERE j.action = 'budget_reserved'
+              AND j.timestamp >= ?
+              AND j.result != 'failed'
+              AND NOT EXISTS (
+                  SELECT 1 FROM journal j2
+                  WHERE (j2.action = 'budget_committed' OR j2.action = 'budget_released')
+                    AND json_extract(j2.payload, '$.op_id') = json_extract(j.payload, '$.op_id')
+                    AND j2.timestamp >= ?
+              )
+            """,
+            (today_start, today_start),
+        ).fetchone()
+        reserved_total = reserved_row[0] if reserved_row else 0.0
+
+        return daily_budget - committed_total - reserved_total
+
     # ── Compaction ───────────────────────────────────────────────────
 
     def compact(self) -> "CompactionResult":
