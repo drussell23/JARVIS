@@ -22,6 +22,8 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # Ensure project root is on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if PROJECT_ROOT not in sys.path:
@@ -595,51 +597,53 @@ class TestGCPauseDetection(unittest.TestCase):
 # TestPressureOracleAsync
 # ===========================================================================
 
-class TestPressureOracleAsync(unittest.TestCase):
+class TestPressureOracleAsync:
+    """Async PressureOracle tests using pytest-asyncio.
 
-    def setUp(self):
+    These must NOT use asyncio.run() — in Python 3.9, asyncio.run() closes
+    and unsets the event loop on completion, poisoning all subsequent tests
+    that import modules using asyncio.Lock()/Event()/Queue() at init time.
+    pytest-asyncio manages the event loop per-test without this side effect.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_oracle(self):
         from backend.core.pressure_aware_watchdog import PressureOracle
         PressureOracle._instance = None
-
-    def tearDown(self):
-        from backend.core.pressure_aware_watchdog import PressureOracle
+        yield
         if PressureOracle._instance:
             PressureOracle._instance.stop_sampling()
         PressureOracle._instance = None
 
-    def test_start_and_stop_sampling(self):
+    @pytest.mark.asyncio
+    async def test_start_and_stop_sampling(self):
         """Oracle can start and stop sampling without errors."""
         from backend.core.pressure_aware_watchdog import PressureOracle
 
-        async def _run():
-            oracle = PressureOracle.get_instance()
-            await oracle.start_sampling()
-            self.assertTrue(oracle._running)
-            # Let it sample once
-            await asyncio.sleep(0.1)
-            oracle.stop_sampling()
-            self.assertFalse(oracle._running)
-
-        asyncio.run(_run())
+        oracle = PressureOracle.get_instance()
+        await oracle.start_sampling()
+        assert oracle._running
+        # Let it sample once
+        await asyncio.sleep(0.1)
+        oracle.stop_sampling()
+        assert not oracle._running
 
     def test_take_sample_returns_snapshot(self):
         from backend.core.pressure_aware_watchdog import PressureOracle, PressureSnapshot
         oracle = PressureOracle.get_instance()
         snap = oracle._take_sample()
-        self.assertIsInstance(snap, PressureSnapshot)
-        self.assertGreater(snap.timestamp_mono, 0)
+        assert isinstance(snap, PressureSnapshot)
+        assert snap.timestamp_mono > 0
 
-    def test_event_loop_lag_measurement(self):
+    @pytest.mark.asyncio
+    async def test_event_loop_lag_measurement(self):
         from backend.core.pressure_aware_watchdog import PressureOracle
 
-        async def _run():
-            oracle = PressureOracle.get_instance()
-            lag = await oracle._measure_event_loop_lag()
-            self.assertIsInstance(lag, float)
-            # In a non-stressed loop, lag should be very small
-            self.assertLess(lag, 500.0)  # < 500ms
-
-        asyncio.run(_run())
+        oracle = PressureOracle.get_instance()
+        lag = await oracle._measure_event_loop_lag()
+        assert isinstance(lag, float)
+        # In a non-stressed loop, lag should be very small
+        assert lag < 500.0  # < 500ms
 
 
 # ===========================================================================

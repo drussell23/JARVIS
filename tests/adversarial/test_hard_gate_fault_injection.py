@@ -151,12 +151,17 @@ class TestHardGateFaultInjection:
 
         reconciler = RecoveryReconciler(j2, engine)
 
-        # comp_b is "STARTING" from epoch1 — probe says UNREACHABLE
+        # comp_b is "STARTING" from epoch1 — probe says UNREACHABLE.
+        # Provide a start_timestamp from >60s ago to indicate it was actually
+        # launched but crashed (not "never launched").
         probe_result = ProbeResult(
             reachable=False,
             category=HealthCategory.UNREACHABLE,
         )
-        actions = await reconciler.reconcile("comp_b", "STARTING", probe_result)
+        stale_start = time.time() - 120  # 120s ago — well past 60s grace
+        actions = await reconciler.reconcile(
+            "comp_b", "STARTING", probe_result, start_timestamp=stale_start,
+        )
 
         # STARTING + UNREACHABLE -> should produce FAILED transition
         assert len(actions) > 0, "Reconciler produced no corrective actions for stalled component"

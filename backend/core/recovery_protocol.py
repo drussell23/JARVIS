@@ -381,12 +381,21 @@ class RecoveryReconciler:
         # ── STARTING/HANDSHAKING + unreachable ───────────────
         elif projected in ("STARTING", "HANDSHAKING") and category == HealthCategory.UNREACHABLE:
             if projected == "STARTING" and start_timestamp is None:
-                # Never launched — request start, don't mark failed
-                actions.append(await self._apply_transition(
-                    component, "STARTING",
-                    reason="reconcile_start_requested",
-                    idemp_key=idemp_base,
-                ))
+                # Never launched — already in STARTING, emit start-requested
+                # action without attempting a self-transition (STARTING → STARTING
+                # is not a valid lifecycle engine transition).
+                action = {
+                    "component": component,
+                    "to": "STARTING",
+                    "reason": "reconcile_start_requested",
+                    "seq": self._journal.current_seq,
+                    "idempotency_key": idemp_base,
+                }
+                logger.info(
+                    "[RecoveryReconciler] %s: start requested (never launched)",
+                    component,
+                )
+                actions.append(action)
             elif projected == "STARTING" and start_timestamp is not None:
                 import time as _time
                 elapsed = _time.time() - start_timestamp
