@@ -59,20 +59,20 @@ class TestErrorTaxonomy:
 class TestFeatureFlags:
     """Verify feature flags read from environment."""
 
-    def test_budget_enforce_default_false(self, monkeypatch):
+    def test_budget_enforce_default_true(self, monkeypatch):
         monkeypatch.delenv("JARVIS_BUDGET_ENFORCE", raising=False)
         # Force reimport to pick up env change
         import importlib
         import backend.core.execution_context as mod
         importlib.reload(mod)
-        assert mod.BUDGET_ENFORCE is False
+        assert mod.BUDGET_ENFORCE is True  # Design: defaults to True
 
-    def test_budget_enforce_true(self, monkeypatch):
-        monkeypatch.setenv("JARVIS_BUDGET_ENFORCE", "1")
+    def test_budget_enforce_disabled(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_BUDGET_ENFORCE", "false")
         import importlib
         import backend.core.execution_context as mod
         importlib.reload(mod)
-        assert mod.BUDGET_ENFORCE is True
+        assert mod.BUDGET_ENFORCE is False
 
     def test_budget_shadow_default_false(self, monkeypatch):
         monkeypatch.delenv("JARVIS_BUDGET_SHADOW", raising=False)

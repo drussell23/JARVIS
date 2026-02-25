@@ -56,7 +56,9 @@ def _truthy(val: Optional[str]) -> bool:
     return val is not None and val.strip().lower() in ("1", "true", "yes")
 
 
-BUDGET_ENFORCE: bool = _truthy(os.environ.get("JARVIS_BUDGET_ENFORCE"))
+BUDGET_ENFORCE: bool = os.environ.get(
+    "JARVIS_BUDGET_ENFORCE", "true"
+).strip().lower() in ("1", "true", "yes")
 BUDGET_SHADOW: bool = _truthy(os.environ.get("JARVIS_BUDGET_SHADOW"))
 
 # ---------------------------------------------------------------------------
