@@ -332,6 +332,10 @@ class TraceEnvelopeFactory:
         self._clock = LamportClock()
 
     @property
+    def boot_id(self) -> str:
+        return self._boot_id
+
+    @property
     def runtime_epoch_id(self) -> str:
         return self._runtime_epoch_id
 
