@@ -17,8 +17,7 @@ Design doc: docs/plans/2026-02-24-cross-repo-control-plane-design.md
 import asyncio
 import logging
 import random
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
@@ -55,10 +54,6 @@ class ProbeResult:
 # ── States that need probing vs. those that don't ─────────────────
 
 _SKIP_PROBE_STATES = frozenset({"STOPPED", "REGISTERED"})
-_ACTIVE_STATES = frozenset({
-    "STARTING", "HANDSHAKING", "READY", "DEGRADED",
-    "DRAINING", "STOPPING", "FAILED", "LOST",
-})
 
 
 # ── Recovery Prober ────────────────────────────────────────────────
@@ -88,7 +83,7 @@ class RecoveryProber:
 
     async def classify_for_probe(
         self,
-        component: str,
+        component: str,  # noqa: ARG002 — required by protocol
         projected_status: str,
     ) -> Optional[str]:
         """Decide whether a component needs probing.
@@ -284,12 +279,12 @@ class RecoveryReconciler:
 
         Returns a list of corrective action dicts applied (for auditing).
         """
-        actions: List[dict] = []
+        actions: List[Optional[dict]] = []
 
         # Lease gate
         if not self._journal.lease_held:
             logger.warning("[RecoveryReconciler] Lease lost, aborting reconcile for %s", component)
-            return actions
+            return []
 
         category = probe.category
         idemp_base = self._make_idempotency_key(component, projected, probe)

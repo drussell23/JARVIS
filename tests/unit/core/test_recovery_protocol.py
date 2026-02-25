@@ -4,8 +4,6 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from backend.core.lifecycle_engine import (
     ComponentDeclaration,
     ComponentLocality,
@@ -395,7 +393,7 @@ class TestRecoveryReconciler:
 
         seq_counter = [100]
 
-        async def inc_seq(*args, **kwargs):
+        async def inc_seq(*_args, **_kwargs):
             seq_counter[0] += 1
             return seq_counter[0]
 
@@ -427,7 +425,7 @@ class TestRecoveryReconciler:
 
         seq_counter = [100]
 
-        async def inc_seq(*args, **kwargs):
+        async def inc_seq(*_args, **_kwargs):
             seq_counter[0] += 1
             return seq_counter[0]
 
@@ -483,7 +481,7 @@ class TestRecoveryReconciler:
 
         seq_counter = [100]
 
-        async def inc_seq(*args, **kwargs):
+        async def inc_seq(*_args, **_kwargs):
             seq_counter[0] += 1
             return seq_counter[0]
 
