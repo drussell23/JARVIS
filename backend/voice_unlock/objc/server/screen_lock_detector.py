@@ -1,84 +1,251 @@
 #!/usr/bin/env python3
 """
-Screen Lock Detection Module - Enhanced v2.0
+Screen Lock Detection Module - Enhanced v3.0
 =============================================
 
 Provides robust, multi-method screen lock detection for macOS.
 Uses multiple detection strategies with fallbacks for reliability.
 
-Key improvement: Uses CGSession API via ctypes as fallback when
-pyobjc-framework-Quartz is not available.
+v3.0: PRIMARY method is now pure ctypes (CoreFoundation + CoreGraphics C APIs).
+      This avoids importing pyobjc-framework-Quartz which triggers loading
+      AppKit._metadata — a 15K+ line ObjC bridge registration. That import is
+      NOT safe in threads when CoreAudio IO thread is running (AudioBus active),
+      as it causes SIGSEGV due to concurrent native ObjC runtime mutation.
+      Same class of bug as v270.0 (torch/whisper) and v268.0 (scipy/BLAS).
 """
 
 import subprocess
 import logging
 import os
 import ctypes
-import ctypes.util
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Native macOS APIs via ctypes (fallback when Quartz module unavailable)
+# Pure ctypes CGSession implementation (CoreAudio-IO-thread-safe)
 # =============================================================================
+# Uses CoreFoundation + CoreGraphics C APIs directly. NO ObjC bridge loading,
+# NO AppKit._metadata import, safe to call from ANY thread concurrently with
+# CoreAudio IO thread.
 
-_CGSession = None
+_cf_lib = None
+_cg_lib = None
+_ctypes_ready = False
 
-def _init_cgsession():
-    """Initialize CGSession via ctypes for native screen lock detection."""
-    global _CGSession
-    if _CGSession is not None:
-        return _CGSession
+# CoreFoundation constants
+_kCFStringEncodingUTF8 = 0x08000100
+_kCFNumberFloat64Type = 13
+
+
+def _ensure_ctypes_frameworks() -> bool:
+    """One-time init of CoreFoundation + CoreGraphics ctypes bindings.
+
+    Loads the C dylibs and sets up function signatures. These are pure C
+    libraries — no ObjC runtime interaction, no AppKit, no pyobjc.
+    Thread-safe: dylib loading is idempotent and the global assignment is atomic.
+    """
+    global _cf_lib, _cg_lib, _ctypes_ready
+    if _ctypes_ready:
+        return _cf_lib is not None and _cg_lib is not None
 
     try:
-        # Load ApplicationServices framework
-        framework_path = ctypes.util.find_library('ApplicationServices')
-        if framework_path:
-            _CGSession = ctypes.CDLL(framework_path)
-            return _CGSession
-    except Exception as e:
-        logger.debug(f"[SCREEN-DETECT] Could not load ApplicationServices: {e}")
+        cf = ctypes.CDLL(
+            '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation'
+        )
+        cg = ctypes.CDLL(
+            '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics'
+        )
 
+        # CGSessionCopyCurrentDictionary() -> CFDictionaryRef
+        cg.CGSessionCopyCurrentDictionary.restype = ctypes.c_void_p
+
+        # CFStringCreateWithCString(alloc, cStr, encoding) -> CFStringRef
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32
+        ]
+
+        # CFDictionaryGetValue(dict, key) -> value (does NOT retain)
+        cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+        cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        # CFBooleanGetValue(boolean) -> bool
+        cf.CFBooleanGetValue.restype = ctypes.c_bool
+        cf.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+
+        # CFGetTypeID(cf) -> CFTypeID
+        cf.CFGetTypeID.restype = ctypes.c_ulong
+        cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+
+        # Type ID getters (no args)
+        cf.CFBooleanGetTypeID.restype = ctypes.c_ulong
+        cf.CFNumberGetTypeID.restype = ctypes.c_ulong
+
+        # CFNumberGetValue(number, theType, valuePtr) -> bool
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p
+        ]
+
+        # CFRelease(cf)
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        _cf_lib = cf
+        _cg_lib = cg
+        _ctypes_ready = True
+        return True
+
+    except Exception as e:
+        logger.debug(f"[SCREEN-DETECT] Failed to init ctypes frameworks: {e}")
+        _ctypes_ready = True  # Don't retry on every call
+        return False
+
+
+def _cf_dict_get_bool(cf, session_dict: int, key_name: bytes) -> Optional[bool]:
+    """Read a CFBoolean value from a CFDictionary by key name."""
+    key_cf = cf.CFStringCreateWithCString(None, key_name, _kCFStringEncodingUTF8)
+    if not key_cf:
+        return None
     try:
-        # Alternative: Load CoreGraphics directly
-        cg_path = '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics'
-        if os.path.exists(cg_path):
-            _CGSession = ctypes.CDLL(cg_path)
-            return _CGSession
-    except Exception as e:
-        logger.debug(f"[SCREEN-DETECT] Could not load CoreGraphics: {e}")
+        val = cf.CFDictionaryGetValue(session_dict, key_cf)
+        if not val:
+            return None
+        type_id = cf.CFGetTypeID(val)
+        if type_id == cf.CFBooleanGetTypeID():
+            return bool(cf.CFBooleanGetValue(val))
+        return None
+    finally:
+        cf.CFRelease(key_cf)
 
-    return None
+
+def _cf_dict_get_number(cf, session_dict: int, key_name: bytes) -> Optional[float]:
+    """Read a CFNumber value from a CFDictionary by key name."""
+    key_cf = cf.CFStringCreateWithCString(None, key_name, _kCFStringEncodingUTF8)
+    if not key_cf:
+        return None
+    try:
+        val = cf.CFDictionaryGetValue(session_dict, key_cf)
+        if not val:
+            return None
+        type_id = cf.CFGetTypeID(val)
+        if type_id == cf.CFNumberGetTypeID():
+            result = ctypes.c_double(0)
+            if cf.CFNumberGetValue(val, _kCFNumberFloat64Type, ctypes.byref(result)):
+                return result.value
+        return None
+    finally:
+        cf.CFRelease(key_cf)
 
 
 def _check_cgsession_locked_via_ctypes() -> Optional[bool]:
     """
-    Check screen lock via native CGSession API using ctypes.
-    This is a fallback when pyobjc-framework-Quartz is not installed.
+    Check screen lock via CGSession API using pure ctypes.
+
+    This is the PRIMARY detection method because it uses CoreFoundation and
+    CoreGraphics C APIs directly — no ObjC bridge, no AppKit._metadata loading.
+    Safe to call from any thread, including when CoreAudio IO thread is running.
 
     Returns:
         Optional[bool]: True if locked, False if unlocked, None if cannot determine
     """
+    if not _ensure_ctypes_frameworks():
+        return None
+
+    cf = _cf_lib
+    cg = _cg_lib
+
     try:
-        # Use CoreFoundation to read session dictionary
-        cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
-        cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-
-        # CGSessionCopyCurrentDictionary returns a CFDictionaryRef
-        cg.CGSessionCopyCurrentDictionary.restype = ctypes.c_void_p
-
         session_dict = cg.CGSessionCopyCurrentDictionary()
         if not session_dict:
             return None
 
-        # We need to check the dictionary for CGSSessionScreenIsLocked
-        # Since this is complex with ctypes, use a simpler approach via osascript
-        cf.CFRelease(ctypes.c_void_p(session_dict))
-        return None  # Fall through to other methods
+        try:
+            # Check CGSSessionScreenIsLocked (boolean — definitive lock indicator)
+            is_locked = _cf_dict_get_bool(cf, session_dict, b"CGSSessionScreenIsLocked")
+            if is_locked is True:
+                logger.info(
+                    "🔒 [SCREEN-DETECT] LOCKED via ctypes CGSSessionScreenIsLocked"
+                )
+                return True
+
+            # Check CGSSessionScreenLockedTime (number > 0 means lock active)
+            lock_time = _cf_dict_get_number(
+                cf, session_dict, b"CGSSessionScreenLockedTime"
+            )
+            if lock_time is not None and lock_time > 0:
+                logger.info(
+                    "🔒 [SCREEN-DETECT] LOCKED via ctypes CGSSessionScreenLockedTime"
+                )
+                return True
+
+            # Check kCGSSessionOnConsoleKey (False = not on console = locked)
+            on_console = _cf_dict_get_bool(
+                cf, session_dict, b"kCGSSessionOnConsoleKey"
+            )
+            if on_console is False:
+                logger.info(
+                    "🔒 [SCREEN-DETECT] LOCKED via ctypes kCGSSessionOnConsoleKey=False"
+                )
+                return True
+
+            # Dictionary obtained and no lock indicators — screen is unlocked
+            logger.info(
+                "🔓 [SCREEN-DETECT] CGSession (ctypes) says UNLOCKED - Fast Path"
+            )
+            return False
+
+        finally:
+            cf.CFRelease(session_dict)
 
     except Exception as e:
         logger.debug(f"[SCREEN-DETECT] ctypes CGSession check failed: {e}")
+        return None
+
+
+def _get_cgsession_details_via_ctypes() -> Optional[Dict[str, Any]]:
+    """
+    Get detailed CGSession dictionary values via pure ctypes.
+
+    Returns:
+        Optional[dict]: Session details or None if ctypes unavailable
+    """
+    if not _ensure_ctypes_frameworks():
+        return None
+
+    cf = _cf_lib
+    cg = _cg_lib
+
+    try:
+        session_dict = cg.CGSessionCopyCurrentDictionary()
+        if not session_dict:
+            return None
+
+        try:
+            locked = _cf_dict_get_bool(
+                cf, session_dict, b"CGSSessionScreenIsLocked"
+            )
+            lock_time = _cf_dict_get_number(
+                cf, session_dict, b"CGSSessionScreenLockedTime"
+            )
+            on_console = _cf_dict_get_bool(
+                cf, session_dict, b"kCGSSessionOnConsoleKey"
+            )
+            screensaver = _cf_dict_get_bool(
+                cf, session_dict, b"CGSSessionScreenSaverIsActive"
+            )
+
+            return {
+                "CGSSessionScreenIsLocked": locked if locked is not None else False,
+                "CGSSessionScreenLockedTime": lock_time if lock_time is not None else 0,
+                "kCGSSessionOnConsoleKey": on_console if on_console is not None else True,
+                "CGSSessionScreenSaverIsActive": screensaver if screensaver is not None else False,
+            }
+        finally:
+            cf.CFRelease(session_dict)
+
+    except Exception as e:
+        logger.debug(f"[SCREEN-DETECT] ctypes session details failed: {e}")
         return None
 
 
@@ -196,13 +363,18 @@ def is_screen_locked() -> bool:
     Check if the macOS screen is currently locked.
 
     Uses MULTIPLE detection methods in order of reliability:
-    1. Direct Quartz CGSessionCopyCurrentDictionary (most reliable)
-    2. Native CGSession via ctypes (fallback when Quartz unavailable)
-    3. osascript UI interaction check (detects lock screen password prompt)
-    4. Lock-related process check (loginwindow, ScreenSaverEngine)
-    5. IORegistry display power state check
-    6. Login window frontmost check
-    7. Screen capture test (definitive but slower)
+    1. Pure ctypes CGSessionCopyCurrentDictionary (most reliable, CoreAudio-safe)
+    2. osascript UI interaction check (detects lock screen password prompt)
+    3. Lock-related process check (loginwindow, ScreenSaverEngine)
+    4. IORegistry display power state check
+    5. Login window frontmost check
+    6. Screen capture test (definitive but slower)
+    7. Console user check (final fallback)
+
+    v3.0: Quartz pyobjc import removed as primary method. It triggers loading
+    AppKit._metadata (15K+ lines of ObjC bridge registration) which causes
+    SIGSEGV when called in a thread while CoreAudio IO thread is running.
+    Pure ctypes reads the same CGSession dictionary via C APIs — no ObjC bridge.
 
     IMPORTANT: If ANY reliable method says locked, we return True.
     This prevents false "already unlocked" responses.
@@ -214,37 +386,22 @@ def is_screen_locked() -> bool:
 
     try:
         # =====================================================================
-        # Method 1: Direct Quartz API check (MOST RELIABLE)
+        # Method 1: Pure ctypes CGSession API (MOST RELIABLE, THREAD-SAFE)
+        # Uses CoreFoundation + CoreGraphics C APIs directly.
+        # Does NOT load AppKit._metadata — safe with CoreAudio IO thread.
         # =====================================================================
-        try:
-            import Quartz
-            session_dict = Quartz.CGSessionCopyCurrentDictionary()
-            if session_dict:
-                # Check the definitive lock indicator
-                screen_locked = session_dict.get('CGSSessionScreenIsLocked', False)
-                if screen_locked:
-                    logger.info("🔒 [SCREEN-DETECT] LOCKED via Quartz CGSSessionScreenIsLocked")
-                    return True
-
-                # Also check if screen saver with lock is active
-                screensaver_time = session_dict.get('CGSSessionScreenLockedTime', 0)
-                if screensaver_time and screensaver_time > 0:
-                    logger.info("🔒 [SCREEN-DETECT] LOCKED via Quartz CGSSessionScreenLockedTime")
-                    return True
-
-                # Check on-console status
-                on_console = session_dict.get('kCGSSessionOnConsoleKey', True)
-                if not on_console:
-                    logger.info("🔒 [SCREEN-DETECT] LOCKED via kCGSSessionOnConsoleKey=False")
-                    return True
-
-                detection_results.append(("Quartz", False))
-                logger.info("🔓 [SCREEN-DETECT] Quartz says UNLOCKED - Trusting Quartz (Fast Path)")
+        ctypes_result = _check_cgsession_locked_via_ctypes()
+        if ctypes_result is not None:
+            # ctypes gave a definitive answer — trust it (fast path)
+            if ctypes_result:
+                return True
+            else:
+                detection_results.append(("CGSession-ctypes", False))
+                logger.info(
+                    "🔓 [SCREEN-DETECT] ctypes CGSession says UNLOCKED - "
+                    "Trusting ctypes (Fast Path)"
+                )
                 return False
-        except ImportError:
-            logger.debug("[SCREEN-DETECT] Quartz not available, trying fallbacks")
-        except Exception as e:
-            logger.debug(f"[SCREEN-DETECT] Quartz check failed: {e}")
 
         # =====================================================================
         # Method 2: osascript UI interaction check (CATCHES LOCK SCREEN PROMPT)
@@ -406,21 +563,18 @@ def get_screen_state_details() -> Dict[str, Any]:
     }
 
     try:
-        # Method 1: Quartz CGSession
-        try:
-            import Quartz
-            session_dict = Quartz.CGSessionCopyCurrentDictionary()
-            if session_dict:
-                details["methods"]["quartz"] = {
-                    "CGSSessionScreenIsLocked": session_dict.get('CGSSessionScreenIsLocked', False),
-                    "CGSSessionScreenLockedTime": session_dict.get('CGSSessionScreenLockedTime', 0),
-                    "kCGSSessionOnConsoleKey": session_dict.get('kCGSSessionOnConsoleKey', True),
-                }
-                if details["methods"]["quartz"]["CGSSessionScreenIsLocked"]:
-                    details["isLocked"] = True
-                    details["detectionMethod"] = "Quartz-CGSSessionScreenIsLocked"
-        except Exception as e:
-            details["diagnostics"]["quartz_error"] = str(e)
+        # Method 1: CGSession via pure ctypes (CoreAudio-IO-thread-safe)
+        session_info = _get_cgsession_details_via_ctypes()
+        if session_info is not None:
+            details["methods"]["cgsession_ctypes"] = session_info
+            if session_info.get("CGSSessionScreenIsLocked"):
+                details["isLocked"] = True
+                details["detectionMethod"] = "ctypes-CGSSessionScreenIsLocked"
+            elif session_info.get("CGSSessionScreenSaverIsActive"):
+                details["isLocked"] = True
+                details["detectionMethod"] = "ctypes-CGSSessionScreenSaverIsActive"
+        else:
+            details["diagnostics"]["ctypes_cgsession"] = "unavailable"
 
         # Method 2: Login window frontmost
         try:

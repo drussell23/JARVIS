@@ -461,15 +461,27 @@ class ScreensaverIntegration:
             return False
             
     def _is_screen_locked(self) -> bool:
-        """Check if screen is locked"""
+        """Check if screen is locked using CoreAudio-safe ctypes approach."""
         try:
-            # Use Quartz CGSessionCopyCurrentDictionary
-            session_dict = Quartz.CGSessionCopyCurrentDictionary()
-            if session_dict:
-                screen_locked = session_dict.get("CGSSessionScreenIsLocked", 0)
-                return bool(screen_locked)
+            # v270.1: Use ctypes-based check first — safe with CoreAudio IO thread.
+            # Avoids triggering AppKit._metadata load via Quartz pyobjc bridge.
+            from voice_unlock.objc.server.screen_lock_detector import (
+                _check_cgsession_locked_via_ctypes,
+            )
+            result = _check_cgsession_locked_via_ctypes()
+            if result is not None:
+                return result
+        except ImportError:
+            pass
+
+        try:
+            # Fallback: use pre-imported Quartz (safe if already loaded at module level)
+            if Quartz is not None:
+                session_dict = Quartz.CGSessionCopyCurrentDictionary()
+                if session_dict:
+                    screen_locked = session_dict.get("CGSSessionScreenIsLocked", 0)
+                    return bool(screen_locked)
             return False
-            
         except Exception as e:
             logger.error(f"Error checking screen lock: {e}")
             return False

@@ -2185,17 +2185,19 @@ class AdvancedAsyncPipeline:
         Returns within 2 seconds max.
         """
         try:
-            # Strategy 1: Direct Quartz session check (fastest, most reliable)
+            # Strategy 1: Pure ctypes CGSession check (fastest, CoreAudio-safe)
+            # v270.1: Replaced `from Quartz import CGSessionCopyCurrentDictionary`
+            # with ctypes-based check. Importing Quartz triggers AppKit._metadata
+            # (15K+ ObjC bridge lines) — SIGSEGV risk when CoreAudio IO thread active.
             try:
-                from Quartz import CGSessionCopyCurrentDictionary
-                session_dict = CGSessionCopyCurrentDictionary()
-                if session_dict:
-                    is_locked = session_dict.get("CGSSessionScreenIsLocked", False)
-                    screen_saver = session_dict.get("CGSSessionScreenSaverIsRunning", False)
-                    if is_locked or screen_saver:
-                        logger.debug(f"[FAST-LOCK-CHECK] Quartz: locked={is_locked}, screensaver={screen_saver}")
-                        return True
-                    return False
+                from voice_unlock.objc.server.screen_lock_detector import (
+                    _check_cgsession_locked_via_ctypes,
+                )
+                ctypes_result = _check_cgsession_locked_via_ctypes()
+                if ctypes_result is not None:
+                    if ctypes_result:
+                        logger.debug("[FAST-LOCK-CHECK] ctypes CGSession: locked")
+                    return ctypes_result
             except ImportError:
                 pass
 

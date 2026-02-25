@@ -28,24 +28,27 @@ class ScreenLockContextDetector:
         self._last_state = None
 
     async def is_screen_locked(self) -> bool:
-        """Check if screen is currently locked using Quartz directly.
+        """Check if screen is currently locked using pure ctypes CGSession API.
 
-        v265.0: Direct Quartz check — no SystemStateMonitor dependency.
-        Uses same Quartz keys as simple_context_handler_enhanced.py.
+        v265.0: Direct CGSession check — no SystemStateMonitor dependency.
+        v270.1: Replaced `from Quartz import CGSessionCopyCurrentDictionary`
+        with ctypes-based check from the canonical screen_lock_detector module.
+        Importing Quartz triggers AppKit._metadata (15K+ lines of ObjC bridge
+        registration) which causes SIGSEGV when CoreAudio IO thread is running.
         """
         try:
-            from Quartz import CGSessionCopyCurrentDictionary
+            from voice_unlock.objc.server.screen_lock_detector import (
+                _check_cgsession_locked_via_ctypes,
+            )
 
-            session_dict = CGSessionCopyCurrentDictionary()
-            if session_dict:
-                screen_locked = session_dict.get("CGSSessionScreenIsLocked", False)
-                screen_saver = session_dict.get("CGSSessionScreenSaverIsActive", False)
-                return bool(screen_locked or screen_saver)
+            result = _check_cgsession_locked_via_ctypes()
+            if result is not None:
+                return result
             return False
         except ImportError:
-            logger.debug("[ScreenLockDetector] Quartz not available")
+            logger.debug("[ScreenLockDetector] screen_lock_detector not available")
         except Exception as e:
-            logger.debug(f"[ScreenLockDetector] Quartz check failed: {e}")
+            logger.debug(f"[ScreenLockDetector] ctypes CGSession check failed: {e}")
         return False
 
     async def check_screen_context(
