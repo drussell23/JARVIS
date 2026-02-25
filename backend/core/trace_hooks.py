@@ -114,7 +114,9 @@ def on_boot_failed(
     try:
         meta = {"phase": phase, "duration_s": duration_s}
         if metadata:
-            meta.update(metadata)
+            # Filter out keys that collide with named params of _emit()
+            safe_md = {k: v for k, v in metadata.items() if k not in ("error", "event_type", "ts", "component", "envelope")}
+            meta.update(safe_md)
         emitter.boot_failed(error=error, metadata=meta)
     except Exception:
         logger.debug("Failed to emit boot_failed", exc_info=True)

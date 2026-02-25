@@ -15109,15 +15109,16 @@ class IntelligentResourceOrchestrator:
         )
 
         # v278.0: If any resource check raised an exception, provide safe defaults
+        # Types must match actual return types: memory→dict, disk→float, ports→tuple, cpu→tuple
         if isinstance(memory_result, BaseException):
             logger.warning(f"[ResourceOrch] Memory check failed: {memory_result}")
-            memory_result = {"available_gb": 8.0, "total_gb": 16.0, "pressure": "nominal"}
+            memory_result = {"available_gb": 8.0, "total_gb": 16.0, "pressure": 50.0, "used_gb": 8.0, "percent_used": 50.0}
         if isinstance(disk_result, BaseException):
             logger.warning(f"[ResourceOrch] Disk check failed: {disk_result}")
-            disk_result = {"available_gb": 50.0, "total_gb": 500.0}
+            disk_result = 50.0  # float: available GB
         if isinstance(ports_result, BaseException):
             logger.warning(f"[ResourceOrch] Ports check failed: {ports_result}")
-            ports_result = {"available": True, "conflicts": []}
+            ports_result = ([], [], [])  # Tuple[List[int], List[int], List[str]]
         if isinstance(cpu_result, BaseException):
             logger.warning(f"[ResourceOrch] CPU check failed: {cpu_result}")
             cpu_result = (os.cpu_count() or 4, None)
@@ -57191,7 +57192,13 @@ class StartupWatchdog:
             self._logger.warning(
                 f"[DMS] ⚠️ WARNING ({self._warnings_issued[phase]}): Phase '{phase}' {reason}"
             )
-        
+            # v278.0: Trace recovery outcome — warn issued
+            if _TRACE_HOOKS_AVAILABLE and _trace_recovery_complete:
+                try:
+                    _trace_recovery_complete(phase, "warn_issued")
+                except Exception:
+                    pass
+
         elif action == "diagnostic":
             self._diagnostics_dumped[phase] = self._diagnostics_dumped.get(phase, 0) + 1
             self._logger.warning(f"[DMS] 📊 Dumping diagnostics for phase '{phase}'")
@@ -57211,7 +57218,13 @@ class StartupWatchdog:
                     )
                 except Exception:
                     pass
-        
+            # v278.0: Trace recovery outcome — diagnostic dumped
+            if _TRACE_HOOKS_AVAILABLE and _trace_recovery_complete:
+                try:
+                    _trace_recovery_complete(phase, "diagnostic_dumped")
+                except Exception:
+                    pass
+
         elif action == "restart":
             self._restarts_attempted[phase] = self._restarts_attempted.get(phase, 0) + 1
             attempts = self._restarts_attempted[phase]
@@ -65797,6 +65810,8 @@ class JarvisSystemKernel:
                             _trace_phase_fail("preflight", error="preflight_failed")
                         if _trace_phase_exit:
                             _trace_phase_exit("preflight", progress=15, success=False, duration_s=time.time() - _t0_pf)
+                        if _trace_boot_failed:
+                            _trace_boot_failed(error="preflight_failed", phase="preflight", duration_s=time.time() - _t0_pf)
                     except Exception:
                         pass
                 issue_collector.print_health_report()
@@ -65904,6 +65919,8 @@ class JarvisSystemKernel:
                             _trace_phase_fail("resources", error="resources_failed")
                         if _trace_phase_exit:
                             _trace_phase_exit("resources", progress=25, success=False, duration_s=time.time() - _t0_rs)
+                        if _trace_boot_failed:
+                            _trace_boot_failed(error="resources_failed", phase="resources", duration_s=time.time() - _t0_rs)
                     except Exception:
                         pass
                 issue_collector.print_health_report()
@@ -66001,6 +66018,8 @@ class JarvisSystemKernel:
                             _trace_phase_fail("backend", error="backend_failed")
                         if _trace_phase_exit:
                             _trace_phase_exit("backend", progress=45, success=False, duration_s=time.time() - _t0_be)
+                        if _trace_boot_failed:
+                            _trace_boot_failed(error="backend_failed", phase="backend", duration_s=time.time() - _t0_be)
                     except Exception:
                         pass
                 issue_collector.print_health_report()
