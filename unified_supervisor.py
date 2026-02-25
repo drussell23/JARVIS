@@ -9548,6 +9548,13 @@ class GCPInstanceManager(ResourceManagerBase):
         self._last_preemption_time = time.time()
         self._recovery_attempts += 1
 
+        # Notify V2 lifecycle state machine
+        try:
+            from backend.core.gcp_lifecycle_bridge import notify_bridge
+            notify_bridge("notify_spot_preempted", recovery_attempt=self._recovery_attempts)
+        except Exception:
+            pass
+
         self._logger.warning(
             f"Spot VM preempted! Recovery attempt {self._recovery_attempts}/{self._max_recovery_attempts}"
         )
@@ -12303,6 +12310,11 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
 
     async def _handle_preemption(self) -> None:
         """Handle preemption event (30 seconds to cleanup)."""
+        try:
+            from backend.core.gcp_lifecycle_bridge import notify_bridge
+            notify_bridge("notify_spot_preempted", source="SpotInstanceResilienceHandler")
+        except Exception:
+            pass
         self._logger.warning("⚠️ SPOT PREEMPTION NOTICE - 30 seconds to shutdown!")
 
         self.preemption_count += 1
@@ -20418,6 +20430,11 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
         2. Notify external systems
         3. Trigger fallback
         """
+        try:
+            from backend.core.gcp_lifecycle_bridge import notify_bridge
+            notify_bridge("notify_spot_preempted", source="GCPSpotResilienceManager")
+        except Exception:
+            pass
         self._logger.warning(
             "⚠️ SPOT PREEMPTION NOTICE - 30 seconds to shutdown!"
         )

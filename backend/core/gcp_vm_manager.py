@@ -37,6 +37,15 @@ from enum import Enum
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
+# Lifecycle bridge — fire-and-forget notifications to V2 state machine.
+# All calls are no-ops when JARVIS_GCP_LIFECYCLE_V2 is disabled.
+def _notify_lifecycle(method: str, **kw: Any) -> None:
+    try:
+        from backend.core.gcp_lifecycle_bridge import notify_bridge
+        notify_bridge(method, **kw)
+    except Exception:
+        pass
+
 # Google Cloud Compute Engine API
 # Use TYPE_CHECKING to allow type hints without requiring the library at runtime
 COMPUTE_AVAILABLE = False
@@ -4569,6 +4578,7 @@ class GCPVMManager:
                     allowed, reason, details = await self.cost_tracker.can_create_vm()
                     if not allowed:
                         logger.warning(f"🚫 VM creation blocked by budget: {reason}")
+                        _notify_lifecycle("notify_budget_exhausted", reason=reason)
                         return (False, reason, 0.0)
                     
                     # Log budget status if close to limit
@@ -4581,6 +4591,7 @@ class GCPVMManager:
                     # Fallback to simple daily cost check
                     daily_cost = await self.cost_tracker.get_daily_cost()
                     if daily_cost >= self.config.daily_budget_usd:
+                        _notify_lifecycle("notify_budget_exhausted", reason=f"daily_budget_exceeded:{daily_cost:.2f}")
                         return (
                             False,
                             f"Daily budget exceeded: ${daily_cost:.2f} / ${self.config.daily_budget_usd:.2f}",
@@ -5004,6 +5015,7 @@ class GCPVMManager:
 
                     # Wait for operation to complete
                     await self._wait_for_operation(operation)
+                    _notify_lifecycle("notify_vm_create_accepted", vm_name=vm_name)
 
                     # Get the created instance
                     instance = await asyncio.to_thread(
@@ -5199,7 +5211,8 @@ class GCPVMManager:
 
             # All attempts failed - record in circuit breaker
             circuit.record_failure(last_error)
-            
+            _notify_lifecycle("notify_vm_create_failed", error=str(last_error))
+
             self.stats["total_failed"] += 1
             
             # Check if this was a quota failure
@@ -6275,6 +6288,7 @@ class GCPVMManager:
                 f"[VMLifecycle] VM '{vm_name}' stopped successfully "
                 f"(runtime: {vm_runtime_seconds / 3600:.2f}h)"
             )
+            _notify_lifecycle("notify_vm_stopped", vm_name=vm_name, reason=reason)
             return True
 
         except Exception as e:
@@ -6285,6 +6299,7 @@ class GCPVMManager:
                     f"[VMLifecycle] VM '{vm_name}' not found during stop "
                     f"(may have been preempted) — marking STOPPED"
                 )
+                _notify_lifecycle("notify_spot_preempted", vm_name=vm_name)
                 async with self._vm_lock:
                     if vm_name in self.managed_vms:
                         self.managed_vms[vm_name].state = VMState.STOPPED
@@ -6437,6 +6452,7 @@ class GCPVMManager:
             circuit.record_success()
 
             logger.info(f"✅ VM terminated: {vm_name}")
+            _notify_lifecycle("notify_vm_stopped", vm_name=vm_name, reason=reason)
             logger.info(f"   Uptime: {vm.uptime_hours:.2f}h")
             logger.info(f"   Cost: ${vm.total_cost:.4f}")
 
@@ -6463,6 +6479,7 @@ class GCPVMManager:
                     f"✅ VM '{vm_name}' was deleted between existence check and delete call "
                     f"(likely preempted or deleted by another process)"
                 )
+                _notify_lifecycle("notify_spot_preempted", vm_name=vm_name)
                 # Clean up tracking - VM is in desired state
                 async with self._vm_lock:
                     vm.state = VMState.TERMINATED
@@ -7082,12 +7099,14 @@ class GCPVMManager:
                                             f"demoting from routing layer"
                                         )
                                         await self._ensure_endpoint_depropagated(vm)
+                                        _notify_lifecycle("notify_vm_unhealthy", vm_name=vm_name, consecutive_failures=_fc)
                                         vm.metadata["_ep_fail_count"] = 0
                                     else:
                                         logger.info(
                                             f"[MonitorLoop] VM '{vm_name}' health endpoint "
                                             f"failed (attempt {_fc}/2, will demote on next)"
                                         )
+                                        _notify_lifecycle("notify_vm_degraded", vm_name=vm_name, failure_count=_fc)
                                 else:
                                     # Reset failure counter on success
                                     vm.metadata["_ep_fail_count"] = 0
@@ -7124,6 +7143,7 @@ class GCPVMManager:
                         logger.info(
                             f"⏰ VM {vm_name} exceeded max lifetime ({self.config.max_vm_lifetime_hours}h)"
                         )
+                        _notify_lifecycle("notify_budget_exhausted", vm_name=vm_name, uptime_hours=vm.uptime_hours)
                         # v271.0: Log max-lifetime termination decision
                         try:
                             from backend.core.decision_log import record_decision, DECISION_VM_TERMINATION
@@ -7208,6 +7228,7 @@ class GCPVMManager:
                                 f"📉 Local RAM normalized ({local_mem_percent:.1f}%) - "
                                 f"VM {vm_name} no longer needed"
                             )
+                            _notify_lifecycle("notify_pressure_cooled", local_mem_percent=local_mem_percent, vm_name=vm_name)
                             # v271.0: Log memory-pressure termination decision
                             try:
                                 from backend.core.decision_log import record_decision, DECISION_VM_TERMINATION
@@ -7542,6 +7563,7 @@ class GCPVMManager:
                     logger.warning(
                         f"🚫 [InvincibleNode] ensure_static_vm_ready blocked by budget: {reason}"
                     )
+                    _notify_lifecycle("notify_budget_exhausted", reason=reason)
                     return (False, None, f"BUDGET_EXCEEDED: {reason}")
             except Exception as e:
                 logger.error(
@@ -7696,6 +7718,7 @@ class GCPVMManager:
 
         # Step 5: Poll health endpoint until ready (outside lock to avoid blocking)
         logger.info(f"☁️ [InvincibleNode] Polling health endpoint (timeout: {max_timeout}s)...")
+        _notify_lifecycle("notify_handshake_started", vm_name=instance_name, timeout=max_timeout)
 
         # v235.0: Protect VM from cost tracker termination during startup polling.
         # Cost tracker runs in a separate async task and can kill "idle" VMs.
@@ -7715,8 +7738,12 @@ class GCPVMManager:
 
         if poll_success:
             logger.info(f"✅ [InvincibleNode] VM ready: {static_ip}")
+            _notify_lifecycle("notify_handshake_succeeded", vm_name=instance_name, ip=static_ip)
             return True, static_ip, "READY"
         else:
+            if "timeout" in str(final_status).lower():
+                _notify_lifecycle("notify_boot_deadline_exceeded", vm_name=instance_name, status=final_status)
+            _notify_lifecycle("notify_handshake_failed", vm_name=instance_name, status=final_status)
             return False, static_ip, f"HEALTH_TIMEOUT: {final_status}"
 
     async def _get_static_ip_address(self, ip_name: str, auto_create: bool = True) -> Optional[str]:
@@ -9085,6 +9112,7 @@ fi
 
             # Wait for creation
             await self._wait_for_operation(operation, timeout=300)
+            _notify_lifecycle("notify_vm_create_accepted", vm_name=instance_name)
 
             logger.info(
                 f"✅ [InvincibleNode] VM created: {instance_name} "
@@ -9094,6 +9122,7 @@ fi
 
         except Exception as e:
             logger.error(f"❌ [InvincibleNode] Failed to create VM: {e}")
+            _notify_lifecycle("notify_vm_create_failed", error=str(e))
             return False, str(e)
 
     async def _poll_health_until_ready(

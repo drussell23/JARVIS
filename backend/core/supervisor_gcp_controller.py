@@ -32,6 +32,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Lifecycle bridge — fire-and-forget notifications to V2 state machine.
+def _notify_lifecycle(method: str, **kw: Any) -> None:
+    try:
+        from backend.core.gcp_lifecycle_bridge import notify_bridge
+        notify_bridge(method, **kw)
+    except Exception:
+        pass
+
 
 # ============================================================================
 # ENUMS AND TYPES
@@ -500,18 +508,22 @@ class SupervisorAwareGCPController:
                         request.decision_timestamp = datetime.now()
                         self._record_request(request)
                         return decision, reason
-            
+                else:
+                    _notify_lifecycle("notify_cooldown_expired", elapsed_minutes=elapsed)
+
             # Check 5: Budget check
             estimated_hours = estimated_duration_minutes / 60
             is_emergency = urgency == "critical"
             can_afford, budget_reason = self.can_afford_vm(estimated_hours, is_emergency)
             if not can_afford:
                 decision = VMDecision.DENY_BUDGET
+                _notify_lifecycle("notify_budget_denied", reason=budget_reason)
                 request.decision = decision
                 request.decision_reason = budget_reason
                 request.decision_timestamp = datetime.now()
                 self._record_request(request)
                 return decision, budget_reason
+            _notify_lifecycle("notify_budget_approved", reason=budget_reason)
             
             # Check 6: Effectiveness check
             total_vms = self._effective_vms + self._ineffective_vms
@@ -540,6 +552,7 @@ class SupervisorAwareGCPController:
             # All checks passed - approve creation
             decision = VMDecision.CREATE
             reason = f"Approved: {memory_reason}"
+            _notify_lifecycle("notify_pressure_triggered", reason=memory_reason, urgency=urgency)
             request.decision = decision
             request.decision_reason = reason
             request.decision_timestamp = datetime.now()

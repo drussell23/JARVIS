@@ -88,6 +88,40 @@ def reset_lifecycle_bridge() -> None:
     _bridge_lock = None
 
 
+def notify_bridge(method_name: str, **kwargs) -> None:
+    """Fire-and-forget lifecycle notification for non-async callers.
+
+    Safe to call from anywhere — swallows all errors, no-ops when V2 is
+    disabled or bridge not yet initialized.  Schedules the notification
+    as a background task on the running event loop.
+
+    Usage from gcp_vm_manager / supervisor_gcp_controller::
+
+        from backend.core.gcp_lifecycle_bridge import notify_bridge
+        notify_bridge("notify_vm_create_accepted", vm_name=name)
+    """
+    bridge = _bridge_instance
+    if bridge is None:
+        return
+
+    method = getattr(bridge, method_name, None)
+    if method is None:
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _fire() -> None:
+        try:
+            await asyncio.wait_for(method(**kwargs), timeout=2.0)
+        except Exception:
+            pass  # fire-and-forget — errors logged inside _emit()
+
+    loop.create_task(_fire())
+
+
 class GCPLifecycleBridge:
     """Thin bridge between unified_supervisor and the V2 lifecycle engine.
 
@@ -160,6 +194,11 @@ class GCPLifecycleBridge:
         self._engine = engine
         self._initialized = True
 
+        # Register lease-lost callback so the state machine learns
+        # immediately when another leader steals the journal lease.
+        if hasattr(journal, "on_lease_lost"):
+            journal.on_lease_lost(self._on_lease_lost)
+
         logger.info(
             "[GCPLifecycleBridge] Initialized (state=%s, holder=%s)",
             engine.state.value, holder_id,
@@ -191,6 +230,10 @@ class GCPLifecycleBridge:
 
         self._initialized = False
         logger.info("[GCPLifecycleBridge] Shutdown complete")
+
+    def _on_lease_lost(self, new_holder: str) -> None:
+        """Callback invoked by OrchestrationJournal when lease is stolen."""
+        notify_bridge("notify_lease_lost", new_holder=new_holder)
 
     # ── State query ───────────────────────────────────────────────────
 
