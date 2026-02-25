@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ControlPlaneSubscriber", "HandshakeResponder"]
 
+PONG_WRITE_TIMEOUT_S = 2.0
+
 
 class HandshakeResponder:
     """Responds to supervisor handshake proposals.
@@ -90,6 +92,7 @@ class ControlPlaneSubscriber:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._receive_task: Optional[asyncio.Task] = None
         self._connected = False
+        self._last_subscribe_ack: Optional[Dict[str, Any]] = None
 
     # -- Properties ----------------------------------------------------------
 
@@ -207,6 +210,33 @@ class ControlPlaneSubscriber:
         data = await self._reader.readexactly(length)
         return json.loads(data)
 
+    async def _send_pong(self, ping_msg: Dict[str, Any]) -> None:
+        """Send a pong frame in response to a server ping, with bounded timeout."""
+        if self._writer is None or self._writer.is_closing():
+            return
+        pong_frame = {
+            "type": "pong",
+            "ping_id": ping_msg.get("ping_id", ""),
+            "ts": ping_msg.get("ts"),
+        }
+        try:
+            data = json.dumps(pong_frame, separators=(",", ":")).encode("utf-8")
+            header = struct.pack(">I", len(data))
+            self._writer.write(header + data)
+            await asyncio.wait_for(
+                self._writer.drain(), timeout=PONG_WRITE_TIMEOUT_S
+            )
+        except (
+            ConnectionResetError,
+            BrokenPipeError,
+            OSError,
+            asyncio.TimeoutError,
+        ) as exc:
+            logger.warning(
+                "Failed to send pong for subscriber %s: %s",
+                self._subscriber_id, exc,
+            )
+
     async def _receive_loop(self) -> None:
         """Background task that reads events from the UDS connection."""
         assert self._reader is not None
@@ -214,7 +244,13 @@ class ControlPlaneSubscriber:
             while self._connected:
                 try:
                     event = await self._recv_frame()
-                    self._dispatch_event(event)
+                    msg_type = event.get("type", "")
+                    if msg_type == "ping":
+                        await self._send_pong(event)
+                    elif msg_type == "subscribe_ack":
+                        self._last_subscribe_ack = event
+                    else:
+                        self._dispatch_event(event)
                 except asyncio.IncompleteReadError:
                     logger.info(
                         "UDS connection closed for subscriber %s",
