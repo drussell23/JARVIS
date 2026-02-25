@@ -289,20 +289,44 @@ class MacOSTTSEngine(BaseTTSEngine):
             cmd.append(text)
 
             # Run synthesis
-            # v266.5: start_new_session=True isolates the subprocess from
-            # the parent process group.  Without this, process-group-wide
-            # signals (e.g. SIGINT sent during zombie cleanup at startup)
-            # propagate to the `say` child and kill it mid-synthesis.
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
+            # v270.1: Use asyncio.create_subprocess_exec() instead of
+            # subprocess.run() in a thread executor. Previous approach had
+            # two problems:
+            # 1. subprocess.run() is synchronous+blocking — no clean cancellation
+            # 2. Race window between fork() and setsid() where SIGINT can reach
+            #    child despite start_new_session=True
+            # 3. check=True turns SIGINT into hard CalledProcessError
+            #
+            # asyncio subprocess gives us proper timeout/cancel control and
+            # start_new_session=True still isolates the process group.
+            # SIGINT (returncode -2) during startup is non-fatal and retriable.
+            _max_sigint_retries = 2
+            for _attempt in range(_max_sigint_retries + 1):
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
-                ),
-            )
+                )
+                await proc.wait()
+
+                if proc.returncode == 0:
+                    break  # Success
+
+                if proc.returncode == -2 and _attempt < _max_sigint_retries:
+                    # SIGINT hit during fork→setsid race window — retry
+                    logger.debug(
+                        "[MacOSTTS] say process killed by SIGINT (attempt %d/%d), retrying",
+                        _attempt + 1, _max_sigint_retries + 1,
+                    )
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Non-retriable failure
+                stderr_bytes = await proc.stderr.read() if proc.stderr else b""
+                raise subprocess.CalledProcessError(
+                    proc.returncode, cmd, stderr=stderr_bytes,
+                )
 
             # Read audio file
             audio_data, sample_rate = sf.read(temp_file)

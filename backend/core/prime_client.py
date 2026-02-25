@@ -978,7 +978,13 @@ class PrimeClient:
                 )
 
     async def _check_health(self) -> PrimeStatus:
-        """Check Prime health status."""
+        """Check Prime health status.
+
+        v270.1: Parse and store JSON response as ``_last_health_data`` so the
+        v276.0 version gate can validate the health schema during hot-swap.
+        Previously the JSON body was never read, leaving ``_last_health_data``
+        empty and causing the schema validation to always fail.
+        """
         try:
             async with self._pool.get_session() as session:
                 # Handle both aiohttp and httpx
@@ -994,6 +1000,11 @@ class PrimeClient:
                             self._status = PrimeStatus.DEGRADED
                         else:
                             self._status = PrimeStatus.UNAVAILABLE
+                        # v270.1: Parse JSON body for schema validation
+                        try:
+                            self._last_health_data = await resp.json()
+                        except Exception:
+                            self._last_health_data = {}
                 else:
                     # httpx style
                     resp = await session.get(self._config.health_url)
@@ -1003,6 +1014,11 @@ class PrimeClient:
                         self._status = PrimeStatus.DEGRADED
                     else:
                         self._status = PrimeStatus.UNAVAILABLE
+                    # v270.1: Parse JSON body for schema validation
+                    try:
+                        self._last_health_data = resp.json()
+                    except Exception:
+                        self._last_health_data = {}
 
             self._last_health_check = time.time()
             # v276.0 Phase 12: Record forward reachability for partition detection
