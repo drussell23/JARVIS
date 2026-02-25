@@ -32,24 +32,30 @@ def _get_emitter():
         return None
 
 
-def on_boot_start(metadata: Optional[Dict[str, Any]] = None) -> None:
+def on_boot_start(boot_id: str = "", metadata: Optional[Dict[str, Any]] = None) -> None:
     """Call once at the very start of _startup_impl()."""
     emitter = _get_emitter()
     if emitter is None:
         return
     try:
-        emitter.boot_start(metadata=metadata)
+        meta = {"boot_id": boot_id} if boot_id else {}
+        if metadata:
+            meta.update(metadata)
+        emitter.boot_start(metadata=meta or None)
     except Exception:
         logger.debug("Failed to emit boot_start", exc_info=True)
 
 
-def on_boot_complete(metadata: Optional[Dict[str, Any]] = None) -> None:
+def on_boot_complete(duration_s: float = 0.0, metadata: Optional[Dict[str, Any]] = None) -> None:
     """Call when startup completes successfully."""
     emitter = _get_emitter()
     if emitter is None:
         return
     try:
-        emitter.boot_complete(metadata=metadata)
+        meta = {"duration_s": duration_s} if duration_s else {}
+        if metadata:
+            meta.update(metadata)
+        emitter.boot_complete(metadata=meta or None)
     except Exception:
         logger.debug("Failed to emit boot_complete", exc_info=True)
 
@@ -70,6 +76,7 @@ def on_phase_enter(phase: str, progress: int = 0, metadata: Optional[Dict[str, A
 
 def on_phase_exit(
     phase: str, progress: int = 0, success: bool = True,
+    duration_s: float = 0.0,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Call when exiting a startup phase."""
@@ -77,7 +84,7 @@ def on_phase_exit(
     if emitter is None:
         return
     try:
-        meta = {"progress_pct": progress}
+        meta = {"progress_pct": progress, "duration_s": duration_s}
         if metadata:
             meta.update(metadata)
         emitter.phase_exit(phase, success=success, metadata=meta)

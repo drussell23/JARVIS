@@ -1755,14 +1755,6 @@ def _task_done_callback(task: asyncio.Task, name: str = "unnamed") -> None:
         )
 
 
-# v276.0: Causal traceability — context-propagating task creation
-try:
-    from backend.core.context_task import create_traced_task as _create_traced_task
-    _TRACED_TASK_AVAILABLE = True
-except ImportError:
-    _TRACED_TASK_AVAILABLE = False
-    _create_traced_task = None
-
 
 async def _run_in_context(coro: Coroutine[Any, Any, Any]) -> Any:
     """Await a coroutine (used as target for contextvars.Context.run).

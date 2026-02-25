@@ -60,11 +60,15 @@ from backend.core.async_safety import TimeoutConfig, LazyAsyncEvent, get_shutdow
 
 # v276.0: Causal traceability — HTTP trace header propagation
 try:
-    from backend.core.trace_http import merge_trace_headers as _merge_trace_headers
+    from backend.core.trace_http import (
+        merge_trace_headers as _merge_trace_headers,
+        extract_trace_from_response as _extract_trace_from_response,
+    )
     _TRACE_HTTP_AVAILABLE = True
 except ImportError:
     _TRACE_HTTP_AVAILABLE = False
     _merge_trace_headers = None
+    _extract_trace_from_response = None
 
 logger = logging.getLogger(__name__)
 
@@ -1187,10 +1191,9 @@ class PrimeClient:
                     response_headers = dict(resp.headers)
 
                 # v276.0: Extract incoming trace context from Prime response
-                if _TRACE_HTTP_AVAILABLE:
+                if _TRACE_HTTP_AVAILABLE and _extract_trace_from_response:
                     try:
-                        from backend.core.trace_http import extract_trace_from_response
-                        extract_trace_from_response(response_headers)
+                        _extract_trace_from_response(response_headers)
                     except Exception:
                         pass
 
