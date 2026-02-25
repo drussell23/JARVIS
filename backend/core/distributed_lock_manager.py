@@ -256,6 +256,7 @@ class AsyncRedisLockClient:
         self._available = False
         self._connect_lock = asyncio.Lock()
         self._last_check = 0.0
+        self._last_check_mono = 0.0  # v276.0 Phase 11: monotonic rate limit
         self._check_interval = 30.0  # Re-check availability every 30s
         self._initialized = True
 
@@ -265,11 +266,15 @@ class AsyncRedisLockClient:
             if self._client is not None and self._available:
                 return True
 
-            # Rate limit connection attempts
-            now = time.time()
-            if now - self._last_check < self._check_interval and not self._available:
+            # Rate limit connection attempts — v276.0: monotonic clock
+            try:
+                from backend.core.monotonic_clock import monotonic_now as _redis_mono
+                _rl_now = _redis_mono()
+            except ImportError:
+                _rl_now = time.time()
+            if _rl_now - self._last_check_mono < self._check_interval and not self._available:
                 return False
-            self._last_check = now
+            self._last_check_mono = _rl_now
 
             try:
                 # Try importing redis-py async (preferred) or aioredis (legacy)
@@ -1798,8 +1803,15 @@ class DistributedLockManager:
                         should_clean = True
                         reason = f"identity validation failed: {validation_reason}"
                     # Also check for our own stale lock from previous run
+                    # v276.0 Phase 11: Scale stale threshold by system pressure
                     elif metadata.owner == self._owner_id:
-                        if metadata.acquired_at < time.time() - 60:
+                        _stale_threshold = 60
+                        try:
+                            from backend.core.pressure_aware_watchdog import pressure_multiplier as _dlm_pres_mult
+                            _stale_threshold = 60 * _dlm_pres_mult()
+                        except ImportError:
+                            pass
+                        if metadata.acquired_at < time.time() - _stale_threshold:
                             should_clean = True
                             reason = "own stale lock from previous run"
 
@@ -2343,6 +2355,19 @@ class DistributedLockManager:
                         f"({consecutive_failures}/{max_failures})"
                     )
                     if consecutive_failures >= max_failures:
+                        # v276.0 Phase 11: Check pressure before giving up
+                        try:
+                            from backend.core.pressure_aware_watchdog import should_defer_destructive_action as _ka_defer
+                            _ka_should_defer, _ka_reason = _ka_defer("DLM.keepalive_exhaustion")
+                            if _ka_should_defer:
+                                consecutive_failures = 0
+                                logger.warning(
+                                    f"[v3.2] v276.0: Keepalive failure count reset due to "
+                                    f"system pressure for '{lock_name}': {_ka_reason}"
+                                )
+                                continue
+                        except ImportError:
+                            pass
                         logger.error(
                             f"[v3.2] Keepalive gave up for '{lock_name}' after "
                             f"{max_failures} consecutive failures — auto-releasing"
@@ -2361,6 +2386,19 @@ class DistributedLockManager:
                     f"({consecutive_failures}/{max_failures})"
                 )
                 if consecutive_failures >= max_failures:
+                    # v276.0 Phase 11: Check pressure before giving up (exception path)
+                    try:
+                        from backend.core.pressure_aware_watchdog import should_defer_destructive_action as _ka_defer2
+                        _ka_should_defer2, _ka_reason2 = _ka_defer2("DLM.keepalive_exhaustion")
+                        if _ka_should_defer2:
+                            consecutive_failures = 0
+                            logger.warning(
+                                f"[v3.2] v276.0: Keepalive failure count reset due to "
+                                f"system pressure for '{lock_name}': {_ka_reason2}"
+                            )
+                            continue
+                    except ImportError:
+                        pass
                     logger.error(
                         f"[v3.2] Keepalive gave up for '{lock_name}' after "
                         f"{max_failures} consecutive failures — auto-releasing"

@@ -186,21 +186,32 @@ class CircuitBreaker:
     state: CircuitState = CircuitState.CLOSED
     failure_count: int = 0
     last_failure_time: Optional[float] = None
+    last_failure_mono: Optional[float] = None  # v276.0 Phase 11
     half_open_calls: int = 0
-    
+
     def can_execute(self) -> Tuple[bool, str]:
         """Check if we can execute an operation"""
         if self.state == CircuitState.CLOSED:
             return True, "Circuit closed - normal operation"
-        
+
         if self.state == CircuitState.OPEN:
-            # Check if we should transition to half-open
-            if self.last_failure_time and (time.time() - self.last_failure_time) >= self.recovery_timeout:
+            # v276.0 Phase 11: Prefer monotonic for recovery timing
+            if self.last_failure_mono is not None:
+                try:
+                    from backend.core.monotonic_clock import monotonic_now as _gcp_cb_mono
+                    _elapsed = _gcp_cb_mono() - self.last_failure_mono
+                except ImportError:
+                    _elapsed = time.time() - (self.last_failure_time or 0)
+            elif self.last_failure_time:
+                _elapsed = time.time() - self.last_failure_time
+            else:
+                _elapsed = 0
+            if _elapsed >= self.recovery_timeout:
                 self.state = CircuitState.HALF_OPEN
                 self.half_open_calls = 0
                 logger.info(f"🔌 Circuit '{self.name}' transitioning to HALF_OPEN")
                 return True, "Circuit half-open - testing recovery"
-            return False, f"Circuit OPEN - {self.recovery_timeout - (time.time() - (self.last_failure_time or 0)):.0f}s until retry"
+            return False, f"Circuit OPEN - {self.recovery_timeout - _elapsed:.0f}s until retry"
         
         # Half-open state
         if self.half_open_calls < self.half_open_max_calls:
@@ -219,6 +230,12 @@ class CircuitBreaker:
         """Record failed operation"""
         self.failure_count += 1
         self.last_failure_time = time.time()
+        # v276.0 Phase 11: Also store monotonic timestamp
+        try:
+            from backend.core.monotonic_clock import monotonic_now as _gcp_cb_mono_rf
+            self.last_failure_mono = _gcp_cb_mono_rf()
+        except ImportError:
+            pass
         
         if self.state == CircuitState.HALF_OPEN:
             logger.warning(f"⚠️ Circuit '{self.name}' recovery failed - re-opening")
@@ -2222,6 +2239,14 @@ wait
             health_url = f"http://{vm_ip}:8000/health/startup"
             max_build_time = 20 * 60  # 20 minutes max (typical build is 10-15 min)
             min_build_time = 10 * 60  # Wait at least 10 minutes before giving up
+            # v276.0 Phase 11: Monotonic deadline for golden image build
+            try:
+                from backend.core.monotonic_clock import MonotonicDeadline as _GIBDeadline
+                _build_deadline = _GIBDeadline(max_build_time, label="golden_image_build")
+                _min_build_deadline = _GIBDeadline(min_build_time, label="golden_image_min_build")
+            except ImportError:
+                _build_deadline = None
+                _min_build_deadline = None
             start_time = time.time()
             last_progress = 0
             consecutive_failures = 0
@@ -2230,7 +2255,7 @@ wait
             if AIOHTTP_AVAILABLE:
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
-                    while time.time() - start_time < max_build_time:
+                    while (not _build_deadline.is_expired() if _build_deadline else time.time() - start_time < max_build_time):
                         try:
                             async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                                 if resp.status == 200:
@@ -2257,8 +2282,9 @@ wait
                             
                             # If health endpoint is consistently unreachable (likely firewall),
                             # and we've waited the minimum time, proceed anyway
-                            elapsed = time.time() - start_time
-                            if consecutive_failures >= max_consecutive_failures and elapsed >= min_build_time:
+                            elapsed = _build_deadline.elapsed() if _build_deadline else time.time() - start_time
+                            _min_elapsed = _min_build_deadline.is_expired() if _min_build_deadline else elapsed >= min_build_time
+                            if consecutive_failures >= max_consecutive_failures and _min_elapsed:
                                 self.logger.info(
                                     f"[GoldenImageBuilder] Health endpoint unreachable after {int(elapsed/60)}min. "
                                     f"Proceeding with image creation (build likely complete)."

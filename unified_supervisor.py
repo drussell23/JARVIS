@@ -2208,6 +2208,19 @@ class ProgressAwareStartupController:
         Raises:
             asyncio.TimeoutError: If startup stalls or exceeds hard cap
         """
+        # v276.0 Phase 11: Use monotonic clock for lifecycle deadlines.
+        # time.time() fails under NTP adjustments, suspend/resume, clock jumps.
+        try:
+            from backend.core.monotonic_clock import MonotonicDeadline, monotonic_now as _pc_monotonic_now
+            self._mono_deadline = MonotonicDeadline(self.base_timeout, label="ProgressController")
+            self._mono_hard_cap = MonotonicDeadline(self.max_timeout, label="ProgressController.hard_cap")
+            self._last_progress_mono = _pc_monotonic_now()
+            self._last_activity_mono = _pc_monotonic_now()
+            self._last_diag_log_mono = _pc_monotonic_now()
+            self._completion_seen_mono = 0.0
+            self._pc_has_monotonic = True
+        except ImportError:
+            self._pc_has_monotonic = False
         self._start_time = time.time()
         self._current_deadline = self._start_time + self.base_timeout
         self._last_progress_time = self._start_time
@@ -2233,9 +2246,15 @@ class ProgressAwareStartupController:
 
         try:
             while True:
-                now = time.time()
-                elapsed = now - self._start_time
-                remaining = self._current_deadline - now
+                # v276.0 Phase 11: Prefer monotonic elapsed/remaining for all deadline decisions.
+                if getattr(self, '_pc_has_monotonic', False):
+                    elapsed = self._mono_deadline.elapsed()
+                    remaining = self._mono_deadline.remaining()
+                    now = time.time()  # kept for backward-compat logging only
+                else:
+                    now = time.time()
+                    elapsed = now - self._start_time
+                    remaining = self._current_deadline - now
 
                 # Check if task completed
                 if task.done():
@@ -2372,20 +2391,40 @@ class ProgressAwareStartupController:
                 if should_extend:
                     new_deadline = now + self.extension_buffer
 
-                    # Check hard cap
-                    hard_cap_deadline = self._start_time + self.max_timeout
-                    if new_deadline > hard_cap_deadline:
-                        new_deadline = hard_cap_deadline
-                        if new_deadline <= now:
-                            self.logger.warning(
-                                f"[ProgressController] HARD CAP reached ({self.max_timeout:.0f}s). "
-                                f"Progress: {progress_pct:.1f}%"
-                            )
-                            task.cancel()
-                            raise asyncio.TimeoutError(
-                                f"Startup hard cap reached ({self.max_timeout:.0f}s) "
-                                f"at {progress_pct:.1f}% progress"
-                            )
+                    # Check hard cap — v276.0: prefer monotonic + pressure-aware
+                    if getattr(self, '_pc_has_monotonic', False):
+                        _hard_cap_expired = self._mono_hard_cap.is_expired()
+                    else:
+                        hard_cap_deadline = self._start_time + self.max_timeout
+                        _hard_cap_expired = (new_deadline > hard_cap_deadline and hard_cap_deadline <= now)
+                        new_deadline = min(new_deadline, hard_cap_deadline) if not _hard_cap_expired else new_deadline
+                    if _hard_cap_expired:
+                        # v276.0 Phase 11: Check pressure before killing
+                        try:
+                            from backend.core.pressure_aware_watchdog import should_defer_destructive_action as _pc_defer
+                            _defer, _reason = _pc_defer("ProgressController.hard_cap")
+                            if _defer:
+                                if getattr(self, '_pc_has_monotonic', False):
+                                    self._mono_hard_cap.extend(60.0)
+                                else:
+                                    self.max_timeout += 60.0
+                                self.logger.warning(
+                                    f"[ProgressController] v276.0: Hard cap deferred due to "
+                                    f"system pressure: {_reason}. Extended by 60s."
+                                )
+                                _hard_cap_expired = False  # suppress kill this cycle
+                        except ImportError:
+                            pass
+                    if _hard_cap_expired:
+                        self.logger.warning(
+                            f"[ProgressController] HARD CAP reached ({self.max_timeout:.0f}s). "
+                            f"Progress: {progress_pct:.1f}%"
+                        )
+                        task.cancel()
+                        raise asyncio.TimeoutError(
+                            f"Startup hard cap reached ({self.max_timeout:.0f}s) "
+                            f"at {progress_pct:.1f}% progress"
+                        )
 
                     if new_deadline > self._current_deadline:
                         self._extensions_granted += 1
@@ -4993,10 +5032,16 @@ class IntelligentKernelTakeover:
             # Wait for process to exit
             self.logger.info(f"[Takeover] Waiting for PID {pid} to exit (timeout: {self.handover_timeout}s)...")
 
+            # v276.0 Phase 11: Monotonic handover deadline
+            try:
+                from backend.core.monotonic_clock import MonotonicDeadline as _HandoverDeadline
+                _handover_dl = _HandoverDeadline(self.handover_timeout, label="handover")
+            except ImportError:
+                _handover_dl = None
             start = time.time()
-            while time.time() - start < self.handover_timeout:
+            while (not _handover_dl.is_expired() if _handover_dl else time.time() - start < self.handover_timeout):
                 if not self._is_process_alive_basic(pid):
-                    elapsed = time.time() - start
+                    elapsed = _handover_dl.elapsed() if _handover_dl else time.time() - start
                     self.logger.success(f"[Takeover] Graceful handover complete in {elapsed:.1f}s")
                     return True
                 await asyncio.sleep(0.5)
@@ -5277,6 +5322,7 @@ else:
             self._failure_count = 0
             self._success_count = 0
             self._last_failure_time: Optional[float] = None
+            self._last_failure_mono: Optional[float] = None  # v276.0 Phase 11
             self._half_open_calls = 0
             self._lock = threading.Lock()
 
@@ -5285,8 +5331,18 @@ else:
             """Get current state (may transition from OPEN to HALF_OPEN)."""
             with self._lock:
                 if self._state == CircuitBreakerState.OPEN:
-                    if self._last_failure_time and \
-                       time.time() - self._last_failure_time >= self.recovery_timeout:
+                    # v276.0 Phase 11: Prefer monotonic for recovery timing
+                    if self._last_failure_mono is not None:
+                        try:
+                            from backend.core.monotonic_clock import monotonic_now as _cb_mono
+                            _elapsed = _cb_mono() - self._last_failure_mono
+                        except ImportError:
+                            _elapsed = time.time() - (self._last_failure_time or 0)
+                    elif self._last_failure_time:
+                        _elapsed = time.time() - self._last_failure_time
+                    else:
+                        _elapsed = 0
+                    if _elapsed >= self.recovery_timeout:
                         self._state = CircuitBreakerState.HALF_OPEN
                         self._half_open_calls = 0
                 return self._state
@@ -5320,6 +5376,12 @@ else:
             with self._lock:
                 self._failure_count += 1
                 self._last_failure_time = time.time()
+                # v276.0 Phase 11: Also store monotonic timestamp
+                try:
+                    from backend.core.monotonic_clock import monotonic_now as _cb_mono_rf
+                    self._last_failure_mono = _cb_mono_rf()
+                except ImportError:
+                    pass
 
                 if self._state == CircuitBreakerState.HALF_OPEN:
                     self._state = CircuitBreakerState.OPEN
@@ -56389,8 +56451,10 @@ class StartupWatchdog:
         # State tracking
         self._current_phase: Optional[str] = None
         self._phase_start_time: float = 0
+        self._phase_start_mono: float = 0  # v276.0 Phase 11: monotonic
         self._last_progress: int = 0
         self._last_progress_time: float = 0
+        self._last_progress_time_mono: float = 0  # v276.0 Phase 11: monotonic
         self._last_progress_value_change_time: float = 0
         self._running = False
         self._watchdog_task: Optional[asyncio.Task] = None
@@ -56780,6 +56844,14 @@ class StartupWatchdog:
             old_phase = self._current_phase
             self._current_phase = phase_key
             self._phase_start_time = now
+            # v276.0 Phase 11: Set monotonic phase start
+            try:
+                from backend.core.monotonic_clock import monotonic_now as _dms_mono_sp
+                self._phase_start_mono = _dms_mono_sp()
+                self._last_progress_time_mono = _dms_mono_sp()
+            except ImportError:
+                self._phase_start_mono = 0
+                self._last_progress_time_mono = 0
             self._last_progress_value_change_time = now
             # v232.3: Reset progress tracking for new phase to prevent false regression.
             # Without this, the first update in a new phase (e.g., 71%) gets compared
@@ -56804,6 +56876,12 @@ class StartupWatchdog:
         # This prevents false stall detection when callbacks report same progress
         # (e.g., Trinity health waits reporting progress=66 repeatedly)
         self._last_progress_time = now
+        # v276.0 Phase 11: Update monotonic heartbeat
+        try:
+            from backend.core.monotonic_clock import monotonic_now as _dms_mono_up
+            self._last_progress_time_mono = _dms_mono_up()
+        except ImportError:
+            pass
 
         # v232.2: Progress sanity checks — validate data is plausible
         _sanitized_progress = progress
@@ -56885,9 +56963,15 @@ class StartupWatchdog:
                 if not self._current_phase:
                     continue
                 
-                now = time.time()
+                # v276.0 Phase 11: Prefer monotonic for phase elapsed calculation
+                try:
+                    from backend.core.monotonic_clock import monotonic_now as _dms_mono
+                    _dms_now_mono = _dms_mono()
+                except ImportError:
+                    _dms_now_mono = time.time()
+                now = time.time()  # kept for backward-compat logging
                 phase_config = self._phase_configs.get(self._current_phase)
-                
+
                 if not phase_config:
                     # Unknown phase, use default timeout
                     phase_timeout = 120.0
@@ -56897,8 +56981,8 @@ class StartupWatchdog:
                     phase_timeout = self._calculate_dynamic_timeout(self._current_phase)
                     recovery_action = phase_config.recovery_action
 
-                # Check for phase timeout
-                phase_elapsed = now - self._phase_start_time
+                # Check for phase timeout — v276.0: monotonic elapsed
+                phase_elapsed = (_dms_now_mono - self._phase_start_mono) if self._phase_start_mono > 0 else (now - self._phase_start_time)
                 if phase_elapsed > phase_timeout:
                     # v232.2: PROGRESS-AWARE DECISION — don't kill advancing processes
                     if self._is_progress_advancing():
@@ -56925,6 +57009,18 @@ class StartupWatchdog:
                     # v232.1: Enforce cooldown between escalation steps.
                     _last_action = self._last_timeout_action_time.get(self._current_phase, 0)
                     if (now - _last_action) >= self._escalation_cooldown:
+                        # v276.0 Phase 11: Check pressure before destructive escalation
+                        try:
+                            from backend.core.pressure_aware_watchdog import should_defer_destructive_action as _dms_defer
+                            _dms_should_defer, _dms_reason = _dms_defer("DMS.phase_timeout")
+                            if _dms_should_defer and recovery_action not in ("warn",):
+                                self._logger.info(
+                                    f"[DMS] v276.0: Phase timeout escalation deferred "
+                                    f"due to pressure: {_dms_reason}"
+                                )
+                                continue
+                        except ImportError:
+                            pass
                         self._last_timeout_action_time[self._current_phase] = now
                         await self._handle_timeout(
                             self._current_phase,
@@ -56933,15 +57029,27 @@ class StartupWatchdog:
                             recovery_action
                         )
                     continue
-                
-                # Check for stall (no progress change)
-                progress_stale = now - self._last_progress_time if self._last_progress_time else 0
+
+                # Check for stall (no progress change) — v276.0: monotonic
+                progress_stale = (_dms_now_mono - self._last_progress_time_mono) if self._last_progress_time_mono > 0 else (now - self._last_progress_time if self._last_progress_time else 0)
                 if progress_stale > self._stall_threshold:
                     # v250.1: Enforce cooldown between stall escalation steps.
                     # Without this, every 5s check escalates one step, reaching
                     # rollback in 25s. Cooldown ensures minimum spacing.
                     _last_stall_action = self._last_stall_action_time.get(self._current_phase, 0)
                     if (now - _last_stall_action) >= self._stall_escalation_cooldown:
+                        # v276.0 Phase 11: Check pressure before stall escalation
+                        try:
+                            from backend.core.pressure_aware_watchdog import should_defer_destructive_action as _dms_stall_defer
+                            _stall_should_defer, _stall_reason = _dms_stall_defer("DMS.stall_escalation")
+                            if _stall_should_defer and recovery_action not in ("warn",):
+                                self._logger.info(
+                                    f"[DMS] v276.0: Stall escalation deferred "
+                                    f"due to pressure: {_stall_reason}"
+                                )
+                                continue
+                        except ImportError:
+                            pass
                         self._last_stall_action_time[self._current_phase] = now
                         await self._handle_stall(
                             self._current_phase,
@@ -57058,6 +57166,13 @@ class StartupWatchdog:
                         # Reset phase timer + stall cooldown (v253.1)
                         self._phase_start_time = time.time()
                         self._last_progress_time = time.time()
+                        # v276.0 Phase 11: Reset monotonic timestamps too
+                        try:
+                            from backend.core.monotonic_clock import monotonic_now as _dms_mono_rst
+                            self._phase_start_mono = _dms_mono_rst()
+                            self._last_progress_time_mono = _dms_mono_rst()
+                        except ImportError:
+                            pass
                         self._last_stall_action_time.pop(phase, None)
                         self._warnings_issued.pop(phase, None)
                         self._diagnostics_dumped.pop(phase, None)

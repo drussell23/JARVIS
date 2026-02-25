@@ -379,8 +379,17 @@ class ParentDeathDetector:
             timestamp = data.get("timestamp", 0)
             
             # Check 1: Is heartbeat recent?
+            # v276.0 Phase 11: Scale stale threshold by system pressure.
+            # During CPU/GC pressure, filesystem writes stall → heartbeat file
+            # appears stale → FATAL cascade.  Pressure multiplier extends threshold.
             age = time.time() - timestamp
-            if age > HEARTBEAT_STALE_THRESHOLD:
+            _effective_threshold = HEARTBEAT_STALE_THRESHOLD
+            try:
+                from backend.core.pressure_aware_watchdog import pressure_multiplier as _hb_pres_mult
+                _effective_threshold = HEARTBEAT_STALE_THRESHOLD * _hb_pres_mult()
+            except ImportError:
+                pass
+            if age > _effective_threshold:
                 return False, f"heartbeat_stale_{age:.1f}s"
             
             # Check 2: Is supervisor PID still alive?

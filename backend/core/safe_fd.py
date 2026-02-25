@@ -194,6 +194,12 @@ class _FDTracker:
         self._owned_fds: Dict[int, FDInfo] = {}
         self._closed_fds: Set[int] = set()  # Track recently closed to prevent double-close
         self._last_cleanup = time.time()
+        # v276.0 Phase 11: Monotonic cleanup interval
+        try:
+            from backend.core.monotonic_clock import monotonic_now as _fd_mono
+            self._last_cleanup_mono = _fd_mono()
+        except ImportError:
+            self._last_cleanup_mono = time.time()
         self._initialized = True
 
         logger.debug("[SafeFD] FD Tracker initialized")
@@ -273,10 +279,16 @@ class _FDTracker:
 
     def _cleanup(self) -> None:
         """Clean up stale entries."""
-        now = time.time()
-        if now - self._last_cleanup < SafeFDConfig.CLEANUP_INTERVAL:
+        # v276.0 Phase 11: Prefer monotonic for cleanup interval
+        try:
+            from backend.core.monotonic_clock import monotonic_now as _fd_mono_c
+            _now_mono = _fd_mono_c()
+        except ImportError:
+            _now_mono = time.time()
+        if _now_mono - getattr(self, '_last_cleanup_mono', 0) < SafeFDConfig.CLEANUP_INTERVAL:
             return
-
+        self._last_cleanup_mono = _now_mono
+        now = time.time()  # kept for backward-compat
         self._last_cleanup = now
         stale_fds = []
 
