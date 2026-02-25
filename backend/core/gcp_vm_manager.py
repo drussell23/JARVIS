@@ -118,6 +118,14 @@ except ImportError:
     def is_component_required(component):
         return True
 
+# Causal traceability — VM metadata trace propagation
+try:
+    from backend.core.trace_vm import get_trace_metadata_items as _get_trace_metadata_items
+    _TRACE_VM_AVAILABLE = True
+except ImportError:
+    _TRACE_VM_AVAILABLE = False
+    _get_trace_metadata_items = None
+
 logger = logging.getLogger(__name__)
 
 # Type variable for generic retry decorator
@@ -9019,6 +9027,16 @@ fi
                     metadata_items.append(
                         compute_v1.Items(key="jarvis-force-code-update", value="true")
                     )
+
+            # v276.0: Inject causal traceability metadata for parent-child trace linkage
+            if _TRACE_VM_AVAILABLE and _get_trace_metadata_items:
+                try:
+                    for _tm in _get_trace_metadata_items():
+                        metadata_items.append(
+                            compute_v1.Items(key=_tm["key"], value=str(_tm["value"]))
+                        )
+                except Exception:
+                    pass  # Non-fatal — traceability is observability, not critical path
 
             # Add startup script based on deployment mode
             if deployment_mode == "golden-image":

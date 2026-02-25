@@ -58,6 +58,14 @@ from contextlib import asynccontextmanager
 
 from backend.core.async_safety import TimeoutConfig, LazyAsyncEvent, get_shutdown_event
 
+# v276.0: Causal traceability — HTTP trace header propagation
+try:
+    from backend.core.trace_http import merge_trace_headers as _merge_trace_headers
+    _TRACE_HTTP_AVAILABLE = True
+except ImportError:
+    _TRACE_HTTP_AVAILABLE = False
+    _merge_trace_headers = None
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -1154,9 +1162,17 @@ class PrimeClient:
                 # v242.0: Extract X-Model-Id header from J-Prime response
                 response_headers = {}
 
+                # v276.0: Inject trace context headers for cross-boundary tracing
+                _req_headers = {}
+                if _TRACE_HTTP_AVAILABLE and _merge_trace_headers:
+                    try:
+                        _req_headers = _merge_trace_headers(_req_headers)
+                    except Exception:
+                        pass
+
                 # aiohttp.ClientSession - use context manager for response
                 try:
-                    async with session.post(url, json=payload) as resp:
+                    async with session.post(url, json=payload, headers=_req_headers or None) as resp:
                         if resp.status != 200:
                             text = await resp.text()
                             raise RuntimeError(f"Prime returned {resp.status}: {text}")
@@ -1164,11 +1180,19 @@ class PrimeClient:
                         response_headers = dict(resp.headers)
                 except TypeError:
                     # Fallback for httpx style (no context manager on response)
-                    resp = await session.post(url, json=payload)
+                    resp = await session.post(url, json=payload, headers=_req_headers or None)
                     if resp.status_code != 200:
                         raise RuntimeError(f"Prime returned {resp.status_code}: {resp.text}")
                     data = resp.json()
                     response_headers = dict(resp.headers)
+
+                # v276.0: Extract incoming trace context from Prime response
+                if _TRACE_HTTP_AVAILABLE:
+                    try:
+                        from backend.core.trace_http import extract_trace_from_response
+                        extract_trace_from_response(response_headers)
+                    except Exception:
+                        pass
 
             latency_ms = (time.time() - start_time) * 1000
 
@@ -1229,9 +1253,17 @@ class PrimeClient:
             async with self._pool.get_session() as session:
                 url = f"{self._config.base_url}/generate/stream"
 
+                # v276.0: Inject trace context headers for cross-boundary tracing
+                _req_headers = {}
+                if _TRACE_HTTP_AVAILABLE and _merge_trace_headers:
+                    try:
+                        _req_headers = _merge_trace_headers(_req_headers)
+                    except Exception:
+                        pass
+
                 if hasattr(session, 'post') and hasattr(session.post, '__aenter__'):
                     # aiohttp style
-                    async with session.post(url, json=payload) as resp:
+                    async with session.post(url, json=payload, headers=_req_headers or None) as resp:
                         if resp.status != 200:
                             text = await resp.text()
                             raise RuntimeError(f"Prime returned {resp.status}: {text}")
@@ -1250,7 +1282,7 @@ class PrimeClient:
                                         yield data["content"]
                 else:
                     # httpx style (async streaming)
-                    async with session.stream('POST', url, json=payload) as resp:
+                    async with session.stream('POST', url, json=payload, headers=_req_headers or None) as resp:
                         if resp.status != 200:
                             raise RuntimeError(f"Prime returned {resp.status}")
 

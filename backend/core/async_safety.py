@@ -42,6 +42,7 @@ Version: 100.0.0
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -1754,6 +1755,26 @@ def _task_done_callback(task: asyncio.Task, name: str = "unnamed") -> None:
         )
 
 
+# v276.0: Causal traceability — context-propagating task creation
+try:
+    from backend.core.context_task import create_traced_task as _create_traced_task
+    _TRACED_TASK_AVAILABLE = True
+except ImportError:
+    _TRACED_TASK_AVAILABLE = False
+    _create_traced_task = None
+
+
+async def _run_in_context(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Await a coroutine (used as target for contextvars.Context.run).
+
+    Called via ``ctx.run(_run_in_context, coro)`` which returns a new
+    coroutine object carrying the copied context snapshot.  The event
+    loop then schedules that coroutine, and all ContextVars (including
+    CorrelationContext, TraceEnvelope, etc.) are visible inside *coro*.
+    """
+    return await coro
+
+
 def create_safe_task(
     coro: Coroutine[Any, Any, T],
     name: Optional[str] = None,
@@ -1783,13 +1804,21 @@ def create_safe_task(
         create_safe_task(some_background_work(), name="background_work")
     """
     task_name = name or coro.__qualname__ if hasattr(coro, '__qualname__') else "anonymous"
-    
+
+    # v276.0: Snapshot the parent's ContextVars (CorrelationContext, TraceEnvelope,
+    # etc.) so the child task inherits the caller's trace context automatically.
+    # contextvars.copy_context().run(async_fn, coro) invokes the async function
+    # synchronously, returning a NEW coroutine object that carries the copied
+    # context snapshot.  The event loop then schedules that coroutine, and all
+    # ContextVars are visible inside the original *coro* when it executes.
+    _ctx_coro = contextvars.copy_context().run(_run_in_context, coro)
+
     try:
         # Python 3.8+ supports the name parameter
-        task = asyncio.create_task(coro, name=task_name)
+        task = asyncio.create_task(_ctx_coro, name=task_name)
     except TypeError:
         # Python 3.7 fallback
-        task = asyncio.create_task(coro)
+        task = asyncio.create_task(_ctx_coro)
     
     # Keep reference to prevent garbage collection before completion
     _fire_and_forget_tasks.add(task)

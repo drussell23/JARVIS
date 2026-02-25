@@ -1590,6 +1590,28 @@ except ImportError as _ie:
     EnterpriseHealthStatus = None
     get_health_aggregator = None
 
+# Causal Traceability — production trace hooks (fire-and-forget lifecycle events)
+try:
+    from backend.core.trace_bootstrap import initialize as _trace_initialize, shutdown as _trace_shutdown
+    from backend.core.trace_hooks import (
+        on_boot_start as _trace_boot_start,
+        on_boot_complete as _trace_boot_complete,
+        on_phase_enter as _trace_phase_enter,
+        on_phase_exit as _trace_phase_exit,
+        on_phase_fail as _trace_phase_fail,
+        on_shutdown as _trace_on_shutdown,
+        on_recovery_start as _trace_recovery_start,
+        on_recovery_complete as _trace_recovery_complete,
+    )
+    _TRACE_HOOKS_AVAILABLE = True
+except ImportError:
+    _TRACE_HOOKS_AVAILABLE = False
+    _trace_initialize = None
+    _trace_shutdown = None
+    _trace_boot_start = _trace_boot_complete = None
+    _trace_phase_enter = _trace_phase_exit = _trace_phase_fail = None
+    _trace_on_shutdown = _trace_recovery_start = _trace_recovery_complete = None
+
 # Enterprise Recovery Engine - intelligent failure classification and recovery
 try:
     from backend.core.recovery_engine import (
@@ -57097,6 +57119,13 @@ class StartupWatchdog:
         reason: str
     ) -> None:
         """Execute the appropriate recovery action."""
+        # v276.0: Trace recovery lifecycle event
+        if _TRACE_HOOKS_AVAILABLE and _trace_recovery_start:
+            try:
+                _trace_recovery_start(phase=phase, action=action, reason=reason)
+            except Exception:
+                pass
+
         if self._recovery_mode == "passive":
             # Passive mode: only log, never take action
             self._logger.info(f"[DMS] Passive mode - would take action: {action}")
@@ -62376,6 +62405,18 @@ class JarvisSystemKernel:
         # v258.4: Publish shutdown phase to Trinity IPC for cross-repo consumers.
         _publish_system_phase_to_trinity("shutdown", {"reason": reason, "expected": expected})
 
+        # v276.0: Trace shutdown lifecycle event
+        if _TRACE_HOOKS_AVAILABLE and _trace_on_shutdown:
+            try:
+                _trace_on_shutdown(reason=reason)
+            except Exception:
+                pass
+        if _TRACE_HOOKS_AVAILABLE and _trace_shutdown:
+            try:
+                _trace_shutdown()
+            except Exception:
+                pass
+
         # v181.0: Write crash marker for next startup
         # v205.0: Use asyncio.to_thread to avoid blocking the event loop
         # v242.5: Enriched with diagnostic context (JSON) for crash forensics
@@ -63964,6 +64005,20 @@ class JarvisSystemKernel:
         except Exception as _bridge_init_err:
             self.logger.debug(f"[Lifecycle] Bridge init skipped: {_bridge_init_err}")
 
+        # v276.0: Initialize causal traceability subsystem
+        if _TRACE_HOOKS_AVAILABLE and _trace_initialize:
+            try:
+                _trace_initialize()
+            except Exception:
+                pass  # Non-fatal — traceability is observability, not critical path
+
+        # v276.0: Emit boot_start lifecycle event
+        if _TRACE_HOOKS_AVAILABLE and _trace_boot_start:
+            try:
+                _trace_boot_start(boot_id=os.environ.get("JARVIS_BOOT_ID", ""))
+            except Exception:
+                pass
+
         # v272.0 Phase 9: Initialize startup transaction coordinator
         _txn = None
         try:
@@ -64266,6 +64321,7 @@ class JarvisSystemKernel:
         _cid_cs = f"phase-clean_slate-{uuid.uuid4().hex[:8]}"
         _t0_cs = time.time()
         self._emit_event(SupervisorEventType.PHASE_START, "Phase: Clean Slate", phase="clean_slate", correlation_id=_cid_cs)
+        if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("clean_slate", progress=0, metadata={"correlation_id": _cid_cs})
 
         if _ssm: await _ssm.start_component("clean_slate")
         # v265.0: Add timeout — clean slate runs BEFORE DMS, so no watchdog protection
@@ -64285,6 +64341,7 @@ class JarvisSystemKernel:
             severity=SupervisorEventSeverity.SUCCESS, phase="clean_slate",
             duration_ms=(time.time() - _t0_cs) * 1000, correlation_id=_cid_cs,
         )
+        if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("clean_slate", progress=5, success=True, duration_s=time.time() - _t0_cs)
 
         # =====================================================================
         # v270.3: CONTRACT VALIDATION (non-blocking, advisory only)
@@ -65517,6 +65574,7 @@ class JarvisSystemKernel:
             _cid_le = f"phase-loading_experience-{uuid.uuid4().hex[:8]}"
             _t0_le = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Loading Experience", phase="loading_experience", correlation_id=_cid_le)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("loading_experience", progress=5, metadata={"correlation_id": _cid_le})
 
             if _ssm: await _ssm.start_component("loading_experience")
             # v265.0: Add timeout — loading experience starts Chrome/loading server,
@@ -65543,6 +65601,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="loading_experience",
                 duration_ms=(time.time() - _t0_le) * 1000, correlation_id=_cid_le,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("loading_experience", progress=15, success=True, duration_s=time.time() - _t0_le)
 
             await self._broadcast_startup_progress(
                 stage="loading",
@@ -65604,6 +65663,7 @@ class JarvisSystemKernel:
             _cid_pf = f"phase-preflight-{uuid.uuid4().hex[:8]}"
             _t0_pf = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Preflight", phase="preflight", correlation_id=_cid_pf)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("preflight", progress=15, metadata={"correlation_id": _cid_pf})
 
             if _ssm: await _ssm.start_component("preflight")
             # v270.0: Outer timeout — bare await could hang indefinitely if any
@@ -65645,6 +65705,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="preflight",
                 duration_ms=(time.time() - _t0_pf) * 1000, correlation_id=_cid_pf,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("preflight", progress=25, success=True, duration_s=time.time() - _t0_pf)
 
             await self._broadcast_startup_progress(
                 stage="preflight",
@@ -65695,6 +65756,7 @@ class JarvisSystemKernel:
             _cid_rs = f"phase-resources-{uuid.uuid4().hex[:8]}"
             _t0_rs = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Resources", phase="resources", correlation_id=_cid_rs)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("resources", progress=25, metadata={"correlation_id": _cid_rs})
 
             if _ssm: await _ssm.start_component("resources")
             # v270.0: Outer timeout — resource managers (Docker, GCP, storage) can
@@ -65738,6 +65800,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="resources",
                 duration_ms=(time.time() - _t0_rs) * 1000, correlation_id=_cid_rs,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("resources", progress=45, success=True, duration_s=time.time() - _t0_rs)
 
             await self._broadcast_startup_progress(
                 stage="resources",
@@ -65777,6 +65840,7 @@ class JarvisSystemKernel:
             _cid_be = f"phase-backend-{uuid.uuid4().hex[:8]}"
             _t0_be = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Backend", phase="backend", correlation_id=_cid_be)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("backend", progress=45, metadata={"correlation_id": _cid_be})
 
             if _ssm: await _ssm.start_component("backend")
             # v270.0: Outer timeout — backend startup includes subprocess spawning,
@@ -65819,6 +65883,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="backend",
                 duration_ms=(time.time() - _t0_be) * 1000, correlation_id=_cid_be,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("backend", progress=55, success=True, duration_s=time.time() - _t0_be)
 
             await self._broadcast_startup_progress(
                 stage="backend",
@@ -65920,6 +65985,7 @@ class JarvisSystemKernel:
             _cid_in = f"phase-intelligence-{uuid.uuid4().hex[:8]}"
             _t0_in = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Intelligence", phase="intelligence", correlation_id=_cid_in)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("intelligence", progress=55, metadata={"correlation_id": _cid_in})
 
             # v260.0: Outer timeout on intelligence phase — previously relied solely
             # on DMS watchdog heartbeats which only fire every 5s. Direct timeout
@@ -65970,6 +66036,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="intelligence",
                 duration_ms=(time.time() - _t0_in) * 1000, correlation_id=_cid_in,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("intelligence", progress=65, success=True, duration_s=time.time() - _t0_in)
 
             await self._broadcast_startup_progress(
                 stage="intelligence",
@@ -66395,6 +66462,7 @@ class JarvisSystemKernel:
             _cid_tr = f"phase-trinity-{uuid.uuid4().hex[:8]}"
             _t0_tr = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Trinity", phase="trinity", correlation_id=_cid_tr)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("trinity", progress=65, metadata={"correlation_id": _cid_tr})
             issue_collector.set_current_phase("Phase 5: Trinity")
             issue_collector.set_current_zone("Zone 5.7")
             # v198.2: UNIFIED TRINITY TIMEOUT CALCULATION
@@ -66579,6 +66647,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="trinity",
                 duration_ms=(time.time() - _t0_tr) * 1000, correlation_id=_cid_tr,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("trinity", progress=80, success=True, duration_s=time.time() - _t0_tr)
 
             await self._safe_broadcast(
                 stage="trinity",
@@ -66669,6 +66738,7 @@ class JarvisSystemKernel:
             _cid_en = f"phase-enterprise-{uuid.uuid4().hex[:8]}"
             _t0_en = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Enterprise Services", phase="enterprise", correlation_id=_cid_en)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("enterprise", progress=80, metadata={"correlation_id": _cid_en})
 
             if _ssm: await _ssm.start_component("enterprise_services")
             # v265.0: Add outer timeout to _phase_enterprise_services() — previously
@@ -66702,6 +66772,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="enterprise",
                 duration_ms=(time.time() - _t0_en) * 1000, correlation_id=_cid_en,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("enterprise", progress=85, success=True, duration_s=time.time() - _t0_en)
 
             await self._safe_broadcast(
                 stage="enterprise",
@@ -67127,6 +67198,7 @@ class JarvisSystemKernel:
             _cid_fe = f"phase-frontend-{uuid.uuid4().hex[:8]}"
             _t0_fe = time.time()
             self._emit_event(SupervisorEventType.PHASE_START, "Phase: Frontend Transition", phase="frontend", correlation_id=_cid_fe)
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter: _trace_phase_enter("frontend", progress=93, metadata={"correlation_id": _cid_fe})
 
             # v265.3: Outer timeout for Frontend phase — this was the ONLY
             # post-Trinity phase without asyncio.wait_for(). Inside this method:
@@ -67187,6 +67259,7 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS, phase="frontend",
                 duration_ms=(time.time() - _t0_fe) * 1000, correlation_id=_cid_fe,
             )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit: _trace_phase_exit("frontend", progress=100, success=True, duration_s=time.time() - _t0_fe)
 
             await self._safe_broadcast(
                 stage="complete",
@@ -67421,6 +67494,13 @@ class JarvisSystemKernel:
                 severity=SupervisorEventSeverity.SUCCESS,
                 metadata={"duration_s": round(startup_duration, 2)},
             )
+
+            # v276.0: Emit boot_complete trace lifecycle event
+            if _TRACE_HOOKS_AVAILABLE and _trace_boot_complete:
+                try:
+                    _trace_boot_complete(duration_s=startup_duration)
+                except Exception:
+                    pass
 
             # =====================================================================
             # v180.0: DIAGNOSTIC CHECKPOINT - Startup complete
