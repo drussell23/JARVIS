@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from backend.core.gcp_lifecycle_schema import State, Event, validate_state, validate_event
+from backend.core.gcp_lifecycle_schema import State, Event, validate_state
 from backend.core.gcp_lifecycle_transitions import get_transition
 
 logger = logging.getLogger("jarvis.gcp_lifecycle")
