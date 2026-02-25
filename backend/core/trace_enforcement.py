@@ -239,3 +239,22 @@ class ComplianceTracker:
                 (critical_instrumented / critical_total * 100) if critical_total > 0 else 0.0, 1
             ),
         }
+
+    def ci_gate_passes(self, overall_threshold: float = 80.0) -> bool:
+        """Check if compliance meets CI gate requirements.
+
+        Gate passes when:
+        - All critical boundaries are instrumented (100%)
+        - Overall score >= overall_threshold (default 80%)
+        """
+        score = self.get_score()
+        if score["critical_total"] > 0 and score["score_critical"] < 100.0:
+            return False
+        return score["score_overall"] >= overall_threshold
+
+    def to_json(self) -> str:
+        """Serialize compliance score to JSON string for CI output."""
+        import json
+        score = self.get_score()
+        score["ci_gate_passes"] = self.ci_gate_passes()
+        return json.dumps(score, indent=2)

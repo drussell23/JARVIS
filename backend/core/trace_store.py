@@ -488,16 +488,104 @@ class CausalityIndex:
 
 
 # ---------------------------------------------------------------------------
-# DiskGuard -- stub for Task 12
+# DiskGuard -- disk usage monitoring and rotation
 # ---------------------------------------------------------------------------
 
+_DISK_WARNING_THRESHOLD = float(os.environ.get("JARVIS_TRACE_DISK_WARNING", "0.85"))
+_DISK_CRITICAL_THRESHOLD = float(os.environ.get("JARVIS_TRACE_DISK_CRITICAL", "0.95"))
+
+# Rotation priority: spans first (highest volume, lowest value), then old
+# decisions, then old lifecycle (never current epoch).
+_ROTATION_PRIORITY = ["spans", "decisions", "lifecycle"]
+
+
 class DiskGuard:
-    """Stub for disk usage monitoring. Full implementation in Task 12."""
+    """Disk usage monitoring and rotation for trace data."""
+
+    def __init__(
+        self,
+        base_dir: Path,
+        warning_threshold: float = _DISK_WARNING_THRESHOLD,
+        critical_threshold: float = _DISK_CRITICAL_THRESHOLD,
+    ) -> None:
+        self._base_dir = Path(base_dir)
+        self._warning_threshold = warning_threshold
+        self._critical_threshold = critical_threshold
 
     def check_disk_usage(self) -> float:
-        """Return disk usage ratio (0.0 - 1.0). Stub returns 0.0."""
-        return 0.0
+        """Return disk usage ratio (0.0 - 1.0)."""
+        import shutil
+        try:
+            usage = shutil.disk_usage(self._base_dir)
+            return usage.used / usage.total if usage.total > 0 else 0.0
+        except OSError:
+            return 0.0
 
     def should_rotate(self) -> bool:
-        """Return True if rotation is needed. Stub returns False."""
-        return False
+        """Return True if disk usage exceeds critical threshold."""
+        return self.check_disk_usage() >= self._critical_threshold
+
+    def rotate_if_needed(self, current_epoch: str = "") -> List[str]:
+        """Rotate old files if disk usage exceeds critical threshold.
+
+        Rotation priority: spans → decisions → lifecycle.
+        Never deletes files from the current epoch.
+        Returns list of deleted file paths.
+        """
+        if not self.should_rotate():
+            return []
+
+        rotated: List[str] = []
+        for stream in _ROTATION_PRIORITY:
+            stream_dir = self._base_dir / stream
+            if not stream_dir.exists():
+                continue
+            for jsonl_file in sorted(stream_dir.glob("*.jsonl")):
+                # Never delete current epoch files
+                if current_epoch and current_epoch in jsonl_file.name:
+                    continue
+                try:
+                    jsonl_file.unlink()
+                    rotated.append(str(jsonl_file))
+                except OSError:
+                    logger.debug("Failed to delete %s", jsonl_file, exc_info=True)
+
+            # Re-check after each stream
+            if not self.should_rotate():
+                break
+
+        return rotated
+
+
+# ---------------------------------------------------------------------------
+# Compaction -- gzip old JSONL files
+# ---------------------------------------------------------------------------
+
+def compact_old_files(dir_path: Path, max_age_days: int = 7) -> List[str]:
+    """Compress JSONL files older than max_age_days to .jsonl.gz.
+
+    Returns list of compressed file paths.
+    """
+    import gzip
+
+    dir_path = Path(dir_path)
+    if not dir_path.exists():
+        return []
+
+    now = time.time()
+    cutoff = now - (max_age_days * 86400)
+    compressed: List[str] = []
+
+    for jsonl_file in sorted(dir_path.glob("*.jsonl")):
+        try:
+            if jsonl_file.stat().st_mtime <= cutoff:
+                gz_path = jsonl_file.with_suffix(".jsonl.gz")
+                with open(jsonl_file, "rb") as f_in:
+                    with gzip.open(gz_path, "wb") as f_out:
+                        f_out.write(f_in.read())
+                jsonl_file.unlink()
+                compressed.append(str(gz_path))
+        except OSError:
+            logger.debug("Failed to compact %s", jsonl_file, exc_info=True)
+
+    return compressed
