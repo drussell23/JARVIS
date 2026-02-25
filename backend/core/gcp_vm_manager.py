@@ -6247,6 +6247,15 @@ class GCPVMManager:
         Returns:
             True if terminated/stopped successfully (or VM doesn't exist), False otherwise
         """
+        # v272.0 Phase 9: Advisory ownership audit
+        try:
+            from backend.core.ownership_registry import check_caller_authorized
+            import sys as _ow_sys
+            _caller = _ow_sys._getframe(1).f_code.co_filename.rsplit("/", 1)[-1].replace(".py", "")
+            check_caller_authorized("gcp_vm_lifecycle", _caller)
+        except Exception:
+            pass
+
         # v153.0 → v266.0: Centralized protection check (uses caller's action, not hardcoded DELETE)
         is_protected, guard_msg = self.check_vm_protection(vm_name, action, reason)
         if is_protected:

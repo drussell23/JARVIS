@@ -63403,6 +63403,12 @@ class JarvisSystemKernel:
                 except Exception:
                     pass
 
+            # v272.0 Phase 9: Transaction abort cleanup
+            try:
+                from backend.core.startup_transaction import get_startup_transaction
+                await get_startup_transaction().abort_with_cleanup("progress_controller_timeout")
+            except Exception:
+                pass
             self._state = KernelState.FAILED
             return 1
 
@@ -63793,6 +63799,19 @@ class JarvisSystemKernel:
         # v258.4: Also publish to Trinity IPC for cross-repo consumers.
         _publish_system_phase_to_trinity("startup", {"started_at": time.time()})
         os.environ["JARVIS_STARTUP_TIMESTAMP"] = str(time.time())
+
+        # v272.0 Phase 9: Initialize startup transaction coordinator
+        _txn = None
+        try:
+            from backend.core.startup_transaction import get_startup_transaction
+            _txn = get_startup_transaction()
+            _txn.reset()
+            _txn.register_phase_artifact(
+                "pre_phase", "env_var", "JARVIS_STARTUP_TIMESTAMP",
+                lambda: os.environ.pop("JARVIS_STARTUP_TIMESTAMP", None),
+            )
+        except ImportError:
+            pass
 
         try:
             from intelligence.cloud_database_adapter import register_supervisor_proxy_management
@@ -64316,6 +64335,12 @@ class JarvisSystemKernel:
                 self.logger.error(
                     "[Kernel] Startup aborted: JARVIS_REQUIRE_STARTUP_WATCHDOG=true"
                 )
+                # v272.0 Phase 9: Transaction abort cleanup
+                if _txn:
+                    try:
+                        await _txn.abort_with_cleanup("dms_required_failed")
+                    except Exception:
+                        pass
                 return 1
             # v265.5: Schedule background DMS recovery — system must not run
             # without stall protection for an entire session.  A transient
@@ -65344,6 +65369,9 @@ class JarvisSystemKernel:
             except asyncio.CancelledError:
                 raise
             if _ssm: await _ssm.complete_component("loading_experience")
+            # v272.0 Phase 9: Commit Phase 0
+            if _txn:
+                _txn.mark_phase_committed("loading_experience")
 
             self._emit_event(
                 SupervisorEventType.PHASE_END, "Phase: Loading Experience complete",
@@ -65434,9 +65462,18 @@ class JarvisSystemKernel:
                     IssueCategory.GENERAL,
                     suggestion="Check startup lock and process manager"
                 )
+                # v272.0 Phase 9: Transaction abort cleanup
+                if _txn:
+                    try:
+                        await _txn.abort_with_cleanup("preflight_failed")
+                    except Exception:
+                        pass
                 issue_collector.print_health_report()
                 return 1
             if _ssm: await _ssm.complete_component("preflight")
+            # v272.0 Phase 9: Commit Phase 1
+            if _txn:
+                _txn.mark_phase_committed("preflight")
 
             self._emit_event(
                 SupervisorEventType.PHASE_END, "Phase: Preflight complete",
@@ -65517,9 +65554,18 @@ class JarvisSystemKernel:
                     suggestion="Check Docker, GCP, and port availability"
                 )
                 await self._safe_narrate(self._narrator.narrate_error("Resource initialization failed", critical=True), "error")
+                # v272.0 Phase 9: Transaction abort cleanup
+                if _txn:
+                    try:
+                        await _txn.abort_with_cleanup("resources_failed")
+                    except Exception:
+                        pass
                 issue_collector.print_health_report()
                 return 1
             if _ssm: await _ssm.complete_component("resources")
+            # v272.0 Phase 9: Commit Phase 2
+            if _txn:
+                _txn.mark_phase_committed("resources")
             await self._safe_narrate(self._narrator.narrate_zone_complete(3, success=True), "zone_complete")
 
             self._emit_event(
@@ -65590,9 +65636,18 @@ class JarvisSystemKernel:
                     suggestion="Check if port is already in use or backend code has errors"
                 )
                 await self._safe_narrate(self._narrator.narrate_error("Backend server failed to start", critical=True), "error")
+                # v272.0 Phase 9: Transaction abort cleanup
+                if _txn:
+                    try:
+                        await _txn.abort_with_cleanup("backend_failed")
+                    except Exception:
+                        pass
                 issue_collector.print_health_report()
                 return 1
             if _ssm: await _ssm.complete_component("backend")
+            # v272.0 Phase 9: Commit Phase 3
+            if _txn:
+                _txn.mark_phase_committed("backend")
 
             self._emit_event(
                 SupervisorEventType.PHASE_END, "Phase: Backend complete",
@@ -67317,6 +67372,12 @@ class JarvisSystemKernel:
             issue_collector.print_health_report()
             if self.config.debug:
                 issue_collector.print_tracebacks()
+            # v272.0 Phase 9: Transaction abort cleanup
+            if _txn:
+                try:
+                    await _txn.abort_with_cleanup(f"exception:{type(e).__name__}")
+                except Exception:
+                    pass
             self._state = KernelState.FAILED
             return 1
 
@@ -78191,6 +78252,15 @@ class JarvisSystemKernel:
 
         # Step 3: Mark startup as complete (before redirect)
         # This signals the loading server to allow graceful Chrome disconnect
+        # v272.0 Phase 9: Register completion signal as cleanup-able artifact
+        try:
+            from backend.core.startup_transaction import get_startup_transaction
+            get_startup_transaction().register_phase_artifact(
+                "finalization", "env_var", "JARVIS_STARTUP_COMPLETE",
+                lambda: os.environ.pop("JARVIS_STARTUP_COMPLETE", None),
+            )
+        except Exception:
+            pass
         _set_startup_env("JARVIS_STARTUP_COMPLETE", "true", "all_phases_done", caller="_finalize_startup")
         self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true")
 
