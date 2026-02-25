@@ -1954,6 +1954,22 @@ except ImportError as _ie:
     BoundedAsyncQueue = None
     OverflowPolicy = None
 
+# v280.0: Execution Context — composable timeout budget propagation
+try:
+    from backend.core.execution_context import (
+        execution_budget as _execution_budget,
+        budget_aware_wait_for as _budget_wait,
+        BudgetExhaustedError,
+        LocalCapExceededError,
+        ExternalCancellationError,
+        Criticality as _BudgetCriticality,
+        RequestKind as _BudgetRequestKind,
+        remaining_budget as _remaining_budget,
+    )
+    _BUDGET_AVAILABLE = True
+except ImportError:
+    _BUDGET_AVAILABLE = False
+
 # v265.7: Run import audit at module load to surface all failures
 _log_import_audit()
 
@@ -64420,7 +64436,20 @@ class JarvisSystemKernel:
         # v265.0: Add timeout — clean slate runs BEFORE DMS, so no watchdog protection
         _clean_slate_timeout = _get_env_float("JARVIS_CLEAN_SLATE_TIMEOUT", 30.0)
         try:
-            await asyncio.wait_for(self._phase_clean_slate(), timeout=_clean_slate_timeout)
+            if _BUDGET_AVAILABLE:
+                async with _execution_budget(
+                    "phase_clean_slate", _clean_slate_timeout,
+                    phase_id="0", phase_name="clean_slate",
+                    priority=_BudgetCriticality.CRITICAL,
+                    request_kind=_BudgetRequestKind.STARTUP,
+                ):
+                    await self._phase_clean_slate()
+            else:
+                await asyncio.wait_for(self._phase_clean_slate(), timeout=_clean_slate_timeout)
+        except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+            self.logger.warning(
+                f"[Kernel] Clean Slate budget/cap exceeded ({_clean_slate_timeout:.0f}s) — continuing"
+            )
         except asyncio.TimeoutError:
             self.logger.warning(
                 f"[Kernel] v265.0: Clean Slate timed out ({_clean_slate_timeout:.0f}s) — continuing"
@@ -65780,8 +65809,22 @@ class JarvisSystemKernel:
             # preflight sub-operation stalls (lock handover, zombie scan, IPC bind).
             _preflight_timeout = _get_env_float("JARVIS_PREFLIGHT_TIMEOUT", 90.0)
             try:
-                _preflight_ok = await asyncio.wait_for(
-                    self._phase_preflight(), timeout=_preflight_timeout
+                if _BUDGET_AVAILABLE:
+                    async with _execution_budget(
+                        "phase_preflight", _preflight_timeout,
+                        phase_id="1", phase_name="preflight",
+                        priority=_BudgetCriticality.CRITICAL,
+                        request_kind=_BudgetRequestKind.STARTUP,
+                    ):
+                        _preflight_ok = await self._phase_preflight()
+                else:
+                    _preflight_ok = await asyncio.wait_for(
+                        self._phase_preflight(), timeout=_preflight_timeout
+                    )
+            except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                _preflight_ok = False
+                self.logger.error(
+                    "[Kernel] Preflight budget/cap exceeded after %.0fs", _preflight_timeout
                 )
             except asyncio.TimeoutError:
                 _preflight_ok = False
@@ -65888,8 +65931,22 @@ class JarvisSystemKernel:
             # each stall on network or credential discovery. resource_timeout is
             # already defined above (default 300s).
             try:
-                _resources_ok = await asyncio.wait_for(
-                    self._phase_resources(), timeout=resource_timeout
+                if _BUDGET_AVAILABLE:
+                    async with _execution_budget(
+                        "phase_resources", resource_timeout,
+                        phase_id="2", phase_name="resources",
+                        priority=_BudgetCriticality.CRITICAL,
+                        request_kind=_BudgetRequestKind.STARTUP,
+                    ):
+                        _resources_ok = await self._phase_resources()
+                else:
+                    _resources_ok = await asyncio.wait_for(
+                        self._phase_resources(), timeout=resource_timeout
+                    )
+            except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                _resources_ok = False
+                self.logger.error(
+                    "[Kernel] Resources budget/cap exceeded after %.0fs", resource_timeout
                 )
             except asyncio.TimeoutError:
                 _resources_ok = False
@@ -65987,8 +66044,22 @@ class JarvisSystemKernel:
             # health polling, and optional in-process uvicorn. backend_timeout is
             # already defined above (default 300s).
             try:
-                _backend_ok = await asyncio.wait_for(
-                    self._phase_backend(), timeout=backend_timeout
+                if _BUDGET_AVAILABLE:
+                    async with _execution_budget(
+                        "phase_backend", backend_timeout,
+                        phase_id="3", phase_name="backend",
+                        priority=_BudgetCriticality.CRITICAL,
+                        request_kind=_BudgetRequestKind.STARTUP,
+                    ):
+                        _backend_ok = await self._phase_backend()
+                else:
+                    _backend_ok = await asyncio.wait_for(
+                        self._phase_backend(), timeout=backend_timeout
+                    )
+            except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                _backend_ok = False
+                self.logger.error(
+                    "[Kernel] Backend budget/cap exceeded after %.0fs", backend_timeout
                 )
             except asyncio.TimeoutError:
                 _backend_ok = False
