@@ -75303,7 +75303,15 @@ class JarvisSystemKernel:
             # creating a dead zone the ProgressController could interpret as a stall.
             # New approach: advance 66%→79% proportionally over the Trinity budget,
             # ensuring smooth visible progress throughout the entire phase.
-            _heartbeat_budget = getattr(self, '_startup_max_timeout', 1200.0) * 0.4
+            #
+            # v270.2: Use Trinity-specific timeout (DEFAULT_TRINITY_TIMEOUT) instead of
+            # overall startup max timeout. The old formula (_startup_max_timeout * 0.4)
+            # used 2250 * 0.4 = 900s when GCP+Trinity both enabled, spreading 13%
+            # over 15 minutes. Each 1% took ~60-100s, causing the frontend to see
+            # progress stalled at 71% for 7+ minutes. With Trinity-specific budget
+            # (600 * 0.6 = 360s), each 1% takes ~15-25s — well below the frontend's
+            # 120s stall threshold.
+            _heartbeat_budget = DEFAULT_TRINITY_TIMEOUT * 0.6
             while not heartbeat_stop.is_set():
                 try:
                     await asyncio.sleep(5.0)
@@ -75331,7 +75339,14 @@ class JarvisSystemKernel:
                         # so _current_progress maxed at 73% and never advanced — causing the
                         # ProgressController to see 300s of zero progress → hard cap kill.
                         # Fix: track real heartbeat progress as the phase milestone.
-                        self._current_startup_progress = new_progress
+                        # v270.2: Use max() to prevent regression. On the first tick,
+                        # new_progress=66 but _current_startup_progress=68 from the
+                        # intelligence phase. Writing 66 regresses the milestone, causing
+                        # the _progress_heartbeat_task to see a lower base_progress.
+                        self._current_startup_progress = max(
+                            getattr(self, '_current_startup_progress', 0) or 0,
+                            new_progress,
+                        )
 
                         # v227.0: Sync heartbeat progress to _current_progress so the
                         # ProgressController sees accurate values via get_progress_state().

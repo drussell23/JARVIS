@@ -1081,6 +1081,7 @@ class LoadingServer:
         self._phase = "initializing"
         self._message = "Starting JARVIS..."
         self._components: Dict[str, Dict[str, Any]] = {}
+        self._startup_timeout_ms: Optional[int] = None  # v270.2: Backend-negotiated startup timeout
         self._shutdown_requested = False
         self._stopping = False
         self._server: Optional[asyncio.Server] = None
@@ -1335,9 +1336,7 @@ class LoadingServer:
         except Exception:
             pass
 
-        message = json.dumps({
-            "type": "progress",
-            "data": {
+        ws_data = {
                 "progress": self._progress,
                 "phase": self._phase,
                 "stage": self._phase,  # v185.0: Alias for frontend compatibility
@@ -1352,7 +1351,13 @@ class LoadingServer:
                 "session_id": self._session_id,  # v212.0: Session correlation
                 "trace_id": self._trace_context.trace_id if self._trace_context else None,
                 "timestamp": datetime.now().isoformat()
-            }
+        }
+        # v270.2: Include backend-negotiated startup timeout for frontend negotiation
+        if self._startup_timeout_ms is not None:
+            ws_data["startup_timeout_ms"] = self._startup_timeout_ms
+        message = json.dumps({
+            "type": "progress",
+            "data": ws_data,
         })
 
         # v212.0: Report queue depth for backpressure control
@@ -1965,7 +1970,7 @@ class LoadingServer:
     def _get_progress_response(self) -> Dict[str, Any]:
         """Get current progress state."""
         eta = self._eta_engine.get_predicted_eta()
-        return {
+        result = {
             "progress": self._progress,
             "phase": self._phase,
             "stage": self._phase,  # v185.0: Alias for frontend compatibility
@@ -1979,6 +1984,11 @@ class LoadingServer:
             "sequence": self._sequence_number,  # v186.0: Sequence for tracking
             "timestamp": datetime.now().isoformat(),
         }
+        # v270.2: Include backend-negotiated startup timeout so frontend can negotiate
+        # even on GET polls (not just WebSocket messages)
+        if self._startup_timeout_ms is not None:
+            result["startup_timeout_ms"] = self._startup_timeout_ms
+        return result
 
     def _get_resume_response(self, path: str) -> Dict[str, Any]:
         """
@@ -2273,6 +2283,12 @@ class LoadingServer:
                 # v225.0: Persist Prime v2 init_progress protocol data
                 if "init_progress" in metadata:
                     self._prime_init_progress = metadata["init_progress"]
+
+                # v270.2: Persist backend-negotiated startup timeout for frontend negotiation
+                if "startup_timeout_ms" in metadata:
+                    timeout_ms = metadata["startup_timeout_ms"]
+                    if isinstance(timeout_ms, (int, float)) and timeout_ms > 0:
+                        self._startup_timeout_ms = int(timeout_ms)
 
             self._eta_engine.update_progress(self._progress)
 
