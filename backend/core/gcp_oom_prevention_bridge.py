@@ -839,7 +839,10 @@ class GCPOOMPreventionBridge:
         freed_mb = await self._try_aggressive_memory_optimization()
         available_after_optimization = available_gb + (freed_mb / 1024)
 
-        if available_after_optimization > required_gb + OOM_PREVENTION_THRESHOLDS["min_free_ram_gb"]:
+        # v270.1: Use >= (not >) throughout degradation tiers. When available RAM
+        # exactly equals the threshold, proceeding is correct — the threshold already
+        # includes safety margin. Strict > caused false ABORTs at exact boundary.
+        if available_after_optimization >= required_gb + OOM_PREVENTION_THRESHOLDS["min_free_ram_gb"]:
             strategy = FALLBACK_STRATEGIES[DegradationTier.TIER_2_AGGRESSIVE_OPTIMIZE]
             recommendations.append(f"✅ Tier 2: Freed {freed_mb}MB via aggressive optimization")
             recommendations.append(f"Proceeding with optimized memory settings for {component}")
@@ -850,16 +853,25 @@ class GCPOOMPreventionBridge:
         strategy = FALLBACK_STRATEGIES[DegradationTier.TIER_3_SEQUENTIAL_LOAD]
         reduced_requirement_gb = required_gb * 0.6  # Sequential loading uses ~60% peak memory
 
-        if available_after_optimization > reduced_requirement_gb + OOM_PREVENTION_THRESHOLDS["critical_ram_gb"]:
+        if available_after_optimization >= reduced_requirement_gb + OOM_PREVENTION_THRESHOLDS["critical_ram_gb"]:
             recommendations.append(f"✅ Tier 3: Using sequential loading for {component}")
             recommendations.append(f"Peak memory reduced from {required_gb:.1f}GB to {reduced_requirement_gb:.1f}GB")
             return MemoryDecision.DEGRADED, True, DegradationTier.TIER_3_SEQUENTIAL_LOAD, strategy
 
         # Tier 4: Minimal Mode (core only, no ML models)
+        # v270.1: Use a reduced buffer for minimal mode. Tier 4 loads ~1GB of core
+        # functionality — it does NOT need the full critical_ram_gb (1.5GB) buffer
+        # designed for heavy ML model loading. A 0.75GB buffer is sufficient for
+        # core-only operation, and the check uses >= (not >) so that exact-match
+        # available RAM doesn't false-abort.
         strategy = FALLBACK_STRATEGIES[DegradationTier.TIER_4_MINIMAL_MODE]
         minimal_requirement_gb = 1.0  # Core functionality only needs ~1GB
+        minimal_buffer_gb = float(os.getenv(
+            "JARVIS_MINIMAL_MODE_BUFFER_GB",
+            str(OOM_PREVENTION_THRESHOLDS["critical_ram_gb"] * 0.5),  # Half of critical buffer
+        ))
 
-        if available_after_optimization > minimal_requirement_gb + OOM_PREVENTION_THRESHOLDS["critical_ram_gb"]:
+        if available_after_optimization >= minimal_requirement_gb + minimal_buffer_gb:
             recommendations.append(f"⚠️ Tier 4: Minimal mode for {component} - core only")
             recommendations.append("ML models disabled, API routing available")
             recommendations.append("Use JARVIS_MINIMAL_MODE=false to require full functionality")
@@ -867,54 +879,59 @@ class GCPOOMPreventionBridge:
 
         # Tier 5: All strategies exhausted - ABORT as last resort
         recommendations.append(f"❌ Tier 5: All degradation strategies exhausted for {component}")
-        recommendations.append(f"Available: {available_after_optimization:.1f}GB, Need: {minimal_requirement_gb:.1f}GB minimum")
+        recommendations.append(
+            f"Available: {available_after_optimization:.1f}GB, "
+            f"Need: {minimal_requirement_gb:.1f}GB + {minimal_buffer_gb:.1f}GB buffer"
+        )
         recommendations.append("Options: Add RAM, close applications, or enable GCP (set GCP_PROJECT_ID, GCP_ZONE, GCP_ENABLED=true)")
         return MemoryDecision.ABORT, False, DegradationTier.TIER_5_ABORT, None
 
     async def _try_aggressive_memory_optimization(self) -> int:
         """
-        v2.0.0: Aggressively optimize memory to free up RAM.
+        v2.0.0 / v270.1: Aggressively optimize memory to free up RAM.
+
+        v270.1: MEASURES actual freed memory via psutil instead of fake estimates.
+        The previous implementation added fixed amounts (50+20+30+50=150MB) without
+        measuring — the "freed" memory was never reflected in actual available RAM,
+        causing Tier 4 to fail by margins as small as 100MB.
 
         Returns:
-            Amount of memory freed in MB
+            Amount of memory actually freed in MB (measured, not estimated)
         """
-        freed_mb = 0
-
         try:
-            # 1. Force Python garbage collection
             import gc
-            gc.collect()
-            freed_mb += 50  # Conservative estimate
+            import psutil
 
-            # 2. Try to clear Python caches
+            # Measure BEFORE
+            mem_before = psutil.virtual_memory().available
+
+            # 1. Full garbage collection (3 generations)
+            gc.collect(2)
+            gc.collect(1)
+            gc.collect(0)
+
+            # 2. Clear Python import caches
             try:
                 import importlib
-                # Clear module finder caches
                 importlib.invalidate_caches()
-                freed_mb += 20
             except Exception:
                 pass
 
-            # 3. Clear any in-memory caches we control
+            # 3. Clear linecache (can hold significant text data)
             try:
-                # This is where component-specific cache clearing would go
-                # For now, just log that we tried
-                logger.debug("[OOMBridge] Cleared internal caches")
-                freed_mb += 30
+                import linecache
+                linecache.clearcache()
             except Exception:
                 pass
 
-            # 4. Suggest OS-level memory clearing (macOS specific)
-            try:
-                import platform
-                if platform.system() == "Darwin":
-                    # Note: We can't actually run purge without sudo, but we log the suggestion
-                    logger.debug("[OOMBridge] On macOS - memory pressure may trigger system cleanup")
-                    freed_mb += 50  # macOS often handles this automatically
-            except Exception:
-                pass
+            # Measure AFTER
+            mem_after = psutil.virtual_memory().available
+            freed_mb = max(0, (mem_after - mem_before) // (1024 * 1024))
 
-            logger.info(f"[OOMBridge] Aggressive optimization freed ~{freed_mb}MB")
+            logger.info(
+                f"[OOMBridge] Aggressive optimization freed {freed_mb}MB "
+                f"(before={mem_before // (1024*1024)}MB, after={mem_after // (1024*1024)}MB)"
+            )
             return freed_mb
 
         except Exception as e:
