@@ -4703,6 +4703,21 @@ class GCPVMManager:
             self.stats["last_error_time"] = time.time()
             return None
 
+        # v272.x Phase 10: Idempotency guard — prevent duplicate in-flight creations
+        _creation_op_token = None
+        try:
+            from backend.core.idempotency_registry import start_tracked_operation
+            _vm_resource_id = f"{self.config.vm_name_prefix}:{trigger_reason}"
+            _creation_op_token = start_tracked_operation(
+                "create_vm", _vm_resource_id,
+                timeout_s=float(os.environ.get("JARVIS_VM_CREATE_IDEM_TIMEOUT", "600"))
+            )
+            if _creation_op_token is None:
+                logger.info("[v272.x] create_vm already in-flight for %s, skipping", _vm_resource_id)
+                return None
+        except ImportError:
+            pass
+
         # ═══════════════════════════════════════════════════════════════════════════
         # v1.0: CROSS-PROCESS RESOURCE LOCK (via ProcessCoordinationHub)
         # ═══════════════════════════════════════════════════════════════════════════
@@ -5164,6 +5179,19 @@ class GCPVMManager:
 
             return None
         finally:
+            # v272.x Phase 10: Complete or fail the tracked operation
+            if _creation_op_token is not None:
+                try:
+                    from backend.core.idempotency_registry import (
+                        complete_tracked_operation, fail_tracked_operation,
+                    )
+                    if vm_instance is not None:
+                        complete_tracked_operation(_creation_op_token)
+                    else:
+                        fail_tracked_operation(_creation_op_token)
+                except ImportError:
+                    pass
+
             # v193.2: Clean up creation tracking AND signal waiting callers
             async with self._vm_lock:
                 if creation_id in self.creating_vms:
@@ -5212,6 +5240,15 @@ class GCPVMManager:
         if not can_execute:
             logger.debug("Cost tracker circuit open - skipping creation record")
             return
+
+        # v272.x Phase 10: Dedup cost tracker recording
+        try:
+            from backend.core.idempotency_registry import check_idempotent
+            if not check_idempotent("record_vm_creation", vm_instance.instance_id):
+                logger.debug("[v272.x] Duplicate creation record suppressed: %s", vm_instance.instance_id)
+                return
+        except ImportError:
+            pass
 
         try:
             # Try the new method name first, fall back to old name
@@ -6256,6 +6293,20 @@ class GCPVMManager:
         except Exception:
             pass
 
+        # v272.x Phase 10: Idempotency guard — prevent duplicate in-flight terminations
+        _term_op_token = None
+        try:
+            from backend.core.idempotency_registry import start_tracked_operation
+            _term_op_token = start_tracked_operation(
+                "terminate_vm", vm_name,
+                timeout_s=float(os.environ.get("JARVIS_VM_TERM_IDEM_TIMEOUT", "120"))
+            )
+            if _term_op_token is None:
+                logger.info("[v272.x] terminate_vm already in-flight for %s, skipping", vm_name)
+                return True  # Treat as success — someone is already terminating it
+        except ImportError:
+            pass
+
         # v153.0 → v266.0: Centralized protection check (uses caller's action, not hardcoded DELETE)
         is_protected, guard_msg = self.check_vm_protection(vm_name, action, reason)
         if is_protected:
@@ -6355,6 +6406,13 @@ class GCPVMManager:
             logger.info(f"   Uptime: {vm.uptime_hours:.2f}h")
             logger.info(f"   Cost: ${vm.total_cost:.4f}")
 
+            # v272.x Phase 10: Mark termination operation complete
+            if _term_op_token:
+                try:
+                    from backend.core.idempotency_registry import complete_tracked_operation
+                    complete_tracked_operation(_term_op_token)
+                except ImportError:
+                    pass
             return True
 
         except Exception as e:
@@ -6390,6 +6448,13 @@ class GCPVMManager:
                 error=e,
                 vm_name=vm_name,
             )
+            # v272.x Phase 10: Mark termination operation failed
+            if _term_op_token:
+                try:
+                    from backend.core.idempotency_registry import fail_tracked_operation
+                    fail_tracked_operation(_term_op_token)
+                except ImportError:
+                    pass
             return False
 
     async def _check_vm_exists_in_gcp(self, vm_name: str) -> Tuple[bool, Optional[str]]:
@@ -6681,6 +6746,15 @@ class GCPVMManager:
         if not can_execute:
             logger.debug("Cost tracker circuit open - skipping termination record")
             return
+
+        # v272.x Phase 10: Dedup cost tracker recording
+        try:
+            from backend.core.idempotency_registry import check_idempotent
+            if not check_idempotent("record_vm_termination", vm.instance_id):
+                logger.debug("[v272.x] Duplicate termination record suppressed: %s", vm.instance_id)
+                return
+        except ImportError:
+            pass
 
         try:
             # Try the new method name first, fall back to old name

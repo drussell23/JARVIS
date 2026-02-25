@@ -137,7 +137,12 @@ def _resolve_writable_lock_dir() -> Path:
 
 
 # Lock file location - configurable via environment
-LOCK_DIR = _resolve_writable_lock_dir()
+# v272.x Phase 10: Delegate to split_brain_guard for consistent resolution
+try:
+    from backend.core.split_brain_guard import canonical_lock_dir as _sbg_lock_dir
+    LOCK_DIR = _sbg_lock_dir()
+except ImportError:
+    LOCK_DIR = _resolve_writable_lock_dir()
 os.environ["JARVIS_LOCK_DIR"] = str(LOCK_DIR)
 
 _resolved_home = Path(
@@ -2618,6 +2623,27 @@ class SupervisorSingleton:
             os.lseek(self._lock_fd, 0, os.SEEK_SET)
             os.write(self._lock_fd, f"{os.getpid()}\n".encode())
 
+            # v272.x Phase 10: Write canary + cross-directory sweep
+            try:
+                from backend.core.split_brain_guard import (
+                    LockCanary, CrossDirectorySweep,
+                )
+                self._canary_token = LockCanary.write(SUPERVISOR_LOCK_FILE)
+                conflict = CrossDirectorySweep.sweep(
+                    "supervisor.lock", os.getpid()
+                )
+                if conflict:
+                    logger.warning(
+                        "[Singleton] v272.x: Split-brain risk detected! "
+                        "Competing PID %s in %s",
+                        conflict.get("competing_pid"),
+                        conflict.get("directory"),
+                    )
+            except ImportError:
+                pass
+            except Exception as _sbg_err:
+                logger.debug("[Singleton] v272.x: canary/sweep error: %s", _sbg_err)
+
             logger.info(f"[Singleton] ✅ Lock acquired for {entry_point} (PID: {os.getpid()})")
 
             # v117.0: Load preserved services from disk (for restart recovery)
@@ -2684,6 +2710,13 @@ class SupervisorSingleton:
                     SUPERVISOR_STATE_FILE.unlink()
         except Exception as e:
             logger.debug(f"Error cleaning state file: {e}")
+
+        # v272.x Phase 10: Clean up canary file
+        try:
+            from backend.core.split_brain_guard import LockCanary
+            LockCanary.cleanup(SUPERVISOR_LOCK_FILE)
+        except Exception:
+            pass
 
         logger.info("[Singleton] Lock released")
 

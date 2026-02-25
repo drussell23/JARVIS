@@ -80047,6 +80047,21 @@ class JarvisSystemKernel:
         # Single clamp point - enforce progress bounds
         progress = min(100, max(0, progress))
 
+        # v272.x Phase 10: Suppress duplicate broadcasts within dedup window
+        _bcast_dedup_key = f"{stage}:{progress}"
+        _bcast_dedup_window = float(os.environ.get("JARVIS_BROADCAST_DEDUP_WINDOW", "2.0"))
+        _bcast_now = time.time()
+        if not hasattr(self, '_last_broadcast_cache'):
+            self._last_broadcast_cache = {}
+        if _bcast_dedup_key in self._last_broadcast_cache:
+            if _bcast_now - self._last_broadcast_cache[_bcast_dedup_key] < _bcast_dedup_window:
+                return True  # Suppress duplicate
+        self._last_broadcast_cache[_bcast_dedup_key] = _bcast_now
+        # Bound cache size
+        if len(self._last_broadcast_cache) > 100:
+            _oldest = min(self._last_broadcast_cache, key=self._last_broadcast_cache.get)
+            del self._last_broadcast_cache[_oldest]
+
         # v183.0: Track current progress for heartbeat payloads
         # v227.1: Phase-aware monotonic guard — only startup phases update
         # _current_progress. Runtime status notifications (readiness monitor,

@@ -426,6 +426,15 @@ class PrimeRouter:
         if not self._check_transition_cooldown("promote_gcp_endpoint"):
             return False
 
+        # v272.x Phase 10: Prevent duplicate concurrent promotions
+        try:
+            from backend.core.idempotency_registry import check_idempotent
+            if not check_idempotent("promote_gcp_endpoint", f"{host}:{port}"):
+                logger.info("[PrimeRouter] v272.x: Duplicate promotion suppressed for %s:%s", host, port)
+                return self._gcp_promoted
+        except ImportError:
+            pass
+
         logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
 
         success = await self._prime_client.update_endpoint(host, port)

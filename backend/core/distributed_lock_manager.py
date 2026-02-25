@@ -400,6 +400,23 @@ def get_redis_client() -> AsyncRedisLockClient:
 
 
 # =============================================================================
+# v272.x Phase 10: Unified lock directory via split_brain_guard
+# =============================================================================
+
+def _canonical_cross_repo_lock_dir() -> Path:
+    """Resolve DLM lock directory through split_brain_guard for consistent
+    resolution across all lock consumers.  Falls back to legacy path if
+    split_brain_guard is not available."""
+    try:
+        from backend.core.split_brain_guard import canonical_cross_repo_lock_dir
+        return canonical_cross_repo_lock_dir()
+    except ImportError:
+        fallback = Path.home() / ".jarvis" / "cross_repo" / "locks"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -419,8 +436,8 @@ class LockConfig:
 
     This prevents "corrupted lock file" errors when both systems share the same lock directory.
     """
-    # Lock directory
-    lock_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "cross_repo" / "locks")
+    # Lock directory — v272.x Phase 10: unified via split_brain_guard
+    lock_dir: Path = field(default_factory=lambda: _canonical_cross_repo_lock_dir())
 
     # v96.2: Lock file extension - distinct from flock-based locks
     lock_extension: str = ".dlm.lock"
@@ -457,9 +474,9 @@ class LockConfig:
     keepalive_enabled: bool = True
     keepalive_interval_seconds: float = KEEPALIVE_INTERVAL
 
-    # v3.0: Fencing token counter file (for file-based backend)
+    # v3.0: Fencing token counter file — v272.x Phase 10: unified via split_brain_guard
     fencing_counter_file: Path = field(
-        default_factory=lambda: Path.home() / ".jarvis" / "cross_repo" / "locks" / ".fencing_counter"
+        default_factory=lambda: _canonical_cross_repo_lock_dir() / ".fencing_counter"
     )
 
 
@@ -738,6 +755,13 @@ class DistributedLockManager:
             logger.info(f"[v3.2] Lock '{lock_name}' auto-released after keepalive failure")
         except Exception as release_err:
             logger.error(f"[v3.2] Failed to auto-release '{lock_name}': {release_err}")
+
+        # v272.x Phase 10: Signal keepalive breach for split-brain detection
+        try:
+            from backend.core.split_brain_guard import KeepaliveBreachSignal
+            KeepaliveBreachSignal().signal_breach(lock_name)
+        except Exception:
+            pass
 
         # 2. Mark expired
         self._expired_locks.add(lock_name)
@@ -1998,9 +2022,15 @@ class DistributedLockManager:
                 if token > 0:
                     return token
 
-            # Fall back to file-based counter
-            self._fencing_token_counter += 1
-            return self._fencing_token_counter
+            # Fall back to persistent file-based counter (v272.x Phase 10)
+            try:
+                from backend.core.split_brain_guard import PersistentFencingToken
+                return PersistentFencingToken(
+                    path=self.config.fencing_counter_file
+                ).next_token()
+            except ImportError:
+                self._fencing_token_counter += 1
+                return self._fencing_token_counter
 
     async def _try_acquire_redis(
         self,
