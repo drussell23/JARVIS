@@ -23,6 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger("jarvis.orchestration_journal")
@@ -43,6 +44,11 @@ LEASE_ACQUIRE_RETRY_S = 0.25
 MAX_REPLAY_ENTRIES = 1000
 VALID_RESULTS = ("pending", "committed", "failed", "superseded")
 
+# Compaction constants
+COMPACTION_RETAIN_PRIOR_EPOCHS = int(os.environ.get("JARVIS_JOURNAL_RETAIN_PRIOR", "1000"))
+COMPACTION_BATCH_SIZE = int(os.environ.get("JARVIS_JOURNAL_COMPACTION_BATCH_SIZE", "10000"))
+COMPACTION_ARCHIVE_ENABLED = os.environ.get("JARVIS_JOURNAL_ARCHIVE_ENABLED", "true").lower() == "true"
+
 
 class StaleEpochError(Exception):
     """Raised when a write is attempted with an outdated epoch.
@@ -50,6 +56,14 @@ class StaleEpochError(Exception):
     NOT retryable. The correct response is to abdicate leadership.
     """
     pass
+
+
+@dataclass
+class CompactionResult:
+    """Result of a journal compaction operation."""
+    entries_archived: int
+    entries_remaining: int
+    duration_s: float
 
 
 class OrchestrationJournal:
@@ -185,6 +199,21 @@ class OrchestrationJournal:
                 registered_at   REAL NOT NULL,
                 epoch           INTEGER NOT NULL,
                 PRIMARY KEY (component, contract_type, contract_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS journal_archive (
+                seq             INTEGER PRIMARY KEY,
+                epoch           INTEGER NOT NULL,
+                timestamp       REAL NOT NULL,
+                wall_clock      TEXT NOT NULL,
+                actor           TEXT NOT NULL,
+                action          TEXT NOT NULL,
+                target          TEXT NOT NULL,
+                idempotency_key TEXT,
+                payload         TEXT,
+                result          TEXT,
+                fence_token     INTEGER NOT NULL,
+                archived_at     REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS schema_version (
@@ -452,6 +481,127 @@ class OrchestrationJournal:
                 (result, seq, self._epoch),
             )
             self._conn.commit()
+
+    # ── Compaction ───────────────────────────────────────────────────
+
+    def compact(self) -> "CompactionResult":
+        """Compact journal: archive old entries, retain current epoch + last N from priors.
+
+        Must hold lease. All operations are fenced.
+        Archive + delete happen in a single transaction for atomicity.
+        """
+        start = time.time()
+
+        with self._write_lock:
+            self._verify_epoch()
+
+            conn = self._conn
+
+            # Step 1: Count prior-epoch entries
+            row = conn.execute(
+                "SELECT COUNT(*) FROM journal WHERE epoch < ?",
+                (self._epoch,),
+            ).fetchone()
+            prior_count = row[0] if row else 0
+
+            if prior_count <= COMPACTION_RETAIN_PRIOR_EPOCHS:
+                remaining = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
+                return CompactionResult(
+                    entries_archived=0,
+                    entries_remaining=remaining,
+                    duration_s=time.time() - start,
+                )
+
+            # Step 2: Find boundary seq (keep newest COMPACTION_RETAIN_PRIOR_EPOCHS from prior epochs)
+            to_remove = prior_count - COMPACTION_RETAIN_PRIOR_EPOCHS
+            boundary_row = conn.execute(
+                "SELECT seq FROM journal WHERE epoch < ? "
+                "ORDER BY seq ASC LIMIT 1 OFFSET ?",
+                (self._epoch, to_remove - 1),
+            ).fetchone()
+
+            if boundary_row is None:
+                remaining = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
+                return CompactionResult(
+                    entries_archived=0,
+                    entries_remaining=remaining,
+                    duration_s=time.time() - start,
+                )
+
+            boundary_seq = boundary_row[0]
+
+            # Step 3: FK safety -- update component_state refs that point to compactable entries
+            components_to_update = conn.execute(
+                "SELECT component, last_seq FROM component_state WHERE last_seq <= ?",
+                (boundary_seq,),
+            ).fetchall()
+
+            if components_to_update:
+                # Find nearest retained seq
+                nearest = conn.execute(
+                    "SELECT MIN(seq) FROM journal WHERE seq > ?",
+                    (boundary_seq,),
+                ).fetchone()
+                new_seq = nearest[0] if nearest and nearest[0] is not None else boundary_seq + 1
+
+                for comp_name, old_seq in components_to_update:
+                    conn.execute(
+                        "UPDATE component_state SET last_seq = ? WHERE component = ?",
+                        (new_seq, comp_name),
+                    )
+                    logger.info(
+                        "[Journal] Compaction: updated component_state %s last_seq %d -> %d",
+                        comp_name, old_seq, new_seq,
+                    )
+
+            # Step 4: Archive + delete in single transaction
+            archived_count = 0
+
+            # Re-verify epoch (fencing inside transaction)
+            self._verify_epoch()
+
+            if COMPACTION_ARCHIVE_ENABLED:
+                conn.execute(
+                    """
+                    INSERT INTO journal_archive (
+                        seq, epoch, timestamp, wall_clock, actor, action, target,
+                        idempotency_key, payload, result, fence_token, archived_at
+                    )
+                    SELECT
+                        seq, epoch, timestamp, wall_clock, actor, action, target,
+                        idempotency_key, payload, result, fence_token, ?
+                    FROM journal
+                    WHERE seq <= ? AND epoch < ?
+                    """,
+                    (time.time(), boundary_seq, self._epoch),
+                )
+
+            cursor = conn.execute(
+                "DELETE FROM journal WHERE seq <= ? AND epoch < ?",
+                (boundary_seq, self._epoch),
+            )
+            archived_count = cursor.rowcount
+            conn.commit()
+
+            # Step 5: Reclaim WAL space
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as exc:
+                logger.warning("[Journal] WAL checkpoint failed: %s", exc)
+
+            remaining = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
+            duration = time.time() - start
+
+            logger.info(
+                "[Journal] Compaction complete: archived=%d, remaining=%d, duration=%.2fs",
+                archived_count, remaining, duration,
+            )
+
+            return CompactionResult(
+                entries_archived=archived_count,
+                entries_remaining=remaining,
+                duration_s=duration,
+            )
 
     # ── Replay ──────────────────────────────────────────────────────
 
