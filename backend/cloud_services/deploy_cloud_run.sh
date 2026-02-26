@@ -16,7 +16,14 @@
 #   ./deploy_cloud_run.sh --local-build      # Build locally, push to GCR
 #   ./deploy_cloud_run.sh --dry-run          # Show commands without executing
 #
-# v20.4.0 - BLOCKING Initialization with Startup State Machine
+# v20.5.0 - Enterprise-Grade Cloud Run Deployment
+#   - min-instances=1 eliminates cold starts (the root cause of ECAPA probe timeouts)
+#   - Startup CPU Boost doubles vCPU during model loading
+#   - Gen2 execution environment for full Linux compat with native C extensions
+#   - Instance-based billing (--no-cpu-throttling) keeps model warm between requests
+#   - Session affinity routes sequential requests to warm instances
+#   - Startup probe prevents traffic before ECAPA model is loaded
+#   - Liveness probe restarts deadlocked containers
 # =============================================================================
 
 set -e
@@ -33,10 +40,31 @@ IMAGE_NAME="${ECAPA_IMAGE_NAME:-ecapa-cloud-service}"
 # Cloud Run configuration
 MEMORY="${CLOUD_RUN_MEMORY:-4Gi}"
 CPU="${CLOUD_RUN_CPU:-2}"
-MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-0}"  # Scale to zero
+# v20.5.0: min-instances=1 eliminates cold starts for latency-sensitive ML inference.
+# Cloud Run cold start for ECAPA model = 10-30s. Client probe timeout = 8-12s.
+# With min-instances=0, probe ALWAYS times out when container is cold.
+# Cost: ~$145/month for 1 always-warm instance (2 vCPU, 4Gi).
+# Override with CLOUD_RUN_MIN_INSTANCES=0 for dev/staging to save costs.
+MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-1}"
 MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-3}"
-CONCURRENCY="${CLOUD_RUN_CONCURRENCY:-10}"
+# v20.5.0: Concurrency reduced from 10 to 6 for CPU-bound ECAPA inference.
+# 2 vCPU can realistically handle 2 concurrent inference + 4 headroom for health/IO.
+CONCURRENCY="${CLOUD_RUN_CONCURRENCY:-6}"
 TIMEOUT="${CLOUD_RUN_TIMEOUT:-300s}"
+# v20.5.0: Instance-based billing keeps CPU always allocated. Prevents latency
+# spike on first request after idle (CPU re-allocation delay). Required for ML
+# inference where model must stay warm in memory.
+CPU_THROTTLING="${CLOUD_RUN_CPU_THROTTLING:-false}"  # false = always-on CPU
+# v20.5.0: Startup CPU Boost temporarily doubles vCPU during container startup.
+# 2 vCPU → 4 vCPU for model loading. Cuts cold start by 30-50%.
+CPU_BOOST="${CLOUD_RUN_CPU_BOOST:-true}"
+# v20.5.0: Gen2 execution environment uses microVM instead of gVisor sandbox.
+# Full Linux compat for PyTorch/SpeechBrain native C extensions (torch, torchaudio,
+# soundfile, numpy BLAS). No system call emulation overhead = faster inference.
+EXECUTION_ENV="${CLOUD_RUN_EXECUTION_ENV:-gen2}"
+# v20.5.0: Session affinity routes sequential requests from same client to same
+# instance. Warm caches (ECAPA embeddings, audio features) stay hot.
+SESSION_AFFINITY="${CLOUD_RUN_SESSION_AFFINITY:-true}"
 
 # Security / cost control
 # If unauthenticated access is allowed, anyone who finds the URL can generate billable requests.
@@ -150,14 +178,19 @@ check_prerequisites() {
 cd "$(dirname "$0")"
 
 log "============================================================"
-log "ECAPA Cloud Service Deployment - v18.2.0"
+log "ECAPA Cloud Service Deployment - v20.5.0"
 log "============================================================"
-log "Project:    $GCP_PROJECT"
-log "Region:     $GCP_REGION"
-log "Service:    $SERVICE_NAME"
-log "Memory:     $MEMORY"
-log "CPU:        $CPU"
-log "Instances:  $MIN_INSTANCES-$MAX_INSTANCES"
+log "Project:      $GCP_PROJECT"
+log "Region:       $GCP_REGION"
+log "Service:      $SERVICE_NAME"
+log "Memory:       $MEMORY"
+log "CPU:          $CPU"
+log "Instances:    $MIN_INSTANCES-$MAX_INSTANCES"
+log "Concurrency:  $CONCURRENCY"
+log "CPU Boost:    $CPU_BOOST"
+log "CPU Throttle: $CPU_THROTTLING"
+log "Exec Env:     $EXECUTION_ENV"
+log "Session Aff:  $SESSION_AFFINITY"
 log "============================================================"
 
 check_prerequisites
@@ -185,7 +218,7 @@ fi
 
 # Build image
 IMAGE_URI="${AR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/${IMAGE_NAME}:latest"
-IMAGE_URI_TAGGED="${AR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/${IMAGE_NAME}:v20.4.0"
+IMAGE_URI_TAGGED="${AR_LOCATION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/${IMAGE_NAME}:v20.5.0"
 
 if [ "$SKIP_BUILD" = false ]; then
     if [ "$LOCAL_BUILD" = true ]; then
@@ -221,19 +254,62 @@ AUTH_FLAG=""
 if [ "$ALLOW_UNAUTHENTICATED" = "true" ]; then
     AUTH_FLAG="--allow-unauthenticated"
 fi
-run_cmd gcloud run deploy "$SERVICE_NAME" \
-    --image "$IMAGE_URI" \
-    --region "$GCP_REGION" \
-    --platform managed \
-    --memory "$MEMORY" \
-    --cpu "$CPU" \
-    --min-instances "$MIN_INSTANCES" \
-    --max-instances "$MAX_INSTANCES" \
-    --concurrency "$CONCURRENCY" \
-    --timeout "$TIMEOUT" \
-    $AUTH_FLAG \
-    --set-env-vars "ECAPA_DEVICE=cpu,ECAPA_WARMUP_ON_START=true,ECAPA_CACHE_TTL=3600,ECAPA_USE_OPTIMIZED=true" \
+# v20.5.0: Build deploy flags dynamically based on configuration.
+# This avoids hardcoded flag assumptions and respects env var overrides.
+DEPLOY_FLAGS=(
+    --image "$IMAGE_URI"
+    --region "$GCP_REGION"
+    --platform managed
+    --memory "$MEMORY"
+    --cpu "$CPU"
+    --min-instances "$MIN_INSTANCES"
+    --max-instances "$MAX_INSTANCES"
+    --concurrency "$CONCURRENCY"
+    --timeout "$TIMEOUT"
+    --execution-environment "$EXECUTION_ENV"
     --port 8010
+    --set-env-vars "ECAPA_DEVICE=cpu,ECAPA_WARMUP_ON_START=true,ECAPA_CACHE_TTL=3600,ECAPA_USE_OPTIMIZED=true"
+)
+
+# CPU throttling: false = instance-based billing (always-on CPU)
+if [ "$CPU_THROTTLING" = "false" ]; then
+    DEPLOY_FLAGS+=(--no-cpu-throttling)
+else
+    DEPLOY_FLAGS+=(--cpu-throttling)
+fi
+
+# Startup CPU Boost: doubles vCPU during container startup
+if [ "$CPU_BOOST" = "true" ]; then
+    DEPLOY_FLAGS+=(--cpu-boost)
+else
+    DEPLOY_FLAGS+=(--no-cpu-boost)
+fi
+
+# Session affinity: routes sequential requests to same warm instance
+if [ "$SESSION_AFFINITY" = "true" ]; then
+    DEPLOY_FLAGS+=(--session-affinity)
+fi
+
+# v20.5.0: Startup probe — prevents Cloud Run from sending traffic to instances
+# that haven't finished loading the ECAPA model. Without this, Cloud Run considers
+# the container ready as soon as the HTTP port opens (before model loads).
+# Budget: initialDelay(5s) + failureThreshold(20) × period(3s) = 65s
+DEPLOY_FLAGS+=(
+    --startup-probe "httpGet.path=/health,httpGet.port=8010,initialDelaySeconds=5,periodSeconds=3,failureThreshold=20,timeoutSeconds=3"
+)
+
+# v20.5.0: Liveness probe — detects deadlocked containers (corrupted model state,
+# PyTorch hang, etc.) and restarts them. 3 consecutive failures = restart.
+DEPLOY_FLAGS+=(
+    --liveness-probe "httpGet.path=/health,httpGet.port=8010,initialDelaySeconds=0,periodSeconds=30,failureThreshold=3,timeoutSeconds=5"
+)
+
+# Authentication flag
+if [ -n "$AUTH_FLAG" ]; then
+    DEPLOY_FLAGS+=($AUTH_FLAG)
+fi
+
+run_cmd gcloud run deploy "$SERVICE_NAME" "${DEPLOY_FLAGS[@]}"
 
 # Get service URL
 SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \

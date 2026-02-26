@@ -64,9 +64,9 @@ variable "image_tag" {
 }
 
 variable "min_instances" {
-  description = "Minimum Cloud Run instances (0 = scale to zero)"
+  description = "Minimum Cloud Run instances. Set to 1+ for latency-sensitive ML inference to eliminate cold starts."
   type        = number
-  default     = 0
+  default     = 1
 }
 
 variable "max_instances" {
@@ -230,12 +230,17 @@ resource "google_cloud_run_v2_service" "jarvis_backend" {
       image = "${var.region}-docker.pkg.dev/${var.project_id}/jarvis-backend/jarvis-backend:${var.image_tag}"
 
       # Resources
+      # cpu_idle=false = instance-based billing (always-on CPU).
+      # Required for ML inference: model stays warm in memory between requests,
+      # no CPU re-allocation delay on request arrival.
+      # startup_cpu_boost=true = doubles vCPU during container startup,
+      # cutting model load time by 30-50%.
       resources {
         limits = {
           cpu    = var.cpu
           memory = var.memory
         }
-        cpu_idle          = true
+        cpu_idle          = false
         startup_cpu_boost = true
       }
 
@@ -358,27 +363,31 @@ resource "google_cloud_run_v2_service" "jarvis_backend" {
         }
       }
 
-      # Startup probe
+      # Startup probe — prevents traffic before ML model is loaded.
+      # Budget: 5s delay + 20 failures × 3s period = 65s total startup budget.
+      # Aligned with deploy_cloud_run.sh v20.5.0.
       startup_probe {
         http_get {
           path = "/health"
           port = 8010
         }
-        initial_delay_seconds = 10
-        timeout_seconds       = 10
-        period_seconds        = 10
-        failure_threshold     = 30
+        initial_delay_seconds = 5
+        timeout_seconds       = 3
+        period_seconds        = 3
+        failure_threshold     = 20
       }
 
-      # Liveness probe
+      # Liveness probe — restarts deadlocked containers (corrupted model state,
+      # PyTorch hang). 3 consecutive failures × 30s period = 90s to declare dead.
       liveness_probe {
         http_get {
           path = "/health"
           port = 8010
         }
-        initial_delay_seconds = 30
+        initial_delay_seconds = 0
         timeout_seconds       = 5
         period_seconds        = 30
+        failure_threshold     = 3
       }
     }
 

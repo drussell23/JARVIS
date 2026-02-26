@@ -1285,6 +1285,11 @@ class MLEngineRegistry:
         # This runs in the background while other init proceeds.
         self._schedule_cloud_prewarm()
 
+        # v276.2: Register MemoryQuantizer recovery callback for event-driven
+        # ECAPA reload. When memory recovers from CRITICAL/EMERGENCY, this fires
+        # immediately instead of waiting for the next 30s poll cycle.
+        self._register_memory_recovery_callback()
+
         logger.info(f"🔧 MLEngineRegistry initialized with {len(self._engines)} engines")
         logger.info(f"   Config: {MLConfig.to_dict()}")
         logger.info(f"   Cloud fallback enabled: {self._cloud_fallback_enabled}")
@@ -1299,6 +1304,59 @@ class MLEngineRegistry:
             candidate = f"/{candidate}"
         normalized = candidate.rstrip("/")
         return normalized or default
+
+    def _register_memory_recovery_callback(self) -> None:
+        """
+        v276.2: Register event-driven ECAPA reload on memory recovery.
+
+        The MemoryQuantizer fires recovery callbacks when memory transitions
+        from CRITICAL/EMERGENCY back to stable tiers. This eliminates the
+        30s poll delay in _schedule_deferred_ecapa_recovery() — ECAPA reload
+        triggers instantly when memory pressure subsides.
+
+        The callback creates an asyncio task (non-blocking) to attempt cloud
+        first, then local, matching the deferred recovery strategy.
+        """
+        try:
+            import backend.core.memory_quantizer as _mq_mod
+
+            _mq = _mq_mod._memory_quantizer_instance
+            if _mq is None:
+                logger.debug("[v276.2] MemoryQuantizer not yet initialized — "
+                             "recovery callback will be registered later")
+                return
+
+            def _on_memory_recovered(old_tier, new_tier) -> None:
+                """Callback fired by MemoryQuantizer when memory stabilizes."""
+                if not self._memory_gate_blocked:
+                    return  # ECAPA wasn't blocked — nothing to recover
+
+                if self.is_ready:
+                    return  # Already recovered via another path
+
+                logger.info(
+                    f"[v276.2] Memory recovered ({old_tier.value} → {new_tier.value}) "
+                    "— triggering immediate ECAPA recovery"
+                )
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(
+                        self._attempt_ecapa_recovery(
+                            source="memory_recovery_callback"
+                        ),
+                        name="ecapa-memory-recovery",
+                    )
+                except RuntimeError:
+                    logger.debug("[v276.2] No event loop for memory recovery callback")
+
+            _mq.register_recovery_callback(_on_memory_recovered)
+            logger.debug("[v276.2] MemoryQuantizer recovery callback registered for ECAPA")
+
+        except ImportError:
+            logger.debug("[v276.2] MemoryQuantizer not available — skipping recovery callback")
+        except Exception as e:
+            logger.debug(f"[v276.2] Failed to register memory recovery callback: {e}")
 
     def _schedule_cloud_prewarm(self) -> None:
         """
@@ -3251,14 +3309,134 @@ class MLEngineRegistry:
             logger.error(f"❌ Local ECAPA fallback exception: {e}")
             return False
 
+    async def _attempt_ecapa_recovery(self, source: str = "deferred") -> bool:
+        """
+        v276.2: Unified ECAPA recovery — cloud-first, then local.
+
+        This is the single recovery method used by BOTH the deferred recovery
+        loop AND the MemoryQuantizer recovery callback. The strategy is:
+
+        1. TRY CLOUD FIRST — by the time recovery fires (30s+ after initial
+           failure), the Cloud Run container has completed its cold start and
+           is warm. This is the highest-probability path to success.
+        2. If cloud fails AND memory allows, try local as fallback.
+        3. If both fail, return False (caller decides whether to retry).
+
+        Args:
+            source: Who triggered this recovery (for logging/telemetry)
+
+        Returns:
+            True if ECAPA was successfully recovered via any backend
+        """
+        if self.is_ready:
+            logger.debug(f"[v276.2] ECAPA already ready (source={source}) — skipping recovery")
+            return True
+
+        logger.info(
+            f"[v276.2] Attempting ECAPA recovery (source={source}) — cloud-first strategy"
+        )
+
+        # ── Phase 1: Try cloud (highest probability after cold start completes) ──
+        cloud_success = False
+        try:
+            cloud_success = await self._fallback_to_cloud(
+                f"recovery attempt (source={source})"
+            )
+        except Exception as e:
+            logger.warning(f"[v276.2] Cloud recovery failed: {e}")
+
+        if cloud_success:
+            self._status.is_ready = True
+            self._status.errors = [
+                e for e in self._status.errors
+                if "memory emergency" not in e and "ECAPA UNAVAILABLE" not in e
+            ]
+            self._ready_event.set()
+            self._memory_gate_blocked = False
+            logger.info(
+                f"[v276.2] ECAPA recovery SUCCESSFUL via cloud (source={source})"
+            )
+            return True
+
+        # ── Phase 2: Check if local loading is safe ──
+        local_allowed = False
+        try:
+            import backend.core.memory_quantizer as _mq_mod
+            from backend.core.memory_quantizer import MemoryTier
+
+            _mq = _mq_mod._memory_quantizer_instance
+            if _mq is not None:
+                _thrash = _mq._thrash_state
+                _tier = _mq.current_tier
+                if _thrash in ("healthy",) and _tier not in (
+                    MemoryTier.CRITICAL, MemoryTier.EMERGENCY
+                ):
+                    local_allowed = True
+                else:
+                    logger.debug(
+                        f"[v276.2] Local ECAPA blocked: thrash={_thrash}, "
+                        f"tier={_tier.value} (source={source})"
+                    )
+            else:
+                use_cloud, _, _ = MLConfig.check_memory_pressure()
+                local_allowed = not use_cloud
+        except ImportError:
+            use_cloud, _, _ = MLConfig.check_memory_pressure()
+            local_allowed = not use_cloud
+        except Exception:
+            use_cloud, _, _ = MLConfig.check_memory_pressure()
+            local_allowed = not use_cloud
+
+        if local_allowed:
+            logger.info(f"[v276.2] Cloud failed, trying local ECAPA (source={source})")
+            try:
+                local_success = await self._fallback_to_local_ecapa(
+                    f"recovery after cloud failure (source={source})"
+                )
+                if local_success:
+                    self._status.is_ready = True
+                    self._status.errors = [
+                        e for e in self._status.errors
+                        if "memory emergency" not in e and "ECAPA UNAVAILABLE" not in e
+                    ]
+                    self._ready_event.set()
+                    self._memory_gate_blocked = False
+                    logger.info(
+                        f"[v276.2] ECAPA recovery SUCCESSFUL via local (source={source})"
+                    )
+                    return True
+            except Exception as e:
+                logger.warning(f"[v276.2] Local recovery also failed: {e}")
+
+        logger.warning(
+            f"[v276.2] ECAPA recovery failed — both cloud and local unavailable "
+            f"(source={source})"
+        )
+        return False
+
     def _schedule_deferred_ecapa_recovery(self) -> None:
         """
-        v271.0: Schedule a background task that monitors memory state and
-        re-attempts ECAPA loading when conditions improve.
+        v271.0→v276.2: Schedule background ECAPA recovery with cloud-first strategy.
 
-        Called when the memory gate blocks initial ECAPA loading. Ensures
-        "degrade gracefully until memory stabilizes" is actually true — the
-        system WILL recover without requiring a restart.
+        ROOT CAUSE OF RECURRING FAILURE (v271.0):
+            Original implementation ONLY retried local ECAPA loading. When memory
+            emergency blocked local load, recovery waited for memory to stabilize.
+            Meanwhile, the Cloud Run container completed its cold start (10-30s)
+            and was sitting warm and ready — but recovery never tried it.
+
+        THE CURE (v276.2):
+            Recovery now uses _attempt_ecapa_recovery() which tries CLOUD FIRST.
+            By T+30s (first recovery poll), Cloud Run has been warm for 0-20s.
+            The cloud probe succeeds immediately (~100ms) instead of timing out.
+
+            Additionally, MemoryQuantizer recovery callbacks provide event-driven
+            reload (registered in __init__), so recovery doesn't purely rely on
+            this 30s poll loop.
+
+        Strategy per attempt:
+            1. Try cloud (warm by now) → success? done.
+            2. If cloud fails AND memory safe → try local → success? done.
+            3. Both fail → wait for next poll interval.
         """
         if self._deferred_ecapa_recovery_task is not None:
             return  # Already scheduled
@@ -3275,7 +3453,7 @@ class MLEngineRegistry:
             attempt = 0
 
             logger.info(
-                f"[v271.0] Deferred ECAPA recovery scheduled "
+                f"[v276.2] Deferred ECAPA recovery scheduled — cloud-first strategy "
                 f"(poll every {poll_interval}s, max {max_attempts} attempts)"
             )
 
@@ -3283,73 +3461,36 @@ class MLEngineRegistry:
                 await asyncio.sleep(poll_interval)
                 attempt += 1
 
-                # Check if someone else already loaded ECAPA
+                # Check if someone else already loaded ECAPA (e.g., memory callback)
                 if self.is_ready:
-                    logger.info("[v271.0] ECAPA already ready — deferred recovery exiting")
+                    logger.info(
+                        "[v276.2] ECAPA already ready — deferred recovery exiting"
+                    )
                     self._memory_gate_blocked = False
                     return
 
-                # Check memory state
-                can_load = False
+                logger.info(
+                    f"[v276.2] Deferred recovery attempt #{attempt}/{max_attempts}"
+                )
+
                 try:
-                    import backend.core.memory_quantizer as _mq_mod
-                    from backend.core.memory_quantizer import MemoryTier
-
-                    _mq = _mq_mod._memory_quantizer_instance
-                    if _mq is not None:
-                        _thrash = _mq._thrash_state
-                        _tier = _mq.current_tier
-                        if _thrash == "healthy" and _tier not in (
-                            MemoryTier.CRITICAL, MemoryTier.EMERGENCY
-                        ):
-                            can_load = True
-                        else:
-                            logger.debug(
-                                f"[v271.0] Deferred recovery check #{attempt}: "
-                                f"thrash={_thrash}, tier={_tier.value} — not yet safe"
-                            )
-                    else:
-                        # MemoryQuantizer not available — use MLConfig fallback
-                        use_cloud, _, _ = MLConfig.check_memory_pressure()
-                        can_load = not use_cloud
-                except Exception:
-                    # Can't check — use MLConfig fallback
-                    use_cloud, _, _ = MLConfig.check_memory_pressure()
-                    can_load = not use_cloud
-
-                if can_load:
-                    logger.info(
-                        f"[v271.0] Memory stabilized — attempting deferred ECAPA load "
-                        f"(attempt #{attempt})"
+                    success = await self._attempt_ecapa_recovery(
+                        source=f"deferred_poll_{attempt}"
                     )
-                    try:
-                        success = await self._fallback_to_local_ecapa(
-                            "deferred recovery after memory stabilization"
+                    if success:
+                        logger.info(
+                            f"[v276.2] Deferred ECAPA recovery SUCCESSFUL on "
+                            f"attempt #{attempt} — voice unlock now available!"
                         )
-                        if success:
-                            self._status.is_ready = True
-                            self._status.errors = [
-                                e for e in self._status.errors
-                                if "memory emergency" not in e
-                            ]
-                            self._ready_event.set()
-                            self._memory_gate_blocked = False
-                            logger.info(
-                                "[v271.0] Deferred ECAPA recovery SUCCESSFUL — "
-                                "voice unlock now available!"
-                            )
-                            return
-                        else:
-                            logger.warning(
-                                f"[v271.0] Deferred ECAPA load failed (attempt #{attempt})"
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            f"[v271.0] Deferred ECAPA recovery error: {e}"
-                        )
+                        return
+                except Exception as e:
+                    logger.warning(
+                        f"[v276.2] Deferred ECAPA recovery attempt #{attempt} error: {e}"
+                    )
 
-            logger.warning(
-                f"[v271.0] Deferred ECAPA recovery exhausted {max_attempts} attempts. "
+            logger.error(
+                f"[v276.2] Deferred ECAPA recovery exhausted {max_attempts} attempts "
+                f"over {max_attempts * poll_interval:.0f}s. "
                 "Voice unlock will remain unavailable until restart."
             )
             self._memory_gate_blocked = False
@@ -3361,7 +3502,10 @@ class MLEngineRegistry:
                 name="ecapa-deferred-recovery",
             )
         except RuntimeError:
-            logger.debug("[v271.0] No running event loop for deferred recovery")
+            logger.error(
+                "[v276.2] CRITICAL: No running event loop for deferred recovery. "
+                "ECAPA will remain unavailable until restart."
+            )
 
     async def _fallback_to_cloud(self, reason: str) -> bool:
         """
