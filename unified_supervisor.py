@@ -62837,8 +62837,15 @@ class JarvisSystemKernel:
             pass
 
         # v232.0: Notify PrimeRouter singleton of GCP endpoint promotion
+        # v271.1: Changed from fire-and-forget to tracked tasks with validation.
+        # Root cause: create_safe_task notifications could silently fail under
+        # event loop pressure, leaving env vars pointing to GCP but PrimeRouter
+        # still routing to localhost (split-state). Now we track tasks and
+        # schedule a deferred validation to catch propagation failures.
+        _router_task = None
+        _serving_task = None
         try:
-            create_safe_task(
+            _router_task = create_safe_task(
                 self._notify_prime_router_of_gcp(node_ip, port),
                 name="notify_prime_router_gcp_up",
             )
@@ -62847,9 +62854,54 @@ class JarvisSystemKernel:
 
         # v234.0: Notify UnifiedModelServing of GCP endpoint
         try:
-            create_safe_task(
+            _serving_task = create_safe_task(
                 self._notify_model_serving_of_gcp(node_ip, port),
                 name="notify_model_serving_gcp_up",
+            )
+        except Exception:
+            pass
+
+        # v271.1: Schedule deferred validation of propagation success.
+        # Runs 5s after propagation to verify PrimeRouter actually accepted
+        # the GCP endpoint. If not, retries the notification.
+        async def _validate_propagation_deferred() -> None:
+            await asyncio.sleep(5.0)
+            # Check if PrimeRouter has the GCP endpoint
+            try:
+                from backend.core.prime_router import get_prime_router
+                _router = get_prime_router()
+                if _router is None:
+                    return
+                _current_decision = getattr(_router, "_current_routing_decision", None)
+                # If router isn't routing to GCP, retry notification
+                if _current_decision is not None:
+                    _decision_name = getattr(_current_decision, "name", str(_current_decision))
+                    if "GCP" not in _decision_name.upper():
+                        self.logger.warning(
+                            f"[InvincibleNode] v271.1: PrimeRouter not using GCP "
+                            f"({_decision_name}) 5s after propagation — retrying"
+                        )
+                        try:
+                            await self._notify_prime_router_of_gcp(node_ip, port)
+                        except Exception as _retry_err:
+                            self.logger.debug(
+                                f"[InvincibleNode] v271.1: Retry failed: {_retry_err}"
+                            )
+                    else:
+                        self.logger.debug(
+                            f"[InvincibleNode] v271.1: Propagation validated — "
+                            f"PrimeRouter using {_decision_name}"
+                        )
+            except ImportError:
+                pass
+            except Exception as _val_err:
+                self.logger.debug(
+                    f"[InvincibleNode] v271.1: Propagation validation: {_val_err}"
+                )
+        try:
+            create_safe_task(
+                _validate_propagation_deferred(),
+                name="validate_gcp_propagation",
             )
         except Exception:
             pass
@@ -68801,6 +68853,27 @@ class JarvisSystemKernel:
                     "frontend", "error",
                     f"Budget/cap exceeded ({_fe_outer_timeout:.0f}s)",
                 )
+                # v271.1: Disarm DMS on budget/cap failure (same pattern as timeout)
+                if self._startup_watchdog:
+                    try:
+                        await self._startup_watchdog.stop()
+                    except Exception:
+                        pass
+                try:
+                    self._current_startup_phase = "complete"
+                    self._current_startup_progress = 100
+                    await self._safe_broadcast(
+                        stage="complete",
+                        message="JARVIS startup complete (frontend budget exceeded)",
+                        progress=100,
+                        metadata={
+                            "icon": "warning",
+                            "phase": "complete",
+                            "frontend_failed": True,
+                        },
+                    )
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 self.logger.error(
                     f"[Kernel] v265.3: _phase_frontend_transition() OUTER "
@@ -68811,11 +68884,57 @@ class JarvisSystemKernel:
                     "frontend", "error",
                     f"Outer timeout ({_fe_outer_timeout:.0f}s)",
                 )
+                # =============================================================
+                # v271.1: DMS DISARM ON TIMEOUT (Critical gap fix)
+                # =============================================================
+                # If the outer wait_for() fires BEFORE _phase_frontend_transition()
+                # reaches its internal DMS disarm (line ~80641), the DMS stays
+                # active with stale phase="frontend". It then detects a "stall"
+                # (no progress change since the timed-out phase stopped updating)
+                # and escalates to rollback — killing an otherwise-completing
+                # startup.
+                #
+                # Fix: Disarm DMS immediately in the timeout handler. All startup
+                # phases are complete at this point (frontend is the final phase).
+                # Also emit degraded-complete broadcast so the loading page can
+                # transition even though the frontend phase itself failed.
+                # =============================================================
+                if self._startup_watchdog:
+                    try:
+                        await self._startup_watchdog.stop()
+                        self.logger.info(
+                            "[Kernel] v271.1: DMS disarmed after frontend phase timeout"
+                        )
+                    except Exception:
+                        pass
+                # Emit degraded-complete broadcast so loading page isn't stuck
+                try:
+                    self._current_startup_phase = "complete"
+                    self._current_startup_progress = 100
+                    await self._safe_broadcast(
+                        stage="complete",
+                        message="JARVIS startup complete (frontend timed out)",
+                        progress=100,
+                        metadata={
+                            "icon": "warning",
+                            "phase": "complete",
+                            "frontend_failed": True,
+                            "frontend_timeout": True,
+                        },
+                    )
+                except Exception:
+                    pass
             except asyncio.CancelledError:
                 self.logger.error(
                     "[Kernel] v265.3: _phase_frontend_transition() cancelled"
                 )
                 _fe_ok = False
+                # v271.1: Disarm DMS on cancellation too
+                if self._startup_watchdog:
+                    try:
+                        await self._startup_watchdog.stop()
+                    except Exception:
+                        pass
                 raise
             if _ssm:
                 if _fe_ok:
@@ -80552,9 +80671,16 @@ class JarvisSystemKernel:
         self._current_startup_progress = 98
         await self._broadcast_progress(98, "frontend", "Transitioning to main UI...")
 
-        # Step 3: Mark startup as complete (before redirect)
-        # This signals the loading server to allow graceful Chrome disconnect
+        # v271.1: JARVIS_STARTUP_COMPLETE is now set AFTER the 100% broadcast
+        # (moved from here). Previously it was set before the broadcast, which
+        # meant external consumers saw "complete" while the loading page was
+        # still at 98%. If the broadcast then failed (timeout), external systems
+        # proceeded but the UI never transitioned. The env var is now set inside
+        # both the frontend_started and !frontend_started branches, AFTER their
+        # respective 100% broadcasts succeed.
+        #
         # v272.0 Phase 9: Register completion signal as cleanup-able artifact
+        # (registration stays here since it's a setup step, not the actual set)
         try:
             from backend.core.startup_transaction import get_startup_transaction
             get_startup_transaction().register_phase_artifact(
@@ -80563,8 +80689,6 @@ class JarvisSystemKernel:
             )
         except Exception:
             pass
-        _set_startup_env("JARVIS_STARTUP_COMPLETE", "true", "all_phases_done", caller="_finalize_startup")
-        self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true")
 
         # v270.2: Grant cross_repo authority now that supervisor controls startup.
         try:
@@ -80656,6 +80780,15 @@ class JarvisSystemKernel:
                 }
             )
 
+            # v271.1: Set JARVIS_STARTUP_COMPLETE AFTER broadcast succeeds
+            # (moved from before redirect). External consumers must not see
+            # "complete" until the loading page has received the 100% signal.
+            _set_startup_env(
+                "JARVIS_STARTUP_COMPLETE", "true",
+                "all_phases_done", caller="_finalize_startup",
+            )
+            self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true (after broadcast)")
+
             # Step 5: Gracefully stop the loading server (AFTER 100% is sent)
             # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
             redirect_stabilization_delay = float(
@@ -80720,6 +80853,13 @@ class JarvisSystemKernel:
                 phase="frontend",
                 metadata={"frontend_started": False, "api_only": True},
             )
+
+            # v271.1: Set JARVIS_STARTUP_COMPLETE AFTER broadcast (same as main path)
+            _set_startup_env(
+                "JARVIS_STARTUP_COMPLETE", "true",
+                "all_phases_done_api_only", caller="_finalize_startup",
+            )
+            self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true (API-only, after broadcast)")
 
             # Brief stabilization delay for any WebSocket consumers
             await asyncio.sleep(0.5)
