@@ -1314,49 +1314,96 @@ class MLEngineRegistry:
         30s poll delay in _schedule_deferred_ecapa_recovery() — ECAPA reload
         triggers instantly when memory pressure subsides.
 
-        The callback creates an asyncio task (non-blocking) to attempt cloud
-        first, then local, matching the deferred recovery strategy.
+        If MemoryQuantizer is not yet initialized (common during startup —
+        MLEngineRegistry.__init__ runs synchronously, MemoryQuantizer requires
+        async initialize()), schedules deferred retries until registration
+        succeeds.
         """
-        try:
-            import backend.core.memory_quantizer as _mq_mod
+        self._memory_recovery_callback_registered = False
 
-            _mq = _mq_mod._memory_quantizer_instance
-            if _mq is None:
-                logger.debug("[v276.2] MemoryQuantizer not yet initialized — "
-                             "recovery callback will be registered later")
-                return
+        def _on_memory_recovered(old_tier, new_tier) -> None:
+            """Callback fired by MemoryQuantizer when memory stabilizes."""
+            if not self._memory_gate_blocked:
+                return  # ECAPA wasn't blocked — nothing to recover
 
-            def _on_memory_recovered(old_tier, new_tier) -> None:
-                """Callback fired by MemoryQuantizer when memory stabilizes."""
-                if not self._memory_gate_blocked:
-                    return  # ECAPA wasn't blocked — nothing to recover
+            if self.is_ready:
+                return  # Already recovered via another path
 
-                if self.is_ready:
-                    return  # Already recovered via another path
+            logger.info(
+                f"[v276.2] Memory recovered ({old_tier.value} → {new_tier.value}) "
+                "— triggering immediate ECAPA recovery"
+            )
 
-                logger.info(
-                    f"[v276.2] Memory recovered ({old_tier.value} → {new_tier.value}) "
-                    "— triggering immediate ECAPA recovery"
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._attempt_ecapa_recovery(
+                        source="memory_recovery_callback"
+                    ),
+                    name="ecapa-memory-recovery",
                 )
+            except RuntimeError:
+                logger.debug("[v276.2] No event loop for memory recovery callback")
 
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(
-                        self._attempt_ecapa_recovery(
-                            source="memory_recovery_callback"
-                        ),
-                        name="ecapa-memory-recovery",
+        # Store reference for deferred registration
+        self._memory_recovery_callback_fn = _on_memory_recovered
+
+        def _try_register() -> bool:
+            """Attempt registration. Returns True on success."""
+            try:
+                import backend.core.memory_quantizer as _mq_mod
+
+                _mq = _mq_mod._memory_quantizer_instance
+                if _mq is None:
+                    return False
+
+                _mq.register_recovery_callback(self._memory_recovery_callback_fn)
+                self._memory_recovery_callback_registered = True
+                logger.debug("[v276.2] MemoryQuantizer recovery callback registered")
+                return True
+            except ImportError:
+                return False
+            except Exception as e:
+                logger.debug(f"[v276.2] Callback registration failed: {e}")
+                return False
+
+        # Try immediate registration
+        if _try_register():
+            return
+
+        # MemoryQuantizer not yet initialized — schedule deferred retries.
+        # By the time prewarm_all() runs (seconds later), MQ should be up.
+        async def _deferred_register() -> None:
+            retry_delay = float(os.getenv(
+                "JARVIS_ECAPA_MQ_CALLBACK_RETRY_DELAY", "10.0"
+            ))
+            max_retries = int(os.getenv(
+                "JARVIS_ECAPA_MQ_CALLBACK_MAX_RETRIES", "6"
+            ))
+            for attempt in range(1, max_retries + 1):
+                await asyncio.sleep(retry_delay)
+                if self._memory_recovery_callback_registered:
+                    return  # Registered by another path
+                if _try_register():
+                    logger.info(
+                        f"[v276.2] Deferred MQ callback registration succeeded "
+                        f"(attempt {attempt})"
                     )
-                except RuntimeError:
-                    logger.debug("[v276.2] No event loop for memory recovery callback")
+                    return
+            logger.warning(
+                "[v276.2] MQ callback registration failed after "
+                f"{max_retries} retries. Event-driven ECAPA recovery "
+                "unavailable (poll-based recovery still active)."
+            )
 
-            _mq.register_recovery_callback(_on_memory_recovered)
-            logger.debug("[v276.2] MemoryQuantizer recovery callback registered for ECAPA")
-
-        except ImportError:
-            logger.debug("[v276.2] MemoryQuantizer not available — skipping recovery callback")
-        except Exception as e:
-            logger.debug(f"[v276.2] Failed to register memory recovery callback: {e}")
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                _deferred_register(),
+                name="ecapa-mq-callback-register",
+            )
+        except RuntimeError:
+            logger.debug("[v276.2] No event loop — MQ callback deferred to prewarm phase")
 
     def _schedule_cloud_prewarm(self) -> None:
         """
@@ -3368,7 +3415,7 @@ class MLEngineRegistry:
             if _mq is not None:
                 _thrash = _mq._thrash_state
                 _tier = _mq.current_tier
-                if _thrash in ("healthy",) and _tier not in (
+                if _thrash == "healthy" and _tier not in (
                     MemoryTier.CRITICAL, MemoryTier.EMERGENCY
                 ):
                     local_allowed = True

@@ -72,7 +72,7 @@ variable "min_instances" {
 variable "max_instances" {
   description = "Maximum Cloud Run instances"
   type        = number
-  default     = 5
+  default     = 3
 }
 
 variable "memory" {
@@ -94,9 +94,9 @@ variable "timeout" {
 }
 
 variable "concurrency" {
-  description = "Maximum concurrent requests per instance"
+  description = "Maximum concurrent requests per instance. For CPU-bound ML inference (ECAPA), 6 is optimal (2 inference threads + 4 headroom for health/IO)."
   type        = number
-  default     = 80
+  default     = 6
 }
 
 # Integration variables
@@ -224,6 +224,7 @@ resource "google_cloud_run_v2_service" "jarvis_backend" {
     # Execution environment
     execution_environment            = "EXECUTION_ENVIRONMENT_GEN2"
     max_instance_request_concurrency = var.concurrency
+    session_affinity                 = true
 
     # Container
     containers {

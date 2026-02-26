@@ -236,13 +236,16 @@ if [ "$SKIP_BUILD" = false ]; then
         run_cmd docker push "$IMAGE_URI_TAGGED"
     else
         log "Building image with Cloud Build (JIT Optimization included)..."
-        # Increase timeout for JIT compilation during build
+        # v20.5.0: gcloud builds submit --tag only accepts a single URI.
+        # Build with versioned tag, then add :latest alias.
         run_cmd gcloud builds submit \
-            --tag "$IMAGE_URI" \
             --tag "$IMAGE_URI_TAGGED" \
             --timeout=3600s \
             --machine-type=E2_HIGHCPU_8 \
             .
+        # Tag as :latest for the deploy step
+        log "Adding :latest tag..."
+        run_cmd gcloud container images add-tag "$IMAGE_URI_TAGGED" "$IMAGE_URI" --quiet
     fi
 else
     log "Skipping build (--skip-build specified)"
