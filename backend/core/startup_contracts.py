@@ -62,6 +62,25 @@ ENV_CONTRACTS: List[EnvContract] = [
         pattern=r"^(local_full|local_optimized|sequential|cloud_first|cloud_only|minimal)$",
     ),
     EnvContract(
+        "JARVIS_CAN_SPAWN_HEAVY", "Shared heavy-init admission gate",
+        value_type="bool",
+        pattern=r"^(true|false)$",
+        default="true",
+    ),
+    EnvContract(
+        "JARVIS_HEAVY_ADMISSION_REASON", "Reason for heavy-init gate decision",
+        value_type="str",
+    ),
+    EnvContract(
+        "JARVIS_HEAVY_ADMISSION_CONTEXT", "Lifecycle context that published admission decision",
+        value_type="str",
+    ),
+    EnvContract(
+        "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB", "Measured available memory at admission decision",
+        value_type="float",
+        pattern=r"^\d+\.\d+$",
+    ),
+    EnvContract(
         "JARVIS_STARTUP_COMPLETE", "Whether startup has completed",
         value_type="bool",
         pattern=r"^(true|false)$",

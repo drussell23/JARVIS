@@ -3136,6 +3136,91 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
         return current, 0.0
 
 
+def _sync_heavy_spawn_gate(
+    context: str,
+    *,
+    min_available_gb: float = 1.5,
+    mode: Optional[str] = None,
+    available_gb: Optional[float] = None,
+) -> Tuple[bool, str, str, Optional[float]]:
+    """
+    Evaluate/publish shared heavy-init admission gate for cross-module callers.
+
+    Returns:
+        (admitted, reason, effective_mode, measured_available_gb)
+    """
+    effective_mode = (
+        (mode or os.environ.get("JARVIS_STARTUP_EFFECTIVE_MODE", "")).strip().lower()
+        or os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full").strip().lower()
+    )
+    admitted = True
+    reason = "admitted"
+    measured_gb = available_gb
+
+    try:
+        try:
+            from backend.core.state_authority import publish_heavy_spawn_admission
+        except ImportError:
+            from core.state_authority import publish_heavy_spawn_admission
+
+        admission_result = publish_heavy_spawn_admission(
+            context=context,
+            min_available_gb=min_available_gb,
+            mode=effective_mode,
+            available_gb=available_gb,
+        )
+        admitted = admission_result.authoritative_value == "true"
+        for token in admission_result.divergences:
+            if token.startswith("effective_mode="):
+                effective_mode = token.split("=", 1)[1].strip().lower() or effective_mode
+            elif token.startswith("reason="):
+                reason = token.split("=", 1)[1].strip() or reason
+            elif token.startswith("available_gb="):
+                try:
+                    measured_gb = float(token.split("=", 1)[1])
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        if measured_gb is None:
+            measured_gb = _read_available_memory_gb()
+        if os.environ.get("JARVIS_BACKEND_MINIMAL", "").strip().lower() == "true":
+            admitted = False
+            reason = "backend_minimal=true"
+        elif effective_mode in ("sequential", "cloud_only", "minimal"):
+            admitted = False
+            reason = f"mode={effective_mode}"
+        elif measured_gb is not None and measured_gb < min_available_gb:
+            admitted = False
+            reason = f"available_gb={measured_gb:.2f}<{min_available_gb:.2f}"
+        os.environ["JARVIS_CAN_SPAWN_HEAVY"] = "true" if admitted else "false"
+        os.environ["JARVIS_HEAVY_ADMISSION_REASON"] = reason
+        os.environ["JARVIS_HEAVY_ADMISSION_CONTEXT"] = context
+        if measured_gb is not None:
+            os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"] = f"{measured_gb:.2f}"
+        elif "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB" in os.environ:
+            del os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"]
+
+    _set_startup_env(
+        "JARVIS_STARTUP_EFFECTIVE_MODE",
+        effective_mode,
+        f"heavy_spawn_gate:{context}",
+        caller="_sync_heavy_spawn_gate",
+    )
+    _set_startup_env(
+        "JARVIS_CAN_SPAWN_HEAVY",
+        "true" if admitted else "false",
+        f"heavy_spawn_gate:{context}",
+        caller="_sync_heavy_spawn_gate",
+    )
+    os.environ["JARVIS_HEAVY_ADMISSION_REASON"] = reason
+    os.environ["JARVIS_HEAVY_ADMISSION_CONTEXT"] = context
+    if measured_gb is not None:
+        os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"] = f"{measured_gb:.2f}"
+    elif "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB" in os.environ:
+        del os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"]
+    return admitted, reason, effective_mode, measured_gb
+
+
 def _check_spawn_admission(component: str, min_gb: float = 1.5) -> Tuple[bool, str]:
     """Pre-spawn admission check — verify enough memory before launching
     a heavy subprocess.
@@ -3146,24 +3231,33 @@ def _check_spawn_admission(component: str, min_gb: float = 1.5) -> Tuple[bool, s
     v270.1: Prevents OOM from launching backend/model subprocesses when
     memory is already critically low.
     """
-    mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-    avail = _read_available_memory_gb()
-
-    # Mode-based rejection: minimal mode means no heavy local work
-    if mode == "minimal":
-        return False, f"mode=minimal — {component} deferred"
+    admitted, reason, effective_mode, avail = _sync_heavy_spawn_gate(
+        f"spawn:{component}",
+        min_available_gb=min_gb,
+        mode=os.environ.get("JARVIS_STARTUP_EFFECTIVE_MODE")
+        or os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full"),
+        available_gb=_read_available_memory_gb(),
+    )
+    if admitted:
+        return True, "admitted"
 
     # Memory-based rejection: below floor. Use _compute_ideal_mode for
-    # accurate degradation target instead of hardcoded cloud_first.
+    # accurate degradation target and keep effective mode synchronized.
     if avail is not None and avail < min_gb:
         ideal = _compute_ideal_mode(avail)
         _apply_mode_degradation(
             ideal,
             reason=f"spawn_admission:{component}:avail={avail:.1f}GB<{min_gb}GB",
         )
+        _sync_heavy_spawn_gate(
+            f"spawn:{component}:post_degrade",
+            min_available_gb=min_gb,
+            mode=os.environ.get("JARVIS_STARTUP_MEMORY_MODE", effective_mode),
+            available_gb=avail,
+        )
         return False, f"avail={avail:.1f}GB < {min_gb}GB floor for {component}"
 
-    return True, "admitted"
+    return False, f"{reason} — {component} deferred"
 
 
 async def _kill_orphaned_subprocess(
@@ -3391,6 +3485,12 @@ def _apply_startup_mode_target(
             write_only_true=True,
             caller=caller,
         )
+    _sync_heavy_spawn_gate(
+        f"{caller}:{reason}",
+        min_available_gb=_get_env_float("JARVIS_HEAVY_SPAWN_MIN_GB", 1.5),
+        mode=_effective,
+        available_gb=_read_available_memory_gb(),
+    )
     return _effective
 
 
@@ -83101,6 +83201,8 @@ class JarvisSystemKernel:
                 "effective_mode": os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full"),
                 "cloud_recovery_candidate": os.environ.get("JARVIS_CLOUD_RECOVERY_CANDIDATE", "false"),
                 "oombridge_available": os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE", "1"),
+                "can_spawn_heavy": os.environ.get("JARVIS_CAN_SPAWN_HEAVY", "true"),
+                "heavy_admission_reason": os.environ.get("JARVIS_HEAVY_ADMISSION_REASON", ""),
                 "oom_fail_closed": os.environ.get("JARVIS_OOM_FAIL_CLOSED", "false"),
                 "oom_preflight_retry_budget_remaining": os.environ.get(
                     "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_REMAINING",
@@ -83147,6 +83249,13 @@ class JarvisSystemKernel:
             "effective_mode": os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full"),
             "cloud_recovery_candidate": os.environ.get("JARVIS_CLOUD_RECOVERY_CANDIDATE", "false"),
             "oombridge_available": os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE", "1"),
+            "can_spawn_heavy": os.environ.get("JARVIS_CAN_SPAWN_HEAVY", "true"),
+            "heavy_admission_reason": os.environ.get("JARVIS_HEAVY_ADMISSION_REASON", ""),
+            "heavy_admission_context": os.environ.get("JARVIS_HEAVY_ADMISSION_CONTEXT", ""),
+            "heavy_admission_available_gb": os.environ.get(
+                "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB",
+                "",
+            ),
             "oom_fail_closed": os.environ.get("JARVIS_OOM_FAIL_CLOSED", "false"),
             "oom_preflight_retry_budget_total": os.environ.get(
                 "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_TOTAL",

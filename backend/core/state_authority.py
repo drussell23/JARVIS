@@ -27,6 +27,141 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
+# Shared Startup Admission Gate
+# ===========================================================================
+
+_STARTUP_MODE_ORDER = (
+    "local_full",
+    "local_optimized",
+    "sequential",
+    "cloud_first",
+    "cloud_only",
+    "minimal",
+)
+_STARTUP_MODE_SET = set(_STARTUP_MODE_ORDER)
+_HEAVY_BLOCKED_MODES = {"sequential", "cloud_only", "minimal"}
+
+
+def normalize_startup_mode(mode: Optional[str], default: str = "local_full") -> str:
+    """Normalize startup mode token to the canonical value."""
+    candidate = (mode or "").strip().lower()
+    if candidate in _STARTUP_MODE_SET:
+        return candidate
+    return default
+
+
+def get_effective_startup_mode(default: str = "local_full") -> str:
+    """
+    Resolve authoritative effective startup mode from env.
+
+    Source priority:
+      1. JARVIS_STARTUP_EFFECTIVE_MODE
+      2. JARVIS_STARTUP_MEMORY_MODE
+      3. default
+    """
+    effective = os.environ.get("JARVIS_STARTUP_EFFECTIVE_MODE", "")
+    if effective:
+        return normalize_startup_mode(effective, default=default)
+    memory_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "")
+    return normalize_startup_mode(memory_mode, default=default)
+
+
+def can_spawn_heavy(
+    *,
+    min_available_gb: float = 1.5,
+    mode: Optional[str] = None,
+    available_gb: Optional[float] = None,
+) -> "ConsistencyResult":
+    """
+    Shared heavy-init admission gate for supervisor and parallel initializer.
+
+    Returns a ConsistencyResult where:
+      - concept is "heavy_spawn_admission"
+      - authoritative_value is "true"/"false" (gate open/closed)
+      - divergences carries structured detail:
+          [0] effective_mode=...
+          [1] reason=...
+          [2] available_gb=... (if known)
+    """
+    effective_mode = normalize_startup_mode(mode or get_effective_startup_mode())
+    reason = "admitted"
+
+    if os.environ.get("JARVIS_BACKEND_MINIMAL", "").strip().lower() == "true":
+        reason = "backend_minimal=true"
+        admitted = False
+    elif effective_mode in _HEAVY_BLOCKED_MODES:
+        reason = f"mode={effective_mode}"
+        admitted = False
+    else:
+        admitted = True
+        observed_gb: Optional[float] = available_gb
+        if observed_gb is None:
+            try:
+                import psutil
+
+                observed_gb = float(psutil.virtual_memory().available / (1024 ** 3))
+            except Exception:
+                observed_gb = None
+        if observed_gb is not None and observed_gb < max(0.1, float(min_available_gb)):
+            admitted = False
+            reason = f"available_gb={observed_gb:.2f}<{min_available_gb:.2f}"
+        available_gb = observed_gb
+
+    details = [f"effective_mode={effective_mode}", f"reason={reason}"]
+    if available_gb is not None:
+        details.append(f"available_gb={available_gb:.2f}")
+
+    return ConsistencyResult(
+        concept="heavy_spawn_admission",
+        consistent=admitted,
+        authoritative_value="true" if admitted else "false",
+        divergences=details,
+    )
+
+
+def publish_heavy_spawn_admission(
+    *,
+    context: str,
+    min_available_gb: float = 1.5,
+    mode: Optional[str] = None,
+    available_gb: Optional[float] = None,
+) -> "ConsistencyResult":
+    """
+    Evaluate and publish heavy-init admission state to env for cross-module use.
+    """
+    result = can_spawn_heavy(
+        min_available_gb=min_available_gb,
+        mode=mode,
+        available_gb=available_gb,
+    )
+    effective_mode = get_effective_startup_mode()
+    reason = "unknown"
+    measured = ""
+    for item in result.divergences:
+        if item.startswith("effective_mode="):
+            effective_mode = normalize_startup_mode(
+                item.split("=", 1)[1],
+                default=effective_mode,
+            )
+        elif item.startswith("reason="):
+            reason = item.split("=", 1)[1]
+        elif item.startswith("available_gb="):
+            measured = item.split("=", 1)[1]
+
+    os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = effective_mode
+    os.environ["JARVIS_CAN_SPAWN_HEAVY"] = (
+        "true" if result.authoritative_value == "true" else "false"
+    )
+    os.environ["JARVIS_HEAVY_ADMISSION_REASON"] = reason
+    os.environ["JARVIS_HEAVY_ADMISSION_CONTEXT"] = context
+    if measured:
+        os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"] = measured
+    elif "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB" in os.environ:
+        del os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"]
+    return result
+
+
+# ===========================================================================
 # Data Model
 # ===========================================================================
 
@@ -87,6 +222,16 @@ STATE_DECLARATIONS: Dict[str, StateDeclaration] = {
         secondary_sources=(
             "env:JARVIS_STARTUP_EFFECTIVE_MODE",
             "env:JARVIS_STARTUP_DESIRED_MODE",
+        ),
+    ),
+    "heavy_spawn_admission": StateDeclaration(
+        concept="heavy_spawn_admission",
+        description="Shared heavy component spawn admission gate",
+        authoritative_source="env:JARVIS_CAN_SPAWN_HEAVY",
+        secondary_sources=(
+            "env:JARVIS_STARTUP_EFFECTIVE_MODE",
+            "env:JARVIS_HEAVY_ADMISSION_REASON",
+            "env:JARVIS_HEAVY_ADMISSION_AVAILABLE_GB",
         ),
     ),
 }
@@ -289,11 +434,52 @@ def _validate_startup_memory_mode(**kwargs: Any) -> ConsistencyResult:
     )
 
 
+def _validate_heavy_spawn_admission(**kwargs: Any) -> ConsistencyResult:
+    """Validate consistency between effective mode and heavy spawn gate env."""
+    concept = "heavy_spawn_admission"
+    divergences: List[str] = []
+
+    gate_raw = os.environ.get("JARVIS_CAN_SPAWN_HEAVY", "").strip().lower()
+    mode = get_effective_startup_mode()
+    backend_minimal = os.environ.get("JARVIS_BACKEND_MINIMAL", "").strip().lower()
+
+    if not gate_raw:
+        return ConsistencyResult(
+            concept=concept,
+            consistent=True,
+            authoritative_value=None,
+            divergences=["skipped: JARVIS_CAN_SPAWN_HEAVY not set"],
+        )
+
+    if gate_raw not in {"true", "false"}:
+        divergences.append(
+            f"JARVIS_CAN_SPAWN_HEAVY='{gate_raw}' invalid (expected true/false)"
+        )
+
+    if gate_raw == "true" and mode in _HEAVY_BLOCKED_MODES:
+        divergences.append(
+            f"gate=true but effective_mode={mode} blocks heavy spawn"
+        )
+
+    if gate_raw == "true" and backend_minimal == "true":
+        divergences.append(
+            "gate=true but JARVIS_BACKEND_MINIMAL=true"
+        )
+
+    return ConsistencyResult(
+        concept=concept,
+        consistent=len(divergences) == 0,
+        authoritative_value=gate_raw,
+        divergences=divergences,
+    )
+
+
 # Map concept → validator function
 _VALIDATORS: Dict[str, Callable[..., ConsistencyResult]] = {
     "gcp_vm_readiness": _validate_gcp_vm_readiness,
     "prime_routing_mode": _validate_prime_routing_mode,
     "startup_memory_mode": _validate_startup_memory_mode,
+    "heavy_spawn_admission": _validate_heavy_spawn_admission,
 }
 
 

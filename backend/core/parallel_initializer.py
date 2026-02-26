@@ -155,6 +155,22 @@ except ImportError:
     DegradationTier = None  # Fallback placeholder
     logging.getLogger(__name__).debug("OOM Prevention Bridge not available")
 
+# Shared startup admission gate (v271.1)
+STARTUP_ADMISSION_AVAILABLE = False
+try:
+    from core.state_authority import (
+        publish_heavy_spawn_admission,
+    )
+    STARTUP_ADMISSION_AVAILABLE = True
+except ImportError:
+    try:
+        from backend.core.state_authority import (  # type: ignore
+            publish_heavy_spawn_admission,
+        )
+        STARTUP_ADMISSION_AVAILABLE = True
+    except ImportError:
+        STARTUP_ADMISSION_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # v3.0: Path for persisting adaptive threshold history across restarts
@@ -534,6 +550,107 @@ class ParallelInitializer:
             self._interactive_ready_event = asyncio.Event()
         return self._interactive_ready_event
 
+    def _is_heavy_component(self, comp: ComponentInit) -> bool:
+        """
+        Classify components eligible for heavy-init admission gating.
+
+        Interactive components remain eligible even under degraded memory mode
+        so core command paths stay responsive.
+        """
+        if comp.is_interactive:
+            return False
+        floor = max(
+            1,
+            int(os.environ.get("JARVIS_HEAVY_COMPONENT_PRIORITY_FLOOR", "40")),
+        )
+        if comp.priority >= floor:
+            return True
+        explicit = {
+            token.strip()
+            for token in os.environ.get("JARVIS_HEAVY_COMPONENT_NAMES", "").split(",")
+            if token.strip()
+        }
+        return comp.name in explicit
+
+    def _sync_startup_admission_gate(
+        self,
+        context: str,
+        *,
+        min_available_gb: float = 1.5,
+    ) -> tuple:
+        """
+        Sync shared can_spawn_heavy + effective_mode into app state/env.
+
+        Returns:
+            (admitted, reason, effective_mode, available_gb)
+        """
+        effective_mode = (
+            os.environ.get("JARVIS_STARTUP_EFFECTIVE_MODE", "").strip().lower()
+            or os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full").strip().lower()
+        )
+        admitted = True
+        reason = "admitted"
+        available_gb = None
+
+        if STARTUP_ADMISSION_AVAILABLE:
+            try:
+                result = publish_heavy_spawn_admission(
+                    context=context,
+                    min_available_gb=min_available_gb,
+                    mode=effective_mode,
+                    available_gb=None,
+                )
+                admitted = result.authoritative_value == "true"
+                for token in result.divergences:
+                    if token.startswith("effective_mode="):
+                        effective_mode = token.split("=", 1)[1].strip().lower() or effective_mode
+                    elif token.startswith("reason="):
+                        reason = token.split("=", 1)[1].strip() or reason
+                    elif token.startswith("available_gb="):
+                        try:
+                            available_gb = float(token.split("=", 1)[1])
+                        except (TypeError, ValueError):
+                            pass
+            except Exception as gate_err:
+                logger.debug("[AdmissionGate] shared gate unavailable (%s)", gate_err)
+
+        if available_gb is None:
+            try:
+                import psutil
+
+                available_gb = psutil.virtual_memory().available / (1024 ** 3)
+            except Exception:
+                available_gb = None
+
+        if os.environ.get("JARVIS_BACKEND_MINIMAL", "").strip().lower() == "true":
+            admitted = False
+            reason = "backend_minimal=true"
+        elif effective_mode in ("sequential", "cloud_only", "minimal"):
+            admitted = False
+            reason = f"mode={effective_mode}"
+        elif available_gb is not None and available_gb < min_available_gb:
+            admitted = False
+            reason = f"available_gb={available_gb:.2f}<{min_available_gb:.2f}"
+
+        os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = effective_mode
+        os.environ["JARVIS_CAN_SPAWN_HEAVY"] = "true" if admitted else "false"
+        os.environ["JARVIS_HEAVY_ADMISSION_REASON"] = reason
+        os.environ["JARVIS_HEAVY_ADMISSION_CONTEXT"] = context
+        if available_gb is not None:
+            os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"] = f"{available_gb:.2f}"
+        elif "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB" in os.environ:
+            del os.environ["JARVIS_HEAVY_ADMISSION_AVAILABLE_GB"]
+
+        self.app.state.startup_effective_mode = effective_mode
+        self.app.state.can_spawn_heavy = admitted
+        self.app.state.heavy_admission_reason = reason
+        self.app.state.heavy_admission_context = context
+        self.app.state.heavy_admission_available_gb = available_gb
+        if not admitted:
+            self._force_sequential = True
+
+        return admitted, reason, effective_mode, available_gb
+
     def _register_components(self):
         """
         Register all JARVIS components with priorities and circuit breaker settings.
@@ -698,6 +815,16 @@ class ParallelInitializer:
         self.app.state.components_failed = set()
         # v2.0: Track interactive readiness
         self.app.state.interactive_ready = False
+        # v271.1: Shared startup admission contract
+        self.app.state.can_spawn_heavy = True
+        self.app.state.startup_effective_mode = (
+            os.environ.get("JARVIS_STARTUP_EFFECTIVE_MODE", "").strip().lower()
+            or os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full").strip().lower()
+        )
+        self.app.state.heavy_admission_reason = "not_evaluated"
+        self.app.state.heavy_admission_context = "minimal_setup"
+        self.app.state.heavy_admission_available_gb = None
+        self._sync_startup_admission_gate("parallel_initializer:minimal_setup")
 
         # Mark config as complete (it's just loading env vars)
         await self._mark_complete("config")
@@ -733,6 +860,17 @@ class ParallelInitializer:
         logger.info("=" * 60)
 
         self.app.state.startup_phase = "INITIALIZING"
+        _gate_open, _gate_reason, _gate_mode, _gate_avail = self._sync_startup_admission_gate(
+            "parallel_initializer:background_start",
+        )
+        if not _gate_open:
+            logger.warning(
+                "[AdmissionGate] heavy init gate closed at startup "
+                "(mode=%s reason=%s avail=%sGB) — forcing sequential/deferred init",
+                _gate_mode,
+                _gate_reason,
+                f"{_gate_avail:.2f}" if _gate_avail is not None else "unknown",
+            )
 
         # v3.2: Signal DMS that parallel_init is managing component lifecycle
         _signal_dms_active(True)
@@ -780,6 +918,10 @@ class ParallelInitializer:
                     "— forcing sequential init",
                     reason,
                 )
+            finally:
+                self._sync_startup_admission_gate(
+                    f"parallel_initializer:oom_bridge_unavailable:{reason}"
+                )
 
         if OOM_PREVENTION_AVAILABLE:
             try:
@@ -798,6 +940,14 @@ class ParallelInitializer:
                     estimated_mb=total_estimated_mb,
                     auto_offload=True,
                 )
+                _recommended_mode = str(
+                    getattr(memory_result, "recommended_startup_mode", "")
+                ).strip().lower()
+                if _recommended_mode:
+                    os.environ["JARVIS_STARTUP_EFFECTIVE_MODE"] = _recommended_mode
+                    if bool(getattr(memory_result, "force_mode_apply", False)):
+                        os.environ["JARVIS_STARTUP_MEMORY_MODE"] = _recommended_mode
+                self._sync_startup_admission_gate("parallel_initializer:oom_bridge_result")
 
                 if memory_result.decision == MemoryDecision.CLOUD_REQUIRED:
                     logger.warning(f"[OOM Prevention] ⚠️ Local RAM insufficient - GCP offload required")
@@ -869,6 +1019,7 @@ class ParallelInitializer:
             # Import failure is still an OOM-bridge outage. Fail-closed under low RAM.
             _force_sequential_on_bridge_unavailable("bridge_import_unavailable")
         # =========================================================================
+        self._sync_startup_admission_gate("parallel_initializer:post_oom_preflight")
 
         try:
             # Group components by priority
@@ -880,6 +1031,20 @@ class ParallelInitializer:
                     break
 
                 logger.info(f"Initializing priority {priority} components: {[c.name for c in group]}")
+                _group_gate_open, _group_gate_reason, _group_mode, _group_avail = (
+                    self._sync_startup_admission_gate(
+                        f"parallel_initializer:priority:{priority}",
+                    )
+                )
+                if not _group_gate_open:
+                    logger.info(
+                        "[AdmissionGate] priority=%s heavy gate closed "
+                        "(mode=%s reason=%s avail=%sGB)",
+                        priority,
+                        _group_mode,
+                        _group_gate_reason,
+                        f"{_group_avail:.2f}" if _group_avail is not None else "unknown",
+                    )
 
                 # Run group in parallel (or sequentially if _force_sequential)
                 tasks = []
@@ -888,6 +1053,12 @@ class ParallelInitializer:
                     # v125.0: Enhanced dependency checking with failure propagation
                     dep_status = self._check_dependency_status(comp)
                     if dep_status == "ready":
+                        if (not _group_gate_open) and self._is_heavy_component(comp):
+                            await self._mark_skipped(
+                                comp.name,
+                                f"Heavy admission gate closed ({_group_gate_reason})",
+                            )
+                            continue
                         tasks.append(self._init_component(comp.name))
                         _task_comp_names.append(comp.name)
                     elif dep_status == "failed":
@@ -910,7 +1081,8 @@ class ParallelInitializer:
                         await self._mark_skipped(comp.name, "Dependencies not ready")
 
                 if tasks:
-                    if self._force_sequential:
+                    _run_sequential = self._force_sequential or (not _group_gate_open)
+                    if _run_sequential:
                         # v266.3: Sequential init — one component at a time with
                         # memory check between each to prevent OOM cascade
                         _seq_completed_idx = len(tasks) - 1  # Assume all complete unless break
