@@ -121,6 +121,27 @@ E = TypeVar("E", bound=Exception)
 
 logger = logging.getLogger(__name__)
 
+
+def _require_control_plane_authority(action: str) -> None:
+    """
+    Enforce single control-plane ownership when a supervisor lock is active.
+    """
+    try:
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            enforce_single_control_plane_authority,
+        )
+    except Exception:
+        return
+
+    if not enforce_single_control_plane_authority(
+        action,
+        allow_bootstrap_owner=True,
+        allow_when_no_kernel_lock=True,
+    ):
+        raise RuntimeError(
+            f"Control-plane authority required for TrinityIntegrator action: {action}"
+        )
+
 # =============================================================================
 # Advanced Constants & Configuration Registry
 # =============================================================================
@@ -9762,6 +9783,8 @@ class TrinityUnifiedOrchestrator:
         Returns:
             True if startup successful (or degraded), False on failure
         """
+        _require_control_plane_authority("trinity_integrator_start")
+
         async with self._tracer.trace("trinity_startup") as root_span:
             async with self._lock:
                 if self._state != TrinityState.UNINITIALIZED:
@@ -12770,6 +12793,8 @@ class TrinityUnifiedOrchestrator:
         Returns:
             True if shutdown successful
         """
+        _require_control_plane_authority("trinity_integrator_stop")
+
         async with self._lock:
             if self._state in (TrinityState.STOPPED, TrinityState.STOPPING):
                 return True
@@ -13189,12 +13214,14 @@ async def get_trinity_integrator(**kwargs) -> TrinityUnifiedOrchestrator:
 
 async def start_trinity() -> bool:
     """Start the Trinity system."""
+    _require_control_plane_authority("trinity_integrator_start_wrapper")
     orchestrator = await get_trinity_orchestrator()
     return await orchestrator.start()
 
 
 async def stop_trinity(force: bool = False) -> bool:
     """Stop the Trinity system."""
+    _require_control_plane_authority("trinity_integrator_stop_wrapper")
     global _orchestrator
 
     if _orchestrator:

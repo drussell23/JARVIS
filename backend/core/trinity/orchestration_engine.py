@@ -82,6 +82,27 @@ from typing import (
 logger = logging.getLogger("TrinityOrchestration")
 
 
+def _require_control_plane_authority(action: str) -> None:
+    """
+    Enforce single control-plane ownership when a supervisor lock is active.
+    """
+    try:
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            enforce_single_control_plane_authority,
+        )
+    except Exception:
+        return
+
+    if not enforce_single_control_plane_authority(
+        action,
+        allow_bootstrap_owner=True,
+        allow_when_no_kernel_lock=True,
+    ):
+        raise RuntimeError(
+            f"Control-plane authority required for TrinityOrchestration action: {action}"
+        )
+
+
 # =============================================================================
 # CONFIGURATION (Dynamic, no hardcoding)
 # =============================================================================
@@ -1418,6 +1439,8 @@ class TrinityOrchestrationEngine:
         5. Verify all components healthy
         6. Start background tasks (monitoring, consensus)
         """
+        _require_control_plane_authority("trinity_engine_start")
+
         if self._running:
             self.logger.warning("Trinity already running")
             return True
@@ -1484,6 +1507,8 @@ class TrinityOrchestrationEngine:
         5. Stop Mind
         6. Cleanup
         """
+        _require_control_plane_authority("trinity_engine_stop")
+
         if self._shutting_down:
             return
 
@@ -2009,12 +2034,14 @@ def get_orchestration_engine() -> TrinityOrchestrationEngine:
 
 async def start_trinity() -> bool:
     """Start the Trinity ecosystem."""
+    _require_control_plane_authority("trinity_engine_start_wrapper")
     engine = get_orchestration_engine()
     return await engine.start()
 
 
 async def stop_trinity() -> None:
     """Stop the Trinity ecosystem."""
+    _require_control_plane_authority("trinity_engine_stop_wrapper")
     global _engine
     if _engine:
         await _engine.stop()
