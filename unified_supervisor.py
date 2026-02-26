@@ -77175,9 +77175,34 @@ class JarvisSystemKernel:
                         except Exception as _cap_err:
                             self.logger.debug(f"[Kernel] Capability activation skipped: {_cap_err}")
 
+                # v277.0: Cross-repo contract gate (boot-time)
+                # Enforces schema/version/handshake compatibility before leaving
+                # Trinity phase. Required-target failures can fail-closed via env.
+                try:
+                    await self._run_cross_repo_contract_check(
+                        phase="trinity_boot",
+                        runtime=False,
+                        include_inactive=False,
+                    )
+                except Exception as _contract_err:
+                    self.logger.error("[Contract] Trinity boot contract gate failed: %s", _contract_err)
+                    self._update_component_status(
+                        "trinity",
+                        "error",
+                        f"Contract gate failure: {_contract_err}",
+                    )
+                    if _get_env_bool("JARVIS_CONTRACT_FAIL_CLOSED", True):
+                        raise
+
                 return True  # Trinity is optional
 
             except Exception as e:
+                if (
+                    _get_env_bool("JARVIS_CONTRACT_FAIL_CLOSED", True)
+                    and str(e).startswith("contract_gate_required_failure:")
+                ):
+                    raise
+
                 # v188.0: Stop heartbeat task even on error
                 heartbeat_stop.set()
                 if heartbeat_task:
@@ -80868,6 +80893,218 @@ class JarvisSystemKernel:
             states[name] = status
         return states
 
+    def _build_cross_repo_contract_targets(
+        self,
+        *,
+        include_inactive: bool = False,
+    ) -> List[Any]:
+        """
+        Build contract targets for active Trinity components.
+        """
+        try:
+            from backend.core.cross_repo_contract_enforcer import ContractTarget
+        except Exception:
+            return []
+
+        def _active(status: str) -> bool:
+            return status in {"running", "complete", "ready", "operational", "degraded"}
+
+        targets: List[Any] = []
+        require_handshake = _get_env_bool("JARVIS_CONTRACT_REQUIRE_HANDSHAKE", True)
+        allow_legacy = _get_env_bool("JARVIS_CONTRACT_ALLOW_LEGACY_HANDSHAKE", True)
+
+        prime_status = str(
+            self._component_status.get("jarvis_prime", {}).get("status", "pending")
+        )
+        if self.config.prime_enabled and (include_inactive or _active(prime_status)):
+            prime_caps = tuple(
+                c.strip()
+                for c in os.environ.get(
+                    "JARVIS_PRIME_REQUIRED_CAPABILITIES",
+                    "inference",
+                ).split(",")
+                if c.strip()
+            )
+            prime_endpoint = (
+                os.environ.get("JARVIS_PRIME_URL")
+                or f"http://localhost:{self.config.prime_api_port}"
+            )
+            targets.append(
+                ContractTarget(
+                    name="jarvis_prime",
+                    endpoint=prime_endpoint,
+                    health_schema_key="prime:/health",
+                    min_api_version=os.environ.get("JARVIS_PRIME_API_MIN_VERSION", "0.0.0"),
+                    max_api_version=os.environ.get(
+                        "JARVIS_PRIME_API_MAX_VERSION",
+                        "9999.9999.9999",
+                    ),
+                    required_capabilities=prime_caps,
+                    required=_get_env_bool("JARVIS_CONTRACT_REQUIRE_PRIME", True),
+                    require_handshake=require_handshake,
+                    allow_legacy_handshake=allow_legacy,
+                )
+            )
+
+        reactor_status = str(
+            self._component_status.get("reactor_core", {}).get("status", "pending")
+        )
+        if self.config.reactor_enabled and (include_inactive or _active(reactor_status)):
+            reactor_caps = tuple(
+                c.strip()
+                for c in os.environ.get(
+                    "JARVIS_REACTOR_REQUIRED_CAPABILITIES",
+                    "training",
+                ).split(",")
+                if c.strip()
+            )
+            reactor_endpoint = f"http://localhost:{self.config.reactor_api_port}"
+            targets.append(
+                ContractTarget(
+                    name="reactor_core",
+                    endpoint=reactor_endpoint,
+                    health_schema_key="/health",
+                    min_api_version=os.environ.get("JARVIS_REACTOR_API_MIN_VERSION", "0.0.0"),
+                    max_api_version=os.environ.get(
+                        "JARVIS_REACTOR_API_MAX_VERSION",
+                        "9999.9999.9999",
+                    ),
+                    required_capabilities=reactor_caps,
+                    required=_get_env_bool("JARVIS_CONTRACT_REQUIRE_REACTOR", False),
+                    require_handshake=require_handshake,
+                    allow_legacy_handshake=allow_legacy,
+                )
+            )
+
+        return targets
+
+    async def _run_cross_repo_contract_check(
+        self,
+        *,
+        phase: str,
+        runtime: bool = False,
+        include_inactive: bool = False,
+    ) -> bool:
+        """
+        Enforce cross-repo contracts (schema + version + handshake).
+        """
+        if not self.config.trinity_enabled:
+            return True
+        if not _get_env_bool("JARVIS_CONTRACT_ENFORCEMENT_ENABLED", True):
+            return True
+
+        try:
+            from backend.core.cross_repo_contract_enforcer import (
+                ContractDriftMonitor,
+                CrossRepoContractEnforcer,
+            )
+        except Exception:
+            return True
+
+        targets = self._build_cross_repo_contract_targets(include_inactive=include_inactive)
+        if not targets:
+            return True
+
+        local_protocol_version = os.environ.get("JARVIS_PROTOCOL_VERSION", "1.0.0")
+        timeout_s = _get_env_float("JARVIS_CONTRACT_REQUEST_TIMEOUT_S", 8.0)
+        enforcer = CrossRepoContractEnforcer(
+            supervisor_instance_id=self.config.kernel_id,
+            local_protocol_version=local_protocol_version,
+            request_timeout_s=timeout_s,
+        )
+        results = await enforcer.check_many(targets)
+
+        # Persist lightweight diagnostics for status APIs.
+        self._last_contract_check_at = time.time()
+        self._last_contract_check_phase = phase
+        self._last_contract_check_results = {
+            name: {
+                "ok": res.ok,
+                "reason": res.reason,
+                "api_version": res.api_version,
+                "handshake_mode": res.handshake_mode,
+                "required": bool(res.target.required),
+                "checked_at": res.checked_at,
+            }
+            for name, res in results.items()
+        }
+
+        fail_closed = _get_env_bool("JARVIS_CONTRACT_FAIL_CLOSED", True)
+        required_failures: List[str] = []
+
+        if runtime:
+            failure_threshold = _get_env_int("JARVIS_CONTRACT_FAILURE_THRESHOLD", 2)
+            recovery_threshold = _get_env_int("JARVIS_CONTRACT_RECOVERY_THRESHOLD", 2)
+            monitor = getattr(self, "_contract_drift_monitor", None)
+            if monitor is None:
+                monitor = ContractDriftMonitor(
+                    failure_threshold=failure_threshold,
+                    recovery_threshold=recovery_threshold,
+                )
+                self._contract_drift_monitor = monitor
+
+            transitions = monitor.update(results)
+            self._contract_drift_snapshot = monitor.snapshot()
+
+            for transition in transitions:
+                if transition.to_state == "degraded":
+                    self.logger.warning(
+                        "[Contract] Runtime drift (%s): %s -> %s (%s)",
+                        phase,
+                        transition.target,
+                        transition.to_state,
+                        transition.reason,
+                    )
+                    self._update_component_status(
+                        transition.target,
+                        "degraded",
+                        f"Contract drift: {transition.reason}",
+                    )
+                elif transition.to_state == "healthy":
+                    self.logger.info(
+                        "[Contract] Runtime restored (%s): %s",
+                        phase,
+                        transition.target,
+                    )
+                    current = self._component_status.get(transition.target, {}).get("status")
+                    if current in {"degraded", "error", "pending"}:
+                        self._update_component_status(
+                            transition.target,
+                            "complete",
+                            "Contract compatibility restored",
+                        )
+        else:
+            for name, result in results.items():
+                if result.ok:
+                    self.logger.debug(
+                        "[Contract] %s compatible (api=%s, mode=%s)",
+                        name,
+                        result.api_version or "unknown",
+                        result.handshake_mode,
+                    )
+                    continue
+
+                level = "error" if result.target.required else "warning"
+                if level == "error":
+                    self.logger.error("[Contract] %s incompatible: %s", name, result.reason)
+                else:
+                    self.logger.warning("[Contract] %s incompatible: %s", name, result.reason)
+
+                self._update_component_status(
+                    name,
+                    "error" if result.target.required else "degraded",
+                    f"Contract mismatch: {result.reason}",
+                )
+                if result.target.required:
+                    required_failures.append(name)
+
+        if required_failures and fail_closed:
+            raise RuntimeError(
+                "contract_gate_required_failure:" + ",".join(sorted(required_failures))
+            )
+
+        return not required_failures
+
     async def _check_and_revoke_readiness(self) -> None:
         """
         Check if readiness should be revoked due to unhealthy components.
@@ -80989,6 +81226,29 @@ class JarvisSystemKernel:
                         )
                     except Exception as _ssr_e:
                         self.logger.debug(f"[SSR] Health check error: {_ssr_e}")
+
+                # v277.0: Runtime contract drift monitor with hysteresis.
+                if _get_env_bool("JARVIS_RUNTIME_CONTRACT_MONITOR_ENABLED", True):
+                    _contract_interval = max(
+                        5.0,
+                        _get_env_float("JARVIS_RUNTIME_CONTRACT_MONITOR_INTERVAL_S", 45.0),
+                    )
+                    _now = time.time()
+                    _last = float(getattr(self, "_contract_runtime_last_check", 0.0) or 0.0)
+                    if (_now - _last) >= _contract_interval:
+                        try:
+                            await self._run_cross_repo_contract_check(
+                                phase="runtime_monitor",
+                                runtime=True,
+                                include_inactive=False,
+                            )
+                        except Exception as _contract_err:
+                            self.logger.warning(
+                                "[Contract] Runtime monitor check error: %s",
+                                _contract_err,
+                            )
+                        finally:
+                            self._contract_runtime_last_check = _now
 
                 await asyncio.sleep(10.0)  # Check every 10 seconds
             except asyncio.CancelledError:
