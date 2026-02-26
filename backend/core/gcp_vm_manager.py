@@ -4578,6 +4578,103 @@ class GCPVMManager:
         
         return False, None
 
+    async def _enforce_budget_gate(
+        self,
+        *,
+        operation: str,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """Mandatory fail-closed budget gate for all VM start/create/ensure paths."""
+        details: Dict[str, Any] = {
+            "operation": operation,
+            "gate": "cost_tracker",
+            "checked_at": time.time(),
+        }
+
+        if not self.cost_tracker:
+            reason = "cost_tracker_unavailable"
+            details["fail_mode"] = "closed"
+            details["reason"] = reason
+            logger.error(
+                "🚫 [CostGate] %s blocked: %s",
+                operation,
+                reason,
+            )
+            _notify_lifecycle("notify_budget_exhausted", reason=reason, operation=operation)
+            return False, reason, details
+
+        try:
+            if hasattr(self.cost_tracker, "can_create_vm"):
+                allowed, reason, tracker_details = await self.cost_tracker.can_create_vm()
+                if isinstance(tracker_details, dict):
+                    details.update(tracker_details)
+                details["reason"] = reason
+                if not allowed:
+                    logger.warning(
+                        "🚫 [CostGate] %s blocked by budget: %s",
+                        operation,
+                        reason,
+                    )
+                    _notify_lifecycle(
+                        "notify_budget_exhausted",
+                        reason=reason,
+                        operation=operation,
+                    )
+                    return False, reason, details
+                return True, reason or "budget_ok", details
+
+            if hasattr(self.cost_tracker, "get_daily_cost"):
+                daily_cost = await self.cost_tracker.get_daily_cost()
+                daily_budget = float(self.config.daily_budget_usd)
+                details.update(
+                    {
+                        "daily_spent": daily_cost,
+                        "daily_budget": daily_budget,
+                        "daily_remaining": daily_budget - daily_cost,
+                        "budget_percent_used": (
+                            round((daily_cost / daily_budget) * 100.0, 1)
+                            if daily_budget > 0
+                            else 0.0
+                        ),
+                    }
+                )
+                if daily_cost >= daily_budget:
+                    reason = f"daily_budget_exceeded:{daily_cost:.2f}"
+                    logger.warning(
+                        "🚫 [CostGate] %s blocked by fallback budget check: %s",
+                        operation,
+                        reason,
+                    )
+                    _notify_lifecycle(
+                        "notify_budget_exhausted",
+                        reason=reason,
+                        operation=operation,
+                    )
+                    return False, reason, details
+                return True, "budget_ok", details
+
+            reason = "cost_tracker_missing_budget_api"
+            details["fail_mode"] = "closed"
+            details["reason"] = reason
+            logger.error(
+                "🚫 [CostGate] %s blocked: %s",
+                operation,
+                reason,
+            )
+            _notify_lifecycle("notify_budget_exhausted", reason=reason, operation=operation)
+            return False, reason, details
+        except Exception as e:
+            details["fail_mode"] = "closed"
+            details["error"] = str(e)
+            logger.error(
+                f"🚫 [CostGate] {operation} budget check failed — blocking for safety: {e}"
+            )
+            _notify_lifecycle(
+                "notify_budget_exhausted",
+                reason=f"budget_check_error:{e}",
+                operation=operation,
+            )
+            return False, f"budget_check_error:{e}", details
+
     async def should_create_vm(
         self, memory_snapshot, trigger_reason: str = ""
     ) -> Tuple[bool, str, float]:
@@ -4591,46 +4688,16 @@ class GCPVMManager:
         if not self.initialized:
             await self.initialize()
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # v2.0: INTELLIGENT BUDGET ENFORCEMENT
-        # ═══════════════════════════════════════════════════════════════════════════
-        # Uses cost_tracker.can_create_vm() which provides:
-        # - Hard budget enforcement (blocks when exceeded)
-        # - Budget warning alerts (at 50% threshold)
-        # - Cost forecasting (warns if likely to exceed)
-        # - Solo developer mode protection
-        # ═══════════════════════════════════════════════════════════════════════════
-        if self.cost_tracker:
-            try:
-                # Use intelligent budget check
-                if hasattr(self.cost_tracker, 'can_create_vm'):
-                    allowed, reason, details = await self.cost_tracker.can_create_vm()
-                    if not allowed:
-                        logger.warning(f"🚫 VM creation blocked by budget: {reason}")
-                        _notify_lifecycle("notify_budget_exhausted", reason=reason)
-                        return (False, reason, 0.0)
-                    
-                    # Log budget status if close to limit
-                    if details.get("budget_percent_used", 0) >= 50:
-                        logger.info(
-                            f"💰 Budget status: {details['budget_percent_used']:.0f}% used "
-                            f"(${details['daily_spent']:.2f}/${details['daily_budget']:.2f})"
-                        )
-                else:
-                    # Fallback to simple daily cost check
-                    daily_cost = await self.cost_tracker.get_daily_cost()
-                    if daily_cost >= self.config.daily_budget_usd:
-                        _notify_lifecycle("notify_budget_exhausted", reason=f"daily_budget_exceeded:{daily_cost:.2f}")
-                        return (
-                            False,
-                            f"Daily budget exceeded: ${daily_cost:.2f} / ${self.config.daily_budget_usd:.2f}",
-                            0.0,
-                        )
-            except Exception as e:
-                logger.error(
-                    f"🚫 [CostGuard] Budget check failed — blocking VM creation for safety: {e}"
-                )
-                return (False, f"Budget check error (blocking): {e}", 0.0)
+        allowed, reason, details = await self._enforce_budget_gate(
+            operation=f"should_create_vm:{trigger_reason or 'unspecified'}"
+        )
+        if not allowed:
+            return (False, reason, 0.0)
+        if details.get("budget_percent_used", 0) >= 50:
+            logger.info(
+                f"💰 Budget status: {details.get('budget_percent_used', 0):.0f}% used "
+                f"(${details.get('daily_spent', 0.0):.2f}/${details.get('daily_budget', self.config.daily_budget_usd):.2f})"
+            )
 
         # v229.0: Check concurrent VM limits using REAL GCP instance count
         # Previous bug: only checked tracked VMs (self.managed_vms), but untracked
@@ -4774,6 +4841,15 @@ class GCPVMManager:
             logger.debug("   To enable: set GCP_PROJECT_ID, GCP_ZONE, and GCP_ENABLED=true")
             self.stats["total_failed"] += 1
             self.stats["last_error"] = f"Configuration invalid: {validation_error}"
+            self.stats["last_error_time"] = time.time()
+            return None
+
+        budget_allowed, budget_reason, _ = await self._enforce_budget_gate(
+            operation=f"create_vm:{trigger_reason or 'unspecified'}"
+        )
+        if not budget_allowed:
+            self.stats["total_failed"] += 1
+            self.stats["last_error"] = f"Budget blocked: {budget_reason}"
             self.stats["last_error_time"] = time.time()
             return None
 
@@ -7582,23 +7658,14 @@ class GCPVMManager:
         if not is_valid:
             return False, None, f"CONFIG_INVALID: {validation_error}"
 
-        # v266.0: Budget gate — check cost before creating or starting VMs
-        # For STOPPED VMs (fast restart), use a lenient check since starting
-        # costs near-zero. For new CREATE operations, enforce full budget.
-        if self.cost_tracker and hasattr(self.cost_tracker, 'can_create_vm'):
-            try:
-                allowed, reason, details = await self.cost_tracker.can_create_vm()
-                if not allowed:
-                    logger.warning(
-                        f"🚫 [InvincibleNode] ensure_static_vm_ready blocked by budget: {reason}"
-                    )
-                    _notify_lifecycle("notify_budget_exhausted", reason=reason)
-                    return (False, None, f"BUDGET_EXCEEDED: {reason}")
-            except Exception as e:
-                logger.error(
-                    f"🚫 [InvincibleNode] Budget check failed — blocking for safety: {e}"
-                )
-                return (False, None, f"BUDGET_CHECK_ERROR: {e}")
+        budget_allowed, budget_reason, _ = await self._enforce_budget_gate(
+            operation=f"ensure_static_vm_ready:{instance_name}"
+        )
+        if not budget_allowed:
+            logger.warning(
+                f"🚫 [InvincibleNode] ensure_static_vm_ready blocked by budget: {budget_reason}"
+            )
+            return (False, None, f"BUDGET_EXCEEDED: {budget_reason}")
 
         # Use lock to prevent concurrent start/create operations
         async with self._vm_lock:
@@ -8899,6 +8966,12 @@ fi
         Returns:
             Tuple of (success: bool, error: Optional[str])
         """
+        budget_allowed, budget_reason, _ = await self._enforce_budget_gate(
+            operation=f"start_instance:{instance_name}"
+        )
+        if not budget_allowed:
+            return False, f"BUDGET_EXCEEDED: {budget_reason}"
+
         try:
             logger.info(f"☁️ [InvincibleNode] Sending start command: {instance_name}")
 
@@ -8933,6 +9006,12 @@ fi
         Returns:
             Tuple of (success: bool, error: Optional[str])
         """
+        budget_allowed, budget_reason, _ = await self._enforce_budget_gate(
+            operation=f"create_static_vm:{instance_name}"
+        )
+        if not budget_allowed:
+            return False, f"BUDGET_EXCEEDED: {budget_reason}"
+
         try:
             logger.info(f"☁️ [InvincibleNode] Creating VM with static IP: {instance_name}")
 
