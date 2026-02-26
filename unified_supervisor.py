@@ -2885,11 +2885,11 @@ def _allocate_ephemeral_port(host: str = "127.0.0.1") -> Optional[int]:
         return None
 
 def _read_available_memory_gb() -> Optional[float]:
-    """Read available system memory in GB, if metrics are available."""
-    if not PSUTIL_AVAILABLE:
-        return None
+    """Read available system memory in GB from canonical startup memory source."""
     try:
-        return float(psutil.virtual_memory().available / (1024 ** 3))
+        _snapshot = _read_startup_memory_snapshot_sync("sync_read")
+        _available = _snapshot.get("available_gb")
+        return float(_available) if _available is not None else None
     except Exception:
         return None
 
@@ -2979,6 +2979,199 @@ def _get_env_write_log() -> List[Dict[str, str]]:
     return list(_ENV_WRITE_LOG)
 
 
+def _normalize_memory_snapshot(
+    snapshot: Optional[Dict[str, Any]],
+    *,
+    fallback_source: str,
+) -> Dict[str, Any]:
+    """Normalize memory snapshot payload from quantizer/psutil probes."""
+    normalized: Dict[str, Any] = {
+        "available_gb": None,
+        "raw_available_gb": None,
+        "reserved_gb": 0.0,
+        "tier": "",
+        "pressure": "",
+        "source": fallback_source,
+        "timestamp": time.time(),
+    }
+    if isinstance(snapshot, dict):
+        normalized.update(snapshot)
+
+    for key in ("available_gb", "raw_available_gb", "reserved_gb"):
+        value = normalized.get(key)
+        try:
+            if value is not None:
+                normalized[key] = float(value)
+        except (TypeError, ValueError):
+            normalized[key] = None if key != "reserved_gb" else 0.0
+
+    source = str(normalized.get("source", "")).strip().lower()
+    normalized["source"] = source or fallback_source
+    normalized["tier"] = str(normalized.get("tier", "")).strip().lower()
+    normalized["pressure"] = str(normalized.get("pressure", "")).strip().lower()
+    return normalized
+
+
+def _psutil_memory_snapshot() -> Dict[str, Any]:
+    """Fallback memory snapshot when MemoryQuantizer is unavailable."""
+    if not PSUTIL_AVAILABLE:
+        return _normalize_memory_snapshot(None, fallback_source="unavailable")
+    try:
+        mem = psutil.virtual_memory()
+        return _normalize_memory_snapshot(
+            {
+                "available_gb": float(mem.available / (1024 ** 3)),
+                "raw_available_gb": float(mem.available / (1024 ** 3)),
+                "reserved_gb": 0.0,
+                "source": "psutil",
+            },
+            fallback_source="psutil",
+        )
+    except Exception:
+        return _normalize_memory_snapshot(None, fallback_source="unavailable")
+
+
+def _publish_memory_snapshot(
+    snapshot: Dict[str, Any],
+    *,
+    reason: str,
+    caller: str,
+) -> None:
+    """Publish memory source-of-truth snapshot to startup env telemetry."""
+    source = str(snapshot.get("source", "")).strip().lower() or "unknown"
+    tier = str(snapshot.get("tier", "")).strip().lower()
+    available_gb = snapshot.get("available_gb")
+    try:
+        if available_gb is not None:
+            _set_startup_env(
+                "JARVIS_MEASURED_AVAILABLE_GB",
+                f"{float(available_gb):.2f}",
+                reason,
+                caller=caller,
+            )
+    except Exception:
+        pass
+
+    _set_startup_env(
+        "JARVIS_MEASURED_MEMORY_SOURCE",
+        source,
+        reason,
+        caller=caller,
+    )
+    if tier:
+        _set_startup_env(
+            "JARVIS_MEASURED_MEMORY_TIER",
+            tier,
+            reason,
+            caller=caller,
+        )
+
+
+def _read_startup_memory_snapshot_sync(
+    context: str,
+    *,
+    include_reservations: bool = True,
+) -> Dict[str, Any]:
+    """
+    Read startup memory snapshot from canonical source of truth.
+
+    Priority:
+      1) Existing MemoryQuantizer singleton (cached, non-blocking path)
+      2) psutil fallback
+    """
+    try:
+        try:
+            from backend.core.memory_quantizer import get_memory_quantizer_instance
+        except ImportError:
+            from core.memory_quantizer import get_memory_quantizer_instance  # type: ignore
+
+        mq = get_memory_quantizer_instance()
+        if mq and hasattr(mq, "get_admission_snapshot"):
+            snapshot = mq.get_admission_snapshot(
+                refresh=False,
+                include_reservations=include_reservations,
+                allow_probe_if_missing=False,
+            )
+            normalized = _normalize_memory_snapshot(
+                snapshot,
+                fallback_source="memory_quantizer_sync",
+            )
+            if normalized.get("available_gb") is not None:
+                return normalized
+    except Exception as err:
+        logging.getLogger(__name__).debug(
+            "[MemorySOT] %s sync quantizer read failed: %s",
+            context,
+            err,
+        )
+
+    return _psutil_memory_snapshot()
+
+
+async def _read_startup_memory_snapshot_async(
+    context: str,
+    *,
+    include_reservations: bool = True,
+    refresh_quantizer: bool = True,
+) -> Dict[str, Any]:
+    """
+    Async startup memory snapshot with bounded quantizer probe and fallback.
+    """
+    fallback_snapshot = _read_startup_memory_snapshot_sync(
+        context,
+        include_reservations=include_reservations,
+    )
+    timeout_s = max(0.25, _get_env_float("JARVIS_MEMORY_SOT_TIMEOUT", 2.0))
+    init_if_missing = os.environ.get(
+        "JARVIS_MEMORY_SOT_INIT_IF_MISSING",
+        "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    try:
+        try:
+            from backend.core.memory_quantizer import (
+                get_memory_quantizer,
+                get_memory_quantizer_instance,
+            )
+        except ImportError:
+            from core.memory_quantizer import (  # type: ignore
+                get_memory_quantizer,
+                get_memory_quantizer_instance,
+            )
+
+        mq = get_memory_quantizer_instance()
+        if mq is None and init_if_missing:
+            mq = await asyncio.wait_for(get_memory_quantizer(), timeout=timeout_s)
+        if mq and hasattr(mq, "get_admission_snapshot_async"):
+            snapshot = await asyncio.wait_for(
+                mq.get_admission_snapshot_async(
+                    refresh=refresh_quantizer,
+                    include_reservations=include_reservations,
+                ),
+                timeout=timeout_s,
+            )
+            normalized = _normalize_memory_snapshot(
+                snapshot,
+                fallback_source="memory_quantizer_async",
+            )
+            if normalized.get("available_gb") is not None:
+                return normalized
+    except asyncio.TimeoutError:
+        logging.getLogger(__name__).debug(
+            "[MemorySOT] %s async quantizer probe timed out (%.2fs)",
+            context,
+            timeout_s,
+        )
+    except Exception as err:
+        logging.getLogger(__name__).debug(
+            "[MemorySOT] %s async quantizer read failed: %s",
+            context,
+            err,
+        )
+
+    return fallback_snapshot
+
+
 # =========================================================================
 # v270.1: CENTRALIZED STARTUP MODE MANAGEMENT
 # =========================================================================
@@ -3058,7 +3251,12 @@ def _apply_mode_degradation(new_mode: str, reason: str) -> str:
         return current
 
 
-def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
+def _reevaluate_mode_at_boundary(
+    phase_label: str,
+    *,
+    available_gb: Optional[float] = None,
+    memory_snapshot: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, float]:
     """Re-evaluate startup mode at a phase boundary.
 
     Returns (effective_mode, available_gb). During startup, mode can only
@@ -3070,7 +3268,30 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
     """
     _log = logging.getLogger(__name__)
     try:
-        avail_gb = _read_available_memory_gb()
+        snapshot = memory_snapshot
+        if snapshot is None:
+            snapshot = _read_startup_memory_snapshot_sync(
+                f"boundary:{phase_label}",
+                include_reservations=True,
+            )
+        normalized_snapshot = _normalize_memory_snapshot(
+            snapshot,
+            fallback_source="unknown",
+        )
+
+        if available_gb is None:
+            available_gb = normalized_snapshot.get("available_gb")
+        elif normalized_snapshot.get("available_gb") is None:
+            normalized_snapshot["available_gb"] = available_gb
+            normalized_snapshot["raw_available_gb"] = available_gb
+
+        _publish_memory_snapshot(
+            normalized_snapshot,
+            reason=f"boundary:{phase_label}:memory_snapshot",
+            caller="_reevaluate_mode_at_boundary",
+        )
+
+        avail_gb = available_gb
         if avail_gb is None:
             current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
             _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", current, f"boundary:{phase_label}:memprobe_failed", caller="_reevaluate_mode_at_boundary")
@@ -3094,7 +3315,6 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
             )
             _set_startup_env("JARVIS_STARTUP_MEMORY_MODE", ideal, f"boundary:{phase_label}:{direction}", caller="_reevaluate_mode_at_boundary")
             _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", ideal, f"boundary:{phase_label}:{direction}", caller="_reevaluate_mode_at_boundary")
-            _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{avail_gb:.2f}", f"boundary:{phase_label}:measured", caller="_reevaluate_mode_at_boundary")
             # v271.0: Log mode transition decision
             try:
                 from backend.core.decision_log import record_decision, DECISION_MODE_TRANSITION
@@ -3128,12 +3348,25 @@ def _reevaluate_mode_at_boundary(phase_label: str) -> Tuple[str, float]:
                 phase_label, current, avail_gb,
             )
             _set_startup_env("JARVIS_STARTUP_EFFECTIVE_MODE", current, f"boundary:{phase_label}:unchanged", caller="_reevaluate_mode_at_boundary")
-            _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{avail_gb:.2f}", f"boundary:{phase_label}:measured", caller="_reevaluate_mode_at_boundary")
             return current, avail_gb
     except Exception as err:
         _log.debug("[ModeControl] %s reevaluation error: %s", phase_label, err)
         current = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
         return current, 0.0
+
+
+async def _reevaluate_mode_at_boundary_async(phase_label: str) -> Tuple[str, float]:
+    """Async boundary reevaluation using quantizer-backed memory source."""
+    snapshot = await _read_startup_memory_snapshot_async(
+        f"boundary:{phase_label}",
+        include_reservations=True,
+        refresh_quantizer=True,
+    )
+    return _reevaluate_mode_at_boundary(
+        phase_label,
+        available_gb=snapshot.get("available_gb"),
+        memory_snapshot=snapshot,
+    )
 
 
 def _sync_heavy_spawn_gate(
@@ -3221,7 +3454,13 @@ def _sync_heavy_spawn_gate(
     return admitted, reason, effective_mode, measured_gb
 
 
-def _check_spawn_admission(component: str, min_gb: float = 1.5) -> Tuple[bool, str]:
+def _check_spawn_admission(
+    component: str,
+    min_gb: float = 1.5,
+    *,
+    available_gb: Optional[float] = None,
+    memory_snapshot: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
     """Pre-spawn admission check — verify enough memory before launching
     a heavy subprocess.
 
@@ -3231,12 +3470,33 @@ def _check_spawn_admission(component: str, min_gb: float = 1.5) -> Tuple[bool, s
     v270.1: Prevents OOM from launching backend/model subprocesses when
     memory is already critically low.
     """
+    snapshot = memory_snapshot
+    if snapshot is None:
+        snapshot = _read_startup_memory_snapshot_sync(
+            f"spawn:{component}",
+            include_reservations=True,
+        )
+    normalized_snapshot = _normalize_memory_snapshot(
+        snapshot,
+        fallback_source="unknown",
+    )
+    if available_gb is None:
+        available_gb = normalized_snapshot.get("available_gb")
+    elif normalized_snapshot.get("available_gb") is None:
+        normalized_snapshot["available_gb"] = available_gb
+        normalized_snapshot["raw_available_gb"] = available_gb
+    _publish_memory_snapshot(
+        normalized_snapshot,
+        reason=f"spawn:{component}:memory_snapshot",
+        caller="_check_spawn_admission",
+    )
+
     admitted, reason, effective_mode, avail = _sync_heavy_spawn_gate(
         f"spawn:{component}",
         min_available_gb=min_gb,
         mode=os.environ.get("JARVIS_STARTUP_EFFECTIVE_MODE")
         or os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full"),
-        available_gb=_read_available_memory_gb(),
+        available_gb=available_gb,
     )
     if admitted:
         return True, "admitted"
@@ -3258,6 +3518,24 @@ def _check_spawn_admission(component: str, min_gb: float = 1.5) -> Tuple[bool, s
         return False, f"avail={avail:.1f}GB < {min_gb}GB floor for {component}"
 
     return False, f"{reason} — {component} deferred"
+
+
+async def _check_spawn_admission_async(
+    component: str,
+    min_gb: float = 1.5,
+) -> Tuple[bool, str]:
+    """Async pre-spawn admission check using quantizer-backed memory snapshot."""
+    snapshot = await _read_startup_memory_snapshot_async(
+        f"spawn:{component}",
+        include_reservations=True,
+        refresh_quantizer=True,
+    )
+    return _check_spawn_admission(
+        component,
+        min_gb=min_gb,
+        available_gb=snapshot.get("available_gb"),
+        memory_snapshot=snapshot,
+    )
 
 
 async def _kill_orphaned_subprocess(
@@ -65123,7 +65401,7 @@ class JarvisSystemKernel:
         # v270.1: Thin wrapper — delegates to module-level _reevaluate_mode_at_boundary.
         # Kept as nested function so existing call sites within _startup_impl don't change.
         async def _reevaluate_startup_mode(phase_label: str) -> None:
-            _reevaluate_mode_at_boundary(phase_label)
+            await _reevaluate_mode_at_boundary_async(phase_label)
 
         # =====================================================================
         # v258.4 (P1-7): LOADED COMPONENTS REGISTRY
@@ -69582,7 +69860,7 @@ class JarvisSystemKernel:
 
         # v270.1: Phase 2 memory gate — delegates to centralized _reevaluate_mode_at_boundary.
         # Phase-specific post-action: defer Docker/storage in cloud_only/minimal.
-        _current_mode2, _avail_gb2 = _reevaluate_mode_at_boundary("phase_resources")
+        _current_mode2, _avail_gb2 = await _reevaluate_mode_at_boundary_async("phase_resources")
         if _current_mode2 in ("cloud_only", "minimal"):
             self.logger.warning(
                 "[ModeControl] Phase 2: mode=%s — deferring heavy local resources",
@@ -70678,7 +70956,17 @@ class JarvisSystemKernel:
 
         # v270.1: Phase 3 memory gate — delegates to centralized _reevaluate_mode_at_boundary.
         # Phase-specific post-action: set BACKEND_MINIMAL when critically low.
-        _current_mode3, _avail_gb3 = _reevaluate_mode_at_boundary("phase_backend")
+        _phase_backend_snapshot = await _read_startup_memory_snapshot_async(
+            "phase_backend",
+            include_reservations=True,
+            refresh_quantizer=True,
+        )
+        _phase_backend_avail = _phase_backend_snapshot.get("available_gb")
+        _current_mode3, _avail_gb3 = _reevaluate_mode_at_boundary(
+            "phase_backend",
+            available_gb=_phase_backend_avail,
+            memory_snapshot=_phase_backend_snapshot,
+        )
         if _current_mode3 in ("cloud_first", "cloud_only", "minimal"):
             if _avail_gb3 < 2.0:
                 self.logger.warning(
@@ -70690,7 +70978,12 @@ class JarvisSystemKernel:
 
         # v270.1: Pre-spawn admission check — verify enough memory before
         # launching the backend subprocess (the heaviest single allocation).
-        _be_admitted, _be_admit_reason = _check_spawn_admission("backend", min_gb=1.5)
+        _be_admitted, _be_admit_reason = _check_spawn_admission(
+            "backend",
+            min_gb=1.5,
+            available_gb=_phase_backend_avail,
+            memory_snapshot=_phase_backend_snapshot,
+        )
         if not _be_admitted:
             self.logger.warning(
                 "[ModeControl] Backend spawn rejected: %s", _be_admit_reason
@@ -83203,6 +83496,8 @@ class JarvisSystemKernel:
                 "oombridge_available": os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE", "1"),
                 "can_spawn_heavy": os.environ.get("JARVIS_CAN_SPAWN_HEAVY", "true"),
                 "heavy_admission_reason": os.environ.get("JARVIS_HEAVY_ADMISSION_REASON", ""),
+                "measured_memory_source": os.environ.get("JARVIS_MEASURED_MEMORY_SOURCE", ""),
+                "measured_memory_tier": os.environ.get("JARVIS_MEASURED_MEMORY_TIER", ""),
                 "oom_fail_closed": os.environ.get("JARVIS_OOM_FAIL_CLOSED", "false"),
                 "oom_preflight_retry_budget_remaining": os.environ.get(
                     "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_REMAINING",
@@ -83256,6 +83551,8 @@ class JarvisSystemKernel:
                 "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB",
                 "",
             ),
+            "measured_memory_source": os.environ.get("JARVIS_MEASURED_MEMORY_SOURCE", ""),
+            "measured_memory_tier": os.environ.get("JARVIS_MEASURED_MEMORY_TIER", ""),
             "oom_fail_closed": os.environ.get("JARVIS_OOM_FAIL_CLOSED", "false"),
             "oom_preflight_retry_budget_total": os.environ.get(
                 "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_TOTAL",

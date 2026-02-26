@@ -592,6 +592,102 @@ class MemoryQuantizer:
         self.current_metrics = metrics
         return metrics
 
+    @staticmethod
+    def _effective_available_gb(
+        metrics: MemoryMetrics,
+        *,
+        include_reservations: bool = True,
+    ) -> Tuple[float, float]:
+        """
+        Compute effective available memory for admission decisions.
+
+        Returns:
+            (effective_available_gb, reserved_gb_applied)
+        """
+        available_gb = max(0.0, float(metrics.system_memory_available_gb))
+        reserved_gb = 0.0
+        if include_reservations:
+            try:
+                reserved_gb = max(
+                    0.0,
+                    float((metrics.metadata or {}).get("reserved_gb", 0.0)),
+                )
+            except Exception:
+                reserved_gb = 0.0
+            available_gb = max(0.0, available_gb - reserved_gb)
+        return available_gb, reserved_gb
+
+    def build_admission_snapshot(
+        self,
+        metrics: MemoryMetrics,
+        *,
+        include_reservations: bool = True,
+        source: str = "memory_quantizer",
+    ) -> Dict[str, Any]:
+        """
+        Build a canonical memory snapshot for startup/runtime admission checks.
+        """
+        effective_available_gb, reserved_gb = self._effective_available_gb(
+            metrics,
+            include_reservations=include_reservations,
+        )
+        return {
+            "available_gb": effective_available_gb,
+            "raw_available_gb": float(metrics.system_memory_available_gb),
+            "reserved_gb": reserved_gb,
+            "tier": metrics.tier.value,
+            "pressure": metrics.pressure.value,
+            "source": source,
+            "timestamp": float(metrics.timestamp),
+        }
+
+    def get_admission_snapshot(
+        self,
+        *,
+        refresh: bool = False,
+        include_reservations: bool = True,
+        allow_probe_if_missing: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Return canonical memory snapshot for startup/runtime gates (sync).
+        """
+        metrics = self.current_metrics
+        if refresh or (metrics is None and allow_probe_if_missing):
+            metrics = self.get_current_metrics()
+        if metrics is None:
+            return {
+                "available_gb": None,
+                "raw_available_gb": None,
+                "reserved_gb": 0.0,
+                "tier": "",
+                "pressure": "",
+                "source": "memory_quantizer_sync",
+                "timestamp": time.time(),
+            }
+        return self.build_admission_snapshot(
+            metrics,
+            include_reservations=include_reservations,
+            source="memory_quantizer_sync",
+        )
+
+    async def get_admission_snapshot_async(
+        self,
+        *,
+        refresh: bool = True,
+        include_reservations: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Return canonical memory snapshot for startup/runtime gates (async).
+        """
+        metrics = self.current_metrics
+        if refresh or metrics is None:
+            metrics = await self.get_current_metrics_async()
+        return self.build_admission_snapshot(
+            metrics,
+            include_reservations=include_reservations,
+            source="memory_quantizer_async",
+        )
+
     def _calculate_macos_memory_pressure(self, mem) -> float:
         """
         Calculate macOS-specific memory pressure percentage
@@ -1317,6 +1413,11 @@ class MemoryQuantizer:
 # ============================================================================
 
 _memory_quantizer_instance: Optional[MemoryQuantizer] = None
+
+
+def get_memory_quantizer_instance() -> Optional[MemoryQuantizer]:
+    """Return current singleton without creating a new quantizer instance."""
+    return _memory_quantizer_instance
 
 
 async def get_memory_quantizer(

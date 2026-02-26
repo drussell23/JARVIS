@@ -22,6 +22,8 @@ def _clean_env(monkeypatch):
         "JARVIS_STARTUP_COMPLETE",
         "JARVIS_OOMBRIDGE_AVAILABLE",
         "JARVIS_MEASURED_AVAILABLE_GB",
+        "JARVIS_MEASURED_MEMORY_SOURCE",
+        "JARVIS_MEASURED_MEMORY_TIER",
         "JARVIS_CRITICAL_THRESHOLD_GB",
         "JARVIS_CLOUD_THRESHOLD_GB",
         "JARVIS_OPTIMIZE_THRESHOLD_GB",
@@ -228,12 +230,27 @@ class TestOOMBridgePolicyHelpers:
 class TestReevaluateModeAtBoundary:
     """Test _reevaluate_mode_at_boundary phase-boundary reevaluation."""
 
+    @staticmethod
+    def _snapshot(available_gb, source="unit_test", tier="optimal"):
+        return {
+            "available_gb": available_gb,
+            "raw_available_gb": available_gb,
+            "reserved_gb": 0.0,
+            "tier": tier,
+            "pressure": "normal",
+            "source": source,
+            "timestamp": 0.0,
+        }
+
     def test_returns_current_mode_when_psutil_unavailable(self, monkeypatch):
         _, _, _, reeval, *_ = _import_functions()
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "sequential")
-        # Mock _read_available_memory_gb to return None
         import unified_supervisor
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: None)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(None, source="unavailable"),
+        )
         mode, avail = reeval("test_phase")
         assert mode == "sequential"
         assert avail == 0.0
@@ -243,7 +260,11 @@ class TestReevaluateModeAtBoundary:
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
         # Simulate 1.5GB available → should degrade to cloud_only
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 1.5)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(1.5),
+        )
         mode, avail = reeval("test_phase")
         assert mode == "cloud_only"
         assert avail == 1.5
@@ -255,7 +276,11 @@ class TestReevaluateModeAtBoundary:
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
         # 12GB → local_full, no change
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 12.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(12.0),
+        )
         mode, avail = reeval("test_phase")
         assert mode == "local_full"
         assert avail == 12.0
@@ -266,7 +291,11 @@ class TestReevaluateModeAtBoundary:
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "cloud_first")
         # 12GB available would suggest local_full, but can't recover during startup
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 12.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(12.0),
+        )
         mode, avail = reeval("test_phase")
         assert mode == "cloud_first"  # Not upgraded to local_full
 
@@ -275,7 +304,11 @@ class TestReevaluateModeAtBoundary:
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "cloud_first")
         monkeypatch.setenv("JARVIS_STARTUP_COMPLETE", "true")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 12.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(12.0),
+        )
         mode, avail = reeval("test_phase")
         assert mode == "local_full"  # CAN recover after startup
 
@@ -283,19 +316,40 @@ class TestReevaluateModeAtBoundary:
         _, _, _, reeval, *_ = _import_functions()
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 7.42)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(7.42, source="memory_quantizer_async"),
+        )
         reeval("test_phase")
         assert os.environ["JARVIS_MEASURED_AVAILABLE_GB"] == "7.42"
+        assert os.environ["JARVIS_MEASURED_MEMORY_SOURCE"] == "memory_quantizer_async"
 
 
 class TestCheckSpawnAdmission:
     """Test _check_spawn_admission pre-spawn memory gate."""
 
+    @staticmethod
+    def _snapshot(available_gb, source="unit_test", tier="optimal"):
+        return {
+            "available_gb": available_gb,
+            "raw_available_gb": available_gb,
+            "reserved_gb": 0.0,
+            "tier": tier,
+            "pressure": "normal",
+            "source": source,
+            "timestamp": 0.0,
+        }
+
     def test_admitted_with_sufficient_memory(self, monkeypatch):
         *_, check, _ = _import_functions()
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 8.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(8.0),
+        )
         admitted, reason = check("backend", min_gb=1.5)
         assert admitted is True
 
@@ -303,7 +357,11 @@ class TestCheckSpawnAdmission:
         *_, check, _ = _import_functions()
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "minimal")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 8.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(8.0),
+        )
         admitted, reason = check("backend", min_gb=1.5)
         assert admitted is False
         assert "minimal" in reason
@@ -312,7 +370,11 @@ class TestCheckSpawnAdmission:
         *_, check, _ = _import_functions()
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 1.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(1.0),
+        )
         admitted, reason = check("backend", min_gb=1.5)
         assert admitted is False
         assert "1.0GB" in reason
@@ -321,7 +383,11 @@ class TestCheckSpawnAdmission:
         *_, check, _ = _import_functions()
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: None)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(None, source="unavailable"),
+        )
         admitted, reason = check("backend", min_gb=1.5)
         assert admitted is True  # Can't measure → fail open
 
@@ -330,7 +396,11 @@ class TestCheckSpawnAdmission:
         *_, check, _ = _import_functions()
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 1.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(1.0),
+        )
         check("backend", min_gb=1.5)
         # Mode should have been degraded (1.0GB < 2.0 critical → cloud_only)
         assert os.environ["JARVIS_STARTUP_MEMORY_MODE"] != "local_full"
@@ -340,10 +410,35 @@ class TestCheckSpawnAdmission:
         *_, check, _ = _import_functions()
         import unified_supervisor
         monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
-        monkeypatch.setattr(unified_supervisor, "_read_available_memory_gb", lambda: 1.0)
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: self._snapshot(1.0),
+        )
         check("backend", min_gb=1.5)
         # 1.0GB < 2.0 critical → ideal is cloud_only
         assert os.environ["JARVIS_STARTUP_MEMORY_MODE"] == "cloud_only"
+
+    def test_injected_snapshot_is_authoritative_for_spawn_admission(self, monkeypatch):
+        *_, check, _ = _import_functions()
+        import unified_supervisor
+
+        monkeypatch.setenv("JARVIS_STARTUP_MEMORY_MODE", "local_full")
+        monkeypatch.setenv("JARVIS_STARTUP_EFFECTIVE_MODE", "local_full")
+        monkeypatch.setattr(
+            unified_supervisor,
+            "_read_startup_memory_snapshot_sync",
+            lambda *_args, **_kwargs: pytest.fail("fallback probe should not run"),
+        )
+
+        admitted, _reason = check(
+            "backend",
+            min_gb=1.5,
+            available_gb=3.25,
+            memory_snapshot=self._snapshot(3.25, source="memory_quantizer_async", tier="optimal"),
+        )
+        assert admitted is True
+        assert os.environ["JARVIS_MEASURED_MEMORY_SOURCE"] == "memory_quantizer_async"
 
 
 class TestComputeIdealModeEdgeCases:

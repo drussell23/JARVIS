@@ -168,6 +168,16 @@ ENV_CONTRACTS: List[EnvContract] = [
         value_type="float",
         pattern=r"^\d+\.\d+$",
     ),
+    EnvContract(
+        "JARVIS_MEASURED_MEMORY_SOURCE", "Source used for startup memory measurements",
+        value_type="str",
+        pattern=r"^[a-z0-9_\-]+$",
+    ),
+    EnvContract(
+        "JARVIS_MEASURED_MEMORY_TIER", "Memory tier at last startup/runtime admission check",
+        value_type="str",
+        pattern=r"^(abundant|optimal|elevated|constrained|critical|emergency|unknown)$",
+    ),
 ]
 
 # Index by canonical name for fast lookup
