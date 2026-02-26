@@ -66122,9 +66122,26 @@ class JarvisSystemKernel:
             _loop = asyncio.get_running_loop()
 
             def _preload_native_libs_sync():
-                """Pre-import ALL major native C extensions in isolation."""
+                """Pre-import ALL native C extensions before CoreAudio starts.
+
+                v275.3: Extended from 4 libraries to ALL native C extensions
+                imported during parallel_import_components(). The previous
+                list (numpy/scipy/torch/numba) was incomplete — soundfile,
+                PIL, cv2, torchaudio, soxr, and webrtcvad were all imported
+                in 4 worker threads concurrent with the CoreAudio IO thread,
+                triggering native C init collisions → SIGSEGV at NULL+4 on
+                com.apple.audio.IOThread.client.
+
+                The cure: pre-load EVERYTHING here. Once in sys.modules,
+                subsequent imports skip native init entirely.
+
+                Order: dependency-safe (dependencies loaded before dependents).
+                Each is optional — ImportError = not installed, skip silently.
+                """
                 import os as _os
                 _preloaded = []
+
+                # ── Tier 1: Foundational (everything depends on these) ──
 
                 # 1. numpy — BLAS/LAPACK native extensions
                 try:
@@ -66138,7 +66155,6 @@ class JarvisSystemKernel:
                 # 2. scipy — Fortran runtime + BLAS wrappers
                 try:
                     import scipy  # noqa: F401
-                    # scipy.signal is commonly used at module level
                     from scipy import signal as _  # noqa: F401
                     _preloaded.append(f"scipy {scipy.__version__}")
                 except ImportError:
@@ -66146,10 +66162,10 @@ class JarvisSystemKernel:
                 except Exception as _e:
                     _preloaded.append(f"scipy: {_e}")
 
+                # ── Tier 2: ML/DL frameworks (depend on numpy) ──
+
                 # 3. torch — BLAS, LLVM JIT, MPS (Apple Metal)
-                # This is the heaviest (~5-10s) but is the primary SIGSEGV
-                # source. Module-level `import torch` in 20+ voice/ML files
-                # loads BLAS + LLVM concurrently with CoreAudio.
+                # Heaviest (~5-10s) but primary SIGSEGV source.
                 try:
                     import torch  # noqa: F401
                     _preloaded.append(f"torch {torch.__version__}")
@@ -66158,7 +66174,16 @@ class JarvisSystemKernel:
                 except Exception as _e:
                     _preloaded.append(f"torch: {_e}")
 
-                # 4. numba — LLVM JIT (lighter, often already handled)
+                # 4. torchaudio — native audio extensions (depends on torch)
+                try:
+                    import torchaudio  # noqa: F401
+                    _preloaded.append(f"torchaudio {torchaudio.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"torchaudio: {_e}")
+
+                # 5. numba — LLVM JIT
                 _os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
                 _os.environ.setdefault("NUMBA_NUM_THREADS", "1")
                 _os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
@@ -66170,12 +66195,70 @@ class JarvisSystemKernel:
                 except Exception as _e:
                     _preloaded.append(f"numba: {_e}")
 
+                # ── Tier 3: Audio native extensions ──
+                # These are imported by voice_system in parallel_import_components()
+                # and by safe_say() lazily. Without preloading, their CFFI/C
+                # init collides with CoreAudio IO thread.
+
+                # 6. soundfile — libsndfile via CFFI (used by safe_say, voice engines)
+                try:
+                    import soundfile  # noqa: F401
+                    _preloaded.append(f"soundfile {soundfile.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"soundfile: {_e}")
+
+                # 7. soxr — SOX Resampler (used by librosa, audio resampling)
+                try:
+                    import soxr  # noqa: F401
+                    _preloaded.append("soxr")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"soxr: {_e}")
+
+                # 8. webrtcvad — WebRTC VAD C extension
+                try:
+                    import webrtcvad  # noqa: F401
+                    _preloaded.append("webrtcvad")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"webrtcvad: {_e}")
+
+                # ── Tier 4: Vision/image native extensions ──
+                # Imported by vision_system in parallel_import_components()
+
+                # 9. PIL/Pillow — libjpeg, libpng, libtiff, zlib
+                try:
+                    import PIL  # noqa: F401
+                    from PIL import Image as _  # noqa: F401 — triggers codec init
+                    _preloaded.append(f"Pillow {PIL.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"PIL: {_e}")
+
+                # 10. cv2/OpenCV — massive C++ native library
+                try:
+                    import cv2  # noqa: F401
+                    _preloaded.append(f"cv2 {cv2.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"cv2: {_e}")
+
                 if _preloaded:
-                    return f"native libs preloaded: {', '.join(_preloaded)}"
+                    return f"native libs preloaded ({len(_preloaded)}): {', '.join(_preloaded)}"
                 return "no native libs installed (all optional)"
 
+            # v275.3: Increased default from 45s → 60s to accommodate the
+            # expanded pre-load list (10 libraries instead of 4). torch alone
+            # can take 5-10s; PIL+cv2 add ~3-5s more. Under CPU pressure
+            # (other startup tasks), 45s was too tight.
             _preload_timeout = float(os.environ.get(
-                "JARVIS_NATIVE_PRELOAD_TIMEOUT", "45.0"
+                "JARVIS_NATIVE_PRELOAD_TIMEOUT", "60.0"
             ))
             _preload_msg = await asyncio.wait_for(
                 _loop.run_in_executor(None, _preload_native_libs_sync),
