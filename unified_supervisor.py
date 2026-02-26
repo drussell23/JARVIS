@@ -66295,7 +66295,6 @@ class JarvisSystemKernel:
             _preload_timeout = float(os.environ.get(
                 "JARVIS_NATIVE_PRELOAD_TIMEOUT", "60.0"
             ))
-            _preload_t0 = time.time()
             _preload_msg = await asyncio.wait_for(
                 _loop.run_in_executor(None, _preload_native_libs_sync),
                 timeout=_preload_timeout,
@@ -66319,9 +66318,34 @@ class JarvisSystemKernel:
         # audio can route through the bus from the very first utterance.
         # On failure, revert self._audio_bus_enabled = False so all
         # downstream code uses legacy paths.
+        #
+        # v275.5: Adaptive timeout. The previous fixed 10s default was set
+        # when only 4 native libs were pre-loaded. With 11 libs (v275.3),
+        # the post-preload system state has higher memory/GC/GIL pressure.
+        # FullDuplexDevice._open_stream_sync() makes 5+ sequential CoreAudio
+        # C calls (query_devices, check_settings × N profiles, Pa_OpenStream,
+        # Pa_StartStream), each of which can take 1-3s under pressure.
+        # The timeout now adapts to observed preload duration and CPU load.
         # =====================================================================
         if self._audio_bus_enabled:
-            _ab_timeout = _get_env_float("JARVIS_AUDIO_BUS_INIT_TIMEOUT", 10.0)
+            _ab_base_timeout = _get_env_float("JARVIS_AUDIO_BUS_INIT_TIMEOUT", 15.0)
+            # v275.5: Adaptive scaling based on preload duration.
+            # If preload took > 15s, the system is under heavy load —
+            # CoreAudio operations will be proportionally slower.
+            _ab_timeout = _ab_base_timeout
+            if _preload_elapsed > 15.0:
+                # Scale linearly: 15s preload → 1.0x, 30s → 1.5x, 60s → 2.5x
+                _load_factor = 1.0 + (_preload_elapsed - 15.0) / 30.0
+                _ab_timeout = _ab_base_timeout * min(_load_factor, 3.0)
+            # v275.5: CPU-aware scaling (same pattern as recovery loop).
+            try:
+                import psutil as _ab_psutil
+                _ab_cpu = _ab_psutil.cpu_percent(interval=None)
+                if _ab_cpu > 80.0:
+                    _cpu_factor = 1.0 + (_ab_cpu - 80.0) / 20.0  # up to 2x at 100%
+                    _ab_timeout *= _cpu_factor
+            except Exception:
+                pass
             try:
                 # v266.4: Import AudioBus in thread executor.
                 # The import chain triggers `import sounddevice` which
@@ -66331,6 +66355,9 @@ class JarvisSystemKernel:
                 # dialog, CoreAudio stall), freezing the event loop and
                 # defeating asyncio.wait_for() timeouts. Same root-cause
                 # pattern as ECAPA v265.2 and Zone 6 v265.2.
+                #
+                # v275.3+: sounddevice is now pre-loaded, so this import
+                # should be near-instant. Timeout kept as safety net.
                 _loop = asyncio.get_running_loop()
 
                 def _import_audio_bus():
@@ -66353,15 +66380,20 @@ class JarvisSystemKernel:
                     "status": "running",
                     "message": "AudioBus initialized",
                 }
-                self.logger.info("[Kernel] AudioBus started (v267.0)")
+                self.logger.info(
+                    "[Kernel] AudioBus started (v267.0, timeout=%.1fs, preload=%.1fs)",
+                    _ab_timeout, _preload_elapsed,
+                )
             except asyncio.TimeoutError:
                 self.logger.warning(
-                    f"[Kernel] AudioBus init timed out ({_ab_timeout:.0f}s) — scheduling recovery"
+                    "[Kernel] AudioBus init timed out (%.1fs, preload=%.1fs) "
+                    "— scheduling recovery",
+                    _ab_timeout, _preload_elapsed,
                 )
                 self._audio_bus = None
                 self._component_status["audio_infrastructure"] = {
                     "status": "degraded",
-                    "message": "AudioBus init timeout — recovery scheduled",
+                    "message": f"AudioBus init timeout ({_ab_timeout:.0f}s) — recovery scheduled",
                 }
                 self._schedule_audio_bus_recovery("early_init_timeout")
             except Exception as ab_err:
