@@ -83073,6 +83073,18 @@ class JarvisSystemKernel:
         if not hasattr(self, '_loading_server_process') or not self._loading_server_process:
             return False
 
+        # v274.0: Early async-safe exit-detection — check returncode on the
+        # asyncio.subprocess.Process BEFORE dispatching to a thread.
+        # asyncio.subprocess.Process auto-updates .returncode via the event
+        # loop's child-process watcher, so reading it here is both correct
+        # and thread-safe.  This also replaces the broken .poll() call that
+        # existed in _sync_broadcast_progress (asyncio.subprocess.Process
+        # does NOT have .poll() — only subprocess.Popen does).
+        _ls_rc = getattr(self._loading_server_process, 'returncode', None)
+        if _ls_rc is not None:
+            self._last_broadcast_error = f"Loading server exited (code: {_ls_rc})"
+            return False
+
         # v210.0: Skip if loading server isn't confirmed ready (health check passed)
         # This prevents broadcast attempts before the server is accepting connections
         if not getattr(self, '_loading_server_ready', False):
@@ -83172,9 +83184,19 @@ class JarvisSystemKernel:
         import urllib.error
         import json as _json
 
-        # v210.0: Check if loading server process is still running
+        # v274.0: Check if loading server process is still running.
+        # Supports both asyncio.subprocess.Process (.returncode, auto-updated)
+        # and subprocess.Popen (.poll() to refresh .returncode).
+        # The primary async-safe check now lives in _broadcast_startup_progress
+        # (before dispatch to thread), so this is a defense-in-depth fallback.
         if hasattr(self, '_loading_server_process') and self._loading_server_process:
-            poll_result = self._loading_server_process.poll()
+            _proc = self._loading_server_process
+            if hasattr(_proc, 'poll'):
+                # subprocess.Popen: .poll() refreshes and returns .returncode
+                poll_result = _proc.poll()
+            else:
+                # asyncio.subprocess.Process: .returncode auto-updated by event loop
+                poll_result = getattr(_proc, 'returncode', None)
             if poll_result is not None:
                 # Process has exited - store reason for diagnostic
                 self._last_broadcast_error = f"Loading server exited (code: {poll_result})"
