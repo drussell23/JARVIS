@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -588,21 +589,31 @@ class CAIVoiceFeedbackManager:
                         source="cai_voice_feedback",
                     )
                 else:
-                    # Fallback: raw subprocess (only when safe_say unavailable)
-                    self._current_speech_process = await asyncio.create_subprocess_exec(
-                        "say",
-                        "-v", self._voice_name,
-                        "-r", str(rate),
-                        text,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    if wait:
-                        await asyncio.wait_for(
-                            self._current_speech_process.wait(),
-                            timeout=30.0,
+                    # Fallback: say -o tempfile + afplay (NEVER raw say)
+                    import tempfile as _tmpmod
+                    _fd, _tmp = _tmpmod.mkstemp(suffix=".aiff", prefix="jarvis_cai_")
+                    os.close(_fd)
+                    try:
+                        self._current_speech_process = await asyncio.create_subprocess_exec(
+                            "say", "-v", self._voice_name, "-r", str(rate),
+                            "-o", _tmp, text,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
                         )
-                    result = True
+                        await asyncio.wait_for(self._current_speech_process.wait(), timeout=30.0)
+                        if wait:
+                            _afp = await asyncio.create_subprocess_exec(
+                                "afplay", _tmp,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await asyncio.wait_for(_afp.wait(), timeout=30.0)
+                        result = True
+                    finally:
+                        try:
+                            os.unlink(_tmp)
+                        except OSError:
+                            pass
 
                 elapsed = (time.time() - start_time) * 1000
                 self._total_speech_time_ms += elapsed
@@ -937,15 +948,30 @@ async def speak_cai_message(message: str, wait: bool = True) -> bool:
                     source="cai_voice_fallback",
                 )
             else:
-                # Last resort: raw subprocess (safe_say unavailable)
-                process = await asyncio.create_subprocess_exec(
-                    "say", "-v", "Daniel", message,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                if wait:
-                    await asyncio.wait_for(process.wait(), timeout=30.0)
-                return True
+                # Last resort: say -o tempfile + afplay (NEVER raw say)
+                import tempfile as _tmpmod
+                _fd, _tmp = _tmpmod.mkstemp(suffix=".aiff", prefix="jarvis_cai_fb_")
+                os.close(_fd)
+                try:
+                    _proc = await asyncio.create_subprocess_exec(
+                        "say", "-v", "Daniel", "-o", _tmp, message,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(_proc.wait(), timeout=30.0)
+                    if wait:
+                        _afp = await asyncio.create_subprocess_exec(
+                            "afplay", _tmp,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(_afp.wait(), timeout=30.0)
+                    return True
+                finally:
+                    try:
+                        os.unlink(_tmp)
+                    except OSError:
+                        pass
         except Exception:
             return False
 
