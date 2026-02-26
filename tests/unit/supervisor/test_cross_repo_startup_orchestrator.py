@@ -205,6 +205,77 @@ class TestSupervisorAuthorityGate:
         )
         assert not orchestrator_mod.check_supervisor_authority("bootstrap_action")
 
+    def test_enforce_single_authority_allows_standalone_without_lock(
+        self, tmp_path, monkeypatch
+    ):
+        import backend.supervisor.cross_repo_startup_orchestrator as orchestrator_mod
+
+        authority_state = tmp_path / "locks" / "supervisor_authority.json"
+        kernel_lock = tmp_path / "locks" / "kernel.lock"
+        kernel_lock.parent.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(orchestrator_mod, "_AUTHORITY_STATE_PATH", authority_state)
+        monkeypatch.setattr(orchestrator_mod, "_KERNEL_LOCK_PATH", kernel_lock)
+
+        orchestrator_mod.revoke_supervisor_authority("standalone_reset")
+        assert orchestrator_mod.enforce_single_control_plane_authority(
+            "standalone_action",
+            allow_when_no_kernel_lock=True,
+        )
+
+    def test_enforce_single_authority_blocks_when_foreign_lock_owner(
+        self, tmp_path, monkeypatch
+    ):
+        import backend.supervisor.cross_repo_startup_orchestrator as orchestrator_mod
+
+        authority_state = tmp_path / "locks" / "supervisor_authority.json"
+        kernel_lock = tmp_path / "locks" / "kernel.lock"
+        kernel_lock.parent.mkdir(parents=True, exist_ok=True)
+        kernel_lock.write_text(
+            json.dumps({"pid": os.getpid() + 99999}),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(orchestrator_mod, "_AUTHORITY_STATE_PATH", authority_state)
+        monkeypatch.setattr(orchestrator_mod, "_KERNEL_LOCK_PATH", kernel_lock)
+
+        orchestrator_mod.revoke_supervisor_authority("foreign_owner_reset")
+        with patch.object(orchestrator_mod, "_pid_is_alive", return_value=True):
+            assert not orchestrator_mod.enforce_single_control_plane_authority(
+                "foreign_owner_action",
+                allow_bootstrap_owner=True,
+            )
+
+
+class TestAuthorityGuardedLifecycle:
+    """Tests for public lifecycle APIs guarded by control-plane authority."""
+
+    @pytest.mark.asyncio
+    async def test_start_all_services_blocked_without_authority(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        with patch(
+            "backend.supervisor.cross_repo_startup_orchestrator.enforce_single_control_plane_authority",
+            return_value=False,
+        ):
+            result = await orchestrator.start_all_services()
+
+        assert result == {"auth_gate_blocked": False}
+
+    @pytest.mark.asyncio
+    async def test_restart_service_blocked_without_authority(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        with patch(
+            "backend.supervisor.cross_repo_startup_orchestrator.enforce_single_control_plane_authority",
+            return_value=False,
+        ):
+            result = await orchestrator.restart_service("jarvis-prime")
+
+        assert result is False
+
 
 class TestStartupLockError:
     """Tests for the StartupLockError exception class."""

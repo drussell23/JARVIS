@@ -82,6 +82,29 @@ from backend.core.startup_summary import StartupSummary
 logger = logging.getLogger("jarvis.enterprise_startup_orchestrator")
 
 
+def _require_control_plane_authority(action: str) -> None:
+    """
+    Prevent split-brain lifecycle control when a kernel owner is active.
+
+    Standalone/unit-test mode remains allowed when no kernel lock owner exists.
+    """
+    try:
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            enforce_single_control_plane_authority,
+        )
+    except Exception:
+        return
+
+    if not enforce_single_control_plane_authority(
+        action,
+        allow_bootstrap_owner=True,
+        allow_when_no_kernel_lock=True,
+    ):
+        raise RuntimeError(
+            f"Control-plane authority required for {action}; unified supervisor owns lifecycle"
+        )
+
+
 class StartupEvent(Enum):
     """Events emitted during startup/shutdown lifecycle."""
 
@@ -253,6 +276,8 @@ class EnterpriseStartupOrchestrator:
         Returns:
             StartupResult with success status, timing, and component results
         """
+        _require_control_plane_authority("enterprise_orchestrate_startup")
+
         start_time = datetime.now(timezone.utc)
         self.summary.start_time = start_time
 
@@ -719,6 +744,8 @@ class EnterpriseStartupOrchestrator:
         Args:
             reverse_order: If True, shutdown in reverse startup order
         """
+        _require_control_plane_authority("enterprise_shutdown_all")
+
         logger.info("Beginning shutdown sequence")
         await self._emit_event(StartupEvent.SHUTDOWN_BEGUN)
 

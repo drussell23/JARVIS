@@ -1126,3 +1126,27 @@ class TestErrorClassification:
 
         assert result.success is True
         assert result.components["config-dependent"].status == ComponentStatus.FAILED
+
+
+class TestControlPlaneAuthority:
+    """Tests for control-plane authority enforcement hooks."""
+
+    @pytest.mark.asyncio
+    async def test_orchestrate_startup_requires_authority(self, registry):
+        orchestrator = EnterpriseStartupOrchestrator(registry=registry)
+        with patch(
+            "backend.core.enterprise_startup_orchestrator._require_control_plane_authority",
+            side_effect=RuntimeError("Control-plane authority required"),
+        ):
+            with pytest.raises(RuntimeError, match="Control-plane authority required"):
+                await orchestrator.orchestrate_startup()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_all_requires_authority(self, registry):
+        orchestrator = EnterpriseStartupOrchestrator(registry=registry)
+        with patch(
+            "backend.core.enterprise_startup_orchestrator._require_control_plane_authority",
+            side_effect=RuntimeError("Control-plane authority required"),
+        ):
+            with pytest.raises(RuntimeError, match="Control-plane authority required"):
+                await orchestrator.shutdown_all()

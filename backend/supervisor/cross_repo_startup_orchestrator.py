@@ -422,6 +422,14 @@ def _read_kernel_lock_owner_pid() -> Optional[int]:
         return None
 
 
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
 def _get_authority_snapshot() -> Dict[str, Any]:
     disk = _read_json_file(_AUTHORITY_STATE_PATH)
     if isinstance(disk, dict):
@@ -586,6 +594,59 @@ def check_supervisor_authority(
         lock_owner_pid,
         current_pid,
         state.get("reason"),
+        state.get("epoch"),
+    )
+    return False
+
+
+def enforce_single_control_plane_authority(
+    action: str,
+    *,
+    allow_bootstrap_owner: bool = False,
+    allow_when_no_kernel_lock: bool = True,
+) -> bool:
+    """
+    Enforce single-authority control-plane semantics for lifecycle mutations.
+
+    Behavior:
+    - If a kernel lock owner exists, require valid supervisor authority.
+    - If no kernel lock owner exists, optionally allow standalone execution
+      (used by unit tests and offline tooling).
+    """
+    state = get_supervisor_authority_state()
+    lock_owner_pid = state.get("kernel_lock_owner_pid")
+    current_pid = state.get("current_pid")
+
+    if lock_owner_pid is not None and not _pid_is_alive(int(lock_owner_pid)):
+        logging.getLogger(__name__).warning(
+            "[AuthGate] Ignoring stale kernel lock owner pid=%s for %s",
+            lock_owner_pid,
+            action,
+        )
+        lock_owner_pid = None
+
+    if lock_owner_pid is None:
+        if allow_when_no_kernel_lock:
+            return True
+        logging.getLogger(__name__).warning(
+            "[AuthGate] BLOCKED %s -- no kernel lock owner (strict standalone disallowed)",
+            action,
+        )
+        return False
+
+    if check_supervisor_authority(
+        action,
+        allow_bootstrap_owner=allow_bootstrap_owner,
+    ):
+        return True
+
+    logging.getLogger(__name__).warning(
+        "[AuthGate] BLOCKED %s -- single-authority fence denied "
+        "(lock_owner_pid=%s current_pid=%s granted=%s epoch=%s)",
+        action,
+        lock_owner_pid,
+        current_pid,
+        state.get("granted"),
         state.get("epoch"),
     )
     return False
@@ -17703,6 +17764,17 @@ echo "=== JARVIS Prime started ==="
         Returns:
             True if restart succeeded, False otherwise
         """
+        if not enforce_single_control_plane_authority(
+            f"restart_service:{service_name}",
+            allow_bootstrap_owner=True,
+            allow_when_no_kernel_lock=True,
+        ):
+            logger.error(
+                "[AuthGate] BLOCKED restart_service for %s - no valid control-plane authority",
+                service_name,
+            )
+            return False
+
         if service_name not in self.processes:
             # v125.0: Lazy registration - try to find the service definition
             # and start it if it's a known service
@@ -21937,6 +22009,16 @@ echo "=== JARVIS Prime started ==="
 
         Returns dict mapping service names to success status.
         """
+        if not enforce_single_control_plane_authority(
+            "start_all_services",
+            allow_bootstrap_owner=True,
+            allow_when_no_kernel_lock=True,
+        ):
+            logger.error(
+                "[AuthGate] BLOCKED start_all_services - no valid control-plane authority"
+            )
+            return {"auth_gate_blocked": False}
+
         self._running = True
 
         # =========================================================================
@@ -22852,6 +22934,13 @@ async def probe_reactor_core() -> bool:
 
 async def start_all_repos() -> Dict[str, bool]:
     """Legacy: Start all repos with orchestration."""
+    if not enforce_single_control_plane_authority(
+        "start_all_repos",
+        allow_bootstrap_owner=True,
+        allow_when_no_kernel_lock=True,
+    ):
+        logger.error("[AuthGate] BLOCKED legacy start_all_repos call")
+        return {"auth_gate_blocked": False}
     orchestrator = get_orchestrator()
     return await orchestrator.start_all_services()
 
@@ -22878,6 +22967,17 @@ async def initialize_cross_repo_orchestration() -> None:
     6. Start neural mesh bridge (registers repos as mesh agents)
     7. Initialize advanced training coordinator (if Reactor-Core available)
     """
+    if not enforce_single_control_plane_authority(
+        "initialize_cross_repo_orchestration",
+        allow_bootstrap_owner=True,
+        allow_when_no_kernel_lock=True,
+    ):
+        logger.error(
+            "[AuthGate] BLOCKED initialize_cross_repo_orchestration - "
+            "kernel authority not established"
+        )
+        return
+
     integration_results: Dict[str, bool] = {
         "state_initializer": False,
         "orchestrator": False,
@@ -23131,6 +23231,7 @@ __all__ = [
     "ServiceStatus",
     "OrchestratorConfig",
     "get_orchestrator",
+    "enforce_single_control_plane_authority",
     "create_restart_function",
     "register_restart_commands_with_mesh",
     "start_all_repos",

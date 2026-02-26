@@ -81,6 +81,37 @@ import threading
 logger = logging.getLogger(__name__)
 
 
+def _require_legacy_orchestrator_authority(action: str) -> None:
+    """
+    Hard-disable deprecated startup authority unless explicitly re-enabled.
+    """
+    enabled = os.environ.get(
+        "JARVIS_ALLOW_DEPRECATED_STARTUP_ORCHESTRATORS",
+        "false",
+    ).lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        raise RuntimeError(
+            "Deprecated startup orchestrator is disabled. "
+            "Use unified_supervisor.py control plane."
+        )
+
+    try:
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            enforce_single_control_plane_authority,
+        )
+    except Exception:
+        return
+
+    if not enforce_single_control_plane_authority(
+        action,
+        allow_bootstrap_owner=True,
+        allow_when_no_kernel_lock=True,
+    ):
+        raise RuntimeError(
+            f"Control-plane authority required for deprecated action: {action}"
+        )
+
+
 # =============================================================================
 # CONFIGURATION - Environment Driven
 # =============================================================================
@@ -520,9 +551,11 @@ class IntelligentStartupOrchestrator:
     async def run_startup_sequence(self):
         """
         Run the full startup sequence with parallel initialization.
-        
+
         This should be called from the FastAPI lifespan.
         """
+        _require_legacy_orchestrator_authority("deprecated_intelligent_startup")
+
         self._started_at = datetime.now()
         self._start_time = time.time()
         
@@ -600,6 +633,8 @@ class IntelligentStartupOrchestrator:
     
     async def shutdown(self):
         """Cleanup on shutdown."""
+        _require_legacy_orchestrator_authority("deprecated_intelligent_shutdown")
+
         for task in self._background_tasks:
             if not task.done():
                 task.cancel()
@@ -685,4 +720,3 @@ async def health_ready_progressive():
     """
     orchestrator = get_startup_orchestrator()
     return orchestrator.get_health_response()
-

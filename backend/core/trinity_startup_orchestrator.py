@@ -80,6 +80,37 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _require_legacy_orchestrator_authority(action: str) -> None:
+    """
+    Hard-disable deprecated startup authority unless explicitly re-enabled.
+    """
+    enabled = os.environ.get(
+        "JARVIS_ALLOW_DEPRECATED_STARTUP_ORCHESTRATORS",
+        "false",
+    ).lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        raise RuntimeError(
+            "Deprecated startup orchestrator is disabled. "
+            "Use unified_supervisor.py control plane."
+        )
+
+    try:
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            enforce_single_control_plane_authority,
+        )
+    except Exception:
+        return
+
+    if not enforce_single_control_plane_authority(
+        action,
+        allow_bootstrap_owner=True,
+        allow_when_no_kernel_lock=True,
+    ):
+        raise RuntimeError(
+            f"Control-plane authority required for deprecated action: {action}"
+        )
+
+
 # =============================================================================
 # IMPORTS FROM UNIFIED CONFIG
 # =============================================================================
@@ -280,6 +311,8 @@ class TrinityStartupOrchestrator:
         Returns:
             True if all required components started successfully
         """
+        _require_legacy_orchestrator_authority("deprecated_trinity_start")
+
         self.logger.info("=" * 60)
         self.logger.info("TRINITY STARTUP ORCHESTRATOR v79.0")
         self.logger.info("=" * 60)
@@ -637,6 +670,8 @@ class TrinityStartupOrchestrator:
 
     async def stop_trinity_ecosystem(self) -> None:
         """Stop all Trinity components gracefully."""
+        _require_legacy_orchestrator_authority("deprecated_trinity_stop")
+
         self.logger.info("[Trinity] Stopping Trinity ecosystem...")
 
         # Signal shutdown
@@ -706,11 +741,13 @@ def get_trinity_orchestrator() -> TrinityStartupOrchestrator:
 
 async def start_trinity() -> bool:
     """Convenience function to start Trinity ecosystem."""
+    _require_legacy_orchestrator_authority("deprecated_trinity_start_wrapper")
     orchestrator = get_trinity_orchestrator()
     return await orchestrator.start_trinity_ecosystem()
 
 
 async def stop_trinity() -> None:
     """Convenience function to stop Trinity ecosystem."""
+    _require_legacy_orchestrator_authority("deprecated_trinity_stop_wrapper")
     if _orchestrator:
         await _orchestrator.stop_trinity_ecosystem()
