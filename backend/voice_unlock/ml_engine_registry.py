@@ -880,51 +880,23 @@ class ECAPATDNNWrapper(MLEngineWrapper):
         logger.info(f"   [{self.name}] Importing SpeechBrain...")
 
         def _load_sync():
-            # v271.2: CRITICAL — Import speechbrain_engine FIRST to apply meta tensor
-            # patches before using EncoderClassifier. Without this, PyTorch 2.8+
-            # creates models with meta tensors and .to() fails with:
-            #   "Cannot copy out of meta tensor; no data!"
-            # The patches in speechbrain_engine.py monkey-patch Pretrained.__init__
-            # to use .to_empty() and load_state_dict(assign=True).
+            # v271.3: Route through centralized safe loader (meta tensor protection).
+            # Replaces v271.2's manual dual-import + conditional wrapping with the
+            # canonical safe_from_hparams() which ensures patches + recovery in one call.
             try:
-                from voice.engines.speechbrain_engine import (  # noqa: F401
-                    _clean_pytorch_dispatch_for_load,
-                    _load_with_meta_tensor_recovery,
-                )
-                _patches_available = True
+                from voice.engines.speechbrain_engine import safe_from_hparams
             except ImportError:
-                try:
-                    from backend.voice.engines.speechbrain_engine import (  # noqa: F401
-                        _clean_pytorch_dispatch_for_load,
-                        _load_with_meta_tensor_recovery,
-                    )
-                    _patches_available = True
-                except ImportError:
-                    logger.warning(
-                        f"   [{self.name}] v271.2: speechbrain_engine patches not available "
-                        "— meta tensor errors may occur on PyTorch 2.8+"
-                    )
-                    _patches_available = False
-
-            from speechbrain.inference.speaker import EncoderClassifier
-
-            # Force CPU for speaker encoder (MPS doesn't support FFT)
-            run_opts = {"device": "cpu"}
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
 
             logger.info(f"   [{self.name}] Loading from: speechbrain/spkrec-ecapa-voxceleb")
 
-            def _do_load():
-                return EncoderClassifier.from_hparams(
-                    source="speechbrain/spkrec-ecapa-voxceleb",
-                    savedir=str(cache_dir),
-                    run_opts=run_opts,
-                )
-
-            # v271.2: Use meta tensor recovery wrapper when patches are available
-            if _patches_available:
-                model = _load_with_meta_tensor_recovery(_do_load, "ecapa_tdnn")
-            else:
-                model = _do_load()
+            model = safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="ecapa_tdnn",
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=str(cache_dir),
+                run_opts={"device": "cpu"},
+            )
 
             return model
 
@@ -1044,45 +1016,28 @@ class SpeechBrainSTTWrapper(MLEngineWrapper):
         is_apple_silicon = platform.machine() == 'arm64' and sys.platform == 'darwin'
 
         def _load_sync():
-            # v271.2: Import speechbrain_engine FIRST to apply meta tensor patches
-            _patches_available = False
+            # v271.3: Route through centralized safe loader (meta tensor protection)
             try:
-                from voice.engines.speechbrain_engine import (  # noqa: F401
-                    _load_with_meta_tensor_recovery,
-                )
-                _patches_available = True
+                from voice.engines.speechbrain_engine import safe_from_hparams
             except ImportError:
-                try:
-                    from backend.voice.engines.speechbrain_engine import (  # noqa: F401
-                        _load_with_meta_tensor_recovery,
-                    )
-                    _patches_available = True
-                except ImportError:
-                    pass
-
-            from speechbrain.inference.ASR import EncoderDecoderASR
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
 
             cache_dir = MLConfig.CACHE_DIR / "speechbrain" / "speechbrain-wav2vec2"
             cache_dir.mkdir(parents=True, exist_ok=True)
 
             # Use MPS on Apple Silicon, CPU otherwise
             device = "mps" if is_apple_silicon and torch.backends.mps.is_available() else "cpu"
-            run_opts = {"device": device}
 
             logger.info(f"   [{self.name}] Loading from: speechbrain/asr-wav2vec2-commonvoice-en")
             logger.info(f"   [{self.name}] Device: {device}")
 
-            def _do_load():
-                return EncoderDecoderASR.from_hparams(
-                    source="speechbrain/asr-wav2vec2-commonvoice-en",
-                    savedir=str(cache_dir),
-                    run_opts=run_opts,
-                )
-
-            if _patches_available:
-                model = _load_with_meta_tensor_recovery(_do_load, "wav2vec2_stt")
-            else:
-                model = _do_load()
+            model = safe_from_hparams(
+                "speechbrain.inference.ASR.EncoderDecoderASR",
+                model_name="wav2vec2_stt",
+                source="speechbrain/asr-wav2vec2-commonvoice-en",
+                savedir=str(cache_dir),
+                run_opts={"device": device},
+            )
 
             return model
 
