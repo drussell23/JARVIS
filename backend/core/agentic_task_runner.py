@@ -725,9 +725,38 @@ class AgenticTaskRunner:
     async def initialize(self) -> bool:
         """
         Initialize all available components.
-        
+
         v2.0.0: Enhanced with individual component timeouts to prevent
         cascade failures when network services are unavailable.
+
+        v3.0.0 (v271.0): ROOT CAUSE FIX — Dependency-aware concurrent init.
+        Previously, 26 optional components were initialized SEQUENTIALLY,
+        each with 10-20s timeouts. When >= 6 network-dependent components
+        were unavailable, sequential timeout accumulation (6 × 10s = 60s)
+        exceeded the outer 60s deadline → "AgenticTaskRunner creation
+        timed out".
+
+        Fix: Components are grouped by dependency chains and initialized
+        concurrently via asyncio.gather(). Independent components run in
+        parallel, bounded by a semaphore to prevent thundering herd.
+        Total init time = MAX(group durations) ≈ 20s instead of
+        SUM(all timeouts) ≈ 260s.
+
+        Dependency DAG:
+          Phase 1 (sequential, required):
+            Computer Use Tool → Direct Connector (fallback)
+
+          Phase 2 (concurrent, optional — bounded by semaphore):
+            Group A: UAE chain (init → start → enhanced)
+            Group B: Neural Mesh chain (coordinator → bridge → deep)
+            Independent: Autonomous Agent, Watchdog, Voice Auth,
+                         Tool Registry, Memory Manager, Phase Manager,
+                         Error Recovery, UAE Context, Intervention,
+                         JARVIS Prime, Reactor-Core, Vision Cognitive,
+                         Vision-Safety, Cognitive Architecture
+
+          Phase 3 (sequential, sync-only):
+            Safe Code Executor, SOP Enforcer
 
         Returns:
             True if initialization successful
@@ -735,13 +764,26 @@ class AgenticTaskRunner:
         if self._initialized:
             return True
 
-        self.logger.info("[AgenticRunner] Initializing...")
-        
+        self.logger.info("[AgenticRunner] Initializing (v3.0 concurrent)...")
+
         # v2.0.0: Component initialization timeout (prevents single component from blocking all)
         COMPONENT_TIMEOUT = 10.0  # 10 seconds max per component
 
+        # v3.0.0: Bounded concurrency — limits parallel init to prevent
+        # thundering herd on shared resources (DB pools, cloud clients).
+        _max_concurrent = int(os.environ.get("JARVIS_RUNNER_MAX_CONCURRENT_INIT", "6"))
+        _init_semaphore = asyncio.Semaphore(_max_concurrent)
+
+        async def _bounded(coro):
+            """Run coroutine under semaphore to bound concurrency."""
+            async with _init_semaphore:
+                return await coro
+
         try:
-            # Initialize Computer Use Tool (required)
+            # =============================================================
+            # PHASE 1: Required execution capabilities (sequential, fast)
+            # These are sync factory calls — no timeout needed.
+            # =============================================================
             if self._availability.get("computer_use_tool"):
                 try:
                     from autonomy.computer_use_tool import get_computer_use_tool
@@ -752,7 +794,6 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.warning(f"[AgenticRunner] ✗ Computer Use Tool: {e}")
 
-            # Initialize Direct Connector (fallback)
             if self._availability.get("direct_connector") and not self._computer_use_tool:
                 try:
                     from autonomy.claude_computer_use_connector import get_computer_use_connector
@@ -763,27 +804,29 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.warning(f"[AgenticRunner] ✗ Direct Connector: {e}")
 
-            # Initialize UAE (optional) - connects to intelligence.uae_integration
-            # Uses lazy initialization pattern: if UAE not yet initialized, initialize it now
-            # v2.0.0: Added timeout protection for network-dependent operations
-            if self._availability.get("uae") and self.config.uae_enabled:
+            # =============================================================
+            # PHASE 2: Optional components — CONCURRENT, dependency-aware
+            # =============================================================
+            # Each component/group is wrapped in an async function that
+            # handles its own exceptions internally. asyncio.gather runs
+            # them concurrently, bounded by semaphore.
+
+            # ----- Group A: UAE chain (internal sequential dependency) ----
+            async def _init_uae_group():
+                if not (self._availability.get("uae") and self.config.uae_enabled):
+                    return
                 try:
-                    # Try the new intelligence module path first
                     from intelligence.uae_integration import (
                         get_uae,
                         get_enhanced_uae,
                         initialize_uae,
-                        is_uae_initialized,  # Proper check function (not private variable)
+                        is_uae_initialized,
                     )
 
-                    # Lazy initialization: if UAE hasn't been initialized yet, do it now
-                    # This ensures UAE is available regardless of startup order
                     if not is_uae_initialized():
                         self.logger.info("[AgenticRunner] UAE not yet initialized - performing lazy initialization...")
                         try:
-                            # Create voice callback using Trinity Voice Coordinator
                             async def _voice_callback(text: str):
-                                """Voice callback for proactive suggestions via Trinity Voice Coordinator."""
                                 try:
                                     from core.trinity_voice_coordinator import get_voice_coordinator, VoiceContext
                                     coordinator = await get_voice_coordinator()
@@ -793,16 +836,13 @@ class AgenticTaskRunner:
                                 except Exception as e:
                                     self.logger.debug(f"[AgenticRunner-Voice] Error: {e}")
 
-                            # Create notification callback
                             async def _notification_callback(title: str, message: str, priority: str = "low"):
-                                """Notification callback for proactive suggestions."""
                                 self.logger.info(f"[AgenticRunner-Notify] [{priority.upper()}] {title}: {message}")
 
-                            # v2.0.0: Use timeout-protected initialization
                             await self._init_component_with_timeout(
                                 "UAE lazy init",
                                 initialize_uae(
-                                    vision_analyzer=None,  # Will be connected later if needed
+                                    vision_analyzer=None,
                                     sai_monitoring_interval=5.0,
                                     enable_auto_start=True,
                                     enable_learning_db=True,
@@ -820,10 +860,8 @@ class AgenticTaskRunner:
                         except Exception as init_err:
                             self.logger.debug(f"[AgenticRunner] UAE lazy initialization failed: {init_err}")
 
-                    # Now get the initialized UAE instances (silent=True to avoid redundant warnings)
                     self._uae = get_uae(silent=True)
                     if self._uae and not self._uae.is_active:
-                        # v2.0.0: Timeout-protected UAE start
                         await self._init_component_with_timeout(
                             "UAE start",
                             self._uae.start(),
@@ -831,7 +869,6 @@ class AgenticTaskRunner:
                             critical=False,
                         )
 
-                    # Also get enhanced UAE for chain-of-thought reasoning
                     self._enhanced_uae = get_enhanced_uae(silent=True)
 
                     if self._uae:
@@ -841,7 +878,6 @@ class AgenticTaskRunner:
                     else:
                         self.logger.debug("[AgenticRunner] UAE initialization returned None")
                 except ImportError:
-                    # Fallback to legacy path
                     try:
                         from unified_awareness.uae_core import get_uae_engine
                         self._uae = get_uae_engine()
@@ -853,11 +889,11 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ UAE: {e}")
 
-            # Initialize Neural Mesh (optional)
-            # v2.0.0: Added timeout protection for network-dependent operations
-            if self._availability.get("neural_mesh") and self.config.neural_mesh_enabled:
+            # ----- Group B: Neural Mesh chain (internal sequential) -------
+            async def _init_neural_mesh_group():
+                if not (self._availability.get("neural_mesh") and self.config.neural_mesh_enabled):
+                    return
                 try:
-                    # v9.4: Try production Neural Mesh first (with coordinator and bridge)
                     if self.config.neural_mesh_production:
                         try:
                             from neural_mesh.neural_mesh_coordinator import (
@@ -871,7 +907,6 @@ class AgenticTaskRunner:
                                 JARVISNeuralMeshBridge,
                             )
 
-                            # v2.0.0: Timeout-protected coordinator init
                             self._neural_mesh_coordinator = await self._init_component_with_timeout(
                                 "Neural Mesh get",
                                 get_neural_mesh(),
@@ -886,13 +921,11 @@ class AgenticTaskRunner:
                                     critical=False,
                                 )
 
-                            # Also use basic reference for compatibility
                             self._neural_mesh = self._neural_mesh_coordinator
 
                             if self._neural_mesh_coordinator:
                                 self.logger.info("[AgenticRunner] ✓ Neural Mesh Coordinator (production)")
 
-                            # Initialize JARVIS Bridge for cross-system tasks
                             if self.config.neural_mesh_use_bridge:
                                 try:
                                     self._neural_mesh_bridge = await self._init_component_with_timeout(
@@ -924,7 +957,6 @@ class AgenticTaskRunner:
 
                         except ImportError as ie:
                             self.logger.debug(f"[AgenticRunner] Production Neural Mesh not available: {ie}")
-                            # Fallback to basic start_neural_mesh
                             from neural_mesh.neural_mesh_coordinator import start_neural_mesh
                             self._neural_mesh = await self._init_component_with_timeout(
                                 "Neural Mesh basic",
@@ -935,7 +967,6 @@ class AgenticTaskRunner:
                             if self._neural_mesh:
                                 self.logger.info("[AgenticRunner] ✓ Neural Mesh (basic)")
                     else:
-                        # Basic Neural Mesh
                         from neural_mesh.neural_mesh_coordinator import start_neural_mesh
                         self._neural_mesh = await self._init_component_with_timeout(
                             "Neural Mesh basic",
@@ -946,7 +977,6 @@ class AgenticTaskRunner:
                         if self._neural_mesh:
                             self.logger.info("[AgenticRunner] ✓ Neural Mesh")
 
-                    # Deep Integration: Setup pattern subscription
                     if self.config.neural_mesh_deep_enabled and self._neural_mesh:
                         await self._init_component_with_timeout(
                             "Neural Mesh deep integration",
@@ -955,7 +985,6 @@ class AgenticTaskRunner:
                             critical=False,
                         )
 
-                    # v9.4: Setup production integrations
                     if self._nm_production_active:
                         await self._init_component_with_timeout(
                             "Neural Mesh production integration",
@@ -967,9 +996,11 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Neural Mesh: {e}")
 
-            # Initialize Autonomous Agent (optional)
-            # v2.0.0: Added timeout protection
-            if self._availability.get("autonomous_agent"):
+            # ----- Independent components (each in own async function) ----
+
+            async def _init_autonomous_agent():
+                if not self._availability.get("autonomous_agent"):
+                    return
                 try:
                     from autonomy.autonomous_agent import (
                         AutonomousAgent, AgentConfig, AgentMode, AgentPersonality
@@ -989,9 +1020,9 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Autonomous Agent: {e}")
 
-            # Initialize Watchdog if not provided externally
-            # v2.0.0: Added timeout protection
-            if not self._watchdog and self._availability.get("watchdog") and self.config.watchdog_integration:
+            async def _init_watchdog_internal():
+                if self._watchdog or not self._availability.get("watchdog") or not self.config.watchdog_integration:
+                    return
                 try:
                     from core.agentic_watchdog import start_watchdog
                     self._watchdog = await self._init_component_with_timeout(
@@ -1006,9 +1037,9 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Watchdog: {e}")
 
-            # Initialize Voice Authentication Layer (v5.0)
-            # v2.0.0: Added timeout protection
-            if self._availability.get("voice_auth_layer") and self.config.voice_auth_enabled:
+            async def _init_voice_auth():
+                if not (self._availability.get("voice_auth_layer") and self.config.voice_auth_enabled):
+                    return
                 try:
                     from core.voice_authentication_layer import start_voice_auth_layer
                     self._voice_auth_layer = await self._init_component_with_timeout(
@@ -1025,13 +1056,9 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Voice Auth Layer: {e}")
 
-            # =================================================================
-            # Initialize Autonomy Components (v6.0)
-            # v2.0.0: All async operations wrapped with timeout protection
-            # =================================================================
-
-            # Initialize Tool Registry (before phase manager - tools needed for phases)
-            if self._availability.get("tool_registry") and self.config.tool_registry_enabled:
+            async def _init_tool_registry():
+                if not (self._availability.get("tool_registry") and self.config.tool_registry_enabled):
+                    return
                 try:
                     from autonomy.unified_tool_registry import start_tool_registry
                     self._tool_registry = await self._init_component_with_timeout(
@@ -1045,8 +1072,9 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Tool Registry: {e}")
 
-            # Initialize Memory Manager (before phase manager - memory for context)
-            if self._availability.get("memory_manager") and self.config.memory_manager_enabled:
+            async def _init_memory_manager():
+                if not (self._availability.get("memory_manager") and self.config.memory_manager_enabled):
+                    return
                 try:
                     from autonomy.unified_memory_manager import start_memory_manager
                     self._memory_manager = await self._init_component_with_timeout(
@@ -1060,8 +1088,9 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Memory Manager: {e}")
 
-            # Initialize Phase Manager (core execution orchestration)
-            if self._availability.get("phase_manager") and self.config.phase_manager_enabled:
+            async def _init_phase_manager():
+                if not (self._availability.get("phase_manager") and self.config.phase_manager_enabled):
+                    return
                 try:
                     from autonomy.langgraph_phase_manager import start_phase_manager
                     self._phase_manager = await self._init_component_with_timeout(
@@ -1075,8 +1104,9 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Phase Manager: {e}")
 
-            # Initialize Error Recovery Orchestrator (wraps execution)
-            if self._availability.get("error_recovery") and self.config.error_recovery_enabled:
+            async def _init_error_recovery():
+                if not (self._availability.get("error_recovery") and self.config.error_recovery_enabled):
+                    return
                 try:
                     from autonomy.error_recovery_orchestrator import start_error_recovery
                     self._error_recovery = await self._init_component_with_timeout(
@@ -1085,15 +1115,15 @@ class AgenticTaskRunner:
                         timeout=COMPONENT_TIMEOUT,
                         critical=False,
                     )
-                    # Register component reset handlers
                     if self._error_recovery:
                         self._register_error_recovery_handlers()
                         self.logger.info("[AgenticRunner] ✓ Error Recovery")
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Error Recovery: {e}")
 
-            # Initialize UAE Context Manager (continuous screen monitoring)
-            if self._availability.get("uae_context") and self.config.uae_context_enabled:
+            async def _init_uae_context():
+                if not (self._availability.get("uae_context") and self.config.uae_context_enabled):
+                    return
                 try:
                     from autonomy.uae_context_manager import start_uae_context
                     self._uae_context = await self._init_component_with_timeout(
@@ -1107,8 +1137,9 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ UAE Context Manager: {e}")
 
-            # Initialize Intervention Orchestrator (proactive assistance)
-            if self._availability.get("intervention") and self.config.intervention_enabled:
+            async def _init_intervention():
+                if not (self._availability.get("intervention") and self.config.intervention_enabled):
+                    return
                 try:
                     from autonomy.intervention_orchestrator import start_intervention_orchestrator
                     self._intervention = await self._init_component_with_timeout(
@@ -1122,26 +1153,24 @@ class AgenticTaskRunner:
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ Intervention Orchestrator: {e}")
 
-            # Initialize JARVIS Prime Client (Tier-0 Brain)
-            # v2.0.0: Critical component with longer timeout for network operations
-            if self.config.jarvis_prime_enabled:
+            async def _init_jarvis_prime():
+                if not self.config.jarvis_prime_enabled:
+                    return
                 try:
                     await self._init_component_with_timeout(
                         "JARVIS Prime Client",
                         self._initialize_jarvis_prime_client(),
-                        timeout=COMPONENT_TIMEOUT * 2,  # Double timeout for network-heavy init
-                        critical=True,  # Log as warning if fails
+                        timeout=COMPONENT_TIMEOUT * 2,
+                        critical=True,
                     )
                     if hasattr(self, '_jarvis_prime_client') and self._jarvis_prime_client:
                         self.logger.info("[AgenticRunner] ✓ JARVIS Prime Client")
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ JARVIS Prime Client: {e}")
 
-            # =================================================================
-            # Initialize Reactor-Core Client (v10.0 - "Ignition Key")
-            # v2.0.0: Added timeout protection for network operations
-            # =================================================================
-            if self.config.reactor_core_enabled:
+            async def _init_reactor_core():
+                if not self.config.reactor_core_enabled:
+                    return
                 try:
                     from backend.clients.reactor_core_client import (
                         ReactorCoreClient,
@@ -1154,17 +1183,15 @@ class AgenticTaskRunner:
                         min_trigger_interval_hours=self.config.reactor_core_min_trigger_interval_hours,
                     )
                     self._reactor_core_client = ReactorCoreClient(reactor_config)
-                    
-                    # v2.0.0: Timeout-protected network initialization
+
                     init_result = await self._init_component_with_timeout(
                         "Reactor-Core Client",
                         self._reactor_core_client.initialize(),
-                        timeout=COMPONENT_TIMEOUT * 2,  # Double timeout for network ops
+                        timeout=COMPONENT_TIMEOUT * 2,
                         critical=True,
                     )
 
                     if init_result is not None:
-                        # Register event callbacks
                         self._reactor_core_client.on_training_completed(self._on_training_completed)
                         self._reactor_core_client.on_training_failed(self._on_training_failed)
 
@@ -1178,11 +1205,9 @@ class AgenticTaskRunner:
                     self.logger.warning(f"[AgenticRunner] ✗ Reactor-Core Client: {e}")
                     self._reactor_core_client = None
 
-            # =================================================================
-            # Initialize Vision Cognitive Loop (v10.2 - "Eyes of JARVIS")
-            # v2.0.0: Added timeout protection
-            # =================================================================
-            if self._availability.get("vision_cognitive_loop") and self.config.vision_cognitive_loop_enabled:
+            async def _init_vision_cognitive():
+                if not (self._availability.get("vision_cognitive_loop") and self.config.vision_cognitive_loop_enabled):
+                    return
                 try:
                     from core.vision_cognitive_loop import (
                         VisionCognitiveLoop,
@@ -1191,13 +1216,11 @@ class AgenticTaskRunner:
                     )
                     self._vision_cognitive_loop = get_vision_cognitive_loop()
 
-                    # Configure based on settings
                     self._vision_cognitive_loop.verification_timeout_ms = (
                         self.config.vision_verification_timeout_ms
                     )
                     self._vision_cognitive_loop.max_retries = self.config.vision_max_retries
 
-                    # Initialize (loads vision components) - with timeout protection
                     self._vision_loop_initialized = await self._init_component_with_timeout(
                         "Vision Cognitive Loop",
                         self._vision_cognitive_loop.initialize(),
@@ -1219,11 +1242,9 @@ class AgenticTaskRunner:
                     self._vision_cognitive_loop = None
                     self._vision_loop_initialized = False
 
-            # =================================================================
-            # Initialize Vision-Safety Integration (v10.3 - "Safety Certificate")
-            # v2.0.0: Added timeout protection
-            # =================================================================
-            if self._availability.get("vision_safety") and self.config.safety_integration_enabled:
+            async def _init_vision_safety():
+                if not (self._availability.get("vision_safety") and self.config.safety_integration_enabled):
+                    return
                 try:
                     from core.vision_safety_integration import (
                         VisionSafetyIntegration,
@@ -1231,7 +1252,6 @@ class AgenticTaskRunner:
                         initialize_vision_safety,
                     )
 
-                    # Build safety config from runner config
                     safety_config = VisionSafetyConfig()
                     safety_config.dead_man_switch_enabled = self.config.dead_man_switch_enabled
                     safety_config.safety_audit_enabled = self.config.safety_audit_enabled
@@ -1239,7 +1259,6 @@ class AgenticTaskRunner:
                     safety_config.auto_confirm_green = self.config.auto_confirm_safe_actions
                     safety_config.confirmation_timeout_seconds = self.config.confirmation_timeout_seconds
 
-                    # Initialize with TTS and watchdog - with timeout protection
                     self._vision_safety = await self._init_component_with_timeout(
                         "Vision-Safety Integration",
                         initialize_vision_safety(
@@ -1250,7 +1269,7 @@ class AgenticTaskRunner:
                         timeout=COMPONENT_TIMEOUT,
                         critical=False,
                     )
-                    
+
                     if self._vision_safety:
                         self._safety_initialized = True
                         status = self._vision_safety.get_status()
@@ -1265,6 +1284,92 @@ class AgenticTaskRunner:
                     self._vision_safety = None
                     self._safety_initialized = False
 
+            async def _init_cognitive_architecture():
+                if not (
+                    self._availability.get("cognitive_architecture")
+                    and self.config.cognitive_architecture_enabled
+                ):
+                    return
+                try:
+                    from core.cognitive_architecture import (
+                        CognitiveSystem,
+                        get_cognitive_system,
+                    )
+
+                    self._cognitive_system = await self._init_component_with_timeout(
+                        "Cognitive Architecture",
+                        get_cognitive_system(),
+                        timeout=COMPONENT_TIMEOUT,
+                        critical=False,
+                    )
+
+                    if self._cognitive_system:
+                        self._cognitive_initialized = True
+
+                        capabilities = []
+                        if self.config.cognitive_causal_reasoning:
+                            capabilities.append("Causal")
+                        if self.config.cognitive_world_model:
+                            capabilities.append("WorldModel")
+                        if self.config.cognitive_theory_of_mind:
+                            capabilities.append("ToM")
+                        if self.config.cognitive_abstract_reasoning:
+                            capabilities.append("Abstract")
+                        if self.config.cognitive_planning:
+                            capabilities.append("Planning")
+                        if self.config.cognitive_ethics:
+                            capabilities.append("Ethics")
+
+                        self.logger.info(
+                            f"[AgenticRunner] ✓ Cognitive Architecture "
+                            f"({len(capabilities)} modules: {', '.join(capabilities)})"
+                        )
+                except ImportError:
+                    self.logger.debug("[AgenticRunner] ✗ Cognitive Architecture: module not available")
+                    self._cognitive_system = None
+                    self._cognitive_initialized = False
+                except Exception as e:
+                    self.logger.debug(f"[AgenticRunner] ✗ Cognitive Architecture: {e}")
+                    self._cognitive_system = None
+                    self._cognitive_initialized = False
+
+            # ----- Execute all groups/components concurrently -------------
+            _init_t0 = time.time()
+            _results = await asyncio.gather(
+                _bounded(_init_uae_group()),
+                _bounded(_init_neural_mesh_group()),
+                _bounded(_init_autonomous_agent()),
+                _bounded(_init_watchdog_internal()),
+                _bounded(_init_voice_auth()),
+                _bounded(_init_tool_registry()),
+                _bounded(_init_memory_manager()),
+                _bounded(_init_phase_manager()),
+                _bounded(_init_error_recovery()),
+                _bounded(_init_uae_context()),
+                _bounded(_init_intervention()),
+                _bounded(_init_jarvis_prime()),
+                _bounded(_init_reactor_core()),
+                _bounded(_init_vision_cognitive()),
+                _bounded(_init_vision_safety()),
+                _bounded(_init_cognitive_architecture()),
+                return_exceptions=True,
+            )
+            _init_elapsed = time.time() - _init_t0
+
+            # Log any unexpected exceptions from gather (not from _init_component_with_timeout)
+            for _i, _r in enumerate(_results):
+                if isinstance(_r, BaseException):
+                    self.logger.debug(f"[AgenticRunner] Concurrent init slot {_i} exception: {_r}")
+
+            self.logger.info(
+                f"[AgenticRunner] Concurrent init completed in {_init_elapsed:.1f}s "
+                f"({len(_results)} groups, max_concurrent={_max_concurrent})"
+            )
+
+            # =============================================================
+            # PHASE 3: Sync-only components (fast, no timeout needed)
+            # =============================================================
+
             # Initialize Safe Code Executor (v6.0 - Open Interpreter pattern)
             if self.config.safe_code_enabled:
                 try:
@@ -1274,7 +1379,6 @@ class AgenticTaskRunner:
                     )
 
                     cu_config = ComputerUseConfig()
-                    # Override with agentic runner config values
                     cu_config.sandbox_max_cpu_time_sec = self.config.safe_code_timeout_sec
                     cu_config.sandbox_max_memory_mb = self.config.safe_code_max_memory_mb
 
@@ -1319,58 +1423,6 @@ class AgenticTaskRunner:
                     self.logger.debug("[AgenticRunner] ✗ SOP Enforcer: module not available")
                 except Exception as e:
                     self.logger.debug(f"[AgenticRunner] ✗ SOP Enforcer: {e}")
-
-            # =================================================================
-            # Initialize Cognitive Architecture (v12.0 - "AGI Reasoning Core")
-            # v2.0.0: Added timeout protection
-            # =================================================================
-            if (
-                self._availability.get("cognitive_architecture")
-                and self.config.cognitive_architecture_enabled
-            ):
-                try:
-                    from core.cognitive_architecture import (
-                        CognitiveSystem,
-                        get_cognitive_system,
-                    )
-
-                    self._cognitive_system = await self._init_component_with_timeout(
-                        "Cognitive Architecture",
-                        get_cognitive_system(),
-                        timeout=COMPONENT_TIMEOUT,
-                        critical=False,
-                    )
-                    
-                    if self._cognitive_system:
-                        self._cognitive_initialized = True
-
-                        # Log enabled capabilities
-                        capabilities = []
-                        if self.config.cognitive_causal_reasoning:
-                            capabilities.append("Causal")
-                        if self.config.cognitive_world_model:
-                            capabilities.append("WorldModel")
-                        if self.config.cognitive_theory_of_mind:
-                            capabilities.append("ToM")
-                        if self.config.cognitive_abstract_reasoning:
-                            capabilities.append("Abstract")
-                        if self.config.cognitive_planning:
-                            capabilities.append("Planning")
-                        if self.config.cognitive_ethics:
-                            capabilities.append("Ethics")
-
-                        self.logger.info(
-                            f"[AgenticRunner] ✓ Cognitive Architecture "
-                            f"({len(capabilities)} modules: {', '.join(capabilities)})"
-                        )
-                except ImportError:
-                    self.logger.debug("[AgenticRunner] ✗ Cognitive Architecture: module not available")
-                    self._cognitive_system = None
-                    self._cognitive_initialized = False
-                except Exception as e:
-                    self.logger.debug(f"[AgenticRunner] ✗ Cognitive Architecture: {e}")
-                    self._cognitive_system = None
-                    self._cognitive_initialized = False
 
             self._initialized = True
             self.logger.info("[AgenticRunner] Initialization complete")
