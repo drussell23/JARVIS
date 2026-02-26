@@ -1225,6 +1225,34 @@ class ProxyLifecycleController:
                 except Exception:
                     pass
 
+            # v271.0: Record Cloud SQL proxy session cost BEFORE clearing state.
+            # This makes proxy runtime visible to budget enforcement so
+            # can_create_vm() sees real total spend, not just VM costs.
+            _proxy_uptime_h = 0.0
+            if self._start_time is not None:
+                _proxy_uptime_h = (time.monotonic() - self._start_time) / 3600.0
+            if _proxy_uptime_h > 0:
+                try:
+                    from backend.core.cost_tracker import (
+                        get_cost_tracker,
+                        CloudServiceType,
+                    )
+                    _ct = get_cost_tracker()
+                    if _ct and _ct._initialized:
+                        await _ct.record_cloud_service_cost(
+                            service_type=CloudServiceType.CLOUD_SQL,
+                            duration_hours=_proxy_uptime_h,
+                            hourly_rate=_ct.config.cloud_sql_hourly_cost,
+                            metadata={
+                                "pid": self._pid,
+                                "graceful": graceful,
+                            },
+                        )
+                except Exception as _cost_err:
+                    logger.debug(
+                        f"[v271.0] Cloud SQL cost recording failed (non-critical): {_cost_err}"
+                    )
+
             self._process = None
             self._pid = None
             self._start_time = None

@@ -3175,11 +3175,11 @@ class MLEngineRegistry:
                             )
                     else:
                         # MemoryQuantizer not available — use MLConfig fallback
-                        use_cloud, avail, reason = MLConfig.check_memory_pressure()
+                        use_cloud, _, _ = MLConfig.check_memory_pressure()
                         can_load = not use_cloud
                 except Exception:
                     # Can't check — use MLConfig fallback
-                    use_cloud, avail, reason = MLConfig.check_memory_pressure()
+                    use_cloud, _, _ = MLConfig.check_memory_pressure()
                     can_load = not use_cloud
 
                 if can_load:

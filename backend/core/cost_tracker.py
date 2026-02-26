@@ -106,6 +106,23 @@ class TriggerReason(Enum):
     SCHEDULED = "SCHEDULED"
 
 
+class CloudServiceType(Enum):
+    """
+    v271.0: Non-VM cloud service cost categories.
+
+    Budget enforcement previously saw ONLY VM compute costs. These categories
+    make Cloud SQL, static IPs, Cloud Run, and API costs visible to the same
+    budget view so policy decisions operate on real total spend.
+    """
+
+    CLOUD_SQL = "cloud_sql"
+    STATIC_IP = "static_ip"
+    CLOUD_RUN = "cloud_run"
+    API_CALL = "api_call"
+    ARTIFACT_STORAGE = "artifact_storage"
+    DATA_TRANSFER = "data_transfer"
+
+
 # ============================================================================
 # CONFIGURATION CLASS
 # ============================================================================
@@ -190,6 +207,27 @@ class CostTrackerConfig:
     )
     cleanup_check_interval_hours: int = field(
         default_factory=lambda: int(os.getenv("CLEANUP_CHECK_INTERVAL_HOURS", "1"))
+    )
+
+    # =========================================================================
+    # v271.0: NON-VM CLOUD SERVICE COST RATES
+    # =========================================================================
+    # These rates make ALL cloud costs visible to budget enforcement.
+    # Without them, can_create_vm() only sees VM compute costs.
+    cloud_sql_hourly_cost: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_CLOUD_SQL_HOURLY_COST", "0.0150"))
+    )
+    static_ip_hourly_cost: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_STATIC_IP_HOURLY_COST", "0.010"))
+    )
+    cloud_run_per_invocation_cost: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_CLOUD_RUN_INVOCATION_COST", "0.0000004"))
+    )
+    # Whether to include non-VM costs in budget enforcement decisions
+    include_cloud_services_in_budget: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_INCLUDE_CLOUD_SERVICES_IN_BUDGET", "true"
+        ).lower() == "true"
     )
 
     # Alert notification configuration
@@ -839,6 +877,33 @@ class CostTracker:
                     """
                     )
 
+                    # v271.0: Non-VM cloud service costs table.
+                    # Budget enforcement previously saw ONLY vm_sessions costs.
+                    # This table tracks Cloud SQL, static IPs, Cloud Run, etc.
+                    # so policy decisions (can_create_vm) operate on real total spend.
+                    await db.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS cloud_service_costs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TEXT NOT NULL,
+                            service_type TEXT NOT NULL,
+                            duration_hours REAL NOT NULL DEFAULT 0.0,
+                            estimated_cost REAL NOT NULL DEFAULT 0.0,
+                            unit_count INTEGER DEFAULT 0,
+                            hourly_rate REAL DEFAULT 0.0,
+                            metadata TEXT
+                        )
+                    """
+                    )
+
+                    # v271.0: Index for fast daily aggregation in budget enforcement
+                    await db.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_cloud_service_costs_timestamp
+                        ON cloud_service_costs(timestamp)
+                    """
+                    )
+
                     await db.commit()
 
                     # Run migrations for existing databases
@@ -1408,6 +1473,146 @@ class CostTracker:
         # v93.6: Clean exit logging
         logger.info("Auto-cleanup loop stopped")
 
+    # ========================================================================
+    # v271.0: Non-VM Cloud Service Cost Tracking
+    # ========================================================================
+
+    async def record_cloud_service_cost(
+        self,
+        service_type: CloudServiceType,
+        duration_hours: float = 0.0,
+        estimated_cost: float = 0.0,
+        unit_count: int = 0,
+        hourly_rate: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record a non-VM cloud service cost entry.
+
+        v271.0: Makes Cloud SQL, static IPs, Cloud Run, and API costs
+        visible to budget enforcement. Without this, can_create_vm()
+        only saw VM compute costs — partial data for policy decisions.
+
+        Args:
+            service_type: Category of cloud service
+            duration_hours: How long the service ran (for hourly-billed services)
+            estimated_cost: Pre-calculated cost (if known)
+            unit_count: Number of units (invocations, requests, etc.)
+            hourly_rate: Rate used for calculation (for audit trail)
+            metadata: Additional context (proxy PID, IP address, etc.)
+        """
+        try:
+            import aiosqlite
+
+            if estimated_cost == 0.0 and duration_hours > 0 and hourly_rate > 0:
+                estimated_cost = duration_hours * hourly_rate
+
+            async with self._db_lock:
+                async with aiosqlite.connect(self.config.db_path) as db:
+                    await db.execute(
+                        """
+                        INSERT INTO cloud_service_costs
+                        (timestamp, service_type, duration_hours, estimated_cost,
+                         unit_count, hourly_rate, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            datetime.utcnow().isoformat(),
+                            service_type.value,
+                            duration_hours,
+                            estimated_cost,
+                            unit_count,
+                            hourly_rate,
+                            json.dumps(metadata or {}),
+                        ),
+                    )
+                    await db.commit()
+
+            # Publish event for real-time dashboard
+            await self._publish_event(
+                REDIS_CHANNEL_COST_UPDATES,
+                {
+                    "type": "cloud_service_cost",
+                    "service": service_type.value,
+                    "cost": estimated_cost,
+                    "duration_hours": duration_hours,
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+            )
+
+        except Exception as e:
+            log_component_failure(
+                "cost-tracker",
+                f"Failed to record {service_type.value} cost",
+                error=e,
+            )
+
+    async def get_cloud_service_costs(self, period: str = "day") -> Dict[str, Any]:
+        """
+        Get aggregated non-VM cloud service costs for a period.
+
+        v271.0: Complements get_cost_summary() which only queries vm_sessions.
+        Budget enforcement needs BOTH to see real total spend.
+
+        Returns:
+            Dict with per-service breakdown and total cloud service cost.
+        """
+        now = datetime.utcnow()
+        period_start = {
+            "day": now - timedelta(days=1),
+            "week": now - timedelta(weeks=1),
+            "month": now - timedelta(days=30),
+            "all": datetime(2000, 1, 1),
+        }.get(period, now - timedelta(days=1))
+
+        try:
+            import aiosqlite
+
+            async with self._db_lock:
+                async with aiosqlite.connect(self.config.db_path) as db:
+                    async with db.execute(
+                        """
+                        SELECT
+                            service_type,
+                            SUM(duration_hours) as total_hours,
+                            SUM(estimated_cost) as total_cost,
+                            SUM(unit_count) as total_units,
+                            COUNT(*) as entry_count
+                        FROM cloud_service_costs
+                        WHERE timestamp >= ?
+                        GROUP BY service_type
+                    """,
+                        (period_start.isoformat(),),
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+
+                        breakdown = {}
+                        total_cost = 0.0
+                        for row in rows:
+                            svc = row[0]
+                            cost = row[2] or 0.0
+                            breakdown[svc] = {
+                                "total_hours": round(row[1] or 0.0, 4),
+                                "total_cost": round(cost, 6),
+                                "total_units": row[3] or 0,
+                                "entry_count": row[4] or 0,
+                            }
+                            total_cost += cost
+
+                        return {
+                            "period": period,
+                            "total_cloud_service_cost": round(total_cost, 6),
+                            "services": breakdown,
+                        }
+
+        except Exception as e:
+            log_component_failure(
+                "cost-tracker",
+                "Failed to get cloud service costs",
+                error=e,
+            )
+            return {"period": period, "total_cloud_service_cost": 0.0, "services": {}}
+
     async def record_routing_decision(
         self,
         local_ram_percent: float,
@@ -1493,26 +1698,57 @@ class CostTracker:
                         row = await cursor.fetchone()
 
                         if row:
-                            total_cost = row[2] or 0.0
+                            vm_cost = row[2] or 0.0
                             total_hours = row[1] or 0.0
                             total_actual = row[3] or 0.0
 
                             regular_cost = total_hours * self.config.regular_vm_hourly_cost
-                            savings = regular_cost - total_cost
+                            savings = regular_cost - vm_cost
 
                             # Calculate cost efficiency score
                             if total_actual > 0:
-                                efficiency = ((total_actual - total_cost) / total_actual) * 100
+                                efficiency = ((total_actual - vm_cost) / total_actual) * 100
                             else:
                                 efficiency = 0.0
 
-                            return {
+                            # v271.0: Include non-VM cloud service costs in total.
+                            # Budget enforcement (can_create_vm) uses total_estimated_cost
+                            # from this method. Without cloud service costs, policy
+                            # decisions operate on partial spend data.
+                            cloud_svc_cost = 0.0
+                            cloud_svc_breakdown = {}
+                            if self.config.include_cloud_services_in_budget:
+                                try:
+                                    async with db.execute(
+                                        """
+                                        SELECT
+                                            service_type,
+                                            SUM(estimated_cost) as svc_cost
+                                        FROM cloud_service_costs
+                                        WHERE timestamp >= ?
+                                        GROUP BY service_type
+                                    """,
+                                        (period_start.isoformat(),),
+                                    ) as svc_cursor:
+                                        svc_rows = await svc_cursor.fetchall()
+                                        for svc_row in svc_rows:
+                                            svc_name = svc_row[0]
+                                            svc_amt = svc_row[1] or 0.0
+                                            cloud_svc_breakdown[svc_name] = round(svc_amt, 6)
+                                            cloud_svc_cost += svc_amt
+                                except Exception:
+                                    pass  # Table may not exist yet (pre-migration)
+
+                            total_cost = vm_cost + cloud_svc_cost
+
+                            result = {
                                 "period": period,
                                 "period_start": period_start.isoformat(),
                                 "period_end": now.isoformat(),
                                 "total_vms_created": row[0] or 0,
                                 "total_runtime_hours": round(total_hours, 2),
                                 "total_estimated_cost": round(total_cost, 4),
+                                "vm_estimated_cost": round(vm_cost, 4),
                                 "total_actual_cost": round(total_actual, 4),
                                 "orphaned_vms_count": row[4] or 0,
                                 "orphaned_vms_cost": round(row[5] or 0.0, 4),
@@ -1528,6 +1764,13 @@ class CostTracker:
                                 "spot_rate": self.config.spot_vm_hourly_cost,
                                 "regular_rate": self.config.regular_vm_hourly_cost,
                             }
+
+                            # v271.0: Include cloud service breakdown when present
+                            if cloud_svc_cost > 0:
+                                result["cloud_service_cost"] = round(cloud_svc_cost, 6)
+                                result["cloud_service_breakdown"] = cloud_svc_breakdown
+
+                            return result
 
             return {}
 
@@ -1897,14 +2140,23 @@ class CostTracker:
         try:
             daily_summary = await self.get_cost_summary("day")
             daily_spent = daily_summary.get("total_estimated_cost", 0.0)
-            
+
             # Include cost of currently running VMs
             for session in self.active_sessions.values():
                 runtime_cost = session.calculate_cost(self.config.spot_vm_hourly_cost)
                 daily_spent += runtime_cost
-            
+
             details["daily_spent"] = round(daily_spent, 4)
             details["daily_remaining"] = round(self.config.alert_threshold_daily - daily_spent, 4)
+
+            # v271.0: Expose VM vs cloud service cost breakdown for observability.
+            # total_estimated_cost now includes cloud service costs (if enabled).
+            vm_cost = daily_summary.get("vm_estimated_cost", daily_summary.get("total_estimated_cost", 0.0))
+            cloud_svc_cost = daily_summary.get("cloud_service_cost", 0.0)
+            details["vm_cost"] = round(vm_cost, 4)
+            details["cloud_service_cost"] = round(cloud_svc_cost, 6)
+            if cloud_svc_cost > 0:
+                details["cloud_service_breakdown"] = daily_summary.get("cloud_service_breakdown", {})
             details["budget_percent_used"] = round(
                 (daily_spent / self.config.alert_threshold_daily * 100) 
                 if self.config.alert_threshold_daily > 0 else 0, 1
