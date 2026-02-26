@@ -81463,6 +81463,8 @@ class JarvisSystemKernel:
         """
         await self._stop_loading_server_heartbeat()
         await self._stop_startup_progress_heartbeat()
+        # v275.0: Close persistent broadcast session
+        await self._close_broadcast_session()
 
         if not hasattr(self, '_loading_server_process') or not self._loading_server_process:
             self._cleanup_loading_server_log()
@@ -83139,20 +83141,37 @@ class JarvisSystemKernel:
             except Exception:
                 pass
 
-        # v205.0: Bounded retries - max 2 attempts, NON-FATAL
+        # v275.0: Bounded retries - max 2 attempts, NON-FATAL.
+        # Primary transport: async aiohttp (no thread scheduling overhead).
+        # Fallback: thread-based urllib (when aiohttp unavailable).
+        #
+        # Root cause of v274.1 60% stall: asyncio.to_thread(urllib.urlopen)
+        # dispatches HTTP POST to a thread pool worker. During Trinity phase,
+        # heavy concurrent operations (whisper, vision, model loading) create
+        # CPU/GIL pressure. Thread doesn't get scheduled within the 2.5s outer
+        # timeout → asyncio.TimeoutError → broadcast silently dropped.
+        # Fix: aiohttp.ClientSession.post() runs in the event loop cooperative
+        # scheduler — no thread scheduling, no GIL contention.
         max_retries = 2
+        _broadcast_url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
 
         for attempt in range(max_retries):
             try:
-                # Run HTTP POST in thread to never block event loop
-                success = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self._sync_broadcast_progress,
-                        progress_data,
-                        timeout
-                    ),
-                    timeout=timeout + 0.5  # Slightly longer outer timeout
-                )
+                # v275.0: Prefer async aiohttp (no thread dispatch overhead)
+                if AIOHTTP_AVAILABLE and aiohttp is not None:
+                    success = await self._async_broadcast_to_loading_server(
+                        _broadcast_url, progress_data, timeout
+                    )
+                else:
+                    # Fallback: thread-based urllib
+                    success = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._sync_broadcast_progress,
+                            progress_data,
+                            timeout
+                        ),
+                        timeout=timeout + 0.5
+                    )
 
                 if success:
                     # v274.0: Reset consecutive failure counter on success
@@ -83168,10 +83187,18 @@ class JarvisSystemKernel:
                     )
 
             except asyncio.TimeoutError:
+                # v275.0: Set _last_broadcast_error on timeout so throttled
+                # warning reports the actual failure reason instead of stale
+                # None from a previous success.
+                self._last_broadcast_error = (
+                    f"broadcast timeout ({timeout:.1f}s outer) — "
+                    f"event loop or thread under load"
+                )
                 self.logger.debug(
                     f"[Broadcast] Attempt {attempt + 1}/{max_retries} timed out (outer)"
                 )
             except Exception as e:
+                self._last_broadcast_error = f"{type(e).__name__}: {e}"
                 self.logger.debug(
                     f"[Broadcast] Attempt {attempt + 1}/{max_retries} exception: {e}"
                 )
@@ -83203,6 +83230,114 @@ class JarvisSystemKernel:
                 f"(non-fatal, consecutive={self._broadcast_consecutive_failures})"
             )
         return False
+
+    def _get_broadcast_session(self) -> "aiohttp.ClientSession":
+        """
+        v275.0: Get or create persistent aiohttp session for broadcasts.
+
+        Lazy-creates a single ClientSession with keepalive connection to
+        the loading server. Reuse eliminates per-request overhead:
+        - DNS resolution (50-200ms under memory pressure for 'localhost')
+        - TCP connection establishment (SYN/SYN-ACK/ACK)
+        - Session object allocation (connector, pool, cookie jar)
+
+        Uses 127.0.0.1 instead of 'localhost' to bypass DNS resolution
+        entirely (macOS DNS resolver is a separate process that stalls
+        under memory pressure).
+        """
+        session = getattr(self, '_broadcast_session', None)
+        if session is not None and not session.closed:
+            return session
+        # Create persistent session with generous timeout and keepalive.
+        # Connector limit=5 is plenty for localhost broadcasts.
+        connector = aiohttp.TCPConnector(
+            limit=5,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True,
+        )
+        self._broadcast_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=5.0),
+        )
+        return self._broadcast_session
+
+    async def _close_broadcast_session(self) -> None:
+        """v275.0: Close persistent broadcast session on shutdown."""
+        session = getattr(self, '_broadcast_session', None)
+        if session is not None and not session.closed:
+            try:
+                await session.close()
+            except Exception:
+                pass
+            self._broadcast_session = None
+
+    async def _async_broadcast_to_loading_server(
+        self,
+        url: str,
+        progress_data: Dict[str, Any],
+        timeout: float,
+    ) -> bool:
+        """
+        v275.0: Async HTTP POST to loading server via persistent aiohttp session.
+
+        Primary broadcast transport. Runs entirely in the event loop —
+        no thread dispatch, no GIL contention. Uses a persistent
+        ClientSession to eliminate per-request DNS + TCP + allocation
+        overhead that caused 2s timeouts under CPU/memory pressure.
+
+        Root cause of v274.1 60% stall (two layers):
+        Layer 1: asyncio.to_thread(urllib) thread couldn't get scheduled
+                 under GIL contention during heavy phases.
+        Layer 2: Even after switching to async aiohttp (first v275.0),
+                 creating a NEW ClientSession per broadcast added
+                 DNS resolution (macOS resolver stalls under memory
+                 pressure) + TCP connect + object allocation overhead
+                 that exceeded the 2.0s timeout during Resources phase.
+
+        Fix: Persistent session with keepalive connection to 127.0.0.1
+        (not 'localhost' — skips DNS). Per-request overhead: ~1ms.
+
+        Args:
+            url: Loading server update endpoint (will be rewritten to
+                 use 127.0.0.1 for DNS-free resolution)
+            progress_data: Progress payload (JSON-serializable)
+            timeout: Request timeout in seconds (per-request override)
+
+        Returns:
+            True on HTTP 200, False otherwise. Sets _last_broadcast_error
+            on failure.
+        """
+        try:
+            session = self._get_broadcast_session()
+            # v275.0: Use 127.0.0.1 to bypass DNS resolution.
+            # macOS DNS resolver is a separate process; under memory
+            # pressure it can take 200ms+ to resolve 'localhost'.
+            ip_url = url.replace("localhost", "127.0.0.1", 1)
+            async with session.post(
+                ip_url,
+                json=progress_data,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status == 200:
+                    self._last_broadcast_error = None
+                    self._loading_server_ready = True
+                    return True
+                else:
+                    self._last_broadcast_error = f"HTTP {resp.status}"
+                    return False
+        except asyncio.TimeoutError:
+            self._last_broadcast_error = (
+                f"aiohttp timeout ({timeout:.1f}s)"
+            )
+            return False
+        except aiohttp.ClientError as e:
+            # Session may be stale — close for fresh reconnect on next call
+            await self._close_broadcast_session()
+            self._last_broadcast_error = f"aiohttp: {e}"
+            return False
+        except Exception as e:
+            self._last_broadcast_error = f"{type(e).__name__}: {e}"
+            return False
 
     def _sync_broadcast_progress(
         self,
