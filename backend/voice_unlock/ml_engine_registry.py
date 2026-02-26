@@ -360,6 +360,48 @@ class RoutingPolicy(Enum):
     DEGRADED = "degraded"
 
 
+class RouteDecisionReason(Enum):
+    """
+    v276.5: Stable enum for every routing decision.
+
+    Each value is a machine-parseable reason code logged and counted
+    for SLO tracking (route flaps/hour, degraded dwell time, etc.).
+    """
+    CLOUD_PRIMARY = "cloud_primary"
+    LOCAL_PRIMARY = "local_primary"
+    CLOUD_FALLBACK = "cloud_fallback"
+    LOCAL_FALLBACK = "local_fallback"
+    POLICY_CLOUD_ONLY = "policy_cloud_only"
+    POLICY_LOCAL_ONLY = "policy_local_only"
+    POLICY_DEGRADED = "policy_degraded"
+    FLAP_DAMPENED = "flap_dampened"
+    MEMORY_PRESSURE = "memory_pressure"
+    RECOVERY_SUCCESS_CLOUD = "recovery_success_cloud"
+    RECOVERY_SUCCESS_LOCAL = "recovery_success_local"
+    RECOVERY_FAILED = "recovery_failed"
+    DEEP_HEALTH_OK = "deep_health_ok"
+    DEEP_HEALTH_FAILED = "deep_health_failed"
+    SEMANTIC_READINESS_OK = "semantic_readiness_ok"
+    SEMANTIC_READINESS_FAILED = "semantic_readiness_failed"
+    CROSS_PROCESS_FENCED = "cross_process_fenced"
+    HYSTERESIS_DWELL = "hysteresis_dwell"
+    PARITY_MISMATCH = "parity_mismatch"
+    PARITY_RESTORED = "parity_restored"
+
+
+class ParityStrictness(Enum):
+    """
+    v276.5: Per-environment parity enforcement policy.
+
+    ENFORCE:  (prod default) Parity mismatch changes routing policy immediately.
+    DEGRADE:  Warning + DEGRADED mode but doesn't force CLOUD_ONLY/LOCAL_ONLY.
+    WARN:     (dev default) Log warning only, no routing changes.
+    """
+    ENFORCE = "enforce"
+    DEGRADE = "degrade"
+    WARN = "warn"
+
+
 @dataclass
 class EngineMetrics:
     """Telemetry for a single ML engine."""
@@ -1424,6 +1466,53 @@ class MLEngineRegistry:
 
         # v276.4: Periodic deep health task ref (started after first prewarm)
         self._deep_health_task: Optional[asyncio.Task] = None
+
+        # v276.5: Monotonic state sequence — every state transition gets a
+        # sequence number. Observers reject events with seq < their last seen.
+        # Prevents "ghost recovered/degraded" from out-of-order telemetry.
+        self._state_seq: int = 0
+
+        # v276.5: Cross-process recovery idempotency. File-based token with
+        # PID + timestamp + source. Process checks token before starting
+        # recovery — if another process is already recovering (token age
+        # < fence_ttl), skip to prevent duplicate recoveries.
+        self._recovery_fence_ttl: float = float(os.getenv(
+            "JARVIS_ECAPA_RECOVERY_FENCE_TTL", "30.0"
+        ))  # Max expected recovery duration
+
+        # v276.5: Route decision reason telemetry — stable counters
+        # for SLO tracking. get_routing_telemetry() exposes this.
+        self._routing_decisions: Dict[str, int] = {
+            r.value: 0 for r in RouteDecisionReason
+        }
+        self._routing_decisions_since: float = time.time()
+
+        # v276.5: Warm-instance degradation tracking.
+        # Tracks cloud inference latency percentiles and memory growth
+        # to detect slow poisoning on always-warm min-instances=1.
+        self._cloud_latency_samples: List[float] = []
+        self._cloud_latency_window: int = int(os.getenv(
+            "JARVIS_ECAPA_LATENCY_WINDOW", "50"
+        ))  # Keep last N latency samples
+        self._cloud_latency_p95_baseline: float = 0.0  # Set after first N samples
+        self._cloud_latency_degradation_threshold: float = float(os.getenv(
+            "JARVIS_ECAPA_LATENCY_DEGRADATION_FACTOR", "3.0"
+        ))  # Alert when P95 exceeds baseline by this factor
+        self._cloud_memory_baseline_mb: float = 0.0
+        self._cloud_memory_growth_threshold_mb: float = float(os.getenv(
+            "JARVIS_ECAPA_MEMORY_GROWTH_THRESHOLD_MB", "512.0"
+        ))  # Alert when cloud service memory grows by this much
+
+        # v276.5: Parity strictness per environment
+        _strictness = os.getenv(
+            "JARVIS_ECAPA_PARITY_STRICTNESS",
+            "enforce" if os.getenv("ENVIRONMENT", "dev") == "prod" else "warn"
+        ).lower()
+        self._parity_strictness: ParityStrictness = (
+            ParityStrictness(_strictness)
+            if _strictness in ParityStrictness._value2member_map_
+            else ParityStrictness.WARN
+        )
 
         # v275.1: Cloud Run pre-warming. Cloud Run containers have cold starts
         # of 10-30s. The contract probe (4s timeout) runs during heavy startup
@@ -3418,10 +3507,13 @@ class MLEngineRegistry:
                 "reason": reason,
                 "source_repo": "jarvis",
                 "pid": os.getpid(),
-                "version": "v276.4",
+                "version": "v276.5",
                 # v276.4: Embedding parity tracking
                 "parity": self.get_parity_status(),
                 "routing_reason": self._last_routing_reason,
+                # v276.5: Monotonic state sequence for event ordering
+                "state_seq": self._state_seq,
+                "routing_policy": self._routing_policy.value,
             }
 
             # Atomic write with temp file
@@ -3461,6 +3553,17 @@ class MLEngineRegistry:
 
             if state_age > max_age:
                 logger.debug(f"[v115.0] Cross-repo ECAPA state too old ({state_age:.1f}s > {max_age}s)")
+                return None
+
+            # v276.5: Reject stale events — if the file's state_seq is
+            # older than our current seq, another process wrote a state
+            # that predates our latest transition. Ignore it.
+            file_seq = state.get("state_seq", 0)
+            if file_seq < self._state_seq:
+                logger.debug(
+                    f"[v276.5] Cross-repo state has stale seq "
+                    f"({file_seq} < {self._state_seq}) — rejecting"
+                )
                 return None
 
             logger.info(f"[v115.0] Found recent cross-repo ECAPA state from {state.get('source_repo', 'unknown')} ({state_age:.1f}s ago)")
@@ -3567,6 +3670,89 @@ class MLEngineRegistry:
             logger.error(f"❌ Local ECAPA fallback exception: {e}")
             return False
 
+    # ── v276.5: Cross-process recovery fence ─────────────────────────────
+
+    def _acquire_recovery_fence(self, source: str) -> bool:
+        """
+        v276.5: File-based cross-process idempotency token.
+
+        Before starting recovery, write a fence token with our PID +
+        timestamp + source. If another process's fence is still live
+        (age < _recovery_fence_ttl), skip recovery to prevent duplicates.
+
+        Returns True if we own the fence. Callers MUST call
+        _release_recovery_fence() when done (success or failure).
+        """
+        import json
+        from pathlib import Path
+
+        fence_file = Path.home() / ".jarvis" / "cross_repo" / "ecapa_recovery_fence.json"
+        try:
+            fence_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Check existing fence
+            if fence_file.exists():
+                try:
+                    existing = json.loads(fence_file.read_text())
+                    fence_age = time.time() - existing.get("timestamp", 0)
+                    fence_pid = existing.get("pid", 0)
+
+                    if fence_age < self._recovery_fence_ttl:
+                        # Check if fencing process is still alive
+                        process_alive = False
+                        try:
+                            os.kill(fence_pid, 0)  # Signal 0 = existence check
+                            process_alive = True
+                        except (OSError, ProcessLookupError):
+                            pass
+
+                        if process_alive and fence_pid != os.getpid():
+                            logger.info(
+                                f"[v276.5] Recovery fence held by PID {fence_pid} "
+                                f"({fence_age:.1f}s ago, source={existing.get('source', '?')}). "
+                                f"Skipping recovery (our source={source})."
+                            )
+                            return False
+                        # Stale fence from dead process — take over
+                except (json.JSONDecodeError, KeyError):
+                    pass  # Corrupted fence file — overwrite
+
+            # Write our fence
+            fence = {
+                "pid": os.getpid(),
+                "timestamp": time.time(),
+                "source": source,
+                "state_seq": self._state_seq,
+            }
+            tmp = fence_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(fence))
+            tmp.rename(fence_file)
+            return True
+
+        except Exception as e:
+            logger.debug(f"[v276.5] Recovery fence error (proceeding anyway): {e}")
+            return True  # Fail-open: don't block recovery on fence IO errors
+
+    def _release_recovery_fence(self) -> None:
+        """v276.5: Release cross-process recovery fence."""
+        from pathlib import Path
+
+        try:
+            fence_file = Path.home() / ".jarvis" / "cross_repo" / "ecapa_recovery_fence.json"
+            if fence_file.exists():
+                import json
+                existing = json.loads(fence_file.read_text())
+                # Only remove if WE own it
+                if existing.get("pid") == os.getpid():
+                    fence_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _next_state_seq(self) -> int:
+        """v276.5: Monotonically increment and return state sequence number."""
+        self._state_seq += 1
+        return self._state_seq
+
     async def _attempt_ecapa_recovery(self, source: str = "deferred") -> bool:
         """
         v276.2→v276.3: Unified ECAPA recovery — cloud-first, then local.
@@ -3601,6 +3787,12 @@ class MLEngineRegistry:
             self._last_routing_reason = "recovery_in_progress"
             return False
 
+        # ── Guard: cross-process fence (v276.5) ──
+        if not self._acquire_recovery_fence(source):
+            self._last_routing_reason = "cross_process_fenced"
+            self._record_routing_decision(RouteDecisionReason.CROSS_PROCESS_FENCED)
+            return False
+
         # ── Guard: hysteresis dwell window ──
         dwell_seconds = float(os.getenv(
             "JARVIS_ECAPA_RECOVERY_DWELL_SECONDS", "10.0"
@@ -3613,12 +3805,14 @@ class MLEngineRegistry:
                 f"source={source}) — skipping"
             )
             self._last_routing_reason = "hysteresis_dwell"
+            self._release_recovery_fence()
             return self._last_recovery_result
 
         async with self._recovery_lock:
             # Double-check after acquiring lock (another thread may have recovered)
             if self.is_ready:
                 self._last_routing_reason = "already_ready_post_lock"
+                self._release_recovery_fence()
                 return True
 
             self._last_recovery_attempt_at = time.time()
@@ -3685,6 +3879,7 @@ class MLEngineRegistry:
                     self._cloud_parity = await self._fetch_cloud_parity_fingerprint()
                 except Exception:
                     pass  # Parity is informational, don't block recovery
+                self._release_recovery_fence()
                 return True
 
             # ── Phase 2: Check if local loading is safe ──
@@ -3746,6 +3941,7 @@ class MLEngineRegistry:
                             )
                             # v276.4: Capture local fingerprint for parity
                             self._local_parity = self._get_local_parity_fingerprint()
+                            self._release_recovery_fence()
                             return True
                         else:
                             local_reason = "local_semantic_readiness_failed"
@@ -3764,6 +3960,7 @@ class MLEngineRegistry:
                 f"[v276.3] ECAPA recovery failed (source={source}) — "
                 f"cloud={cloud_reason}, local={local_reason}"
             )
+            self._release_recovery_fence()
             return False
 
     async def _verify_semantic_readiness(self, backend: str = "cloud") -> bool:
@@ -3852,12 +4049,71 @@ class MLEngineRegistry:
                 return False
 
             elif backend == "local":
-                # For local, just verify the engine is loaded and can produce output
+                # v276.5: Full semantic readiness — actually extract embedding
+                # from synthetic audio, not just check is_loaded flag.
+                # A loaded model with corrupt weights or misconfigured
+                # preprocessing passes is_loaded but fails inference.
                 ecapa = self._engines.get("ecapa_tdnn")
-                if ecapa is not None and ecapa.is_loaded:
-                    logger.debug("[v276.3] Local semantic readiness OK (engine loaded)")
+                if ecapa is None or not ecapa.is_loaded:
+                    return False
+
+                try:
+                    import struct
+
+                    # Generate same 1s 16kHz silence WAV as cloud path
+                    _sr = 16000
+                    _ns = _sr
+                    _wav = bytearray()
+                    _ds = _ns * 2
+                    _wav.extend(b'RIFF')
+                    _wav.extend(struct.pack('<I', 36 + _ds))
+                    _wav.extend(b'WAVEfmt ')
+                    _wav.extend(struct.pack('<IHHIIHH', 16, 1, 1, _sr,
+                                            _sr * 2, 2, 16))
+                    _wav.extend(b'data')
+                    _wav.extend(struct.pack('<I', _ds))
+                    _wav.extend(b'\x00' * _ds)
+
+                    test_result = await asyncio.wait_for(
+                        ecapa.extract_speaker_embedding(bytes(_wav)),
+                        timeout=semantic_timeout,
+                    )
+                    if test_result is None:
+                        logger.warning(
+                            "[v276.5] Local semantic test: extraction returned None"
+                        )
+                        return False
+
+                    emb_len = len(test_result) if hasattr(test_result, '__len__') else 0
+                    if emb_len < 64:
+                        logger.warning(
+                            f"[v276.5] Local semantic test: embedding too short "
+                            f"(dim={emb_len}, expected >= 64)"
+                        )
+                        return False
+
+                    # Capture local embedding dim for parity tracking
+                    if self._local_parity.embedding_dim == 0:
+                        self._local_parity.embedding_dim = emb_len
+                        self._local_parity.captured_at = time.time()
+
+                    logger.debug(
+                        f"[v276.5] Local semantic readiness OK "
+                        f"(embedding dim={emb_len})"
+                    )
                     return True
-                return False
+
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[v276.5] Local semantic test timed out "
+                        f"({semantic_timeout}s)"
+                    )
+                    return False
+                except Exception as e:
+                    logger.warning(
+                        f"[v276.5] Local semantic test extraction failed: {e}"
+                    )
+                    return False
 
             else:
                 logger.debug(f"[v276.3] Semantic readiness: unknown backend '{backend}'")
@@ -4142,6 +4398,27 @@ class MLEngineRegistry:
             )
             return
 
+        # v276.5: Parity strictness per environment
+        self._record_routing_decision(RouteDecisionReason.PARITY_MISMATCH)
+        if self._parity_strictness == ParityStrictness.WARN:
+            logger.warning(
+                f"[v276.5] Parity mismatch ({mismatch_reason}) — strictness=warn, "
+                f"no routing change applied. Set JARVIS_ECAPA_PARITY_STRICTNESS=enforce "
+                f"to change routing on mismatch."
+            )
+            return
+        if self._parity_strictness == ParityStrictness.DEGRADE:
+            logger.warning(
+                f"[v276.5] Parity mismatch ({mismatch_reason}) — strictness=degrade. "
+                f"Entering DEGRADED mode without forcing single-backend routing."
+            )
+            self._routing_policy = RoutingPolicy.DEGRADED
+            self._routing_policy_reason = (
+                f"parity_mismatch:degrade ({mismatch_reason})"
+            )
+            return
+
+        # strictness == ENFORCE (prod default) — full routing policy change
         CANONICAL_DIM = 192
         CANONICAL_RATE = 16000
         CANONICAL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
@@ -4332,17 +4609,27 @@ class MLEngineRegistry:
 
                 if ok:
                     consecutive_failures = 0
+                    self._record_routing_decision(RouteDecisionReason.DEEP_HEALTH_OK)
                     logger.debug(
                         f"[v276.4] Deep health OK (backend={active})"
                     )
                     # Also refresh parity on success
                     if active == "cloud":
                         self._cloud_parity = await self._fetch_cloud_parity_fingerprint()
+                        # v276.5: Check for warm-instance memory growth
+                        try:
+                            fp = self._cloud_parity
+                            mem_mb = fp.raw_metadata.get("memory_mb", 0)
+                            if mem_mb > 0:
+                                self.record_cloud_memory(mem_mb)
+                        except Exception:
+                            pass
                     else:
                         self._local_parity = self._get_local_parity_fingerprint()
                     continue
 
                 consecutive_failures += 1
+                self._record_routing_decision(RouteDecisionReason.DEEP_HEALTH_FAILED)
                 logger.warning(
                     f"[v276.4] Deep health FAILED for {active} "
                     f"(consecutive={consecutive_failures}/{max_consecutive_failures})"
@@ -4387,6 +4674,10 @@ class MLEngineRegistry:
             new_backend: "cloud" or "local"
             source: What triggered the transition (for logging)
         """
+        # v276.5: Bump monotonic state sequence FIRST — observers
+        # that read the state file reject events with seq < their last seen.
+        seq = self._next_state_seq()
+
         # Record transition for flap detection
         self._record_backend_transition(new_backend)
 
@@ -4394,18 +4685,20 @@ class MLEngineRegistry:
             self._use_cloud = True
             self._memory_gate_blocked = False
             logger.info(
-                f"[v276.4] State reconciled → cloud (source={source})"
+                f"[v276.5] State reconciled → cloud "
+                f"(source={source}, seq={seq})"
             )
         elif new_backend == "local":
             self._use_cloud = False
             self._cloud_verified = False
             self._memory_gate_blocked = False
             logger.info(
-                f"[v276.4] State reconciled → local (source={source})"
+                f"[v276.5] State reconciled → local "
+                f"(source={source}, seq={seq})"
             )
         else:
             logger.warning(
-                f"[v276.4] _reconcile_state_after_recovery called with "
+                f"[v276.5] _reconcile_state_after_recovery called with "
                 f"unexpected backend={new_backend!r} (source={source}). "
                 f"No state changes applied — investigate caller."
             )
@@ -4438,10 +4731,13 @@ class MLEngineRegistry:
             "flap_threshold": self._flap_threshold,
             "parity": self.get_parity_status(),
             "last_routing_reason": self._last_routing_reason,
+            "state_seq": self._state_seq,
+            "parity_strictness": self._parity_strictness.value,
             "deep_health_running": (
                 self._deep_health_task is not None
                 and not self._deep_health_task.done()
             ),
+            "telemetry": self.get_routing_telemetry(),
         }
 
     def get_parity_status(self) -> Dict[str, Any]:
@@ -4457,6 +4753,120 @@ class MLEngineRegistry:
             "last_reason": self._parity_last_reason,
             "cloud": self._cloud_parity.to_dict(),
             "local": self._local_parity.to_dict(),
+        }
+
+    # ── v276.5: Telemetry + warm-instance degradation ───────────────────
+
+    def _record_routing_decision(self, reason: RouteDecisionReason) -> None:
+        """
+        v276.5: Increment stable counter for a routing decision reason.
+
+        Enables SLO tracking: route flaps/hour, degraded dwell time,
+        recovery latency, parity mismatch duration. Counters are monotonic
+        and never reset (except on process restart).
+        """
+        self._routing_decisions[reason.value] = (
+            self._routing_decisions.get(reason.value, 0) + 1
+        )
+
+    def record_cloud_latency(self, latency_s: float) -> Optional[str]:
+        """
+        v276.5: Record a cloud inference latency sample. Returns a warning
+        string if degradation is detected, None otherwise.
+
+        Called from extract_speaker_embedding_cloud() success path.
+        """
+        samples = self._cloud_latency_samples
+        samples.append(latency_s)
+
+        # Sliding window
+        if len(samples) > self._cloud_latency_window:
+            samples[:] = samples[-self._cloud_latency_window:]
+
+        # Establish baseline after first N samples
+        if self._cloud_latency_p95_baseline == 0.0 and len(samples) >= 10:
+            sorted_s = sorted(samples)
+            p95_idx = int(len(sorted_s) * 0.95)
+            self._cloud_latency_p95_baseline = sorted_s[min(p95_idx, len(sorted_s) - 1)]
+            logger.info(
+                f"[v276.5] Cloud latency baseline established: "
+                f"P95={self._cloud_latency_p95_baseline*1000:.0f}ms "
+                f"(from {len(samples)} samples)"
+            )
+            return None
+
+        # Check degradation
+        if self._cloud_latency_p95_baseline > 0.0 and len(samples) >= 10:
+            sorted_s = sorted(samples[-20:])  # Recent window
+            p95_idx = int(len(sorted_s) * 0.95)
+            current_p95 = sorted_s[min(p95_idx, len(sorted_s) - 1)]
+            threshold = self._cloud_latency_p95_baseline * self._cloud_latency_degradation_threshold
+
+            if current_p95 > threshold:
+                msg = (
+                    f"Cloud ECAPA latency degraded: P95={current_p95*1000:.0f}ms "
+                    f"(baseline={self._cloud_latency_p95_baseline*1000:.0f}ms, "
+                    f"threshold={threshold*1000:.0f}ms)"
+                )
+                logger.warning(f"[v276.5] {msg}")
+                self._record_routing_decision(RouteDecisionReason.DEEP_HEALTH_FAILED)
+                return msg
+
+        return None
+
+    def record_cloud_memory(self, memory_mb: float) -> Optional[str]:
+        """
+        v276.5: Record cloud service memory usage. Returns a warning
+        string if growth exceeds threshold, None otherwise.
+
+        Called from deep health check when /status exposes memory info.
+        """
+        if self._cloud_memory_baseline_mb == 0.0:
+            self._cloud_memory_baseline_mb = memory_mb
+            return None
+
+        growth = memory_mb - self._cloud_memory_baseline_mb
+        if growth > self._cloud_memory_growth_threshold_mb:
+            msg = (
+                f"Cloud ECAPA memory growth detected: "
+                f"{memory_mb:.0f}MB (baseline={self._cloud_memory_baseline_mb:.0f}MB, "
+                f"growth={growth:.0f}MB, threshold={self._cloud_memory_growth_threshold_mb:.0f}MB)"
+            )
+            logger.warning(f"[v276.5] {msg}")
+            return msg
+        return None
+
+    def get_routing_telemetry(self) -> Dict[str, Any]:
+        """
+        v276.5: Return routing decision counters for SLO monitoring.
+
+        Includes: decision counts by reason, uptime, latency baselines,
+        memory tracking, and parity strictness mode.
+        """
+        uptime = time.time() - self._routing_decisions_since
+        total_decisions = sum(self._routing_decisions.values())
+        flap_count = (
+            self._routing_decisions.get(RouteDecisionReason.RECOVERY_SUCCESS_CLOUD.value, 0)
+            + self._routing_decisions.get(RouteDecisionReason.RECOVERY_SUCCESS_LOCAL.value, 0)
+        )
+        return {
+            "decisions": dict(self._routing_decisions),
+            "total_decisions": total_decisions,
+            "uptime_seconds": uptime,
+            "flaps_per_hour": (flap_count / max(uptime, 1)) * 3600,
+            "parity_strictness": self._parity_strictness.value,
+            "cloud_latency": {
+                "baseline_p95_ms": (
+                    self._cloud_latency_p95_baseline * 1000
+                    if self._cloud_latency_p95_baseline > 0 else None
+                ),
+                "samples_count": len(self._cloud_latency_samples),
+                "degradation_factor": self._cloud_latency_degradation_threshold,
+            },
+            "cloud_memory": {
+                "baseline_mb": self._cloud_memory_baseline_mb or None,
+                "growth_threshold_mb": self._cloud_memory_growth_threshold_mb,
+            },
         }
 
     def _schedule_deferred_ecapa_recovery(self) -> None:
@@ -4924,19 +5334,35 @@ class MLEngineRegistry:
         audio_data: bytes,
         timeout: float = 30.0,
         _allow_failover_retry: bool = True,
+        _bypass_policy: bool = False,
     ) -> Optional[Any]:
         """
         Extract speaker embedding using cloud backend.
 
         v21.1.0: Added readiness gate, circuit breaker, and 503 handling.
+        v276.5: Added routing policy gate — direct callers that bypass
+        resolve_effective_backend() are now blocked when policy is LOCAL_ONLY.
 
         Args:
             audio_data: Raw audio bytes (16kHz, mono, float32)
             timeout: Request timeout in seconds
+            _bypass_policy: Internal flag — set True only when called from
+                extract_speaker_embedding() which already checked policy.
 
         Returns:
             Embedding tensor or None if failed
         """
+        # v276.5: Routing policy gate — prevent direct callers from
+        # bypassing LOCAL_ONLY policy. Internal calls from the public
+        # extract_speaker_embedding() set _bypass_policy=True because
+        # they've already checked via resolve_effective_backend().
+        if not _bypass_policy and self._routing_policy == RoutingPolicy.LOCAL_ONLY:
+            logger.debug(
+                "[v276.5] extract_speaker_embedding_cloud() blocked by "
+                "LOCAL_ONLY routing policy"
+            )
+            return None
+
         if not self._cloud_endpoint:
             logger.error("Cloud endpoint not configured")
             return None
@@ -5090,6 +5516,7 @@ class MLEngineRegistry:
                                             audio_data,
                                             timeout=timeout,
                                             _allow_failover_retry=False,
+                                            _bypass_policy=True,
                                         )
 
                             return None
@@ -5157,6 +5584,7 @@ class MLEngineRegistry:
                                         audio_data,
                                         timeout=timeout,
                                         _allow_failover_retry=False,
+                                        _bypass_policy=True,
                                     )
                         else:
                             self._cloud_verified = False
@@ -5189,6 +5617,7 @@ class MLEngineRegistry:
                         audio_data,
                         timeout=timeout,
                         _allow_failover_retry=False,
+                        _bypass_policy=True,
                     )
             return None
         except Exception as e:
@@ -5213,6 +5642,7 @@ class MLEngineRegistry:
                         audio_data,
                         timeout=timeout,
                         _allow_failover_retry=False,
+                        _bypass_policy=True,
                     )
             return None
 
@@ -5222,20 +5652,30 @@ class MLEngineRegistry:
         reference_embedding: Any,
         timeout: float = 30.0,
         _allow_failover_retry: bool = True,
+        _bypass_policy: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         Verify speaker using cloud backend.
 
         v21.1.0: Added readiness gate, circuit breaker, and 503 handling.
+        v276.5: Added routing policy gate.
 
         Args:
             audio_data: Raw audio bytes (16kHz, mono, float32)
             reference_embedding: Reference embedding to compare against
             timeout: Request timeout in seconds
+            _bypass_policy: Internal flag — set True only when called from
+                verify_speaker_with_best_method() which already checked policy.
 
         Returns:
             Dict with verification result or None if failed
         """
+        # v276.5: Routing policy gate
+        if not _bypass_policy and self._routing_policy == RoutingPolicy.LOCAL_ONLY:
+            logger.debug(
+                "[v276.5] verify_speaker_cloud() blocked by LOCAL_ONLY routing policy"
+            )
+            return None
         if not self._cloud_endpoint:
             logger.error("Cloud endpoint not configured")
             return None
@@ -5362,6 +5802,7 @@ class MLEngineRegistry:
                                             reference_embedding,
                                             timeout=timeout,
                                             _allow_failover_retry=False,
+                                            _bypass_policy=True,
                                         )
                             return None
 
@@ -5426,6 +5867,7 @@ class MLEngineRegistry:
                                         reference_embedding,
                                         timeout=timeout,
                                         _allow_failover_retry=False,
+                                        _bypass_policy=True,
                                     )
                         else:
                             self._cloud_verified = False
@@ -5459,6 +5901,7 @@ class MLEngineRegistry:
                         reference_embedding,
                         timeout=timeout,
                         _allow_failover_retry=False,
+                        _bypass_policy=True,
                     )
             return None
         except Exception as e:
@@ -5484,6 +5927,7 @@ class MLEngineRegistry:
                         reference_embedding,
                         timeout=timeout,
                         _allow_failover_retry=False,
+                        _bypass_policy=True,
                     )
             return None
 
@@ -6018,9 +6462,17 @@ async def extract_speaker_embedding(
     if use_cloud:
         logger.debug("Using cloud for speaker embedding extraction")
 
-        embedding = await registry.extract_speaker_embedding_cloud(audio_data)
+        _t0 = time.time()
+        embedding = await registry.extract_speaker_embedding_cloud(
+            audio_data, _bypass_policy=True,
+        )
 
         if embedding is not None:
+            # v276.5: Track cloud latency for warm-instance degradation detection
+            _latency = time.time() - _t0
+            registry.record_cloud_latency(_latency)
+            registry._record_routing_decision(RouteDecisionReason.CLOUD_PRIMARY)
+
             logger.debug(f"Cloud embedding extracted: shape {embedding.shape}")
             return embedding
 
@@ -6061,7 +6513,9 @@ async def extract_speaker_embedding(
                 and registry._routing_policy != RoutingPolicy.LOCAL_ONLY
             ):
                 logger.warning("Local engines not ready, falling back to cloud")
-                return await registry.extract_speaker_embedding_cloud(audio_data)
+                return await registry.extract_speaker_embedding_cloud(
+                    audio_data, _bypass_policy=True,
+                )
 
             logger.error("Local engines not ready and no cloud fallback")
             return None
@@ -6084,7 +6538,9 @@ async def extract_speaker_embedding(
             await registry._activate_cloud_routing()
 
         if registry.cloud_endpoint:
-            return await registry.extract_speaker_embedding_cloud(audio_data)
+            return await registry.extract_speaker_embedding_cloud(
+                audio_data, _bypass_policy=True,
+            )
 
     logger.error("Speaker embedding extraction failed (local and cloud)")
     return None
@@ -6460,7 +6916,8 @@ async def verify_speaker_with_best_method(
     if effective_backend == "cloud":
         # Use cloud verification
         return await registry.verify_speaker_cloud(
-            audio_data, reference_embedding, timeout
+            audio_data, reference_embedding, timeout,
+            _bypass_policy=True,
         )
 
     # Use local verification
@@ -6508,7 +6965,8 @@ async def verify_speaker_with_best_method(
         ):
             logger.info("Falling back to cloud verification")
             return await registry.verify_speaker_cloud(
-                audio_data, reference_embedding, timeout
+                audio_data, reference_embedding, timeout,
+                _bypass_policy=True,
             )
 
         return None
