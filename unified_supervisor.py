@@ -64956,46 +64956,97 @@ class JarvisSystemKernel:
 
         self._started_at = time.time()
         # =====================================================================
-        # v270.0: NUMBA / NATIVE LIBRARY PRELOAD (before AudioBus)
+        # v270.0/v270.3: NATIVE C EXTENSION PRELOAD (before AudioBus)
         # =====================================================================
         # MUST run before AudioBus init. AudioBus starts a CoreAudio IO thread
-        # via FullDuplexDevice. If numba/torch/BLAS native extensions are loaded
-        # while the CoreAudio IO thread is running, the concurrent native C
-        # initializations collide — corrupting memory and causing SIGSEGV on
-        # the audio callback thread (KERN_INVALID_ADDRESS at 0x4).
+        # via FullDuplexDevice. If native C extensions (numpy/BLAS, scipy/Fortran,
+        # torch/LLVM+MPS, numba/LLVM) are loaded while the CoreAudio IO thread
+        # is running, the concurrent native initializations collide — corrupting
+        # memory and causing SIGSEGV on the audio callback thread.
         #
-        # By pre-loading numba here (before CoreAudio starts), the native
-        # extensions are fully initialized. Later imports find them already in
-        # sys.modules and skip native init, eliminating the collision window.
+        # v270.0: Originally only preloaded numba.
+        # v270.3: Extended to ALL major native C extensions used by the backend.
+        #   The backend runs IN-PROCESS (from backend.main import app). Its
+        #   parallel_import_components() loads voice/ML modules in 4 thread
+        #   workers. Those modules have module-level `import torch`, `import
+        #   scipy`, etc. that trigger native init concurrent with CoreAudio.
+        #   By preloading ALL of them here BEFORE CoreAudio starts, later
+        #   imports find them in sys.modules and skip native init entirely.
+        #
+        # Preload order (dependency-safe): numpy → scipy → torch → numba
+        # Each is optional — ImportError = not installed, skip silently.
         # =====================================================================
         try:
             _loop = asyncio.get_running_loop()
 
-            def _preload_numba_sync():
-                """Pre-import numba native extensions in isolation."""
+            def _preload_native_libs_sync():
+                """Pre-import ALL major native C extensions in isolation."""
                 import os as _os
+                _preloaded = []
+
+                # 1. numpy — BLAS/LAPACK native extensions
+                try:
+                    import numpy  # noqa: F401
+                    _preloaded.append(f"numpy {numpy.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"numpy: {_e}")
+
+                # 2. scipy — Fortran runtime + BLAS wrappers
+                try:
+                    import scipy  # noqa: F401
+                    # scipy.signal is commonly used at module level
+                    from scipy import signal as _  # noqa: F401
+                    _preloaded.append(f"scipy {scipy.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"scipy: {_e}")
+
+                # 3. torch — BLAS, LLVM JIT, MPS (Apple Metal)
+                # This is the heaviest (~5-10s) but is the primary SIGSEGV
+                # source. Module-level `import torch` in 20+ voice/ML files
+                # loads BLAS + LLVM concurrently with CoreAudio.
+                try:
+                    import torch  # noqa: F401
+                    _preloaded.append(f"torch {torch.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"torch: {_e}")
+
+                # 4. numba — LLVM JIT (lighter, often already handled)
                 _os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
                 _os.environ.setdefault("NUMBA_NUM_THREADS", "1")
                 _os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
                 try:
-                    import numba  # noqa: F401 — triggers LLVM native ext load
-                    return f"numba {numba.__version__} preloaded"
+                    import numba  # noqa: F401
+                    _preloaded.append(f"numba {numba.__version__}")
                 except ImportError:
-                    return "numba not installed (optional)"
+                    pass
                 except Exception as _e:
-                    return f"numba preload warning: {_e}"
+                    _preloaded.append(f"numba: {_e}")
 
+                if _preloaded:
+                    return f"native libs preloaded: {', '.join(_preloaded)}"
+                return "no native libs installed (all optional)"
+
+            _preload_timeout = float(os.environ.get(
+                "JARVIS_NATIVE_PRELOAD_TIMEOUT", "45.0"
+            ))
             _preload_msg = await asyncio.wait_for(
-                _loop.run_in_executor(None, _preload_numba_sync),
-                timeout=30.0,
+                _loop.run_in_executor(None, _preload_native_libs_sync),
+                timeout=_preload_timeout,
             )
             self.logger.info("[Kernel] %s", _preload_msg)
         except asyncio.TimeoutError:
             self.logger.warning(
-                "[Kernel] numba preload timed out (30s) — continuing without preload"
+                "[Kernel] native lib preload timed out (%.0fs) — continuing without preload",
+                _preload_timeout,
             )
         except Exception as _npe:
-            self.logger.debug("[Kernel] numba preload non-fatal: %s", _npe)
+            self.logger.debug("[Kernel] native lib preload non-fatal: %s", _npe)
 
         # =====================================================================
         # v238.0: AUDIO BUS EARLY INIT (before narrator)
@@ -83960,49 +84011,91 @@ class JarvisSystemKernel:
                         f"{required_gb:.2f}GB"
                     )
 
-                # v268.0: Check speechbrain availability in SUBPROCESS.
-                # ROOT CAUSE FIX (v268.0): v265.2 ran the import in a thread
-                # executor, which kept the event loop responsive but loaded
-                # scipy/numpy/BLAS native C extensions in-process.  When
-                # AudioBus recovery concurrently starts PortAudio (also native),
-                # the two native init paths collide — crashing in a native
-                # thread with <no Python frame> (segfault).  Running the check
-                # in a subprocess completely isolates native code and makes the
-                # segfault impossible.
-                def _check_speechbrain_subprocess() -> Tuple[bool, Optional[str], str]:
-                    try:
-                        _result = subprocess.run(
-                            [sys.executable, "-c", "import speechbrain; print('ok')"],
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                            start_new_session=True,
-                        )
-                        if _result.returncode == 0 and "ok" in _result.stdout:
-                            return True, None, ""
-
-                        _stderr = (_result.stderr or "").strip().lower()
-                        _stdout = (_result.stdout or "").strip().lower()
-                        if "no module named" in _stderr or "speechbrain" in _stderr:
-                            return (
-                                False,
-                                "speechbrain module not installed",
-                                "MODEL_NOT_LOADED",
-                            )
-                        return (
-                            False,
-                            _stderr or _stdout or "speechbrain import failed",
-                            "MODEL_NOT_LOADED",
-                        )
-                    except subprocess.TimeoutExpired:
-                        return False, "speechbrain import timed out", "TIMEOUT"
-                    except Exception as exc:
-                        return False, str(exc), "UNREACHABLE"
+                # v271.0: ADAPTIVE SpeechBrain availability check.
+                #
+                # ROOT CAUSE (ecapa_ba:DEGR): v268.0 used subprocess isolation
+                # to prevent SIGSEGV from concurrent native C extension loading
+                # (scipy BLAS + PortAudio collision). But subprocess does a COLD
+                # import of speechbrain (~4s), which equals the 4s probe deadline.
+                # Under startup CPU pressure (parallel_import_components running
+                # 4 thread workers), the subprocess exceeds 4s → TIMEOUT → all
+                # probes fail → degraded.
+                #
+                # v270.3 now preloads ALL major native libs (numpy, scipy, torch,
+                # numba) BEFORE AudioBus starts CoreAudio. With these in
+                # sys.modules, subsequent imports skip native init — no collision
+                # risk. So when preloaded, we use in-process thread executor:
+                # fast (~1.5s, deps cached) and safe (no native init contention).
+                #
+                # Subprocess fallback preserved for the non-preloaded edge case
+                # (e.g., preload timed out or was skipped).
+                _native_preloaded = (
+                    "torch" in sys.modules and "numpy" in sys.modules
+                )
 
                 _loop = asyncio.get_running_loop()
-                _sb_ok, _sb_error, _sb_category = await _loop.run_in_executor(
-                    None, _check_speechbrain_subprocess
-                )
+
+                if _native_preloaded:
+                    # FAST PATH: In-process thread executor (~1.5s).
+                    # Safe because v270.3 preloaded native libs before CoreAudio.
+                    def _check_speechbrain_inprocess() -> Tuple[bool, Optional[str], str]:
+                        try:
+                            import speechbrain  # noqa: F401
+                            return True, None, ""
+                        except ImportError as _ie:
+                            _msg = str(_ie).lower()
+                            if "speechbrain" in _msg or "no module named" in _msg:
+                                return (
+                                    False,
+                                    "speechbrain module not installed",
+                                    "MODEL_NOT_LOADED",
+                                )
+                            return False, str(_ie), "MODEL_NOT_LOADED"
+                        except Exception as _e:
+                            return False, str(_e), "UNREACHABLE"
+
+                    _sb_ok, _sb_error, _sb_category = await _loop.run_in_executor(
+                        None, _check_speechbrain_inprocess
+                    )
+                else:
+                    # SAFE PATH: Subprocess isolation (v268.0).
+                    # Used when native libs weren't preloaded — prevents SIGSEGV
+                    # from concurrent native init with CoreAudio IO thread.
+                    def _check_speechbrain_subprocess() -> Tuple[bool, Optional[str], str]:
+                        try:
+                            _result = subprocess.run(
+                                [sys.executable, "-c",
+                                 "import speechbrain; print('ok')"],
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                                start_new_session=True,
+                            )
+                            if _result.returncode == 0 and "ok" in _result.stdout:
+                                return True, None, ""
+
+                            _stderr = (_result.stderr or "").strip().lower()
+                            _stdout = (_result.stdout or "").strip().lower()
+                            if "no module named" in _stderr or "speechbrain" in _stderr:
+                                return (
+                                    False,
+                                    "speechbrain module not installed",
+                                    "MODEL_NOT_LOADED",
+                                )
+                            return (
+                                False,
+                                _stderr or _stdout or "speechbrain import failed",
+                                "MODEL_NOT_LOADED",
+                            )
+                        except subprocess.TimeoutExpired:
+                            return False, "speechbrain import timed out", "TIMEOUT"
+                        except Exception as exc:
+                            return False, str(exc), "UNREACHABLE"
+
+                    _sb_ok, _sb_error, _sb_category = await _loop.run_in_executor(
+                        None, _check_speechbrain_subprocess
+                    )
+
                 if _sb_ok:
                     probe["available"] = True
                 else:

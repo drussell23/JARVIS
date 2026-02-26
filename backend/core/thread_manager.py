@@ -3093,24 +3093,50 @@ class SegfaultHandler:
 
     @classmethod
     def _handle_sigsegv(cls, signum, frame):
-        """Handle SIGSEGV signal."""
+        """Handle SIGSEGV signal.
+
+        v270.3: Signal handlers run in the faulting thread's context.
+        When SIGSEGV fires on a native thread (e.g., CoreAudio IO thread)
+        that has no Python thread state, threading.current_thread() calls
+        _thread.get_ident() which fails with "returned a result with an
+        error set". The handler must be signal-safe: avoid threading APIs
+        that require valid Python thread state.
+        """
         try:
-            # Get thread info
-            thread = threading.current_thread()
-            thread_id = thread.ident
-            thread_name = thread.name
+            # v270.3: Get thread info safely — avoid threading.current_thread()
+            # which calls get_ident() and crashes in native threads without
+            # Python thread state (e.g., CoreAudio IO thread).
+            thread_id = "unknown"
+            thread_name = "unknown (possibly native/CoreAudio)"
+            try:
+                # _thread.get_ident() is the low-level C call that fails
+                # in native threads. Test it first.
+                import _thread
+                _tid = _thread.get_ident()
+                thread_id = str(_tid)
+                # Only access threading.current_thread() if get_ident() succeeded
+                thread = threading.current_thread()
+                thread_name = thread.name
+            except Exception:
+                pass  # Native thread — use defaults
 
             # Log crash info
             print("\n" + "=" * 70, file=sys.stderr)
-            print("🔥 CRITICAL: SIGSEGV (Segmentation Fault) detected!", file=sys.stderr)
+            print("CRITICAL: SIGSEGV (Segmentation Fault) detected!", file=sys.stderr)
             print("=" * 70, file=sys.stderr)
             print(f"Thread: {thread_name} (ID: {thread_id})", file=sys.stderr)
-            print(f"Time: {datetime.now().isoformat()}", file=sys.stderr)
+            try:
+                print(f"Time: {datetime.now().isoformat()}", file=sys.stderr)
+            except Exception:
+                pass
 
             # Try to get stack trace
             if frame:
-                print("\nStack trace:", file=sys.stderr)
-                traceback.print_stack(frame, file=sys.stderr)
+                try:
+                    print("\nStack trace:", file=sys.stderr)
+                    traceback.print_stack(frame, file=sys.stderr)
+                except Exception:
+                    print("(stack trace unavailable — native thread)", file=sys.stderr)
 
             # Log native guard stats
             try:
@@ -3135,8 +3161,11 @@ class SegfaultHandler:
 
         finally:
             # Re-raise to let default handler terminate
-            if cls._original_handler:
-                signal.signal(signal.SIGSEGV, cls._original_handler)
+            try:
+                if cls._original_handler:
+                    signal.signal(signal.SIGSEGV, cls._original_handler)
+            except Exception:
+                pass
             # Exit with error code
             sys.exit(139)  # 128 + 11 (SIGSEGV)
 
