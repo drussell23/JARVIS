@@ -1238,7 +1238,7 @@ class ProxyLifecycleController:
                         CloudServiceType,
                     )
                     _ct = get_cost_tracker()
-                    if _ct and _ct._initialized:
+                    if _ct is not None:
                         await _ct.record_cloud_service_cost(
                             service_type=CloudServiceType.CLOUD_SQL,
                             duration_hours=_proxy_uptime_h,
