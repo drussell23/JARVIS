@@ -339,6 +339,27 @@ class EngineState(Enum):
     DISABLED = auto()
 
 
+class RoutingPolicy(Enum):
+    """
+    v276.4: Deterministic routing policy for ECAPA backend selection.
+
+    Set by parity checks, flap detection, and operator overrides.
+    Honored by ALL embedding extraction and verification paths.
+
+    AUTO:        Normal routing — cloud if available, local fallback.
+    CLOUD_ONLY:  Force cloud. Used when parity mismatch shows local is
+                 the divergent backend, or when memory blocks local.
+    LOCAL_ONLY:  Force local. Used when parity mismatch shows cloud is
+                 divergent, or when cloud is unreachable.
+    DEGRADED:    Both backends have issues. Accept best-effort with
+                 logged warning. Flap dampening may set this.
+    """
+    AUTO = "auto"
+    CLOUD_ONLY = "cloud_only"
+    LOCAL_ONLY = "local_only"
+    DEGRADED = "degraded"
+
+
 @dataclass
 class EngineMetrics:
     """Telemetry for a single ML engine."""
@@ -1372,6 +1393,38 @@ class MLEngineRegistry:
         self._parity_last_checked: float = 0.0
         self._parity_last_reason: str = "not_checked"
 
+        # v276.4: Routing policy — deterministic backend selection override.
+        # Set by parity checks, flap detection, or operator env var.
+        # Honored by extract_speaker_embedding() and verify_speaker_with_best_method().
+        _override = os.getenv("JARVIS_ECAPA_ROUTING_POLICY", "auto").lower()
+        self._routing_policy: RoutingPolicy = (
+            RoutingPolicy(_override) if _override in RoutingPolicy._value2member_map_
+            else RoutingPolicy.AUTO
+        )
+        self._routing_policy_reason: str = (
+            f"env_override:{_override}" if _override != "auto"
+            else "default"
+        )
+
+        # v276.4: Backend flap detection — tracks cloud↔local transitions.
+        # If > _flap_threshold transitions in _flap_window seconds, routing
+        # is dampened to DEGRADED to prevent state thrashing.
+        self._backend_transitions: List[Tuple[str, float]] = []  # (backend, timestamp)
+        self._flap_window: float = float(os.getenv(
+            "JARVIS_ECAPA_FLAP_WINDOW", "300.0"
+        ))  # 5 minutes
+        self._flap_threshold: int = int(os.getenv(
+            "JARVIS_ECAPA_FLAP_THRESHOLD", "4"
+        ))
+        self._flap_dampened: bool = False
+        self._flap_dampened_at: float = 0.0
+        self._flap_dampen_duration: float = float(os.getenv(
+            "JARVIS_ECAPA_FLAP_DAMPEN_DURATION", "600.0"
+        ))  # 10 minutes lockout
+
+        # v276.4: Periodic deep health task ref (started after first prewarm)
+        self._deep_health_task: Optional[asyncio.Task] = None
+
         # v275.1: Cloud Run pre-warming. Cloud Run containers have cold starts
         # of 10-30s. The contract probe (4s timeout) runs during heavy startup
         # when the container is most likely cold → always times out. Fix: send
@@ -1789,8 +1842,12 @@ class MLEngineRegistry:
                 self._use_cloud = True
                 await self._activate_cloud_routing()
 
-                # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready
-                cloud_ready, cloud_reason = await self._verify_cloud_backend_ready()
+                # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready.
+                # v276.4: Always require test_extraction=True at startup — process-ready
+                # is not inference-ready.
+                cloud_ready, cloud_reason = await self._verify_cloud_backend_ready(
+                    test_extraction=True,
+                )
 
                 if cloud_ready:
                     # Cloud verified - mark as ready
@@ -1798,6 +1855,8 @@ class MLEngineRegistry:
                     self._status.prewarm_end_time = time.time()
                     self._status.is_ready = True
                     self._ready_event.set()
+                    # v276.4: Reconcile state + record transition
+                    self._reconcile_state_after_recovery("cloud", "startup_decision")
                     logger.info("✅ Cloud ML backend VERIFIED - voice unlock ready!")
                     return self._status
                 else:
@@ -1807,11 +1866,21 @@ class MLEngineRegistry:
 
                     if fallback_enabled:
                         fallback_success = await self._fallback_to_local_ecapa(cloud_reason)
+                        # v276.4: Semantic readiness after local fallback at startup
+                        if fallback_success:
+                            semantic_ok = await self._verify_semantic_readiness(backend="local")
+                            if not semantic_ok:
+                                fallback_success = False
+                                logger.warning(
+                                    "[v276.4] Local fallback loaded but failed "
+                                    "semantic readiness test"
+                                )
                         if fallback_success:
                             self._status.prewarm_completed = True
                             self._status.prewarm_end_time = time.time()
                             self._status.is_ready = True
                             self._ready_event.set()
+                            self._reconcile_state_after_recovery("local", "startup_decision_fallback")
                             logger.info("✅ Local ECAPA fallback successful - voice unlock ready!")
                             return self._status
                         else:
@@ -1846,14 +1915,18 @@ class MLEngineRegistry:
             self._use_cloud = True
             await self._activate_cloud_routing()
 
-            # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready
-            cloud_ready, cloud_reason = await self._verify_cloud_backend_ready()
+            # CRITICAL FIX: Verify cloud backend is actually ready before marking as ready.
+            # v276.4: Always require test_extraction=True at startup.
+            cloud_ready, cloud_reason = await self._verify_cloud_backend_ready(
+                test_extraction=True,
+            )
 
             if cloud_ready:
                 self._status.prewarm_completed = True
                 self._status.prewarm_end_time = time.time()
                 self._status.is_ready = True
                 self._ready_event.set()
+                self._reconcile_state_after_recovery("cloud", "memory_pressure")
                 logger.info("✅ Cloud ML backend VERIFIED - voice unlock ready!")
                 return self._status
             else:
@@ -1864,11 +1937,21 @@ class MLEngineRegistry:
                 if fallback_enabled:
                     logger.warning("⚠️ Attempting local ECAPA despite memory pressure...")
                     fallback_success = await self._fallback_to_local_ecapa(cloud_reason)
+                    # v276.4: Semantic readiness after local fallback
+                    if fallback_success:
+                        semantic_ok = await self._verify_semantic_readiness(backend="local")
+                        if not semantic_ok:
+                            fallback_success = False
+                            logger.warning(
+                                "[v276.4] Local fallback loaded but failed "
+                                "semantic readiness test"
+                            )
                     if fallback_success:
                         self._status.prewarm_completed = True
                         self._status.prewarm_end_time = time.time()
                         self._status.is_ready = True
                         self._ready_event.set()
+                        self._reconcile_state_after_recovery("local", "memory_pressure_fallback")
                         logger.info("✅ Local ECAPA fallback successful - voice unlock ready!")
                         return self._status
 
@@ -1954,6 +2037,16 @@ class MLEngineRegistry:
             logger.info(f"   {status_icon} {name}: {engine.metrics.state.name} ({load_str})")
 
         logger.info("=" * 70)
+
+        # v276.4: Start periodic deep health validation task.
+        # Only after first prewarm — no point checking health before models load.
+        if self._deep_health_task is None or self._deep_health_task.done():
+            try:
+                self._deep_health_task = asyncio.get_running_loop().create_task(
+                    self._periodic_deep_health_check()
+                )
+            except RuntimeError:
+                pass  # No event loop
 
         return self._status
 
@@ -3579,9 +3672,10 @@ class MLEngineRegistry:
 
             if cloud_success:
                 self._ready_event.set()
-                self._memory_gate_blocked = False
                 self._last_recovery_result = True
                 self._last_routing_reason = cloud_reason
+                # v276.4: Reconcile all state atomically + record transition
+                self._reconcile_state_after_recovery("cloud", source)
                 logger.info(
                     f"[v276.3] ECAPA recovery SUCCESSFUL via cloud "
                     f"(source={source}, reason={cloud_reason})"
@@ -3642,9 +3736,10 @@ class MLEngineRegistry:
                         )
                         if semantic_ok:
                             self._ready_event.set()
-                            self._memory_gate_blocked = False
                             self._last_recovery_result = True
                             self._last_routing_reason = "local_loaded"
+                            # v276.4: Reconcile all state atomically + record transition
+                            self._reconcile_state_after_recovery("local", source)
                             logger.info(
                                 f"[v276.3] ECAPA recovery SUCCESSFUL via local "
                                 f"(source={source})"
@@ -4004,14 +4099,334 @@ class MLEngineRegistry:
                 f"Speaker verification results will be inconsistent. "
                 f"Cloud: {cloud_fp.to_dict()}, Local: {local_fp.to_dict()}"
             )
+            # v276.4: Enforce routing policy — don't just warn, ACT.
+            # Use the backend with the canonical embedding dim (192).
+            self._enforce_parity_routing_policy(cloud_fp, local_fp, reason)
         else:
             logger.info(
                 f"[v276.4] ECAPA parity OK — cloud and local compatible "
                 f"(dim={cloud_fp.embedding_dim}, rate={cloud_fp.sample_rate}, "
                 f"model={cloud_fp.model_source or 'default'})"
             )
+            # Clear any parity-driven routing override
+            if self._routing_policy_reason.startswith("parity_mismatch"):
+                self._routing_policy = RoutingPolicy.AUTO
+                self._routing_policy_reason = "parity_restored"
+                logger.info("[v276.4] Parity restored — routing policy reset to AUTO")
 
         return compatible, reason
+
+    def _enforce_parity_routing_policy(
+        self,
+        cloud_fp: _ParityFingerprint,
+        local_fp: _ParityFingerprint,
+        mismatch_reason: str,
+    ) -> None:
+        """
+        v276.4: Enforce deterministic routing when cloud/local embeddings diverge.
+
+        The canonical ECAPA-TDNN produces 192-dim embeddings at 16kHz from
+        'speechbrain/spkrec-ecapa-voxceleb'. Whichever backend matches the
+        canonical spec gets traffic. If neither matches or both are wrong,
+        enter DEGRADED mode.
+
+        This is NOT a warning — it changes live routing immediately.
+        """
+        CANONICAL_DIM = 192
+        CANONICAL_RATE = 16000
+        CANONICAL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
+
+        def _matches_canonical(fp: _ParityFingerprint) -> bool:
+            if fp.embedding_dim != CANONICAL_DIM:
+                return False
+            if fp.sample_rate != CANONICAL_RATE:
+                return False
+            # model_source may be empty if not reported — don't penalize
+            if fp.model_source and CANONICAL_SOURCE not in fp.model_source:
+                return False
+            return True
+
+        cloud_canonical = _matches_canonical(cloud_fp)
+        local_canonical = _matches_canonical(local_fp)
+
+        if cloud_canonical and not local_canonical:
+            self._routing_policy = RoutingPolicy.CLOUD_ONLY
+            self._routing_policy_reason = (
+                f"parity_mismatch:local_divergent ({mismatch_reason})"
+            )
+            logger.warning(
+                f"[v276.4] Routing policy → CLOUD_ONLY: local backend diverged "
+                f"from canonical ECAPA spec ({mismatch_reason})"
+            )
+        elif local_canonical and not cloud_canonical:
+            self._routing_policy = RoutingPolicy.LOCAL_ONLY
+            self._routing_policy_reason = (
+                f"parity_mismatch:cloud_divergent ({mismatch_reason})"
+            )
+            logger.warning(
+                f"[v276.4] Routing policy → LOCAL_ONLY: cloud backend diverged "
+                f"from canonical ECAPA spec ({mismatch_reason})"
+            )
+        elif cloud_canonical and local_canonical:
+            # Both match canonical but differ from each other — should not happen
+            # unless comparison has a bug. Default to AUTO.
+            self._routing_policy = RoutingPolicy.AUTO
+            self._routing_policy_reason = (
+                f"parity_mismatch:both_canonical_but_different ({mismatch_reason})"
+            )
+            logger.warning(
+                f"[v276.4] Both backends match canonical spec but differ "
+                f"from each other — routing policy stays AUTO ({mismatch_reason})"
+            )
+        else:
+            # Neither matches canonical — degraded mode
+            self._routing_policy = RoutingPolicy.DEGRADED
+            self._routing_policy_reason = (
+                f"parity_mismatch:both_non_canonical ({mismatch_reason})"
+            )
+            logger.error(
+                f"[v276.4] DEGRADED: Neither cloud nor local matches canonical "
+                f"ECAPA spec. Embedding results will be unreliable. "
+                f"({mismatch_reason})"
+            )
+
+    def resolve_effective_backend(
+        self,
+        prefer_cloud: Optional[bool] = None,
+    ) -> Tuple[str, str]:
+        """
+        v276.4: Central routing decision point.
+
+        Combines routing policy, flap dampening, and caller preference
+        into a single deterministic backend choice. ALL embedding extraction
+        and verification paths MUST use this instead of raw `is_using_cloud`.
+
+        Returns:
+            (backend, reason) — backend is "cloud", "local", or "best_effort"
+        """
+        # 1. Operator env var override is absolute
+        if self._routing_policy != RoutingPolicy.AUTO:
+            if self._routing_policy == RoutingPolicy.CLOUD_ONLY:
+                return "cloud", f"policy:{self._routing_policy_reason}"
+            elif self._routing_policy == RoutingPolicy.LOCAL_ONLY:
+                return "local", f"policy:{self._routing_policy_reason}"
+            elif self._routing_policy == RoutingPolicy.DEGRADED:
+                # In degraded mode, prefer whichever is available
+                if self._use_cloud and self._cloud_endpoint:
+                    return "cloud", f"degraded:cloud_available"
+                return "local", f"degraded:local_fallback"
+
+        # 2. Flap dampening locks to last-stable backend
+        if self._flap_dampened:
+            elapsed = time.time() - self._flap_dampened_at
+            if elapsed < self._flap_dampen_duration:
+                # Stay on whatever we're currently on
+                current = "cloud" if self._use_cloud else "local"
+                return current, f"flap_dampened:{elapsed:.0f}s/{self._flap_dampen_duration:.0f}s"
+            else:
+                # Dampen period expired — release
+                self._flap_dampened = False
+                logger.info(
+                    f"[v276.4] Flap dampening released after "
+                    f"{self._flap_dampen_duration:.0f}s"
+                )
+
+        # 3. Caller preference (per-call override)
+        if prefer_cloud is True:
+            return "cloud", "caller_preference:cloud"
+        elif prefer_cloud is False:
+            return "local", "caller_preference:local"
+
+        # 4. Default routing based on current state
+        if self._use_cloud and self._cloud_endpoint:
+            return "cloud", "auto:cloud_active"
+        return "local", "auto:local_active"
+
+    def _record_backend_transition(self, new_backend: str) -> None:
+        """
+        v276.4: Record a backend transition for flap detection.
+
+        If more than _flap_threshold transitions occur within _flap_window
+        seconds, enter dampened mode to stabilize routing.
+        """
+        now = time.time()
+
+        # Check if this is actually a transition (not same backend)
+        if self._backend_transitions:
+            last_backend, _ = self._backend_transitions[-1]
+            if last_backend == new_backend:
+                return  # Same backend — not a transition
+
+        self._backend_transitions.append((new_backend, now))
+
+        # Prune transitions outside the window
+        cutoff = now - self._flap_window
+        self._backend_transitions = [
+            (b, t) for b, t in self._backend_transitions if t >= cutoff
+        ]
+
+        # Check for flap condition
+        if len(self._backend_transitions) >= self._flap_threshold:
+            if not self._flap_dampened:
+                self._flap_dampened = True
+                self._flap_dampened_at = now
+                logger.warning(
+                    f"[v276.4] BACKEND FLAP DETECTED: "
+                    f"{len(self._backend_transitions)} transitions in "
+                    f"{self._flap_window:.0f}s (threshold={self._flap_threshold}). "
+                    f"Dampening routing for {self._flap_dampen_duration:.0f}s. "
+                    f"History: {[(b, f'{t:.0f}') for b, t in self._backend_transitions]}"
+                )
+
+    async def _periodic_deep_health_check(self) -> None:
+        """
+        v276.4: Background task that periodically validates the active ECAPA
+        backend can actually produce embeddings (not just respond to /health).
+
+        Detects:
+        - Warm instance with corrupted model state
+        - Memory leak causing silent quality degradation
+        - Stale model cache on long-lived Cloud Run instance
+        - Model loaded but inference hanging
+
+        Runs semantic readiness test every N minutes. On failure, triggers
+        recovery to switch to the other backend or reload.
+        """
+        interval = float(os.getenv(
+            "JARVIS_ECAPA_DEEP_HEALTH_INTERVAL", "180.0"
+        ))  # 3 minutes default
+        max_consecutive_failures = int(os.getenv(
+            "JARVIS_ECAPA_DEEP_HEALTH_MAX_FAILURES", "2"
+        ))
+
+        consecutive_failures = 0
+
+        logger.info(
+            f"[v276.4] Periodic deep health check started "
+            f"(interval={interval}s, max_failures={max_consecutive_failures})"
+        )
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                # Skip if not ready (recovery handles this)
+                if not self.is_ready:
+                    consecutive_failures = 0
+                    continue
+
+                # Determine active backend
+                active = "cloud" if (self._use_cloud and self._cloud_endpoint) else "local"
+
+                # Run semantic readiness (actual embedding test)
+                ok = await self._verify_semantic_readiness(backend=active)
+
+                if ok:
+                    consecutive_failures = 0
+                    logger.debug(
+                        f"[v276.4] Deep health OK (backend={active})"
+                    )
+                    # Also refresh parity on success
+                    if active == "cloud":
+                        self._cloud_parity = await self._fetch_cloud_parity_fingerprint()
+                    else:
+                        self._local_parity = self._get_local_parity_fingerprint()
+                    continue
+
+                consecutive_failures += 1
+                logger.warning(
+                    f"[v276.4] Deep health FAILED for {active} "
+                    f"(consecutive={consecutive_failures}/{max_consecutive_failures})"
+                )
+
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error(
+                        f"[v276.4] {active} backend failed {consecutive_failures} "
+                        f"consecutive deep health checks — triggering recovery"
+                    )
+                    consecutive_failures = 0
+                    # Trigger recovery (will try the OTHER backend)
+                    try:
+                        await self._attempt_ecapa_recovery(
+                            source=f"deep_health_failure:{active}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[v276.4] Recovery after deep health failure: {e}"
+                        )
+
+            except asyncio.CancelledError:
+                logger.info("[v276.4] Deep health check task cancelled")
+                break
+            except Exception as e:
+                logger.debug(f"[v276.4] Deep health check error: {e}")
+                await asyncio.sleep(30)  # Back off on unexpected error
+
+    def _reconcile_state_after_recovery(
+        self,
+        new_backend: str,
+        source: str,
+    ) -> None:
+        """
+        v276.4: Reconcile all routing state after a backend transition.
+
+        When switching between cloud and local, multiple flags must be
+        updated atomically to prevent split-state where one subsystem
+        sees 'cloud' while another sees 'local'.
+
+        Args:
+            new_backend: "cloud" or "local"
+            source: What triggered the transition (for logging)
+        """
+        # Record transition for flap detection
+        self._record_backend_transition(new_backend)
+
+        if new_backend == "cloud":
+            self._use_cloud = True
+            self._memory_gate_blocked = False
+            logger.info(
+                f"[v276.4] State reconciled → cloud (source={source})"
+            )
+        elif new_backend == "local":
+            self._use_cloud = False
+            self._cloud_verified = False
+            self._memory_gate_blocked = False
+            logger.info(
+                f"[v276.4] State reconciled → local (source={source})"
+            )
+
+        # Update cross-repo state file (async — fire-and-forget)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._write_cross_repo_ecapa_state(
+                is_ready=self.is_ready,
+                reason=f"reconciled:{new_backend}:{source}",
+            ))
+        except RuntimeError:
+            pass  # No event loop — skip (e.g., sync test context)
+
+    def get_routing_status(self) -> Dict[str, Any]:
+        """
+        v276.4: Return current routing state for health endpoints.
+
+        Provides full observability into routing decisions including
+        policy, flap state, parity, and active backend.
+        """
+        return {
+            "routing_policy": self._routing_policy.value,
+            "routing_policy_reason": self._routing_policy_reason,
+            "active_backend": "cloud" if (self._use_cloud and self._cloud_endpoint) else "local",
+            "flap_dampened": self._flap_dampened,
+            "flap_transitions": len(self._backend_transitions),
+            "flap_window": self._flap_window,
+            "flap_threshold": self._flap_threshold,
+            "parity": self.get_parity_status(),
+            "last_routing_reason": self._last_routing_reason,
+            "deep_health_running": (
+                self._deep_health_task is not None
+                and not self._deep_health_task.done()
+            ),
+        }
 
     def get_parity_status(self) -> Dict[str, Any]:
         """
@@ -5570,8 +5985,16 @@ async def extract_speaker_embedding(
     """
     registry = await get_ml_registry()
 
-    # Determine routing: cloud, local, or auto
-    use_cloud = prefer_cloud if prefer_cloud is not None else registry.is_using_cloud
+    # v276.4: Use centralized routing decision that honors routing policy,
+    # flap dampening, and parity-driven overrides — not just raw _use_cloud.
+    effective_backend, routing_reason = registry.resolve_effective_backend(
+        prefer_cloud=prefer_cloud,
+    )
+    use_cloud = (effective_backend == "cloud")
+    logger.debug(
+        f"[v276.4] Embedding routing: backend={effective_backend}, "
+        f"reason={routing_reason}"
+    )
 
     # ==========================================================================
     # CLOUD EXTRACTION PATH
@@ -5585,8 +6008,13 @@ async def extract_speaker_embedding(
             logger.debug(f"Cloud embedding extracted: shape {embedding.shape}")
             return embedding
 
-        # Cloud failed - try local if fallback enabled and local is ready
-        if fallback_enabled and registry.is_voice_unlock_ready:
+        # Cloud failed - try local if fallback enabled, local is ready, and
+        # routing policy allows it (CLOUD_ONLY suppresses local fallback)
+        if (
+            fallback_enabled
+            and registry.is_voice_unlock_ready
+            and registry._routing_policy != RoutingPolicy.CLOUD_ONLY
+        ):
             # v251.2: Log-once pattern for cloud→local fallback.  This fires
             # on EVERY voice verification while cloud is down — very spammy
             # when the circuit breaker is open.  Only log the first occurrence
@@ -5623,8 +6051,12 @@ async def extract_speaker_embedding(
     if embedding is not None:
         return embedding
 
-    # Local extraction failed - try cloud fallback
-    if fallback_enabled and MLConfig.CLOUD_FALLBACK_ENABLED:
+    # Local extraction failed - try cloud fallback (suppressed by LOCAL_ONLY policy)
+    if (
+        fallback_enabled
+        and MLConfig.CLOUD_FALLBACK_ENABLED
+        and registry._routing_policy != RoutingPolicy.LOCAL_ONLY
+    ):
         logger.warning("Local extraction failed, attempting cloud fallback")
 
         # Activate cloud if not already active
@@ -5998,7 +6430,14 @@ async def verify_speaker_with_best_method(
     """
     registry = await get_ml_registry()
 
-    if registry.is_using_cloud:
+    # v276.4: Use centralized routing decision
+    effective_backend, routing_reason = registry.resolve_effective_backend()
+    logger.debug(
+        f"[v276.4] Verify routing: backend={effective_backend}, "
+        f"reason={routing_reason}"
+    )
+
+    if effective_backend == "cloud":
         # Use cloud verification
         return await registry.verify_speaker_cloud(
             audio_data, reference_embedding, timeout
