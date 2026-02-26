@@ -3025,7 +3025,10 @@ def _compute_ideal_mode(avail_gb: float) -> str:
         os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE") == "0"
         and ideal in ("cloud_first", "cloud_only")
     ):
-        ideal = "sequential"
+        ideal = _resolve_local_startup_mode_on_cloud_unavailable(
+            ideal,
+            available_gb=avail_gb,
+        )
 
     return ideal
 
@@ -3262,6 +3265,201 @@ def _resolve_local_startup_mode_on_cloud_unavailable(
     current_sev = severity.get(normalized_mode, 0)
     candidate_sev = severity.get(candidate, 0)
     return normalized_mode if candidate_sev < current_sev else candidate
+
+
+def _compute_oom_preflight_retry_attempts() -> List[float]:
+    """Build deterministic OOM preflight timeout attempts from retry budget."""
+    first_timeout = max(1.0, _get_env_float("JARVIS_OOM_PREFLIGHT_TIMEOUT", 10.0))
+    retry_timeout = max(
+        1.0,
+        _get_env_float(
+            "JARVIS_OOM_RETRY_TIMEOUT",
+            max(first_timeout * 1.5, first_timeout + 5.0),
+        ),
+    )
+    retry_budget = max(0, _get_env_int("JARVIS_OOM_PREFLIGHT_RETRY_BUDGET", 1))
+    retry_backoff = max(1.0, _get_env_float("JARVIS_OOM_PREFLIGHT_RETRY_BACKOFF", 1.0))
+    retry_timeout_cap = max(
+        retry_timeout,
+        _get_env_float("JARVIS_OOM_PREFLIGHT_RETRY_TIMEOUT_MAX", retry_timeout),
+    )
+
+    attempts: List[float] = [first_timeout]
+    next_timeout = retry_timeout
+    for _ in range(retry_budget):
+        attempts.append(min(next_timeout, retry_timeout_cap))
+        next_timeout = min(retry_timeout_cap, next_timeout * retry_backoff)
+    return attempts
+
+
+def _extract_oombridge_decision_token(decision: Any) -> str:
+    """Normalize OOMBridge decision enums/strings into lowercase tokens."""
+    if decision is None:
+        return ""
+    try:
+        if hasattr(decision, "value"):
+            return str(getattr(decision, "value", "")).strip().lower()
+    except Exception:
+        pass
+    return str(decision).strip().lower()
+
+
+def _extract_oombridge_tier_token(result: Any) -> str:
+    """Extract degradation tier token from OOMBridge result."""
+    _tier = getattr(result, "degradation_tier", None)
+    if _tier is None:
+        return ""
+    try:
+        if hasattr(_tier, "value"):
+            return str(getattr(_tier, "value", "")).strip().lower()
+    except Exception:
+        pass
+    return str(_tier).strip().lower()
+
+
+def _derive_startup_mode_from_oombridge_result(result: Any) -> Tuple[Optional[str], bool, bool]:
+    """Map OOMBridge result to (mode, force_apply, skip_local_prewarm)."""
+    decision = _extract_oombridge_decision_token(getattr(result, "decision", None))
+    can_local = bool(getattr(result, "can_proceed_locally", False))
+    _available_gb_raw = getattr(result, "available_ram_gb", None)
+    try:
+        available_gb = float(_available_gb_raw) if _available_gb_raw is not None else None
+    except (TypeError, ValueError):
+        available_gb = None
+
+    if decision in ("cloud", "cloud_required"):
+        return "cloud_first", False, True
+
+    if decision == "degraded":
+        _tier = _extract_oombridge_tier_token(result)
+        if _tier == "minimal":
+            return "minimal", True, True
+        if _tier == "sequential":
+            return "sequential", True, False
+        if _tier == "aggressive":
+            return "local_optimized", True, False
+        if _tier == "abort":
+            _mode = _select_oombridge_fail_closed_mode(available_gb, error=None)
+            return _mode, True, True
+        return "sequential", True, False
+
+    if decision == "abort":
+        _mode = _select_oombridge_fail_closed_mode(available_gb, error=None)
+        return _mode, True, True
+
+    # Compatibility fallback: unknown decision but explicit no-local contract.
+    if not can_local:
+        return "cloud_first", False, True
+    return None, False, False
+
+
+def _apply_startup_mode_target(
+    target_mode: str,
+    reason: str,
+    *,
+    caller: str,
+    force: bool = False,
+) -> str:
+    """Apply startup mode with optional forced transition and env synchronization."""
+    _normalized = (target_mode or "local_full").strip().lower()
+    if _normalized not in _MODE_SEVERITY:
+        _normalized = "local_full"
+
+    if force:
+        _set_startup_env(
+            "JARVIS_STARTUP_MEMORY_MODE",
+            _normalized,
+            reason,
+            caller=caller,
+        )
+        _effective = _normalized
+    else:
+        _effective = _apply_mode_degradation(_normalized, reason)
+
+    _set_startup_env(
+        "JARVIS_STARTUP_EFFECTIVE_MODE",
+        _effective,
+        reason,
+        caller=caller,
+    )
+
+    if _effective == "minimal":
+        _set_startup_env(
+            "JARVIS_BACKEND_MINIMAL",
+            "true",
+            f"{reason}:minimal_mode",
+            write_only_true=True,
+            caller=caller,
+        )
+    return _effective
+
+
+def _select_oombridge_fail_closed_mode(
+    available_gb: Optional[float],
+    error: Optional[BaseException],
+) -> str:
+    """Select deterministic fail-closed local mode when OOMBridge is unavailable."""
+    critical_floor = max(0.5, _get_env_float("JARVIS_OOM_FAIL_CLOSED_CRITICAL_GB", 2.0))
+    low_ram_floor = max(
+        critical_floor,
+        _get_env_float("JARVIS_OOM_FAIL_CLOSED_LOW_RAM_GB", 4.0),
+    )
+
+    mode = _resolve_local_startup_mode_on_cloud_unavailable(
+        "cloud_only",
+        available_gb=available_gb,
+    )
+    if available_gb is not None:
+        if available_gb < critical_floor:
+            mode = "minimal"
+        elif available_gb < low_ram_floor:
+            mode = "sequential"
+
+    _errno_value: Optional[int] = None
+    if isinstance(error, OSError):
+        _errno_value = getattr(error, "errno", None)
+    if _errno_value == errno.ENOMEM:
+        mode = "minimal" if (available_gb is not None and available_gb < critical_floor) else "sequential"
+
+    if mode not in _MODE_SEVERITY:
+        mode = "sequential"
+    return mode
+
+
+def _apply_oombridge_fail_closed(
+    reason: str,
+    *,
+    error: Optional[BaseException],
+    available_gb: Optional[float],
+) -> str:
+    """Apply canonical OOMBridge fail-closed behavior and publish mode/env state."""
+    _mode = _select_oombridge_fail_closed_mode(available_gb, error)
+    _effective = _apply_startup_mode_target(
+        _mode,
+        reason=f"oombridge_fail_closed:{reason}",
+        caller="_apply_oombridge_fail_closed",
+        force=True,
+    )
+    _set_startup_env(
+        "JARVIS_OOMBRIDGE_AVAILABLE",
+        "0",
+        reason=f"oombridge_fail_closed:{reason}",
+        caller="_apply_oombridge_fail_closed",
+    )
+    _set_startup_env(
+        "JARVIS_OOM_FAIL_CLOSED",
+        "true",
+        reason=f"oombridge_fail_closed:{reason}",
+        caller="_apply_oombridge_fail_closed",
+    )
+    if available_gb is not None:
+        _set_startup_env(
+            "JARVIS_MEASURED_AVAILABLE_GB",
+            f"{available_gb:.2f}",
+            reason=f"oombridge_fail_closed:{reason}:measured",
+            caller="_apply_oombridge_fail_closed",
+        )
+    return _effective
 
 
 def _is_cloud_probe_candidate(
@@ -65329,21 +65527,33 @@ class JarvisSystemKernel:
         # credential discovery, module imports, and memory telemetry take 10-30s under
         # I/O pressure. The old 8s total was the primary contributor to 28s+ startup
         # delays (OOMBridge timed out → degrade → GCP probe → retry cascade).
-        _oom_preflight_timeout = _get_env_float("JARVIS_OOM_PREFLIGHT_TIMEOUT", 10.0)
-        _oom_retry_timeout = _get_env_float("JARVIS_OOM_RETRY_TIMEOUT", 15.0)
         self._startup_memory_decision = None
-        _oom_attempts = [_oom_preflight_timeout, _oom_retry_timeout]
+        _oom_attempts = _compute_oom_preflight_retry_attempts()
+        _oom_retry_budget_total = max(0, len(_oom_attempts) - 1)
         _oom_succeeded = False  # v266.3: Read by GCP probe to log bridge status
-        os.environ.setdefault("JARVIS_OOMBRIDGE_AVAILABLE", "1")
-
-        # v270.1: Thin wrappers — delegate to module-level _mode_severity / _apply_mode_degradation.
-        def _startup_mode_severity(mode: str) -> int:
-            return _mode_severity(mode)
-
-        def _apply_effective_mode_degradation(new_mode: str, reason: str) -> None:
-            _apply_mode_degradation(new_mode, reason)
+        _set_startup_env("JARVIS_OOMBRIDGE_AVAILABLE", "1", "oom_preflight:begin", caller="_startup_impl:oom_preflight")
+        _set_startup_env("JARVIS_OOM_FAIL_CLOSED", "false", "oom_preflight:begin", caller="_startup_impl:oom_preflight")
+        _set_startup_env(
+            "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_TOTAL",
+            str(_oom_retry_budget_total),
+            "oom_preflight:begin",
+            caller="_startup_impl:oom_preflight",
+        )
+        _set_startup_env(
+            "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_REMAINING",
+            str(_oom_retry_budget_total),
+            "oom_preflight:begin",
+            caller="_startup_impl:oom_preflight",
+        )
 
         for _oom_attempt_idx, _oom_timeout in enumerate(_oom_attempts):
+            _remaining_budget = max(0, len(_oom_attempts) - (_oom_attempt_idx + 1))
+            _set_startup_env(
+                "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_REMAINING",
+                str(_remaining_budget),
+                f"oom_preflight:attempt:{_oom_attempt_idx + 1}",
+                caller="_startup_impl:oom_preflight",
+            )
             try:
                 from core.gcp_oom_prevention_bridge import check_memory_before_heavy_init
                 _oom_result = await asyncio.wait_for(
@@ -65356,29 +65566,52 @@ class JarvisSystemKernel:
                 )
                 self._startup_memory_decision = _oom_result
 
-                if not _oom_result.can_proceed_locally:
-                    _apply_effective_mode_degradation(
-                        "cloud_first",
-                        reason=(
-                            f"oombridge:{_oom_result.decision.value}:"
-                            f"avail={_oom_result.available_ram_gb:.1f}GB"
-                        ),
-                    )
-                    _skip_local_prewarm = True
-                    _skip_reason = (
-                        f"oom_bridge: {_oom_result.decision.value} "
-                        f"(avail={_oom_result.available_ram_gb:.1f}GB)"
-                    )
-                elif _oom_result.decision.value == "degraded":
-                    _apply_effective_mode_degradation(
-                        "sequential",
-                        reason=(
-                            f"oombridge:degraded:avail={_oom_result.available_ram_gb:.1f}GB"
-                        ),
+                _decision_token = _extract_oombridge_decision_token(
+                    getattr(_oom_result, "decision", None)
+                )
+                _avail_gb_raw = getattr(_oom_result, "available_ram_gb", None)
+                try:
+                    _avail_gb = float(_avail_gb_raw) if _avail_gb_raw is not None else None
+                except (TypeError, ValueError):
+                    _avail_gb = None
+                _avail_tag = f"{_avail_gb:.1f}GB" if _avail_gb is not None else "unknown"
+
+                _hint_mode_raw = getattr(_oom_result, "recommended_startup_mode", None)
+                _hint_force = bool(getattr(_oom_result, "force_mode_apply", False))
+                _hint_skip = bool(getattr(_oom_result, "skip_local_prewarm", False))
+                _target_mode: Optional[str]
+                _force_mode: bool
+                _skip_hint: bool
+                if _hint_mode_raw:
+                    _target_mode = str(_hint_mode_raw).strip().lower()
+                    _force_mode = _hint_force
+                    _skip_hint = _hint_skip
+                else:
+                    _target_mode, _force_mode, _skip_hint = _derive_startup_mode_from_oombridge_result(
+                        _oom_result
                     )
 
+                if _target_mode:
+                    _effective_mode = _apply_startup_mode_target(
+                        _target_mode,
+                        reason=f"oombridge:{_decision_token or 'unknown'}:avail={_avail_tag}",
+                        caller="_startup_impl:oom_preflight",
+                        force=_force_mode,
+                    )
+                    if _skip_hint or _effective_mode in (
+                        "cloud_first",
+                        "cloud_only",
+                        "sequential",
+                        "minimal",
+                    ):
+                        _skip_local_prewarm = True
+                        _skip_reason = (
+                            f"oom_bridge:{_decision_token or 'unknown'}"
+                            + (f" (avail={_avail_tag})" if _avail_gb is not None else "")
+                        )
+
                 _oom_succeeded = True
-                os.environ["JARVIS_OOMBRIDGE_AVAILABLE"] = "1"
+                _set_startup_env("JARVIS_OOMBRIDGE_AVAILABLE", "1", "oom_preflight:success", caller="_startup_impl:oom_preflight")
                 break  # Success — exit retry loop
             except asyncio.CancelledError:
                 raise
@@ -65388,36 +65621,19 @@ class JarvisSystemKernel:
                         "[OOMBridge] Attempt %d failed (%s), retrying with %ds timeout...",
                         _oom_attempt_idx + 1,
                         str(_oom_err) or type(_oom_err).__name__,
-                        int(_oom_retry_timeout),
+                        int(_oom_attempts[_oom_attempt_idx + 1]),
                     )
                     continue
                 # Final attempt failed — unconditional degradation
                 _available_gb = _read_available_memory_gb()
-                _guard_mode = _resolve_local_startup_mode_on_cloud_unavailable(
-                    "cloud_only",
+                _guard_mode = _apply_oombridge_fail_closed(
+                    "unavailable",
+                    error=_oom_err,
                     available_gb=_available_gb,
                 )
-                if _available_gb is not None and _available_gb < 4.0:
-                    _guard_mode = "sequential"
-
-                _oom_errno = None
-                try:
-                    if isinstance(_oom_err, OSError):
-                        _oom_errno = _oom_err.errno
-                except Exception:
-                    _oom_errno = None
-
-                if _oom_errno == errno.ENOMEM:
-                    _guard_mode = "minimal" if (_available_gb is not None and _available_gb < 2.0) else "sequential"
-                    self.logger.error(
-                        "[OOMBridge] ENOMEM during preflight; forcing deterministic degrade to %s",
-                        _guard_mode,
-                    )
-                # v266.3: OOMBridge is broken — cloud modes can't execute without it.
-                # Unconditionally degrade to local fallback regardless of current mode.
-                _apply_effective_mode_degradation(_guard_mode, reason="oombridge_unavailable")
-                # v266.3: Signal to Phase 2/3 gates that cloud modes are not viable.
-                os.environ["JARVIS_OOMBRIDGE_AVAILABLE"] = "0"
+                if _guard_mode in ("sequential", "minimal"):
+                    _skip_local_prewarm = True
+                    _skip_reason = f"oom_bridge_fail_closed:{_guard_mode}"
 
                 _oom_err_str = str(_oom_err) or type(_oom_err).__name__
                 _oom_msg = (
@@ -82885,6 +83101,11 @@ class JarvisSystemKernel:
                 "effective_mode": os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full"),
                 "cloud_recovery_candidate": os.environ.get("JARVIS_CLOUD_RECOVERY_CANDIDATE", "false"),
                 "oombridge_available": os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE", "1"),
+                "oom_fail_closed": os.environ.get("JARVIS_OOM_FAIL_CLOSED", "false"),
+                "oom_preflight_retry_budget_remaining": os.environ.get(
+                    "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_REMAINING",
+                    "0",
+                ),
             },
         }
 
@@ -82926,6 +83147,15 @@ class JarvisSystemKernel:
             "effective_mode": os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full"),
             "cloud_recovery_candidate": os.environ.get("JARVIS_CLOUD_RECOVERY_CANDIDATE", "false"),
             "oombridge_available": os.environ.get("JARVIS_OOMBRIDGE_AVAILABLE", "1"),
+            "oom_fail_closed": os.environ.get("JARVIS_OOM_FAIL_CLOSED", "false"),
+            "oom_preflight_retry_budget_total": os.environ.get(
+                "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_TOTAL",
+                "0",
+            ),
+            "oom_preflight_retry_budget_remaining": os.environ.get(
+                "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_REMAINING",
+                "0",
+            ),
             "backend_minimal": os.environ.get("JARVIS_BACKEND_MINIMAL", "false"),
         }
 

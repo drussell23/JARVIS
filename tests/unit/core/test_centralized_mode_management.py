@@ -5,7 +5,9 @@ _reevaluate_mode_at_boundary, and _check_spawn_admission all behave correctly
 and maintain the same semantics as the 6 duplicate inline implementations
 they replaced.
 """
+import errno
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +29,14 @@ def _clean_env(monkeypatch):
         "JARVIS_CAPABILITY_DOCKER",
         "JARVIS_CAPABILITY_LOCAL_STORAGE",
         "JARVIS_BACKEND_MINIMAL",
+        "JARVIS_OOM_FAIL_CLOSED",
+        "JARVIS_OOM_FAIL_CLOSED_CRITICAL_GB",
+        "JARVIS_OOM_FAIL_CLOSED_LOW_RAM_GB",
+        "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET",
+        "JARVIS_OOM_PREFLIGHT_RETRY_BACKOFF",
+        "JARVIS_OOM_PREFLIGHT_RETRY_TIMEOUT_MAX",
+        "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_TOTAL",
+        "JARVIS_OOM_PREFLIGHT_RETRY_BUDGET_REMAINING",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -155,6 +165,64 @@ class TestApplyModeDegradation:
         # Can't go back
         apply_deg("sequential", "step3_backwards")
         assert os.environ["JARVIS_STARTUP_MEMORY_MODE"] == "cloud_first"
+
+
+class TestOOMBridgePolicyHelpers:
+    """Test OOMBridge fail-closed helpers and retry budget expansion."""
+
+    def test_fail_closed_mode_selection(self, monkeypatch):
+        import unified_supervisor
+
+        monkeypatch.setenv("JARVIS_OOM_FAIL_CLOSED_CRITICAL_GB", "2.0")
+        monkeypatch.setenv("JARVIS_OOM_FAIL_CLOSED_LOW_RAM_GB", "4.0")
+
+        assert unified_supervisor._select_oombridge_fail_closed_mode(1.2, None) == "minimal"
+        assert unified_supervisor._select_oombridge_fail_closed_mode(2.6, None) == "sequential"
+        assert unified_supervisor._select_oombridge_fail_closed_mode(8.0, None) == "local_optimized"
+
+    def test_fail_closed_mode_selection_enomem_prefers_strict_fallback(self):
+        import unified_supervisor
+
+        err = OSError(errno.ENOMEM, "out of memory")
+        assert unified_supervisor._select_oombridge_fail_closed_mode(6.0, err) == "sequential"
+        assert unified_supervisor._select_oombridge_fail_closed_mode(1.0, err) == "minimal"
+
+    def test_retry_budget_expands_attempts(self, monkeypatch):
+        import unified_supervisor
+
+        monkeypatch.setenv("JARVIS_OOM_PREFLIGHT_TIMEOUT", "5.0")
+        monkeypatch.setenv("JARVIS_OOM_RETRY_TIMEOUT", "7.0")
+        monkeypatch.setenv("JARVIS_OOM_PREFLIGHT_RETRY_BUDGET", "2")
+        monkeypatch.setenv("JARVIS_OOM_PREFLIGHT_RETRY_BACKOFF", "2.0")
+        monkeypatch.setenv("JARVIS_OOM_PREFLIGHT_RETRY_TIMEOUT_MAX", "12.0")
+
+        attempts = unified_supervisor._compute_oom_preflight_retry_attempts()
+        assert attempts == [5.0, 7.0, 12.0]
+
+    def test_decision_to_mode_mapping_for_abort_and_degraded(self):
+        import unified_supervisor
+
+        degraded_minimal = SimpleNamespace(
+            decision=SimpleNamespace(value="degraded"),
+            can_proceed_locally=True,
+            available_ram_gb=1.4,
+            degradation_tier=SimpleNamespace(value="minimal"),
+        )
+        mode, force, skip = unified_supervisor._derive_startup_mode_from_oombridge_result(
+            degraded_minimal
+        )
+        assert (mode, force, skip) == ("minimal", True, True)
+
+        abort_result = SimpleNamespace(
+            decision=SimpleNamespace(value="abort"),
+            can_proceed_locally=False,
+            available_ram_gb=2.4,
+            degradation_tier=SimpleNamespace(value="abort"),
+        )
+        mode2, force2, skip2 = unified_supervisor._derive_startup_mode_from_oombridge_result(
+            abort_result
+        )
+        assert (mode2, force2, skip2) == ("sequential", True, True)
 
 
 class TestReevaluateModeAtBoundary:

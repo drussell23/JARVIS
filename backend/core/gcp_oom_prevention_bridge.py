@@ -205,6 +205,11 @@ class MemoryCheckResult:
     gcp_auto_enabled: bool = False  # True if GCP was auto-enabled due to critical memory
     adaptive_estimate_used: bool = False  # True if using learned estimate
     actual_estimate_mb: int = 0  # The estimate that was actually used
+    # v2.1.0: Supervisor control-plane contract fields
+    recommended_startup_mode: str = "local_full"
+    force_mode_apply: bool = False
+    skip_local_prewarm: bool = False
+    bridge_available: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for logging/IPC."""
@@ -226,6 +231,10 @@ class MemoryCheckResult:
             "gcp_auto_enabled": self.gcp_auto_enabled,
             "adaptive_estimate_used": self.adaptive_estimate_used,
             "actual_estimate_mb": self.actual_estimate_mb,
+            "recommended_startup_mode": self.recommended_startup_mode,
+            "force_mode_apply": self.force_mode_apply,
+            "skip_local_prewarm": self.skip_local_prewarm,
+            "bridge_available": self.bridge_available,
         }
 
     @property
@@ -286,6 +295,59 @@ OOM_PREVENTION_THRESHOLDS = {
     "auto_enable_gcp_on_critical": os.getenv("JARVIS_AUTO_ENABLE_GCP", "true").lower() == "true",
     "skip_gcp_if_credentials_missing": os.getenv("JARVIS_SKIP_GCP_NO_CREDS", "true").lower() == "true",
 }
+
+def _select_fail_closed_startup_mode(available_gb: Optional[float]) -> str:
+    """Deterministic local fallback when cloud/bridge execution is unavailable."""
+    critical_floor = max(0.5, float(OOM_PREVENTION_THRESHOLDS.get("critical_ram_gb", 1.5)))
+    low_ram_floor = max(
+        critical_floor,
+        float(os.getenv("JARVIS_OOM_FAIL_CLOSED_LOW_RAM_GB", "4.0")),
+    )
+
+    if available_gb is None:
+        return "sequential"
+    if available_gb < critical_floor:
+        return "minimal"
+    if available_gb < low_ram_floor:
+        return "sequential"
+    return "local_optimized"
+
+
+def _derive_startup_mode_contract(
+    decision: MemoryDecision,
+    degradation_tier: DegradationTier,
+    *,
+    can_proceed_locally: bool,
+    available_gb: Optional[float],
+) -> Tuple[str, bool, bool]:
+    """
+    Map OOMBridge decisions to supervisor startup-mode contract.
+
+    Returns:
+        Tuple of (recommended_startup_mode, force_mode_apply, skip_local_prewarm)
+    """
+    if decision in (MemoryDecision.CLOUD, MemoryDecision.CLOUD_REQUIRED):
+        return "cloud_first", False, True
+
+    if decision == MemoryDecision.DEGRADED:
+        if degradation_tier == DegradationTier.TIER_2_AGGRESSIVE_OPTIMIZE:
+            return "local_optimized", True, False
+        if degradation_tier == DegradationTier.TIER_3_SEQUENTIAL_LOAD:
+            return "sequential", True, True
+        if degradation_tier == DegradationTier.TIER_4_MINIMAL_MODE:
+            return "minimal", True, True
+        if degradation_tier == DegradationTier.TIER_5_ABORT:
+            _mode = _select_fail_closed_startup_mode(available_gb)
+            return _mode, True, True
+        return "sequential", True, True
+
+    if decision == MemoryDecision.ABORT:
+        _mode = _select_fail_closed_startup_mode(available_gb)
+        return _mode, True, True
+
+    if not can_proceed_locally:
+        return "cloud_first", False, True
+    return "local_full", False, False
 
 
 class AdaptiveMemoryEstimator:
@@ -703,6 +765,13 @@ class GCPOOMPreventionBridge:
                         can_proceed_locally = True
                         recommendations.append("⚠️ GCP unavailable - proceeding locally with risk")
 
+        recommended_mode, force_mode_apply, skip_local_prewarm = _derive_startup_mode_contract(
+            decision,
+            degradation_tier,
+            can_proceed_locally=can_proceed_locally,
+            available_gb=available_gb,
+        )
+
         result = MemoryCheckResult(
             decision=decision,
             can_proceed_locally=can_proceed_locally,
@@ -720,6 +789,10 @@ class GCPOOMPreventionBridge:
             gcp_auto_enabled=gcp_auto_enabled,
             adaptive_estimate_used=adaptive_estimate_used,
             actual_estimate_mb=estimated_mb,
+            recommended_startup_mode=recommended_mode,
+            force_mode_apply=force_mode_apply,
+            skip_local_prewarm=skip_local_prewarm,
+            bridge_available=True,
         )
 
         # Log decision with tier info
