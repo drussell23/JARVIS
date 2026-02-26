@@ -774,7 +774,11 @@ def _load_with_meta_tensor_recovery(load_fn, model_name: str, max_retries: int =
                 return load_fn()
         except RuntimeError as e:
             error_str = str(e)
-            if "meta" in error_str and ("expected device cpu" in error_str or "not on the expected device" in error_str):
+            if "meta" in error_str and (
+                "expected device cpu" in error_str
+                or "not on the expected device" in error_str
+                or "Cannot copy out of meta tensor" in error_str
+            ):
                 last_error = e
                 if attempt < max_retries:
                     logger.warning(
