@@ -132,12 +132,11 @@ class SpeakerRecognitionEngine:
 
         def _load_speechbrain_model():
             """Synchronous SpeechBrain model loader (runs in thread)."""
-            # v93.0: Updated to use speechbrain.inference (pretrained deprecated in SpeechBrain 1.0)
+            # v271.3: Route through centralized safe loader (meta tensor protection)
             try:
-                from speechbrain.inference import EncoderClassifier
+                from voice.engines.speechbrain_engine import safe_from_hparams
             except ImportError:
-                # Fallback for older SpeechBrain versions
-                from speechbrain.pretrained import EncoderClassifier
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
             import torch
 
             # Limit torch threads to prevent CPU overload
@@ -149,7 +148,9 @@ class SpeakerRecognitionEngine:
 
             logger.info(f"Loading SpeechBrain model in background thread: {model_name}")
 
-            model = EncoderClassifier.from_hparams(
+            model = safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="xvect_speaker_recognition",
                 source=model_name,
                 savedir=save_dir,
                 run_opts={"device": device},

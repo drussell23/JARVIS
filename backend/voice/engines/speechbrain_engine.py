@@ -644,10 +644,73 @@ def _patch_torch_load_for_speechbrain():
         logger.warning(f"⚠️ Could not apply torch.load patch: {e}")
 
 
-# Apply all meta tensor patches when module loads
-_patch_torch_load_for_speechbrain()
-_patch_speechbrain_parameter_transfer()
-_patch_speechbrain_meta_tensor_handling()
+# ============================================================================
+# v271.3: CENTRALIZED SPEECHBRAIN PATCH BOOTSTRAP
+# ============================================================================
+# All meta tensor patches (torch.load, parameter_transfer, Pretrained.__init__)
+# are applied through a single idempotent, thread-safe bootstrap function.
+#
+# WHY: Previously, patches were applied as module-level side effects on import.
+# Correctness depended on import ORDER — files that loaded SpeechBrain models
+# without first importing this module got unpatched codepaths. Under async/
+# parallel startup, import order is nondeterministic → intermittent crashes.
+#
+# NOW: `ensure_speechbrain_patches_applied()` is the SINGLE source of truth.
+# Every SpeechBrain model loader MUST call it (or use `safe_from_hparams()`).
+# Module-level application below ensures backward compat for direct importers.
+# ============================================================================
+import threading as _threading
+
+_PATCHES_APPLIED = False
+_PATCHES_LOCK = _threading.Lock()
+
+
+def ensure_speechbrain_patches_applied() -> bool:
+    """v271.3: Centralized, idempotent SpeechBrain meta tensor patch bootstrap.
+
+    MUST be called before any SpeechBrain from_hparams() invocation.
+    Thread-safe and idempotent — safe to call from any thread, any number of times.
+
+    Applies three global monkey-patches to SpeechBrain internals:
+      1. torch.load patch — prevents meta tensor creation via mmap=False
+      2. parameter_transfer patch — handles assign=True for meta tensors
+      3. Pretrained.__init__ patch — uses to_empty() + safe device movement
+
+    Returns:
+        True if patches are active, False if SpeechBrain is not importable.
+    """
+    global _PATCHES_APPLIED
+    if _PATCHES_APPLIED:
+        return True
+
+    with _PATCHES_LOCK:
+        if _PATCHES_APPLIED:  # Double-check after acquiring lock
+            return True
+        try:
+            _patch_torch_load_for_speechbrain()
+            _patch_speechbrain_parameter_transfer()
+            _patch_speechbrain_meta_tensor_handling()
+            _PATCHES_APPLIED = True
+
+            # Set marker on speechbrain module for external verification
+            try:
+                import speechbrain as _sb
+                _sb._JARVIS_META_PATCHES_ACTIVE = True
+            except ImportError:
+                pass
+
+            logger.info("   [v271.3] SpeechBrain meta tensor patches applied (centralized bootstrap)")
+            return True
+        except ImportError:
+            logger.debug("   [v271.3] SpeechBrain not available — patches deferred")
+            return False
+        except Exception as e:
+            logger.warning(f"   [v271.3] Failed to apply SpeechBrain patches: {e}")
+            return False
+
+
+# Apply patches when this module loads (backward compat for direct importers)
+ensure_speechbrain_patches_applied()
 
 
 # ============================================================================
@@ -799,6 +862,74 @@ def _load_with_meta_tensor_recovery(load_fn, model_name: str, max_retries: int =
             else:
                 raise
     raise last_error  # Should not reach here, but safety net
+
+
+def safe_from_hparams(cls_or_path, *, model_name: str = "unknown", **from_hparams_kwargs):
+    """v271.3: Centralized SpeechBrain model loader with full meta tensor protection.
+
+    THE canonical way to load any SpeechBrain model throughout the JARVIS codebase.
+    Replaces direct cls.from_hparams() calls. Ensures:
+      1. Global patches are applied (idempotent bootstrap)
+      2. PyTorch dispatch state is clean (context manager)
+      3. Meta tensor errors trigger automatic recovery (retry wrapper)
+
+    Args:
+        cls_or_path: Either a SpeechBrain class (e.g., EncoderClassifier) or a
+                     fully-qualified class path string (e.g.,
+                     "speechbrain.inference.speaker.EncoderClassifier").
+                     String form eliminates the need for callers to import SpeechBrain.
+        model_name: Human-readable name for logging (e.g., "ecapa_tdnn", "asr_wav2vec2")
+        **from_hparams_kwargs: Passed directly to cls.from_hparams()
+
+    Returns:
+        Loaded SpeechBrain model instance
+
+    Example:
+        # With class:
+        from speechbrain.inference.speaker import EncoderClassifier
+        model = safe_from_hparams(EncoderClassifier, model_name="ecapa", source="...")
+
+        # With string (no SpeechBrain import needed at call site):
+        model = safe_from_hparams(
+            "speechbrain.inference.speaker.EncoderClassifier",
+            model_name="ecapa",
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cpu"},
+        )
+    """
+    ensure_speechbrain_patches_applied()
+
+    # Resolve class from string path if needed
+    if isinstance(cls_or_path, str):
+        import importlib
+        module_path, cls_name = cls_or_path.rsplit(".", 1)
+        try:
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, cls_name)
+        except (ImportError, AttributeError):
+            # SpeechBrain 1.0 reorganized: inference.speaker → inference → pretrained
+            # Try progressively older module paths
+            if "speechbrain.inference" in module_path:
+                for fallback in ["speechbrain.inference", "speechbrain.pretrained"]:
+                    try:
+                        mod = importlib.import_module(fallback)
+                        cls = getattr(mod, cls_name)
+                        break
+                    except (ImportError, AttributeError):
+                        continue
+                else:
+                    raise ImportError(
+                        f"Cannot import {cls_name} from {module_path} or fallback paths"
+                    )
+            else:
+                raise
+    else:
+        cls = cls_or_path
+
+    def _do_load():
+        return cls.from_hparams(**from_hparams_kwargs)
+
+    return _load_with_meta_tensor_recovery(_do_load, model_name)
 
 
 @dataclass
@@ -1654,7 +1785,10 @@ __all__ = ["EncoderClassifier"]
         logger.info("   Loading model from local directory...")
         from speechbrain.inference.speaker import EncoderClassifier
 
-        model = EncoderClassifier.from_hparams(
+        # v271.3: Route through centralized safe loader
+        model = safe_from_hparams(
+            EncoderClassifier,
+            model_name="ecapa_tdnn_fallback",
             source=str(save_dir),
             savedir=str(save_dir),
             hparams_file=str(hyperparams_patched),
@@ -1750,11 +1884,19 @@ __all__ = ["EncoderDecoderASR"]
 
         hparams_file = str(hyperparams_patched) if hyperparams_patched.exists() else None
 
-        model = EncoderDecoderASR.from_hparams(
-            source=str(save_dir),
-            savedir=str(save_dir),
-            hparams_file=hparams_file,
-            run_opts=run_opts,
+        # v271.3: Route through centralized safe loader
+        _hparams_kwargs = {
+            "source": str(save_dir),
+            "savedir": str(save_dir),
+            "run_opts": run_opts,
+        }
+        if hparams_file is not None:
+            _hparams_kwargs["hparams_file"] = hparams_file
+
+        model = safe_from_hparams(
+            EncoderDecoderASR,
+            model_name="asr_wav2vec2_fallback",
+            **_hparams_kwargs,
         )
 
         logger.info("   ✅ ASR model loaded via fallback method")

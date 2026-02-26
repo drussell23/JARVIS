@@ -1995,17 +1995,22 @@ class UnifiedVoiceCacheManager:
         try:
             logger.info("🔄 Loading ECAPA-TDNN directly from SpeechBrain...")
 
-            # Define loader function (imports inside to avoid issues)
+            # v271.3: Route through centralized safe loader (meta tensor protection)
             def _load():
                 import torch
-                from speechbrain.inference.speaker import EncoderClassifier
+                try:
+                    from voice.engines.speechbrain_engine import safe_from_hparams
+                except ImportError:
+                    from backend.voice.engines.speechbrain_engine import safe_from_hparams
 
                 # Force CPU to avoid MPS issues
                 torch.set_num_threads(1)
 
-                return EncoderClassifier.from_hparams(
+                return safe_from_hparams(
+                    "speechbrain.inference.speaker.EncoderClassifier",
+                    model_name="ecapa_cache_direct",
                     source="speechbrain/spkrec-ecapa-voxceleb",
-                    run_opts={"device": "cpu"}
+                    run_opts={"device": "cpu"},
                 )
 
             # Use asyncio.to_thread (Python 3.9+) for thread-safe execution
@@ -2034,15 +2039,21 @@ class UnifiedVoiceCacheManager:
         Returns a callable that loads the model, for use with ParallelModelLoader.
         """
         def _load_ecapa():
+            # v271.3: Route through centralized safe loader (meta tensor protection)
             import torch
-            from speechbrain.inference.speaker import EncoderClassifier
+            try:
+                from voice.engines.speechbrain_engine import safe_from_hparams
+            except ImportError:
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
 
             # Force CPU to avoid MPS issues with FFT operations
             torch.set_num_threads(1)
 
-            encoder = EncoderClassifier.from_hparams(
+            encoder = safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="ecapa_cache_factory",
                 source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"}
+                run_opts={"device": "cpu"},
             )
             return encoder
 

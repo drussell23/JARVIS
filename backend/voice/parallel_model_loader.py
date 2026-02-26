@@ -524,7 +524,11 @@ async def load_whisper_model() -> Any:
 async def load_ecapa_encoder() -> Any:
     """Load ECAPA-TDNN speaker encoder with caching."""
     def _load():
-        from speechbrain.inference.speaker import EncoderClassifier
+        # v271.3: Route through centralized safe loader (meta tensor protection)
+        try:
+            from voice.engines.speechbrain_engine import safe_from_hparams
+        except ImportError:
+            from backend.voice.engines.speechbrain_engine import safe_from_hparams
         import torch
 
         # Force CPU for ECAPA-TDNN (MPS doesn't support required FFT ops)
@@ -532,9 +536,11 @@ async def load_ecapa_encoder() -> Any:
 
         # Suppress benign HuggingFace warnings about Wav2Vec2 weight initialization
         with suppress_hf_model_warnings():
-            encoder = EncoderClassifier.from_hparams(
+            encoder = safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="ecapa_parallel_loader",
                 source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"}
+                run_opts={"device": "cpu"},
             )
         return encoder
 
@@ -551,7 +557,11 @@ async def load_all_voice_models() -> ParallelLoadResult:
     Whisper and ECAPA-TDNN simultaneously for minimum startup time.
     """
     from voice.whisper_audio_fix import _whisper_handler
-    from speechbrain.inference.speaker import EncoderClassifier
+    # v271.3: Route through centralized safe loader (meta tensor protection)
+    try:
+        from voice.engines.speechbrain_engine import safe_from_hparams
+    except ImportError:
+        from backend.voice.engines.speechbrain_engine import safe_from_hparams
     import torch
 
     def load_whisper():
@@ -562,9 +572,11 @@ async def load_all_voice_models() -> ParallelLoadResult:
         torch.set_num_threads(1)
         # Suppress benign HuggingFace warnings about Wav2Vec2 weight initialization
         with suppress_hf_model_warnings():
-            return EncoderClassifier.from_hparams(
+            return safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="ecapa_parallel_all",
                 source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"}
+                run_opts={"device": "cpu"},
             )
 
     loader = get_model_loader()

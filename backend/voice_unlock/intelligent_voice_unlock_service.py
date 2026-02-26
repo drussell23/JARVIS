@@ -4091,10 +4091,17 @@ async def get_cached_ecapa_classifier():
         start = time.time()
 
         def _load_model():
-            from speechbrain.inference.speaker import EncoderClassifier
-            return EncoderClassifier.from_hparams(
+            # v271.3: Route through centralized safe loader (meta tensor protection)
+            try:
+                from voice.engines.speechbrain_engine import safe_from_hparams
+            except ImportError:
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
+            return safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="ecapa_voice_unlock",
                 source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir=os.path.expanduser("~/.cache/speechbrain/spkrec-ecapa-voxceleb")
+                savedir=os.path.expanduser("~/.cache/speechbrain/spkrec-ecapa-voxceleb"),
+                run_opts={"device": "cpu"},
             )
 
         # Use thread-safe event loop getter
