@@ -1268,8 +1268,22 @@ class MLEngineRegistry:
         self._deferred_ecapa_recovery_task: Optional[asyncio.Task] = None
         self._memory_gate_blocked: bool = False
 
+        # v275.1: Cloud Run pre-warming. Cloud Run containers have cold starts
+        # of 10-30s. The contract probe (4s timeout) runs during heavy startup
+        # when the container is most likely cold → always times out. Fix: send
+        # a fire-and-forget warmup ping immediately on registry init. By the
+        # time prewarm_all() calls _activate_cloud_routing() (seconds later),
+        # the Cloud Run container is already warm from our early ping.
+        self._cloud_prewarm_task: Optional[asyncio.Task] = None
+        self._cloud_prewarm_started_at: float = 0.0
+        self._cloud_prewarm_completed: bool = False
+
         # Register available engines based on config
         self._register_engines()
+
+        # v275.1: Schedule cloud pre-warm immediately (non-blocking).
+        # This runs in the background while other init proceeds.
+        self._schedule_cloud_prewarm()
 
         logger.info(f"🔧 MLEngineRegistry initialized with {len(self._engines)} engines")
         logger.info(f"   Config: {MLConfig.to_dict()}")
@@ -1285,6 +1299,84 @@ class MLEngineRegistry:
             candidate = f"/{candidate}"
         normalized = candidate.rstrip("/")
         return normalized or default
+
+    def _schedule_cloud_prewarm(self) -> None:
+        """
+        v275.1: Fire-and-forget Cloud Run container warmup.
+
+        Root cause (the disease):
+            Cloud Run containers scale to zero when idle. The ECAPA contract
+            probe runs during startup with a 4s timeout. Cloud Run cold start
+            takes 10-30s. The probe ALWAYS times out → falls back to local
+            ECAPA (500MB+) → memory pressure → Trinity stall at 80%.
+
+        The cure:
+            Send a lightweight HTTP GET to the Cloud Run health endpoint
+            IMMEDIATELY when the registry is constructed (in __init__). This
+            triggers Cloud Run's container provisioning in the background.
+            By the time prewarm_all() calls _activate_cloud_routing() (which
+            runs the contract probe), the container is already warm from
+            our early ping. The 4s probe now succeeds because it hits a
+            warm container (~100ms response time).
+
+        Implementation:
+            - Discovers cloud endpoints from env vars (same logic as
+              _discover_cloud_endpoint_candidates but synchronous/cached)
+            - Sends fire-and-forget HTTP GET to each candidate's /health
+            - Doesn't wait for response — the point is to trigger cold start
+            - If no event loop is running, no-ops gracefully (will work when
+              prewarm_all() runs in an async context)
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # No event loop yet — prewarm will happen in prewarm_all()
+
+        # Collect cloud endpoint candidates synchronously from env vars
+        candidates = []
+        for env_key in (
+            "ECAPA_CLOUD_RUN_URL",
+            "JARVIS_CLOUD_ML_ENDPOINT",
+            "JARVIS_CLOUD_ECAPA_ENDPOINT",
+            "JARVIS_ML_CLOUD_ENDPOINT",
+        ):
+            endpoint = os.getenv(env_key, "").strip()
+            if endpoint:
+                candidates.append(endpoint)
+
+        if not candidates:
+            return  # No cloud endpoints configured
+
+        self._cloud_prewarm_started_at = time.time()
+
+        async def _prewarm_ping() -> None:
+            """Send lightweight GET to trigger Cloud Run cold start."""
+            import aiohttp
+            for endpoint in candidates:
+                health_url = endpoint.rstrip("/") + "/health"
+                try:
+                    timeout = aiohttp.ClientTimeout(total=45)  # Cloud Run cold start up to 30s
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(health_url) as resp:
+                            if resp.status == 200:
+                                logger.info(
+                                    f"☁️  [v275.1] Cloud Run pre-warmed: {endpoint} "
+                                    f"(cold start: {time.time() - self._cloud_prewarm_started_at:.1f}s)"
+                                )
+                                self._cloud_prewarm_completed = True
+                                return
+                            else:
+                                logger.debug(
+                                    f"[v275.1] Cloud prewarm ping got HTTP {resp.status} from {endpoint}"
+                                )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug(f"[v275.1] Cloud prewarm ping to {endpoint} failed: {e}")
+
+        self._cloud_prewarm_task = loop.create_task(
+            _prewarm_ping(), name="ecapa-cloud-prewarm"
+        )
 
     def _cloud_route_candidates(self, operation: str) -> List[str]:
         """
@@ -2493,13 +2585,46 @@ class MLEngineRegistry:
         This configures the registry to route speaker verification
         and other ML operations to GCP instead of local processing.
 
+        v275.1: Waits for cloud pre-warm task (if running) before probing.
+        This ensures the Cloud Run container is warm when we probe, eliminating
+        the 4s timeout failures that previously caused fallback to local ECAPA.
+
         Returns:
             True if cloud routing was successfully activated
         """
         try:
+            # v275.1: If a cloud pre-warm task is running, wait for it to complete
+            # (or timeout gracefully). This gives Cloud Run time to cold-start.
+            _prewarm_task = self._cloud_prewarm_task
+            if _prewarm_task is not None and not _prewarm_task.done():
+                _prewarm_wait = float(os.getenv("JARVIS_CLOUD_PREWARM_WAIT", "35.0"))
+                logger.info(
+                    f"[v275.1] Waiting up to {_prewarm_wait:.0f}s for Cloud Run "
+                    f"pre-warm to complete..."
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(_prewarm_task), timeout=_prewarm_wait
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[v275.1] Cloud Run pre-warm didn't complete in time — "
+                        "proceeding with contract probe (container may still be cold)"
+                    )
+                except Exception as e:
+                    logger.debug(f"[v275.1] Cloud pre-warm task error: {e}")
+
+                if self._cloud_prewarm_completed:
+                    logger.info(
+                        f"[v275.1] Cloud Run container is warm "
+                        f"(cold start: {time.time() - self._cloud_prewarm_started_at:.1f}s)"
+                    )
+
             candidates = await self._discover_cloud_endpoint_candidates()
+            # v275.1: Use a generous timeout now that we've pre-warmed.
+            # The container should respond in ~100ms if warm.
             contract_timeout = max(
-                1.0, float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"))
+                1.0, float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "8.0"))
             )
             for endpoint, source in candidates:
                 if not self._cloud_endpoint_probe_allowed(endpoint):

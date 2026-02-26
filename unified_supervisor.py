@@ -15012,20 +15012,63 @@ class AsyncVoiceNarrator:
             self._speaking = True
             self._current_priority = priority
 
-            self._process = await asyncio.create_subprocess_exec(
-                "say",
-                "-v", self.voice,
-                "-r", str(self.rate),
-                text,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+            # v275.1: NEVER use raw `say` (no -o flag) — it opens the audio
+            # device directly, causing device contention with FullDuplexDevice
+            # (AudioBus) → static/garbled audio. This is the same disease
+            # class as v236.6 and v267.0.
+            #
+            # The cure: `say -o tempfile` synthesizes to file WITHOUT opening
+            # the audio device. Then route playback through AudioBus if it's
+            # running (single-stream, no contention), or afplay if AudioBus
+            # is not running (afplay uses its own device access — safe when
+            # AudioBus isn't holding the device).
+            import tempfile as _tmpmod
+            _temp_fd, _temp_path = _tmpmod.mkstemp(suffix=".aiff", prefix="jarvis_narrator_")
+            os.close(_temp_fd)
+            try:
+                self._process = await asyncio.create_subprocess_exec(
+                    "say",
+                    "-v", self.voice,
+                    "-r", str(self.rate),
+                    "-o", _temp_path,
+                    text,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
 
-            if wait:
-                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
-            else:
-                # Fire and forget for non-blocking, but still hold lock during speech
-                await asyncio.wait_for(self._process.communicate(), timeout=30.0)
+                # Play through AudioBus if running (safe single-stream path),
+                # otherwise fall back to afplay (safe when AudioBus isn't holding device).
+                _played = False
+                try:
+                    from backend.audio.audio_bus import AudioBus as _ABClass
+                    _bus = _ABClass.get_instance_safe()
+                    if _bus is not None and _bus.is_running:
+                        import soundfile as _sf
+                        import numpy as _np
+                        _data, _sr = _sf.read(_temp_path, dtype="float32")
+                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                        await _bus.play_audio(_data, _sr, wait_for_drain=True)
+                        _played = True
+                except Exception as _bus_err:
+                    _unified_logger.debug(f"[Voice] AudioBus playback failed: {_bus_err}")
+
+                if not _played:
+                    # AudioBus not running — use afplay (opens device directly,
+                    # but safe because AudioBus isn't holding it).
+                    _play_proc = await asyncio.create_subprocess_exec(
+                        "afplay", _temp_path,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(_play_proc.communicate(), timeout=30.0)
+            finally:
+                try:
+                    os.unlink(_temp_path)
+                except OSError:
+                    pass
 
             self._messages_spoken += 1
 
