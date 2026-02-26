@@ -4478,8 +4478,16 @@ class JARVISLoadingManager {
                 const backendPort = this.config.backendPort || 8010;
                 const apiUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
                 this.addLogEntry('API', `Backend API available at: ${apiUrl}`, 'success');
-                // Show a backend-direct link
-                this.showBackendFallbackButton();
+                // v271.2: Create inline API-mode link (bypasses v225.0 button suppression)
+                if (this.elements.statusMessage) {
+                    this.elements.statusMessage.innerHTML = `
+                        ${apiModeMsg}<br>
+                        <a href="${apiUrl}/health" target="_blank" rel="noopener"
+                           style="color: #00ff41; text-decoration: underline; font-size: 0.8rem; margin-top: 4px; display: inline-block;">
+                            Open Backend API
+                        </a>
+                    `;
+                }
             }
             return;
         }
