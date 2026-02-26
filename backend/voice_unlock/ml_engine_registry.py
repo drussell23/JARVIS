@@ -296,6 +296,25 @@ class MLConfig:
                 elif available_gb < effective_local_threshold:
                     return (True, available_gb, f"Low RAM: {available_gb:.1f}GB < {effective_local_threshold:.1f}GB")
                 else:
+                    # v271.0: Even with "sufficient" vm_stat RAM, thrash state
+                    # overrides. Active memory thrashing indicates the system
+                    # is page-faulting faster than it can reclaim, regardless
+                    # of what vm_stat reports as "free/inactive" pages. This
+                    # bridges MLConfig to MemoryQuantizer's real-time pagein
+                    # tracking, which is the authoritative memory health signal.
+                    try:
+                        import backend.core.memory_quantizer as _mq_mod
+                        _mq_inst = _mq_mod._memory_quantizer_instance
+                        if _mq_inst is not None and _mq_inst._thrash_state == "emergency":
+                            return (
+                                True,
+                                available_gb,
+                                f"Memory thrash EMERGENCY override "
+                                f"(pageins/sec: {_mq_inst._pagein_rate:.0f}, "
+                                f"RAM={available_gb:.1f}GB appears sufficient but system is thrashing)"
+                            )
+                    except Exception:
+                        pass
                     return (False, available_gb, f"Sufficient RAM: {available_gb:.1f}GB >= {effective_local_threshold:.1f}GB")
 
         except Exception as e:
@@ -1234,6 +1253,11 @@ class MLEngineRegistry:
         # v21.1.0: Cloud embedding circuit breaker
         self._cloud_embedding_cb = CloudEmbeddingCircuitBreaker()
 
+        # v271.0: Deferred recovery when memory gate blocks initial ECAPA load.
+        # Populated by _schedule_deferred_ecapa_recovery() when fallback is refused.
+        self._deferred_ecapa_recovery_task: Optional[asyncio.Task] = None
+        self._memory_gate_blocked: bool = False
+
         # Register available engines based on config
         self._register_engines()
 
@@ -1537,8 +1561,38 @@ class MLEngineRegistry:
                         logger.info("✅ Local ECAPA fallback successful - voice unlock ready!")
                         return self._status
 
-                # Both failed - continue to local prewarm as last resort
-                logger.warning("🔄 Cloud and quick fallback failed - attempting full local prewarm...")
+                # Both failed — check if memory state forbids local loading.
+                # v271.0: If we got here because check_memory_pressure() said
+                # "use_cloud" AND the memory gate blocked _fallback_to_local_ecapa(),
+                # falling through to full local prewarm would defeat the gate.
+                _mem_blocks_local = False
+                try:
+                    import backend.core.memory_quantizer as _mq_mod
+                    from backend.core.memory_quantizer import MemoryTier
+                    _mq = _mq_mod._memory_quantizer_instance
+                    if _mq is not None:
+                        _mem_blocks_local = (
+                            _mq._thrash_state == "emergency"
+                            or _mq.current_tier in (MemoryTier.CRITICAL, MemoryTier.EMERGENCY)
+                        )
+                except Exception:
+                    pass
+
+                if _mem_blocks_local:
+                    logger.warning(
+                        "[v271.0] Cloud failed and memory state forbids local loading. "
+                        "Voice unlock will be unavailable until memory stabilizes."
+                    )
+                    self._schedule_deferred_ecapa_recovery()
+                    self._status.prewarm_completed = True
+                    self._status.prewarm_end_time = time.time()
+                    self._status.is_ready = False
+                    self._status.errors.append(
+                        "Cloud ECAPA unavailable and local loading blocked by memory emergency"
+                    )
+                    return self._status
+                else:
+                    logger.warning("🔄 Cloud and quick fallback failed - attempting full local prewarm...")
 
         # =======================================================================
         # LOCAL PREWARM (Sufficient RAM)
@@ -2274,6 +2328,27 @@ class MLEngineRegistry:
                 req_timeout *= _cpu_factor
         except Exception:
             pass
+        # v271.0: Extend timeout under memory thrash. During EMERGENCY
+        # thrash (5000+ pageins/sec), the event loop is severely starved
+        # by constant page faults — even simple HTTP responses can't be
+        # read within normal timeouts. This is MORE impactful than CPU
+        # pressure because page faults are uninterruptible kernel waits.
+        try:
+            import backend.core.memory_quantizer as _mq_mod
+            _mq_inst = _mq_mod._memory_quantizer_instance
+            if _mq_inst is not None:
+                if _mq_inst._thrash_state == "emergency":
+                    _mem_floor = float(os.getenv(
+                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_THRASH_EMERGENCY", "12.0"
+                    ))
+                    req_timeout = max(req_timeout, _mem_floor)
+                elif _mq_inst._thrash_state == "thrashing":
+                    _mem_floor = float(os.getenv(
+                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_THRASH_WARNING", "8.0"
+                    ))
+                    req_timeout = max(req_timeout, _mem_floor)
+        except Exception:
+            pass
         probe_attempts = max(1, int(os.getenv("JARVIS_CLOUD_CONTRACT_ATTEMPTS", "2")))
         probe_backoff = max(0.1, float(os.getenv("JARVIS_CLOUD_CONTRACT_BACKOFF_SECONDS", "0.35")))
         connect_timeout = max(
@@ -2948,12 +3023,65 @@ class MLEngineRegistry:
         """
         Fallback to local ECAPA loading when cloud is unavailable.
 
+        v271.0: Memory-aware gate. REFUSES local load when system is in
+        memory emergency (thrashing) or critical/emergency tier. Loading
+        a 500MB+ ECAPA model during memory crisis would worsen the
+        thrashing that other systems (UnifiedModelServing) are trying
+        to resolve via GCP offload.
+
         Args:
             reason: Why we're falling back (for logging)
 
         Returns:
             True if local ECAPA was successfully loaded
         """
+        # v271.0: Memory-aware gate — refuse local load during memory emergency.
+        # The MemoryQuantizer singleton tracks pagein rates and thrash state,
+        # which are FAR more reliable indicators of memory crisis than raw
+        # vm_stat page counts. Loading 500MB+ during emergency = positive
+        # feedback loop that worsens the crisis.
+        try:
+            import backend.core.memory_quantizer as _mq_mod
+            from backend.core.memory_quantizer import MemoryTier
+
+            _mq = _mq_mod._memory_quantizer_instance
+            if _mq is not None:
+                _thrash = _mq._thrash_state
+                _tier = _mq.current_tier
+
+                if _thrash == "emergency":
+                    logger.warning(
+                        "=" * 70 + "\n"
+                        "   [v271.0] LOCAL ECAPA LOAD BLOCKED: memory thrash EMERGENCY\n"
+                        f"   Pagein rate: {_mq._pagein_rate:.0f}/sec\n"
+                        "   Loading 500MB+ model would worsen the crisis.\n"
+                        "   Voice unlock will degrade gracefully until memory stabilizes.\n"
+                        + "=" * 70
+                    )
+                    self._schedule_deferred_ecapa_recovery()
+                    return False
+
+                if _tier in (MemoryTier.CRITICAL, MemoryTier.EMERGENCY):
+                    logger.warning(
+                        "=" * 70 + "\n"
+                        f"   [v271.0] LOCAL ECAPA LOAD BLOCKED: memory tier {_tier.value}\n"
+                        "   Insufficient headroom for model loading.\n"
+                        "   Voice unlock will degrade gracefully until memory stabilizes.\n"
+                        + "=" * 70
+                    )
+                    self._schedule_deferred_ecapa_recovery()
+                    return False
+
+                if _thrash == "thrashing":
+                    logger.warning(
+                        f"[v271.0] Memory thrashing detected (pageins/sec: {_mq._pagein_rate:.0f}). "
+                        "Proceeding with local ECAPA load cautiously."
+                    )
+        except ImportError:
+            pass
+        except Exception as _e:
+            logger.debug(f"[v271.0] MemoryQuantizer check failed (proceeding cautiously): {_e}")
+
         logger.warning("=" * 70)
         logger.warning("🔄 CLOUD FALLBACK: Attempting local ECAPA load")
         logger.warning("=" * 70)
@@ -2987,6 +3115,118 @@ class MLEngineRegistry:
         except Exception as e:
             logger.error(f"❌ Local ECAPA fallback exception: {e}")
             return False
+
+    def _schedule_deferred_ecapa_recovery(self) -> None:
+        """
+        v271.0: Schedule a background task that monitors memory state and
+        re-attempts ECAPA loading when conditions improve.
+
+        Called when the memory gate blocks initial ECAPA loading. Ensures
+        "degrade gracefully until memory stabilizes" is actually true — the
+        system WILL recover without requiring a restart.
+        """
+        if self._deferred_ecapa_recovery_task is not None:
+            return  # Already scheduled
+
+        self._memory_gate_blocked = True
+
+        async def _recovery_loop() -> None:
+            poll_interval = float(os.getenv(
+                "JARVIS_ECAPA_RECOVERY_POLL_INTERVAL", "30.0"
+            ))
+            max_attempts = int(os.getenv(
+                "JARVIS_ECAPA_RECOVERY_MAX_ATTEMPTS", "20"
+            ))
+            attempt = 0
+
+            logger.info(
+                f"[v271.0] Deferred ECAPA recovery scheduled "
+                f"(poll every {poll_interval}s, max {max_attempts} attempts)"
+            )
+
+            while attempt < max_attempts:
+                await asyncio.sleep(poll_interval)
+                attempt += 1
+
+                # Check if someone else already loaded ECAPA
+                if self.is_ready:
+                    logger.info("[v271.0] ECAPA already ready — deferred recovery exiting")
+                    self._memory_gate_blocked = False
+                    return
+
+                # Check memory state
+                can_load = False
+                try:
+                    import backend.core.memory_quantizer as _mq_mod
+                    from backend.core.memory_quantizer import MemoryTier
+
+                    _mq = _mq_mod._memory_quantizer_instance
+                    if _mq is not None:
+                        _thrash = _mq._thrash_state
+                        _tier = _mq.current_tier
+                        if _thrash == "healthy" and _tier not in (
+                            MemoryTier.CRITICAL, MemoryTier.EMERGENCY
+                        ):
+                            can_load = True
+                        else:
+                            logger.debug(
+                                f"[v271.0] Deferred recovery check #{attempt}: "
+                                f"thrash={_thrash}, tier={_tier.value} — not yet safe"
+                            )
+                    else:
+                        # MemoryQuantizer not available — use MLConfig fallback
+                        use_cloud, avail, reason = MLConfig.check_memory_pressure()
+                        can_load = not use_cloud
+                except Exception:
+                    # Can't check — use MLConfig fallback
+                    use_cloud, avail, reason = MLConfig.check_memory_pressure()
+                    can_load = not use_cloud
+
+                if can_load:
+                    logger.info(
+                        f"[v271.0] Memory stabilized — attempting deferred ECAPA load "
+                        f"(attempt #{attempt})"
+                    )
+                    try:
+                        success = await self._fallback_to_local_ecapa(
+                            "deferred recovery after memory stabilization"
+                        )
+                        if success:
+                            self._status.is_ready = True
+                            self._status.errors = [
+                                e for e in self._status.errors
+                                if "memory emergency" not in e
+                            ]
+                            self._ready_event.set()
+                            self._memory_gate_blocked = False
+                            logger.info(
+                                "[v271.0] Deferred ECAPA recovery SUCCESSFUL — "
+                                "voice unlock now available!"
+                            )
+                            return
+                        else:
+                            logger.warning(
+                                f"[v271.0] Deferred ECAPA load failed (attempt #{attempt})"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[v271.0] Deferred ECAPA recovery error: {e}"
+                        )
+
+            logger.warning(
+                f"[v271.0] Deferred ECAPA recovery exhausted {max_attempts} attempts. "
+                "Voice unlock will remain unavailable until restart."
+            )
+            self._memory_gate_blocked = False
+
+        try:
+            loop = asyncio.get_running_loop()
+            self._deferred_ecapa_recovery_task = loop.create_task(
+                _recovery_loop(),
+                name="ecapa-deferred-recovery",
+            )
+        except RuntimeError:
+            logger.debug("[v271.0] No running event loop for deferred recovery")
 
     async def _fallback_to_cloud(self, reason: str) -> bool:
         """
