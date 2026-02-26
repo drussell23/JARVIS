@@ -111,6 +111,11 @@ class CyclicDependencyError(Exception):
     pass
 
 
+class DependencyNotReadyError(Exception):
+    """Raised when a component start is attempted before dependencies are ready."""
+    pass
+
+
 class StartupStateMachine:
     """
     DAG-driven startup state machine with wave-based parallel execution.
@@ -445,10 +450,59 @@ class StartupStateMachine:
             if phase == StartupPhase.FULL_MODE:
                 self._full_mode_event.set()
 
-    async def start_component(self, name: str):
-        """Mark a component as starting to load"""
+    def get_blocking_dependencies(
+        self,
+        name: str,
+        *,
+        allow_skipped: bool = False,
+    ) -> List[str]:
+        """
+        Return dependencies that are not yet in a ready terminal state.
+
+        Args:
+            name: Component being evaluated.
+            allow_skipped: If True, treat SKIPPED dependencies as satisfied.
+        """
+        comp = self.components.get(name)
+        if comp is None:
+            return []
+
+        blocking: List[str] = []
+        for dep_name in comp.dependencies:
+            dep = self.components.get(dep_name)
+            if dep is None:
+                # External dependencies are treated as already satisfied.
+                continue
+
+            dep_ready = dep.status == ComponentStatus.READY
+            if allow_skipped:
+                dep_ready = dep_ready or dep.status == ComponentStatus.SKIPPED
+
+            if not dep_ready:
+                blocking.append(f"{dep_name}:{dep.status.value}")
+
+        return blocking
+
+    async def start_component(
+        self,
+        name: str,
+        *,
+        enforce_dependencies: bool = False,
+        allow_skipped_dependencies: bool = False,
+    ):
+        """Mark a component as starting to load."""
         if name not in self.components:
             self.register_component(name, is_critical=False, load_order=100)
+
+        if enforce_dependencies:
+            blocking = self.get_blocking_dependencies(
+                name,
+                allow_skipped=allow_skipped_dependencies,
+            )
+            if blocking:
+                raise DependencyNotReadyError(
+                    f"{name} blocked by dependencies: {', '.join(blocking)}"
+                )
 
         async with self._lock:
             comp = self.components[name]

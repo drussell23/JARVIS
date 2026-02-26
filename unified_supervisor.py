@@ -61372,6 +61372,90 @@ class IPCServer:
 # ZONE 6.3: JARVIS SYSTEM KERNEL
 # =============================================================================
 
+class KernelBackgroundTaskRegistry:
+    """
+    Track kernel-owned background tasks with lifecycle fencing.
+
+    Guarantees:
+    - De-duplicates task registration.
+    - Rejects late registrations once shutdown begins.
+    - Auto-prunes completed tasks to prevent stale-handle buildup.
+    """
+
+    def __init__(
+        self,
+        *,
+        logger: Optional[UnifiedLogger] = None,
+        can_accept_new: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        self._logger = logger
+        self._can_accept_new = can_accept_new or (lambda: True)
+        self._tasks: List["asyncio.Task[Any]"] = []
+
+    @staticmethod
+    def _task_name(task: "asyncio.Task[Any]") -> str:
+        try:
+            return task.get_name()
+        except Exception:
+            return "unnamed-task"
+
+    def _on_task_done(self, task: "asyncio.Task[Any]") -> None:
+        try:
+            self._tasks.remove(task)
+        except ValueError:
+            pass
+
+    def append(self, task: Optional["asyncio.Task[Any]"]) -> bool:
+        """Register one background task. Returns True if accepted."""
+        if task is None:
+            return False
+
+        if task.done():
+            return False
+
+        if task in self._tasks:
+            return False
+
+        if not self._can_accept_new():
+            if not task.done():
+                task.cancel()
+            if self._logger:
+                self._logger.debug(
+                    "[Kernel] Rejected background task registration during shutdown: %s",
+                    self._task_name(task),
+                )
+            return False
+
+        self._tasks.append(task)
+        task.add_done_callback(self._on_task_done)
+        return True
+
+    def extend(self, tasks: List["asyncio.Task[Any]"]) -> int:
+        """Register many background tasks. Returns number accepted."""
+        accepted = 0
+        for task in tasks:
+            if self.append(task):
+                accepted += 1
+        return accepted
+
+    def remove(self, task: "asyncio.Task[Any]") -> None:
+        self._tasks.remove(task)
+
+    def snapshot(self, *, include_done: bool = True) -> List["asyncio.Task[Any]"]:
+        if include_done:
+            return list(self._tasks)
+        return [task for task in self._tasks if not task.done()]
+
+    def __iter__(self):
+        return iter(self.snapshot(include_done=True))
+
+    def __contains__(self, task: object) -> bool:
+        return task in self._tasks
+
+    def __len__(self) -> int:
+        return len(self._tasks)
+
+
 class JarvisSystemKernel:
     """
     The brain that ties the entire JARVIS system together.
@@ -61500,8 +61584,13 @@ class JarvisSystemKernel:
         }
 
         # Background tasks
-        self._background_tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
+        self._is_shutting_down: bool = False
+        self._allow_background_task_registration: bool = True
+        self._background_tasks = KernelBackgroundTaskRegistry(
+            logger=self.logger,
+            can_accept_new=self._can_accept_background_tasks,
+        )
 
         # v250.0: Visual Pipeline state (Phase 6.8)
         self._ghost_hands_orchestrator = None
@@ -61941,6 +62030,116 @@ class JarvisSystemKernel:
             stage, f"startup_activity:{stage}"
         )
         return marker_ts, marker_source
+
+    def _can_accept_background_tasks(self) -> bool:
+        """Gate background task registration once shutdown begins."""
+        if not getattr(self, "_allow_background_task_registration", True):
+            return False
+        if self._shutdown_event.is_set():
+            return False
+        return self._state not in (
+            KernelState.SHUTTING_DOWN,
+            KernelState.STOPPED,
+            KernelState.FAILED,
+        )
+
+    def _begin_shutdown(self, reason: str) -> None:
+        """
+        Freeze background task registration and mark shutdown intent.
+
+        This is intentionally idempotent and safe to call from both cleanup and
+        emergency paths.
+        """
+        if not self._is_shutting_down:
+            self.logger.debug("[Kernel] Shutdown gate activated (%s)", reason)
+        self._is_shutting_down = True
+        self._allow_background_task_registration = False
+        self._shutdown_event.set()
+
+    def _track_background_task(
+        self,
+        task: Optional["asyncio.Task[Any]"],
+        *,
+        source: str = "unspecified",
+    ) -> bool:
+        """Register a kernel-owned background task via a single control path."""
+        accepted = self._background_tasks.append(task)
+        if (
+            not accepted
+            and task is not None
+            and not task.done()
+            and task.cancelled()
+        ):
+            self.logger.debug(
+                "[Kernel] Background task rejected by shutdown gate (%s): %s",
+                source,
+                task.get_name() if hasattr(task, "get_name") else "unnamed-task",
+            )
+        return accepted
+
+    async def _cancel_and_drain_background_tasks(
+        self,
+        *,
+        timeout_s: float,
+        reason: str,
+        exclude: Optional[Set["asyncio.Task[Any]"]] = None,
+    ) -> Tuple[int, int]:
+        """
+        Cancel and await all tracked background tasks with bounded drain time.
+
+        Returns:
+            (cancelled_count, still_running_count)
+        """
+        exclude_set: Set["asyncio.Task[Any]"] = set(exclude or set())
+
+        def _active_snapshot() -> List["asyncio.Task[Any]"]:
+            return [
+                task
+                for task in self._background_tasks.snapshot(include_done=False)
+                if task not in exclude_set
+            ]
+
+        tasks = _active_snapshot()
+        if not tasks:
+            return 0, 0
+
+        for task in tasks:
+            task.cancel()
+
+        cancelled_count = len(tasks)
+        still_running_count = 0
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=max(0.1, timeout_s),
+            )
+        except asyncio.TimeoutError:
+            still_running_count = sum(1 for task in tasks if not task.done())
+            if still_running_count:
+                self.logger.warning(
+                    "[Kernel] Background task drain timed out after %.1fs "
+                    "(reason=%s, still_running=%d)",
+                    timeout_s,
+                    reason,
+                    still_running_count,
+                )
+
+        # Safety sweep for tasks registered right before the shutdown gate closed.
+        late_tasks = _active_snapshot()
+        if late_tasks:
+            for task in late_tasks:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*late_tasks, return_exceptions=True),
+                    timeout=max(0.1, min(2.0, timeout_s)),
+                )
+            except asyncio.TimeoutError:
+                pass
+            still_running_count = max(still_running_count, sum(1 for task in late_tasks if not task.done()))
+
+        return cancelled_count, still_running_count
 
     def connect_neural_mesh(self, mesh: Any) -> None:
         """
@@ -62750,6 +62949,7 @@ class JarvisSystemKernel:
             f"[Kernel] ⚠️ Emergency shutdown initiated (reason={reason}, expected={expected})"
         )
         self._state = KernelState.SHUTTING_DOWN
+        self._begin_shutdown(f"emergency:{reason}")
 
         # v258.4: Publish shutdown phase to Trinity IPC for cross-repo consumers.
         _publish_system_phase_to_trinity("shutdown", {"reason": reason, "expected": expected})
@@ -64687,7 +64887,12 @@ class JarvisSystemKernel:
             try: _trace_phase_enter("clean_slate", progress=0, metadata={"correlation_id": _cid_cs})
             except Exception: pass
 
-        if _ssm: await _ssm.start_component("clean_slate")
+        if _ssm:
+            await _ssm.start_component(
+                "clean_slate",
+                enforce_dependencies=True,
+                allow_skipped_dependencies=False,
+            )
         # v265.0: Add timeout — clean slate runs BEFORE DMS, so no watchdog protection
         _clean_slate_timeout = _get_env_float("JARVIS_CLEAN_SLATE_TIMEOUT", 30.0)
         try:
@@ -66008,7 +66213,12 @@ class JarvisSystemKernel:
                 try: _trace_phase_enter("loading_experience", progress=5, metadata={"correlation_id": _cid_le})
                 except Exception: pass
 
-            if _ssm: await _ssm.start_component("loading_experience")
+            if _ssm:
+                await _ssm.start_component(
+                    "loading_experience",
+                    enforce_dependencies=True,
+                    allow_skipped_dependencies=False,
+                )
             # v265.0: Add timeout — loading experience starts Chrome/loading server,
             # which can hang if Chrome is unresponsive or port is blocked
             _loading_exp_timeout = _get_env_float("JARVIS_LOADING_EXPERIENCE_TIMEOUT", 30.0)
@@ -66101,7 +66311,12 @@ class JarvisSystemKernel:
                 try: _trace_phase_enter("preflight", progress=15, metadata={"correlation_id": _cid_pf})
                 except Exception: pass
 
-            if _ssm: await _ssm.start_component("preflight")
+            if _ssm:
+                await _ssm.start_component(
+                    "preflight",
+                    enforce_dependencies=True,
+                    allow_skipped_dependencies=False,
+                )
             # v270.0: Outer timeout — bare await could hang indefinitely if any
             # preflight sub-operation stalls (lock handover, zombie scan, IPC bind).
             _preflight_timeout = _get_env_float("JARVIS_PREFLIGHT_TIMEOUT", 90.0)
@@ -66225,7 +66440,12 @@ class JarvisSystemKernel:
                 try: _trace_phase_enter("resources", progress=25, metadata={"correlation_id": _cid_rs})
                 except Exception: pass
 
-            if _ssm: await _ssm.start_component("resources")
+            if _ssm:
+                await _ssm.start_component(
+                    "resources",
+                    enforce_dependencies=True,
+                    allow_skipped_dependencies=False,
+                )
             # v270.0: Outer timeout — resource managers (Docker, GCP, storage) can
             # each stall on network or credential discovery. resource_timeout is
             # already defined above (default 300s).
@@ -66340,7 +66560,12 @@ class JarvisSystemKernel:
                 try: _trace_phase_enter("backend", progress=45, metadata={"correlation_id": _cid_be})
                 except Exception: pass
 
-            if _ssm: await _ssm.start_component("backend")
+            if _ssm:
+                await _ssm.start_component(
+                    "backend",
+                    enforce_dependencies=True,
+                    allow_skipped_dependencies=False,
+                )
             # v270.0: Outer timeout — backend startup includes subprocess spawning,
             # health polling, and optional in-process uvicorn. backend_timeout is
             # already defined above (default 300s).
@@ -66519,7 +66744,12 @@ class JarvisSystemKernel:
             # v260.0: Outer timeout on intelligence phase — previously relied solely
             # on DMS watchdog heartbeats which only fire every 5s. Direct timeout
             # provides clean CancelledError propagation and resource cleanup.
-            if _ssm: await _ssm.start_component("intelligence")
+            if _ssm:
+                await _ssm.start_component(
+                    "intelligence",
+                    enforce_dependencies=True,
+                    allow_skipped_dependencies=False,
+                )
             _intel_ok = False
             try:
                 if _BUDGET_AVAILABLE:
@@ -66792,7 +67022,12 @@ class JarvisSystemKernel:
             # v238.1: Adaptive timeout — if upstream infra is degraded (Cloud SQL down,
             # parallel init had failures), use a reduced fast-path timeout instead of
             # burning 80s on components that will cascade-fail.
-            if _ssm: await _ssm.start_component("two_tier_security")
+            if _ssm:
+                await _ssm.start_component(
+                    "two_tier_security",
+                    enforce_dependencies=True,
+                    allow_skipped_dependencies=False,
+                )
             _two_tier_init_timeout = _get_env_float("JARVIS_TWO_TIER_INIT_TIMEOUT", 80.0)
             # v265.4: CPU-aware outer timeout — extend under pressure
             try:
@@ -66892,11 +67127,43 @@ class JarvisSystemKernel:
                     f"[TwoTier] Init timed out ({_two_tier_init_timeout:.0f}s) — "
                     "continuing without Two-Tier Security"
                 )
+                if _ssm:
+                    await _ssm.complete_component(
+                        "two_tier_security",
+                        error=f"Timed out after {_two_tier_init_timeout:.0f}s",
+                    )
                 self._update_component_status("two_tier_security", "degraded", "Timed out")
                 issue_collector.add_warning(
                     f"Two-Tier Security timed out ({_two_tier_init_timeout:.0f}s)",
                     IssueCategory.INTELLIGENCE,
                     suggestion="Increase JARVIS_TWO_TIER_INIT_TIMEOUT or check component health"
+                )
+            except asyncio.CancelledError:
+                if _ssm:
+                    await _ssm.complete_component(
+                        "two_tier_security",
+                        error="Cancelled",
+                    )
+                raise
+            except Exception as _two_tier_err:
+                if _ssm:
+                    await _ssm.complete_component(
+                        "two_tier_security",
+                        error=str(_two_tier_err),
+                    )
+                self.logger.warning(
+                    "[TwoTier] Init failed: %s — continuing without Two-Tier Security",
+                    _two_tier_err,
+                )
+                self._update_component_status(
+                    "two_tier_security",
+                    "degraded",
+                    f"Init failed: {_two_tier_err}",
+                )
+                issue_collector.add_warning(
+                    f"Two-Tier Security failed: {_two_tier_err}",
+                    IssueCategory.INTELLIGENCE,
+                    suggestion="Check Two-Tier security initialization dependencies",
                 )
 
             # v256.1: Reset two_tier stall timer by advancing progress (R3-#3).
@@ -67107,6 +67374,8 @@ class JarvisSystemKernel:
                 f"progress_cap={trinity_progress_aware_cap:.0f}s, "
                 f"outer={effective_trinity_outer_timeout:.0f}s"
             )
+            _trinity_phase_ok = True
+            _trinity_phase_error = ""
             if self.config.trinity_enabled:
                 # v258.2: Wrap narrator calls in timeouts — previously unbounded awaits
                 # that could block indefinitely if TTS engine hangs, preventing
@@ -67178,13 +67447,17 @@ class JarvisSystemKernel:
                             timeout=_trinity_outer_timeout,
                         )
                 except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                    _trinity_phase_ok = False
+                    _trinity_phase_error = (
+                        f"Budget/cap exceeded ({_trinity_outer_timeout:.0f}s)"
+                    )
                     self.logger.error(
                         f"[Kernel] Trinity budget/cap exceeded after "
                         f"{_trinity_outer_timeout:.0f}s — continuing without Trinity"
                     )
                     self._update_component_status(
                         "trinity", "error",
-                        f"Budget/cap exceeded ({_trinity_outer_timeout:.0f}s)",
+                        _trinity_phase_error,
                     )
                     issue_collector.add_warning(
                         f"Trinity phase budget/cap exceeded ({_trinity_outer_timeout:.0f}s) — "
@@ -67193,13 +67466,17 @@ class JarvisSystemKernel:
                         suggestion="Check J-Prime and Reactor-Core availability"
                     )
                 except asyncio.TimeoutError:
+                    _trinity_phase_ok = False
+                    _trinity_phase_error = (
+                        f"Outer timeout ({_trinity_outer_timeout:.0f}s)"
+                    )
                     self.logger.error(
                         f"[Kernel] v265.0: _phase_trinity() OUTER timeout after "
                         f"{_trinity_outer_timeout:.0f}s — continuing without Trinity"
                     )
                     self._update_component_status(
                         "trinity", "error",
-                        f"Outer timeout ({_trinity_outer_timeout:.0f}s)",
+                        _trinity_phase_error,
                     )
                     issue_collector.add_warning(
                         f"Trinity phase timed out ({_trinity_outer_timeout:.0f}s) — "
@@ -67209,7 +67486,14 @@ class JarvisSystemKernel:
                     )
                 except asyncio.CancelledError:
                     raise
-                if _ssm: await _ssm.complete_component("trinity")
+                if _ssm:
+                    if _trinity_phase_ok:
+                        await _ssm.complete_component("trinity")
+                    else:
+                        await _ssm.complete_component(
+                            "trinity",
+                            error=_trinity_phase_error or "Trinity phase failed",
+                        )
             else:
                 # v170.0: Explicitly log when Trinity is disabled
                 self.logger.info("[Kernel] ───────────────────────────────────────────────────────")
@@ -67321,7 +67605,12 @@ class JarvisSystemKernel:
                 try: _trace_phase_enter("enterprise", progress=80, metadata={"correlation_id": _cid_en})
                 except Exception: pass
 
-            if _ssm: await _ssm.start_component("enterprise_services")
+            if _ssm:
+                await _ssm.start_component(
+                    "enterprise_services",
+                    enforce_dependencies=True,
+                    allow_skipped_dependencies=False,
+                )
             # v265.0: Add outer timeout to _phase_enterprise_services() — previously
             # had none. Internal per-service timeouts (30s each) provide normal
             # protection, but if asyncio.gather itself hangs or a service coroutine
@@ -67329,6 +67618,8 @@ class JarvisSystemKernel:
             # timeout (90s default) which is generous since 5 services run in parallel
             # with 30s each.
             _enterprise_outer_timeout = enterprise_timeout + 30.0
+            _enterprise_phase_ok = True
+            _enterprise_phase_error = ""
             try:
                 if _BUDGET_AVAILABLE:
                     async with _execution_budget(
@@ -67347,26 +67638,41 @@ class JarvisSystemKernel:
                         timeout=_enterprise_outer_timeout,
                     )
             except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
+                _enterprise_phase_ok = False
+                _enterprise_phase_error = (
+                    f"Budget/cap exceeded ({_enterprise_outer_timeout:.0f}s)"
+                )
                 self.logger.error(
                     f"[Kernel] Enterprise budget/cap exceeded "
                     f"after {_enterprise_outer_timeout:.0f}s — continuing"
                 )
                 self._update_component_status(
                     "enterprise", "degraded",
-                    f"Budget/cap exceeded ({_enterprise_outer_timeout:.0f}s)",
+                    _enterprise_phase_error,
                 )
             except asyncio.TimeoutError:
+                _enterprise_phase_ok = False
+                _enterprise_phase_error = (
+                    f"Outer timeout ({_enterprise_outer_timeout:.0f}s)"
+                )
                 self.logger.error(
                     f"[Kernel] v265.0: _phase_enterprise_services() OUTER timeout "
                     f"after {_enterprise_outer_timeout:.0f}s — continuing"
                 )
                 self._update_component_status(
                     "enterprise", "degraded",
-                    f"Outer timeout ({_enterprise_outer_timeout:.0f}s)",
+                    _enterprise_phase_error,
                 )
             except asyncio.CancelledError:
                 raise
-            if _ssm: await _ssm.complete_component("enterprise_services")
+            if _ssm:
+                if _enterprise_phase_ok:
+                    await _ssm.complete_component("enterprise_services")
+                else:
+                    await _ssm.complete_component(
+                        "enterprise_services",
+                        error=_enterprise_phase_error or "Enterprise phase failed",
+                    )
             await self._safe_narrate(self._narrator.narrate_zone_complete(6, success=True), "zone_complete")
 
             self._emit_event(
@@ -81977,6 +82283,7 @@ class JarvisSystemKernel:
             Exit code
         """
         self._state = KernelState.SHUTTING_DOWN
+        self._begin_shutdown("cleanup")
         self.logger.info("[Kernel] Initiating shutdown...")
 
         # v258.4: Publish shutdown phase to Trinity IPC for cross-repo consumers.
@@ -82155,15 +82462,20 @@ class JarvisSystemKernel:
             except Exception as ml_err:
                 self.logger.debug(f"[Kernel] Model lifecycle manager cleanup error: {ml_err}")
 
-            # Cancel background tasks (backend serve task is managed separately)
-            background_tasks = [
-                task for task in self._background_tasks if task is not self._backend_server_task
-            ]
-            for task in background_tasks:
-                task.cancel()
-
-            if background_tasks:
-                await asyncio.gather(*background_tasks, return_exceptions=True)
+            # Cancel and drain background tasks via the kernel-owned registry.
+            # This centralizes cancellation behavior and catches late registrations
+            # that slip in near shutdown boundaries.
+            _bg_timeout = _get_env_float("JARVIS_BACKGROUND_TASK_CLEANUP_TIMEOUT", 10.0)
+            _, _still_running = await self._cancel_and_drain_background_tasks(
+                timeout_s=_bg_timeout,
+                reason="cleanup",
+                exclude={self._backend_server_task} if self._backend_server_task else None,
+            )
+            if _still_running:
+                self.logger.warning(
+                    "[Kernel] Background tasks still pending after cleanup drain: %d",
+                    _still_running,
+                )
 
             # Stop Trinity (v206.0: PILLAR 5 - use tiered_stop for guaranteed cleanup)
             if self._trinity:
