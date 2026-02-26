@@ -4132,6 +4132,16 @@ class MLEngineRegistry:
 
         This is NOT a warning — it changes live routing immediately.
         """
+        # v276.4: Respect operator env var override — do NOT overwrite
+        # a policy that was explicitly set via JARVIS_ECAPA_ROUTING_POLICY.
+        if self._routing_policy_reason.startswith("env_override"):
+            logger.info(
+                f"[v276.4] Parity mismatch detected ({mismatch_reason}) but "
+                f"routing policy is operator-locked ({self._routing_policy_reason}). "
+                f"Skipping automatic routing policy change."
+            )
+            return
+
         CANONICAL_DIM = 192
         CANONICAL_RATE = 16000
         CANONICAL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
@@ -4257,13 +4267,12 @@ class MLEngineRegistry:
             if last_backend == new_backend:
                 return  # Same backend — not a transition
 
-        self._backend_transitions.append((new_backend, now))
-
-        # Prune transitions outside the window
+        # Prune transitions outside the window BEFORE appending
         cutoff = now - self._flap_window
         self._backend_transitions = [
             (b, t) for b, t in self._backend_transitions if t >= cutoff
         ]
+        self._backend_transitions.append((new_backend, now))
 
         # Check for flap condition
         if len(self._backend_transitions) >= self._flap_threshold:
@@ -4394,6 +4403,13 @@ class MLEngineRegistry:
             logger.info(
                 f"[v276.4] State reconciled → local (source={source})"
             )
+        else:
+            logger.warning(
+                f"[v276.4] _reconcile_state_after_recovery called with "
+                f"unexpected backend={new_backend!r} (source={source}). "
+                f"No state changes applied — investigate caller."
+            )
+            return  # Don't write cross-repo state for unknown backend
 
         # Update cross-repo state file (async — fire-and-forget)
         try:
@@ -6038,8 +6054,12 @@ async def extract_speaker_embedding(
         ready = await wait_for_voice_unlock_ready(timeout=30.0)
 
         if not ready:
-            # Local not ready - try cloud fallback
-            if fallback_enabled and registry.cloud_endpoint:
+            # Local not ready - try cloud fallback (suppressed by LOCAL_ONLY policy)
+            if (
+                fallback_enabled
+                and registry.cloud_endpoint
+                and registry._routing_policy != RoutingPolicy.LOCAL_ONLY
+            ):
                 logger.warning("Local engines not ready, falling back to cloud")
                 return await registry.extract_speaker_embedding_cloud(audio_data)
 
@@ -6480,8 +6500,12 @@ async def verify_speaker_with_best_method(
     except Exception as e:
         logger.error(f"Local speaker verification failed: {e}")
 
-        # Try cloud fallback
-        if registry._cloud_fallback_enabled and registry.cloud_endpoint:
+        # Try cloud fallback (suppressed by LOCAL_ONLY routing policy)
+        if (
+            registry._cloud_fallback_enabled
+            and registry.cloud_endpoint
+            and registry._routing_policy != RoutingPolicy.LOCAL_ONLY
+        ):
             logger.info("Falling back to cloud verification")
             return await registry.verify_speaker_cloud(
                 audio_data, reference_embedding, timeout
