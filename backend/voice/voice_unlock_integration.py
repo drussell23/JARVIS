@@ -444,21 +444,70 @@ class VoiceUnlockIntegration:
             return
 
         try:
-            # Use urgent rate for important messages, normal rate otherwise
+            # v275.2: Route through global speech gate + safe TTS path
             rate = self.urgent_voice_rate if urgent else self.jarvis_voice_rate
 
-            # Run say command asynchronously in background (non-blocking)
-            proc = await asyncio.create_subprocess_exec(
-                'say',
-                '-v', self.jarvis_voice_name,
-                '-r', str(rate),
-                message,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
+            # Try unified orchestrator first (gated + deduped)
+            try:
+                from backend.core.supervisor.unified_voice_orchestrator import (
+                    get_global_speech_gate,
+                    global_speech_dedup_check,
+                )
+                if global_speech_dedup_check(message):
+                    logger.debug(f"[JARVIS VOICE] Global dedup skipped: {message[:50]}")
+                    return
+            except ImportError:
+                pass
 
-            # Don't wait for completion - let it speak in background
-            logger.info(f"🔊 [JARVIS VOICE] Speaking: '{message}' (voice={self.jarvis_voice_name}, rate={rate} WPM)")
+            # v275.2: Safe say -o tempfile path
+            import tempfile as _tmpmod
+            _temp_fd, _temp_path = _tmpmod.mkstemp(
+                suffix=".aiff", prefix="jarvis_vui_"
+            )
+            os.close(_temp_fd)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    'say',
+                    '-v', self.jarvis_voice_name,
+                    '-r', str(rate),
+                    '-o', _temp_path,
+                    message,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                await asyncio.wait_for(proc.wait(), timeout=30.0)
+
+                # Play safely
+                _played = False
+                try:
+                    from backend.audio.audio_bus import AudioBus as _ABCls
+                    _ab = _ABCls.get_instance_safe()
+                    if _ab is not None and _ab.is_running:
+                        import soundfile as _sf
+                        import numpy as _np
+                        _data, _sr = _sf.read(_temp_path, dtype="float32")
+                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                        await _ab.play_audio(_data, _sr)
+                        _played = True
+                except Exception:
+                    pass
+
+                if not _played:
+                    _play_proc = await asyncio.create_subprocess_exec(
+                        "afplay", _temp_path,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await _play_proc.wait()
+            finally:
+                try:
+                    os.unlink(_temp_path)
+                except OSError:
+                    pass
+
+            logger.info(f"[JARVIS VOICE] Speaking: '{message}' (voice={self.jarvis_voice_name}, rate={rate} WPM)")
 
         except Exception as e:
             logger.error(f"Failed to speak with JARVIS voice: {e}")

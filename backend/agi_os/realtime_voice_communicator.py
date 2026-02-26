@@ -155,7 +155,17 @@ class RealTimeVoiceCommunicator:
         self._is_speaking = False
         self._current_message: Optional[SpeechMessage] = None
         self._speech_task: Optional[asyncio.Task] = None
-        self._immediate_speech_lock: asyncio.Lock = asyncio.Lock()  # Prevents voice overlap
+        # v275.2: Use the process-wide global speech gate instead of a
+        # per-instance lock.  This ensures RealTimeVoiceCommunicator CANNOT
+        # speak while the orchestrator or narrator is speaking, eliminating
+        # voice overlap at the root.
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import (
+                get_global_speech_gate,
+            )
+            self._immediate_speech_lock: asyncio.Lock = get_global_speech_gate()
+        except ImportError:
+            self._immediate_speech_lock: asyncio.Lock = asyncio.Lock()
         self._current_speech_process: Optional[asyncio.subprocess.Process] = None
 
         # State management
@@ -681,37 +691,101 @@ class RealTimeVoiceCommunicator:
         """
         Speak a single message — AudioBus path or macOS say fallback.
 
+        v275.2: Acquires the global speech gate to prevent overlap with
+        the orchestrator, narrator, or any other speech producer.
+        Always uses say -o tempfile to avoid device contention.
+
         Args:
             message: Message to speak
         """
-        _bus_enabled = os.getenv(
-            "JARVIS_AUDIO_BUS_ENABLED", "false"
-        ).lower() in ("true", "1", "yes")
-
-        if _bus_enabled:
+        # v275.2: Acquire global speech gate (queue-processed path was ungated)
+        async with self._immediate_speech_lock:
+            # v275.2: Broker-level dedup
             try:
-                from backend.voice.engines.unified_tts_engine import get_tts_engine
-                tts = await get_tts_engine()
-                await tts.speak(message.text, play_audio=True)
-                return
-            except Exception as e:
-                logger.debug("AudioBus speak failed, falling back: %s", e)
+                from backend.core.supervisor.unified_voice_orchestrator import (
+                    global_speech_dedup_check,
+                )
+                if global_speech_dedup_check(message.text):
+                    logger.debug(f"[SpeakMessage] Global dedup skipped: {message.text[:50]}")
+                    return
+            except ImportError:
+                pass
 
-        # Legacy: direct macOS say
-        config = self._mode_configs.get(message.mode, self._mode_configs[VoiceMode.NORMAL])
-        cmd = [
-            'say',
-            '-v', config.voice,
-            '-r', str(config.rate),
-            message.text
-        ]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,  # v267.0: isolate from parent signals
-        )
-        await process.wait()
+            _bus_enabled = os.getenv(
+                "JARVIS_AUDIO_BUS_ENABLED", "false"
+            ).lower() in ("true", "1", "yes")
+
+            # v275.2: Also check actual device state
+            _device_held = False
+            try:
+                from backend.audio.audio_bus import AudioBus as _ABCls
+                _ab = _ABCls.get_instance_safe()
+                _device_held = _ab is not None and _ab.is_running
+            except ImportError:
+                pass
+
+            if _bus_enabled or _device_held:
+                try:
+                    from backend.voice.engines.unified_tts_engine import get_tts_engine
+                    tts = await get_tts_engine()
+                    await tts.speak(message.text, play_audio=True)
+                    return
+                except Exception as e:
+                    if _device_held:
+                        logger.warning("[SpeakMessage] TTS failed while device held: %s — skipping", e)
+                        return
+                    logger.debug("AudioBus speak failed, falling back: %s", e)
+
+            # v275.2: Safe legacy — always say -o tempfile
+            import tempfile as _tmpmod
+            config = self._mode_configs.get(message.mode, self._mode_configs[VoiceMode.NORMAL])
+            _temp_fd, _temp_path = _tmpmod.mkstemp(
+                suffix=".aiff", prefix="jarvis_rtvc_msg_"
+            )
+            os.close(_temp_fd)
+            try:
+                cmd = [
+                    'say',
+                    '-v', config.voice,
+                    '-r', str(config.rate),
+                    '-o', _temp_path,
+                    message.text
+                ]
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                await process.wait()
+
+                # Play through AudioBus if available, else afplay
+                _played = False
+                try:
+                    if _ab is not None and _ab.is_running:
+                        import soundfile as _sf
+                        import numpy as _np
+                        _data, _sr = _sf.read(_temp_path, dtype="float32")
+                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                        await _ab.play_audio(_data, _sr)
+                        _played = True
+                except Exception:
+                    pass
+
+                if not _played:
+                    _play_proc = await asyncio.create_subprocess_exec(
+                        "afplay", _temp_path,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await _play_proc.wait()
+            finally:
+                try:
+                    os.unlink(_temp_path)
+                except OSError:
+                    pass
 
     def _process_text(self, text: str, mode: VoiceMode) -> str:
         """
@@ -1403,8 +1477,20 @@ class RealTimeVoiceCommunicator:
                 except Exception:
                     pass
 
-        # Acquire lock to prevent overlapping speech
+        # Acquire the global speech gate (v275.2: shared with orchestrator)
         async with self._immediate_speech_lock:
+            # v275.2: Broker-level dedup — skip if same text was spoken
+            # recently by ANY speech path (orchestrator, narrator, etc.)
+            try:
+                from backend.core.supervisor.unified_voice_orchestrator import (
+                    global_speech_dedup_check,
+                )
+                if global_speech_dedup_check(text):
+                    logger.debug(f"[SpeakImmediate] Global dedup skipped: {text[:50]}")
+                    return
+            except ImportError:
+                pass
+
             speech_start_time = time.time()
             try:
                 # =========================================================

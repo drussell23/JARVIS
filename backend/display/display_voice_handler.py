@@ -183,38 +183,70 @@ class DisplayVoiceHandler:
             >>> await handler._speak_with_say("Hello world")
         """
         try:
-            # Build say command
-            cmd = ['say']
+            # v275.2: Safe say -o tempfile path to avoid device contention
+            import tempfile as _tmpmod
 
-            # Add voice name
+            # Build say command with -o flag
+            cmd = ['say']
             if self.voice_name:
                 cmd.extend(['-v', self.voice_name])
-
-            # Add rate
             if self.voice_rate != 1.0:
-                rate = int(175 * self.voice_rate)  # 175 is default rate
+                rate = int(175 * self.voice_rate)
                 cmd.extend(['-r', str(rate)])
 
-            # Add message
-            cmd.append(message)
-
-            # v251.5: Wait for completion to prevent overlapping `say` processes
-            # with the unified orchestrator — fire-and-forget was the root cause
-            # of audio static when display voice and startup narrator spoke
-            # simultaneously.
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+            _temp_fd, _temp_path = _tmpmod.mkstemp(
+                suffix=".aiff", prefix="jarvis_display_"
             )
-
-            logger.debug(f"[DISPLAY VOICE] Used macOS say command (voice={self.voice_name}, rate={self.voice_rate})")
+            import os as _os
+            _os.close(_temp_fd)
 
             try:
-                await asyncio.wait_for(process.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                process.kill()
-                logger.warning("[DISPLAY VOICE] say process timed out, killed")
+                cmd.extend(['-o', _temp_path, message])
+
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    logger.warning("[DISPLAY VOICE] say process timed out, killed")
+                    return
+
+                # Play safely via AudioBus or afplay
+                _played = False
+                try:
+                    from backend.audio.audio_bus import AudioBus as _ABCls
+                    _ab = _ABCls.get_instance_safe()
+                    if _ab is not None and _ab.is_running:
+                        import soundfile as _sf
+                        import numpy as _np
+                        _data, _sr = _sf.read(_temp_path, dtype="float32")
+                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                        await _ab.play_audio(_data, _sr)
+                        _played = True
+                except Exception:
+                    pass
+
+                if not _played:
+                    _play_proc = await asyncio.create_subprocess_exec(
+                        "afplay", _temp_path,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(_play_proc.wait(), timeout=30.0)
+
+                logger.debug(f"[DISPLAY VOICE] Used safe say -o (voice={self.voice_name}, rate={self.voice_rate})")
+            finally:
+                try:
+                    _os.unlink(_temp_path)
+                except OSError:
+                    pass
 
         except FileNotFoundError:
             logger.error("[DISPLAY VOICE] say command not found (not on macOS?)")

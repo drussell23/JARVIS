@@ -14829,22 +14829,20 @@ class AsyncVoiceNarrator:
 
     def _get_shared_speech_lock(self) -> asyncio.Lock:
         """
-        v251.5: Get the shared speech lock from UnifiedVoiceOrchestrator if
-        available.  This prevents concurrent ``say`` processes between the
-        AsyncVoiceNarrator (direct subprocess) and the
-        IntelligentStartupNarrator (orchestrator → Trinity engines) — the
-        root cause of audio static/overlapping voices during startup.
+        v275.2: Get the process-wide global speech gate.
 
-        Falls back to our own ``_speech_lock`` if the orchestrator hasn't
-        been created yet (very early startup).
+        This is THE ONE LOCK shared by UnifiedVoiceOrchestrator,
+        RealTimeVoiceCommunicator, and all other speech producers.
+        Ensures mutual exclusion across the entire process.
+
+        Falls back to our own ``_speech_lock`` only if the orchestrator
+        module cannot be imported (should never happen in practice).
         """
         try:
             from backend.core.supervisor.unified_voice_orchestrator import (
-                get_voice_orchestrator,
+                get_global_speech_gate,
             )
-            orch = get_voice_orchestrator()
-            if orch is not None and hasattr(orch, "_speech_lock"):
-                return orch._speech_lock
+            return get_global_speech_gate()
         except Exception:
             pass
         return self._speech_lock
@@ -14938,6 +14936,19 @@ class AsyncVoiceNarrator:
             _unified_logger.debug(f"[Voice] Skipping duplicate message: {text[:50]}...")
             self._messages_deduplicated += 1
             return
+
+        # v275.2: Broker-level dedup — skip if same text was spoken
+        # recently by ANY speech path (orchestrator, communicator, etc.)
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import (
+                global_speech_dedup_check,
+            )
+            if global_speech_dedup_check(text):
+                _unified_logger.debug(f"[Voice] Global dedup skipped: {text[:50]}...")
+                self._messages_deduplicated += 1
+                return
+        except ImportError:
+            pass
 
         # Prefer the unified orchestrator path to avoid mixed startup audio stacks.
         self._last_spoken_text = text

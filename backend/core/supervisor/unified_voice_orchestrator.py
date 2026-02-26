@@ -83,6 +83,7 @@ import hashlib
 import logging
 import os
 import platform
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -431,8 +432,10 @@ class UnifiedVoiceOrchestrator:
         self._running = False
         self._shutting_down = False
 
-        # Global speech lock - THE KEY to preventing concurrent voices
-        self._speech_lock = asyncio.Lock()
+        # v275.2: Use the process-wide global speech gate so that ALL
+        # speech producers (orchestrator, RealTimeVoiceCommunicator,
+        # AsyncVoiceNarrator, legacy TTS) share ONE lock.
+        self._speech_lock = get_global_speech_gate()
 
         # Priority queue for messages
         self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue(
@@ -951,17 +954,23 @@ class UnifiedVoiceOrchestrator:
                     f"— falling back to direct say"
                 )
 
-        # Device free on macOS: direct say fallback.
+        # Device free on macOS: safe say fallback (say -o tempfile → afplay).
+        # v275.2: ALWAYS use -o to avoid opening audio device (device state
+        # can change between check and playback; defense-in-depth).
         if self._is_macos:
+            import tempfile as _tmpmod
+            _temp_fd, _temp_path = _tmpmod.mkstemp(
+                suffix=".aiff", prefix="jarvis_orch_"
+            )
+            os.close(_temp_fd)
             try:
                 cmd = [
                     "say",
                     "-v", self.config.voice,
                     "-r", str(self.config.rate),
+                    "-o", _temp_path,
                     text,
                 ]
-                # v266.5: start_new_session isolates child from parent
-                # process group signals (SIGINT from zombie cleanup, etc.)
                 self._current_process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.DEVNULL,
@@ -969,6 +978,32 @@ class UnifiedVoiceOrchestrator:
                     start_new_session=True,
                 )
                 await self._current_process.wait()
+                self._current_process = None
+
+                # Play through AudioBus if running, else afplay
+                _played = False
+                try:
+                    from backend.audio.audio_bus import AudioBus as _ABPlay
+                    _ab = _ABPlay.get_instance_safe()
+                    if _ab is not None and _ab.is_running:
+                        import soundfile as _sf
+                        import numpy as _np
+                        _data, _sr = _sf.read(_temp_path, dtype="float32")
+                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                        await _ab.play_audio(_data, _sr)
+                        _played = True
+                except Exception as _ab_err:
+                    logger.debug(f"[UnifiedVoice] AudioBus play failed: {_ab_err}")
+
+                if not _played:
+                    _play_proc = await asyncio.create_subprocess_exec(
+                        "afplay", _temp_path,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await _play_proc.wait()
                 return
             except FileNotFoundError:
                 logger.error("[UnifiedVoice] macOS 'say' command not found")
@@ -976,6 +1011,10 @@ class UnifiedVoiceOrchestrator:
                 logger.warning(f"[UnifiedVoice] Direct 'say' failed: {direct_error}")
             finally:
                 self._current_process = None
+                try:
+                    os.unlink(_temp_path)
+                except OSError:
+                    pass
 
         # Optional Trinity fallback for non-macOS or direct say failures.
         if _env_flag("JARVIS_VOICE_ENABLE_TRINITY_FALLBACK", "false"):
@@ -1092,6 +1131,72 @@ class UnifiedVoiceOrchestrator:
     def on_speak_end(self, callback: Callable[[VoiceMessage, float], None]) -> None:
         """Register callback for when speaking ends."""
         self._on_speak_end.append(callback)
+
+
+# ===========================================================================
+# Process-wide Global Speech Gate (v275.2)
+# ===========================================================================
+# THE ONE LOCK that gates ALL audio output across every speech path in the
+# JARVIS process.  Every component that produces voice — the orchestrator,
+# RealTimeVoiceCommunicator, AsyncVoiceNarrator, and legacy TTS callers —
+# MUST acquire this lock before emitting sound.
+#
+# This eliminates the root cause of voice overlap: independent locks in
+# different subsystems allowing concurrent `say` processes.
+# ===========================================================================
+
+_global_speech_gate: Optional[asyncio.Lock] = None
+_global_speech_gate_creation_lock = threading.Lock()
+
+# Process-wide dedup fingerprints — shared across all speech paths
+_global_speech_fingerprints: Dict[str, float] = {}
+_GLOBAL_DEDUP_WINDOW_SECONDS = 10.0
+
+
+def get_global_speech_gate() -> asyncio.Lock:
+    """
+    Get the process-wide speech gate.
+
+    Returns the ONE asyncio.Lock that all speech producers must acquire
+    before emitting audio.  Thread-safe creation; the lock itself is
+    async-safe (must be used with ``async with``).
+    """
+    global _global_speech_gate
+    if _global_speech_gate is None:
+        with _global_speech_gate_creation_lock:
+            if _global_speech_gate is None:
+                _global_speech_gate = asyncio.Lock()
+    return _global_speech_gate
+
+
+def global_speech_dedup_check(text: str, window: Optional[float] = None) -> bool:
+    """
+    Check if *text* was spoken recently (within *window* seconds).
+
+    Returns True if the message should be SKIPPED (duplicate).
+    Returns False if the message is allowed (not a duplicate).
+
+    This provides broker-level dedup for paths that bypass the
+    orchestrator's queue-level dedup (e.g., RealTimeVoiceCommunicator,
+    AsyncVoiceNarrator fallback).
+    """
+    import hashlib
+
+    window = window or _GLOBAL_DEDUP_WINDOW_SECONDS
+    now = time.time()
+
+    # Purge stale entries
+    stale = [k for k, t in _global_speech_fingerprints.items() if now - t > window * 2]
+    for k in stale:
+        _global_speech_fingerprints.pop(k, None)
+
+    fp = hashlib.md5(text.strip().lower().encode()).hexdigest()[:16]
+    last_time = _global_speech_fingerprints.get(fp)
+    if last_time is not None and now - last_time < window:
+        return True  # Duplicate — skip
+
+    _global_speech_fingerprints[fp] = now
+    return False  # Allowed
 
 
 # Singleton instance
