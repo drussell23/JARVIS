@@ -75936,6 +75936,22 @@ class JarvisSystemKernel:
                             except Exception:
                                 pass
 
+                            # v271.1 (Gap 8): Emit structured transition event
+                            self._emit_event(
+                                SupervisorEventType.COMPONENT_STATUS,
+                                f"GCP late-arrival detected: VM {_inv_ip} confirmed, "
+                                f"Hollow Client routing activated",
+                                severity=SupervisorEventSeverity.SUCCESS,
+                                phase="trinity",
+                                component="jarvis-prime",
+                                metadata={
+                                    "transition": "late_arrival_detected",
+                                    "gcp_ip": _inv_ip,
+                                    "local_prime_killed": True,
+                                    "elapsed_s": round(elapsed, 1),
+                                },
+                            )
+
                 # =============================================================
                 # v271.0: EARLY RETURN ON GCP LATE-ARRIVAL
                 # =============================================================
@@ -75970,6 +75986,57 @@ class JarvisSystemKernel:
                     except (asyncio.CancelledError, Exception):
                         pass
 
+                    # =============================================================
+                    # v271.1: GCP HEALTH VERIFICATION (Gap 2 fix)
+                    # =============================================================
+                    # Before returning synthetic success, verify the GCP endpoint
+                    # is actually serving. _confirm_prime_router_gcp_promotion()
+                    # already validated routing, but do a quick /health check to
+                    # confirm the endpoint is live right now (not stale state).
+                    # =============================================================
+                    _gcp_verified = False
+                    if _inv_ip:
+                        try:
+                            import aiohttp as _aiohttp_gcp
+                            _gcp_health_url = (
+                                f"http://{_inv_ip}:{self.config.invincible_node_port}/health"
+                            )
+                            async with _aiohttp_gcp.ClientSession() as _gcp_sess:
+                                async with _gcp_sess.get(
+                                    _gcp_health_url,
+                                    timeout=_aiohttp_gcp.ClientTimeout(total=5.0),
+                                ) as _gcp_resp:
+                                    if _gcp_resp.status == 200:
+                                        _gcp_health = await _gcp_resp.json()
+                                        _gcp_ready = _gcp_health.get(
+                                            "ready_for_inference",
+                                            _gcp_health.get("status") == "healthy",
+                                        )
+                                        _gcp_verified = bool(_gcp_ready)
+                                        self.logger.info(
+                                            f"[{integrator_name}] v271.1: GCP health verified: "
+                                            f"ready_for_inference={_gcp_ready}"
+                                        )
+                                    else:
+                                        self.logger.warning(
+                                            f"[{integrator_name}] v271.1: GCP health check "
+                                            f"returned status {_gcp_resp.status}"
+                                        )
+                        except Exception as _gcp_err:
+                            self.logger.warning(
+                                f"[{integrator_name}] v271.1: GCP health check failed: "
+                                f"{_gcp_err} — proceeding anyway (promotion was confirmed)"
+                            )
+
+                    # Even if health check fails, proceed. The promotion was already
+                    # confirmed by _confirm_prime_router_gcp_promotion(). The health
+                    # check is defense-in-depth, not a gate.
+                    if not _gcp_verified:
+                        self.logger.info(
+                            f"[{integrator_name}] v271.1: GCP health not verified "
+                            f"but promotion was confirmed — accepting synthetic success"
+                        )
+
                     # Build synthetic results: Prime = success (via Hollow Client),
                     # others = best-effort from whatever completed before cancellation
                     _synthetic_results = {"jarvis-prime": True}
@@ -75981,6 +76048,79 @@ class JarvisSystemKernel:
                         except Exception:
                             pass
                     _synthetic_results["jarvis-prime"] = True  # Always true via GCP
+                    _synthetic_results["_gcp_health_verified"] = _gcp_verified
+
+                    # =============================================================
+                    # v271.1: CANCELLATION SIDE-EFFECTS FIX (Gap 1)
+                    # =============================================================
+                    # start_components() runs health monitor + NightShift AFTER
+                    # component startup. Cancellation skips these. Explicitly run
+                    # the required finalizers so monitoring/training still work.
+                    # =============================================================
+                    _trinity = getattr(self, "_trinity", None)
+                    if _trinity:
+                        # Start health monitor if not already running
+                        try:
+                            _health_mon = getattr(_trinity, "_health_monitor_task", None)
+                            if _health_mon is None or _health_mon.done():
+                                await _trinity._start_health_monitor()
+                                self.logger.info(
+                                    f"[{integrator_name}] v271.1: Started Trinity health "
+                                    f"monitor after GCP takeover (was skipped by cancellation)"
+                                )
+                        except Exception as _hm_err:
+                            self.logger.debug(
+                                f"[{integrator_name}] v271.1: Health monitor start: {_hm_err}"
+                            )
+
+                        # Start NightShift training monitor if reactor-core was up
+                        try:
+                            _reactor = getattr(_trinity, "_reactor", None)
+                            _ns_task = getattr(_trinity, "_nightshift_task", None)
+                            if _reactor and (_ns_task is None or _ns_task.done()):
+                                _reactor_ok = _synthetic_results.get("reactor-core", False)
+                                if _reactor_ok:
+                                    _trinity._nightshift_task = create_safe_task(
+                                        _trinity._nightshift_training_monitor(),
+                                        name="nightshift-training-monitor",
+                                    )
+                                    self.logger.info(
+                                        f"[{integrator_name}] v271.1: Started NightShift "
+                                        f"training monitor after GCP takeover"
+                                    )
+                        except Exception as _ns_err:
+                            self.logger.debug(
+                                f"[{integrator_name}] v271.1: NightShift start: {_ns_err}"
+                            )
+
+                        # Update component status to reflect GCP routing
+                        try:
+                            _dashboard = get_live_dashboard()
+                            _dashboard.update_component(
+                                "jarvis-prime",
+                                status="healthy",
+                                detail=f"Hollow Client → GCP {_inv_ip}",
+                            )
+                        except Exception:
+                            pass
+
+                    # =============================================================
+                    # v271.1: OBSERVABILITY — STRUCTURED TRANSITION EVENTS (Gap 8)
+                    # =============================================================
+                    self._emit_event(
+                        SupervisorEventType.COMPONENT_STATUS,
+                        f"GCP late-arrival fast-forward: inference via Hollow Client → {_inv_ip}",
+                        severity=SupervisorEventSeverity.SUCCESS,
+                        phase="trinity",
+                        component="jarvis-prime",
+                        metadata={
+                            "transition": "gcp_late_arrival_fast_forward",
+                            "gcp_ip": _inv_ip,
+                            "startup_task_cancelled": True,
+                            "synthetic_results": _synthetic_results,
+                            "elapsed_s": round(elapsed, 1),
+                        },
+                    )
 
                     self.logger.success(
                         f"[{integrator_name}] v271.0: GCP late-arrival fast-forward complete. "
@@ -75988,14 +76128,41 @@ class JarvisSystemKernel:
                     )
                     return _synthetic_results, False, None
 
+                # =============================================================
+                # v271.1: PROGRESS REGRESSION GUARD (Gap 4 fix)
+                # =============================================================
+                # After GCP late-arrival kills local Prime, the local health
+                # endpoint (/health on localhost:{prime_port}) is dead. Polling
+                # it returns 0% progress, which corrupts startup state and
+                # triggers false stall detection. Once GCP routing is
+                # authoritative, hold progress at a stable value and skip the
+                # local health poll entirely.
+                # =============================================================
+                _gcp_authoritative = getattr(self, "_gcp_late_arrival_handled", False)
+                if _gcp_authoritative:
+                    # GCP routing is active — local Prime health is irrelevant.
+                    # Hold progress at a high stable value to prevent regression.
+                    current_progress = max(last_progress_pct, 80.0)
+                    model_loading_active = False
+                    eta_seconds = None
+                    current_phase_name = "gcp_hollow_client"
+                    self.logger.info(
+                        f"[{integrator_name}] v271.1: GCP routing authoritative — "
+                        f"holding progress at {current_progress:.1f}% "
+                        f"(skipping local Prime health poll)"
+                    )
+                else:
+                    pass  # Fall through to normal health polling below
+
                 # Check model loading progress
                 # v223.0: Dashboard fallback — ensure progress is observable even
                 # if _live_dashboard was not initialized before this function runs.
                 # v224.0: Phase-aware progress with v2 protocol support.
-                current_progress = 0.0
-                model_loading_active = False
-                eta_seconds = None
-                current_phase_name = None  # v224.0: Track current init phase for stall thresholds
+                if not _gcp_authoritative:
+                    current_progress = 0.0
+                    model_loading_active = False
+                    eta_seconds = None
+                    current_phase_name = None  # v224.0: Track current init phase for stall thresholds
 
                 # v224.0: Always poll Prime's HTTP health endpoint first for v2
                 # protocol data. This provides real milestone-based progress across
@@ -76005,72 +76172,77 @@ class JarvisSystemKernel:
                 # which doesn't exist in Prime's response. Prime returns
                 # model_load_progress_pct at top level, and v224.0+ returns
                 # init_progress with protocol_version 2.
-                _got_v2_data = False
-                try:
-                    import aiohttp as _aiohttp
-                    # v224.0: Resolve Prime's actual port from multiple sources.
-                    # Priority: 1) cross-repo state file, 2) TRINITY_JPRIME_PORT env,
-                    # 3) JARVIS_PRIME_PORT env, 4) default 8001 (v238.0 aligned)
-                    prime_port = None
+                #
+                # v271.1 (Gap 4): Skip local health poll when GCP routing is
+                # authoritative — local Prime is dead, polling it returns 0%
+                # which corrupts progress state and triggers false stall detection.
+                _got_v2_data = _gcp_authoritative  # Skip poll when GCP active
+                if not _gcp_authoritative:
                     try:
-                        import json as _json
-                        _state_path = os.path.expanduser("~/.jarvis/cross_repo/jarvis_prime_state.json")
-                        if os.path.exists(_state_path):
-                            with open(_state_path) as _f:
-                                _state = _json.load(_f)
-                                _sp = _state.get("port")
-                                if _sp and isinstance(_sp, int):
-                                    prime_port = _sp
-                    except Exception:
-                        pass
-                    if prime_port is None:
-                        prime_port = int(os.environ.get(
-                            "TRINITY_JPRIME_PORT",
-                            os.environ.get("JARVIS_PRIME_PORT", "8001")
-                        ))
-                    async with _aiohttp.ClientSession() as _sess:
-                        async with _sess.get(
-                            f"http://localhost:{prime_port}/health",
-                            timeout=_aiohttp.ClientTimeout(total=3.0),
-                        ) as resp:
-                            if resp.status == 200:
-                                health_data = await resp.json()
+                        import aiohttp as _aiohttp
+                        # v224.0: Resolve Prime's actual port from multiple sources.
+                        # Priority: 1) cross-repo state file, 2) TRINITY_JPRIME_PORT env,
+                        # 3) JARVIS_PRIME_PORT env, 4) default 8001 (v238.0 aligned)
+                        prime_port = None
+                        try:
+                            import json as _json
+                            _state_path = os.path.expanduser("~/.jarvis/cross_repo/jarvis_prime_state.json")
+                            if os.path.exists(_state_path):
+                                with open(_state_path) as _f:
+                                    _state = _json.load(_f)
+                                    _sp = _state.get("port")
+                                    if _sp and isinstance(_sp, int):
+                                        prime_port = _sp
+                        except Exception:
+                            pass
+                        if prime_port is None:
+                            prime_port = int(os.environ.get(
+                                "TRINITY_JPRIME_PORT",
+                                os.environ.get("JARVIS_PRIME_PORT", "8001")
+                            ))
+                        async with _aiohttp.ClientSession() as _sess:
+                            async with _sess.get(
+                                f"http://localhost:{prime_port}/health",
+                                timeout=_aiohttp.ClientTimeout(total=3.0),
+                            ) as resp:
+                                if resp.status == 200:
+                                    health_data = await resp.json()
 
-                                # v224.0: Try v2 protocol first (phase-based progress)
-                                init_progress = health_data.get("init_progress")
-                                if init_progress and init_progress.get("protocol_version", 0) >= 2:
-                                    current_progress = float(init_progress.get("overall_pct", 0))
-                                    cp = init_progress.get("current_phase") or {}
-                                    current_phase_name = cp.get("name")
-                                    # Any in-progress phase means active work
-                                    model_loading_active = cp.get("status") == "in_progress"
-                                    # Calculate ETA from remaining phases
-                                    completed = init_progress.get("completed_phases", 0)
-                                    total = init_progress.get("total_phases", 9)
-                                    if completed > 0 and total > completed:
-                                        avg_phase_time = elapsed / max(completed, 1)
-                                        eta_seconds = avg_phase_time * (total - completed)
-                                    _got_v2_data = True
-                                    # v225.0: Store init_progress for loading server broadcast
-                                    self._prime_init_progress = init_progress
-                                    self.logger.info(
-                                        f"[{integrator_name}] v2 progress: {current_progress:.1f}% "
-                                        f"phase={current_phase_name} ({completed}/{total})"
-                                    )
-                                else:
-                                    # v1 fallback: read actual Prime response fields
-                                    # BUGFIX: was reading non-existent "model.progress" path
-                                    current_progress = float(health_data.get("model_load_progress_pct", 0))
-                                    model_loading_active = health_data.get("model_loading_in_progress", False)
-                                    # Also check if Prime is actively initializing (status=starting)
-                                    if not model_loading_active and health_data.get("status") == "starting":
-                                        model_loading_active = True
-                                    self.logger.info(
-                                        f"[{integrator_name}] v1 progress: {current_progress:.1f}% "
-                                        f"active={model_loading_active}"
-                                    )
-                except Exception:
-                    pass  # Health endpoint not available yet
+                                    # v224.0: Try v2 protocol first (phase-based progress)
+                                    init_progress = health_data.get("init_progress")
+                                    if init_progress and init_progress.get("protocol_version", 0) >= 2:
+                                        current_progress = float(init_progress.get("overall_pct", 0))
+                                        cp = init_progress.get("current_phase") or {}
+                                        current_phase_name = cp.get("name")
+                                        # Any in-progress phase means active work
+                                        model_loading_active = cp.get("status") == "in_progress"
+                                        # Calculate ETA from remaining phases
+                                        completed = init_progress.get("completed_phases", 0)
+                                        total = init_progress.get("total_phases", 9)
+                                        if completed > 0 and total > completed:
+                                            avg_phase_time = elapsed / max(completed, 1)
+                                            eta_seconds = avg_phase_time * (total - completed)
+                                        _got_v2_data = True
+                                        # v225.0: Store init_progress for loading server broadcast
+                                        self._prime_init_progress = init_progress
+                                        self.logger.info(
+                                            f"[{integrator_name}] v2 progress: {current_progress:.1f}% "
+                                            f"phase={current_phase_name} ({completed}/{total})"
+                                        )
+                                    else:
+                                        # v1 fallback: read actual Prime response fields
+                                        # BUGFIX: was reading non-existent "model.progress" path
+                                        current_progress = float(health_data.get("model_load_progress_pct", 0))
+                                        model_loading_active = health_data.get("model_loading_in_progress", False)
+                                        # Also check if Prime is actively initializing (status=starting)
+                                        if not model_loading_active and health_data.get("status") == "starting":
+                                            model_loading_active = True
+                                        self.logger.info(
+                                            f"[{integrator_name}] v1 progress: {current_progress:.1f}% "
+                                            f"active={model_loading_active}"
+                                        )
+                    except Exception:
+                        pass  # Health endpoint not available yet
 
                 # Fallback: use dashboard model-loading data only when HTTP poll failed
                 if not _got_v2_data and current_progress == 0.0:
@@ -80502,8 +80674,55 @@ class JarvisSystemKernel:
                 except Exception:
                     pass
         else:
-            # No frontend - stop loading server if running, but log that we're in API-only mode
+            # =============================================================
+            # v271.1: DEGRADED-COMPLETE BROADCAST (Gap 3 fix)
+            # =============================================================
+            # When frontend_started == False, the loading page must still
+            # transition. Without this broadcast, StartupGate.js polls
+            # forever at 98% because the 100% broadcast only fires inside
+            # the `if frontend_started:` branch above.
+            #
+            # Emit stage="complete" with frontend_failed=true so the
+            # loading UI can transition (possibly to an API-only fallback
+            # or a "frontend unavailable" message).
+            # =============================================================
             self.logger.info("[Kernel] Running in API-only mode (no frontend)")
+            self.logger.warning(
+                "[Kernel] v271.1: Frontend did not start — emitting "
+                "degraded-complete broadcast so loading page can transition"
+            )
+
+            # Disarm DMS (same as the frontend_started path)
+            if self._startup_watchdog:
+                try:
+                    await self._startup_watchdog.stop()
+                except Exception:
+                    pass
+
+            self._current_startup_phase = "complete"
+            self._current_startup_progress = 100
+            await self._safe_broadcast(
+                stage="complete",
+                message="JARVIS startup complete (API-only mode)",
+                progress=100,
+                metadata={
+                    "icon": "check",
+                    "phase": "complete",
+                    "frontend_failed": True,
+                    "api_only": True,
+                }
+            )
+
+            self._emit_event(
+                SupervisorEventType.WARNING,
+                "Frontend did not start — degraded-complete broadcast emitted",
+                severity=SupervisorEventSeverity.WARNING,
+                phase="frontend",
+                metadata={"frontend_started": False, "api_only": True},
+            )
+
+            # Brief stabilization delay for any WebSocket consumers
+            await asyncio.sleep(0.5)
             await self._stop_loading_server()
 
         # Clear the supervisor loading flag
@@ -81852,12 +82071,20 @@ class JarvisSystemKernel:
         v182.0: All three components (JARVIS Body, Prime, Reactor) must be ready
         before the loading page should redirect to the main UI.
 
+        v271.1 (Gap 6): Unified "Trinity ready" condition that recognizes GCP
+        hollow client routing. When GCP late-arrival has been handled and inference
+        is routed via Hollow Client, Prime is definitionally "ready" regardless of
+        local Prime process state.
+
         Returns:
             True if all Trinity components are ready
         """
         # JARVIS Body (backend) is required
         if not self._trinity_ready.get("jarvis_body", False):
             return False
+
+        # v271.1 (Gap 6): GCP hollow client = Prime ready, skip local checks
+        _gcp_routed = getattr(self, "_gcp_late_arrival_handled", False)
 
         # If Trinity is enabled, check Prime and Reactor
         if self.config.trinity_enabled:
@@ -81872,9 +82099,11 @@ class JarvisSystemKernel:
                 getattr(self.config, "reactor_core_optional", os.getenv("TRINITY_REACTOR_OPTIONAL", "true").lower() == "true")
             )
 
-            # If configured but not complete, not ready
-            if not prime_optional and prime_status.get("status") in {"pending", "running", "error", "failed"}:
-                return False
+            # v271.1: When GCP routing is active, Prime is always ready
+            # (inference goes to GCP VM, not local process)
+            if not _gcp_routed:
+                if not prime_optional and prime_status.get("status") in {"pending", "running", "error", "failed"}:
+                    return False
             if not reactor_optional and reactor_status.get("status") in {"pending", "running", "error", "failed"}:
                 return False
 
