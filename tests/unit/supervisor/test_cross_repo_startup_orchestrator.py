@@ -5,6 +5,8 @@ Tests for ProcessOrchestrator.startup_lock_context() method.
 TDD approach for Pillar 1: Lock-Guarded Single-Owner Startup.
 """
 import pytest
+import json
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -149,6 +151,59 @@ class TestStartupLockContext:
                                 pass
 
                             mock_gcp.assert_not_called()
+
+
+class TestSupervisorAuthorityGate:
+    """Tests for split-brain fencing in supervisor authority checks."""
+
+    def test_authority_requires_kernel_lock_owner(self, tmp_path, monkeypatch):
+        import backend.supervisor.cross_repo_startup_orchestrator as orchestrator_mod
+
+        authority_state = tmp_path / "locks" / "supervisor_authority.json"
+        kernel_lock = tmp_path / "locks" / "kernel.lock"
+        kernel_lock.parent.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(orchestrator_mod, "_AUTHORITY_STATE_PATH", authority_state)
+        monkeypatch.setattr(orchestrator_mod, "_KERNEL_LOCK_PATH", kernel_lock)
+
+        kernel_lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+        epoch = orchestrator_mod.grant_supervisor_authority(
+            "unit_test_grant",
+            owner_pid=os.getpid(),
+            epoch="unit-test-epoch",
+        )
+        assert epoch == "unit-test-epoch"
+        assert orchestrator_mod.check_supervisor_authority(
+            "unit_test_action",
+            expected_epoch=epoch,
+        )
+
+        kernel_lock.write_text(json.dumps({"pid": os.getpid() + 99999}), encoding="utf-8")
+        assert not orchestrator_mod.check_supervisor_authority(
+            "unit_test_action",
+            expected_epoch=epoch,
+        )
+
+        orchestrator_mod.revoke_supervisor_authority("unit_test_done")
+
+    def test_bootstrap_owner_allowed_before_grant(self, tmp_path, monkeypatch):
+        import backend.supervisor.cross_repo_startup_orchestrator as orchestrator_mod
+
+        authority_state = tmp_path / "locks" / "supervisor_authority.json"
+        kernel_lock = tmp_path / "locks" / "kernel.lock"
+        kernel_lock.parent.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(orchestrator_mod, "_AUTHORITY_STATE_PATH", authority_state)
+        monkeypatch.setattr(orchestrator_mod, "_KERNEL_LOCK_PATH", kernel_lock)
+
+        orchestrator_mod.revoke_supervisor_authority("bootstrap_reset")
+        kernel_lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+
+        assert orchestrator_mod.check_supervisor_authority(
+            "bootstrap_action",
+            allow_bootstrap_owner=True,
+        )
+        assert not orchestrator_mod.check_supervisor_authority("bootstrap_action")
 
 
 class TestStartupLockError:

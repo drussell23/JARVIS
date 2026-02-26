@@ -362,6 +362,58 @@ class AGIOSCoordinator:
             ),
         }
 
+        # v273.1: Align components phase timeout with execution mode.
+        # Root issue: 35s was tuned for parallel startup, but low-memory/sequential
+        # execution can legitimately require longer even when healthy.
+        components_timeout_base = float(phase_timeouts.get("agi_os_components", 35.0))
+        components_timeout = components_timeout_base
+
+        if self._memory_mode in {"sequential", "minimal"}:
+            seq_multiplier = max(
+                1.0,
+                _env_float(
+                    "JARVIS_AGI_OS_SEQUENTIAL_COMPONENTS_TIMEOUT_MULTIPLIER",
+                    1.6,
+                ),
+            )
+            components_timeout = max(
+                components_timeout,
+                components_timeout_base * seq_multiplier,
+            )
+        else:
+            try:
+                import psutil as _psutil_phase_budget
+
+                avail_mb = _psutil_phase_budget.virtual_memory().available / (1024 * 1024)
+                low_mem_threshold_mb = _env_float(
+                    "JARVIS_AGI_OS_COMPONENTS_GUARD_SEQUENTIAL_MB",
+                    3000.0,
+                )
+                if avail_mb < low_mem_threshold_mb:
+                    low_mem_multiplier = max(
+                        1.0,
+                        _env_float(
+                            "JARVIS_AGI_OS_LOWMEM_COMPONENTS_TIMEOUT_MULTIPLIER",
+                            1.35,
+                        ),
+                    )
+                    components_timeout = max(
+                        components_timeout,
+                        components_timeout_base * low_mem_multiplier,
+                    )
+            except Exception:
+                pass
+
+        if components_timeout != components_timeout_base:
+            logger.info(
+                "AGI components phase timeout adjusted: %.1fs -> %.1fs "
+                "(memory_mode=%s)",
+                components_timeout_base,
+                components_timeout,
+                self._memory_mode,
+            )
+        phase_timeouts["agi_os_components"] = components_timeout
+
         # Keep phase-level budgets aligned with the caller's startup envelope.
         effective_budget = startup_budget_seconds
         if effective_budget is None:
@@ -959,6 +1011,7 @@ class AGIOSCoordinator:
         # v255.0: Memory guard — adapt component init based on memory pressure
         _force_sequential = False
         _skip_optional = False
+        _skip_optional_reason: Optional[str] = None
         try:
             import psutil as _psutil_guard
             _vm = _psutil_guard.virtual_memory()
@@ -973,6 +1026,7 @@ class AGIOSCoordinator:
                     _avail_mb, _mem_mode,
                 )
                 _skip_optional = True
+                _skip_optional_reason = "Skipped: memory pressure"
                 _force_sequential = True
             elif _avail_mb < _guard_seq or _mem_mode == "sequential":
                 logger.warning(
@@ -1029,10 +1083,26 @@ class AGIOSCoordinator:
                 )
             return max(_comp_timeout_min, _comp_timeout_auto)
 
+        def _component_estimate_for(component_name: str, default_seconds: float) -> float:
+            """
+            Estimate expected init duration for startup planning decisions.
+
+            Uses p75 history when available; falls back to env-configurable defaults.
+            """
+            history = list(self._component_init_history.get(component_name, []))
+            if history:
+                ordered = sorted(history)
+                p75_index = min(len(ordered) - 1, int(len(ordered) * 0.75))
+                return max(0.5, float(ordered[p75_index]))
+            env_key = f"JARVIS_AGI_OS_ESTIMATE_{component_name.upper()}"
+            return max(0.5, _env_float(env_key, default_seconds))
+
+        _init_mode_label = "sequential" if _force_sequential else "parallel"
         logger.info(
-            "Component init: phase_budget=%.1fs, per_component_timeout=auto<=%.1fs (parallel)",
+            "Component init: phase_budget=%.1fs, per_component_timeout=auto<=%.1fs (%s)",
             _phase_budget,
             _phase_timeout_cap,
+            _init_mode_label,
         )
 
         async def _init_one(
@@ -1090,6 +1160,49 @@ class AGIOSCoordinator:
                 await self._report_init_progress(name, f"{label} failed")
                 return (name, None)
 
+        # v273.1: In sequential mode, optional components can make the phase
+        # mathematically impossible to finish within its allocated budget.
+        # Defer optional startup work to health-loop recovery when estimates
+        # exceed the sequential startup envelope.
+        if _force_sequential and not _skip_optional:
+            core_estimate = (
+                _component_estimate_for("approval", 2.0)
+                + _component_estimate_for("events", 2.0)
+            )
+            if self._config["enable_voice"]:
+                core_estimate += _component_estimate_for("voice", 6.0)
+            if self._config["enable_autonomous_actions"]:
+                core_estimate += _component_estimate_for("orchestrator", 4.0)
+
+            optional_estimate = (
+                _component_estimate_for("notification_monitor", 5.0)
+                + _component_estimate_for("system_event_monitor", 4.0)
+                + _component_estimate_for("ghost_hands", 6.0)
+                + _component_estimate_for("ghost_display", 12.0)
+            )
+
+            sequential_fit_ratio = max(
+                0.5,
+                min(
+                    1.0,
+                    _env_float("JARVIS_AGI_OS_SEQUENTIAL_OPTIONAL_FIT_RATIO", 0.85),
+                ),
+            )
+            sequential_budget = max(_comp_timeout_min, _phase_budget - _comp_timeout_margin)
+            sequential_allowed = sequential_budget * sequential_fit_ratio
+
+            if (core_estimate + optional_estimate) > sequential_allowed:
+                _skip_optional = True
+                _skip_optional_reason = "Deferred: startup sequential budget"
+                logger.warning(
+                    "Components guard: sequential budget fit failed "
+                    "(core=%.1fs optional=%.1fs allowed=%.1fs) — "
+                    "deferring optional components",
+                    core_estimate,
+                    optional_estimate,
+                    sequential_allowed,
+                )
+
         # ── Build list of component init coroutines ──
         coros = []
 
@@ -1144,11 +1257,12 @@ class AGIOSCoordinator:
                 "ghost_display", "Ghost Display", _get_ghost_display, is_async=False,
             ))
         else:
+            _skip_reason = _skip_optional_reason or "Skipped: memory pressure"
             for _skipped in ("notification_monitor", "system_event_monitor", "ghost_hands", "ghost_display"):
                 self._component_status[_skipped] = ComponentStatus(
-                    name=_skipped, available=False, error="Skipped: memory pressure",
+                    name=_skipped, available=False, error=_skip_reason,
                 )
-                logger.info("Skipped %s (memory pressure)", _skipped)
+                logger.info("Skipped %s (%s)", _skipped, _skip_reason)
 
         # ── Run components (parallel by default, sequential under memory pressure) ──
         if _force_sequential:
@@ -1185,8 +1299,8 @@ class AGIOSCoordinator:
         succeeded = sum(1 for v in result_map.values() if v is not None)
         total = len(coros)
         logger.info(
-            "Component init complete: %d/%d succeeded (parallel, %.1fs budget)",
-            succeeded, total, _phase_budget,
+            "Component init complete: %d/%d succeeded (%s, %.1fs budget)",
+            succeeded, total, _init_mode_label, _phase_budget,
         )
 
     async def _init_intelligence_systems(self) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from backend.agi_os.agi_os_coordinator import AGIOSCoordinator, AGIOSState, ComponentStatus
 
 
@@ -79,3 +81,64 @@ def test_get_status_includes_phases_separately():
     assert "phases" in status
     assert "phase_components_connected" in status["phases"]
     assert "phase_components_connected" not in status["components"]
+
+
+async def test_start_adjusts_components_phase_timeout_for_sequential_mode(monkeypatch):
+    coordinator = AGIOSCoordinator()
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setenv("JARVIS_AGI_OS_SEQUENTIAL_COMPONENTS_TIMEOUT_MULTIPLIER", "2.0")
+    monkeypatch.setattr(coordinator, "_init_agi_os_components", _noop)
+    monkeypatch.setattr(coordinator, "_init_intelligence_systems", _noop)
+    monkeypatch.setattr(coordinator, "_init_neural_mesh", _noop)
+    monkeypatch.setattr(coordinator, "_init_hybrid_orchestrator", _noop)
+    monkeypatch.setattr(coordinator, "_init_screen_analyzer", _noop)
+    monkeypatch.setattr(coordinator, "_connect_components", _noop)
+
+    await coordinator.start(memory_mode="sequential")
+
+    assert coordinator._phase_budgets["agi_os_components"] >= 70.0
+
+    await coordinator.stop()
+
+
+async def test_components_phase_defers_optional_when_sequential_budget_tight(monkeypatch):
+    coordinator = AGIOSCoordinator()
+    coordinator._memory_mode = "sequential"
+    coordinator._phase_budgets = {"agi_os_components": 20.0}
+    coordinator._config["enable_voice"] = False
+    coordinator._config["enable_autonomous_actions"] = False
+
+    async def _ok_async(*args, **kwargs):
+        return object()
+
+    monkeypatch.setattr(
+        "backend.agi_os.agi_os_coordinator.get_approval_manager",
+        _ok_async,
+    )
+    monkeypatch.setattr(
+        "backend.agi_os.agi_os_coordinator.get_event_stream",
+        _ok_async,
+    )
+
+    import psutil
+
+    monkeypatch.setattr(
+        psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=8 * 1024 * 1024 * 1024),
+    )
+
+    await coordinator._init_agi_os_components()
+
+    for name in (
+        "notification_monitor",
+        "system_event_monitor",
+        "ghost_hands",
+        "ghost_display",
+    ):
+        status = coordinator._component_status[name]
+        assert status.available is False
+        assert status.error == "Deferred: startup sequential budget"

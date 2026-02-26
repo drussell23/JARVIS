@@ -204,6 +204,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -386,35 +387,206 @@ from enum import auto as enum_auto
 
 _SUPERVISOR_AUTHORITY_GRANTED: bool = False
 _SUPERVISOR_AUTHORITY_REASON: str = "not_yet_granted"
+_SUPERVISOR_AUTHORITY_EPOCH: str = "none"
+_SUPERVISOR_AUTHORITY_OWNER_PID: Optional[int] = None
+_SUPERVISOR_AUTHORITY_GRANTED_AT: float = 0.0
+
+_AUTHORITY_STATE_PATH = Path.home() / ".jarvis" / "locks" / "supervisor_authority.json"
+_KERNEL_LOCK_PATH = Path.home() / ".jarvis" / "locks" / "kernel.lock"
 
 
-def grant_supervisor_authority(reason: str = "supervisor_startup_complete") -> None:
+def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_kernel_lock_owner_pid() -> Optional[int]:
+    data = _read_json_file(_KERNEL_LOCK_PATH)
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    try:
+        return int(pid) if pid is not None else None
+    except Exception:
+        return None
+
+
+def _get_authority_snapshot() -> Dict[str, Any]:
+    disk = _read_json_file(_AUTHORITY_STATE_PATH)
+    if isinstance(disk, dict):
+        return {
+            "granted": bool(disk.get("granted", False)),
+            "reason": str(disk.get("reason", "unknown")),
+            "epoch": str(disk.get("epoch", "none")),
+            "owner_pid": disk.get("owner_pid"),
+            "granted_at": float(disk.get("granted_at", 0.0) or 0.0),
+        }
+    return {
+        "granted": _SUPERVISOR_AUTHORITY_GRANTED,
+        "reason": _SUPERVISOR_AUTHORITY_REASON,
+        "epoch": _SUPERVISOR_AUTHORITY_EPOCH,
+        "owner_pid": _SUPERVISOR_AUTHORITY_OWNER_PID,
+        "granted_at": _SUPERVISOR_AUTHORITY_GRANTED_AT,
+    }
+
+
+def get_supervisor_authority_state() -> Dict[str, Any]:
+    """Return current authority state including lock ownership diagnostics."""
+    state = _get_authority_snapshot()
+    state["kernel_lock_owner_pid"] = _read_kernel_lock_owner_pid()
+    state["current_pid"] = os.getpid()
+    return state
+
+
+def grant_supervisor_authority(
+    reason: str = "supervisor_startup_complete",
+    *,
+    epoch: Optional[str] = None,
+    owner_pid: Optional[int] = None,
+) -> str:
     """Grant authority for cross_repo to take autonomous destructive actions."""
-    global _SUPERVISOR_AUTHORITY_GRANTED, _SUPERVISOR_AUTHORITY_REASON
+    global _SUPERVISOR_AUTHORITY_GRANTED
+    global _SUPERVISOR_AUTHORITY_REASON
+    global _SUPERVISOR_AUTHORITY_EPOCH
+    global _SUPERVISOR_AUTHORITY_OWNER_PID
+    global _SUPERVISOR_AUTHORITY_GRANTED_AT
+    now = time.time()
+    resolved_owner_pid = int(owner_pid if owner_pid is not None else os.getpid())
+    resolved_epoch = str(
+        epoch
+        if epoch is not None
+        else f"{resolved_owner_pid}-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
+    )
+
     _SUPERVISOR_AUTHORITY_GRANTED = True
     _SUPERVISOR_AUTHORITY_REASON = reason
+    _SUPERVISOR_AUTHORITY_EPOCH = resolved_epoch
+    _SUPERVISOR_AUTHORITY_OWNER_PID = resolved_owner_pid
+    _SUPERVISOR_AUTHORITY_GRANTED_AT = now
+
+    try:
+        _write_json_atomic(
+            _AUTHORITY_STATE_PATH,
+            {
+                "granted": True,
+                "reason": reason,
+                "epoch": resolved_epoch,
+                "owner_pid": resolved_owner_pid,
+                "granted_at": now,
+            },
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "[AuthGate] Failed to persist authority grant state: %s", e
+        )
+
     logging.getLogger(__name__).info(
-        "[AuthGate] Supervisor authority GRANTED: %s", reason
+        "[AuthGate] Supervisor authority GRANTED: %s (pid=%s epoch=%s)",
+        reason,
+        resolved_owner_pid,
+        resolved_epoch,
     )
+    return resolved_epoch
 
 
 def revoke_supervisor_authority(reason: str = "supervisor_shutdown") -> None:
     """Revoke authority -- cross_repo will only log, not act."""
-    global _SUPERVISOR_AUTHORITY_GRANTED, _SUPERVISOR_AUTHORITY_REASON
+    global _SUPERVISOR_AUTHORITY_GRANTED
+    global _SUPERVISOR_AUTHORITY_REASON
+    global _SUPERVISOR_AUTHORITY_EPOCH
+    global _SUPERVISOR_AUTHORITY_OWNER_PID
+    global _SUPERVISOR_AUTHORITY_GRANTED_AT
     _SUPERVISOR_AUTHORITY_GRANTED = False
     _SUPERVISOR_AUTHORITY_REASON = reason
+    _SUPERVISOR_AUTHORITY_EPOCH = "none"
+    _SUPERVISOR_AUTHORITY_OWNER_PID = None
+    _SUPERVISOR_AUTHORITY_GRANTED_AT = 0.0
+
+    try:
+        _write_json_atomic(
+            _AUTHORITY_STATE_PATH,
+            {
+                "granted": False,
+                "reason": reason,
+                "epoch": "none",
+                "owner_pid": None,
+                "granted_at": time.time(),
+            },
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "[AuthGate] Failed to persist authority revoke state: %s", e
+        )
+
     logging.getLogger(__name__).info(
         "[AuthGate] Supervisor authority REVOKED: %s", reason
     )
 
 
-def check_supervisor_authority(action: str) -> bool:
-    """Check if a destructive action is authorized. Logs and returns False if not."""
-    if _SUPERVISOR_AUTHORITY_GRANTED:
+def check_supervisor_authority(
+    action: str,
+    *,
+    expected_epoch: Optional[str] = None,
+    allow_bootstrap_owner: bool = False,
+) -> bool:
+    """
+    Check if a destructive action is authorized.
+
+    Authorization requires active grant bound to this PID and (when present)
+    ownership of the kernel startup lock. Optional bootstrap mode allows the
+    current lock owner to perform startup mutations before grant.
+    """
+    state = _get_authority_snapshot()
+    current_pid = os.getpid()
+    lock_owner_pid = _read_kernel_lock_owner_pid()
+    bootstrap_owner = lock_owner_pid == current_pid and allow_bootstrap_owner
+
+    if expected_epoch is not None and state.get("epoch") != expected_epoch:
+        logging.getLogger(__name__).warning(
+            "[AuthGate] BLOCKED %s -- epoch mismatch (expected=%s actual=%s)",
+            action,
+            expected_epoch,
+            state.get("epoch"),
+        )
+        return False
+
+    if (
+        bool(state.get("granted", False))
+        and int(state.get("owner_pid") or -1) == current_pid
+        and lock_owner_pid == current_pid
+    ):
         return True
+
+    if bootstrap_owner:
+        logging.getLogger(__name__).info(
+            "[AuthGate] Bootstrap authority for %s (pid=%s lock_owner=%s)",
+            action,
+            current_pid,
+            lock_owner_pid,
+        )
+        return True
+
     logging.getLogger(__name__).warning(
-        "[AuthGate] BLOCKED %s -- supervisor authority not granted (%s)",
-        action, _SUPERVISOR_AUTHORITY_REASON,
+        "[AuthGate] BLOCKED %s -- no valid authority "
+        "(granted=%s owner_pid=%s lock_owner_pid=%s current_pid=%s reason=%s epoch=%s)",
+        action,
+        state.get("granted", False),
+        state.get("owner_pid"),
+        lock_owner_pid,
+        current_pid,
+        state.get("reason"),
+        state.get("epoch"),
     )
     return False
 

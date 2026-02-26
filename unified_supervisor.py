@@ -61960,6 +61960,52 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.debug(f"[Kernel] CollectiveAI mesh wiring warning: {e}")
 
+    def _control_plane_authorized(
+        self,
+        action: str,
+        *,
+        allow_bootstrap_owner: bool = True,
+    ) -> bool:
+        """
+        Authorize control-plane mutations with split-brain fencing.
+
+        During startup, lock owner may mutate before grant. After grant, the
+        action must match the supervisor authority epoch and lock ownership.
+        """
+        if getattr(self, "_is_shutting_down", False):
+            self.logger.warning("[AuthGate] BLOCKED %s -- supervisor shutting down", action)
+            return False
+
+        expected_epoch = getattr(self, "_supervisor_authority_epoch", None)
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import (
+                check_supervisor_authority,
+            )
+
+            return bool(
+                check_supervisor_authority(
+                    action,
+                    expected_epoch=expected_epoch,
+                    allow_bootstrap_owner=allow_bootstrap_owner,
+                )
+            )
+        except Exception as e:
+            # Fail closed when strict mode is enabled.
+            strict = _get_env_bool("JARVIS_STRICT_CONTROL_PLANE_AUTH", True)
+            if strict:
+                self.logger.warning(
+                    "[AuthGate] BLOCKED %s -- authority check unavailable (%s)",
+                    action,
+                    e,
+                )
+                return False
+            self.logger.debug(
+                "[AuthGate] Fallback allow for %s (strict disabled): %s",
+                action,
+                e,
+            )
+            return True
+
     def _propagate_invincible_node_url(self, node_ip: str, source: str = "startup") -> None:
         """
         v219.0: ROOT CAUSE FIX - Propagate Invincible Node URL to environment.
@@ -61973,6 +62019,18 @@ class JarvisSystemKernel:
             node_ip: The IP address of the ready Invincible Node
             source: Where this was called from (for logging)
         """
+        if not self._control_plane_authorized(
+            f"propagate_invincible_node_url:{source}",
+            allow_bootstrap_owner=True,
+        ):
+            self.logger.warning(
+                "[InvincibleNode] URL propagation blocked by authority gate "
+                "(source=%s, ip=%s)",
+                source,
+                node_ip,
+            )
+            return
+
         port = self.config.invincible_node_port
         prime_url = f"http://{node_ip}:{port}"
         
@@ -62053,6 +62111,12 @@ class JarvisSystemKernel:
         Uses bounded retries with backoff/jitter and deduplicates concurrent
         callers so multiple startup paths do not race each other.
         """
+        if not self._control_plane_authorized(
+            f"prime_router_gcp_promotion:{source}",
+            allow_bootstrap_owner=True,
+        ):
+            return False
+
         endpoint = (str(host), int(port))
         inflight_task = getattr(self, "_prime_router_gcp_promotion_task", None)
         inflight_endpoint = getattr(self, "_prime_router_gcp_promotion_endpoint", None)
@@ -63265,6 +63329,7 @@ class JarvisSystemKernel:
         try:
             from backend.supervisor.cross_repo_startup_orchestrator import revoke_supervisor_authority
             revoke_supervisor_authority("supervisor_shutdown")
+            self._supervisor_authority_epoch = None
         except Exception as _auth_err:
             self.logger.debug("[Kernel] v270.2: AuthGate revoke error: %s", _auth_err)
 
@@ -72109,6 +72174,17 @@ class JarvisSystemKernel:
         Returns:
             True if coordinator started, False otherwise
         """
+        if not self._control_plane_authorized(
+            "initialize_agi_os",
+            allow_bootstrap_owner=True,
+        ):
+            self._update_component_status(
+                "agi_os",
+                "blocked",
+                "Blocked by control-plane authority gate",
+            )
+            return False
+
         if not self.config.agi_os_enabled:
             self.logger.info("[AGI-OS] AGI OS disabled via config")
             self._update_component_status("agi_os", "skipped", "Disabled via config")
@@ -78306,6 +78382,7 @@ class JarvisSystemKernel:
             "files_cleared": 0,
             "semaphores_cleaned": 0,
             "actions_taken": [],
+            "residual_risks": [],
         }
 
         try:
@@ -78440,19 +78517,54 @@ class JarvisSystemKernel:
                     import json as _json
                     content = await asyncio.to_thread(pressure_file.read_text)
                     data = _json.loads(content)
-                    status = data.get("status", "")
+                    status = str(data.get("status", "") or "").strip().lower()
                     timestamp = data.get("timestamp", 0)
-                    is_emergency = status == "offload_active" or data.get("emergency", False)
+                    emergency_flag = bool(data.get("emergency", False))
+                    is_emergency = status in {"offload_active", "emergency", "critical"} or emergency_flag
+                    age_s = None
+                    if timestamp:
+                        age_s = max(0.0, time.time() - float(timestamp))
+
+                    fresh_window_s = max(
+                        30.0,
+                        _get_env_float(
+                            "JARVIS_CLEAN_SLATE_MEMORY_PRESSURE_FRESH_WINDOW_S",
+                            120.0,
+                        ),
+                    )
+                    stale_window_s = max(
+                        fresh_window_s,
+                        _get_env_float(
+                            "JARVIS_CLEAN_SLATE_MEMORY_PRESSURE_STALE_WINDOW_S",
+                            900.0,
+                        ),
+                    )
 
                     confidence = 0.0
+                    should_clear = False
                     if is_emergency:
-                        confidence = 0.8
-                    if timestamp and (time.time() - timestamp > 1800):
-                        confidence = max(confidence, 0.6)
+                        # offload_active indicates prior pressure routing; this is
+                        # a recovery signal, not a definitive hard crash marker.
+                        should_clear = True
+                        if age_s is None:
+                            confidence = 0.45
+                        elif age_s <= fresh_window_s:
+                            confidence = 0.35
+                        elif age_s <= stale_window_s:
+                            confidence = 0.50
+                        else:
+                            confidence = 0.65
+                    elif age_s is not None and age_s > stale_window_s:
+                        # Non-emergency stale pressure files are hygiene signals.
+                        should_clear = True
+                        confidence = 0.55
 
-                    return ("memory_pressure", confidence, confidence > 0.5, pressure_file, status)
+                    detail = status or "unknown"
+                    if age_s is not None:
+                        detail = f"{detail}, age={age_s:.0f}s"
+                    return ("memory_pressure", confidence, should_clear, pressure_file, detail)
                 except Exception:
-                    return ("memory_pressure", 0.5, True, pressure_file, "corrupted")
+                    return ("memory_pressure", 0.55, True, pressure_file, "corrupted")
 
             async def detect_stale_heartbeat() -> tuple:
                 """Detect stale heartbeat (process died without cleanup)."""
@@ -78528,6 +78640,8 @@ class JarvisSystemKernel:
 
             # Process signals and determine if crash recovery is needed
             crash_confidence = 0.0
+            hard_crash_confidence = 0.0
+            hard_crash_signals = {"crash_marker", "cloud_lock", "heartbeat", "stale_ports"}
             for signal in signals:
                 if isinstance(signal, Exception):
                     self.logger.debug(f"[Clean Slate] Detector failed: {signal}")
@@ -78540,6 +78654,8 @@ class JarvisSystemKernel:
                         f"clear={should_clear} detail={detail}"
                     )
                     crash_confidence = max(crash_confidence, confidence)
+                    if name in hard_crash_signals:
+                        hard_crash_confidence = max(hard_crash_confidence, confidence)
 
                     if should_clear and file_path and file_path.exists():
                         try:
@@ -78547,19 +78663,29 @@ class JarvisSystemKernel:
                             recovery_stats["files_cleared"] += 1
                             recovery_stats["actions_taken"].append(f"cleared_{name}")
                             if confidence >= 0.8:
-                                recovery_stats["crash_detected"] = True
-                                self.logger.warning(
-                                    f"[Clean Slate] Crash signal: {name} "
-                                    f"(confidence={confidence:.0%}, {detail})"
-                                )
+                                if name in hard_crash_signals:
+                                    recovery_stats["crash_detected"] = True
+                                    self.logger.info(
+                                        f"[Clean Slate] Crash signal detected: {name} "
+                                        f"(confidence={confidence:.0%}, {detail})"
+                                    )
+                                else:
+                                    self.logger.info(
+                                        f"[Clean Slate] Recovery signal detected: {name} "
+                                        f"(confidence={confidence:.0%}, {detail})"
+                                    )
                         except Exception as e:
                             self.logger.debug(f"[Clean Slate] Failed to clear {name}: {e}")
+                            recovery_stats["residual_risks"].append(
+                                f"clear_{name}_failed"
+                            )
 
             # Log overall crash confidence
             if crash_confidence >= 0.5:
                 self.logger.info(
-                    f"[Clean Slate] Crash confidence: {crash_confidence:.0%} - "
-                    f"recovery mode {'ACTIVE' if crash_confidence >= 0.8 else 'PARTIAL'}"
+                    f"[Clean Slate] Recovery confidence: {crash_confidence:.0%} "
+                    f"(hard_crash={hard_crash_confidence:.0%}) - "
+                    f"mode {'ACTIVE' if hard_crash_confidence >= 0.8 else 'PARTIAL'}"
                 )
 
             # =================================================================
@@ -78587,7 +78713,7 @@ class JarvisSystemKernel:
                             )
                             break
                         should_remove = False
-                        if crash_confidence >= 0.8:
+                        if hard_crash_confidence >= 0.8:
                             # Crash detected — owning process is dead, all locks are stale
                             should_remove = True
                         else:
@@ -78710,6 +78836,7 @@ class JarvisSystemKernel:
                         recovery_stats["actions_taken"].append(f"cleaned_{cleaned}_semaphores")
                 except Exception as e:
                     self.logger.debug(f"[Clean Slate] Semaphore cleanup failed: {e}")
+                    recovery_stats["residual_risks"].append("semaphore_cleanup_failed")
             elif SHUTDOWN_HOOK_AVAILABLE and cleanup_orphaned_semaphores_on_startup:
                 try:
                     # Use sync version from shutdown_hook
@@ -78721,6 +78848,7 @@ class JarvisSystemKernel:
                         recovery_stats["actions_taken"].append(f"cleaned_{cleaned}_semaphores")
                 except Exception as e:
                     self.logger.debug(f"[Clean Slate] Semaphore cleanup failed: {e}")
+                    recovery_stats["residual_risks"].append("semaphore_cleanup_failed")
 
             # =================================================================
             # STEP 3: Prevent multiple JARVIS instances
@@ -78733,6 +78861,7 @@ class JarvisSystemKernel:
                         recovery_stats["actions_taken"].append("instance_check_passed")
                 except Exception as e:
                     self.logger.warning(f"[Clean Slate] Instance check failed (non-fatal): {e}")
+                    recovery_stats["residual_risks"].append("instance_check_failed")
 
             # =================================================================
             # STEP 4: Verify shutdown handlers (registered at module load)
@@ -78751,18 +78880,39 @@ class JarvisSystemKernel:
             # =================================================================
             # STEP 5: Log recovery summary
             # =================================================================
+            had_cleanup_work = (
+                recovery_stats["files_cleared"] > 0
+                or recovery_stats["semaphores_cleaned"] > 0
+                or len(recovery_stats["actions_taken"]) > 0
+            )
             if recovery_stats["crash_detected"]:
-                self.logger.warning(
-                    f"[Clean Slate] Crash recovery completed: "
-                    f"files_cleared={recovery_stats['files_cleared']}, "
-                    f"semaphores_cleaned={recovery_stats['semaphores_cleaned']}, "
-                    f"actions={recovery_stats['actions_taken']}"
-                )
+                if recovery_stats["residual_risks"]:
+                    self.logger.warning(
+                        f"[Clean Slate] Crash recovery completed with residual risk: "
+                        f"files_cleared={recovery_stats['files_cleared']}, "
+                        f"semaphores_cleaned={recovery_stats['semaphores_cleaned']}, "
+                        f"actions={recovery_stats['actions_taken']}, "
+                        f"residual_risks={recovery_stats['residual_risks']}"
+                    )
+                else:
+                    self.logger.info(
+                        f"[Clean Slate] Crash recovery completed successfully: "
+                        f"files_cleared={recovery_stats['files_cleared']}, "
+                        f"semaphores_cleaned={recovery_stats['semaphores_cleaned']}, "
+                        f"actions={recovery_stats['actions_taken']}"
+                    )
                 if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                     try:
                         log_startup_checkpoint("crash_recovery_complete")
                     except Exception:
                         pass
+            elif had_cleanup_work:
+                self.logger.info(
+                    f"[Clean Slate] Startup hygiene cleanup completed: "
+                    f"files_cleared={recovery_stats['files_cleared']}, "
+                    f"semaphores_cleaned={recovery_stats['semaphores_cleaned']}, "
+                    f"actions={recovery_stats['actions_taken']}"
+                )
             else:
                 self.logger.success("[Clean Slate] System state is clean - no recovery needed")
 
@@ -79212,7 +79362,10 @@ class JarvisSystemKernel:
         # v270.2: Grant cross_repo authority now that supervisor controls startup.
         try:
             from backend.supervisor.cross_repo_startup_orchestrator import grant_supervisor_authority
-            grant_supervisor_authority("startup_complete")
+            self._supervisor_authority_epoch = grant_supervisor_authority(
+                "startup_complete",
+                owner_pid=os.getpid(),
+            )
         except Exception as _auth_err:
             self.logger.debug("[Kernel] v270.2: AuthGate grant error: %s", _auth_err)
 
@@ -79270,6 +79423,20 @@ class JarvisSystemKernel:
             # the phase), but the 100% broadcast was sent AFTER the phase returned
             # (in _startup_impl). By then the server was dead — StartupGate never
             # received the completion signal and stayed at 98% forever.
+
+            # v270.3: Disarm DMS BEFORE changing _current_startup_phase to "complete".
+            # Root cause: The heartbeat reads _current_startup_phase and broadcasts
+            # stage="complete". _resolve_watchdog_stage("complete") returns None
+            # (not in canonical map), so update_phase() is never called. The DMS
+            # _last_progress_time stops resetting while _current_phase is still
+            # "frontend" → 183.7s stall → rollback. Startup monitoring is done
+            # at this point — all phases are complete — so disarm the DMS.
+            if self._startup_watchdog:
+                try:
+                    await self._startup_watchdog.stop()
+                except Exception:
+                    pass
+
             self._current_startup_phase = "complete"
             self._current_startup_progress = 100
             await self._safe_broadcast(
@@ -80974,7 +81141,16 @@ class JarvisSystemKernel:
 
         if is_heartbeat:
             heartbeat_phase = getattr(self, "_current_startup_phase", "")
-            return canonical.get(heartbeat_phase)
+            resolved = canonical.get(heartbeat_phase)
+            if resolved:
+                return resolved
+            # v270.3: Defense-in-depth — when _current_startup_phase is a
+            # post-startup phase like "complete" or "ready" (not in canonical),
+            # return the DMS's own current phase so heartbeats continue resetting
+            # _last_progress_time. Without this, heartbeats silently stop
+            # feeding the DMS, causing false stall detection.
+            if self._startup_watchdog and hasattr(self._startup_watchdog, '_current_phase'):
+                return self._startup_watchdog._current_phase or None
 
         return None
 
