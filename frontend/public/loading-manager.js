@@ -4493,6 +4493,15 @@ class JARVISLoadingManager {
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
+        // v275.1: Begin Matrix rain transition IMMEDIATELY at verification start.
+        // The user should see falling Matrix characters during the 96-100%
+        // verification steps, NOT the static JARVIS title with a percentage.
+        // This creates a seamless visual bridge to the main app (which also
+        // has Matrix rain via MatrixBackground.js in StartupGate).
+        // ═══════════════════════════════════════════════════════════════════════════
+        this._beginMatrixTransition();
+
+        // ═══════════════════════════════════════════════════════════════════════════
         // STEP 1: Wait for BACKEND to be OPERATIONALLY ready (not just HTTP responding)
         // ═══════════════════════════════════════════════════════════════════════════
         console.log('[Complete] Step 1: Waiting for backend to be operationally ready...');
@@ -5103,10 +5112,13 @@ class JARVISLoadingManager {
     async playEpicCompletionAnimation(redirectUrl) {
         const container = document.querySelector('.loading-container');
         const reactor = this.elements.reactor;
+        const matrixCanvas = document.getElementById('matrix-canvas');
+        const particlesBg = document.getElementById('particles');
+        const scanLines = document.querySelector('.scan-lines');
+        const hudFrame = document.querySelector('.hud-frame');
+        const phaseTimeline = document.getElementById('phase-timeline');
 
-        const totalDuration = 3000;
-
-        // Phase 1: Power surge
+        // Phase 1: Quick power surge on reactor (300ms)
         if (reactor) {
             reactor.style.transition = 'all 0.3s ease-out';
             reactor.style.transform = 'translate(-50%, -50%) scale(1.5)';
@@ -5117,32 +5129,64 @@ class JARVISLoadingManager {
             }
         }
 
-        await this.sleep(600);
+        await this.sleep(400);
 
-        // Phase 2: Fade out
+        // Phase 2: Transition to pure Matrix rain
+        // Fade out ALL UI elements (container, HUD, particles, scan lines)
+        // while simultaneously cranking the Matrix canvas to full opacity.
+        // This creates the "dissolving into the Matrix" effect.
         if (container) {
-            container.style.transition = 'opacity 1s ease-out';
+            container.style.transition = 'opacity 0.8s ease-out';
             container.style.opacity = '0';
         }
         if (reactor) {
-            reactor.style.transition = 'all 1s ease-out';
+            reactor.style.transition = 'all 0.8s ease-out';
             reactor.style.transform = 'translate(-50%, -50%) scale(2)';
             reactor.style.opacity = '0';
         }
+        if (particlesBg) {
+            particlesBg.style.transition = 'opacity 0.6s ease-out';
+            particlesBg.style.opacity = '0';
+        }
+        if (scanLines) {
+            scanLines.style.transition = 'opacity 0.6s ease-out';
+            scanLines.style.opacity = '0';
+        }
+        if (hudFrame) {
+            hudFrame.style.transition = 'opacity 0.6s ease-out';
+            hudFrame.style.opacity = '0';
+        }
+        if (phaseTimeline) {
+            phaseTimeline.style.transition = 'opacity 0.6s ease-out';
+            phaseTimeline.style.opacity = '0';
+        }
 
-        await this.sleep(1500);
+        // Bring Matrix rain canvas to full prominence
+        if (matrixCanvas) {
+            matrixCanvas.style.transition = 'opacity 0.8s ease-in';
+            matrixCanvas.style.opacity = '1';
+            matrixCanvas.style.zIndex = '1';
+        }
 
-        // Phase 3: Navigate
-        const overlay = document.createElement('div');
-        overlay.style.cssText = `
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: #000; opacity: 0;
-            transition: opacity 0.5s ease-in; z-index: 10001;
-        `;
-        document.body.appendChild(overlay);
-        setTimeout(() => overlay.style.opacity = '1', 10);
+        // Also boost the MatrixRain animation speed/density if available
+        if (window.matrixRain && window.matrixRain.config) {
+            // Increase layer opacities to full visibility
+            window.matrixRain.config.layerOpacities = [0.4, 0.6, 0.9];
+            // Speed up the rain for dramatic effect
+            window.matrixRain.config.layerSpeeds = [0.3, 0.5, 0.8];
+            // Disable pulse sync (steady full brightness)
+            if (window.matrixRain.config.pulseSync) {
+                window.matrixRain.config.pulseSync.minOpacity = 0.9;
+                window.matrixRain.config.pulseSync.maxOpacity = 1.0;
+            }
+        }
 
-        await this.sleep(500);
+        // Hold on pure Matrix rain for 2 seconds — this is what the
+        // user sees as the transition: just falling Matrix characters
+        // on a black background, exactly like the main app page.
+        await this.sleep(2000);
+
+        // Phase 3: Navigate (no black overlay needed — Matrix rain IS the transition)
         window.location.href = redirectUrl;
     }
 
@@ -5168,6 +5212,66 @@ class JARVISLoadingManager {
 
         reactor.parentElement.appendChild(ring);
         setTimeout(() => { ring.remove(); style.remove(); }, 1000);
+    }
+
+    _beginMatrixTransition() {
+        /**
+         * v275.1: Begin gradual Matrix rain transition at verification start.
+         *
+         * Root cause: During the 96-100% verification steps (backend check,
+         * Trinity check, frontend check, final check), the user sees the
+         * static JARVIS title + progress percentage for 5-15 seconds. This
+         * looks like the page is "stuck at 98%".
+         *
+         * The cure: Start fading out UI chrome (logo, progress bar, HUD,
+         * particles, scan lines) and fading IN the Matrix rain canvas
+         * BEFORE verification steps begin. The user sees falling Matrix
+         * characters during the wait — a seamless visual bridge to the
+         * main app (which has the same Matrix rain via StartupGate.js).
+         *
+         * The transition is gradual (2s CSS transitions) so it feels
+         * like a dissolve, not a sudden switch.
+         */
+        console.log('[Complete] v275.1: Beginning Matrix rain transition');
+
+        const matrixCanvas = document.getElementById('matrix-canvas');
+        const container = document.querySelector('.loading-container');
+        const particlesBg = document.getElementById('particles');
+        const scanLines = document.querySelector('.scan-lines');
+        const hudFrame = document.querySelector('.hud-frame');
+        const phaseTimeline = document.getElementById('phase-timeline');
+
+        // Fade out UI chrome with a slow 2s transition
+        const fadeOutElements = [particlesBg, scanLines, hudFrame, phaseTimeline];
+        for (const el of fadeOutElements) {
+            if (el) {
+                el.style.transition = 'opacity 2s ease-out';
+                el.style.opacity = '0';
+            }
+        }
+
+        // Fade the loading container to semi-transparent (not fully gone
+        // yet — the progress percentage is still useful as a subtle overlay)
+        if (container) {
+            container.style.transition = 'opacity 2s ease-out';
+            container.style.opacity = '0.15';
+        }
+
+        // Bring Matrix rain canvas to high visibility
+        if (matrixCanvas) {
+            matrixCanvas.style.transition = 'opacity 2s ease-in';
+            matrixCanvas.style.opacity = '0.85';
+        }
+
+        // Boost MatrixRain animation parameters for prominence
+        if (window.matrixRain && window.matrixRain.config) {
+            window.matrixRain.config.layerOpacities = [0.25, 0.4, 0.7];
+            window.matrixRain.config.layerSpeeds = [0.2, 0.35, 0.55];
+            if (window.matrixRain.config.pulseSync) {
+                window.matrixRain.config.pulseSync.minOpacity = 0.7;
+                window.matrixRain.config.pulseSync.maxOpacity = 1.0;
+            }
+        }
     }
 
     sleep(ms) {
