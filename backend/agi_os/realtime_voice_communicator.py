@@ -1479,23 +1479,62 @@ class RealTimeVoiceCommunicator:
                         logger.debug(f"[SpeakImmediate] AudioBus path failed, falling back: {bus_err}")
 
                     if not _bus_fallback_succeeded:
-                        # Legacy: direct macOS say subprocess
+                        # v275.2: SAFE fallback — always use say -o tempfile
+                        # to avoid opening audio device (causes static when
+                        # FullDuplexDevice holds the device).
+                        import tempfile as _tmpmod
                         config = self._mode_configs.get(mode, self._mode_configs[VoiceMode.NORMAL])
-                        cmd = [
-                            'say',
-                            '-v', config.voice,
-                            '-r', str(config.rate),
-                            text
-                        ]
-                        process = await asyncio.create_subprocess_exec(
-                            *cmd,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
-                            start_new_session=True,  # v267.0: isolate from parent signals
+                        _temp_fd, _temp_path = _tmpmod.mkstemp(
+                            suffix=".aiff", prefix="jarvis_rtvc_"
                         )
-                        self._current_speech_process = process
-                        await asyncio.wait_for(process.wait(), timeout=timeout)
-                        self._current_speech_process = None
+                        os.close(_temp_fd)
+                        try:
+                            cmd = [
+                                'say',
+                                '-v', config.voice,
+                                '-r', str(config.rate),
+                                '-o', _temp_path,
+                                text
+                            ]
+                            process = await asyncio.create_subprocess_exec(
+                                *cmd,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                                start_new_session=True,
+                            )
+                            self._current_speech_process = process
+                            await asyncio.wait_for(process.wait(), timeout=timeout)
+                            self._current_speech_process = None
+
+                            # Play through AudioBus if running, else afplay
+                            _played = False
+                            try:
+                                from backend.audio.audio_bus import AudioBus as _ABCls
+                                _ab = _ABCls.get_instance_safe()
+                                if _ab is not None and _ab.is_running:
+                                    import soundfile as _sf
+                                    import numpy as _np
+                                    _data, _sr = _sf.read(_temp_path, dtype="float32")
+                                    if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                                        _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                                    _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                                    await _ab.play_audio(_data, _sr)
+                                    _played = True
+                            except Exception as _ab_err:
+                                logger.debug(f"[SpeakImmediate] AudioBus play failed: {_ab_err}")
+
+                            if not _played:
+                                _play_proc = await asyncio.create_subprocess_exec(
+                                    "afplay", _temp_path,
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                                await asyncio.wait_for(_play_proc.wait(), timeout=30.0)
+                        finally:
+                            try:
+                                os.unlink(_temp_path)
+                            except OSError:
+                                pass
 
                 logger.debug(f"🔊 [SPEAKING] Finished: {text[:50]}...")
 

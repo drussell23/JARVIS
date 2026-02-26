@@ -1889,12 +1889,57 @@ class EnhancedVoiceEngine:
             logger.debug("[TTS] Engine not yet initialized (lazy), skipping speak")
             return
 
-        # Speak
+        # Speak — v275.2: MacOS voice path (macos_voice.py) is safe (uses
+        # say -o tempfile + AudioBus).  For pyttsx3, use save_to_file to
+        # avoid opening audio device when FullDuplexDevice holds it.
         if USE_MACOS_VOICE:
             self.tts_engine.say_and_wait(text)
         else:
-            self.tts_engine.say(text)
-            self.tts_engine.runAndWait()
+            # v275.2: Safe pyttsx3 path — save to file, then play via
+            # AudioBus or afplay to avoid device contention.
+            import tempfile as _tmpmod
+            _temp_fd, _temp_path = _tmpmod.mkstemp(
+                suffix=".wav", prefix="jarvis_pyttsx3_"
+            )
+            os.close(_temp_fd)
+            try:
+                self.tts_engine.save_to_file(text, _temp_path)
+                self.tts_engine.runAndWait()
+                # Play the generated file safely
+                _device_held = False
+                try:
+                    from backend.audio.audio_bus import AudioBus as _ABCls
+                    _bus = _ABCls.get_instance_safe()
+                    _device_held = _bus is not None and _bus.is_running
+                except ImportError:
+                    pass
+                if _device_held:
+                    try:
+                        import soundfile as _sf
+                        import numpy as _np
+                        _data, _sr = _sf.read(_temp_path, dtype="float32")
+                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                        import asyncio
+                        _loop = asyncio.get_event_loop()
+                        if _loop.is_running():
+                            asyncio.run_coroutine_threadsafe(
+                                _bus.play_audio(_data, _sr), _loop
+                            ).result(timeout=30)
+                        else:
+                            _loop.run_until_complete(_bus.play_audio(_data, _sr))
+                    except Exception:
+                        import subprocess as _sp
+                        _sp.run(["afplay", _temp_path], check=False)
+                else:
+                    import subprocess as _sp
+                    _sp.run(["afplay", _temp_path], check=False)
+            finally:
+                try:
+                    os.unlink(_temp_path)
+                except OSError:
+                    pass
 
     # ===================================================================
     # ADAPTIVE RECOGNITION METHODS

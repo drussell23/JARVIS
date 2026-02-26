@@ -149,11 +149,21 @@ class MacOSVoice:
         # Add text processing for better speech
         processed_text = self._process_text_for_speech(text)
         
-        # AudioBus path when enabled — use the TTS singleton.
+        # v275.2: Check ACTUAL device state (not just env var).
+        # Intent (env var) vs State (bus.is_running) — always use state.
+        _device_held = False
+        try:
+            from backend.audio.audio_bus import AudioBus as _ABCls
+            _bus = _ABCls.get_instance_safe()
+            _device_held = _bus is not None and _bus.is_running
+        except ImportError:
+            pass
+
+        # AudioBus path — use the TTS singleton when available.
         # This method runs in a background thread, so we must use
         # run_coroutine_threadsafe() with the main loop (captured at init),
         # NOT run_until_complete (which fails if the loop is already running).
-        _bus_enabled = os.getenv(
+        _bus_enabled = _device_held or os.getenv(
             "JARVIS_AUDIO_BUS_ENABLED", "false"
         ).lower() in ("true", "1", "yes")
         if _bus_enabled:
@@ -177,21 +187,59 @@ class MacOSVoice:
                     asyncio.run(_speak_via_singleton())
                 return
             except Exception:
-                pass  # Fall through to legacy
+                pass  # Fall through to safe legacy
 
-        # Legacy: direct macOS say
-        # v267.0: Use Popen to track PID for targeted kill + start_new_session
-        # to isolate from parent signal group
-        proc = subprocess.Popen(
-            cmd + [processed_text],
-            start_new_session=True,
+        # v275.2: Safe legacy — ALWAYS use say -o tempfile to avoid
+        # opening audio device when FullDuplexDevice may hold it.
+        import tempfile as _tmpmod
+        _temp_fd, _temp_path = _tmpmod.mkstemp(
+            suffix=".aiff", prefix="jarvis_macos_voice_"
         )
-        self._current_say_process = proc
+        os.close(_temp_fd)
         try:
-            proc.wait()
+            proc = subprocess.Popen(
+                cmd + ['-o', _temp_path, processed_text],
+                start_new_session=True,
+            )
+            self._current_say_process = proc
+            try:
+                proc.wait()
+            finally:
+                if self._current_say_process is proc:
+                    self._current_say_process = None
+
+            # Play through AudioBus if running, else afplay
+            if _device_held:
+                try:
+                    import soundfile as _sf
+                    import numpy as _np
+                    _data, _sr = _sf.read(_temp_path, dtype="float32")
+                    if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                        _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                    _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                    # Sync context — use run_coroutine_threadsafe
+                    import asyncio
+                    _loop = self._event_loop
+                    if _loop is not None and _loop.is_running():
+                        _fut = asyncio.run_coroutine_threadsafe(
+                            _bus.play_audio(_data, _sr), _loop
+                        )
+                        _fut.result(timeout=30)
+                        return
+                except Exception:
+                    pass  # Fall through to afplay
+
+            # afplay fallback (file-based, safe — no device contention)
+            _play_proc = subprocess.Popen(
+                ["afplay", _temp_path],
+                start_new_session=True,
+            )
+            _play_proc.wait()
         finally:
-            if self._current_say_process is proc:
-                self._current_say_process = None
+            try:
+                os.unlink(_temp_path)
+            except OSError:
+                pass
     
     def _process_text_for_speech(self, text: str) -> str:
         """Process text for better speech synthesis"""
