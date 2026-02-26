@@ -48,6 +48,8 @@ async function fetchProgress(hostname) {
       const data = await resp.json();
 
       if (candidate.type === 'loading_server') {
+        // v271.2: Extract completion mode flags for degraded completion handling
+        const completionMode = data.completion_mode || {};
         return {
           progress: typeof data.progress === 'number' ? data.progress : 0,
           stage: data.stage || 'unknown',
@@ -55,6 +57,8 @@ async function fetchProgress(hostname) {
           isReady: data.progress >= 100 || data.stage === 'complete',
           source: 'loading_server',
           eta: data.predictive_eta?.eta_seconds || null,
+          apiOnly: completionMode.api_only || completionMode.frontend_failed || false,
+          frontendTimeout: completionMode.frontend_timeout || false,
         };
       }
 
@@ -239,6 +243,7 @@ const StartupGate = ({ children }) => {
              stage === 'complete' ? 'System Ready' :
              'Initializing Systems'}
           </div>
+
 
           {/* Progress percentage - large display */}
           <div style={{

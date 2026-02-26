@@ -902,21 +902,59 @@ class TrinityHealthAggregator:
         }
         self._last_health: Dict[str, Dict[str, Any]] = {}
         self._health_history: Deque[Dict[str, Any]] = collections.deque(maxlen=100)
+        # v271.2: Dynamic Prime endpoint — defaults to localhost, updated on GCP late-arrival
+        self._prime_host: str = "localhost"
+        self._prime_port: int = config.prime_port
+        self._prime_is_gcp: bool = False
+
+    def update_prime_endpoint(self, host: str, port: int, *, is_gcp: bool = False) -> None:
+        """
+        v271.2: Update Prime health check target at runtime.
+
+        Called when GCP late-arrival is detected and local Prime is killed.
+        Health checks must now target the GCP endpoint instead of dead localhost.
+
+        Args:
+            host: New Prime host (IP address or hostname)
+            port: New Prime port
+            is_gcp: Whether this is a GCP endpoint
+        """
+        old_target = f"{self._prime_host}:{self._prime_port}"
+        self._prime_host = host
+        self._prime_port = port
+        self._prime_is_gcp = is_gcp
+        # Reset circuit breaker so first check against new endpoint starts clean
+        cb = self._circuit_breakers.get("prime")
+        if cb:
+            cb._state = CircuitState.CLOSED
+            cb._failure_count = 0
+            cb._success_count = 0
+        logger.info(
+            f"[TrinityHealth] v271.2: Prime endpoint updated: {old_target} -> "
+            f"{host}:{port} (gcp={is_gcp})"
+        )
 
     async def _check_http_health(self, name: str, url: str) -> Dict[str, Any]:
-        """Check HTTP health endpoint with circuit breaker."""
+        """Check HTTP health endpoint with circuit breaker.
+
+        v271.2: Supports host:port format for remote endpoints (GCP).
+        """
         cb = self._circuit_breakers.get(name)
         if cb and not cb.can_execute():
             return {"status": "circuit_open", "error": "Circuit breaker open"}
 
         start = time.time()
         try:
+            # v271.2: Parse host:port from url string (supports "host:port" and "localhost:port")
+            _parts = url.split(":")
+            _host = _parts[0] if len(_parts) >= 2 else "localhost"
+            _port = int(_parts[-1].split("/")[0])
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection('localhost', int(url.split(':')[-1].split('/')[0])),
+                asyncio.open_connection(_host, _port),
                 timeout=self.config.health_check_timeout
             )
 
-            request = f"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            request = f"GET /health HTTP/1.1\r\nHost: {_host}\r\nConnection: close\r\n\r\n"
             writer.write(request.encode())
             await writer.drain()
 
@@ -998,9 +1036,11 @@ class TrinityHealthAggregator:
         results = {}
 
         # Check all components in parallel
+        # v271.2: Use dynamic Prime endpoint (updated on GCP late-arrival)
+        _prime_target = f"{self._prime_host}:{self._prime_port}"
         checks = await asyncio.gather(
             self._check_http_health("backend", f"localhost:{self.config.backend_port}"),
-            self._check_http_health("prime", f"localhost:{self.config.prime_port}"),
+            self._check_http_health("prime", _prime_target),
             self._check_heartbeat_file("reactor", self.config.trinity_components_dir / "reactor_core.json"),
             return_exceptions=True
         )
@@ -1128,6 +1168,11 @@ class LoadingServer:
 
         # v225.0: Prime v2 init_progress protocol data
         self._prime_init_progress: Optional[Dict[str, Any]] = None
+
+        # v271.2: Degraded completion metadata from supervisor
+        self._frontend_failed: bool = False
+        self._api_only: bool = False
+        self._frontend_timeout: bool = False
 
         # =================================================================
         # v212.0: Advanced Feature Integration
@@ -1876,6 +1921,10 @@ class LoadingServer:
         elif path == "/api/trinity/status" and method == "GET":
             return self._json_response({"trinity": self._trinity_status})
 
+        # v271.2: Endpoint update from supervisor (GCP late-arrival)
+        elif path == "/api/endpoint/update" and method == "POST":
+            return await self._handle_endpoint_update(body)
+
         # =================================================================
         # v212.0: New Advanced API Endpoints
         # =================================================================
@@ -1988,6 +2037,20 @@ class LoadingServer:
         # even on GET polls (not just WebSocket messages)
         if self._startup_timeout_ms is not None:
             result["startup_timeout_ms"] = self._startup_timeout_ms
+        # v271.2: Include degraded completion flags so frontend can adjust behavior
+        if self._frontend_failed or self._api_only or self._frontend_timeout:
+            result["completion_mode"] = {
+                "frontend_failed": self._frontend_failed,
+                "api_only": self._api_only,
+                "frontend_timeout": self._frontend_timeout,
+            }
+        # v271.2: Include Prime endpoint info for frontend health display
+        if hasattr(self, "_health_aggregator") and self._health_aggregator._prime_is_gcp:
+            result["prime_endpoint"] = {
+                "host": self._health_aggregator._prime_host,
+                "port": self._health_aggregator._prime_port,
+                "is_gcp": True,
+            }
         return result
 
     def _get_resume_response(self, path: str) -> Dict[str, Any]:
@@ -2290,6 +2353,14 @@ class LoadingServer:
                     if isinstance(timeout_ms, (int, float)) and timeout_ms > 0:
                         self._startup_timeout_ms = int(timeout_ms)
 
+                # v271.2: Persist degraded completion flags for frontend
+                if metadata.get("frontend_failed"):
+                    self._frontend_failed = True
+                if metadata.get("api_only"):
+                    self._api_only = True
+                if metadata.get("frontend_timeout"):
+                    self._frontend_timeout = True
+
             self._eta_engine.update_progress(self._progress)
 
             # v212.0: Update enhanced ETA engine
@@ -2425,6 +2496,67 @@ class LoadingServer:
             logger.info(f"[v183.0] Trinity update: {component} → {data.get('progress', 0)}% ({data.get('status', 'unknown')})")
             
             return self._json_response({"status": "updated"})
+        except Exception as e:
+            return self._json_response({"error": str(e)}, status=400)
+
+    async def _handle_endpoint_update(self, body: Optional[bytes]) -> str:
+        """
+        v271.2: Handle runtime endpoint update from supervisor.
+
+        Called when GCP late-arrival is detected and Prime endpoint changes
+        from localhost to a GCP VM IP. Updates the health aggregator so health
+        checks target the correct endpoint.
+
+        Expected payload:
+        {
+            "component": "prime",
+            "host": "34.56.78.90",
+            "port": 8001,
+            "is_gcp": true
+        }
+        """
+        if not body:
+            return self._json_response({"error": "No body"}, status=400)
+
+        try:
+            data = json.loads(body.decode())
+            component = data.get("component", "")
+            host = data.get("host", "")
+            port = int(data.get("port", 0))
+
+            if not host or not port:
+                return self._json_response(
+                    {"error": "Missing host or port"}, status=400
+                )
+
+            if component == "prime":
+                is_gcp = bool(data.get("is_gcp", False))
+                self._health_aggregator.update_prime_endpoint(
+                    host, port, is_gcp=is_gcp
+                )
+                # Also update CrossRepoHealthAggregator if available
+                if self._cross_repo_health:
+                    try:
+                        self._cross_repo_health.update_component_endpoint(
+                            "jarvis_prime", host, port
+                        )
+                    except Exception:
+                        pass
+                # Update Trinity status to reflect GCP routing
+                self._trinity_status["jarvis_prime"]["status"] = "gcp_routed"
+                self._trinity_status["jarvis_prime"]["last_update"] = time.time()
+                self._trinity_status["jarvis_prime"]["gcp_host"] = host
+                self._trinity_status["jarvis_prime"]["gcp_port"] = port
+
+                logger.info(
+                    f"[v271.2] Endpoint update: {component} -> {host}:{port} "
+                    f"(is_gcp={is_gcp})"
+                )
+                return self._json_response({"status": "updated"})
+            else:
+                return self._json_response(
+                    {"error": f"Unsupported component: {component}"}, status=400
+                )
         except Exception as e:
             return self._json_response({"error": str(e)}, status=400)
 

@@ -2625,6 +2625,12 @@ class JARVISLoadingManager {
         if (data.trinity_ready !== undefined) {
             data.metadata.trinity_ready = data.metadata.trinity_ready ?? data.trinity_ready;
         }
+        // v271.2: Merge completion_mode flags into metadata for handleCompletion
+        if (data.completion_mode) {
+            if (data.completion_mode.frontend_failed) data.metadata.frontend_failed = true;
+            if (data.completion_mode.api_only) data.metadata.api_only = true;
+            if (data.completion_mode.frontend_timeout) data.metadata.frontend_timeout = true;
+        }
 
         // Process the data
         this.handleProgressUpdate(data);
@@ -4428,6 +4434,57 @@ class JARVISLoadingManager {
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
+        // v271.2: Handle degraded completion modes (API-only, frontend failed/timeout)
+        // When supervisor reports frontend_failed or api_only, skip frontend check
+        // and show appropriate UI instead of waiting for a frontend that won't start.
+        // ═══════════════════════════════════════════════════════════════════════════
+        const isApiOnly = metadata.api_only === true || metadata.frontend_failed === true || metadata.frontend_timeout === true;
+        if (isApiOnly) {
+            console.log('[Complete] v271.2: API-only / frontend-degraded mode detected');
+            this.elements.subtitle.textContent = 'API MODE';
+            this.updateStatusText('Backend services ready (API mode)', 'ready');
+
+            // Wait for backend only — skip frontend checks entirely
+            const backendOk = await this.waitForBackendOperational();
+            if (!backendOk) {
+                this.showError(message || 'Backend services failed to initialize.');
+                this.updateStatusText('Backend unavailable', 'error');
+                return;
+            }
+
+            // Show API-mode completion UI
+            this.state.progress = 100;
+            this.state.targetProgress = 100;
+            this.updateProgressBar();
+            this.elements.subtitle.textContent = 'SYSTEM READY';
+            const apiModeMsg = metadata.frontend_timeout
+                ? 'JARVIS is online (frontend timed out — API mode active)'
+                : metadata.frontend_failed
+                    ? 'JARVIS is online (frontend unavailable — API mode active)'
+                    : 'JARVIS is online (API-only mode)';
+            this.elements.statusMessage.textContent = apiModeMsg;
+            this.updateStatusText('API mode active', 'ready');
+
+            // Still attempt redirect in case frontend recovers, but with short timeout
+            const quickFrontend = await this._quickFrontendProbe();
+            if (quickFrontend) {
+                console.log('[Complete] v271.2: Frontend recovered — redirecting');
+                this.cleanup();
+                const finalUrl = this._buildReadyRedirectUrl(redirectUrl);
+                window.location.href = finalUrl;
+            } else {
+                console.log('[Complete] v271.2: Frontend not available — staying on loading page with API info');
+                this.addLogEntry('System', apiModeMsg, 'warning');
+                const backendPort = this.config.backendPort || 8010;
+                const apiUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
+                this.addLogEntry('API', `Backend API available at: ${apiUrl}`, 'success');
+                // Show a backend-direct link
+                this.showBackendFallbackButton();
+            }
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
         // STEP 1: Wait for BACKEND to be OPERATIONALLY ready (not just HTTP responding)
         // ═══════════════════════════════════════════════════════════════════════════
         console.log('[Complete] Step 1: Waiting for backend to be operationally ready...');
@@ -4907,6 +4964,30 @@ class JARVISLoadingManager {
         // Return false to indicate frontend is not ready
         // The caller should handle this appropriately
         return false;
+    }
+
+    async _quickFrontendProbe() {
+        /**
+         * v271.2: Quick, non-blocking frontend probe for API-only fallback.
+         *
+         * Unlike waitForFrontendWithRetries() which waits up to 120s,
+         * this does a single 5s check to see if frontend happens to be available.
+         * Used in API-only mode where frontend is optional.
+         */
+        try {
+            const mainAppPort = this.config.mainAppPort || 3000;
+            const url = `${this.config.httpProtocol}//${this.config.hostname}:${mainAppPort}`;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 5000);
+            const resp = await fetch(url, {
+                cache: 'no-cache',
+                signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+            return resp.ok;
+        } catch {
+            return false;
+        }
     }
 
     async verifyBackendReady(redirectUrl) {

@@ -234,14 +234,18 @@ class CrossRepoHealthAggregator:
                 error="Circuit breaker open",
             )
 
+        # v271.2: Use component-specific host (supports GCP endpoints)
+        config = self.components.get(name, {})
+        host = config.get("host", "localhost")
+
         start = time.time()
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection("localhost", port),
+                asyncio.open_connection(host, port),
                 timeout=self.health_check_timeout,
             )
 
-            request = f"GET {endpoint} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            request = f"GET {endpoint} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
             writer.write(request.encode())
             await writer.drain()
 
@@ -532,6 +536,40 @@ class CrossRepoHealthAggregator:
         """Get circuit breaker state for a component."""
         cb = self._circuit_breakers.get(name)
         return cb.state if cb else None
+
+    def update_component_endpoint(
+        self, name: str, host: str, port: int
+    ) -> bool:
+        """
+        v271.2: Update health check target for a component at runtime.
+
+        Called when GCP late-arrival promotes Prime from localhost to GCP endpoint.
+        Updates the component config and resets the circuit breaker.
+
+        Args:
+            name: Component name (e.g., "jarvis_prime")
+            host: New host address
+            port: New port number
+
+        Returns:
+            True if update successful
+        """
+        config = self.components.get(name)
+        if not config:
+            logger.warning(
+                f"[HealthAggregator] Cannot update unknown component: {name}"
+            )
+            return False
+
+        old_port = config.get("port", "?")
+        config["port"] = port
+        config["host"] = host  # v271.2: Store host for non-localhost endpoints
+        self.reset_circuit_breaker(name)
+        logger.info(
+            f"[HealthAggregator] v271.2: Updated {name} endpoint: "
+            f"localhost:{old_port} -> {host}:{port}"
+        )
+        return True
 
     def reset_circuit_breaker(self, name: str) -> bool:
         """

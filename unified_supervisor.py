@@ -62800,10 +62800,41 @@ class JarvisSystemKernel:
         ):
             self.logger.warning(
                 "[InvincibleNode] URL propagation blocked by authority gate "
-                "(source=%s, ip=%s)",
+                "(source=%s, ip=%s) — scheduling deferred retry",
                 source,
                 node_ip,
             )
+            # v271.2: Authority gate can block during early boot before epoch is
+            # granted. Schedule a deferred retry so propagation isn't permanently lost.
+            async def _deferred_propagation_retry() -> None:
+                for _delay in (3.0, 8.0, 15.0):
+                    await asyncio.sleep(_delay)
+                    if self._control_plane_authorized(
+                        f"propagate_invincible_node_url:deferred_{source}",
+                        allow_bootstrap_owner=True,
+                    ):
+                        self.logger.info(
+                            "[InvincibleNode] v271.2: Authority gate opened — "
+                            "retrying propagation (source=%s, ip=%s)",
+                            source,
+                            node_ip,
+                        )
+                        self._propagate_invincible_node_url(
+                            node_ip, source=f"deferred_{source}"
+                        )
+                        return
+                self.logger.error(
+                    "[InvincibleNode] v271.2: Authority gate never opened after "
+                    "3 retries — GCP propagation lost (ip=%s)",
+                    node_ip,
+                )
+            try:
+                create_safe_task(
+                    _deferred_propagation_retry(),
+                    name="deferred_gcp_propagation",
+                )
+            except Exception:
+                pass
             return
 
         port = self.config.invincible_node_port
@@ -62892,6 +62923,24 @@ class JarvisSystemKernel:
                             f"[InvincibleNode] v271.1: Propagation validated — "
                             f"PrimeRouter using {_decision_name}"
                         )
+                        # v271.2: After confirming router promotion, verify
+                        # actual inference capability (not just health check)
+                        try:
+                            _inf_ok = await self._verify_gcp_inference_capability(
+                                node_ip, port, timeout_s=15.0
+                            )
+                            if not _inf_ok:
+                                self.logger.warning(
+                                    "[InvincibleNode] v271.2: GCP inference "
+                                    "verification FAILED — router is promoted "
+                                    "but inference may not work. Monitoring."
+                                )
+                        except Exception as _inf_err:
+                            self.logger.debug(
+                                "[InvincibleNode] v271.2: Inference verification "
+                                "error: %s",
+                                _inf_err,
+                            )
             except ImportError:
                 pass
             except Exception as _val_err:
@@ -62922,6 +62971,50 @@ class JarvisSystemKernel:
             pass
         except Exception as e:
             self.logger.debug(f"[InvincibleNode] Trinity event sync failed: {e}")
+
+        # v271.2: Notify loading server of Prime endpoint change so health checks
+        # target the GCP VM instead of dead localhost. Fire-and-forget — loading
+        # server health is non-critical for startup flow.
+        async def _notify_loading_server_endpoint() -> None:
+            try:
+                import aiohttp as _aiohttp_ls
+                _ls_port = int(os.environ.get("JARVIS_LOADING_SERVER_PORT", "8080"))
+                _ls_url = f"http://localhost:{_ls_port}/api/endpoint/update"
+                async with _aiohttp_ls.ClientSession() as _ls_sess:
+                    async with _ls_sess.post(
+                        _ls_url,
+                        json={
+                            "component": "prime",
+                            "host": node_ip,
+                            "port": port,
+                            "is_gcp": True,
+                        },
+                        timeout=_aiohttp_ls.ClientTimeout(total=3.0),
+                    ) as _ls_resp:
+                        if _ls_resp.status == 200:
+                            self.logger.debug(
+                                "[InvincibleNode] v271.2: Loading server notified of "
+                                "Prime endpoint change"
+                            )
+                        else:
+                            self.logger.debug(
+                                "[InvincibleNode] v271.2: Loading server notification "
+                                "returned %d",
+                                _ls_resp.status,
+                            )
+            except Exception as _ls_err:
+                self.logger.debug(
+                    "[InvincibleNode] v271.2: Loading server notification failed: %s",
+                    _ls_err,
+                )
+
+        try:
+            create_safe_task(
+                _notify_loading_server_endpoint(),
+                name="notify_loading_server_gcp_endpoint",
+            )
+        except Exception:
+            pass
 
     async def _confirm_prime_router_gcp_promotion(
         self,
@@ -63160,6 +63253,90 @@ class JarvisSystemKernel:
             self.logger.warning(
                 f"[InvincibleNode] UnifiedModelServing demotion failed: {e}"
             )
+
+    async def _verify_gcp_inference_capability(
+        self, host: str, port: int, *, timeout_s: float = 10.0
+    ) -> bool:
+        """
+        v271.2: Verify that a GCP endpoint can actually serve inference.
+
+        Goes beyond health checks to send a lightweight test prompt
+        and verify the model responds. This catches the gap where
+        health returns 200 but inference fails (model not loaded,
+        wrong model, CUDA OOM, etc.).
+
+        Args:
+            host: GCP VM IP address
+            port: GCP VM port
+            timeout_s: Maximum time to wait for inference response
+
+        Returns:
+            True if inference test succeeded
+        """
+        import aiohttp as _aiohttp_inf
+
+        _url = f"http://{host}:{port}/v1/chat/completions"
+        _payload = {
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 5,
+            "temperature": 0.0,
+            "stream": False,
+        }
+
+        try:
+            async with _aiohttp_inf.ClientSession() as _sess:
+                async with _sess.post(
+                    _url,
+                    json=_payload,
+                    timeout=_aiohttp_inf.ClientTimeout(total=timeout_s),
+                ) as _resp:
+                    if _resp.status != 200:
+                        self.logger.warning(
+                            "[InvincibleNode] v271.2: Inference test HTTP %d "
+                            "from %s:%d",
+                            _resp.status,
+                            host,
+                            port,
+                        )
+                        return False
+
+                    _data = await _resp.json()
+                    _choices = _data.get("choices", [])
+                    if not _choices:
+                        self.logger.warning(
+                            "[InvincibleNode] v271.2: Inference test returned "
+                            "empty choices from %s:%d",
+                            host,
+                            port,
+                        )
+                        return False
+
+                    self.logger.info(
+                        "[InvincibleNode] v271.2: Inference test PASSED "
+                        "(%s:%d) — model serving confirmed",
+                        host,
+                        port,
+                    )
+                    return True
+
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "[InvincibleNode] v271.2: Inference test timed out "
+                "(%ss) from %s:%d",
+                timeout_s,
+                host,
+                port,
+            )
+            return False
+        except Exception as _inf_err:
+            self.logger.warning(
+                "[InvincibleNode] v271.2: Inference test error "
+                "from %s:%d: %s",
+                host,
+                port,
+                _inf_err,
+            )
+            return False
 
     def _clear_invincible_node_url(self, reason: str = "unhealthy") -> None:
         """
