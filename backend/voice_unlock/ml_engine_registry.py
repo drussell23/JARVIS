@@ -1993,6 +1993,7 @@ class MLEngineRegistry:
         self._memory_pressure_at_init = (use_cloud, available_ram, reason)
 
         if use_cloud and not MLConfig.CLOUD_FIRST_MODE:
+            self._record_routing_decision(RouteDecisionReason.MEMORY_PRESSURE)
             logger.info("=" * 70)
             logger.info("☁️  ML ENGINE REGISTRY: AUTO CLOUD MODE (Memory Pressure)")
             logger.info("=" * 70)
@@ -3805,6 +3806,7 @@ class MLEngineRegistry:
                 f"source={source}) — skipping"
             )
             self._last_routing_reason = "hysteresis_dwell"
+            self._record_routing_decision(RouteDecisionReason.HYSTERESIS_DWELL)
             self._release_recovery_fence()
             return self._last_recovery_result
 
@@ -3859,10 +3861,13 @@ class MLEngineRegistry:
                 if not semantic_ok:
                     cloud_success = False
                     cloud_reason = "cloud_semantic_readiness_failed"
+                    self._record_routing_decision(RouteDecisionReason.SEMANTIC_READINESS_FAILED)
                     logger.warning(
                         "[v276.3] Cloud passed health check but failed semantic "
                         "readiness (embedding test). Falling through to local."
                     )
+                else:
+                    self._record_routing_decision(RouteDecisionReason.SEMANTIC_READINESS_OK)
 
             if cloud_success:
                 self._ready_event.set()
@@ -3870,6 +3875,7 @@ class MLEngineRegistry:
                 self._last_routing_reason = cloud_reason
                 # v276.4: Reconcile all state atomically + record transition
                 self._reconcile_state_after_recovery("cloud", source)
+                self._record_routing_decision(RouteDecisionReason.RECOVERY_SUCCESS_CLOUD)
                 logger.info(
                     f"[v276.3] ECAPA recovery SUCCESSFUL via cloud "
                     f"(source={source}, reason={cloud_reason})"
@@ -3930,11 +3936,13 @@ class MLEngineRegistry:
                             backend="local"
                         )
                         if semantic_ok:
+                            self._record_routing_decision(RouteDecisionReason.SEMANTIC_READINESS_OK)
                             self._ready_event.set()
                             self._last_recovery_result = True
                             self._last_routing_reason = "local_loaded"
                             # v276.4: Reconcile all state atomically + record transition
                             self._reconcile_state_after_recovery("local", source)
+                            self._record_routing_decision(RouteDecisionReason.RECOVERY_SUCCESS_LOCAL)
                             logger.info(
                                 f"[v276.3] ECAPA recovery SUCCESSFUL via local "
                                 f"(source={source})"
@@ -3944,6 +3952,7 @@ class MLEngineRegistry:
                             self._release_recovery_fence()
                             return True
                         else:
+                            self._record_routing_decision(RouteDecisionReason.SEMANTIC_READINESS_FAILED)
                             local_reason = "local_semantic_readiness_failed"
                     else:
                         local_reason = "local_load_failed"
@@ -3956,6 +3965,7 @@ class MLEngineRegistry:
             self._last_routing_reason = (
                 f"both_unavailable:cloud={cloud_reason},local={local_reason}"
             )
+            self._record_routing_decision(RouteDecisionReason.RECOVERY_FAILED)
             logger.warning(
                 f"[v276.3] ECAPA recovery failed (source={source}) — "
                 f"cloud={cloud_reason}, local={local_reason}"
@@ -4368,6 +4378,7 @@ class MLEngineRegistry:
             if self._routing_policy_reason.startswith("parity_mismatch"):
                 self._routing_policy = RoutingPolicy.AUTO
                 self._routing_policy_reason = "parity_restored"
+                self._record_routing_decision(RouteDecisionReason.PARITY_RESTORED)
                 logger.info("[v276.4] Parity restored — routing policy reset to AUTO")
 
         return compatible, reason
@@ -4494,10 +4505,13 @@ class MLEngineRegistry:
         # 1. Operator env var override is absolute
         if self._routing_policy != RoutingPolicy.AUTO:
             if self._routing_policy == RoutingPolicy.CLOUD_ONLY:
+                self._record_routing_decision(RouteDecisionReason.POLICY_CLOUD_ONLY)
                 return "cloud", f"policy:{self._routing_policy_reason}"
             elif self._routing_policy == RoutingPolicy.LOCAL_ONLY:
+                self._record_routing_decision(RouteDecisionReason.POLICY_LOCAL_ONLY)
                 return "local", f"policy:{self._routing_policy_reason}"
             elif self._routing_policy == RoutingPolicy.DEGRADED:
+                self._record_routing_decision(RouteDecisionReason.POLICY_DEGRADED)
                 # In degraded mode, prefer whichever is available
                 if self._use_cloud and self._cloud_endpoint:
                     return "cloud", f"degraded:cloud_available"
@@ -4507,6 +4521,7 @@ class MLEngineRegistry:
         if self._flap_dampened:
             elapsed = time.time() - self._flap_dampened_at
             if elapsed < self._flap_dampen_duration:
+                self._record_routing_decision(RouteDecisionReason.FLAP_DAMPENED)
                 # Stay on whatever we're currently on
                 current = "cloud" if self._use_cloud else "local"
                 return current, f"flap_dampened:{elapsed:.0f}s/{self._flap_dampen_duration:.0f}s"
@@ -6493,6 +6508,7 @@ async def extract_speaker_embedding(
                 _cloud_fallback_warned = True
             else:
                 logger.debug("Cloud extraction failed, falling back to local")
+            registry._record_routing_decision(RouteDecisionReason.LOCAL_FALLBACK)
             return await _extract_local_embedding(registry, audio_data)
 
         logger.error("Cloud extraction failed and fallback not available")
@@ -6523,6 +6539,7 @@ async def extract_speaker_embedding(
     embedding = await _extract_local_embedding(registry, audio_data)
 
     if embedding is not None:
+        registry._record_routing_decision(RouteDecisionReason.LOCAL_PRIMARY)
         return embedding
 
     # Local extraction failed - try cloud fallback (suppressed by LOCAL_ONLY policy)
@@ -6532,6 +6549,7 @@ async def extract_speaker_embedding(
         and registry._routing_policy != RoutingPolicy.LOCAL_ONLY
     ):
         logger.warning("Local extraction failed, attempting cloud fallback")
+        registry._record_routing_decision(RouteDecisionReason.CLOUD_FALLBACK)
 
         # Activate cloud if not already active
         if not registry.cloud_endpoint:

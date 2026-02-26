@@ -66123,6 +66123,8 @@ class JarvisSystemKernel:
         # Preload order (dependency-safe): numpy → scipy → torch → numba
         # Each is optional — ImportError = not installed, skip silently.
         # =====================================================================
+        _preload_elapsed = 0.0  # v275.5: track preload duration for adaptive AudioBus timeout
+        _preload_t0 = time.time()
         try:
             _loop = asyncio.get_running_loop()
 
@@ -66293,17 +66295,21 @@ class JarvisSystemKernel:
             _preload_timeout = float(os.environ.get(
                 "JARVIS_NATIVE_PRELOAD_TIMEOUT", "60.0"
             ))
+            _preload_t0 = time.time()
             _preload_msg = await asyncio.wait_for(
                 _loop.run_in_executor(None, _preload_native_libs_sync),
                 timeout=_preload_timeout,
             )
-            self.logger.info("[Kernel] %s", _preload_msg)
+            _preload_elapsed = time.time() - _preload_t0
+            self.logger.info("[Kernel] %s (%.1fs)", _preload_msg, _preload_elapsed)
         except asyncio.TimeoutError:
+            _preload_elapsed = _preload_timeout  # timed out → max duration
             self.logger.warning(
                 "[Kernel] native lib preload timed out (%.0fs) — continuing without preload",
                 _preload_timeout,
             )
         except Exception as _npe:
+            _preload_elapsed = time.time() - _preload_t0
             self.logger.debug("[Kernel] native lib preload non-fatal: %s", _npe)
 
         # =====================================================================
