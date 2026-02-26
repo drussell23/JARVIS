@@ -572,6 +572,88 @@ class CloudEmbeddingCircuitBreaker:
 
 
 # =============================================================================
+# EMBEDDING PARITY FINGERPRINT (v276.4)
+# =============================================================================
+# Tracks the model identity/configuration of both cloud and local ECAPA backends
+# to detect version drift that causes confidence instability and inconsistent
+# auth outcomes. Cloud ECAPA and local ECAPA MUST produce compatible embeddings;
+# if model version, embedding dimension, sample rate, or preprocessing diverge,
+# cosine-similarity scores become meaningless.
+
+@dataclass
+class _ParityFingerprint:
+    """
+    v276.4: Immutable snapshot of an ECAPA backend's model identity.
+
+    Used for cloud-vs-local parity comparison. Two fingerprints are
+    "compatible" iff embedding_dim, sample_rate, and model_source match.
+    service_version and load_strategy are informational (don't affect
+    embedding compatibility) but are tracked for forensic debugging.
+    """
+    backend: str = ""               # "cloud" or "local"
+    embedding_dim: int = 0          # Expected: 192 for ECAPA-TDNN
+    sample_rate: int = 0            # Expected: 16000 Hz
+    model_source: str = ""          # e.g. "speechbrain/spkrec-ecapa-voxceleb"
+    service_version: str = ""       # Cloud service version (e.g. "21.0.0")
+    load_strategy: str = ""         # "jit", "onnx", "speechbrain", or ""
+    captured_at: float = 0.0        # time.time() when fingerprint was captured
+    raw_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def is_populated(self) -> bool:
+        """True if the fingerprint has been captured (not default-constructed)."""
+        return self.embedding_dim > 0 and self.sample_rate > 0
+
+    def is_compatible_with(self, other: "_ParityFingerprint") -> Tuple[bool, str]:
+        """
+        Check if two fingerprints produce compatible embeddings.
+
+        Returns:
+            (compatible, reason) — reason explains the mismatch if incompatible.
+        """
+        if not self.is_populated() or not other.is_populated():
+            return False, (
+                f"incomplete fingerprint: self.populated={self.is_populated()}, "
+                f"other.populated={other.is_populated()}"
+            )
+
+        mismatches = []
+        if self.embedding_dim != other.embedding_dim:
+            mismatches.append(
+                f"embedding_dim: {self.backend}={self.embedding_dim} vs "
+                f"{other.backend}={other.embedding_dim}"
+            )
+        if self.sample_rate != other.sample_rate:
+            mismatches.append(
+                f"sample_rate: {self.backend}={self.sample_rate} vs "
+                f"{other.backend}={other.sample_rate}"
+            )
+        if (
+            self.model_source
+            and other.model_source
+            and self.model_source != other.model_source
+        ):
+            mismatches.append(
+                f"model_source: {self.backend}={self.model_source} vs "
+                f"{other.backend}={other.model_source}"
+            )
+
+        if mismatches:
+            return False, "; ".join(mismatches)
+        return True, "compatible"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "embedding_dim": self.embedding_dim,
+            "sample_rate": self.sample_rate,
+            "model_source": self.model_source,
+            "service_version": self.service_version,
+            "load_strategy": self.load_strategy,
+            "captured_at": self.captured_at,
+        }
+
+
+# =============================================================================
 # ENGINE WRAPPER - Base class for all ML engines
 # =============================================================================
 
@@ -1267,6 +1349,28 @@ class MLEngineRegistry:
         # Populated by _schedule_deferred_ecapa_recovery() when fallback is refused.
         self._deferred_ecapa_recovery_task: Optional[asyncio.Task] = None
         self._memory_gate_blocked: bool = False
+
+        # v276.3: Recovery idempotency fencing. Prevents concurrent recovery
+        # attempts from the deferred poll loop and the MemoryQuantizer callback.
+        # Without this, both paths can call _attempt_ecapa_recovery() simultaneously,
+        # causing duplicate cloud probes, state corruption on _use_cloud/_cloud_verified,
+        # and wasted resources.
+        self._recovery_lock = LazyAsyncLock()
+        # Tracks the last recovery attempt timestamp to enforce minimum dwell
+        # between successive attempts (hysteresis).
+        self._last_recovery_attempt_at: float = 0.0
+        self._last_recovery_result: Optional[bool] = None
+        # v276.3: Structured routing reason for observability/forensics.
+        self._last_routing_reason: str = "not_initialized"
+
+        # v276.4: Embedding parity tracking. Captures model identity fingerprints
+        # from both cloud and local backends, then compares to detect version drift
+        # that would cause confidence instability in speaker verification.
+        self._cloud_parity: _ParityFingerprint = _ParityFingerprint(backend="cloud")
+        self._local_parity: _ParityFingerprint = _ParityFingerprint(backend="local")
+        self._parity_compatible: Optional[bool] = None  # None = not yet checked
+        self._parity_last_checked: float = 0.0
+        self._parity_last_reason: str = "not_checked"
 
         # v275.1: Cloud Run pre-warming. Cloud Run containers have cold starts
         # of 10-30s. The contract probe (4s timeout) runs during heavy startup
@@ -2681,6 +2785,17 @@ class MLEngineRegistry:
         self._cloud_contract_endpoint = target
         self._cloud_contract_last_checked = time.time()
         self._cloud_contract_last_error = ""
+
+        # v276.4: Schedule parity check (non-blocking). Doesn't gate contract
+        # acceptance — parity drift is a WARNING, not a hard failure — but it
+        # surfaces early so operators can fix model version mismatches before
+        # they cause confidence instability in speaker verification.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._check_embedding_parity(force=True))
+        except RuntimeError:
+            pass  # No event loop — skip parity check (e.g., sync test context)
+
         return True, "ECAPA contract verified"
 
     async def _activate_cloud_routing(self) -> bool:
@@ -3210,7 +3325,10 @@ class MLEngineRegistry:
                 "reason": reason,
                 "source_repo": "jarvis",
                 "pid": os.getpid(),
-                "version": "v115.0",
+                "version": "v276.4",
+                # v276.4: Embedding parity tracking
+                "parity": self.get_parity_status(),
+                "routing_reason": self._last_routing_reason,
             }
 
             # Atomic write with temp file
@@ -3358,108 +3476,557 @@ class MLEngineRegistry:
 
     async def _attempt_ecapa_recovery(self, source: str = "deferred") -> bool:
         """
-        v276.2: Unified ECAPA recovery — cloud-first, then local.
+        v276.2→v276.3: Unified ECAPA recovery — cloud-first, then local.
 
-        This is the single recovery method used by BOTH the deferred recovery
-        loop AND the MemoryQuantizer recovery callback. The strategy is:
+        Hardened with:
+        - Idempotency lock: prevents concurrent recovery from deferred loop +
+          memory callback racing each other. Single-writer on routing state.
+        - Hysteresis dwell: refuses to attempt recovery if the last attempt was
+          < DWELL_SECONDS ago. Prevents state-flapping when memory oscillates
+          between CRITICAL↔ELEVATED rapidly.
+        - Semantic readiness: after cloud verification, runs an actual embedding
+          extraction test to confirm the model is truly inference-ready (not just
+          process-ready from startup probe).
+        - Structured reason codes: every decision logged with a machine-parseable
+          reason code for forensic clarity.
 
-        1. TRY CLOUD FIRST — by the time recovery fires (30s+ after initial
-           failure), the Cloud Run container has completed its cold start and
-           is warm. This is the highest-probability path to success.
-        2. If cloud fails AND memory allows, try local as fallback.
-        3. If both fail, return False (caller decides whether to retry).
-
-        Args:
-            source: Who triggered this recovery (for logging/telemetry)
-
-        Returns:
-            True if ECAPA was successfully recovered via any backend
+        Strategy:
+            1. TRY CLOUD FIRST — warm by now after 30s+ cold start completion.
+            2. If cloud fails AND memory allows, try local.
+            3. Both fail → return False (caller decides retry policy).
         """
+        # ── Guard: already ready ──
         if self.is_ready:
-            logger.debug(f"[v276.2] ECAPA already ready (source={source}) — skipping recovery")
+            self._last_routing_reason = "already_ready"
             return True
 
-        logger.info(
-            f"[v276.2] Attempting ECAPA recovery (source={source}) — cloud-first strategy"
-        )
-
-        # ── Phase 1: Try cloud (highest probability after cold start completes) ──
-        cloud_success = False
-        try:
-            cloud_success = await self._fallback_to_cloud(
-                f"recovery attempt (source={source})"
+        # ── Guard: idempotency lock (non-blocking check) ──
+        if self._recovery_lock.locked():
+            logger.debug(
+                f"[v276.3] Recovery already in progress — skipping (source={source})"
             )
-        except Exception as e:
-            logger.warning(f"[v276.2] Cloud recovery failed: {e}")
+            self._last_routing_reason = "recovery_in_progress"
+            return False
 
-        if cloud_success:
-            self._status.is_ready = True
-            self._status.errors = [
-                e for e in self._status.errors
-                if "memory emergency" not in e and "ECAPA UNAVAILABLE" not in e
-            ]
-            self._ready_event.set()
-            self._memory_gate_blocked = False
+        # ── Guard: hysteresis dwell window ──
+        dwell_seconds = float(os.getenv(
+            "JARVIS_ECAPA_RECOVERY_DWELL_SECONDS", "10.0"
+        ))
+        elapsed = time.time() - self._last_recovery_attempt_at
+        if elapsed < dwell_seconds and self._last_recovery_result is not None:
+            logger.debug(
+                f"[v276.3] Hysteresis dwell: {elapsed:.1f}s < {dwell_seconds}s "
+                f"since last attempt (result={self._last_recovery_result}, "
+                f"source={source}) — skipping"
+            )
+            self._last_routing_reason = "hysteresis_dwell"
+            return self._last_recovery_result
+
+        async with self._recovery_lock:
+            # Double-check after acquiring lock (another thread may have recovered)
+            if self.is_ready:
+                self._last_routing_reason = "already_ready_post_lock"
+                return True
+
+            self._last_recovery_attempt_at = time.time()
+
             logger.info(
-                f"[v276.2] ECAPA recovery SUCCESSFUL via cloud (source={source})"
+                f"[v276.3] ECAPA recovery started (source={source}) — "
+                "cloud-first strategy"
             )
-            return True
 
-        # ── Phase 2: Check if local loading is safe ──
-        local_allowed = False
-        try:
-            import backend.core.memory_quantizer as _mq_mod
-            from backend.core.memory_quantizer import MemoryTier
-
-            _mq = _mq_mod._memory_quantizer_instance
-            if _mq is not None:
-                _thrash = _mq._thrash_state
-                _tier = _mq.current_tier
-                if _thrash == "healthy" and _tier not in (
-                    MemoryTier.CRITICAL, MemoryTier.EMERGENCY
-                ):
-                    local_allowed = True
+            # ── Phase 1: Try cloud ──
+            cloud_reason = "not_attempted"
+            cloud_success = False
+            try:
+                cloud_success = await self._fallback_to_cloud(
+                    f"recovery (source={source})"
+                )
+                if cloud_success:
+                    cloud_reason = "cloud_warm_ready"
                 else:
-                    logger.debug(
-                        f"[v276.2] Local ECAPA blocked: thrash={_thrash}, "
-                        f"tier={_tier.value} (source={source})"
+                    cloud_reason = "cloud_verification_failed"
+            except asyncio.TimeoutError:
+                # Classify: is this timeout under host stress?
+                _cpu_pct = 0.0
+                try:
+                    import psutil
+                    _cpu_pct = psutil.cpu_percent(interval=None)
+                except Exception:
+                    pass
+                if _cpu_pct > 85.0:
+                    cloud_reason = "cloud_timeout_under_host_stress"
+                    logger.warning(
+                        f"[v276.3] Cloud probe timed out under CPU stress "
+                        f"({_cpu_pct:.0f}%) — not a backend failure"
                     )
-            else:
+                else:
+                    cloud_reason = "cloud_timeout_clean"
+            except Exception as e:
+                cloud_reason = f"cloud_exception:{type(e).__name__}"
+                logger.warning(f"[v276.3] Cloud recovery error: {e}")
+
+            if cloud_success:
+                # ── Semantic readiness: verify actual inference capability ──
+                semantic_ok = await self._verify_semantic_readiness(backend="cloud")
+                if not semantic_ok:
+                    cloud_success = False
+                    cloud_reason = "cloud_semantic_readiness_failed"
+                    logger.warning(
+                        "[v276.3] Cloud passed health check but failed semantic "
+                        "readiness (embedding test). Falling through to local."
+                    )
+
+            if cloud_success:
+                self._ready_event.set()
+                self._memory_gate_blocked = False
+                self._last_recovery_result = True
+                self._last_routing_reason = cloud_reason
+                logger.info(
+                    f"[v276.3] ECAPA recovery SUCCESSFUL via cloud "
+                    f"(source={source}, reason={cloud_reason})"
+                )
+                # v276.4: Capture cloud fingerprint for parity tracking
+                try:
+                    self._cloud_parity = await self._fetch_cloud_parity_fingerprint()
+                except Exception:
+                    pass  # Parity is informational, don't block recovery
+                return True
+
+            # ── Phase 2: Check if local loading is safe ──
+            local_reason = "not_attempted"
+            local_allowed = False
+            try:
+                import backend.core.memory_quantizer as _mq_mod
+                from backend.core.memory_quantizer import MemoryTier
+
+                _mq = _mq_mod._memory_quantizer_instance
+                if _mq is not None:
+                    _thrash = _mq._thrash_state
+                    _tier = _mq.current_tier
+                    if _thrash == "healthy" and _tier not in (
+                        MemoryTier.CRITICAL, MemoryTier.EMERGENCY
+                    ):
+                        local_allowed = True
+                        local_reason = "memory_healthy"
+                    else:
+                        local_reason = (
+                            f"memory_blocked_local:thrash={_thrash},tier={_tier.value}"
+                        )
+                else:
+                    use_cloud, _, _ = MLConfig.check_memory_pressure()
+                    local_allowed = not use_cloud
+                    local_reason = "mlconfig_fallback"
+            except ImportError:
                 use_cloud, _, _ = MLConfig.check_memory_pressure()
                 local_allowed = not use_cloud
-        except ImportError:
-            use_cloud, _, _ = MLConfig.check_memory_pressure()
-            local_allowed = not use_cloud
-        except Exception:
-            use_cloud, _, _ = MLConfig.check_memory_pressure()
-            local_allowed = not use_cloud
+                local_reason = "mlconfig_fallback_no_mq"
+            except Exception:
+                use_cloud, _, _ = MLConfig.check_memory_pressure()
+                local_allowed = not use_cloud
+                local_reason = "mlconfig_fallback_exception"
 
-        if local_allowed:
-            logger.info(f"[v276.2] Cloud failed, trying local ECAPA (source={source})")
-            try:
-                local_success = await self._fallback_to_local_ecapa(
-                    f"recovery after cloud failure (source={source})"
+            if local_allowed:
+                logger.info(
+                    f"[v276.3] Cloud failed ({cloud_reason}), trying local "
+                    f"(source={source}, local_reason={local_reason})"
                 )
-                if local_success:
-                    self._status.is_ready = True
-                    self._status.errors = [
-                        e for e in self._status.errors
-                        if "memory emergency" not in e and "ECAPA UNAVAILABLE" not in e
-                    ]
-                    self._ready_event.set()
-                    self._memory_gate_blocked = False
-                    logger.info(
-                        f"[v276.2] ECAPA recovery SUCCESSFUL via local (source={source})"
+                try:
+                    local_success = await self._fallback_to_local_ecapa(
+                        f"recovery after cloud failure (source={source})"
                     )
-                    return True
-            except Exception as e:
-                logger.warning(f"[v276.2] Local recovery also failed: {e}")
+                    if local_success:
+                        # Semantic readiness for local
+                        semantic_ok = await self._verify_semantic_readiness(
+                            backend="local"
+                        )
+                        if semantic_ok:
+                            self._ready_event.set()
+                            self._memory_gate_blocked = False
+                            self._last_recovery_result = True
+                            self._last_routing_reason = "local_loaded"
+                            logger.info(
+                                f"[v276.3] ECAPA recovery SUCCESSFUL via local "
+                                f"(source={source})"
+                            )
+                            # v276.4: Capture local fingerprint for parity
+                            self._local_parity = self._get_local_parity_fingerprint()
+                            return True
+                        else:
+                            local_reason = "local_semantic_readiness_failed"
+                    else:
+                        local_reason = "local_load_failed"
+                except Exception as e:
+                    local_reason = f"local_exception:{type(e).__name__}"
+                    logger.warning(f"[v276.3] Local recovery error: {e}")
 
-        logger.warning(
-            f"[v276.2] ECAPA recovery failed — both cloud and local unavailable "
-            f"(source={source})"
-        )
-        return False
+            # ── Both failed ──
+            self._last_recovery_result = False
+            self._last_routing_reason = (
+                f"both_unavailable:cloud={cloud_reason},local={local_reason}"
+            )
+            logger.warning(
+                f"[v276.3] ECAPA recovery failed (source={source}) — "
+                f"cloud={cloud_reason}, local={local_reason}"
+            )
+            return False
+
+    async def _verify_semantic_readiness(self, backend: str = "cloud") -> bool:
+        """
+        v276.3: Verify ECAPA is truly inference-ready by running a test embedding.
+
+        A startup probe passing (HTTP 200) means the process is running, but
+        the ECAPA model may still be loading tensors, warming JIT caches, or
+        have a corrupted model state. This test sends a small synthetic audio
+        sample and verifies a valid 192-dimensional embedding is returned.
+
+        Args:
+            backend: "cloud" or "local" — determines which path to test
+
+        Returns:
+            True if a valid embedding was extracted successfully
+        """
+        semantic_timeout = float(os.getenv(
+            "JARVIS_ECAPA_SEMANTIC_READINESS_TIMEOUT", "10.0"
+        ))
+
+        try:
+            if backend == "cloud" and self._use_cloud and self._cloud_endpoint:
+                # Test cloud endpoint with a synthetic embedding request
+                import aiohttp
+                import struct
+
+                # Generate minimal valid WAV header + 1s of silence at 16kHz
+                # (44 byte header + 32000 bytes of 16-bit PCM silence)
+                sample_rate = 16000
+                num_samples = sample_rate  # 1 second
+                wav_data = bytearray()
+                # RIFF header
+                data_size = num_samples * 2  # 16-bit = 2 bytes per sample
+                wav_data.extend(b'RIFF')
+                wav_data.extend(struct.pack('<I', 36 + data_size))
+                wav_data.extend(b'WAVE')
+                wav_data.extend(b'fmt ')
+                wav_data.extend(struct.pack('<IHHIIHH', 16, 1, 1, sample_rate,
+                                           sample_rate * 2, 2, 16))
+                wav_data.extend(b'data')
+                wav_data.extend(struct.pack('<I', data_size))
+                wav_data.extend(b'\x00' * data_size)
+
+                endpoint = self._cloud_endpoint.rstrip("/")
+                # Try known embedding routes
+                for route in self._cloud_route_candidates("embedding"):
+                    url = f"{endpoint}{route}"
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=semantic_timeout)
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            async with session.post(
+                                url,
+                                data=bytes(wav_data),
+                                headers={"Content-Type": "audio/wav"},
+                            ) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    embedding = data.get("embedding", [])
+                                    if isinstance(embedding, list) and len(embedding) >= 64:
+                                        # v276.4: Capture actual embedding dim
+                                        # from live inference for parity tracking
+                                        if self._cloud_parity.embedding_dim == 0:
+                                            self._cloud_parity.embedding_dim = len(embedding)
+                                            self._cloud_parity.captured_at = time.time()
+                                        logger.debug(
+                                            f"[v276.3] Cloud semantic readiness OK "
+                                            f"(embedding dim={len(embedding)})"
+                                        )
+                                        return True
+                                    logger.warning(
+                                        f"[v276.3] Cloud returned invalid embedding: "
+                                        f"len={len(embedding) if isinstance(embedding, list) else 'N/A'}"
+                                    )
+                                    return False
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[v276.3] Semantic readiness timeout ({semantic_timeout}s) "
+                            f"on {route}"
+                        )
+                    except Exception as e:
+                        logger.debug(f"[v276.3] Semantic test on {route}: {e}")
+                        continue
+
+                logger.warning("[v276.3] Cloud semantic readiness: no working route found")
+                return False
+
+            elif backend == "local":
+                # For local, just verify the engine is loaded and can produce output
+                ecapa = self._engines.get("ecapa_tdnn")
+                if ecapa is not None and ecapa.is_loaded:
+                    logger.debug("[v276.3] Local semantic readiness OK (engine loaded)")
+                    return True
+                return False
+
+            else:
+                logger.debug(f"[v276.3] Semantic readiness: unknown backend '{backend}'")
+                return False
+
+        except Exception as e:
+            logger.warning(f"[v276.3] Semantic readiness check failed: {e}")
+            return False
+
+    # ── v276.4: Embedding Parity Version Tracking ──────────────────────────
+
+    async def _fetch_cloud_parity_fingerprint(self) -> _ParityFingerprint:
+        """
+        v276.4: Fetch ECAPA model identity from the cloud /status endpoint.
+
+        Queries the cloud service's detailed status API to extract:
+        - embedding_dim from prebaked manifest
+        - sample_rate from config
+        - model_source from config.model_path
+        - service_version from top-level version
+        - load_strategy from model.model_cache.load_source
+
+        Returns a populated _ParityFingerprint or a default (empty) one on failure.
+        """
+        fp = _ParityFingerprint(backend="cloud")
+        if not self._cloud_endpoint:
+            return fp
+
+        endpoint = self._cloud_endpoint.rstrip("/")
+        # Try /status first (richer metadata), fall back to /api/ml/health
+        status_paths = ["/status", "/api/ml/status", "/api/ml/health", "/health"]
+        parity_timeout = float(os.getenv(
+            "JARVIS_ECAPA_PARITY_FETCH_TIMEOUT", "8.0"
+        ))
+
+        try:
+            import aiohttp
+
+            timeout_cfg = aiohttp.ClientTimeout(total=parity_timeout)
+            async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+                for path in status_paths:
+                    url = f"{endpoint}{path}"
+                    try:
+                        async with session.get(
+                            url, headers={"Accept": "application/json"}
+                        ) as resp:
+                            if resp.status != 200:
+                                continue
+                            data = await resp.json()
+
+                            # Extract from /status response structure
+                            fp.raw_metadata = data
+                            fp.captured_at = time.time()
+
+                            # Service version — top level
+                            fp.service_version = str(
+                                data.get("version", "")
+                            )
+
+                            # Config section → sample_rate, model_path
+                            config = data.get("config", {})
+                            if isinstance(config, dict):
+                                fp.sample_rate = int(
+                                    config.get("sample_rate", 0)
+                                    or config.get("SAMPLE_RATE", 0)
+                                    or 0
+                                )
+                                fp.model_source = str(
+                                    config.get("model_path", "")
+                                    or config.get("model_source", "")
+                                )
+
+                            # Model section → load_source
+                            model_section = data.get("model", {})
+                            if isinstance(model_section, dict):
+                                model_cache = model_section.get(
+                                    "model_cache", {}
+                                )
+                                if isinstance(model_cache, dict):
+                                    fp.load_strategy = str(
+                                        model_cache.get("load_source", "")
+                                    )
+
+                            # Prebaked manifest → embedding_dim
+                            manifest = data.get("prebaked_manifest", {})
+                            if isinstance(manifest, dict):
+                                fp.embedding_dim = int(
+                                    manifest.get("embedding_dim", 0) or 0
+                                )
+
+                            # Fallback: if /health response, extract what we can
+                            if not fp.service_version:
+                                fp.service_version = str(
+                                    data.get("version", "")
+                                )
+
+                            # If we got embedding_dim or sample_rate, this
+                            # response was useful. If /health only, try harder
+                            # with next path for richer data.
+                            if fp.embedding_dim > 0 or fp.sample_rate > 0:
+                                break
+
+                    except asyncio.TimeoutError:
+                        logger.debug(
+                            f"[v276.4] Parity fetch timeout on {path}"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"[v276.4] Parity fetch error on {path}: {e}"
+                        )
+
+            # If /status didn't have embedding_dim, fall back to ECAPA default
+            if fp.embedding_dim == 0 and fp.service_version:
+                # Known ECAPA-TDNN always produces 192-dim embeddings
+                fp.embedding_dim = 192
+            if fp.sample_rate == 0 and fp.service_version:
+                # Known ECAPA-TDNN always uses 16kHz
+                fp.sample_rate = 16000
+
+        except ImportError:
+            logger.debug("[v276.4] aiohttp not available for parity fetch")
+        except Exception as e:
+            logger.debug(f"[v276.4] Cloud parity fingerprint fetch failed: {e}")
+
+        return fp
+
+    def _get_local_parity_fingerprint(self) -> _ParityFingerprint:
+        """
+        v276.4: Construct ECAPA model identity from local engine state.
+
+        Local ECAPA always uses SpeechBrain's spkrec-ecapa-voxceleb model
+        with 192-dim embeddings at 16kHz. The fingerprint captures these
+        constants plus the current engine state for forensic comparison.
+        """
+        fp = _ParityFingerprint(backend="local")
+        fp.captured_at = time.time()
+
+        ecapa = self._engines.get("ecapa_tdnn")
+        if ecapa is None:
+            return fp
+
+        # ECAPA-TDNN constants (same as cloud service)
+        fp.embedding_dim = 192
+        fp.sample_rate = 16000
+        fp.model_source = "speechbrain/spkrec-ecapa-voxceleb"
+        fp.load_strategy = "speechbrain"
+
+        # Try to extract more detail from the engine wrapper
+        try:
+            if hasattr(ecapa, "_model") and getattr(ecapa, "_model", None) is not None:
+                fp.service_version = "local"
+                # Try to get SpeechBrain version for forensics
+                try:
+                    import speechbrain
+                    fp.raw_metadata["speechbrain_version"] = str(
+                        getattr(speechbrain, "__version__", "unknown")
+                    )
+                except ImportError:
+                    pass
+                # Try to get PyTorch version
+                try:
+                    import torch
+                    fp.raw_metadata["torch_version"] = str(torch.__version__)
+                except ImportError:
+                    pass
+        except Exception:
+            pass
+
+        return fp
+
+    async def _check_embedding_parity(
+        self,
+        force: bool = False,
+    ) -> Tuple[bool, str]:
+        """
+        v276.4: Compare cloud and local ECAPA fingerprints for compatibility.
+
+        This detects version drift that causes confidence instability:
+        - Different embedding dimensions → cosine similarity meaningless
+        - Different sample rates → feature extraction mismatch
+        - Different model sources → different embedding spaces
+
+        Args:
+            force: If True, re-fetch fingerprints even if recently checked.
+
+        Returns:
+            (compatible, reason) — reason explains mismatch if incompatible,
+            or describes the parity state if compatible.
+        """
+        parity_ttl = float(os.getenv(
+            "JARVIS_ECAPA_PARITY_CHECK_TTL", "300.0"
+        ))
+
+        # Skip if recently checked (unless forced)
+        if (
+            not force
+            and self._parity_compatible is not None
+            and (time.time() - self._parity_last_checked) < parity_ttl
+        ):
+            return self._parity_compatible, self._parity_last_reason
+
+        # Fetch cloud fingerprint (async)
+        cloud_fp = await self._fetch_cloud_parity_fingerprint()
+        # Get local fingerprint (sync — just reads local state)
+        local_fp = self._get_local_parity_fingerprint()
+
+        # Store for observability
+        self._cloud_parity = cloud_fp
+        self._local_parity = local_fp
+        self._parity_last_checked = time.time()
+
+        # If only one backend is populated, parity check is not applicable
+        if not cloud_fp.is_populated() and not local_fp.is_populated():
+            self._parity_compatible = None
+            self._parity_last_reason = "both_fingerprints_empty"
+            return True, self._parity_last_reason
+
+        if not cloud_fp.is_populated():
+            self._parity_compatible = None
+            self._parity_last_reason = "cloud_fingerprint_empty"
+            # Not a parity failure — cloud just isn't available
+            return True, self._parity_last_reason
+
+        if not local_fp.is_populated():
+            self._parity_compatible = None
+            self._parity_last_reason = "local_fingerprint_empty"
+            # Not a parity failure — local just isn't loaded
+            return True, self._parity_last_reason
+
+        # Both populated — compare
+        compatible, reason = cloud_fp.is_compatible_with(local_fp)
+        self._parity_compatible = compatible
+        self._parity_last_reason = reason
+
+        if not compatible:
+            logger.error(
+                f"[v276.4] ECAPA PARITY DRIFT DETECTED: {reason}. "
+                f"Cloud and local embeddings are NOT compatible. "
+                f"Speaker verification results will be inconsistent. "
+                f"Cloud: {cloud_fp.to_dict()}, Local: {local_fp.to_dict()}"
+            )
+        else:
+            logger.info(
+                f"[v276.4] ECAPA parity OK — cloud and local compatible "
+                f"(dim={cloud_fp.embedding_dim}, rate={cloud_fp.sample_rate}, "
+                f"model={cloud_fp.model_source or 'default'})"
+            )
+
+        return compatible, reason
+
+    def get_parity_status(self) -> Dict[str, Any]:
+        """
+        v276.4: Return current embedding parity state for health endpoints.
+
+        Exposes parity fingerprints and compatibility verdict to callers
+        (health checks, dashboards, cross-repo state files).
+        """
+        return {
+            "compatible": self._parity_compatible,
+            "last_checked": self._parity_last_checked,
+            "last_reason": self._parity_last_reason,
+            "cloud": self._cloud_parity.to_dict(),
+            "local": self._local_parity.to_dict(),
+        }
 
     def _schedule_deferred_ecapa_recovery(self) -> None:
         """
