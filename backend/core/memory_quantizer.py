@@ -434,6 +434,7 @@ class MemoryQuantizer:
         self._thrash_warning_since: float = 0.0
         self._thrash_callbacks: List[Callable] = []
         self._unload_callbacks: List[Callable] = []
+        self._recovery_callbacks: List[Callable] = []
 
         logger.info("Advanced Memory Quantizer initialized")
         logger.info(f"  Config: {self.config}")
@@ -1089,10 +1090,9 @@ class MemoryQuantizer:
                 )
                 for callback in self._unload_callbacks:
                     try:
-                        if asyncio.iscoroutinefunction(callback):
-                            await callback(self.current_tier)
-                        else:
-                            callback(self.current_tier)
+                        _result = callback(self.current_tier)
+                        if asyncio.iscoroutine(_result):
+                            await _result
                     except Exception as e:
                         logger.error(f"[ComponentUnload] Callback error: {e}")
             else:
@@ -1186,12 +1186,28 @@ class MemoryQuantizer:
         # Notify callbacks
         for callback in self.tier_change_callbacks:
             try:
-                if asyncio.iscoroutinefunction(callback):
-                    await callback(old_tier, new_tier)
-                else:
-                    callback(old_tier, new_tier)
+                _result = callback(old_tier, new_tier)
+                if asyncio.iscoroutine(_result):
+                    await _result
             except Exception as e:
                 logger.error(f"Tier change callback error: {e}")
+
+        if (
+            old_tier in (MemoryTier.CRITICAL, MemoryTier.EMERGENCY)
+            and new_tier in (MemoryTier.ABUNDANT, MemoryTier.OPTIMAL, MemoryTier.ELEVATED)
+        ):
+            logger.info(
+                "[MemoryRecovery] Tier recovery detected: %s -> %s",
+                old_tier.value,
+                new_tier.value,
+            )
+            for callback in self._recovery_callbacks:
+                try:
+                    _result = callback(old_tier, new_tier)
+                    if asyncio.iscoroutine(_result):
+                        await _result
+                except Exception as e:
+                    logger.error(f"Recovery callback error: {e}")
 
         # Store to Learning DB
         if self.learning_db:
@@ -1208,7 +1224,8 @@ class MemoryQuantizer:
 
     def register_tier_change_callback(self, callback: Callable):
         """Register callback for tier changes"""
-        self.tier_change_callbacks.append(callback)
+        if callback not in self.tier_change_callbacks:
+            self.tier_change_callbacks.append(callback)
 
     def register_thrash_callback(self, callback: Callable) -> None:
         """Register callback for thrash state changes.
@@ -1216,7 +1233,13 @@ class MemoryQuantizer:
         Callback receives one argument: 'healthy', 'thrashing', or 'emergency'.
         Called when state transitions (not on every check).
         """
-        self._thrash_callbacks.append(callback)
+        if callback not in self._thrash_callbacks:
+            self._thrash_callbacks.append(callback)
+
+    def unregister_thrash_callback(self, callback: Callable) -> None:
+        """Unregister thrash-state callback if present."""
+        if callback in self._thrash_callbacks:
+            self._thrash_callbacks.remove(callback)
 
     def register_unload_callback(self, callback: Callable) -> None:
         """Register callback for COMPONENT_UNLOAD strategy.
@@ -1226,7 +1249,23 @@ class MemoryQuantizer:
         the COMPONENT_UNLOAD optimization strategy fires. Use this to
         unload heavy components (e.g., the local LLM model) to free RAM.
         """
-        self._unload_callbacks.append(callback)
+        if callback not in self._unload_callbacks:
+            self._unload_callbacks.append(callback)
+
+    def unregister_unload_callback(self, callback: Callable) -> None:
+        """Unregister unload callback if present."""
+        if callback in self._unload_callbacks:
+            self._unload_callbacks.remove(callback)
+
+    def register_recovery_callback(self, callback: Callable) -> None:
+        """Register callback fired when memory recovers to stable tiers."""
+        if callback not in self._recovery_callbacks:
+            self._recovery_callbacks.append(callback)
+
+    def unregister_recovery_callback(self, callback: Callable) -> None:
+        """Unregister recovery callback if present."""
+        if callback in self._recovery_callbacks:
+            self._recovery_callbacks.remove(callback)
 
     async def _check_thrash_state(self) -> None:
         """Check pagein rate and transition thrash state if needed."""
@@ -1255,10 +1294,9 @@ class MemoryQuantizer:
             )
             for callback in self._thrash_callbacks:
                 try:
-                    if asyncio.iscoroutinefunction(callback):
-                        await callback(new_state)
-                    else:
-                        callback(new_state)
+                    _result = callback(new_state)
+                    if asyncio.iscoroutine(_result):
+                        await _result
                 except Exception as e:
                     logger.debug(f"Thrash callback error: {e}")
 

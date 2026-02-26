@@ -2198,6 +2198,14 @@ class UnifiedModelServing:
         self._running = False
         self._lock = asyncio.Lock()
         self._prime_api_source: Optional[str] = None  # v261.0: "gcp" | "local_jprime" | None
+        self._memory_quantizer: Any = None
+        self._memory_recovery_lock = LazyAsyncLock()
+        self._memory_recovery_armed: bool = False
+        self._memory_recovery_in_progress: bool = False
+        self._memory_recovery_last_attempt: float = 0.0
+        self._memory_recovery_last_success: float = 0.0
+        self._last_local_unload_reason: str = ""
+        self._unload_in_progress: bool = False
 
         # v100.1: Model registry for Trinity Loop hot-swap
         self._registered_models: Dict[str, RegisteredModel] = {}
@@ -2316,6 +2324,7 @@ class UnifiedModelServing:
         try:
             from backend.core.memory_quantizer import get_memory_quantizer
             _mq = await get_memory_quantizer()
+            self._memory_quantizer = _mq
             if _mq and hasattr(_mq, 'register_thrash_callback'):
                 _mq.register_thrash_callback(self._handle_thrash_state_change)
                 self.logger.info("[v266.0] Registered thrash detection callback")
@@ -2323,6 +2332,9 @@ class UnifiedModelServing:
             if _mq and hasattr(_mq, 'register_unload_callback'):
                 _mq.register_unload_callback(self._handle_component_unload)
                 self.logger.info("[v266.0] Registered component unload callback")
+            if _mq and hasattr(_mq, 'register_recovery_callback'):
+                _mq.register_recovery_callback(self._handle_memory_recovery)
+                self.logger.info("[v277.0] Registered memory recovery callback")
         except Exception as e:
             self.logger.debug(f"[v266.0] Memory callback registration: {e}")
 
@@ -2367,7 +2379,10 @@ class UnifiedModelServing:
                             f"to reclaim RAM "
                             f"(available: {_mem_metrics.system_memory_available_gb:.1f}GB)"
                         )
-                        await self._unload_local_model()
+                        await self._unload_local_model(
+                            reason="memory_monitor",
+                            arm_recovery=True,
+                        )
                         _critical_since = None
                 else:
                     if _critical_since is not None:
@@ -2383,31 +2398,55 @@ class UnifiedModelServing:
                 self.logger.debug(f"[v235.1] Memory monitor error: {e}")
                 await asyncio.sleep(30)
 
-    async def _unload_local_model(self) -> None:
-        """v235.1: Safely unload the local GGUF model to reclaim RAM."""
-        _local = self._clients.get(ModelProvider.PRIME_LOCAL)
-        if _local and getattr(_local, '_model', None) is not None:
-            try:
-                _model_path = getattr(_local._model, 'model_path', 'unknown')
-                del _local._model
-                _local._model = None
-                _local._loaded = False
-                import gc
-                gc.collect()
-                # Trip PRIME_LOCAL circuit breaker so routing skips to CLAUDE
-                for _ in range(CIRCUIT_BREAKER_FAILURE_THRESHOLD):
-                    self._circuit_breaker.record_failure(
-                        ModelProvider.PRIME_LOCAL.value
-                    )
-                self.logger.info(
-                    f"[v235.1] Local model unloaded ({_model_path}). "
-                    f"PRIME_LOCAL circuit breaker tripped — "
-                    f"inference falls through to CLAUDE tier."
-                )
-            except Exception as e:
-                self.logger.warning(f"[v235.1] Model unload error: {e}")
+    def _resolve_recovery_arm(
+        self,
+        reason: str,
+        arm_recovery: Optional[bool],
+    ) -> bool:
+        """Resolve whether unload should arm local model recovery lifecycle."""
+        if arm_recovery is not None:
+            return bool(arm_recovery)
+        return reason in {"memory_monitor", "component_unload", "memory_pressure"}
 
-    def reset_local_circuit_breaker(self) -> None:
+    async def _unload_local_model(
+        self,
+        *,
+        reason: str = "unspecified",
+        arm_recovery: Optional[bool] = None,
+    ) -> bool:
+        """v235.1/v277.0: Safely unload local GGUF model and arm recovery when needed."""
+        _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+        if not _local or getattr(_local, "_model", None) is None:
+            self._last_local_unload_reason = reason
+            return False
+
+        _arm = self._resolve_recovery_arm(reason, arm_recovery)
+        try:
+            _model_path = getattr(_local._model, "model_path", "unknown")
+            del _local._model
+            _local._model = None
+            _local._loaded = False
+            import gc
+
+            gc.collect()
+            # Trip PRIME_LOCAL circuit breaker so routing skips to cloud fallback.
+            self.force_open_local_circuit_breaker(reason=f"unload:{reason}")
+            self._memory_recovery_armed = _arm
+            self._last_local_unload_reason = reason
+            if not _arm:
+                self._memory_recovery_in_progress = False
+            self.logger.info(
+                "[v235.1] Local model unloaded (%s). circuit=open reason=%s recovery_armed=%s",
+                _model_path,
+                reason,
+                _arm,
+            )
+            return True
+        except Exception as e:
+            self.logger.warning(f"[v235.1] Model unload error: {e}")
+            return False
+
+    def reset_local_circuit_breaker(self) -> bool:
         """v266.2: Reset PRIME_LOCAL circuit breaker after verified model reload.
 
         Called by GCPHybridPrimeRouter when post-crisis recovery successfully
@@ -2428,9 +2467,19 @@ class UnifiedModelServing:
                 if state:
                     state.state = CircuitState.CLOSED
                     state.failure_count = 0
-        self.logger.info(
-            "[v266.2] PRIME_LOCAL circuit breaker reset to CLOSED (post-crisis recovery)"
-        )
+        _state = self.get_local_circuit_state()
+        _verified = _state == "closed"
+        if _verified:
+            self._memory_recovery_armed = False
+            self.logger.info(
+                "[v266.2] PRIME_LOCAL circuit breaker reset to CLOSED (post-crisis recovery)"
+            )
+        else:
+            self.logger.error(
+                "[v266.2] PRIME_LOCAL circuit reset verification failed (state=%s)",
+                _state,
+            )
+        return _verified
 
     def force_open_local_circuit_breaker(self, reason: str = "recovery_reload") -> None:
         """Force PRIME_LOCAL circuit OPEN so routing stays on cloud during reload."""
@@ -2454,6 +2503,14 @@ class UnifiedModelServing:
         _state = self._circuit_breaker.get_state(ModelProvider.PRIME_LOCAL.value)
         _raw = _state.state.value if hasattr(_state.state, "value") else str(_state.state)
         return str(_raw).lower()
+
+    async def load_model(self, model_name: Optional[str] = None) -> bool:
+        """Load/reload PRIME_LOCAL model via the local client."""
+        _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+        if _local is None or not isinstance(_local, PrimeLocalClient):
+            self.logger.warning("[v277.0] Local load skipped: PRIME_LOCAL client missing")
+            return False
+        return await _local.load_model(model_name=model_name)
 
     async def smoke_test_local_model(self, timeout_seconds: float = 20.0) -> bool:
         """Run a minimal local inference smoke test after reload."""
@@ -2487,6 +2544,98 @@ class UnifiedModelServing:
             self.logger.warning(f"[v266.4] Local smoke test exception: {smoke_err}")
             return False
 
+    async def _handle_memory_recovery(self, old_tier, new_tier) -> None:
+        """Reload local model after memory recovery and verify circuit reset."""
+        if not self._running or not self._memory_recovery_armed:
+            return
+
+        _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+        if _local is None or not isinstance(_local, PrimeLocalClient):
+            return
+
+        try:
+            _cooldown = float(os.getenv("JARVIS_LOCAL_RECOVERY_COOLDOWN_SECONDS", "60.0"))
+        except (TypeError, ValueError):
+            _cooldown = 60.0
+        now = time.time()
+        if now - self._memory_recovery_last_attempt < max(0.0, _cooldown):
+            return
+
+        async with self._memory_recovery_lock:
+            if self._memory_recovery_in_progress:
+                return
+            self._memory_recovery_in_progress = True
+            self._memory_recovery_last_attempt = time.time()
+
+        try:
+            old_label = getattr(old_tier, "value", str(old_tier))
+            new_label = getattr(new_tier, "value", str(new_tier))
+            self.logger.info(
+                "[v277.0] Memory recovery callback: %s -> %s (armed=%s, unload_reason=%s)",
+                old_label,
+                new_label,
+                self._memory_recovery_armed,
+                self._last_local_unload_reason or "unknown",
+            )
+
+            if self._prime_api_source == "gcp":
+                self.logger.info(
+                    "[v277.0] Memory recovered but GCP Prime is active; skipping local reload"
+                )
+                return
+
+            if getattr(_local, "_model", None) is not None and getattr(_local, "_loaded", False):
+                if self.reset_local_circuit_breaker():
+                    self._memory_recovery_armed = False
+                    self._memory_recovery_last_success = time.time()
+                return
+
+            self.force_open_local_circuit_breaker(reason="memory_recovery_reload")
+            try:
+                _load_timeout = float(os.getenv("JARVIS_LOCAL_RECOVERY_LOAD_TIMEOUT", "120.0"))
+            except (TypeError, ValueError):
+                _load_timeout = 120.0
+            try:
+                _smoke_timeout = float(os.getenv("JARVIS_LOCAL_RECOVERY_SMOKE_TIMEOUT", "20.0"))
+            except (TypeError, ValueError):
+                _smoke_timeout = 20.0
+
+            load_ok = await asyncio.wait_for(
+                self.load_model(),
+                timeout=max(5.0, _load_timeout),
+            )
+            if not load_ok:
+                self.logger.warning("[v277.0] Local recovery load_model returned false")
+                return
+
+            smoke_ok = await asyncio.wait_for(
+                self.smoke_test_local_model(timeout_seconds=max(1.0, _smoke_timeout)),
+                timeout=max(5.0, _smoke_timeout + 5.0),
+            )
+            if not smoke_ok:
+                self.logger.warning("[v277.0] Local recovery smoke test failed")
+                await self._unload_local_model(
+                    reason="recovery_smoke_failed",
+                    arm_recovery=True,
+                )
+                return
+
+            if not self.reset_local_circuit_breaker():
+                self.force_open_local_circuit_breaker(reason="recovery_reset_verification_failed")
+                return
+
+            self._memory_recovery_armed = False
+            self._memory_recovery_last_success = time.time()
+            self.logger.info(
+                "[v277.0] Local model recovery complete; circuit closed and verified"
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning("[v277.0] Local memory recovery timed out")
+        except Exception as recovery_err:
+            self.logger.warning(f"[v277.0] Local memory recovery failed: {recovery_err}")
+        finally:
+            self._memory_recovery_in_progress = False
+
     # ── v266.0: Component Unload (GCP-disabled escape valve) ─────────
 
     async def _handle_component_unload(self, tier) -> None:
@@ -2516,7 +2665,10 @@ class UnifiedModelServing:
             f"[ComponentUnload] Memory tier {tier} — unloading local LLM model"
         )
         try:
-            await self._unload_local_model()
+            await self._unload_local_model(
+                reason="component_unload",
+                arm_recovery=True,
+            )
             self.logger.warning("[ComponentUnload] Local LLM model unloaded successfully")
         except Exception as e:
             self.logger.error(f"[ComponentUnload] Unload failed: {e}")
@@ -2594,7 +2746,10 @@ class UnifiedModelServing:
         _local._model_swapping = True
         try:
             # Unload current model via the existing mechanism
-            await self._unload_local_model()
+            await self._unload_local_model(
+                reason="thrash_downgrade",
+                arm_recovery=False,
+            )
 
             # Load smaller model
             success = await _local.load_model(model_name=next_model["filename"])
@@ -2662,6 +2817,20 @@ class UnifiedModelServing:
             except (asyncio.CancelledError, Exception):
                 pass
             self._memory_monitor_task = None
+
+        # Unregister MemoryQuantizer callbacks to avoid stale references.
+        _mq = self._memory_quantizer
+        if _mq:
+            try:
+                if hasattr(_mq, "unregister_thrash_callback"):
+                    _mq.unregister_thrash_callback(self._handle_thrash_state_change)
+                if hasattr(_mq, "unregister_unload_callback"):
+                    _mq.unregister_unload_callback(self._handle_component_unload)
+                if hasattr(_mq, "unregister_recovery_callback"):
+                    _mq.unregister_recovery_callback(self._handle_memory_recovery)
+            except Exception as cb_err:
+                self.logger.debug(f"[v277.0] Memory callback unregister: {cb_err}")
+        self._memory_quantizer = None
 
         # v234.1: Clean up PrimeLocalClient resources
         local_client = self._clients.get(ModelProvider.PRIME_LOCAL)
@@ -3331,7 +3500,10 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
         _model_serving._prime_api_source = "gcp"  # v261.0: GCP wins priority
         # v239.0: Free RAM by unloading local model now that GCP is primary
         try:
-            await _model_serving._unload_local_model()
+            await _model_serving._unload_local_model(
+                reason="gcp_primary",
+                arm_recovery=False,
+            )
             logger.info("[v239.0] Local model unloaded — GCP is now primary tier")
         except Exception as e:
             logger.warning(f"[v239.0] Local model unload failed (non-fatal): {e}")
@@ -3348,7 +3520,10 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
             logger.info(f"[v234.0] GCP endpoint activated: {url}")
             # v239.0: Free RAM by unloading local model now that GCP is primary
             try:
-                await _model_serving._unload_local_model()
+                await _model_serving._unload_local_model(
+                    reason="gcp_primary",
+                    arm_recovery=False,
+                )
                 logger.info("[v239.0] Local model unloaded — GCP is now primary tier")
             except Exception as e:
                 logger.warning(f"[v239.0] Local model unload failed (non-fatal): {e}")
