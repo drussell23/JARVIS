@@ -63333,16 +63333,6 @@ class JarvisSystemKernel:
             except Exception as e:
                 self.logger.debug(f"[Kernel] Agent Runtime cleanup error: {e}")
 
-        # v262.0: Cancel background tasks AND await them so finally blocks execute.
-        # Previously only cancelled with 2s timeout — aiohttp sessions, file handles, etc. leaked.
-        # R3: Added configurable timeout to prevent hung finally blocks from stalling shutdown.
-        background_tasks = [
-            task for task in self._background_tasks
-            if task is not self._backend_server_task and not task.done()
-        ]
-        for task in background_tasks:
-            task.cancel()
-
         # v266.0: Cancel startup + loading server heartbeat tasks explicitly.
         try:
             await self._stop_startup_progress_heartbeat(timeout=1.0)
@@ -63350,21 +63340,18 @@ class JarvisSystemKernel:
         except Exception as e:
             self.logger.debug(f"[Kernel] Heartbeat task cleanup error: {e}")
 
-        # v262.0: Give tasks time to run their finally blocks (e.g., await session.close()).
-        # Timeout prevents a hung finally block from stalling the entire shutdown.
-        if background_tasks:
-            _bg_cleanup_timeout = _get_env_float("JARVIS_BACKGROUND_TASK_CLEANUP_TIMEOUT", 10.0)
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*background_tasks, return_exceptions=True),
-                    timeout=_bg_cleanup_timeout,
-                )
-            except asyncio.TimeoutError:
-                _still_pending = sum(1 for t in background_tasks if not t.done())
-                self.logger.warning(
-                    f"[Kernel] v262.0: Background task cleanup timed out after "
-                    f"{_bg_cleanup_timeout:.0f}s — {_still_pending} tasks still pending"
-                )
+        # v262.0+: Cancel + drain background tasks via one deterministic code path.
+        _bg_cleanup_timeout = _get_env_float("JARVIS_BACKGROUND_TASK_CLEANUP_TIMEOUT", 10.0)
+        _, _still_pending = await self._cancel_and_drain_background_tasks(
+            timeout_s=_bg_cleanup_timeout,
+            reason=f"emergency:{reason}",
+            exclude={self._backend_server_task} if self._backend_server_task else None,
+        )
+        if _still_pending:
+            self.logger.warning(
+                "[Kernel] Background tasks still pending after emergency drain: %d",
+                _still_pending,
+            )
 
         # v223.0: Stop Node.js WebSocket Router (prevents orphaned Node processes)
         if hasattr(self, '_ws_router_process') and self._ws_router_process:
@@ -63853,6 +63840,11 @@ class JarvisSystemKernel:
         Returns:
             Exit code (0 for success, non-zero for failure)
         """
+        # Reset shutdown gate in case this kernel instance is reused in-process.
+        self._is_shutting_down = False
+        self._allow_background_task_registration = True
+        self._shutdown_event.clear()
+
         # v181.0: Calculate effective startup timeout based on enabled features
         # Base timeout from environment or config
         base_timeout = float(os.environ.get(
@@ -82232,9 +82224,10 @@ class JarvisSystemKernel:
             await self._hot_reload.start()
 
         # Start background tasks
-        self._background_tasks.extend([
+        self._track_background_task(
             create_safe_task(self._health_monitor_loop(), name="health-monitor"),
-        ])
+            source="run:health_monitor",
+        )
 
         # v210.0: Start readiness monitoring loop for post-startup health tracking
         # This monitors component health and revokes/restores FULLY_READY as needed
@@ -82242,13 +82235,17 @@ class JarvisSystemKernel:
             self._readiness_monitoring_loop(),
             name="readiness-monitor"
         )
-        self._background_tasks.append(self._readiness_monitor_task)
+        self._track_background_task(
+            self._readiness_monitor_task,
+            source="run:readiness_monitor",
+        )
 
         # If readiness manager has heartbeat, it's already running
         # Add cost optimizer if scale-to-zero is enabled
         if self.config.scale_to_zero_enabled:
-            self._background_tasks.append(
-                create_safe_task(self._cost_optimizer_loop(), name="cost-optimizer")
+            self._track_background_task(
+                create_safe_task(self._cost_optimizer_loop(), name="cost-optimizer"),
+                source="run:cost_optimizer",
             )
 
         try:
@@ -82728,7 +82725,7 @@ class JarvisSystemKernel:
 
     async def _signal_shutdown(self) -> None:
         """Handle shutdown signal callback."""
-        self._shutdown_event.set()
+        self._begin_shutdown("signal_handler")
 
     def _register_ipc_handlers(self) -> None:
         """Register IPC command handlers."""
