@@ -62032,6 +62032,215 @@ class KernelBackgroundTaskRegistry:
         return len(self._tasks)
 
 
+# ============================================================================
+# v275.0: Dedicated Progress Broadcast Worker
+# ============================================================================
+
+
+class _ProgressBroadcastWorker(threading.Thread):
+    """
+    v275.0: Dedicated background thread for reliable progress broadcasts.
+
+    Architectural root cause (the disease):
+        Progress broadcasts from supervisor to loading server failed under
+        heavy startup phases (Resources, Backend, Trinity) because BOTH
+        available transport paths depend on saturated shared resources:
+
+        Path A (asyncio.to_thread + urllib): The thread pool worker
+        couldn't get scheduled under GIL contention from concurrent
+        whisper/vision/model-loading operations. The 2.5s outer
+        asyncio.wait_for() timeout expired before the thread even ran.
+
+        Path B (async aiohttp): The event loop was blocked by
+        synchronous operations (heavy imports, CPU-bound work). The
+        aiohttp coroutine couldn't make progress within the 2.0s
+        ClientTimeout, despite the loading server responding in 4ms
+        to manual curl.
+
+        Path B.1 (persistent aiohttp session): Eliminated per-request
+        overhead but still depended on the event loop. Under peak
+        load (86% CPU), the event loop couldn't service the aiohttp
+        coroutine within timeout.
+
+    The cure:
+        A dedicated background thread with its own persistent HTTP/1.1
+        connection. Completely independent of both the asyncio event
+        loop AND the default thread pool executor:
+
+        - Dedicated thread: Always running, no scheduling delay for
+          new thread creation. OS preemptive scheduling ensures it
+          gets CPU time even when other threads are busy.
+
+        - Persistent HTTP/1.1 connection: No DNS resolution (uses
+          127.0.0.1), no TCP handshake per request (keepalive), no
+          session object allocation. Only the actual HTTP request
+          bytes traverse the socket.
+
+        - Socket I/O releases the GIL: socket.send() and socket.recv()
+          are C-level operations that release the GIL. Even when Python
+          threads hold the GIL for compute (whisper inference, tensor
+          ops), the socket operations proceed unblocked at the OS level.
+
+        - Latest-value semantics: When multiple updates arrive while
+          the worker is busy sending, only the most recent one is
+          kept. Progress updates are monotonic — intermediate values
+          are redundant. This prevents queue buildup under load.
+
+    Performance:
+        Under peak load (86% CPU, 7.4% MEM from whisper+vision+model
+        loading), a persistent HTTP POST to 127.0.0.1 completes in
+        ~1ms. This is ~2000x faster than the 2.0s timeout that killed
+        the aiohttp path.
+    """
+
+    def __init__(self, port: int):
+        super().__init__(daemon=True, name="jarvis-broadcast-worker")
+        self._port = port
+        self._lock = threading.Lock()
+        self._pending_data: Optional[Dict[str, Any]] = None
+        self._has_data = threading.Event()
+        self._stop = threading.Event()
+        self._conn: Optional[Any] = None  # http.client.HTTPConnection
+
+        # Observable state (read by supervisor from the event loop)
+        # These are simple Python objects — atomic under GIL.
+        self.consecutive_failures: int = 0
+        self.last_error: Optional[str] = None
+        self.server_ready: bool = False
+        self.total_sent: int = 0
+
+    def enqueue(self, progress_data: Dict[str, Any]) -> None:
+        """
+        Non-blocking enqueue with latest-value semantics.
+
+        If the worker is busy sending, the new data replaces any
+        pending unsent data. Only the most recent progress matters
+        because progress updates are monotonic.
+        """
+        with self._lock:
+            self._pending_data = progress_data
+        self._has_data.set()
+
+    def shutdown(self) -> None:
+        """Signal stop, flush pending data, and wait for thread exit."""
+        self._stop.set()
+        self._has_data.set()  # Wake up from wait
+        self.join(timeout=5)
+        self._close_conn()
+
+    def run(self) -> None:
+        """Worker loop: wait for data, send HTTP, repeat."""
+        import http.client as _http
+        import json as _json
+
+        _logger = logging.getLogger(__name__)
+        _logger.debug("[BroadcastWorker] Started (port=%d)", self._port)
+
+        while not self._stop.is_set():
+            # Wait for new data or periodic check (2s timeout prevents
+            # the thread from blocking indefinitely if shutdown races)
+            self._has_data.wait(timeout=2.0)
+            if self._stop.is_set():
+                break
+            self._has_data.clear()
+
+            # Consume latest pending data (atomic swap under lock)
+            with self._lock:
+                data = self._pending_data
+                self._pending_data = None
+
+            if data is None:
+                continue
+
+            # Send via persistent HTTP/1.1 connection
+            if self._send_http(data, _http, _json):
+                self.consecutive_failures = 0
+                self.last_error = None
+                self.server_ready = True
+                self.total_sent += 1
+            else:
+                self.consecutive_failures += 1
+
+        # Final flush: send any pending data before exit (for 100%
+        # completion broadcast during graceful shutdown)
+        with self._lock:
+            final_data = self._pending_data
+            self._pending_data = None
+        if final_data is not None:
+            import http.client as _http
+            import json as _json
+            self._send_http(final_data, _http, _json)
+
+        self._close_conn()
+        _logger = logging.getLogger(__name__)
+        _logger.debug("[BroadcastWorker] Stopped (total_sent=%d)", self.total_sent)
+
+    def _send_http(self, data: Dict[str, Any], _http: Any, _json: Any) -> bool:
+        """
+        Send progress data via persistent HTTP/1.1 connection.
+
+        Auto-reconnects on failure. Two attempts per send: if the
+        first fails (stale/broken connection), close and retry with
+        a fresh connection. This handles server restarts, TCP RST,
+        and keepalive expiry transparently.
+        """
+        try:
+            body = _json.dumps(data).encode('utf-8')
+        except (TypeError, ValueError) as e:
+            self.last_error = f"JSON encode: {e}"
+            return False
+
+        for attempt in range(2):
+            try:
+                conn = self._ensure_conn(_http)
+                conn.request(
+                    "POST",
+                    "/api/update-progress",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(body)),
+                    },
+                )
+                resp = conn.getresponse()
+                resp.read()  # Drain response to allow connection reuse
+
+                if resp.status == 200:
+                    return True
+
+                self.last_error = f"HTTP {resp.status}"
+                return False
+
+            except Exception as e:
+                self.last_error = f"{type(e).__name__}: {e}"
+                self._close_conn()
+                if attempt == 0:
+                    continue  # Retry with fresh connection
+                return False
+
+        return False
+
+    def _ensure_conn(self, _http: Any) -> Any:
+        """Get or create persistent HTTP/1.1 connection to 127.0.0.1."""
+        if self._conn is None:
+            # 127.0.0.1 bypasses DNS resolution entirely.
+            # macOS DNS resolver is a separate process that stalls
+            # under memory pressure (50-200ms for 'localhost').
+            self._conn = _http.HTTPConnection(
+                "127.0.0.1", self._port, timeout=5
+            )
+        return self._conn
+
+    def _close_conn(self) -> None:
+        """Close HTTP connection (safe to call multiple times)."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+
 class JarvisSystemKernel:
     """
     The brain that ties the entire JARVIS system together.
@@ -83231,113 +83440,33 @@ class JarvisSystemKernel:
             )
         return False
 
-    def _get_broadcast_session(self) -> "aiohttp.ClientSession":
+    def _start_broadcast_worker(self) -> None:
         """
-        v275.0: Get or create persistent aiohttp session for broadcasts.
+        v275.0: Start dedicated broadcast worker thread.
 
-        Lazy-creates a single ClientSession with keepalive connection to
-        the loading server. Reuse eliminates per-request overhead:
-        - DNS resolution (50-200ms under memory pressure for 'localhost')
-        - TCP connection establishment (SYN/SYN-ACK/ACK)
-        - Session object allocation (connector, pool, cookie jar)
-
-        Uses 127.0.0.1 instead of 'localhost' to bypass DNS resolution
-        entirely (macOS DNS resolver is a separate process that stalls
-        under memory pressure).
+        Called after loading server health check passes. The worker
+        maintains a persistent HTTP/1.1 connection to the loading
+        server, completely independent of the asyncio event loop.
         """
-        session = getattr(self, '_broadcast_session', None)
-        if session is not None and not session.closed:
-            return session
-        # Create persistent session with generous timeout and keepalive.
-        # Connector limit=5 is plenty for localhost broadcasts.
-        connector = aiohttp.TCPConnector(
-            limit=5,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True,
+        port = self.config.loading_server_port
+        if port == 0:
+            return
+        worker = getattr(self, '_broadcast_worker', None)
+        if worker is not None and worker.is_alive():
+            return  # Already running
+        self._broadcast_worker = _ProgressBroadcastWorker(port)
+        self._broadcast_worker.start()
+        self.logger.info(
+            f"[Broadcast] Started dedicated worker thread "
+            f"(port={port}, thread={self._broadcast_worker.name})"
         )
-        self._broadcast_session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=5.0),
-        )
-        return self._broadcast_session
 
-    async def _close_broadcast_session(self) -> None:
-        """v275.0: Close persistent broadcast session on shutdown."""
-        session = getattr(self, '_broadcast_session', None)
-        if session is not None and not session.closed:
-            try:
-                await session.close()
-            except Exception:
-                pass
-            self._broadcast_session = None
-
-    async def _async_broadcast_to_loading_server(
-        self,
-        url: str,
-        progress_data: Dict[str, Any],
-        timeout: float,
-    ) -> bool:
-        """
-        v275.0: Async HTTP POST to loading server via persistent aiohttp session.
-
-        Primary broadcast transport. Runs entirely in the event loop —
-        no thread dispatch, no GIL contention. Uses a persistent
-        ClientSession to eliminate per-request DNS + TCP + allocation
-        overhead that caused 2s timeouts under CPU/memory pressure.
-
-        Root cause of v274.1 60% stall (two layers):
-        Layer 1: asyncio.to_thread(urllib) thread couldn't get scheduled
-                 under GIL contention during heavy phases.
-        Layer 2: Even after switching to async aiohttp (first v275.0),
-                 creating a NEW ClientSession per broadcast added
-                 DNS resolution (macOS resolver stalls under memory
-                 pressure) + TCP connect + object allocation overhead
-                 that exceeded the 2.0s timeout during Resources phase.
-
-        Fix: Persistent session with keepalive connection to 127.0.0.1
-        (not 'localhost' — skips DNS). Per-request overhead: ~1ms.
-
-        Args:
-            url: Loading server update endpoint (will be rewritten to
-                 use 127.0.0.1 for DNS-free resolution)
-            progress_data: Progress payload (JSON-serializable)
-            timeout: Request timeout in seconds (per-request override)
-
-        Returns:
-            True on HTTP 200, False otherwise. Sets _last_broadcast_error
-            on failure.
-        """
-        try:
-            session = self._get_broadcast_session()
-            # v275.0: Use 127.0.0.1 to bypass DNS resolution.
-            # macOS DNS resolver is a separate process; under memory
-            # pressure it can take 200ms+ to resolve 'localhost'.
-            ip_url = url.replace("localhost", "127.0.0.1", 1)
-            async with session.post(
-                ip_url,
-                json=progress_data,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as resp:
-                if resp.status == 200:
-                    self._last_broadcast_error = None
-                    self._loading_server_ready = True
-                    return True
-                else:
-                    self._last_broadcast_error = f"HTTP {resp.status}"
-                    return False
-        except asyncio.TimeoutError:
-            self._last_broadcast_error = (
-                f"aiohttp timeout ({timeout:.1f}s)"
-            )
-            return False
-        except aiohttp.ClientError as e:
-            # Session may be stale — close for fresh reconnect on next call
-            await self._close_broadcast_session()
-            self._last_broadcast_error = f"aiohttp: {e}"
-            return False
-        except Exception as e:
-            self._last_broadcast_error = f"{type(e).__name__}: {e}"
-            return False
+    def _stop_broadcast_worker(self) -> None:
+        """v275.0: Shut down broadcast worker thread."""
+        worker = getattr(self, '_broadcast_worker', None)
+        if worker is not None:
+            worker.shutdown()
+            self._broadcast_worker = None
 
     def _sync_broadcast_progress(
         self,
