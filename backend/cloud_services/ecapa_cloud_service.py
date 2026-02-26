@@ -106,6 +106,16 @@ def _lazy_import_speechbrain():
     """Lazy import SpeechBrain only when needed (fallback from JIT)."""
     global _SPEECHBRAIN_LOADED, EncoderClassifier
     if not _SPEECHBRAIN_LOADED:
+        # v271.3: Apply meta tensor patches BEFORE importing SpeechBrain
+        try:
+            try:
+                from voice.engines.speechbrain_engine import ensure_speechbrain_patches_applied
+            except ImportError:
+                from backend.voice.engines.speechbrain_engine import ensure_speechbrain_patches_applied
+            ensure_speechbrain_patches_applied()
+        except ImportError:
+            pass  # speechbrain_engine not available — patches deferred
+
         print(">>> Lazy-importing speechbrain (JIT fallback)...", flush=True)
         from speechbrain.inference.speaker import EncoderClassifier as EC
         EncoderClassifier = EC
@@ -276,16 +286,35 @@ def _isolated_model_load(cache_dir: str, device: str = "cpu") -> Dict[str, Any]:
             print(f"[SUBPROCESS] Trying SpeechBrain EncoderClassifier", flush=True)
             try:
                 import warnings
-                from speechbrain.inference.speaker import EncoderClassifier
-                # Suppress benign HuggingFace warnings about Wav2Vec2 weight initialization
+                # v271.3: Apply meta tensor patches in subprocess before loading
+                try:
+                    from voice.engines.speechbrain_engine import safe_from_hparams as _sfh
+                    _use_safe = True
+                except ImportError:
+                    try:
+                        from backend.voice.engines.speechbrain_engine import safe_from_hparams as _sfh
+                        _use_safe = True
+                    except ImportError:
+                        _use_safe = False
+
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="Some weights of.*were not initialized.*")
                     warnings.filterwarnings("ignore", message=".*TRAIN this model.*")
-                    _classifier = EncoderClassifier.from_hparams(
-                        source="speechbrain/spkrec-ecapa-voxceleb",
-                        savedir=cache_dir,
-                        run_opts={"device": device}
-                    )
+                    if _use_safe:
+                        _classifier = _sfh(
+                            "speechbrain.inference.speaker.EncoderClassifier",
+                            model_name="ecapa_subprocess",
+                            source="speechbrain/spkrec-ecapa-voxceleb",
+                            savedir=cache_dir,
+                            run_opts={"device": device},
+                        )
+                    else:
+                        from speechbrain.inference.speaker import EncoderClassifier
+                        _classifier = EncoderClassifier.from_hparams(
+                            source="speechbrain/spkrec-ecapa-voxceleb",
+                            savedir=cache_dir,
+                            run_opts={"device": device}
+                        )
                 result['success'] = True
                 result['strategy'] = 'speechbrain'
                 result['optimized'] = False
@@ -1012,12 +1041,18 @@ class OptimizedModelLoader:
         start = time.time()
 
         try:
-            # v20.2.0: Lazy import SpeechBrain only when needed
-            EC = _lazy_import_speechbrain()
-            self._speechbrain_encoder = EC.from_hparams(
+            # v271.3: Route through centralized safe loader (meta tensor protection)
+            try:
+                from voice.engines.speechbrain_engine import safe_from_hparams
+            except ImportError:
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
+
+            self._speechbrain_encoder = safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="ecapa_cloud_fallback",
                 source=CloudECAPAConfig.MODEL_PATH,
                 savedir=self.cache_dir,
-                run_opts={"device": self.device}
+                run_opts={"device": self.device},
             )
 
             # Store feature extraction components for quantized model fallback
@@ -1685,15 +1720,22 @@ class ECAPAModelManager:
             try:
                 logger.info(f"Loading ECAPA-TDNN model (attempt {attempt + 1}/{max_retries})...")
 
-                # Suppress benign HuggingFace warnings about Wav2Vec2 weight initialization
+                # v271.3: Route through centralized safe loader (meta tensor protection)
+                try:
+                    from voice.engines.speechbrain_engine import safe_from_hparams as _sfh
+                except ImportError:
+                    from backend.voice.engines.speechbrain_engine import safe_from_hparams as _sfh
+
                 import warnings
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="Some weights of.*were not initialized.*")
                     warnings.filterwarnings("ignore", message=".*TRAIN this model.*")
-                    self.model = EncoderClassifier.from_hparams(
+                    self.model = _sfh(
+                        "speechbrain.inference.speaker.EncoderClassifier",
+                        model_name="ecapa_cloud_main",
                         source=self.model_path,
                         savedir=self.cache_dir,
-                        run_opts={"device": device}
+                        run_opts={"device": device},
                     )
 
                 load_duration = (time.time() - load_start) * 1000
@@ -1731,10 +1773,12 @@ class ECAPAModelManager:
                         with warnings.catch_warnings():
                             warnings.filterwarnings("ignore", message="Some weights of.*were not initialized.*")
                             warnings.filterwarnings("ignore", message=".*TRAIN this model.*")
-                            self.model = EncoderClassifier.from_hparams(
+                            self.model = _sfh(
+                                "speechbrain.inference.speaker.EncoderClassifier",
+                                model_name="ecapa_cloud_download_fallback",
                                 source=self.model_path,
                                 savedir=self.cache_dir,
-                                run_opts={"device": device}
+                                run_opts={"device": device},
                             )
 
                         self.device = device

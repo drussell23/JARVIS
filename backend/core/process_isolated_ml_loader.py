@@ -905,21 +905,41 @@ def _worker_load_speechbrain_model(
         import torch
         torch.set_num_threads(2)
 
-        # Import SpeechBrain (v93.0: Updated for SpeechBrain 1.0+ compatibility)
+        # v271.3: Route through centralized safe loader (meta tensor protection)
+        # Subprocess may or may not have speechbrain_engine on sys.path
+        _use_safe = False
         try:
-            from speechbrain.inference import EncoderClassifier
+            from voice.engines.speechbrain_engine import safe_from_hparams
+            _use_safe = True
         except ImportError:
-            # Fallback for older SpeechBrain versions
-            from speechbrain.pretrained import EncoderClassifier
+            try:
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
+                _use_safe = True
+            except ImportError:
+                pass
 
         # Load the model
         logger.info(f"[Worker] Loading SpeechBrain model: {model_name}")
 
-        model = EncoderClassifier.from_hparams(
-            source=model_name,
-            savedir=save_dir,
-            run_opts={"device": device},
-        )
+        if _use_safe:
+            model = safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name=f"process_isolated_{model_name}",
+                source=model_name,
+                savedir=save_dir,
+                run_opts={"device": device},
+            )
+        else:
+            # Fallback: direct load without meta tensor protection
+            try:
+                from speechbrain.inference import EncoderClassifier
+            except ImportError:
+                from speechbrain.pretrained import EncoderClassifier
+            model = EncoderClassifier.from_hparams(
+                source=model_name,
+                savedir=save_dir,
+                run_opts={"device": device},
+            )
 
         # Get model info (can't pickle the model itself)
         result['success'] = True

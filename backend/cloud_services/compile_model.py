@@ -950,13 +950,30 @@ class ECAPAModelCompiler:
 
         log.start_timer("load")
 
-        from speechbrain.inference.speaker import EncoderClassifier
+        # v271.3: Route through centralized safe loader (meta tensor protection)
+        try:
+            from voice.engines.speechbrain_engine import safe_from_hparams
+        except ImportError:
+            try:
+                from backend.voice.engines.speechbrain_engine import safe_from_hparams
+            except ImportError:
+                safe_from_hparams = None
 
-        self.encoder = EncoderClassifier.from_hparams(
-            source=self.config.model_source,
-            savedir=self.config.cache_dir,
-            run_opts={"device": self.config.device}
-        )
+        if safe_from_hparams is not None:
+            self.encoder = safe_from_hparams(
+                "speechbrain.inference.speaker.EncoderClassifier",
+                model_name="ecapa_compile",
+                source=self.config.model_source,
+                savedir=self.config.cache_dir,
+                run_opts={"device": self.config.device},
+            )
+        else:
+            from speechbrain.inference.speaker import EncoderClassifier
+            self.encoder = EncoderClassifier.from_hparams(
+                source=self.config.model_source,
+                savedir=self.config.cache_dir,
+                run_opts={"device": self.config.device}
+            )
 
         self.original_load_time_ms = log.stop_timer("load")
 

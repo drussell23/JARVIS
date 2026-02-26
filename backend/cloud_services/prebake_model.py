@@ -235,13 +235,32 @@ def main():
 
     import numpy as np
     import torch
-    from speechbrain.inference.speaker import EncoderClassifier
 
-    encoder = EncoderClassifier.from_hparams(
-        source=args.model_source,
-        savedir=args.cache_dir,
-        run_opts={"device": "cpu"}
-    )
+    # v271.3: Route through centralized safe loader (meta tensor protection)
+    try:
+        from voice.engines.speechbrain_engine import safe_from_hparams
+    except ImportError:
+        try:
+            from backend.voice.engines.speechbrain_engine import safe_from_hparams
+        except ImportError:
+            # CLI script fallback: apply patches manually if available
+            safe_from_hparams = None
+
+    if safe_from_hparams is not None:
+        encoder = safe_from_hparams(
+            "speechbrain.inference.speaker.EncoderClassifier",
+            model_name="ecapa_prebake",
+            source=args.model_source,
+            savedir=args.cache_dir,
+            run_opts={"device": "cpu"},
+        )
+    else:
+        from speechbrain.inference.speaker import EncoderClassifier
+        encoder = EncoderClassifier.from_hparams(
+            source=args.model_source,
+            savedir=args.cache_dir,
+            run_opts={"device": "cpu"}
+        )
 
     download_time = time.time() - start
     log(f"      Model downloaded in {download_time:.1f}s")
