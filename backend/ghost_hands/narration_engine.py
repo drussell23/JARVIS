@@ -685,23 +685,16 @@ class TTSBridge:
                     return success
 
                 if self._use_macos_say:
-                    cmd = [
-                        "say",
-                        "-v", self._say_voice,
-                        "-r", str(self._say_rate_wpm),
-                        text,
-                    ]
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    _, stderr = await proc.communicate()
-                    if proc.returncode == 0:
-                        return True
-
-                    err = stderr.decode(errors="ignore").strip() if stderr else ""
-                    logger.error(f"[NARRATION] macOS say failed ({proc.returncode}): {err}")
+                    try:
+                        from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                        return await safe_say(
+                            text,
+                            voice=self._say_voice,
+                            rate=self._say_rate_wpm,
+                            source="narration_engine",
+                        )
+                    except ImportError:
+                        pass
                     return False
 
                 tts = await self._get_tts()

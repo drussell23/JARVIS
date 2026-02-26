@@ -1137,6 +1137,13 @@ class MacOSSayEngine(TTSEngine):
         of the already-running FullDuplexDevice. Previously, ALL `say` calls
         were blocked when device was held — including the safe file-output
         mode — causing "All engines failed" when Trinity tried to speak.
+        v275.3: Normal path (device NOT held) now also routes through
+        safe_say() instead of raw `say`. Device state can change between
+        the _is_audio_device_held() check and actual subprocess exec,
+        so defense-in-depth requires ALWAYS using `say -o` via safe_say.
+        The device_held branch is kept as a fast path that bypasses
+        safe_say's import and gate overhead when we already know the
+        device is held.
         """
         device_held = _is_audio_device_held()
 
@@ -1150,35 +1157,22 @@ class MacOSSayEngine(TTSEngine):
                         message, resolved_voice, personality.rate, timeout
                     )
 
-                # Normal path: direct say (plays to speakers)
-                cmd = [
-                    "say",
-                    "-v", resolved_voice,
-                    "-r", str(personality.rate),
-                    message
-                ]
-
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-
+                # v275.3: ALWAYS use safe_say — device state can change
+                # between check and playback (defense-in-depth).
+                # The global speech gate inside safe_say serializes ALL
+                # speech across the process; self._lock only serializes
+                # trinity-internal calls.
                 try:
-                    await asyncio.wait_for(process.wait(), timeout=timeout)
-
-                    if process.returncode == 0:
-                        await self._cleanup_processes()
-                        return True
-                    else:
-                        stderr = await process.stderr.read()
-                        self.last_error = stderr.decode().strip()
-                        return False
-
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                    self.last_error = f"Timeout after {timeout}s"
+                    from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                    return await safe_say(
+                        message,
+                        voice=resolved_voice,
+                        rate=personality.rate,
+                        timeout=timeout,
+                        source="trinity_voice_coordinator",
+                    )
+                except ImportError:
+                    self.last_error = "safe_say unavailable (ImportError)"
                     return False
 
         except Exception as e:

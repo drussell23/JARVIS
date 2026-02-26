@@ -1199,6 +1199,157 @@ def global_speech_dedup_check(text: str, window: Optional[float] = None) -> bool
     return False  # Allowed
 
 
+# ===========================================================================
+# safe_say() — THE canonical way to produce voice output from any component
+# ===========================================================================
+# This function is the architectural cure for the "raw say" disease.
+# Every production path that needs to speak MUST call this instead of
+# spawning its own `say` subprocess.  It encapsulates:
+#   1. Global speech gate acquisition (one voice at a time)
+#   2. Broker-level dedup (prevent cross-subsystem repetition)
+#   3. `say -o tempfile` (never opens the audio device)
+#   4. AudioBus / afplay routing (safe single-stream playback)
+#   5. Tempfile cleanup
+#
+# Callers that bypass this function bypass ALL safety guarantees.
+# ===========================================================================
+
+async def safe_say(
+    text: str,
+    voice: str = "Daniel",
+    rate: int = 175,
+    wait: bool = True,
+    skip_dedup: bool = False,
+    skip_gate: bool = False,
+    timeout: float = 30.0,
+    source: str = "unknown",
+) -> bool:
+    """
+    Canonical safe speech function for the entire JARVIS process.
+
+    Acquires the global speech gate, checks dedup, synthesizes to file
+    via ``say -o``, and routes playback through AudioBus or afplay.
+
+    Args:
+        text:        The text to speak.
+        voice:       macOS voice name (default "Daniel").
+        rate:        Words per minute (default 175).
+        wait:        If False, playback is fire-and-forget via a background task.
+        skip_dedup:  True for urgent/critical messages that MUST be spoken
+                     even if recently spoken.
+        skip_gate:   True ONLY for emergency paths where the gate could
+                     deadlock (should almost never be used).
+        timeout:     Max seconds for the ``say`` subprocess.
+        source:      Logging tag for the caller.
+
+    Returns:
+        True if speech was produced, False on failure or dedup skip.
+    """
+    import tempfile as _tmpmod
+
+    if not text or not text.strip():
+        return False
+
+    # 1. Dedup check (broker-level, across all subsystems)
+    if not skip_dedup:
+        if global_speech_dedup_check(text):
+            logger.debug("[safe_say:%s] Dedup skipped: %s", source, text[:60])
+            return False
+
+    async def _do_say() -> bool:
+        _temp_path: Optional[str] = None
+        try:
+            # 2. Synthesize to tempfile (NEVER opens audio device)
+            _temp_fd, _temp_path = _tmpmod.mkstemp(
+                suffix=".aiff", prefix="jarvis_safe_say_"
+            )
+            os.close(_temp_fd)
+
+            proc = await asyncio.create_subprocess_exec(
+                "say",
+                "-v", voice,
+                "-r", str(rate),
+                "-o", _temp_path,
+                text,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.warning("[safe_say:%s] say subprocess timed out (%ss)", source, timeout)
+                return False
+
+            if proc.returncode != 0:
+                logger.warning("[safe_say:%s] say exited %d", source, proc.returncode)
+                return False
+
+            # 3. Route playback: AudioBus (if running) → afplay (fallback)
+            _played = False
+            try:
+                from backend.audio.audio_bus import AudioBus as _ABCls
+                _ab = _ABCls.get_instance_safe()
+                if _ab is not None and _ab.is_running:
+                    import soundfile as _sf
+                    import numpy as _np
+                    _data, _sr = _sf.read(_temp_path, dtype="float32")
+                    if isinstance(_data, _np.ndarray) and _data.ndim > 1:
+                        _data = _np.mean(_data, axis=1, dtype=_np.float32)
+                    _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
+                    await _ab.play_audio(_data, _sr, wait_for_drain=True)
+                    _played = True
+            except Exception as _bus_err:
+                logger.debug("[safe_say:%s] AudioBus path failed: %s", source, _bus_err)
+
+            if not _played:
+                # afplay is safe when AudioBus isn't holding the device
+                _afplay = await asyncio.create_subprocess_exec(
+                    "afplay", _temp_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    await asyncio.wait_for(_afplay.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    _afplay.kill()
+                    logger.warning("[safe_say:%s] afplay timed out", source)
+                    return False
+
+            return True
+
+        except Exception as exc:
+            logger.debug("[safe_say:%s] Error: %s", source, exc)
+            return False
+        finally:
+            # 4. Cleanup tempfile
+            if _temp_path:
+                try:
+                    os.unlink(_temp_path)
+                except OSError:
+                    pass
+
+    # 5. Acquire global speech gate (one voice at a time)
+    if skip_gate:
+        if wait:
+            return await _do_say()
+        else:
+            asyncio.ensure_future(_do_say())
+            return True
+
+    gate = get_global_speech_gate()
+    if wait:
+        async with gate:
+            return await _do_say()
+    else:
+        async def _gated_fire_and_forget():
+            async with gate:
+                await _do_say()
+        asyncio.ensure_future(_gated_fire_and_forget())
+        return True
+
+
 # Singleton instance
 _voice_orchestrator: Optional[UnifiedVoiceOrchestrator] = None
 _orchestrator_lock = LazyAsyncLock()  # v100.1: Lazy initialization to avoid "no running event loop" error

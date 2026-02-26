@@ -64,6 +64,11 @@ from typing import (
 
 import aiofiles
 
+try:
+    from backend.core.supervisor.unified_voice_orchestrator import safe_say as _safe_say
+except ImportError:
+    _safe_say = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -585,14 +590,16 @@ class SpatialAwarenessManager:
             # Use the existing TTS system
             async def speak(message: str) -> None:
                 try:
-                    # Use macOS say command directly for instant feedback
-                    proc = await asyncio.create_subprocess_exec(
-                        "say", "-v", "Daniel", "-r", "180", message,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    # Don't wait - fire and forget for responsiveness
-                    asyncio.create_task(proc.wait())
+                    if _safe_say is not None:
+                        await _safe_say(
+                            message,
+                            voice="Daniel",
+                            rate=180,
+                            wait=False,
+                            source="computer_use_bridge",
+                        )
+                    else:
+                        logger.debug("[SPATIAL] safe_say unavailable, skipping narration")
                 except Exception as e:
                     logger.debug(f"[SPATIAL] Voice narration error: {e}")
 

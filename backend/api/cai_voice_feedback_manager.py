@@ -62,6 +62,13 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
+# Import safe_say for AudioBus-safe speech routing
+try:
+    from backend.core.supervisor.unified_voice_orchestrator import safe_say as _safe_say
+except ImportError:
+    _safe_say = None
+    logger.debug("[CAI-VOICE] safe_say unavailable — will fall back to raw subprocess")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENUMS & DATA CLASSES
@@ -570,28 +577,39 @@ class CAIVoiceFeedbackManager:
 
                 logger.info(f"[CAI-VOICE] Speaking: {text[:80]}...")
 
-                # Use macOS say command
-                self._current_speech_process = await asyncio.create_subprocess_exec(
-                    "say",
-                    "-v", self._voice_name,
-                    "-r", str(rate),
-                    text,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-
-                if wait:
-                    await asyncio.wait_for(
-                        self._current_speech_process.wait(),
-                        timeout=30.0
+                # Route through safe_say for AudioBus-safe speech
+                if _safe_say is not None:
+                    result = await _safe_say(
+                        text,
+                        voice=self._voice_name,
+                        rate=rate,
+                        wait=wait,
+                        timeout=30.0,
+                        source="cai_voice_feedback",
                     )
+                else:
+                    # Fallback: raw subprocess (only when safe_say unavailable)
+                    self._current_speech_process = await asyncio.create_subprocess_exec(
+                        "say",
+                        "-v", self._voice_name,
+                        "-r", str(rate),
+                        text,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    if wait:
+                        await asyncio.wait_for(
+                            self._current_speech_process.wait(),
+                            timeout=30.0,
+                        )
+                    result = True
 
                 elapsed = (time.time() - start_time) * 1000
                 self._total_speech_time_ms += elapsed
                 self._messages_spoken += 1
 
                 logger.debug(f"[CAI-VOICE] Speech completed in {elapsed:.0f}ms")
-                return True
+                return result
 
             except asyncio.TimeoutError:
                 logger.warning("[CAI-VOICE] Speech timeout")
@@ -908,16 +926,26 @@ async def speak_cai_message(message: str, wait: bool = True) -> bool:
             return True
     except Exception as e:
         logger.error(f"[CAI-VOICE] speak_cai_message error: {e}")
-        # Fallback to direct say command
+        # Fallback: route through safe_say for AudioBus safety
         try:
-            process = await asyncio.create_subprocess_exec(
-                "say", "-v", "Daniel", message,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            if wait:
-                await asyncio.wait_for(process.wait(), timeout=30.0)
-            return True
+            if _safe_say is not None:
+                return await _safe_say(
+                    message,
+                    voice="Daniel",
+                    wait=wait,
+                    timeout=30.0,
+                    source="cai_voice_fallback",
+                )
+            else:
+                # Last resort: raw subprocess (safe_say unavailable)
+                process = await asyncio.create_subprocess_exec(
+                    "say", "-v", "Daniel", message,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                if wait:
+                    await asyncio.wait_for(process.wait(), timeout=30.0)
+                return True
         except Exception:
             return False
 

@@ -1752,22 +1752,18 @@ class JARVISVoiceAPI:
             except Exception:
                 pass
 
-        proc = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "say", "-v", "Daniel", message,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(
-                proc.wait(),
-                timeout=float(os.environ.get("JARVIS_CAI_SPEAK_TIMEOUT", "10.0")),
-            )
+            try:
+                from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                await safe_say(
+                    message, voice="Daniel",
+                    timeout=float(os.environ.get("JARVIS_CAI_SPEAK_TIMEOUT", "10.0")),
+                    source="jarvis_voice_api",
+                )
+            except ImportError:
+                pass
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning(f"[CAI] v265.0: speak failed: {e}")
-            if proc is not None:
-                with contextlib.suppress(Exception):
-                    proc.kill()
         finally:
             if _speech_mgr:
                 try:

@@ -2533,13 +2533,12 @@ class AdvancedAsyncPipeline:
             except Exception:
                 pass
 
-            # Fallback to macOS say command
-            process = await asyncio.create_subprocess_exec(
-                "say", "-v", "Daniel", message,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(process.wait(), timeout=10.0)
+            # Fallback to safe_say (AudioBus-aware, no raw device access)
+            try:
+                from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                await safe_say(message, voice="Daniel", timeout=10.0, source="async_pipeline_ack")
+            except ImportError:
+                pass
 
         except Exception as e:
             logger.debug(f"[PROACTIVE-CAI] Could not speak acknowledgment: {e}")
@@ -2833,12 +2832,11 @@ class AdvancedAsyncPipeline:
             # Very brief acknowledgment
             message = f"Now {action_description}."
 
-            process = await asyncio.create_subprocess_exec(
-                "say", "-v", "Daniel", "-r", "180", message,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(process.wait(), timeout=5.0)
+            try:
+                from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                await safe_say(message, voice="Daniel", rate=180, timeout=5.0, source="async_pipeline_cont")
+            except ImportError:
+                pass
         except Exception:
             pass  # Fire and forget
 
