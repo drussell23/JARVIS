@@ -2636,6 +2636,10 @@ class GCPVMManager:
         # IP-to-VM index for O(1) activity lookup by IP address
         self._ip_to_vm: Dict[str, str] = {}
 
+        # v271.0: Static IP cost tracking — IPs cost $0.010/hr even when VM is stopped
+        # Maps ip_name → monotonic allocation time for this session
+        self._static_ip_tracking: Dict[str, float] = {}
+
         # v224.0: Golden Image Builder for pre-baked VM images
         self._golden_image_builder: Optional[GoldenImageBuilder] = None
         self._golden_image_cache: Optional[GoldenImageInfo] = None
@@ -6937,6 +6941,51 @@ class GCPVMManager:
             circuit.record_failure(e)
             logger.warning(f"⚠️  Failed to record VM termination in cost tracker (non-critical): {e}")
 
+    async def _record_static_ip_costs(self) -> None:
+        """
+        Record accumulated static IP costs for this session.
+
+        v271.0: Static IPs cost $0.010/hr even when the VM is stopped or deleted.
+        Budget enforcement must see this cost to make accurate policy decisions.
+        Called during cleanup() to capture the full session duration.
+        """
+        if not self.cost_tracker or not self._static_ip_tracking:
+            return
+
+        try:
+            from core.cost_tracker import CloudServiceType
+        except ImportError:
+            try:
+                from .cost_tracker import CloudServiceType
+            except ImportError:
+                logger.debug("CloudServiceType not importable — skipping static IP cost recording")
+                return
+
+        now = time.monotonic()
+        for ip_name, alloc_time in self._static_ip_tracking.items():
+            duration_hours = (now - alloc_time) / 3600.0
+            if duration_hours < 0.001:  # < 3.6 seconds — not worth recording
+                continue
+
+            hourly_rate = float(os.environ.get("JARVIS_STATIC_IP_HOURLY_COST", "0.010"))
+            try:
+                await self.cost_tracker.record_cloud_service_cost(
+                    service_type=CloudServiceType.STATIC_IP,
+                    duration_hours=duration_hours,
+                    hourly_rate=hourly_rate,
+                    metadata={
+                        "ip_name": ip_name,
+                        "session_duration_hours": round(duration_hours, 4),
+                    },
+                )
+                logger.info(
+                    f"💰 [v271.0] Static IP cost recorded: {ip_name} "
+                    f"({duration_hours:.2f}h @ ${hourly_rate}/hr = "
+                    f"${duration_hours * hourly_rate:.4f})"
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to record static IP cost for {ip_name}: {e}")
+
     def _publish_vm_state(self) -> None:
         """
         Publish VM state to shared filesystem for cross-repo coordination.
@@ -7541,6 +7590,12 @@ class GCPVMManager:
         except Exception as e:
             logger.warning(f"⚠️ VM cleanup error: {e}")
 
+        # v271.0: Record static IP costs for this session before shutdown
+        try:
+            await self._record_static_ip_costs()
+        except Exception as e:
+            logger.debug(f"Static IP cost recording error (non-critical): {e}")
+
         self.initialized = False
         logger.info("🧹 GCP VM Manager cleaned up")
 
@@ -7872,8 +7927,11 @@ class GCPVMManager:
                 timeout=30
             )
             if result.returncode == 0 and result.stdout.strip():
+                # v271.0: Track pre-existing IP from session start for cost accounting
+                if ip_name not in self._static_ip_tracking:
+                    self._static_ip_tracking[ip_name] = time.monotonic()
                 return result.stdout.strip()
-            
+
             # v210.0: Auto-create static IP if it doesn't exist
             if auto_create:
                 logger.info(f"☁️ [InvincibleNode] Static IP '{ip_name}' not found - creating...")
@@ -7948,10 +8006,13 @@ class GCPVMManager:
             )
             
             if describe_result.returncode == 0 and describe_result.stdout.strip():
-                return describe_result.stdout.strip()
-            
+                ip_addr = describe_result.stdout.strip()
+                # v271.0: Track static IP allocation time for cost accounting
+                self._static_ip_tracking[ip_name] = time.monotonic()
+                return ip_addr
+
             return None
-            
+
         except Exception as e:
             logger.warning(f"[InvincibleNode] Error creating static IP: {e}")
             return None

@@ -1804,6 +1804,24 @@ class JarvisPrimeClient:
                 # Estimate Cloud Run cost (~$0.02 per request)
                 cost = 0.02 if latency > 1000 else 0.01  # Cold start costs more
 
+                # v271.0: Record Cloud Run invocation in cost tracker for budget visibility
+                try:
+                    from core.cost_tracker import get_cost_tracker, CloudServiceType
+                    _ct = get_cost_tracker()
+                    if _ct is not None:
+                        await _ct.record_cloud_service_cost(
+                            service_type=CloudServiceType.CLOUD_RUN,
+                            estimated_cost=cost,
+                            unit_count=1,
+                            metadata={
+                                "source": "JarvisPrimeClient",
+                                "tokens": tokens,
+                                "latency_ms": round(latency, 1),
+                            },
+                        )
+                except Exception:
+                    pass  # Non-critical — don't break inference for cost accounting
+
                 return CompletionResponse(
                     success=True,
                     content=content,

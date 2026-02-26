@@ -75845,9 +75845,9 @@ class JarvisSystemKernel:
                 # turns a 660s timeout into a ~300s success.
                 # =============================================================
                 _vm_just_became_ready = False
+                _inv_ip = getattr(self, "_invincible_node_ip", None)
                 if not getattr(self, "_gcp_late_arrival_handled", False):
                     _inv_ready = getattr(self, "_invincible_node_ready", False)
-                    _inv_ip = getattr(self, "_invincible_node_ip", None)
                     if _inv_ready and _inv_ip:
                         _promotion_confirmed = await self._confirm_prime_router_gcp_promotion(
                             _inv_ip,
@@ -75935,6 +75935,58 @@ class JarvisSystemKernel:
                                 )
                             except Exception:
                                 pass
+
+                # =============================================================
+                # v271.0: EARLY RETURN ON GCP LATE-ARRIVAL
+                # =============================================================
+                # ROOT CAUSE FIX: After killing local Prime and routing to GCP,
+                # the polling loop continued waiting for start_components() to
+                # return. But start_components() blocks on local Prime loading
+                # (which was just killed) and Reactor-Core (which may be stalled
+                # by the same memory thrash that triggered GCP offload).
+                #
+                # With GCP routing confirmed, local component loading is
+                # functionally unnecessary — inference routes to the GCP VM.
+                # Cancel startup_task and return synthetic success so the
+                # supervisor can advance past Trinity immediately.
+                #
+                # Check both: newly detected (_vm_just_became_ready) AND
+                # previously detected (_gcp_late_arrival_handled from a prior
+                # polling cycle). The latter covers the case where GCP was
+                # confirmed before this fix existed or on a prior iteration.
+                # =============================================================
+                _gcp_routing_active = _vm_just_became_ready or getattr(
+                    self, "_gcp_late_arrival_handled", False
+                )
+                if _gcp_routing_active and not startup_task.done():
+                    self.logger.info(
+                        f"[{integrator_name}] v271.0: GCP VM confirmed and routing active "
+                        f"— cancelling local component startup and advancing to next phase "
+                        f"(elapsed={elapsed:.0f}s)"
+                    )
+                    startup_task.cancel()
+                    try:
+                        await startup_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                    # Build synthetic results: Prime = success (via Hollow Client),
+                    # others = best-effort from whatever completed before cancellation
+                    _synthetic_results = {"jarvis-prime": True}
+                    if startup_task.done() and not startup_task.cancelled():
+                        try:
+                            _real = startup_task.result()
+                            if isinstance(_real, dict):
+                                _synthetic_results.update(_real)
+                        except Exception:
+                            pass
+                    _synthetic_results["jarvis-prime"] = True  # Always true via GCP
+
+                    self.logger.success(
+                        f"[{integrator_name}] v271.0: GCP late-arrival fast-forward complete. "
+                        f"Inference via Hollow Client → {_inv_ip}"
+                    )
+                    return _synthetic_results, False, None
 
                 # Check model loading progress
                 # v223.0: Dashboard fallback — ensure progress is observable even

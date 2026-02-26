@@ -1573,6 +1573,9 @@ class PrimeCloudRunClient(ModelClient):
                     response.content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                     response.tokens_used = data.get("usage", {}).get("total_tokens", 0)
                     response.success = True
+
+                    # v271.0: Record Cloud Run invocation cost for budget visibility
+                    await self._record_cloud_run_cost(response.tokens_used)
                 else:
                     response.success = False
                     response.error = f"HTTP {resp.status}"
@@ -1584,6 +1587,33 @@ class PrimeCloudRunClient(ModelClient):
 
         response.latency_ms = (time.time() - start_time) * 1000
         return response
+
+    async def _record_cloud_run_cost(self, tokens_used: int) -> None:
+        """
+        Record a Cloud Run inference invocation in the cost tracker.
+
+        v271.0: Cloud Run invocations were invisible to budget enforcement.
+        Each call costs per-vCPU-second + per-request. Recording here
+        ensures can_create_vm() sees real total cloud spend.
+        """
+        try:
+            from core.cost_tracker import get_cost_tracker, CloudServiceType
+        except ImportError:
+            try:
+                from backend.core.cost_tracker import get_cost_tracker, CloudServiceType
+            except ImportError:
+                return
+        try:
+            ct = get_cost_tracker()
+            if ct is None:
+                return
+            await ct.record_cloud_service_cost(
+                service_type=CloudServiceType.CLOUD_RUN,
+                unit_count=1,
+                metadata={"source": "PrimeCloudRunClient", "tokens": tokens_used},
+            )
+        except Exception:
+            pass  # Non-critical — don't break inference for cost accounting
 
     async def generate_stream(self, request: ModelRequest) -> AsyncIterator[str]:
         """Generate a streaming response."""

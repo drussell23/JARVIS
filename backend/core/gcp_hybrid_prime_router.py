@@ -3828,7 +3828,23 @@ class GCPHybridPrimeRouter:
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=GCP_TIMEOUT_MS/1000),
             ) as resp:
-                return await resp.json()
+                result = await resp.json()
+
+        # v271.0: Record Cloud Run invocation cost for budget visibility
+        try:
+            from core.cost_tracker import get_cost_tracker, CloudServiceType
+            _ct = get_cost_tracker()
+            if _ct is not None:
+                tokens = result.get("usage", {}).get("total_tokens", 0) if isinstance(result, dict) else 0
+                await _ct.record_cloud_service_cost(
+                    service_type=CloudServiceType.CLOUD_RUN,
+                    unit_count=1,
+                    metadata={"source": "GCPHybridPrimeRouter", "tokens": tokens},
+                )
+        except Exception:
+            pass  # Non-critical
+
+        return result
 
     async def _execute_cloud_claude(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Execute on Cloud Claude API."""
