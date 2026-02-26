@@ -62237,6 +62237,9 @@ class JarvisSystemKernel:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._startup_progress_heartbeat_task: Optional[asyncio.Task] = None
         self._loading_server_heartbeat_task: Optional[asyncio.Task] = None
+        # v274.0: Broadcast health tracking — throttled warning on sustained failure
+        self._broadcast_consecutive_failures: int = 0
+        self._broadcast_failure_warned_at: float = 0.0
         self._current_progress: int = 0  # Track progress for heartbeat payload
         self._current_startup_phase: str = "initializing"  # Current startup phase name
         self._current_startup_progress: int = 0  # Base progress for heartbeat calculations
@@ -81072,6 +81075,27 @@ class JarvisSystemKernel:
         self._loading_server_process = None
         self._loading_server_ready = False
 
+    def _is_loading_server_alive(self) -> bool:
+        """
+        v274.0: Unified process-alive check — type-stable contract.
+
+        Works for both asyncio.subprocess.Process (.returncode auto-updated
+        by the event loop) and subprocess.Popen (.poll() required to refresh
+        .returncode).  Callers use this single method instead of touching
+        the process object directly, eliminating future API-mismatch bugs.
+
+        Returns:
+            True if the process handle exists and has not exited.
+        """
+        proc = getattr(self, '_loading_server_process', None)
+        if proc is None:
+            return False
+        # subprocess.Popen: .poll() refreshes .returncode then returns it
+        if hasattr(proc, 'poll'):
+            return proc.poll() is None
+        # asyncio.subprocess.Process: .returncode is auto-updated
+        return getattr(proc, 'returncode', None) is None
+
     async def _stop_startup_progress_heartbeat(self, timeout: float = 1.0) -> None:
         """Cancel startup progress heartbeat deterministically."""
         task = self._startup_progress_heartbeat_task or self._heartbeat_task
@@ -83070,19 +83094,13 @@ class JarvisSystemKernel:
         if self.config.loading_server_port == 0:
             return False
 
-        if not hasattr(self, '_loading_server_process') or not self._loading_server_process:
-            return False
-
-        # v274.0: Early async-safe exit-detection — check returncode on the
-        # asyncio.subprocess.Process BEFORE dispatching to a thread.
-        # asyncio.subprocess.Process auto-updates .returncode via the event
-        # loop's child-process watcher, so reading it here is both correct
-        # and thread-safe.  This also replaces the broken .poll() call that
-        # existed in _sync_broadcast_progress (asyncio.subprocess.Process
-        # does NOT have .poll() — only subprocess.Popen does).
-        _ls_rc = getattr(self._loading_server_process, 'returncode', None)
-        if _ls_rc is not None:
-            self._last_broadcast_error = f"Loading server exited (code: {_ls_rc})"
+        # v274.0: Unified process-alive contract — single method handles both
+        # asyncio.subprocess.Process and subprocess.Popen transparently.
+        if not self._is_loading_server_alive():
+            _ls_rc = getattr(
+                getattr(self, '_loading_server_process', None), 'returncode', '?'
+            )
+            self._last_broadcast_error = f"Loading server not alive (code: {_ls_rc})"
             return False
 
         # v210.0: Skip if loading server isn't confirmed ready (health check passed)
@@ -83131,6 +83149,8 @@ class JarvisSystemKernel:
                 )
 
                 if success:
+                    # v274.0: Reset consecutive failure counter on success
+                    self._broadcast_consecutive_failures = 0
                     if not is_heartbeat:
                         self.logger.debug(f"[Progress] {stage}: {progress}% - {message}")
                     return True
@@ -83154,12 +83174,28 @@ class JarvisSystemKernel:
             if attempt < max_retries - 1:
                 await asyncio.sleep(0.1)
 
-        # v210.0: Downgrade to debug - broadcast failure is NON-FATAL and shouldn't pollute logs
-        # The loading page is informational only; startup continues regardless
+        # v274.0: Throttled warning on sustained broadcast failure.
+        # Pure debug-level is invisible — operators had no way to know the
+        # entire progress display pipeline was broken (see v274.0 .poll() bug).
+        # Emit one WARNING every 10 consecutive failures (~50s at 5s heartbeat),
+        # so transport failure is observable without log spam.
         error_reason = getattr(self, '_last_broadcast_error', 'unknown')
-        self.logger.debug(
-            f"[Broadcast] Failed for {stage}: {error_reason} (non-fatal, continuing)"
-        )
+        self._broadcast_consecutive_failures += 1
+        _failure_warn_interval = int(os.environ.get(
+            "JARVIS_BROADCAST_FAILURE_WARN_INTERVAL", "10"
+        ))
+        if self._broadcast_consecutive_failures % _failure_warn_interval == 1:
+            self.logger.warning(
+                f"[Broadcast] Loading-page transport failure "
+                f"(consecutive={self._broadcast_consecutive_failures}, "
+                f"stage={stage}, error={error_reason}). "
+                f"Loading page may show stale progress."
+            )
+        else:
+            self.logger.debug(
+                f"[Broadcast] Failed for {stage}: {error_reason} "
+                f"(non-fatal, consecutive={self._broadcast_consecutive_failures})"
+            )
         return False
 
     def _sync_broadcast_progress(
@@ -83184,23 +83220,13 @@ class JarvisSystemKernel:
         import urllib.error
         import json as _json
 
-        # v274.0: Check if loading server process is still running.
-        # Supports both asyncio.subprocess.Process (.returncode, auto-updated)
-        # and subprocess.Popen (.poll() to refresh .returncode).
-        # The primary async-safe check now lives in _broadcast_startup_progress
-        # (before dispatch to thread), so this is a defense-in-depth fallback.
-        if hasattr(self, '_loading_server_process') and self._loading_server_process:
-            _proc = self._loading_server_process
-            if hasattr(_proc, 'poll'):
-                # subprocess.Popen: .poll() refreshes and returns .returncode
-                poll_result = _proc.poll()
-            else:
-                # asyncio.subprocess.Process: .returncode auto-updated by event loop
-                poll_result = getattr(_proc, 'returncode', None)
-            if poll_result is not None:
-                # Process has exited - store reason for diagnostic
-                self._last_broadcast_error = f"Loading server exited (code: {poll_result})"
-                return False
+        # v274.0: Defense-in-depth — re-check process liveness from the thread.
+        # Primary check is in _broadcast_startup_progress (async context).
+        # Uses the unified _is_loading_server_alive() contract so both
+        # asyncio.subprocess.Process and subprocess.Popen are handled correctly.
+        if not self._is_loading_server_alive():
+            self._last_broadcast_error = "Loading server not alive (thread check)"
+            return False
 
         try:
             url = f"http://localhost:{self.config.loading_server_port}/api/update-progress"
