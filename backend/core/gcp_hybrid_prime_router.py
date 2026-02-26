@@ -799,6 +799,12 @@ class GCPHybridPrimeRouter:
         self._local_circuit_state: str = "unknown"
         self._local_warmup_hook_registered: bool = False
         self._model_serving_ref: Optional[Any] = None
+        self._memory_quantizer: Optional[Any] = None
+        self._memory_tier_change_callback: Optional[Callable] = None
+        self._startup_router_started: bool = False
+        self._memory_callbacks_registered: bool = False
+        self._memory_callback_registration_reason: str = "not_started"
+        self._startup_contract_event: Optional[asyncio.Event] = None
 
         # Process tracking for emergency offload
         self._ml_loader_ref = None  # Reference to ProcessIsolatedMLLoader
@@ -998,12 +1004,144 @@ class GCPHybridPrimeRouter:
         """
         return self.is_cloud_locked()
 
+    def _get_startup_contract_event(self) -> asyncio.Event:
+        if self._startup_contract_event is None:
+            self._startup_contract_event = asyncio.Event()
+            if self._startup_router_started and self._memory_callbacks_registered:
+                self._startup_contract_event.set()
+        return self._startup_contract_event
+
+    def _set_startup_contract_state(
+        self,
+        *,
+        router_started: Optional[bool] = None,
+        memory_callbacks_registered: Optional[bool] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if router_started is not None:
+            self._startup_router_started = bool(router_started)
+        if memory_callbacks_registered is not None:
+            self._memory_callbacks_registered = bool(memory_callbacks_registered)
+        if reason is not None:
+            self._memory_callback_registration_reason = str(reason)
+        ready = self._startup_router_started and self._memory_callbacks_registered
+        if self._startup_contract_event is not None:
+            if ready:
+                self._startup_contract_event.set()
+            else:
+                self._startup_contract_event.clear()
+
+    def get_startup_contract_status(self) -> Dict[str, Any]:
+        """Return deterministic router startup contract status."""
+        return {
+            "router_started": self._startup_router_started,
+            "memory_callbacks_registered": self._memory_callbacks_registered,
+            "ready": self._startup_router_started and self._memory_callbacks_registered,
+            "running": self._running,
+            "memory_callback_registration_reason": self._memory_callback_registration_reason,
+            "vm_provisioning_enabled": self._vm_provisioning_enabled,
+            "gcp_permanently_unavailable": self._gcp_permanently_unavailable,
+            "timestamp": time.time(),
+        }
+
+    async def wait_for_startup_contract(
+        self,
+        timeout_seconds: float = 20.0,
+    ) -> Dict[str, Any]:
+        """Wait until router startup contract is satisfied or timeout expires."""
+        status = self.get_startup_contract_status()
+        if status["ready"] or timeout_seconds <= 0.0:
+            return status
+        event = self._get_startup_contract_event()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.1, timeout_seconds))
+        except asyncio.TimeoutError:
+            pass
+        return self.get_startup_contract_status()
+
+    def _build_memory_tier_change_callback(self) -> Callable:
+        async def _on_tier_change(old_tier, new_tier):
+            """MemoryQuantizer authoritative tier change callback."""
+            if not self._running or not self._vm_provisioning_enabled or self._gcp_permanently_unavailable:
+                return
+            tier_severity = {
+                "abundant": 0, "optimal": 1,
+                "elevated": 2, "constrained": 3,
+                "critical": 4, "emergency": 5,
+            }
+            old_name = old_tier.value if hasattr(old_tier, 'value') else str(old_tier)
+            new_name = new_tier.value if hasattr(new_tier, 'value') else str(new_tier)
+            new_sev = tier_severity.get(new_name.lower(), 0)
+
+            if new_sev >= 4 and self._vm_lifecycle_state == VMLifecycleState.IDLE:
+                self.logger.info(
+                    f"[VMLifecycle] MemoryQuantizer tier change: {old_name} -> {new_name}"
+                )
+                self._trigger_readings.append(True)
+                above_count = sum(1 for r in self._trigger_readings if r)
+                if above_count >= GCP_TRIGGER_READINGS_REQUIRED:
+                    self._transition_vm_lifecycle(
+                        VMLifecycleState.TRIGGERING,
+                        f"mq_tier_{new_name}"
+                    )
+
+        return _on_tier_change
+
+    async def _register_memory_callbacks(self) -> bool:
+        """Register memory callbacks required by router startup contract."""
+        if self._memory_callbacks_registered:
+            return True
+        try:
+            from backend.core.memory_quantizer import get_memory_quantizer
+            mq = await get_memory_quantizer()
+            self._memory_quantizer = mq
+            if not mq:
+                self._set_startup_contract_state(
+                    memory_callbacks_registered=False,
+                    reason="memory_quantizer_unavailable",
+                )
+                return False
+            if not hasattr(mq, 'register_tier_change_callback'):
+                self._set_startup_contract_state(
+                    memory_callbacks_registered=False,
+                    reason="tier_callback_api_missing",
+                )
+                return False
+            callback = self._build_memory_tier_change_callback()
+            mq.register_tier_change_callback(callback)
+            self._memory_tier_change_callback = callback
+            self._set_startup_contract_state(
+                memory_callbacks_registered=True,
+                reason="tier_callbacks_registered",
+            )
+            self.logger.info("[VMLifecycle] Registered MemoryQuantizer tier callback")
+            return True
+        except ImportError:
+            self._set_startup_contract_state(
+                memory_callbacks_registered=False,
+                reason="memory_quantizer_import_unavailable",
+            )
+            self.logger.debug("MemoryQuantizer not available — callback contract not satisfied")
+            return False
+        except Exception as e:
+            self._set_startup_contract_state(
+                memory_callbacks_registered=False,
+                reason=f"tier_callback_registration_failed:{e}",
+            )
+            self.logger.debug(f"MemoryQuantizer callback registration failed: {e}")
+            return False
+
     async def start(self) -> bool:
         """Start the hybrid router."""
         if self._running:
             return True
 
         self._running = True
+        self._set_startup_contract_state(
+            router_started=False,
+            memory_callbacks_registered=False,
+            reason="starting",
+        )
         self.logger.info("GCPHybridPrimeRouter v2.0 starting...")
 
         # Connect to integrations
@@ -1014,6 +1152,14 @@ class GCPHybridPrimeRouter:
             self._monitoring_loop(),
             name="gcp_hybrid_prime_monitor",
         )
+        self._set_startup_contract_state(router_started=True)
+
+        callback_registered = await self._register_memory_callbacks()
+        if not callback_registered:
+            self.logger.warning(
+                "[StartupContract] Router started but memory callbacks not registered (%s)",
+                self._memory_callback_registration_reason,
+            )
 
         self.logger.info(
             f"GCPHybridPrimeRouter ready "
@@ -1043,45 +1189,6 @@ class GCPHybridPrimeRouter:
                 self._gcp_permanently_unavailable = True
             else:
                 # GCP is properly configured - start monitoring
-
-                # v266.0: Register for authoritative macOS memory tier changes
-                try:
-                    from backend.core.memory_quantizer import get_memory_quantizer, MemoryTier
-                    mq = await get_memory_quantizer()
-
-                    async def _on_tier_change(old_tier, new_tier):
-                        """MemoryQuantizer authoritative tier change callback."""
-                        tier_severity = {
-                            "abundant": 0, "optimal": 1,
-                            "elevated": 2, "constrained": 3,
-                            "critical": 4, "emergency": 5,
-                        }
-                        # Handle both enum and string tier values
-                        old_name = old_tier.value if hasattr(old_tier, 'value') else str(old_tier)
-                        new_name = new_tier.value if hasattr(new_tier, 'value') else str(new_tier)
-                        new_sev = tier_severity.get(new_name.lower(), 0)
-
-                        if new_sev >= 4 and self._vm_lifecycle_state == VMLifecycleState.IDLE:
-                            self.logger.info(
-                                f"[VMLifecycle] MemoryQuantizer tier change: {old_name} -> {new_name}"
-                            )
-                            self._trigger_readings.append(True)
-                            above_count = sum(1 for r in self._trigger_readings if r)
-                            if above_count >= GCP_TRIGGER_READINGS_REQUIRED:
-                                self._transition_vm_lifecycle(
-                                    VMLifecycleState.TRIGGERING,
-                                    f"mq_tier_{new_name}"
-                                )
-
-                    if hasattr(mq, 'register_tier_change_callback'):
-                        mq.register_tier_change_callback(_on_tier_change)
-                        self.logger.info("[VMLifecycle] Registered MemoryQuantizer tier callback")
-                    else:
-                        self.logger.debug("MemoryQuantizer has no register_tier_change_callback")
-                except ImportError:
-                    self.logger.debug("MemoryQuantizer not available — using psutil-only polling")
-                except Exception as e:
-                    self.logger.debug(f"MemoryQuantizer callback registration failed: {e}")
 
                 self._memory_pressure_task = asyncio.create_task(
                     self._memory_pressure_monitor(),
@@ -2815,6 +2922,27 @@ class GCPHybridPrimeRouter:
                 pass
 
         if (
+            self._memory_quantizer is not None
+            and self._memory_tier_change_callback is not None
+            and hasattr(self._memory_quantizer, "unregister_tier_change_callback")
+        ):
+            try:
+                self._memory_quantizer.unregister_tier_change_callback(
+                    self._memory_tier_change_callback
+                )
+            except Exception as callback_err:
+                self.logger.debug(
+                    f"[StartupContract] Memory callback unregister failed: {callback_err}"
+                )
+        self._memory_quantizer = None
+        self._memory_tier_change_callback = None
+        self._set_startup_contract_state(
+            router_started=False,
+            memory_callbacks_registered=False,
+            reason="stopped",
+        )
+
+        if (
             self._local_warmup_hook_registered
             and self._model_serving_ref is not None
             and hasattr(self._model_serving_ref, "unregister_local_warmup_hook")
@@ -3840,6 +3968,7 @@ class GCPHybridPrimeRouter:
                     "gcp_permanently_unavailable": self._gcp_permanently_unavailable,
                 },
             },
+            "startup_contract": self.get_startup_contract_status(),
         }
 
     def on_decision(self, callback: Callable) -> None:
@@ -3876,6 +4005,22 @@ async def get_gcp_hybrid_prime_router() -> GCPHybridPrimeRouter:
         return _router
 
 
+async def get_gcp_hybrid_prime_router_with_contract(
+    timeout_seconds: Optional[float] = None,
+) -> Tuple[GCPHybridPrimeRouter, Dict[str, Any]]:
+    """Get router and wait for startup contract readiness status."""
+    router = await get_gcp_hybrid_prime_router()
+    if timeout_seconds is None:
+        try:
+            timeout_seconds = float(
+                os.getenv("JARVIS_ROUTER_STARTUP_CONTRACT_TIMEOUT", "20.0")
+            )
+        except (TypeError, ValueError):
+            timeout_seconds = 20.0
+    status = await router.wait_for_startup_contract(timeout_seconds=max(0.0, timeout_seconds))
+    return router, status
+
+
 async def shutdown_gcp_hybrid_prime_router() -> None:
     """Shutdown the global GCPHybridPrimeRouter."""
     global _router
@@ -3897,5 +4042,6 @@ __all__ = [
     "RouterMetrics",
     "ExecutionResult",
     "get_gcp_hybrid_prime_router",
+    "get_gcp_hybrid_prime_router_with_contract",
     "shutdown_gcp_hybrid_prime_router",
 ]
