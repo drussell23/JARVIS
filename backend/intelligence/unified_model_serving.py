@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -61,6 +62,7 @@ from pathlib import Path
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Coroutine,
     Dict,
@@ -68,6 +70,7 @@ from typing import (
     Literal,
     Optional,
     Protocol,
+    Set,
     Tuple,
     TypeVar,
     Union,
@@ -2205,6 +2208,25 @@ class UnifiedModelServing:
         self._memory_recovery_last_attempt: float = 0.0
         self._memory_recovery_last_success: float = 0.0
         self._last_local_unload_reason: str = ""
+        self._local_recovery_task: Optional[asyncio.Task] = None
+        self._local_ready_generation: int = 0
+        self._local_ready_verified: bool = False
+        self._local_ready_handshake: Dict[str, Any] = {
+            "generation": 0,
+            "ready": False,
+            "verified": False,
+            "model_loaded": False,
+            "circuit_state": "unknown",
+            "source": "startup",
+            "reason": "initial_state",
+            "updated_at": time.time(),
+        }
+        self._local_ready_event: Optional[asyncio.Event] = None
+        self._local_warmup_hooks: Set[
+            Callable[[Dict[str, Any]], Union[None, Awaitable[None]]]
+        ] = set()
+        self._local_warmup_tasks: Set[asyncio.Task] = set()
+        self._local_warmup_sequence: int = 0
         self._unload_in_progress: bool = False
 
         # v100.1: Model registry for Trinity Loop hot-swap
@@ -2408,6 +2430,186 @@ class UnifiedModelServing:
             return bool(arm_recovery)
         return reason in {"memory_monitor", "component_unload", "memory_pressure"}
 
+    def _is_local_model_loaded(self) -> bool:
+        """Return whether PRIME_LOCAL currently has a loaded model instance."""
+        _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+        return bool(
+            _local
+            and getattr(_local, "_model", None) is not None
+            and getattr(_local, "_loaded", False)
+        )
+
+    def _ensure_local_ready_event(self) -> asyncio.Event:
+        """Lazily create local-ready event in the running loop."""
+        if self._local_ready_event is None:
+            self._local_ready_event = asyncio.Event()
+            if bool(self._local_ready_handshake.get("verified", False)):
+                self._local_ready_event.set()
+        return self._local_ready_event
+
+    def _set_local_ready_handshake(
+        self,
+        *,
+        source: str,
+        reason: str,
+        ready: Optional[bool] = None,
+        verified: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Update the explicit local-ready handshake used by external coordinators."""
+        model_loaded = self._is_local_model_loaded()
+        circuit_state = self.get_local_circuit_state()
+        runtime_ready = bool(model_loaded and circuit_state == "closed")
+        if not runtime_ready:
+            self._local_ready_verified = False
+        ready_value = runtime_ready if ready is None else bool(ready and runtime_ready)
+        verified_candidate = self._local_ready_verified if verified is None else bool(verified)
+        verified_value = bool(ready_value and runtime_ready and verified_candidate)
+
+        self._local_ready_generation += 1
+        snapshot = {
+            "generation": self._local_ready_generation,
+            "ready": ready_value,
+            "verified": verified_value,
+            "model_loaded": model_loaded,
+            "circuit_state": circuit_state,
+            "source": source,
+            "reason": reason,
+            "updated_at": time.time(),
+        }
+        self._local_ready_handshake = snapshot
+        if self._local_ready_event is not None:
+            if verified_value:
+                self._local_ready_event.set()
+            else:
+                self._local_ready_event.clear()
+        return dict(snapshot)
+
+    def get_local_ready_handshake(self) -> Dict[str, Any]:
+        """Get explicit local-ready handshake snapshot."""
+        current = self._local_ready_handshake
+        model_loaded = self._is_local_model_loaded()
+        circuit_state = self.get_local_circuit_state()
+        runtime_ready = bool(model_loaded and circuit_state == "closed")
+        expected_verified = bool(runtime_ready and self._local_ready_verified)
+
+        if (
+            not current
+            or current.get("model_loaded") != model_loaded
+            or current.get("circuit_state") != circuit_state
+            or bool(current.get("ready")) != runtime_ready
+            or bool(current.get("verified")) != expected_verified
+        ):
+            return self._set_local_ready_handshake(
+                source="state_sync",
+                reason="runtime_state_changed",
+                ready=runtime_ready,
+                verified=expected_verified,
+            )
+        return dict(current)
+
+    async def wait_for_local_ready_handshake(
+        self,
+        timeout_seconds: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Wait for a verified local-ready handshake, returning latest state."""
+        snapshot = self.get_local_ready_handshake()
+        if bool(snapshot.get("verified")) or timeout_seconds <= 0.0:
+            return snapshot
+        try:
+            event = self._ensure_local_ready_event()
+            await asyncio.wait_for(event.wait(), timeout=max(0.1, timeout_seconds))
+        except asyncio.TimeoutError:
+            pass
+        return self.get_local_ready_handshake()
+
+    def register_local_warmup_hook(
+        self,
+        callback: Callable[[Dict[str, Any]], Union[None, Awaitable[None]]],
+    ) -> bool:
+        """Register background warmup hook for local recovery lifecycle events."""
+        if callback is None:
+            return False
+        self._local_warmup_hooks.add(callback)
+        return True
+
+    def unregister_local_warmup_hook(
+        self,
+        callback: Callable[[Dict[str, Any]], Union[None, Awaitable[None]]],
+    ) -> None:
+        """Remove a local warmup hook."""
+        self._local_warmup_hooks.discard(callback)
+
+    def _cleanup_local_warmup_task(self, task: asyncio.Task) -> None:
+        self._local_warmup_tasks.discard(task)
+
+    async def _invoke_local_warmup_hook(
+        self,
+        callback: Callable[[Dict[str, Any]], Union[None, Awaitable[None]]],
+        event: Dict[str, Any],
+    ) -> None:
+        try:
+            maybe_awaitable = callback(event)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+        except Exception as hook_err:
+            cb_name = getattr(callback, "__name__", repr(callback))
+            self.logger.warning(
+                "[v278.0] Local warmup hook error (%s): %s",
+                cb_name,
+                hook_err,
+            )
+
+    def _emit_local_warmup_event(
+        self,
+        *,
+        phase: str,
+        trigger: str,
+        reason: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Dispatch background warmup event to registered hooks."""
+        if not self._local_warmup_hooks:
+            return
+        self._local_warmup_sequence += 1
+        event: Dict[str, Any] = {
+            "sequence": self._local_warmup_sequence,
+            "phase": phase,
+            "trigger": trigger,
+            "reason": reason,
+            "timestamp": time.time(),
+            "handshake": self.get_local_ready_handshake(),
+        }
+        if extra:
+            event.update(extra)
+
+        for callback in tuple(self._local_warmup_hooks):
+            task = asyncio.create_task(
+                self._invoke_local_warmup_hook(callback, dict(event)),
+                name=f"ums-local-warmup-{phase}",
+            )
+            self._local_warmup_tasks.add(task)
+            task.add_done_callback(self._cleanup_local_warmup_task)
+
+    def _build_local_recovery_result(
+        self,
+        *,
+        ok: bool,
+        reason: str,
+        trigger: str,
+        skipped: bool = False,
+    ) -> Dict[str, Any]:
+        return {
+            "ok": ok,
+            "reason": reason,
+            "trigger": trigger,
+            "skipped": skipped,
+            "in_progress": self._memory_recovery_in_progress,
+            "recovery_armed": self._memory_recovery_armed,
+            "circuit_state": self.get_local_circuit_state(),
+            "handshake": self.get_local_ready_handshake(),
+            "timestamp": time.time(),
+        }
+
     async def _unload_local_model(
         self,
         *,
@@ -2433,6 +2635,13 @@ class UnifiedModelServing:
             self.force_open_local_circuit_breaker(reason=f"unload:{reason}")
             self._memory_recovery_armed = _arm
             self._last_local_unload_reason = reason
+            self._local_ready_verified = False
+            self._set_local_ready_handshake(
+                source="unload_local_model",
+                reason=reason,
+                ready=False,
+                verified=False,
+            )
             if not _arm:
                 self._memory_recovery_in_progress = False
             self.logger.info(
@@ -2469,6 +2678,7 @@ class UnifiedModelServing:
                     state.failure_count = 0
         _state = self.get_local_circuit_state()
         _verified = _state == "closed"
+        self._local_ready_verified = bool(_verified and self._is_local_model_loaded())
         if _verified:
             self._memory_recovery_armed = False
             self.logger.info(
@@ -2479,6 +2689,10 @@ class UnifiedModelServing:
                 "[v266.2] PRIME_LOCAL circuit reset verification failed (state=%s)",
                 _state,
             )
+        self._set_local_ready_handshake(
+            source="reset_local_circuit_breaker",
+            reason="circuit_reset_verified" if _verified else "circuit_reset_failed",
+        )
         return _verified
 
     def force_open_local_circuit_breaker(self, reason: str = "recovery_reload") -> None:
@@ -2497,6 +2711,13 @@ class UnifiedModelServing:
             reason,
             _state_name,
         )
+        self._local_ready_verified = False
+        self._set_local_ready_handshake(
+            source="force_open_local_circuit_breaker",
+            reason=reason,
+            ready=False,
+            verified=False,
+        )
 
     def get_local_circuit_state(self) -> str:
         """Return normalized PRIME_LOCAL circuit state for observability."""
@@ -2510,7 +2731,284 @@ class UnifiedModelServing:
         if _local is None or not isinstance(_local, PrimeLocalClient):
             self.logger.warning("[v277.0] Local load skipped: PRIME_LOCAL client missing")
             return False
-        return await _local.load_model(model_name=model_name)
+        loaded = await _local.load_model(model_name=model_name)
+        if loaded:
+            self._set_local_ready_handshake(
+                source="load_model",
+                reason="model_loaded",
+            )
+        return loaded
+
+    async def _run_local_recovery_flow(self, *, trigger: str) -> Dict[str, Any]:
+        """Execute canonical local model recovery lifecycle."""
+        self._set_local_ready_handshake(
+            source="local_recovery",
+            reason="recovery_started",
+            ready=False,
+            verified=False,
+        )
+        self._emit_local_warmup_event(
+            phase="recovery_start",
+            trigger=trigger,
+            reason=self._last_local_unload_reason or "unspecified",
+        )
+
+        try:
+            _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+            if _local is None or not isinstance(_local, PrimeLocalClient):
+                self.force_open_local_circuit_breaker(reason="recovery_missing_local_client")
+                self._emit_local_warmup_event(
+                    phase="recovery_failed",
+                    trigger=trigger,
+                    reason="local_client_missing",
+                )
+                return self._build_local_recovery_result(
+                    ok=False,
+                    reason="local_client_missing",
+                    trigger=trigger,
+                )
+
+            if getattr(_local, "_model", None) is not None and getattr(_local, "_loaded", False):
+                if self.reset_local_circuit_breaker():
+                    self._memory_recovery_armed = False
+                    self._memory_recovery_last_success = time.time()
+                    self._emit_local_warmup_event(
+                        phase="recovery_success",
+                        trigger=trigger,
+                        reason="model_already_loaded",
+                    )
+                    return self._build_local_recovery_result(
+                        ok=True,
+                        reason="model_already_loaded",
+                        trigger=trigger,
+                    )
+                self.force_open_local_circuit_breaker(reason="recovery_already_loaded_reset_failed")
+                self._emit_local_warmup_event(
+                    phase="recovery_failed",
+                    trigger=trigger,
+                    reason="already_loaded_reset_failed",
+                )
+                return self._build_local_recovery_result(
+                    ok=False,
+                    reason="already_loaded_reset_failed",
+                    trigger=trigger,
+                )
+
+            self.force_open_local_circuit_breaker(reason=f"{trigger}:recovery_reload")
+            try:
+                _load_timeout = float(os.getenv("JARVIS_LOCAL_RECOVERY_LOAD_TIMEOUT", "120.0"))
+            except (TypeError, ValueError):
+                _load_timeout = 120.0
+            try:
+                _smoke_timeout = float(os.getenv("JARVIS_LOCAL_RECOVERY_SMOKE_TIMEOUT", "20.0"))
+            except (TypeError, ValueError):
+                _smoke_timeout = 20.0
+
+            load_ok = await asyncio.wait_for(
+                self.load_model(),
+                timeout=max(5.0, _load_timeout),
+            )
+            if not load_ok:
+                await self._unload_local_model(
+                    reason="recovery_load_failed",
+                    arm_recovery=True,
+                )
+                self._emit_local_warmup_event(
+                    phase="recovery_failed",
+                    trigger=trigger,
+                    reason="load_failed",
+                )
+                return self._build_local_recovery_result(
+                    ok=False,
+                    reason="load_failed",
+                    trigger=trigger,
+                )
+
+            smoke_ok = await asyncio.wait_for(
+                self.smoke_test_local_model(timeout_seconds=max(1.0, _smoke_timeout)),
+                timeout=max(5.0, _smoke_timeout + 5.0),
+            )
+            if not smoke_ok:
+                await self._unload_local_model(
+                    reason="recovery_smoke_failed",
+                    arm_recovery=True,
+                )
+                self._emit_local_warmup_event(
+                    phase="recovery_failed",
+                    trigger=trigger,
+                    reason="smoke_failed",
+                )
+                return self._build_local_recovery_result(
+                    ok=False,
+                    reason="smoke_failed",
+                    trigger=trigger,
+                )
+
+            if not self.reset_local_circuit_breaker():
+                self.force_open_local_circuit_breaker(reason="recovery_reset_verification_failed")
+                self._emit_local_warmup_event(
+                    phase="recovery_failed",
+                    trigger=trigger,
+                    reason="reset_verification_failed",
+                )
+                return self._build_local_recovery_result(
+                    ok=False,
+                    reason="reset_verification_failed",
+                    trigger=trigger,
+                )
+
+            handshake = self.get_local_ready_handshake()
+            if not bool(handshake.get("verified")):
+                self.force_open_local_circuit_breaker(reason="recovery_handshake_unverified")
+                self._emit_local_warmup_event(
+                    phase="recovery_failed",
+                    trigger=trigger,
+                    reason="handshake_unverified",
+                )
+                return self._build_local_recovery_result(
+                    ok=False,
+                    reason="handshake_unverified",
+                    trigger=trigger,
+                )
+
+            self._memory_recovery_armed = False
+            self._memory_recovery_last_success = time.time()
+            self.logger.info(
+                "[v278.0] Local model recovery complete; handshake verified (trigger=%s)",
+                trigger,
+            )
+            self._emit_local_warmup_event(
+                phase="recovery_success",
+                trigger=trigger,
+                reason="handshake_verified",
+            )
+            return self._build_local_recovery_result(
+                ok=True,
+                reason="recovery_complete",
+                trigger=trigger,
+            )
+        except asyncio.TimeoutError:
+            self.force_open_local_circuit_breaker(reason="recovery_timeout")
+            self._emit_local_warmup_event(
+                phase="recovery_failed",
+                trigger=trigger,
+                reason="timeout",
+            )
+            return self._build_local_recovery_result(
+                ok=False,
+                reason="timeout",
+                trigger=trigger,
+            )
+        except asyncio.CancelledError:
+            self.force_open_local_circuit_breaker(reason="recovery_cancelled")
+            self._emit_local_warmup_event(
+                phase="recovery_failed",
+                trigger=trigger,
+                reason="cancelled",
+            )
+            raise
+        except Exception as recovery_err:
+            self.force_open_local_circuit_breaker(reason="recovery_exception")
+            self.logger.warning(f"[v278.0] Local recovery flow failed: {recovery_err}")
+            self._emit_local_warmup_event(
+                phase="recovery_failed",
+                trigger=trigger,
+                reason=str(recovery_err),
+            )
+            return self._build_local_recovery_result(
+                ok=False,
+                reason=f"exception:{recovery_err}",
+                trigger=trigger,
+            )
+        finally:
+            self._memory_recovery_in_progress = False
+            current_task = asyncio.current_task()
+            if self._local_recovery_task is current_task:
+                self._local_recovery_task = None
+
+    async def recover_local_model_singleflight(
+        self,
+        *,
+        trigger: str,
+        require_armed: bool = True,
+        respect_cooldown: bool = True,
+    ) -> Dict[str, Any]:
+        """Run canonical local recovery with singleflight semantics."""
+        if not self._running:
+            return self._build_local_recovery_result(
+                ok=False,
+                reason="model_serving_not_running",
+                trigger=trigger,
+                skipped=True,
+            )
+
+        _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+        if _local is None or not isinstance(_local, PrimeLocalClient):
+            return self._build_local_recovery_result(
+                ok=False,
+                reason="local_client_missing",
+                trigger=trigger,
+                skipped=True,
+            )
+
+        if self._prime_api_source == "gcp":
+            self._set_local_ready_handshake(
+                source="recover_local_model_singleflight",
+                reason="gcp_primary_active",
+                ready=False,
+                verified=False,
+            )
+            return self._build_local_recovery_result(
+                ok=False,
+                reason="gcp_primary_active",
+                trigger=trigger,
+                skipped=True,
+            )
+
+        try:
+            _cooldown = float(os.getenv("JARVIS_LOCAL_RECOVERY_COOLDOWN_SECONDS", "60.0"))
+        except (TypeError, ValueError):
+            _cooldown = 60.0
+
+        joined = False
+        task: Optional[asyncio.Task] = None
+        async with self._memory_recovery_lock:
+            existing_task = self._local_recovery_task
+            if existing_task is not None and not existing_task.done():
+                task = existing_task
+                joined = True
+            else:
+                if require_armed and not self._memory_recovery_armed:
+                    return self._build_local_recovery_result(
+                        ok=False,
+                        reason="recovery_not_armed",
+                        trigger=trigger,
+                        skipped=True,
+                    )
+                now = time.time()
+                if respect_cooldown and (now - self._memory_recovery_last_attempt) < max(0.0, _cooldown):
+                    return self._build_local_recovery_result(
+                        ok=False,
+                        reason="cooldown_active",
+                        trigger=trigger,
+                        skipped=True,
+                    )
+                self._memory_recovery_in_progress = True
+                self._memory_recovery_last_attempt = now
+                task = asyncio.create_task(
+                    self._run_local_recovery_flow(trigger=trigger),
+                    name="ums-local-recovery-singleflight",
+                )
+                self._local_recovery_task = task
+
+        result = await task
+        if joined and isinstance(result, dict):
+            joined_result = dict(result)
+            joined_result["singleflight_joined"] = True
+            return joined_result
+        if isinstance(result, dict):
+            result["singleflight_joined"] = False
+        return result
 
     async def smoke_test_local_model(self, timeout_seconds: float = 20.0) -> bool:
         """Run a minimal local inference smoke test after reload."""
@@ -2553,88 +3051,30 @@ class UnifiedModelServing:
         if _local is None or not isinstance(_local, PrimeLocalClient):
             return
 
-        try:
-            _cooldown = float(os.getenv("JARVIS_LOCAL_RECOVERY_COOLDOWN_SECONDS", "60.0"))
-        except (TypeError, ValueError):
-            _cooldown = 60.0
-        now = time.time()
-        if now - self._memory_recovery_last_attempt < max(0.0, _cooldown):
-            return
+        old_label = getattr(old_tier, "value", str(old_tier))
+        new_label = getattr(new_tier, "value", str(new_tier))
+        self.logger.info(
+            "[v278.0] Memory recovery callback: %s -> %s (armed=%s, unload_reason=%s)",
+            old_label,
+            new_label,
+            self._memory_recovery_armed,
+            self._last_local_unload_reason or "unknown",
+        )
 
-        async with self._memory_recovery_lock:
-            if self._memory_recovery_in_progress:
-                return
-            self._memory_recovery_in_progress = True
-            self._memory_recovery_last_attempt = time.time()
-
-        try:
-            old_label = getattr(old_tier, "value", str(old_tier))
-            new_label = getattr(new_tier, "value", str(new_tier))
+        result = await self.recover_local_model_singleflight(
+            trigger=f"memory_quantizer:{old_label}->{new_label}",
+            require_armed=True,
+            respect_cooldown=True,
+        )
+        if result.get("ok"):
             self.logger.info(
-                "[v277.0] Memory recovery callback: %s -> %s (armed=%s, unload_reason=%s)",
-                old_label,
-                new_label,
-                self._memory_recovery_armed,
-                self._last_local_unload_reason or "unknown",
+                "[v278.0] Memory recovery callback completed with verified local handshake"
             )
-
-            if self._prime_api_source == "gcp":
-                self.logger.info(
-                    "[v277.0] Memory recovered but GCP Prime is active; skipping local reload"
-                )
-                return
-
-            if getattr(_local, "_model", None) is not None and getattr(_local, "_loaded", False):
-                if self.reset_local_circuit_breaker():
-                    self._memory_recovery_armed = False
-                    self._memory_recovery_last_success = time.time()
-                return
-
-            self.force_open_local_circuit_breaker(reason="memory_recovery_reload")
-            try:
-                _load_timeout = float(os.getenv("JARVIS_LOCAL_RECOVERY_LOAD_TIMEOUT", "120.0"))
-            except (TypeError, ValueError):
-                _load_timeout = 120.0
-            try:
-                _smoke_timeout = float(os.getenv("JARVIS_LOCAL_RECOVERY_SMOKE_TIMEOUT", "20.0"))
-            except (TypeError, ValueError):
-                _smoke_timeout = 20.0
-
-            load_ok = await asyncio.wait_for(
-                self.load_model(),
-                timeout=max(5.0, _load_timeout),
+        elif not result.get("skipped"):
+            self.logger.warning(
+                "[v278.0] Memory recovery callback failed: %s",
+                result.get("reason", "unknown"),
             )
-            if not load_ok:
-                self.logger.warning("[v277.0] Local recovery load_model returned false")
-                return
-
-            smoke_ok = await asyncio.wait_for(
-                self.smoke_test_local_model(timeout_seconds=max(1.0, _smoke_timeout)),
-                timeout=max(5.0, _smoke_timeout + 5.0),
-            )
-            if not smoke_ok:
-                self.logger.warning("[v277.0] Local recovery smoke test failed")
-                await self._unload_local_model(
-                    reason="recovery_smoke_failed",
-                    arm_recovery=True,
-                )
-                return
-
-            if not self.reset_local_circuit_breaker():
-                self.force_open_local_circuit_breaker(reason="recovery_reset_verification_failed")
-                return
-
-            self._memory_recovery_armed = False
-            self._memory_recovery_last_success = time.time()
-            self.logger.info(
-                "[v277.0] Local model recovery complete; circuit closed and verified"
-            )
-        except asyncio.TimeoutError:
-            self.logger.warning("[v277.0] Local memory recovery timed out")
-        except Exception as recovery_err:
-            self.logger.warning(f"[v277.0] Local memory recovery failed: {recovery_err}")
-        finally:
-            self._memory_recovery_in_progress = False
 
     # ── v266.0: Component Unload (GCP-disabled escape valve) ─────────
 
@@ -2808,6 +3248,26 @@ class UnifiedModelServing:
         Also unloads any loaded GGUF models to free GPU/system memory.
         """
         self._running = False
+
+        if self._local_recovery_task and not self._local_recovery_task.done():
+            self._local_recovery_task.cancel()
+            try:
+                await self._local_recovery_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._local_recovery_task = None
+
+        for task in list(self._local_warmup_tasks):
+            task.cancel()
+        for task in list(self._local_warmup_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._local_warmup_tasks.clear()
+        self._local_warmup_hooks.clear()
+        if self._local_ready_event is not None:
+            self._local_ready_event.clear()
 
         # v235.1: Stop memory pressure monitor (v270.4: properly await cancellation)
         if hasattr(self, '_memory_monitor_task') and self._memory_monitor_task:

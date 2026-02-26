@@ -797,6 +797,8 @@ class GCPHybridPrimeRouter:
         self._recovery_task: Optional[asyncio.Task] = None
         self._recovery_percent_history: Deque[Tuple[float, float]] = deque(maxlen=8)
         self._local_circuit_state: str = "unknown"
+        self._local_warmup_hook_registered: bool = False
+        self._model_serving_ref: Optional[Any] = None
 
         # Process tracking for emergency offload
         self._ml_loader_ref = None  # Reference to ProcessIsolatedMLLoader
@@ -1714,6 +1716,49 @@ class GCPHybridPrimeRouter:
             self._recovery_attempts,
         )
 
+    def _sync_local_circuit_from_handshake(self, handshake: Optional[Dict[str, Any]]) -> None:
+        """Sync local circuit observability from UnifiedModelServing handshake."""
+        if not handshake or not isinstance(handshake, dict):
+            return
+        state = str(handshake.get("circuit_state", "")).lower()
+        if state:
+            self._local_circuit_state = state
+
+    def _on_local_warmup_event(self, event: Dict[str, Any]) -> None:
+        """Receive background warmup lifecycle events from UnifiedModelServing."""
+        handshake = event.get("handshake") if isinstance(event, dict) else None
+        self._sync_local_circuit_from_handshake(handshake)
+        phase = str(event.get("phase", "unknown")) if isinstance(event, dict) else "unknown"
+        reason = str(event.get("reason", "unknown")) if isinstance(event, dict) else "unknown"
+        generation = None
+        if isinstance(handshake, dict):
+            generation = handshake.get("generation")
+        if phase == "recovery_success":
+            self.logger.info(
+                "[v278.0] Local warmup hook success (generation=%s, circuit=%s)",
+                generation,
+                self._local_circuit_state,
+            )
+        elif phase == "recovery_failed":
+            self.logger.warning(
+                "[v278.0] Local warmup hook failure (reason=%s, circuit=%s)",
+                reason,
+                self._local_circuit_state,
+            )
+
+    def _ensure_local_warmup_hook(self, model_serving: Any) -> None:
+        """Register router warmup hook once to keep local/offload state aligned."""
+        self._model_serving_ref = model_serving
+        if self._local_warmup_hook_registered:
+            return
+        if not hasattr(model_serving, "register_local_warmup_hook"):
+            return
+        try:
+            registered = model_serving.register_local_warmup_hook(self._on_local_warmup_event)
+            self._local_warmup_hook_registered = bool(registered)
+        except Exception as hook_err:
+            self.logger.debug(f"[v278.0] Local warmup hook registration failed: {hook_err}")
+
     async def _run_model_recovery_attempt(
         self,
         attempt_number: int,
@@ -1731,29 +1776,48 @@ class GCPHybridPrimeRouter:
             from backend.intelligence.unified_model_serving import get_model_serving
 
             model_serving = await asyncio.wait_for(get_model_serving(), timeout=10.0)
-            model_serving.force_open_local_circuit_breaker(reason="post_crisis_reload")
-            self._local_circuit_state = model_serving.get_local_circuit_state()
+            self._ensure_local_warmup_hook(model_serving)
 
-            load_ok = await asyncio.wait_for(model_serving.load_model(), timeout=120.0)
-            if not load_ok:
-                raise RuntimeError("load_model returned false")
+            recovery_result = await asyncio.wait_for(
+                model_serving.recover_local_model_singleflight(
+                    trigger="gcp_router_post_crisis",
+                    require_armed=False,
+                    respect_cooldown=False,
+                ),
+                timeout=180.0,
+            )
+            if not isinstance(recovery_result, dict):
+                raise RuntimeError("invalid_local_recovery_result")
 
-            # Abort cleanly if memory regresses to CRITICAL during reload.
+            handshake = recovery_result.get("handshake")
+            if (not handshake or not isinstance(handshake, dict)) and hasattr(
+                model_serving, "get_local_ready_handshake"
+            ):
+                handshake = model_serving.get_local_ready_handshake()
+            self._sync_local_circuit_from_handshake(handshake)
+            if self._local_circuit_state == "unknown":
+                self._local_circuit_state = model_serving.get_local_circuit_state()
+
+            # Abort cleanly if memory regresses to CRITICAL during or immediately after reload.
             ram_after = await self._get_ram_info_with_mb()
             if ram_after and ram_after.get("used_percent", 0.0) >= EMERGENCY_UNLOAD_RAM_PERCENT:
                 raise RuntimeError(
                     f"memory_critical_during_reload:{ram_after.get('used_percent', 0.0):.1f}%"
                 )
 
-            smoke_ok = await asyncio.wait_for(
-                model_serving.smoke_test_local_model(timeout_seconds=20.0),
-                timeout=25.0,
-            )
-            if not smoke_ok:
-                raise RuntimeError("smoke_test_local_model failed")
-
-            model_serving.reset_local_circuit_breaker()
-            self._local_circuit_state = model_serving.get_local_circuit_state()
+            if not recovery_result.get("ok"):
+                raise RuntimeError(str(recovery_result.get("reason", "local_recovery_failed")))
+            if not (
+                bool(handshake and handshake.get("ready"))
+                and bool(handshake and handshake.get("verified"))
+                and self._local_circuit_state == "closed"
+            ):
+                raise RuntimeError(
+                    "local_ready_handshake_unverified:"
+                    f"ready={bool(handshake and handshake.get('ready'))},"
+                    f"verified={bool(handshake and handshake.get('verified'))},"
+                    f"circuit={self._local_circuit_state}"
+                )
 
             self._model_needs_recovery = False
             self._recovery_attempts = 0
@@ -2749,6 +2813,20 @@ class GCPHybridPrimeRouter:
                 await self._recovery_task
             except asyncio.CancelledError:
                 pass
+
+        if (
+            self._local_warmup_hook_registered
+            and self._model_serving_ref is not None
+            and hasattr(self._model_serving_ref, "unregister_local_warmup_hook")
+        ):
+            try:
+                self._model_serving_ref.unregister_local_warmup_hook(
+                    self._on_local_warmup_event
+                )
+            except Exception as hook_err:
+                self.logger.debug(f"[v278.0] Local warmup hook unregister failed: {hook_err}")
+        self._local_warmup_hook_registered = False
+        self._model_serving_ref = None
 
         self.logger.info(
             f"GCPHybridPrimeRouter stopped "
