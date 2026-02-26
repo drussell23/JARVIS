@@ -7,6 +7,7 @@ TDD approach for Pillar 1: Lock-Guarded Single-Owner Startup.
 import pytest
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -481,3 +482,491 @@ class TestUnifiedSupervisorIntegration:
                                     mock_stop()
 
         assert not stop_called, "stop() should not be called when integrator is None"
+
+
+class TestFailurePropagationPolicy:
+    """Tests for deterministic cross-repo failure propagation policy."""
+
+    @staticmethod
+    def _managed(name, depends_on=None, soft_depends_on=None, is_critical=True):
+        return SimpleNamespace(
+            definition=SimpleNamespace(
+                name=name,
+                depends_on=depends_on or [],
+                soft_depends_on=soft_depends_on or [],
+                is_critical=is_critical,
+                default_port=8001,
+                health_endpoint="/health",
+            ),
+            status=None,
+            is_running=False,
+            restart_count=0,
+            consecutive_failures=0,
+        )
+
+    def test_build_failure_plan_transient_drains_hard_dependents(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            FailurePropagationAction,
+            ProcessOrchestrator,
+        )
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator.processes = {
+            "reactor-core": self._managed("reactor-core"),
+            "jarvis-prime": self._managed("jarvis-prime", depends_on=["reactor-core"]),
+            "jarvis-body": self._managed("jarvis-body", depends_on=["jarvis-prime"]),
+        }
+
+        plan = orchestrator._build_failure_propagation_plan(
+            "reactor-core",
+            "process_crash",
+            include_source_action=False,
+        )
+        by_target = {entry.target_service: entry for entry in plan}
+
+        assert by_target["reactor-core"].action == FailurePropagationAction.NONE
+        assert by_target["jarvis-prime"].action == FailurePropagationAction.DRAIN
+        assert by_target["jarvis-body"].action == FailurePropagationAction.NONE
+
+    def test_build_failure_plan_terminal_isolates_source_and_hard_dependents(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            FailurePropagationAction,
+            ProcessOrchestrator,
+        )
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator.processes = {
+            "reactor-core": self._managed("reactor-core"),
+            "jarvis-prime": self._managed("jarvis-prime", depends_on=["reactor-core"]),
+            "jarvis-body": self._managed("jarvis-body", depends_on=["jarvis-prime"]),
+        }
+
+        plan = orchestrator._build_failure_propagation_plan(
+            "reactor-core",
+            "circuit_breaker_open",
+            include_source_action=True,
+        )
+        by_target = {entry.target_service: entry for entry in plan}
+
+        assert by_target["reactor-core"].action == FailurePropagationAction.ISOLATE
+        assert by_target["jarvis-prime"].action == FailurePropagationAction.ISOLATE
+        assert by_target["jarvis-body"].action == FailurePropagationAction.DEGRADE
+
+    @pytest.mark.asyncio
+    async def test_dependency_error_triggers_policy_for_managed_source(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator.processes = {"jarvis-prime": self._managed("jarvis-prime")}
+
+        with patch.object(
+            orchestrator,
+            "_trigger_failure_propagation_policy",
+            new_callable=AsyncMock,
+        ) as mock_trigger:
+            await orchestrator._handle_dependency_error(
+                {
+                    "source_repo": "jarvis-prime",
+                    "message": "dependency timeout",
+                    "reason": "dependency_failed",
+                }
+            )
+
+        mock_trigger.assert_awaited_once_with(
+            "jarvis-prime",
+            "dependency_failed",
+            include_source_action=False,
+            trigger="error_handler.dependency_error",
+        )
+
+    @pytest.mark.asyncio
+    async def test_recovery_path_triggers_policy_before_auto_heal(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator.processes = {"jarvis-prime": self._managed("jarvis-prime")}
+
+        with patch.object(
+            orchestrator,
+            "_trigger_failure_propagation_policy",
+            new_callable=AsyncMock,
+        ) as mock_trigger:
+            with patch.object(orchestrator, "_auto_heal", new_callable=AsyncMock, return_value=True) as mock_heal:
+                result = await orchestrator._initiate_intelligent_recovery(
+                    "jarvis-prime",
+                    "process_dead",
+                )
+
+        assert result is True
+        mock_trigger.assert_awaited_once_with(
+            "jarvis-prime",
+            "process_dead",
+            include_source_action=False,
+            trigger="recovery_coordinator",
+        )
+        mock_heal.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_restart_suppresses_duplicate_auto_heal(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            FailurePropagationAction,
+            FailurePropagationDirective,
+            ProcessOrchestrator,
+            ServiceStatus,
+        )
+
+        orchestrator = ProcessOrchestrator()
+        managed = self._managed("jarvis-prime")
+        managed.status = ServiceStatus.FAILED
+        managed.is_running = False
+        orchestrator.processes = {"jarvis-prime": managed}
+
+        directive = FailurePropagationDirective(
+            source_service="reactor-core",
+            target_service="jarvis-prime",
+            action=FailurePropagationAction.RESTART,
+            reason="process_crash",
+        )
+
+        with patch.object(orchestrator, "_auto_heal", new_callable=AsyncMock, return_value=True) as mock_heal:
+            first = await orchestrator._apply_failure_directive(directive)
+            second = await orchestrator._apply_failure_directive(directive)
+
+        assert first is True
+        assert second is True
+        mock_heal.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_drain_suppresses_duplicate_begin_drain(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            FailurePropagationAction,
+            FailurePropagationDirective,
+            ProcessOrchestrator,
+            ServiceStatus,
+        )
+
+        orchestrator = ProcessOrchestrator()
+        managed = self._managed("jarvis-prime")
+        managed.status = ServiceStatus.HEALTHY
+        orchestrator.processes = {"jarvis-prime": managed}
+
+        directive = FailurePropagationDirective(
+            source_service="reactor-core",
+            target_service="jarvis-prime",
+            action=FailurePropagationAction.DRAIN,
+            reason="dependency_failed",
+        )
+
+        guard = MagicMock()
+        guard.begin_drain = AsyncMock()
+        guard.get_stats = MagicMock(return_value={"draining_categories": ["jarvis-prime"]})
+
+        with patch(
+            "backend.core.resilience.graceful_shutdown.get_operation_guard",
+            new=AsyncMock(return_value=guard),
+        ):
+            first = await orchestrator._apply_failure_directive(directive)
+            second = await orchestrator._apply_failure_directive(directive)
+
+        assert first is True
+        assert second is True
+        guard.begin_drain.assert_awaited_once_with("jarvis-prime")
+
+    @pytest.mark.asyncio
+    async def test_idempotent_state_marks_uncertain_on_cancellation(self):
+        import asyncio
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            FailurePropagationAction,
+            FailurePropagationDirective,
+            ProcessOrchestrator,
+            ServiceStatus,
+        )
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator._failure_effect_idempotency_inflight_s = 120.0
+        managed = self._managed("jarvis-prime")
+        managed.status = ServiceStatus.FAILED
+        orchestrator.processes = {"jarvis-prime": managed}
+
+        directive = FailurePropagationDirective(
+            source_service="reactor-core",
+            target_service="jarvis-prime",
+            action=FailurePropagationAction.RESTART,
+            reason="process_crash",
+        )
+
+        with patch.object(orchestrator, "_auto_heal", new_callable=AsyncMock, side_effect=asyncio.CancelledError()):
+            with pytest.raises(asyncio.CancelledError):
+                await orchestrator._apply_failure_directive(directive)
+
+        key = orchestrator._failure_effect_idempotency_key(directive)
+        assert orchestrator._failure_effect_idempotency_state[key]["status"] == "uncertain"
+
+    @pytest.mark.asyncio
+    async def test_failure_policy_journal_restore_reuses_successful_restart(
+        self, tmp_path, monkeypatch
+    ):
+        from backend.supervisor.cross_repo_startup_orchestrator import (
+            FailurePropagationAction,
+            FailurePropagationDirective,
+            ProcessOrchestrator,
+            ServiceStatus,
+        )
+
+        journal_path = tmp_path / "failure_policy_journal.json"
+        monkeypatch.setenv("JARVIS_FAILURE_POLICY_JOURNAL_PATH", str(journal_path))
+
+        directive = FailurePropagationDirective(
+            source_service="reactor-core",
+            target_service="jarvis-prime",
+            action=FailurePropagationAction.RESTART,
+            reason="process_crash",
+        )
+
+        orchestrator_1 = ProcessOrchestrator()
+        managed_1 = self._managed("jarvis-prime")
+        managed_1.status = ServiceStatus.FAILED
+        managed_1.is_running = False
+        orchestrator_1.processes = {"jarvis-prime": managed_1}
+
+        with patch.object(orchestrator_1, "_auto_heal", new_callable=AsyncMock, return_value=True) as heal_1:
+            assert await orchestrator_1._apply_failure_directive(directive)
+        heal_1.assert_awaited_once()
+        assert journal_path.exists()
+
+        orchestrator_2 = ProcessOrchestrator()
+        managed_2 = self._managed("jarvis-prime")
+        managed_2.status = ServiceStatus.FAILED
+        managed_2.is_running = False
+        orchestrator_2.processes = {"jarvis-prime": managed_2}
+        await orchestrator_2._restore_failure_policy_state_if_needed()
+
+        with patch.object(orchestrator_2, "_auto_heal", new_callable=AsyncMock, return_value=True) as heal_2:
+            assert await orchestrator_2._apply_failure_directive(directive)
+        heal_2.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restore_replays_uncertain_isolate_intent(self, tmp_path, monkeypatch):
+        import time
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator, ServiceStatus
+
+        journal_path = tmp_path / "failure_policy_journal.json"
+        monkeypatch.setenv("JARVIS_FAILURE_POLICY_JOURNAL_PATH", str(journal_path))
+
+        key = "jarvis-prime|isolate"
+        payload = {
+            "schema_version": 1,
+            "updated_at": time.time(),
+            "idempotency_state": {
+                key: {
+                    "operation_id": "op-test-1",
+                    "status": "uncertain",
+                    "updated_at": time.time(),
+                    "attempts": 1,
+                    "source_service": "reactor-core",
+                    "target_service": "jarvis-prime",
+                    "action": "isolate",
+                    "reason": "circuit_breaker_open",
+                    "note": "local_timeout_or_cancelled",
+                    "result": None,
+                }
+            },
+            "history": [],
+            "last_applied": {},
+            "degradation_mode": {},
+            "crash_circuit_breakers": {},
+            "observed_snapshot": {},
+        }
+        journal_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        orchestrator = ProcessOrchestrator()
+        managed = self._managed("jarvis-prime")
+        managed.status = ServiceStatus.HEALTHY
+        managed.is_running = False
+        orchestrator.processes = {"jarvis-prime": managed}
+
+        await orchestrator._restore_failure_policy_state_if_needed()
+
+        assert orchestrator._degradation_mode.get("jarvis-prime") == "isolated"
+        assert orchestrator._crash_circuit_breakers.get("jarvis-prime") is True
+        assert orchestrator._failure_effect_idempotency_state[key]["status"] == "succeeded"
+
+
+class TestOwnershipBoundaries:
+    """Tests for cross-repo ownership boundary contract enforcement."""
+
+    def test_ownership_contract_passes_for_canonical_definitions(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        issues = orchestrator._validate_ownership_boundaries()
+        assert issues == []
+
+    def test_ownership_contract_detects_responsibility_leakage(self):
+        from copy import deepcopy
+        import backend.supervisor.cross_repo_startup_orchestrator as orchestrator_mod
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        original = deepcopy(orchestrator_mod.ServiceDefinitionRegistry._CANONICAL_DEFINITIONS)
+        try:
+            orchestrator_mod.ServiceDefinitionRegistry._CANONICAL_DEFINITIONS["jarvis-prime"][
+                "responsibility_domains"
+            ] = [
+                "model_registry",
+                "capability_routing",
+                "training",  # leakage from reactor-core domain
+            ]
+            orchestrator_mod.ServiceDefinitionRegistry._cache.clear()
+
+            orchestrator = ProcessOrchestrator()
+            issues = orchestrator._validate_ownership_boundaries()
+            assert any("out-of-bound domains" in issue for issue in issues)
+        finally:
+            orchestrator_mod.ServiceDefinitionRegistry._CANONICAL_DEFINITIONS = original
+            orchestrator_mod.ServiceDefinitionRegistry._cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_initialize_cross_repo_integration_strict_ownership_violation_raises(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator._ownership_contract_strict = True
+
+        with patch(
+            "backend.supervisor.cross_repo_startup_orchestrator._emit_event",
+            new=AsyncMock(),
+        ):
+            with patch.object(orchestrator, "_initialize_unified_config", new_callable=AsyncMock):
+                with patch.object(orchestrator, "_initialize_security_context", new_callable=AsyncMock):
+                    with patch.object(orchestrator, "_initialize_unified_logging", new_callable=AsyncMock):
+                        with patch.object(orchestrator, "_initialize_error_propagation", new_callable=AsyncMock):
+                            with patch.object(orchestrator, "_initialize_state_sync", new_callable=AsyncMock):
+                                with patch.object(orchestrator, "_initialize_resource_coordination", new_callable=AsyncMock):
+                                    with patch.object(orchestrator, "_initialize_version_compatibility", new_callable=AsyncMock):
+                                        with patch.object(orchestrator, "_check_compatibility", new_callable=AsyncMock, return_value=[]):
+                                            with patch.object(orchestrator, "_initialize_metrics_collection", new_callable=AsyncMock):
+                                                with patch.object(
+                                                    orchestrator,
+                                                    "_validate_ownership_boundaries",
+                                                    return_value=["jarvis-prime declares out-of-bound domains: ['training']"],
+                                                ):
+                                                    with pytest.raises(RuntimeError, match="ownership contract violation"):
+                                                        await orchestrator._initialize_cross_repo_integration()
+
+
+class TestGlobalAdmissionControl:
+    """Tests for global admission/backpressure governance."""
+
+    @pytest.mark.asyncio
+    async def test_global_admission_denies_on_memory_pressure(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator._global_admission_enabled = True
+        orchestrator._global_admission_timeout_s = 0.01
+        orchestrator._resource_limits = {
+            "memory_mb": 16384,
+            "gpu_memory_mb": 8192,
+            "network_connections": 1000,
+            "cpu_cores": 8,
+        }
+
+        with patch.object(
+            orchestrator,
+            "_collect_global_admission_snapshot",
+            new_callable=AsyncMock,
+            return_value={
+                "memory_percent": 99.0,
+                "available_mb": 256,
+                "available_gb": 0.25,
+                "network_connections": 100,
+                "timestamp": 0.0,
+            },
+        ):
+            allowed, reason, lease_id = await orchestrator._acquire_global_admission_lease(
+                "jarvis-prime",
+                "spawn",
+                timeout_s=0.01,
+            )
+
+        assert allowed is False
+        assert lease_id is None
+        assert "memory_percent" in reason or "available_gb" in reason
+
+    @pytest.mark.asyncio
+    async def test_global_admission_grant_and_release_updates_allocations(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator
+
+        orchestrator = ProcessOrchestrator()
+        orchestrator._global_admission_enabled = True
+        orchestrator._resource_limits = {
+            "memory_mb": 16384,
+            "gpu_memory_mb": 8192,
+            "network_connections": 1000,
+            "cpu_cores": 8,
+        }
+
+        with patch.object(
+            orchestrator,
+            "_collect_global_admission_snapshot",
+            new_callable=AsyncMock,
+            return_value={
+                "memory_percent": 50.0,
+                "available_mb": 12000,
+                "available_gb": 12.0,
+                "network_connections": 10,
+                "timestamp": 0.0,
+            },
+        ):
+            allowed, reason, lease_id = await orchestrator._acquire_global_admission_lease(
+                "jarvis-prime",
+                "spawn",
+                timeout_s=0.01,
+            )
+
+        assert allowed is True
+        assert reason == "admitted"
+        assert lease_id is not None
+        assert "jarvis-prime" in orchestrator._resource_allocations
+        assert lease_id in orchestrator._global_admission_active_leases
+
+        await orchestrator._release_global_admission_lease(
+            lease_id,
+            outcome="test_complete",
+        )
+        assert lease_id not in orchestrator._global_admission_active_leases
+        assert "jarvis-prime" not in orchestrator._resource_allocations
+
+    @pytest.mark.asyncio
+    async def test_spawn_service_inner_blocks_when_global_admission_denied(self):
+        from backend.supervisor.cross_repo_startup_orchestrator import ProcessOrchestrator, ServiceStatus
+
+        orchestrator = ProcessOrchestrator()
+        managed = TestFailurePropagationPolicy._managed("jarvis-prime")
+        managed.status = ServiceStatus.STARTING
+
+        coordinator = MagicMock()
+        coordinator.should_attempt_spawn.return_value = (True, "ok")
+        coordinator.mark_spawning.return_value = True
+        coordinator.mark_ready.return_value = None
+        coordinator.mark_failed.return_value = None
+        coordinator.is_service_ready.return_value = False
+        coordinator.is_spawn_in_progress.return_value = False
+        coordinator.get_spawning_component.return_value = "none"
+
+        with patch(
+            "backend.supervisor.cross_repo_startup_orchestrator.get_spawn_coordinator",
+            return_value=coordinator,
+        ):
+            with patch.object(
+                orchestrator,
+                "_acquire_global_admission_lease",
+                new_callable=AsyncMock,
+                return_value=(False, "memory pressure", None),
+            ):
+                with patch.object(orchestrator, "_spawn_service_core", new_callable=AsyncMock) as mock_core:
+                    result = await orchestrator._spawn_service_inner(managed, managed.definition)
+
+        assert result is False
+        assert managed.status == ServiceStatus.DEGRADED
+        mock_core.assert_not_awaited()

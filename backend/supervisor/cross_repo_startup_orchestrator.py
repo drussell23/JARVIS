@@ -210,7 +210,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Coroutine, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, AsyncIterator, Awaitable, Callable, Coroutine, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import aiohttp
 
@@ -226,6 +226,15 @@ def _get_env_float(name: str, default: float) -> float:
         return float(os.environ.get(name, str(default)))
     except (ValueError, TypeError):
         logger.warning(f"[v256.1] Invalid env var {name}={os.environ.get(name)!r} — using default {default}")
+        return default
+
+
+def _get_env_int(name: str, default: int) -> int:
+    """Safe env var int parser with fallback."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        logger.warning(f"[v281.4] Invalid env var {name}={os.environ.get(name)!r} — using default {default}")
         return default
 
 
@@ -5560,6 +5569,29 @@ class ServiceStatus(Enum):
     STOPPED = "stopped"
 
 
+class FailurePropagationAction(Enum):
+    """Deterministic control-plane actions for cross-repo failure propagation."""
+    NONE = "none"
+    DEGRADE = "degrade"
+    DRAIN = "drain"
+    RESTART = "restart"
+    ISOLATE = "isolate"
+
+
+@dataclass(frozen=True)
+class FailurePropagationDirective:
+    """
+    Policy directive describing one action on one target service.
+
+    This gives cross-repo failure handling a deterministic, inspectable shape
+    instead of ad-hoc retries.
+    """
+    source_service: str
+    target_service: str
+    action: FailurePropagationAction
+    reason: str
+
+
 class CircuitBreakerState(Enum):
     """
     v93.9: Circuit Breaker state machine.
@@ -5869,6 +5901,10 @@ class ServiceDefinition:
     startup_timeout: float = 60.0
     environment: Dict[str, str] = field(default_factory=dict)
 
+    # v281.3: Ownership contract metadata (cross-repo boundary enforcement).
+    owner_repo: str = ""
+    responsibility_domains: List[str] = field(default_factory=list)
+
     # v95.0: Service dependency tracking
     # Services listed here must be healthy before this service starts
     depends_on: List[str] = field(default_factory=list)
@@ -6008,6 +6044,13 @@ class ServiceDefinition:
         # Check health endpoint format
         if not self.health_endpoint.startswith("/"):
             issues.append(f"Health endpoint should start with '/': {self.health_endpoint}")
+
+        # v281.3: Required ownership metadata for core cross-repo services.
+        if self.name in {"jarvis-prime", "reactor-core"}:
+            if not self.owner_repo:
+                issues.append(f"Ownership contract missing owner_repo for {self.name}")
+            if not self.responsibility_domains:
+                issues.append(f"Ownership contract missing responsibility_domains for {self.name}")
 
         return len(issues) == 0, issues
 
@@ -7246,6 +7289,12 @@ class ServiceDefinitionRegistry:
 
     _CANONICAL_DEFINITIONS = {
         "jarvis-prime": {
+            "owner_repo": "jarvis-prime",
+            "responsibility_domains": [
+                "model_registry",
+                "capability_routing",
+                "model_selection",
+            ],
             "script_name": "run_server.py",
             "fallback_scripts": ["main.py", "server.py", "app.py"],
             "default_port_env": "JARVIS_PRIME_PORT",
@@ -7277,6 +7326,12 @@ class ServiceDefinitionRegistry:
             "dependency_wait_timeout": 120.0,
         },
         "reactor-core": {
+            "owner_repo": "reactor-core",
+            "responsibility_domains": [
+                "training",
+                "compute_primitives",
+                "model_training_orchestration",
+            ],
             "script_name": "run_reactor.py",
             "fallback_scripts": ["run_supervisor.py", "main.py", "server.py"],
             "default_port_env": "REACTOR_CORE_PORT",
@@ -7423,6 +7478,8 @@ class ServiceDefinitionRegistry:
             startup_timeout=canonical["startup_timeout"],
             script_args=canonical.get("script_args_factory", lambda p: [])(port),
             environment=canonical.get("environment_factory", lambda p: {})(repo_path),
+            owner_repo=canonical.get("owner_repo", ""),
+            responsibility_domains=canonical.get("responsibility_domains", []),
             use_uvicorn=canonical.get("use_uvicorn", False),
             uvicorn_app=canonical.get("uvicorn_app"),
             # v95.0: Dependency and priority configuration
@@ -7922,6 +7979,39 @@ class ProcessOrchestrator:
         self._cross_repo_breaker: Optional[Any] = None  # CrossRepoCircuitBreaker instance
         self._degradation_lock: Optional[asyncio.Lock] = None
 
+        # v281.0: Policy-driven cross-repo failure propagation control plane.
+        # One source failure deterministically maps to peer actions:
+        # degrade / drain / restart / isolate.
+        self._failure_propagation_lock: Optional[asyncio.Lock] = None
+        self._failure_propagation_last_applied: Dict[str, float] = {}
+        self._failure_propagation_history: List[Dict[str, Any]] = []
+        self._failure_propagation_cooldown_s: float = float(
+            os.environ.get("JARVIS_FAILURE_PROPAGATION_COOLDOWN", "20.0")
+        )
+        self._failure_propagation_history_limit: int = int(
+            os.environ.get("JARVIS_FAILURE_PROPAGATION_HISTORY_LIMIT", "200")
+        )
+        # Root-fix for duplicate side effects during retries/timeouts:
+        # action-level idempotency ledger for drain/restart/isolate operations.
+        self._failure_effect_idempotency_lock: Optional[asyncio.Lock] = None
+        self._failure_effect_idempotency_state: Dict[str, Dict[str, Any]] = {}
+        self._failure_effect_idempotency_ttl_s: float = _get_env_float(
+            "JARVIS_FAILURE_IDEMPOTENCY_TTL_SECONDS",
+            900.0,
+        )
+        self._failure_effect_idempotency_inflight_s: float = _get_env_float(
+            "JARVIS_FAILURE_IDEMPOTENCY_INFLIGHT_SECONDS",
+            45.0,
+        )
+        self._failure_policy_journal_path: Path = Path(
+            os.environ.get(
+                "JARVIS_FAILURE_POLICY_JOURNAL_PATH",
+                str(Path.home() / ".jarvis" / "state" / "failure_policy_journal.json"),
+            )
+        ).expanduser()
+        self._failure_policy_state_loaded: bool = False
+        self._failure_policy_persistence_lock: Optional[asyncio.Lock] = None
+
         # v95.5: Distributed Tracing with Correlation ID Propagation
         # Enables cross-component request tracking for debugging
         self._startup_correlation_id: Optional[str] = None
@@ -8046,6 +8136,28 @@ class ProcessOrchestrator:
         self._resource_lock: Optional[asyncio.Lock] = None
         self._resource_coordination_enabled: bool = os.environ.get("JARVIS_RESOURCE_COORDINATION", "true").lower() == "true"
         self._resource_conflict_handlers: Dict[str, Callable] = {}  # resource -> conflict_handler
+        self._global_admission_enabled: bool = os.environ.get(
+            "JARVIS_GLOBAL_ADMISSION_CONTROL",
+            "true",
+        ).lower() == "true"
+        self._global_admission_timeout_s: float = _get_env_float(
+            "JARVIS_GLOBAL_ADMISSION_TIMEOUT_SECONDS",
+            45.0,
+        )
+        self._global_admission_memory_percent_max: float = _get_env_float(
+            "JARVIS_GLOBAL_ADMISSION_MEMORY_PERCENT_MAX",
+            90.0,
+        )
+        self._global_admission_min_available_gb: float = _get_env_float(
+            "JARVIS_GLOBAL_ADMISSION_MIN_AVAILABLE_GB",
+            1.0,
+        )
+        self._global_admission_history_limit: int = _get_env_int(
+            "JARVIS_GLOBAL_ADMISSION_HISTORY_LIMIT",
+            500,
+        )
+        self._global_admission_active_leases: Dict[str, Dict[str, Any]] = {}
+        self._global_admission_history: List[Dict[str, Any]] = []
 
         # Issue 37: Cross-Repo Version Compatibility - Compatibility matrix
         self._version_registry: Dict[str, str] = {}  # service -> version
@@ -8053,6 +8165,13 @@ class ProcessOrchestrator:
         self._version_check_enabled: bool = os.environ.get("JARVIS_VERSION_CHECK", "true").lower() == "true"
         self._version_lock: Optional[asyncio.Lock] = None
         self._incompatibility_handlers: Dict[str, Callable] = {}  # service_pair -> handler
+
+        # v281.3: Cross-repo ownership boundary enforcement.
+        self._ownership_contract_strict: bool = os.environ.get(
+            "JARVIS_OWNERSHIP_CONTRACT_STRICT",
+            "true",
+        ).lower() == "true"
+        self._ownership_contract_violations: List[str] = []
 
         # Issue 38: Cross-Repo Security Context - Unified security
         self._security_context: Dict[str, Any] = {}  # Current security context
@@ -8122,6 +8241,12 @@ class ProcessOrchestrator:
         # v95.5: Degradation and tracing locks
         if self._degradation_lock is None:
             self._degradation_lock = asyncio.Lock()
+        if self._failure_propagation_lock is None:
+            self._failure_propagation_lock = asyncio.Lock()
+        if self._failure_effect_idempotency_lock is None:
+            self._failure_effect_idempotency_lock = asyncio.Lock()
+        if self._failure_policy_persistence_lock is None:
+            self._failure_policy_persistence_lock = asyncio.Lock()
         if self._trace_lock is None:
             self._trace_lock = asyncio.Lock()
 
@@ -8152,6 +8277,27 @@ class ProcessOrchestrator:
         self._ensure_locks_initialized()
         assert self._degradation_lock is not None, "Degradation lock should be initialized"
         return self._degradation_lock
+
+    @property
+    def _failure_propagation_lock_safe(self) -> asyncio.Lock:
+        """Type-safe accessor for failure propagation lock."""
+        self._ensure_locks_initialized()
+        assert self._failure_propagation_lock is not None, "Failure propagation lock should be initialized"
+        return self._failure_propagation_lock
+
+    @property
+    def _failure_effect_idempotency_lock_safe(self) -> asyncio.Lock:
+        """Type-safe accessor for failure effect idempotency lock."""
+        self._ensure_locks_initialized()
+        assert self._failure_effect_idempotency_lock is not None, "Failure effect idempotency lock should be initialized"
+        return self._failure_effect_idempotency_lock
+
+    @property
+    def _failure_policy_persistence_lock_safe(self) -> asyncio.Lock:
+        """Type-safe accessor for failure policy persistence lock."""
+        self._ensure_locks_initialized()
+        assert self._failure_policy_persistence_lock is not None, "Failure policy persistence lock should be initialized"
+        return self._failure_policy_persistence_lock
 
     @property
     def _trace_lock_safe(self) -> asyncio.Lock:
@@ -8451,6 +8597,12 @@ class ProcessOrchestrator:
         if not spawn_processes:
             logger.info("[v200.0] spawn_processes=False - orchestrator will NOT spawn processes")
             logger.info("[v200.0] TrinityIntegrator is the designated sole spawner")
+
+        # v281.2: Recover crash-consistent failure policy state before orchestration.
+        try:
+            await self._restore_failure_policy_state_if_needed()
+        except Exception as e:
+            logger.warning(f"[v281.2] Failure policy state restore skipped: {e}")
 
         try:
             from backend.core.cross_repo_state_initializer import initialize_cross_repo_state
@@ -8973,6 +9125,12 @@ class ProcessOrchestrator:
                         }
                     )
 
+                    await self._trigger_failure_propagation_policy(
+                        service_name,
+                        "oom_circuit_breaker_tripped",
+                        include_source_action=True,
+                        trigger="process_crash.oom_circuit_breaker",
+                    )
                     return  # STOP - do not attempt restart
 
                 # =====================================================================
@@ -9050,6 +9208,12 @@ class ProcessOrchestrator:
 
                     # DO NOT restart - prevent OOM crash loop
                     self._crash_circuit_breakers[service_name] = True
+                    await self._trigger_failure_propagation_policy(
+                        service_name,
+                        "gcp_vm_provision_failed",
+                        include_source_action=True,
+                        trigger="process_crash.active_rescue_failed",
+                    )
                     return
 
             # Continue to normal crash handling (will trigger GCP offload in restart logic)
@@ -9120,6 +9284,14 @@ class ProcessOrchestrator:
                 "\n".join(f"    | {line}" for line in output_lines[-10:])
         )
 
+        propagation_reason = "oom_kill" if is_oom_kill else "process_crash"
+        await self._trigger_failure_propagation_policy(
+            service_name,
+            propagation_reason,
+            include_source_action=False,
+            trigger="process_crash.detected",
+        )
+
         # Check circuit breaker
         if self._should_circuit_break(service_name):
             logger.error(
@@ -9136,6 +9308,12 @@ class ProcessOrchestrator:
                 service_name,
                 "circuit_breaker_open",
                 {"reason": "crash_rate_exceeded", "analysis": analysis}
+            )
+            await self._trigger_failure_propagation_policy(
+                service_name,
+                "circuit_breaker_open",
+                include_source_action=True,
+                trigger="process_crash.circuit_breaker_open",
             )
             return
 
@@ -11213,7 +11391,21 @@ class ProcessOrchestrator:
 
     async def _handle_dependency_error(self, error_info: Dict[str, Any]) -> None:
         """Handle dependency errors."""
-        logger.warning(f"[v95.10] Dependency error from {error_info['source_repo']}: {error_info['message']}")
+        source_repo = str(error_info.get("source_repo", "unknown"))
+        reason = str(error_info.get("reason", "dependency_error"))
+        message = str(error_info.get("message", "dependency_error"))
+
+        logger.warning(f"[v95.10] Dependency error from {source_repo}: {message}")
+
+        if source_repo and self._normalize_trinity_service_name(source_repo) in {
+            self._normalize_trinity_service_name(name) for name in self.processes.keys()
+        }:
+            await self._trigger_failure_propagation_policy(
+                source_repo,
+                reason,
+                include_source_action=False,
+                trigger="error_handler.dependency_error",
+            )
 
     def register_error_handler(self, error_type: str, handler: Callable) -> None:
         """Register an error handler."""
@@ -11563,11 +11755,268 @@ class ProcessOrchestrator:
                 "utilization": used / limit if limit > 0 else 0,
             }
 
+        status["global_admission"] = {
+            "enabled": self._global_admission_enabled,
+            "timeout_seconds": self._global_admission_timeout_s,
+            "memory_percent_max": self._global_admission_memory_percent_max,
+            "min_available_gb": self._global_admission_min_available_gb,
+            "active_leases": len(self._global_admission_active_leases),
+            "recent_events": self._global_admission_history[-50:],
+        }
+
         return status
 
     def register_resource_conflict_handler(self, resource: str, handler: Callable) -> None:
         """Register a conflict resolution handler for a resource."""
         self._resource_conflict_handlers[resource] = handler
+
+    def _record_global_admission_event(self, event: Dict[str, Any]) -> None:
+        """Record bounded admission history for observability."""
+        self._global_admission_history.append(event)
+        if len(self._global_admission_history) > self._global_admission_history_limit:
+            self._global_admission_history = self._global_admission_history[-self._global_admission_history_limit:]
+
+    async def _collect_global_admission_snapshot(self) -> Dict[str, Any]:
+        """
+        Collect cross-repo pressure snapshot used by global admission control.
+        """
+        memory_info = await get_memory_info_nonblocking()
+        try:
+            net_connections = await get_net_connections_nonblocking(port=None)
+            network_connection_count = len(net_connections)
+        except Exception:
+            network_connection_count = 0
+
+        available_mb = int(memory_info.get("available_gb", 0) * 1024)
+        return {
+            "memory_percent": float(memory_info.get("percent", 0.0)),
+            "available_mb": available_mb,
+            "available_gb": float(memory_info.get("available_gb", 0.0)),
+            "network_connections": int(network_connection_count),
+            "timestamp": time.time(),
+        }
+
+    def _estimate_global_admission_demand(self, service: str, operation: str) -> Dict[str, int]:
+        """
+        Estimate required shared resources for an operation lease.
+        """
+        service_key = str(service or "unknown").strip().lower().replace("-", "_")
+        operation_key = str(operation or "op").strip().lower().replace("-", "_")
+
+        service_weights = {
+            "jarvis_prime": 0.35,
+            "reactor_core": 0.25,
+            "jarvis_body": 0.15,
+        }
+        op_multipliers = {
+            "spawn": 1.0,
+            "restart": 0.8,
+            "recovery": 0.8,
+        }
+
+        weight = service_weights.get(service_key, 0.1)
+        op_multiplier = op_multipliers.get(operation_key, 0.5)
+
+        limit_mem = max(int(self._resource_limits.get("memory_mb", 16384)), 1)
+        limit_gpu = max(int(self._resource_limits.get("gpu_memory_mb", 8192)), 1)
+        limit_net = max(int(self._resource_limits.get("network_connections", 1000)), 1)
+        limit_cpu = max(int(self._resource_limits.get("cpu_cores", 8)), 1)
+
+        default_memory_mb = max(256, int(limit_mem * weight * op_multiplier))
+        default_gpu_mb = int(limit_gpu * weight * op_multiplier)
+        default_net = max(10, int(limit_net * 0.05 * op_multiplier))
+        default_cpu = max(1, int(limit_cpu * 0.2 * op_multiplier))
+
+        env_prefix = f"JARVIS_ADMISSION_{service_key.upper()}_{operation_key.upper()}"
+        return {
+            "memory_mb": _get_env_int(f"{env_prefix}_MEMORY_MB", default_memory_mb),
+            "gpu_memory_mb": _get_env_int(f"{env_prefix}_GPU_MEMORY_MB", default_gpu_mb),
+            "network_connections": _get_env_int(f"{env_prefix}_NETWORK_CONNECTIONS", default_net),
+            "cpu_cores": _get_env_int(f"{env_prefix}_CPU_CORES", default_cpu),
+        }
+
+    async def _acquire_global_admission_lease(
+        self,
+        service: str,
+        operation: str,
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> Tuple[bool, str, Optional[str]]:
+        """
+        Acquire global admission lease to prevent cross-repo overload loops.
+        """
+        if not self._global_admission_enabled:
+            return True, "admission_disabled", None
+
+        self._ensure_locks_initialized()
+        assert self._resource_lock is not None
+
+        demand = self._estimate_global_admission_demand(service, operation)
+        timeout = timeout_s if timeout_s is not None else self._global_admission_timeout_s
+        deadline = time.time() + max(timeout, 0.1)
+        attempt = 0
+        last_reasons: List[str] = []
+
+        while True:
+            snapshot = await self._collect_global_admission_snapshot()
+            now = time.time()
+
+            async with self._resource_lock:
+                denial_reasons: List[str] = []
+
+                if snapshot["memory_percent"] >= self._global_admission_memory_percent_max:
+                    denial_reasons.append(
+                        f"memory_percent={snapshot['memory_percent']:.1f} >= {self._global_admission_memory_percent_max:.1f}"
+                    )
+                if snapshot["available_gb"] < self._global_admission_min_available_gb:
+                    denial_reasons.append(
+                        f"available_gb={snapshot['available_gb']:.2f} < {self._global_admission_min_available_gb:.2f}"
+                    )
+
+                for resource, requested in demand.items():
+                    requested_amt = max(int(requested), 0)
+                    limit = int(self._resource_limits.get(resource, 0))
+                    if limit <= 0:
+                        continue
+                    current_usage = sum(
+                        allocs.get(resource, 0)
+                        for allocs in self._resource_allocations.values()
+                    )
+                    projected = current_usage + requested_amt
+                    if projected > limit:
+                        denial_reasons.append(
+                            f"{resource} projected={projected} exceeds limit={limit}"
+                        )
+
+                net_limit = int(self._resource_limits.get("network_connections", 0))
+                if net_limit > 0:
+                    projected_network = snapshot["network_connections"] + max(
+                        int(demand.get("network_connections", 0)),
+                        0,
+                    )
+                    if projected_network > net_limit:
+                        denial_reasons.append(
+                            f"network_connections projected={projected_network} exceeds limit={net_limit}"
+                        )
+
+                if not denial_reasons:
+                    lease_id = f"admit-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
+                    self._global_admission_active_leases[lease_id] = {
+                        "lease_id": lease_id,
+                        "service": service,
+                        "operation": operation,
+                        "demand": demand,
+                        "acquired_at": now,
+                        "snapshot": snapshot,
+                    }
+
+                    service_alloc = self._resource_allocations.setdefault(service, {})
+                    for resource, requested in demand.items():
+                        amount = max(int(requested), 0)
+                        if amount <= 0:
+                            continue
+                        service_alloc[resource] = service_alloc.get(resource, 0) + amount
+                        self._resource_registry[f"{service}:{resource}:{lease_id}"] = {
+                            "service": service,
+                            "resource": resource,
+                            "amount": amount,
+                            "priority": 100,
+                            "operation": operation,
+                            "lease_id": lease_id,
+                            "timestamp": now,
+                            "admission_control": True,
+                        }
+
+                    self._record_global_admission_event(
+                        {
+                            "timestamp": now,
+                            "service": service,
+                            "operation": operation,
+                            "decision": "granted",
+                            "lease_id": lease_id,
+                            "demand": demand,
+                            "snapshot": snapshot,
+                        }
+                    )
+                    return True, "admitted", lease_id
+
+                last_reasons = denial_reasons
+                self._record_global_admission_event(
+                    {
+                        "timestamp": now,
+                        "service": service,
+                        "operation": operation,
+                        "decision": "deferred",
+                        "attempt": attempt,
+                        "reasons": denial_reasons,
+                        "demand": demand,
+                        "snapshot": snapshot,
+                    }
+                )
+
+            if now >= deadline:
+                reason_text = "; ".join(last_reasons) if last_reasons else "admission_timeout"
+                self._record_global_admission_event(
+                    {
+                        "timestamp": now,
+                        "service": service,
+                        "operation": operation,
+                        "decision": "denied",
+                        "attempts": attempt + 1,
+                        "reasons": last_reasons,
+                        "demand": demand,
+                    }
+                )
+                return False, reason_text, None
+
+            await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
+            attempt += 1
+
+    async def _release_global_admission_lease(
+        self,
+        lease_id: Optional[str],
+        *,
+        outcome: str,
+    ) -> None:
+        """Release global admission lease and return reserved resources."""
+        if not lease_id or not self._global_admission_enabled:
+            return
+
+        self._ensure_locks_initialized()
+        assert self._resource_lock is not None
+
+        async with self._resource_lock:
+            lease = self._global_admission_active_leases.pop(lease_id, None)
+            if not lease:
+                return
+
+            service = str(lease.get("service", "unknown"))
+            demand = lease.get("demand", {}) or {}
+            service_alloc = self._resource_allocations.get(service, {})
+
+            for resource, requested in demand.items():
+                amount = max(int(requested), 0)
+                if amount <= 0:
+                    continue
+                if resource in service_alloc:
+                    service_alloc[resource] = max(0, service_alloc[resource] - amount)
+                    if service_alloc[resource] == 0:
+                        del service_alloc[resource]
+                self._resource_registry.pop(f"{service}:{resource}:{lease_id}", None)
+
+            if not service_alloc and service in self._resource_allocations:
+                del self._resource_allocations[service]
+
+            self._record_global_admission_event(
+                {
+                    "timestamp": time.time(),
+                    "service": service,
+                    "operation": lease.get("operation"),
+                    "decision": "released",
+                    "lease_id": lease_id,
+                    "outcome": outcome,
+                }
+            )
 
     # -------------------------------------------------------------------------
     # Issue 37: Cross-Repo Version Compatibility
@@ -11702,6 +12151,133 @@ class ProcessOrchestrator:
             "compatibility_matrix": self._compatibility_matrix.copy(),
             "check_enabled": self._version_check_enabled,
         }
+
+    # -------------------------------------------------------------------------
+    # v281.3: Cross-Repo Ownership Boundary Contracts
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_csv_domains(raw: Optional[str]) -> Set[str]:
+        """Parse a comma-separated domain list into normalized set."""
+        if not raw:
+            return set()
+        return {
+            item.strip().lower()
+            for item in str(raw).split(",")
+            if item and item.strip()
+        }
+
+    def _get_allowed_responsibility_domains(self) -> Dict[str, Set[str]]:
+        """
+        Get allowed responsibility domains per service with env overrides.
+
+        Env override format:
+        - JARVIS_OWNERSHIP_DOMAINS_JARVIS_PRIME=a,b,c
+        - JARVIS_OWNERSHIP_DOMAINS_REACTOR_CORE=a,b,c
+        - JARVIS_OWNERSHIP_DOMAINS_JARVIS_BODY=a,b,c
+        """
+        defaults = {
+            "jarvis-prime": {
+                "model_registry",
+                "capability_routing",
+                "model_selection",
+            },
+            "reactor-core": {
+                "training",
+                "compute_primitives",
+                "model_training_orchestration",
+            },
+            "jarvis-body": {
+                "runtime_orchestration",
+                "agent_pipelines",
+                "multimodal_pipelines",
+            },
+        }
+
+        overrides = {
+            "jarvis-prime": self._parse_csv_domains(
+                os.environ.get("JARVIS_OWNERSHIP_DOMAINS_JARVIS_PRIME")
+            ),
+            "reactor-core": self._parse_csv_domains(
+                os.environ.get("JARVIS_OWNERSHIP_DOMAINS_REACTOR_CORE")
+            ),
+            "jarvis-body": self._parse_csv_domains(
+                os.environ.get("JARVIS_OWNERSHIP_DOMAINS_JARVIS_BODY")
+            ),
+        }
+        return {
+            service: (overrides[service] if overrides[service] else allowed)
+            for service, allowed in defaults.items()
+        }
+
+    def _validate_ownership_boundaries(self) -> List[str]:
+        """
+        Validate cross-repo ownership boundaries and detect responsibility leakage.
+        """
+        issues: List[str] = []
+        definitions = {
+            definition.name: definition
+            for definition in ServiceDefinitionRegistry.get_all_definitions(validate=True)
+        }
+        allowed_domains = self._get_allowed_responsibility_domains()
+
+        expected_owners = {
+            "jarvis-prime": "jarvis-prime",
+            "reactor-core": "reactor-core",
+        }
+
+        for service_name, expected_owner in expected_owners.items():
+            definition = definitions.get(service_name)
+            if not definition:
+                issues.append(f"Missing canonical definition for {service_name}")
+                continue
+
+            owner = (definition.owner_repo or "").strip().lower()
+            if owner != expected_owner:
+                issues.append(
+                    f"{service_name} owner_repo '{definition.owner_repo}' does not match expected '{expected_owner}'"
+                )
+
+            declared_domains = {
+                domain.strip().lower()
+                for domain in (definition.responsibility_domains or [])
+                if domain and str(domain).strip()
+            }
+            if not declared_domains:
+                issues.append(f"{service_name} has no declared responsibility_domains")
+                continue
+
+            leaked_domains = declared_domains.difference(allowed_domains.get(service_name, set()))
+            if leaked_domains:
+                issues.append(
+                    f"{service_name} declares out-of-bound domains: {sorted(leaked_domains)}"
+                )
+
+        # Cross-role dependency guardrails:
+        # Prime (registry/routing) must not depend on Reactor (training/compute).
+        prime = definitions.get("jarvis-prime")
+        if prime:
+            prime_deps = {
+                dep.strip().lower()
+                for dep in (prime.depends_on or []) + (prime.soft_depends_on or [])
+                if dep and dep.strip()
+            }
+            if "reactor-core" in prime_deps:
+                issues.append("jarvis-prime must not depend on reactor-core (ownership leakage)")
+
+        # Reactor may soft-depend on Prime, but must not hard-depend on it.
+        reactor = definitions.get("reactor-core")
+        if reactor:
+            reactor_hard_deps = {
+                dep.strip().lower()
+                for dep in (reactor.depends_on or [])
+                if dep and dep.strip()
+            }
+            if "jarvis-prime" in reactor_hard_deps:
+                issues.append("reactor-core must not hard-depend on jarvis-prime")
+
+        self._ownership_contract_violations = issues
+        return issues
 
     # -------------------------------------------------------------------------
     # Issue 38: Cross-Repo Security Context
@@ -11900,7 +12476,7 @@ class ProcessOrchestrator:
 
         # Track initialization for voice feedback
         systems_initialized = 0
-        total_systems = 8
+        total_systems = 9
 
         # Initialize in order (some depend on others)
         # 1. Unified Configuration
@@ -11960,7 +12536,32 @@ class ProcessOrchestrator:
             await _emit_event("CROSS_REPO_VERSION_COMPATIBLE", priority="LOW")
         systems_initialized += 1
 
-        # 8. Metrics Collection
+        # 8. Ownership boundary contract validation
+        await _emit_event("CROSS_REPO_OWNERSHIP_CHECK", priority="MEDIUM")
+        ownership_issues = self._validate_ownership_boundaries()
+        if ownership_issues:
+            for issue in ownership_issues:
+                logger.error(f"[v281.3] Ownership contract violation: {issue}")
+
+            await _emit_event(
+                "CROSS_REPO_OWNERSHIP_VIOLATION",
+                priority="HIGH",
+                details={
+                    "strict_mode": self._ownership_contract_strict,
+                    "violation_count": len(ownership_issues),
+                    "violations": ownership_issues,
+                },
+            )
+            if self._ownership_contract_strict:
+                raise RuntimeError(
+                    "Cross-repo ownership contract violation(s): "
+                    + "; ".join(ownership_issues)
+                )
+        else:
+            await _emit_event("CROSS_REPO_OWNERSHIP_VALID", priority="LOW")
+        systems_initialized += 1
+
+        # 9. Metrics Collection
         await _emit_event("CROSS_REPO_METRICS_INIT", priority="LOW")
         await self._initialize_metrics_collection()
         await _emit_event("CROSS_REPO_METRICS_ACTIVE", priority="LOW",
@@ -12004,10 +12605,16 @@ class ProcessOrchestrator:
                 "enabled": self._resource_coordination_enabled,
                 "resources": len(self._resource_limits),
                 "allocations": len(self._resource_registry),
+                "global_admission_enabled": self._global_admission_enabled,
+                "global_admission_active_leases": len(self._global_admission_active_leases),
             },
             "version_compatibility": {
                 "enabled": self._version_check_enabled,
                 "versions": self._version_registry,
+            },
+            "ownership_contract": {
+                "strict_mode": self._ownership_contract_strict,
+                "violations": list(self._ownership_contract_violations),
             },
             "security": {
                 "enabled": self._security_context_enabled,
@@ -12198,6 +12805,898 @@ class ProcessOrchestrator:
                 except Exception:
                     pass
         return status
+
+    # =========================================================================
+    # v281.0: Cross-Repo Failure Propagation Policy Engine
+    # =========================================================================
+
+    @staticmethod
+    def _normalize_trinity_service_name(service_name: str) -> str:
+        """Normalize aliases to canonical Trinity service names."""
+        normalized = str(service_name or "").strip().lower().replace("_", "-")
+        alias_map = {
+            "jarvis": "jarvis-body",
+            "jarvis-body": "jarvis-body",
+            "jarvis-prime": "jarvis-prime",
+            "j-prime": "jarvis-prime",
+            "jprime": "jarvis-prime",
+            "prime": "jarvis-prime",
+            "reactor": "reactor-core",
+            "reactor-core": "reactor-core",
+        }
+        return alias_map.get(normalized, normalized)
+
+    def _iter_trinity_service_names(self) -> List[str]:
+        """
+        Return deterministic service order for propagation directives.
+
+        Canonical Trinity services are always included, with any additional
+        managed services appended in lexical order.
+        """
+        base_order = ["jarvis-body", "jarvis-prime", "reactor-core"]
+        discovered = {
+            self._normalize_trinity_service_name(name)
+            for name in self.processes.keys()
+        }
+        discovered.update(base_order)
+        ordered = [name for name in base_order if name in discovered]
+        extras = sorted(discovered.difference(base_order))
+        return ordered + extras
+
+    def _collect_dependency_sets(self, source_service: str) -> Tuple[Set[str], Set[str]]:
+        """
+        Compute hard and soft dependents for a given source service.
+        """
+        source = self._normalize_trinity_service_name(source_service)
+        hard_dependents: Set[str] = set()
+        soft_dependents: Set[str] = set()
+
+        for service_name, managed in self.processes.items():
+            target = self._normalize_trinity_service_name(service_name)
+            definition = getattr(managed, "definition", None)
+            hard_deps = {
+                self._normalize_trinity_service_name(dep)
+                for dep in getattr(definition, "depends_on", []) or []
+            }
+            soft_deps = {
+                self._normalize_trinity_service_name(dep)
+                for dep in getattr(definition, "soft_depends_on", []) or []
+            }
+            if source in hard_deps:
+                hard_dependents.add(target)
+            if source in soft_deps:
+                soft_dependents.add(target)
+
+        return hard_dependents, soft_dependents
+
+    def _build_failure_propagation_plan(
+        self,
+        failed_service: str,
+        reason: str,
+        *,
+        include_source_action: bool,
+    ) -> List[FailurePropagationDirective]:
+        """
+        Build deterministic action plan for a source failure.
+
+        Policy:
+        - Source: restart by default, isolate for terminal reasons.
+        - Hard dependents: drain on transient dependency break; isolate on terminal.
+        - Soft dependents: degrade.
+        - Unrelated peers: degrade only for terminal/platform-wide conditions.
+        """
+        source = self._normalize_trinity_service_name(failed_service)
+        normalized_reason = str(reason or "unknown").strip().lower()
+        hard_dependents, soft_dependents = self._collect_dependency_sets(source)
+
+        source_is_critical = True
+        if source in self.processes:
+            source_is_critical = bool(getattr(self.processes[source].definition, "is_critical", True))
+
+        terminal_reasons = {
+            "circuit_breaker_open",
+            "max_restart_attempts_exceeded",
+            "oom_circuit_breaker_tripped",
+        }
+        terminal_failure = normalized_reason in terminal_reasons
+        platform_wide_reasons = {
+            "memory_pressure",
+            "network_partition",
+            "event_bus_unavailable",
+        }
+        is_platform_wide_reason = normalized_reason in platform_wide_reasons
+
+        directives: List[FailurePropagationDirective] = []
+        for target in self._iter_trinity_service_names():
+            action = FailurePropagationAction.NONE
+
+            if target == source:
+                if include_source_action:
+                    action = (
+                        FailurePropagationAction.ISOLATE
+                        if terminal_failure
+                        else FailurePropagationAction.RESTART
+                    )
+            elif target in hard_dependents:
+                action = (
+                    FailurePropagationAction.ISOLATE
+                    if terminal_failure
+                    else FailurePropagationAction.DRAIN
+                )
+            elif target in soft_dependents:
+                action = FailurePropagationAction.DEGRADE
+            elif (terminal_failure and source_is_critical) or is_platform_wide_reason:
+                action = FailurePropagationAction.DEGRADE
+
+            directives.append(
+                FailurePropagationDirective(
+                    source_service=source,
+                    target_service=target,
+                    action=action,
+                    reason=normalized_reason,
+                )
+            )
+
+        return directives
+
+    def _should_apply_failure_directive(self, directive: FailurePropagationDirective) -> bool:
+        """
+        Deduplicate rapid repeated directives via cooldown hysteresis.
+        """
+        if directive.action == FailurePropagationAction.NONE:
+            return False
+
+        now = time.time()
+        key = (
+            f"{directive.source_service}|{directive.target_service}|"
+            f"{directive.action.value}|{directive.reason}"
+        )
+        last = self._failure_propagation_last_applied.get(key, 0.0)
+        if (now - last) < self._failure_propagation_cooldown_s:
+            return False
+
+        self._failure_propagation_last_applied[key] = now
+        return True
+
+    @staticmethod
+    def _parse_failure_propagation_action(raw: Any) -> Optional[FailurePropagationAction]:
+        """Parse persisted action string into enum."""
+        if isinstance(raw, FailurePropagationAction):
+            return raw
+        if raw is None:
+            return None
+        try:
+            return FailurePropagationAction(str(raw))
+        except Exception:
+            return None
+
+    def _collect_observed_failure_policy_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Capture current runtime reality used for crash-consistency reconciliation.
+        """
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for service_name, managed in self.processes.items():
+            status = getattr(managed, "status", ServiceStatus.PENDING)
+            snapshot[service_name] = {
+                "is_running": bool(getattr(managed, "is_running", False)),
+                "status": status.value if isinstance(status, ServiceStatus) else str(status),
+                "degradation_mode": self._degradation_mode.get(service_name),
+                "crash_circuit_breaker_open": bool(self._crash_circuit_breakers.get(service_name, False)),
+            }
+        return snapshot
+
+    def _build_failure_policy_persist_payload(self) -> Dict[str, Any]:
+        """Build durable payload with intent, memory state, and observed snapshot."""
+        return {
+            "schema_version": 1,
+            "updated_at": time.time(),
+            "supervisor_pid": os.getpid(),
+            "idempotency_state": self._failure_effect_idempotency_state,
+            "history": self._failure_propagation_history[-self._failure_propagation_history_limit:],
+            "last_applied": self._failure_propagation_last_applied,
+            "degradation_mode": self._degradation_mode,
+            "crash_circuit_breakers": self._crash_circuit_breakers,
+            "observed_snapshot": self._collect_observed_failure_policy_snapshot(),
+        }
+
+    async def _persist_failure_policy_state(self, reason: str = "update") -> None:
+        """
+        Persist failure policy state atomically for crash-consistent recovery.
+        """
+        payload = self._build_failure_policy_persist_payload()
+        async with self._failure_policy_persistence_lock_safe:
+            ok = await write_json_nonblocking(self._failure_policy_journal_path, payload)
+        if not ok:
+            logger.warning(
+                "[v281.2] Failed to persist failure policy journal (%s): %s",
+                reason,
+                self._failure_policy_journal_path,
+            )
+
+    async def _observe_failure_effect_state(
+        self,
+        target_service: str,
+        action: FailurePropagationAction,
+    ) -> bool:
+        """
+        Observe whether a previously-intended side effect is currently true.
+        """
+        target = self._normalize_trinity_service_name(target_service)
+        managed = self.processes.get(target)
+
+        if action == FailurePropagationAction.DEGRADE:
+            return self._degradation_mode.get(target) == "degraded"
+
+        if action == FailurePropagationAction.DRAIN:
+            try:
+                from backend.core.resilience.graceful_shutdown import get_operation_guard
+                guard = await get_operation_guard()
+                stats = guard.get_stats()
+                draining = set(stats.get("draining_categories", []))
+                if target in draining:
+                    return True
+            except Exception:
+                pass
+            return self._degradation_mode.get(target) == "degraded"
+
+        if action == FailurePropagationAction.RESTART:
+            if not managed:
+                return False
+            status = getattr(managed, "status", None)
+            return bool(getattr(managed, "is_running", False)) or status in {
+                ServiceStatus.HEALTHY,
+                ServiceStatus.STARTING,
+                ServiceStatus.RESTARTING,
+            }
+
+        if action == FailurePropagationAction.ISOLATE:
+            isolated = self._degradation_mode.get(target) == "isolated"
+            breaker_open = bool(self._crash_circuit_breakers.get(target, False))
+            stopped = True if not managed else not bool(getattr(managed, "is_running", False))
+            return isolated and breaker_open and stopped
+
+        return True
+
+    async def _replay_restored_failure_intent(
+        self,
+        target_service: str,
+        action: FailurePropagationAction,
+    ) -> bool:
+        """
+        Replay unresolved local control-plane intent after crash/restart.
+        """
+        target = self._normalize_trinity_service_name(target_service)
+        managed = self.processes.get(target)
+
+        if action == FailurePropagationAction.DEGRADE:
+            async with self._degradation_lock_safe:
+                self._degradation_mode[target] = "degraded"
+                self._service_capabilities[target] = {"basic", "read_only"}
+            if managed and getattr(managed, "status", None) == ServiceStatus.HEALTHY:
+                managed.status = ServiceStatus.DEGRADED
+            return True
+
+        if action == FailurePropagationAction.DRAIN:
+            try:
+                from backend.core.resilience.graceful_shutdown import get_operation_guard
+                guard = await get_operation_guard()
+                await guard.begin_drain(target)
+            except Exception:
+                pass
+            async with self._degradation_lock_safe:
+                self._degradation_mode[target] = "degraded"
+                self._service_capabilities[target] = {"basic", "read_only"}
+            if managed and getattr(managed, "status", None) == ServiceStatus.HEALTHY:
+                managed.status = ServiceStatus.DEGRADED
+            return True
+
+        if action == FailurePropagationAction.ISOLATE:
+            async with self._degradation_lock_safe:
+                self._degradation_mode[target] = "isolated"
+                self._service_capabilities[target] = {"basic", "read_only"}
+            self._crash_circuit_breakers[target] = True
+            if managed and bool(getattr(managed, "is_running", False)):
+                try:
+                    await self._stop_process(managed)
+                except Exception:
+                    pass
+            if managed:
+                managed.status = ServiceStatus.FAILED
+            return True
+
+        # RESTART is intentionally not replayed at restore-time to avoid
+        # blind side effects after crash. It is re-evaluated by normal recovery.
+        return False
+
+    async def _reconcile_restored_failure_policy_state(self) -> None:
+        """
+        Reconcile journaled intent with observed runtime truth after restart.
+        """
+        now = time.time()
+        changed = False
+        records = list(self._failure_effect_idempotency_state.items())
+        for key, record in records:
+            status = str(record.get("status", "unknown"))
+            target = self._normalize_trinity_service_name(str(record.get("target_service", "")))
+            action = self._parse_failure_propagation_action(record.get("action"))
+            if not target or action is None:
+                continue
+
+            observed = await self._observe_failure_effect_state(target, action)
+            if observed:
+                if status != "succeeded":
+                    record["status"] = "succeeded"
+                    record["note"] = "reconciled_observed_truth"
+                    record["result"] = True
+                    record["updated_at"] = now
+                    changed = True
+                continue
+
+            if status in {"in_progress", "uncertain"}:
+                replayed = await self._replay_restored_failure_intent(target, action)
+                if replayed:
+                    record["status"] = "succeeded"
+                    record["note"] = "replayed_from_journal_intent"
+                    record["result"] = True
+                else:
+                    record["status"] = "failed"
+                    record["note"] = "unresolved_after_restart_requires_runtime_recovery"
+                    record["result"] = False
+                record["updated_at"] = now
+                changed = True
+
+        if changed:
+            await self._persist_failure_policy_state("reconcile_after_restore")
+
+    async def _restore_failure_policy_state_if_needed(self) -> None:
+        """
+        Load persisted policy state exactly once and reconcile drift.
+        """
+        if self._failure_policy_state_loaded:
+            return
+
+        async with self._failure_policy_persistence_lock_safe:
+            if self._failure_policy_state_loaded:
+                return
+            payload = await read_json_nonblocking(self._failure_policy_journal_path)
+            if not payload:
+                self._failure_policy_state_loaded = True
+                return
+
+            restored_history = payload.get("history", [])
+            restored_last_applied = payload.get("last_applied", {})
+            restored_idempotency = payload.get("idempotency_state", {})
+            restored_degradation = payload.get("degradation_mode", {})
+            restored_breakers = payload.get("crash_circuit_breakers", {})
+
+            if isinstance(restored_history, list):
+                self._failure_propagation_history = [
+                    item for item in restored_history if isinstance(item, dict)
+                ][-self._failure_propagation_history_limit:]
+            if isinstance(restored_last_applied, dict):
+                self._failure_propagation_last_applied = {
+                    str(k): float(v)
+                    for k, v in restored_last_applied.items()
+                    if isinstance(k, str)
+                }
+            if isinstance(restored_idempotency, dict):
+                self._failure_effect_idempotency_state = {
+                    str(k): v
+                    for k, v in restored_idempotency.items()
+                    if isinstance(k, str) and isinstance(v, dict)
+                }
+            if isinstance(restored_degradation, dict):
+                async with self._degradation_lock_safe:
+                    self._degradation_mode.update(
+                        {str(k): str(v) for k, v in restored_degradation.items()}
+                    )
+            if isinstance(restored_breakers, dict):
+                self._crash_circuit_breakers.update(
+                    {str(k): bool(v) for k, v in restored_breakers.items()}
+                )
+
+            self._failure_policy_state_loaded = True
+
+        await self._reconcile_restored_failure_policy_state()
+
+    @staticmethod
+    def _failure_effect_idempotency_key(directive: FailurePropagationDirective) -> str:
+        """
+        Build idempotency key for side-effecting recovery operations.
+
+        Key intentionally ignores transient reason text to prevent duplicate
+        side effects when retries arrive with slightly different labels.
+        """
+        return f"{directive.target_service}|{directive.action.value}"
+
+    async def _prune_failure_effect_idempotency_state(self) -> None:
+        """Drop stale idempotency records so state remains bounded."""
+        now = time.time()
+        ttl = max(self._failure_effect_idempotency_ttl_s, 1.0)
+        inflight = max(self._failure_effect_idempotency_inflight_s, 1.0)
+        changed = False
+
+        async with self._failure_effect_idempotency_lock_safe:
+            stale_keys: List[str] = []
+            for key, record in self._failure_effect_idempotency_state.items():
+                updated_at = float(record.get("updated_at", 0.0))
+                age = now - updated_at
+                status = str(record.get("status", "unknown"))
+
+                # Keep in-progress/uncertain records around for the shorter
+                # in-flight window to avoid duplicate side effects.
+                if status in {"in_progress", "uncertain"}:
+                    if age > inflight:
+                        stale_keys.append(key)
+                    continue
+
+                if age > ttl:
+                    stale_keys.append(key)
+
+            for key in stale_keys:
+                self._failure_effect_idempotency_state.pop(key, None)
+                changed = True
+
+        if changed:
+            await self._persist_failure_policy_state("prune_idempotency")
+
+    async def _reserve_failure_effect_idempotency(
+        self,
+        directive: FailurePropagationDirective,
+    ) -> Tuple[str, str, str]:
+        """
+        Reserve or reuse idempotency slot for a directive.
+
+        Returns:
+            (decision, key, operation_id)
+            decision in {"execute", "reused_success", "in_progress"}
+        """
+        await self._prune_failure_effect_idempotency_state()
+
+        key = self._failure_effect_idempotency_key(directive)
+        now = time.time()
+
+        async with self._failure_effect_idempotency_lock_safe:
+            record = self._failure_effect_idempotency_state.get(key)
+            if record:
+                status = str(record.get("status", "unknown"))
+                updated_at = float(record.get("updated_at", 0.0))
+                age = now - updated_at
+                operation_id = str(record.get("operation_id", "unknown"))
+
+                if status == "succeeded" and age <= self._failure_effect_idempotency_ttl_s:
+                    return "reused_success", key, operation_id
+
+                if status in {"in_progress", "uncertain"} and age <= self._failure_effect_idempotency_inflight_s:
+                    return "in_progress", key, operation_id
+
+            attempts = int(record.get("attempts", 0)) + 1 if record else 1
+            operation_id = f"op-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
+            self._failure_effect_idempotency_state[key] = {
+                "operation_id": operation_id,
+                "status": "in_progress",
+                "updated_at": now,
+                "attempts": attempts,
+                "source_service": directive.source_service,
+                "target_service": directive.target_service,
+                "action": directive.action.value,
+                "reason": directive.reason,
+                "note": "reserved",
+                "result": None,
+            }
+        await self._persist_failure_policy_state("reserve_idempotency")
+        return "execute", key, operation_id
+
+    async def _set_failure_effect_idempotency_status(
+        self,
+        key: str,
+        operation_id: str,
+        *,
+        status: str,
+        note: str,
+        result: Optional[bool],
+    ) -> None:
+        """Update idempotency slot if this operation still owns it."""
+        changed = False
+        async with self._failure_effect_idempotency_lock_safe:
+            record = self._failure_effect_idempotency_state.get(key)
+            if not record:
+                return
+            if str(record.get("operation_id")) != str(operation_id):
+                # Another attempt has superseded this operation.
+                return
+            record["status"] = status
+            record["note"] = note
+            record["result"] = result
+            record["updated_at"] = time.time()
+            changed = True
+        if changed:
+            await self._persist_failure_policy_state("update_idempotency_status")
+
+    async def _execute_idempotent_failure_effect(
+        self,
+        directive: FailurePropagationDirective,
+        effect_coro: Callable[[], Awaitable[Tuple[bool, str]]],
+        verify_coro: Optional[Callable[[], Awaitable[bool]]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Execute one failure directive side effect with idempotency protection.
+
+        Prevents duplicated side effects when a previous attempt timed out or was
+        cancelled locally after the effect may already have been applied.
+        """
+        decision, key, operation_id = await self._reserve_failure_effect_idempotency(directive)
+
+        if decision == "reused_success":
+            return True, "idempotent_reused_success"
+
+        if decision == "in_progress":
+            if verify_coro is not None:
+                try:
+                    if await verify_coro():
+                        await self._set_failure_effect_idempotency_status(
+                            key,
+                            operation_id,
+                            status="succeeded",
+                            note="idempotent_verified_in_progress",
+                            result=True,
+                        )
+                        return True, "idempotent_verified_in_progress"
+                except Exception:
+                    pass
+            return True, "idempotent_in_progress_suppressed"
+
+        try:
+            success, note = await effect_coro()
+        except asyncio.CancelledError:
+            await self._set_failure_effect_idempotency_status(
+                key,
+                operation_id,
+                status="uncertain",
+                note="local_timeout_or_cancelled",
+                result=None,
+            )
+            if verify_coro is not None:
+                try:
+                    if await verify_coro():
+                        await self._set_failure_effect_idempotency_status(
+                            key,
+                            operation_id,
+                            status="succeeded",
+                            note="verified_after_cancellation",
+                            result=True,
+                        )
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            if verify_coro is not None:
+                try:
+                    if await verify_coro():
+                        await self._set_failure_effect_idempotency_status(
+                            key,
+                            operation_id,
+                            status="succeeded",
+                            note="verified_after_exception",
+                            result=True,
+                        )
+                        return True, "verified_after_exception"
+                except Exception:
+                    pass
+
+            note = f"exception:{type(exc).__name__}"
+            await self._set_failure_effect_idempotency_status(
+                key,
+                operation_id,
+                status="failed",
+                note=note,
+                result=False,
+            )
+            return False, note
+
+        await self._set_failure_effect_idempotency_status(
+            key,
+            operation_id,
+            status="succeeded" if success else "failed",
+            note=note,
+            result=success,
+        )
+        return success, note
+
+    async def _record_failure_propagation_event(
+        self,
+        directive: FailurePropagationDirective,
+        *,
+        applied: bool,
+        note: str,
+    ) -> None:
+        event = {
+            "timestamp": time.time(),
+            "source_service": directive.source_service,
+            "target_service": directive.target_service,
+            "action": directive.action.value,
+            "reason": directive.reason,
+            "applied": applied,
+            "note": note,
+        }
+        self._failure_propagation_history.append(event)
+        if len(self._failure_propagation_history) > self._failure_propagation_history_limit:
+            self._failure_propagation_history = self._failure_propagation_history[-self._failure_propagation_history_limit:]
+
+        try:
+            await self._publish_lifecycle_event(
+                event_type="system.failure_propagation",
+                payload=event,
+                priority="HIGH" if applied else "NORMAL",
+            )
+        except Exception:
+            pass
+        await self._persist_failure_policy_state("record_failure_event")
+
+    async def _apply_failure_directive(
+        self,
+        directive: FailurePropagationDirective,
+    ) -> bool:
+        """
+        Apply one policy directive.
+        """
+        target = directive.target_service
+        action = directive.action
+        managed = self.processes.get(target)
+
+        if action == FailurePropagationAction.DEGRADE:
+            async def apply_degrade() -> Tuple[bool, str]:
+                async with self._degradation_lock_safe:
+                    self._degradation_mode[target] = "degraded"
+                    self._service_capabilities[target] = {"basic", "read_only"}
+                if managed and managed.status == ServiceStatus.HEALTHY:
+                    managed.status = ServiceStatus.DEGRADED
+                return True, "service_degraded"
+
+            async def verify_degrade() -> bool:
+                return self._degradation_mode.get(target) == "degraded"
+
+            applied, note = await self._execute_idempotent_failure_effect(
+                directive,
+                apply_degrade,
+                verify_degrade,
+            )
+            await self._record_failure_propagation_event(
+                directive, applied=applied, note=note
+            )
+            return applied
+
+        if action == FailurePropagationAction.DRAIN:
+            async def apply_drain() -> Tuple[bool, str]:
+                note = "operation_guard_drain_started"
+                try:
+                    from backend.core.resilience.graceful_shutdown import get_operation_guard
+                    guard = await get_operation_guard()
+                    await guard.begin_drain(target)
+                except Exception:
+                    note = "operation_guard_unavailable"
+
+                async with self._degradation_lock_safe:
+                    self._degradation_mode[target] = "degraded"
+                    self._service_capabilities[target] = {"basic", "read_only"}
+                if managed and managed.status == ServiceStatus.HEALTHY:
+                    managed.status = ServiceStatus.DEGRADED
+                return True, note
+
+            async def verify_drain() -> bool:
+                try:
+                    from backend.core.resilience.graceful_shutdown import get_operation_guard
+                    guard = await get_operation_guard()
+                    stats = guard.get_stats()
+                    draining = set(stats.get("draining_categories", []))
+                    return target in draining
+                except Exception:
+                    return self._degradation_mode.get(target) == "degraded"
+
+            applied, note = await self._execute_idempotent_failure_effect(
+                directive,
+                apply_drain,
+                verify_drain,
+            )
+            await self._record_failure_propagation_event(
+                directive, applied=applied, note=note
+            )
+            return applied
+
+        if action == FailurePropagationAction.RESTART:
+            if managed is None:
+                await self._record_failure_propagation_event(
+                    directive, applied=False, note="target_not_managed"
+                )
+                return False
+
+            async def apply_restart() -> Tuple[bool, str]:
+                restart_ok = await self._auto_heal(managed)
+                return restart_ok, "restart_attempted"
+
+            async def verify_restart() -> bool:
+                status = getattr(managed, "status", None)
+                return bool(getattr(managed, "is_running", False)) or status in {
+                    ServiceStatus.HEALTHY,
+                    ServiceStatus.STARTING,
+                    ServiceStatus.RESTARTING,
+                }
+
+            restart_ok, note = await self._execute_idempotent_failure_effect(
+                directive,
+                apply_restart,
+                verify_restart,
+            )
+            await self._record_failure_propagation_event(
+                directive,
+                applied=restart_ok,
+                note=note,
+            )
+            return restart_ok
+
+        if action == FailurePropagationAction.ISOLATE:
+            async def apply_isolate() -> Tuple[bool, str]:
+                async with self._degradation_lock_safe:
+                    self._degradation_mode[target] = "isolated"
+                    self._service_capabilities[target] = {"basic", "read_only"}
+                self._crash_circuit_breakers[target] = True
+                if managed and managed.is_running:
+                    await self._stop_process(managed)
+                    managed.status = ServiceStatus.FAILED
+                return True, "service_isolated"
+
+            async def verify_isolate() -> bool:
+                return (
+                    self._degradation_mode.get(target) == "isolated"
+                    and bool(self._crash_circuit_breakers.get(target, False))
+                )
+
+            applied, note = await self._execute_idempotent_failure_effect(
+                directive,
+                apply_isolate,
+                verify_isolate,
+            )
+            await self._record_failure_propagation_event(
+                directive, applied=applied, note=note
+            )
+            return applied
+
+        await self._record_failure_propagation_event(
+            directive, applied=False, note="no_action"
+        )
+        return False
+
+    async def _execute_failure_propagation_policy(
+        self,
+        failed_service: str,
+        reason: str,
+        *,
+        include_source_action: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Execute deterministic cross-repo reaction policy for one failure signal.
+        """
+        await self._restore_failure_policy_state_if_needed()
+        async with self._failure_propagation_lock_safe:
+            directives = self._build_failure_propagation_plan(
+                failed_service,
+                reason,
+                include_source_action=include_source_action,
+            )
+
+            applied: List[Dict[str, str]] = []
+            skipped: List[Dict[str, str]] = []
+            source_result: Optional[bool] = None
+
+            for directive in directives:
+                if not self._should_apply_failure_directive(directive):
+                    skipped.append(
+                        {
+                            "target_service": directive.target_service,
+                            "action": directive.action.value,
+                            "reason": "cooldown_or_none",
+                        }
+                    )
+                    continue
+
+                result = await self._apply_failure_directive(directive)
+                applied.append(
+                    {
+                        "target_service": directive.target_service,
+                        "action": directive.action.value,
+                        "result": "applied" if result else "failed",
+                    }
+                )
+                if directive.target_service == self._normalize_trinity_service_name(failed_service):
+                    source_result = result
+
+            logger.info(
+                "[v281.0] Failure propagation: source=%s reason=%s applied=%d skipped=%d",
+                self._normalize_trinity_service_name(failed_service),
+                reason,
+                len(applied),
+                len(skipped),
+            )
+            return {
+                "source_service": self._normalize_trinity_service_name(failed_service),
+                "reason": str(reason or "unknown"),
+                "applied": applied,
+                "skipped": skipped,
+                "source_result": source_result,
+            }
+
+    async def _trigger_failure_propagation_policy(
+        self,
+        failed_service: str,
+        reason: str,
+        *,
+        include_source_action: bool = False,
+        trigger: str = "unknown",
+    ) -> Dict[str, Any]:
+        """
+        Execute failure propagation safely from runtime call-sites.
+
+        This wrapper keeps runtime paths deterministic while ensuring one
+        handler failure never hides the original service failure.
+        """
+        try:
+            result = await self._execute_failure_propagation_policy(
+                failed_service,
+                reason,
+                include_source_action=include_source_action,
+            )
+            logger.info(
+                "[v281.0] Failure propagation trigger=%s source=%s reason=%s applied=%d",
+                trigger,
+                result.get("source_service", failed_service),
+                result.get("reason", reason),
+                len(result.get("applied", [])),
+            )
+            return result
+        except Exception as exc:
+            logger.warning(
+                "[v281.0] Failure propagation trigger=%s source=%s reason=%s failed: %s",
+                trigger,
+                failed_service,
+                reason,
+                exc,
+            )
+            return {
+                "source_service": self._normalize_trinity_service_name(failed_service),
+                "reason": str(reason or "unknown"),
+                "applied": [],
+                "skipped": [],
+                "source_result": None,
+                "policy_error": str(exc),
+                "trigger": trigger,
+            }
+
+    def get_failure_propagation_status(self) -> Dict[str, Any]:
+        """Return current failure propagation policy state for observability."""
+        history = list(self._failure_propagation_history)
+        idempotency_snapshot = [
+            {
+                "key": key,
+                "status": str(record.get("status", "unknown")),
+                "updated_at": float(record.get("updated_at", 0.0)),
+                "attempts": int(record.get("attempts", 0)),
+                "note": str(record.get("note", "")),
+                "result": record.get("result"),
+            }
+            for key, record in self._failure_effect_idempotency_state.items()
+        ]
+        return {
+            "cooldown_seconds": self._failure_propagation_cooldown_s,
+            "history_limit": self._failure_propagation_history_limit,
+            "recent_events": history[-50:],
+            "total_events_recorded": len(history),
+            "last_applied_size": len(self._failure_propagation_last_applied),
+            "idempotency_ttl_seconds": self._failure_effect_idempotency_ttl_s,
+            "idempotency_inflight_seconds": self._failure_effect_idempotency_inflight_s,
+            "idempotency_entries": idempotency_snapshot[-50:],
+            "journal_path": str(self._failure_policy_journal_path),
+            "journal_loaded": self._failure_policy_state_loaded,
+        }
 
     # =========================================================================
     # v95.5: Distributed Tracing with Correlation ID Propagation
@@ -17589,6 +19088,12 @@ echo "=== JARVIS Prime started ==="
                     "max_attempts": self.config.max_restart_attempts
                 }
             )
+            await self._trigger_failure_propagation_policy(
+                definition.name,
+                "max_restart_attempts_exceeded",
+                include_source_action=True,
+                trigger="auto_heal.max_restart_exceeded",
+            )
             return False
 
         # Calculate backoff
@@ -18132,6 +19637,14 @@ echo "=== JARVIS Prime started ==="
 
         managed = self.processes[service_name]
         logger.info(f"[v95.1] Initiating recovery for {service_name} (reason: {reason})")
+
+        # v281.0: Deterministic cross-repo reaction before local restart attempts.
+        await self._trigger_failure_propagation_policy(
+            service_name,
+            reason,
+            include_source_action=False,
+            trigger="recovery_coordinator",
+        )
 
         # If reason is dependency failure, check and restart dependencies first
         if reason == "dependency_failed" and managed.definition.depends_on:
@@ -19148,6 +20661,28 @@ echo "=== JARVIS Prime started ==="
         - Parallel orchestrator instances
         """
         logger.info(f"[v137.1] _spawn_service_inner({definition.name}): entering...")
+
+        admitted, admission_reason, admission_lease_id = await self._acquire_global_admission_lease(
+            definition.name,
+            "spawn",
+        )
+        if not admitted:
+            logger.warning(
+                "[v281.4] Global admission blocked spawn for %s: %s",
+                definition.name,
+                admission_reason,
+            )
+            managed.status = ServiceStatus.DEGRADED
+            await _emit_event(
+                "GLOBAL_ADMISSION_BLOCKED",
+                service_name=definition.name,
+                priority="HIGH",
+                details={
+                    "operation": "spawn",
+                    "reason": admission_reason,
+                },
+            )
+            return False
         
         # =========================================================================
         # v136.0: GLOBAL SPAWN COORDINATION CHECK
@@ -19205,6 +20740,7 @@ echo "=== JARVIS Prime started ==="
             return False
         logger.info(f"[v137.2] _spawn_service_inner({definition.name}): marked as spawning, calling _spawn_service_core...")
 
+        success = False
         try:
             success = await self._spawn_service_core(managed, definition)
             logger.info(f"[v137.1] _spawn_service_inner({definition.name}): _spawn_service_core returned {success}")
@@ -19231,6 +20767,11 @@ echo "=== JARVIS Prime started ==="
             )
             coordinator.mark_failed(definition.name, str(e))
             raise
+        finally:
+            await self._release_global_admission_lease(
+                admission_lease_id,
+                outcome="spawn_success" if success else "spawn_failed",
+            )
 
     async def _spawn_service_core(
         self,
