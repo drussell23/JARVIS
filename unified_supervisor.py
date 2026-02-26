@@ -62172,7 +62172,12 @@ class _ProgressBroadcastWorker(threading.Thread):
         self._pending_data: Optional[Dict[str, Any]] = None
         self._retry_data: Optional[Dict[str, Any]] = None  # v275.1: failed data kept for retry
         self._has_data = threading.Event()
-        self._stop = threading.Event()
+        # v275.4: Renamed from `_stop` to `_stop_requested` to avoid
+        # shadowing threading.Thread._stop() — an internal method called
+        # by Thread.join() → _wait_for_tstate_lock() → self._stop().
+        # In Python 3.9, overwriting _stop with a threading.Event caused
+        # TypeError("'Event' object is not callable") on join().
+        self._stop_requested = threading.Event()
         self._conn: Optional[Any] = None  # http.client.HTTPConnection
 
         # Observable state (read by supervisor from the event loop)
@@ -62196,7 +62201,7 @@ class _ProgressBroadcastWorker(threading.Thread):
 
     def shutdown(self) -> None:
         """Signal stop, flush pending data, and wait for thread exit."""
-        self._stop.set()
+        self._stop_requested.set()
         self._has_data.set()  # Wake up from wait
         self.join(timeout=5)
         self._close_conn()
@@ -62237,11 +62242,11 @@ class _ProgressBroadcastWorker(threading.Thread):
         except Exception as e:
             _logger.debug("[BroadcastWorker] Pre-warm failed (will retry on first send): %s", e)
 
-        while not self._stop.is_set():
+        while not self._stop_requested.is_set():
             # Wait for new data or periodic check (2s timeout prevents
             # the thread from blocking indefinitely if shutdown races)
             self._has_data.wait(timeout=2.0)
-            if self._stop.is_set():
+            if self._stop_requested.is_set():
                 break
             self._has_data.clear()
 
@@ -62276,7 +62281,7 @@ class _ProgressBroadcastWorker(threading.Thread):
                 self.consecutive_failures += 1
                 # Wake ourselves after a short delay to retry
                 # (don't wait for next enqueue or 2s timeout)
-                if not self._stop.is_set():
+                if not self._stop_requested.is_set():
                     threading.Timer(0.5, self._has_data.set).start()
 
         # Final flush: send any pending data before exit (for 100%
@@ -66124,7 +66129,15 @@ class JarvisSystemKernel:
             def _preload_native_libs_sync():
                 """Pre-import ALL native C extensions before CoreAudio starts.
 
-                v275.3: Extended from 4 libraries to ALL native C extensions
+                v275.4: Extended to 11 libraries. Added sounddevice (PortAudio)
+                to ensure Pa_Initialize() runs in the controlled preload phase
+                before AudioBus creates any CoreAudio streams. Without this,
+                Pa_Initialize() ran during AudioBus init — if AudioBus was
+                disabled or failed, and parallel_import_components() later
+                imported a module with `import sounddevice` at module level,
+                Pa_Initialize() could run concurrent with CoreAudio IO thread.
+
+                v275.3: Extended from 4 libraries to native C extensions
                 imported during parallel_import_components(). The previous
                 list (numpy/scipy/torch/numba) was incomplete — soundfile,
                 PIL, cv2, torchaudio, soxr, and webrtcvad were all imported
@@ -66200,7 +66213,27 @@ class JarvisSystemKernel:
                 # and by safe_say() lazily. Without preloading, their CFFI/C
                 # init collides with CoreAudio IO thread.
 
-                # 6. soundfile — libsndfile via CFFI (used by safe_say, voice engines)
+                # 6. sounddevice — PortAudio wrapper (Pa_Initialize)
+                # v275.4: MUST preload before AudioBus init. sounddevice's
+                # import calls Pa_Initialize() which queries CoreAudio for
+                # audio device enumeration. Previously, this happened during
+                # AudioBus init (line ~66302) in a thread executor. By
+                # preloading here, Pa_Initialize() completes in the controlled
+                # preload phase. AudioBus then finds sounddevice in sys.modules
+                # and skips Pa_Initialize(). Defense-in-depth: if AudioBus is
+                # disabled or fails, and parallel_import_components() later
+                # imports a module with `import sounddevice` at module level
+                # (e.g., unified_tts_engine.py), it finds sounddevice already
+                # in sys.modules — no Pa_Initialize() concurrent with CoreAudio.
+                try:
+                    import sounddevice  # noqa: F401
+                    _preloaded.append(f"sounddevice {sounddevice.__version__}")
+                except ImportError:
+                    pass
+                except Exception as _e:
+                    _preloaded.append(f"sounddevice: {_e}")
+
+                # 7. soundfile — libsndfile via CFFI (used by safe_say, voice engines)
                 try:
                     import soundfile  # noqa: F401
                     _preloaded.append(f"soundfile {soundfile.__version__}")
@@ -66209,7 +66242,7 @@ class JarvisSystemKernel:
                 except Exception as _e:
                     _preloaded.append(f"soundfile: {_e}")
 
-                # 7. soxr — SOX Resampler (used by librosa, audio resampling)
+                # 8. soxr — SOX Resampler (used by librosa, audio resampling)
                 try:
                     import soxr  # noqa: F401
                     _preloaded.append("soxr")
@@ -66218,7 +66251,7 @@ class JarvisSystemKernel:
                 except Exception as _e:
                     _preloaded.append(f"soxr: {_e}")
 
-                # 8. webrtcvad — WebRTC VAD C extension
+                # 9. webrtcvad — WebRTC VAD C extension
                 try:
                     import webrtcvad  # noqa: F401
                     _preloaded.append("webrtcvad")
@@ -66230,7 +66263,7 @@ class JarvisSystemKernel:
                 # ── Tier 4: Vision/image native extensions ──
                 # Imported by vision_system in parallel_import_components()
 
-                # 9. PIL/Pillow — libjpeg, libpng, libtiff, zlib
+                # 10. PIL/Pillow — libjpeg, libpng, libtiff, zlib
                 try:
                     import PIL  # noqa: F401
                     from PIL import Image as _  # noqa: F401 — triggers codec init
@@ -66240,7 +66273,7 @@ class JarvisSystemKernel:
                 except Exception as _e:
                     _preloaded.append(f"PIL: {_e}")
 
-                # 10. cv2/OpenCV — massive C++ native library
+                # 11. cv2/OpenCV — massive C++ native library
                 try:
                     import cv2  # noqa: F401
                     _preloaded.append(f"cv2 {cv2.__version__}")
@@ -66253,10 +66286,10 @@ class JarvisSystemKernel:
                     return f"native libs preloaded ({len(_preloaded)}): {', '.join(_preloaded)}"
                 return "no native libs installed (all optional)"
 
-            # v275.3: Increased default from 45s → 60s to accommodate the
-            # expanded pre-load list (10 libraries instead of 4). torch alone
-            # can take 5-10s; PIL+cv2 add ~3-5s more. Under CPU pressure
-            # (other startup tasks), 45s was too tight.
+            # v275.4: Increased default from 45s → 60s to accommodate the
+            # expanded pre-load list (11 libraries instead of 4). torch alone
+            # can take 5-10s; sounddevice/PIL/cv2 add ~3-5s more. Under CPU
+            # pressure (other startup tasks), 45s was too tight.
             _preload_timeout = float(os.environ.get(
                 "JARVIS_NATIVE_PRELOAD_TIMEOUT", "60.0"
             ))
@@ -69892,20 +69925,6 @@ class JarvisSystemKernel:
                 traceback_str=traceback.format_exc(),
             )
             self.logger.error(f"[Kernel] Startup failed ({type(e).__name__}): {e!r}")
-            # DIAGNOSTIC: Print full traceback to BOTH stderr and a dedicated file
-            import traceback as _tb_diag
-            _tb_str = _tb_diag.format_exc()
-            print("=" * 80)
-            print("FULL STARTUP FAILURE TRACEBACK:")
-            print(_tb_str)
-            print("=" * 80)
-            try:
-                with open("/tmp/jarvis_crash_traceback.txt", "w") as _f:
-                    _f.write(f"Crash at {time.time()}\n")
-                    _f.write(f"Error: {e!r}\n\n")
-                    _f.write(_tb_str)
-            except Exception:
-                pass
 
             # v197.1: Stop the live progress dashboard on error
             try:

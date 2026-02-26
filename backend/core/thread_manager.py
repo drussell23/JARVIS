@@ -3101,7 +3101,22 @@ class SegfaultHandler:
         _thread.get_ident() which fails with "returned a result with an
         error set". The handler must be signal-safe: avoid threading APIs
         that require valid Python thread state.
+
+        v276.1: IMMEDIATELY reset signal to default handler BEFORE any
+        work. Previous code deferred reset to finally block, but if
+        SIGSEGV re-fires during handler execution (print, threading,
+        etc.), each re-entry creates a new stack frame -> infinite
+        recursion -> stack overflow -> hard crash. Resetting first
+        ensures any re-SIGSEGV goes to the OS default handler (abort).
         """
+        # FIRST: Reset to default handler to prevent recursive re-entry.
+        # If SIGSEGV fires again during our logging below, the OS
+        # default handler will terminate the process cleanly.
+        try:
+            signal.signal(signal.SIGSEGV, signal.SIG_DFL)
+        except Exception:
+            pass  # If even this fails, we're in a very bad state
+
         try:
             # v270.3: Get thread info safely — avoid threading.current_thread()
             # which calls get_ident() and crashes in native threads without
@@ -3109,18 +3124,16 @@ class SegfaultHandler:
             thread_id = "unknown"
             thread_name = "unknown (possibly native/CoreAudio)"
             try:
-                # _thread.get_ident() is the low-level C call that fails
-                # in native threads. Test it first.
                 import _thread
                 _tid = _thread.get_ident()
                 thread_id = str(_tid)
-                # Only access threading.current_thread() if get_ident() succeeded
                 thread = threading.current_thread()
                 thread_name = thread.name
             except Exception:
                 pass  # Native thread — use defaults
 
-            # Log crash info
+            # Log crash info (best-effort — may SIGSEGV again, but
+            # signal is now SIG_DFL so OS will terminate cleanly)
             print("\n" + "=" * 70, file=sys.stderr)
             print("CRITICAL: SIGSEGV (Segmentation Fault) detected!", file=sys.stderr)
             print("=" * 70, file=sys.stderr)
@@ -3147,27 +3160,15 @@ class SegfaultHandler:
                 pass
 
             print("=" * 70, file=sys.stderr)
-            print("Attempting graceful shutdown...", file=sys.stderr)
-
-            # Try graceful shutdown
-            try:
-                guard = get_native_library_guard()
-                guard.request_shutdown()
-            except Exception:
-                pass
 
         except Exception as e:
-            print(f"Error in SIGSEGV handler: {e}", file=sys.stderr)
-
-        finally:
-            # Re-raise to let default handler terminate
             try:
-                if cls._original_handler:
-                    signal.signal(signal.SIGSEGV, cls._original_handler)
+                print(f"Error in SIGSEGV handler: {e}", file=sys.stderr)
             except Exception:
                 pass
-            # Exit with error code
-            sys.exit(139)  # 128 + 11 (SIGSEGV)
+
+        # Terminate with SIGSEGV exit code
+        os._exit(139)  # 128 + 11 (SIGSEGV) — os._exit bypasses cleanup
 
     @classmethod
     def uninstall(cls) -> None:
