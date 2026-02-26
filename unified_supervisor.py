@@ -69892,12 +69892,20 @@ class JarvisSystemKernel:
                 traceback_str=traceback.format_exc(),
             )
             self.logger.error(f"[Kernel] Startup failed ({type(e).__name__}): {e!r}")
-            # DIAGNOSTIC: Print full traceback to stderr for debugging
+            # DIAGNOSTIC: Print full traceback to BOTH stderr and a dedicated file
             import traceback as _tb_diag
-            print("=" * 80, file=sys.stderr)
-            print("FULL STARTUP FAILURE TRACEBACK:", file=sys.stderr)
-            _tb_diag.print_exc(file=sys.stderr)
-            print("=" * 80, file=sys.stderr)
+            _tb_str = _tb_diag.format_exc()
+            print("=" * 80)
+            print("FULL STARTUP FAILURE TRACEBACK:")
+            print(_tb_str)
+            print("=" * 80)
+            try:
+                with open("/tmp/jarvis_crash_traceback.txt", "w") as _f:
+                    _f.write(f"Crash at {time.time()}\n")
+                    _f.write(f"Error: {e!r}\n\n")
+                    _f.write(_tb_str)
+            except Exception:
+                pass
 
             # v197.1: Stop the live progress dashboard on error
             try:
