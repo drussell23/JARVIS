@@ -82585,7 +82585,13 @@ class JarvisSystemKernel:
         if not targets:
             return True
 
-        local_protocol_version = os.environ.get("JARVIS_PROTOCOL_VERSION", "1.0.0")
+        # v274.1: Default to "0.0.0" (pre-stable) — v277.0 introduced the
+        # contract gate but no component has been explicitly versioned to 1.x
+        # yet.  J-Prime on the GCP VM still reports 0.x, so the major-version
+        # check (local.major == remote.major) fails when the default is "1.0.0".
+        # Keep at "0.0.0" until an explicit protocol version bump is declared
+        # across all Trinity components simultaneously.
+        local_protocol_version = os.environ.get("JARVIS_PROTOCOL_VERSION", "0.0.0")
         timeout_s = _get_env_float("JARVIS_CONTRACT_REQUEST_TIMEOUT_S", 8.0)
         enforcer = CrossRepoContractEnforcer(
             supervisor_instance_id=self.config.kernel_id,

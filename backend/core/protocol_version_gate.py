@@ -116,7 +116,10 @@ class ProtocolVersion:
           {prefix}_PROTOCOL_MIN_COMPAT (default None)
           {prefix}_PROTOCOL_MAX_COMPAT (default None)
         """
-        ver_str = os.environ.get(f"{prefix}_PROTOCOL_VERSION", "1.0.0")
+        # v274.1: Default to "0.0.0" (pre-stable) to match all Trinity
+        # components.  Bump to "1.0.0" when a deliberate protocol break is
+        # declared across supervisor + J-Prime + Reactor-Core simultaneously.
+        ver_str = os.environ.get(f"{prefix}_PROTOCOL_VERSION", "0.0.0")
         min_str = os.environ.get(f"{prefix}_PROTOCOL_MIN_COMPAT")
         max_str = os.environ.get(f"{prefix}_PROTOCOL_MAX_COMPAT")
         return cls.parse(ver_str, min_str, max_str)
