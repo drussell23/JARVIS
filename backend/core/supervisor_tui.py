@@ -1,22 +1,18 @@
 """
 JARVIS Supervisor TUI — Textual-based terminal UI with 5 tabs.
 
-Consumes the Phase 1 view-model (_build_render_state()) read-only.
-Runs in a daemon thread with its own asyncio event loop.
-Crashes never affect the supervisor's event loop or startup.
+Architecture (v2 — main-thread Textual):
+  Textual MUST own the main thread for terminal control (alternate screen,
+  raw mode, signal handlers). The supervisor startup runs as an async
+  worker INSIDE Textual's event loop.
 
-Architecture:
-  - stdout is redirected to a capture buffer so supervisor banners/prints
-    don't trample the TUI. Textual uses stderr for terminal rendering.
-  - Logging handlers are replaced with a buffer handler so log output
-    goes to the TUI's Events tab instead of stderr.
-  - SnapshotPump is created in attach_to_supervisor() (not start()) to
-    avoid the data race where dashboard_getter was None at pump creation.
+  Entry point: run_supervisor_tui(args) called from main() when --ui tui.
+  This replaces asyncio.run(async_main(args)) — Textual IS the event loop.
 
 Env vars:
   JARVIS_TUI_POLL_MS       = int  (default: 500)  — snapshot poll interval
-  JARVIS_TUI_EVENT_LIMIT   = int  (default: 500)  — max events in Events tab ring
-  JARVIS_TUI_FAULT_LIMIT   = int  (default: 200)  — max faults in Faults tab ring
+  JARVIS_TUI_EVENT_LIMIT   = int  (default: 500)  — max events in ring
+  JARVIS_TUI_FAULT_LIMIT   = int  (default: 200)  — max faults in ring
   JARVIS_TUI_LOG_LIMIT     = int  (default: 3000) — max captured log lines
 """
 
@@ -32,7 +28,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, TYPE_CHECKING
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -48,6 +44,10 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from textual.worker import Worker, WorkerState
+
+if TYPE_CHECKING:
+    import argparse
 
 logger = logging.getLogger(__name__)
 
@@ -102,11 +102,7 @@ _REACTOR_KEYWORDS = frozenset({
 # Output capture — redirect stdout + logging to buffer for TUI display
 # ---------------------------------------------------------------------------
 class _OutputCapture:
-    """File-like object that captures writes to a deque.
-
-    Used to redirect sys.stdout so supervisor banners/prints go to
-    the TUI's log buffer instead of trampling the Textual terminal.
-    """
+    """File-like object that captures writes to a deque."""
 
     def __init__(self, buffer: Deque[str], original: Any = None):
         self._buffer = buffer
@@ -139,7 +135,7 @@ class _OutputCapture:
 
 
 class _TuiLogHandler(logging.Handler):
-    """Logging handler that writes formatted records to a deque for TUI display."""
+    """Logging handler that writes formatted records to a deque."""
 
     def __init__(self, buffer: Deque[str]):
         super().__init__()
@@ -162,12 +158,6 @@ class _TuiLogHandler(logging.Handler):
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class TuiSnapshot:
-    """Immutable snapshot posted from SnapshotPump -> Textual app.
-
-    Frozen dataclass prevents attribute reassignment. Dict fields are
-    deep-copied at construction time so no mutable state crosses threads.
-    """
-
     groups: tuple = ()
     gcp: dict = field(default_factory=dict)
     memory: dict = field(default_factory=dict)
@@ -182,164 +172,9 @@ class TuiSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# SnapshotPump — daemon thread bridging supervisor -> Textual
-# ---------------------------------------------------------------------------
-class SnapshotPump(threading.Thread):
-    """Daemon thread that polls _build_render_state() and posts snapshots.
-
-    - Calls dashboard._build_render_state() every JARVIS_TUI_POLL_MS ms
-    - Collects events via SupervisorEventBus subscription
-    - Includes captured stdout/logging output
-    - Posts TuiSnapshot to Textual app via call_from_thread
-    - Coalescing: skips if previous post hasn't been consumed
-    """
-
-    def __init__(
-        self,
-        dashboard_getter: Callable,
-        app: "JarvisTuiApp",
-        event_bus: Optional[Any] = None,
-        supervisor_loop: Optional[asyncio.AbstractEventLoop] = None,
-        ipc_getter: Optional[Callable] = None,
-        captured_output: Optional[Deque[str]] = None,
-    ):
-        super().__init__(name="jarvis-tui-pump", daemon=True)
-        self._dashboard_getter = dashboard_getter
-        self._app = app
-        self._event_bus = event_bus
-        self._supervisor_loop = supervisor_loop
-        self._ipc_getter = ipc_getter
-        self._captured_output = captured_output or collections.deque()
-        self._stop_event = threading.Event()
-        self._buf_lock = threading.Lock()
-        self._events: Deque[dict] = collections.deque(maxlen=_EVENT_LIMIT)
-        self._faults: Deque[dict] = collections.deque(maxlen=_FAULT_LIMIT)
-        self._consumed = threading.Event()
-        self._consumed.set()
-
-    def _handle_event(self, event: Any) -> None:
-        """Event bus handler — appends to ring buffers (thread-safe)."""
-        try:
-            ev_dict = {
-                "type": event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
-                "timestamp": getattr(event, "timestamp", time.time()),
-                "message": getattr(event, "message", ""),
-                "severity": event.severity.value if hasattr(event.severity, "value") else str(getattr(event, "severity", "info")),
-                "phase": getattr(event, "phase", ""),
-                "component": getattr(event, "component", ""),
-            }
-            with self._buf_lock:
-                self._events.append(ev_dict)
-                if ev_dict["severity"] in _FAULT_SEVERITIES:
-                    self._faults.append(ev_dict)
-        except Exception:
-            pass
-
-    def run(self) -> None:
-        if self._event_bus:
-            try:
-                self._event_bus.subscribe(self._handle_event)
-            except Exception:
-                pass
-
-        interval = _POLL_MS / 1000.0
-        while not self._stop_event.is_set():
-            try:
-                self._pump_once()
-            except Exception:
-                pass
-            self._stop_event.wait(interval)
-
-        if self._event_bus:
-            try:
-                self._event_bus.unsubscribe(self._handle_event)
-            except Exception:
-                pass
-
-    def _pump_once(self) -> None:
-        if not self._consumed.is_set():
-            return
-
-        dashboard = self._dashboard_getter()
-        if dashboard is None:
-            # No dashboard yet — still post captured logs so TUI isn't blank
-            captured_snap = tuple(self._captured_output)
-            with self._buf_lock:
-                events_snap = tuple(self._events)
-                faults_snap = tuple(self._faults)
-
-            snapshot = TuiSnapshot(
-                captured_logs=captured_snap[-500:] if len(captured_snap) > 500 else captured_snap,
-                events=events_snap,
-                faults=faults_snap,
-            )
-            self._consumed.clear()
-            try:
-                self._app.call_from_thread(self._app.update_snapshot, snapshot, self._consumed)
-            except Exception:
-                self._consumed.set()
-            return
-
-        lock = getattr(dashboard, "_lock", None)
-        try:
-            if lock:
-                lock.acquire()
-            state = dashboard._build_render_state()
-        except Exception:
-            return
-        finally:
-            if lock:
-                try:
-                    lock.release()
-                except RuntimeError:
-                    pass
-
-        ipc_data: dict = {}
-        if self._ipc_getter and self._supervisor_loop:
-            try:
-                if self._supervisor_loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._ipc_getter(), self._supervisor_loop,
-                    )
-                    ipc_data = future.result(timeout=2.0)
-            except Exception:
-                pass
-
-        captured_snap = tuple(self._captured_output)
-        with self._buf_lock:
-            events_snap = tuple(self._events)
-            faults_snap = tuple(self._faults)
-
-        snapshot = TuiSnapshot(
-            groups=tuple(copy.deepcopy(state.get("groups", []))),
-            gcp=copy.deepcopy(state.get("gcp", {})),
-            memory=copy.deepcopy(state.get("memory", {})),
-            model=copy.deepcopy(state.get("model", {})),
-            logs=tuple(state.get("logs", [])),
-            elapsed=state.get("elapsed", 0.0),
-            schema_version=state.get("schema_version", "1.0.0"),
-            events=events_snap,
-            faults=faults_snap,
-            ipc_status=copy.deepcopy(ipc_data),
-            captured_logs=captured_snap[-500:] if len(captured_snap) > 500 else captured_snap,
-        )
-
-        self._consumed.clear()
-        try:
-            self._app.call_from_thread(self._app.update_snapshot, snapshot, self._consumed)
-        except Exception:
-            self._consumed.set()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self.join(timeout=3.0)
-
-
-# ---------------------------------------------------------------------------
 # Helper — filter log lines by keyword set
 # ---------------------------------------------------------------------------
 def _filter_logs(lines: tuple, keywords: frozenset, limit: int = 200) -> List[str]:
-    """Return lines containing any keyword (case-insensitive), most recent first."""
     result: List[str] = []
     for line in reversed(lines):
         lower = line.lower()
@@ -355,27 +190,12 @@ def _filter_logs(lines: tuple, keywords: frozenset, limit: int = 200) -> List[st
 # Tab widgets
 # ---------------------------------------------------------------------------
 class SupervisorTab(Container):
-    """Component groups table + GCP progress + memory gauge."""
-
     DEFAULT_CSS = """
-    SupervisorTab {
-        padding: 1 2;
-    }
-    SupervisorTab .section-label {
-        text-style: bold;
-        margin-bottom: 1;
-    }
-    SupervisorTab DataTable {
-        height: auto;
-        max-height: 30;
-    }
-    SupervisorTab .gauge-row {
-        height: 3;
-        margin-top: 1;
-    }
-    SupervisorTab .gauge-label {
-        width: 14;
-    }
+    SupervisorTab { padding: 1 2; }
+    SupervisorTab .section-label { text-style: bold; margin-bottom: 1; }
+    SupervisorTab DataTable { height: auto; max-height: 30; }
+    SupervisorTab .gauge-row { height: 3; margin-top: 1; }
+    SupervisorTab .gauge-label { width: 14; }
     """
 
     def compose(self) -> ComposeResult:
@@ -397,58 +217,32 @@ class SupervisorTab(Container):
             table = self.query_one("#comp-table", DataTable)
             table.clear()
             for group in snap.groups:
-                table.add_row(
-                    group.get("emoji", ""),
-                    f"[bold]{group.get('label', '')}[/bold]",
-                    "",
-                    "",
-                )
+                table.add_row(group.get("emoji", ""), f"[bold]{group.get('label', '')}[/bold]", "", "")
                 for member in group.get("members", []):
                     style = _STATUS_STYLE.get(member.get("status", ""), "")
-                    status_text = member.get("status", "")
-                    if style:
-                        status_text = f"[{style}]{status_text}[/{style}]"
-                    table.add_row(
-                        member.get("emoji", ""),
-                        f"  {member.get('name', '')}",
-                        status_text,
-                        member.get("code", ""),
-                    )
+                    st = member.get("status", "")
+                    st = f"[{style}]{st}[/{style}]" if style else st
+                    table.add_row(member.get("emoji", ""), f"  {member.get('name', '')}", st, member.get("code", ""))
         except Exception:
             pass
-
         try:
             gcp = snap.gcp
             pct = gcp.get("progress", 0)
-            bar = self.query_one("#gcp-bar", ProgressBar)
-            bar.update(progress=float(pct))
-            lbl = self.query_one("#gcp-pct", Label)
-            phase_name = gcp.get("phase_name", "")
-            lbl.update(f" {pct:.0f}% {phase_name}")
+            self.query_one("#gcp-bar", ProgressBar).update(progress=float(pct))
+            self.query_one("#gcp-pct", Label).update(f" {pct:.0f}% {gcp.get('phase_name', '')}")
         except Exception:
             pass
-
         try:
             mem = snap.memory
             used_pct = mem.get("used_pct", 0)
-            bar = self.query_one("#mem-bar", ProgressBar)
-            bar.update(progress=float(used_pct))
-            lbl = self.query_one("#mem-pct", Label)
-            used_gb = mem.get("used_gb", 0)
-            total_gb = mem.get("total_gb", 0)
-            lbl.update(f" {used_pct:.0f}% ({used_gb:.1f}/{total_gb:.1f} GB)")
+            self.query_one("#mem-bar", ProgressBar).update(progress=float(used_pct))
+            self.query_one("#mem-pct", Label).update(f" {used_pct:.0f}% ({mem.get('used_gb', 0):.1f}/{mem.get('total_gb', 0):.1f} GB)")
         except Exception:
             pass
 
 
 class PrimeTab(VerticalScroll):
-    """JARVIS Prime real-time status — IPC data + filtered log stream."""
-
-    DEFAULT_CSS = """
-    PrimeTab {
-        padding: 1 2;
-    }
-    """
+    DEFAULT_CSS = "PrimeTab { padding: 1 2; }"
 
     def compose(self) -> ComposeResult:
         yield Static("[dim]Waiting for Prime data...[/dim]", id="prime-content")
@@ -458,86 +252,46 @@ class PrimeTab(VerticalScroll):
             content = self.query_one("#prime-content", Static)
             lines: List[str] = []
             ipc = snap.ipc_status
-
-            # IPC-sourced structured data
             if ipc:
-                lines.append("[bold underline]JARVIS Prime — Live Status[/bold underline]")
-                lines.append("")
-
+                lines.append("[bold underline]JARVIS Prime — Live Status[/bold underline]\n")
                 lines.append(f"[bold]State:[/bold] {ipc.get('state', 'unknown')}")
                 lines.append(f"[bold]Uptime:[/bold] {ipc.get('uptime_seconds', 0):.0f}s")
                 lines.append(f"[bold]PID:[/bold] {ipc.get('pid', 'N/A')}")
-
                 cfg = ipc.get("config", {})
                 if cfg:
-                    lines.append("")
-                    lines.append("[bold]Configuration[/bold]")
-                    lines.append(f"  Kernel ID: {cfg.get('kernel_id', 'N/A')}")
-                    lines.append(f"  Mode: {cfg.get('mode', 'N/A')}")
-                    lines.append(f"  Backend Port: {cfg.get('backend_port', 'N/A')}")
-
+                    lines.append("\n[bold]Configuration[/bold]")
+                    for k in ("kernel_id", "mode", "backend_port"):
+                        lines.append(f"  {k}: {cfg.get(k, 'N/A')}")
                 trinity = ipc.get("trinity", {})
                 if trinity:
-                    lines.append("")
-                    lines.append("[bold]Trinity Integration[/bold]")
-                    for k, v in trinity.items():
+                    lines.append("\n[bold]Trinity Integration[/bold]")
+                    for k, v in list(trinity.items())[:10]:
                         if isinstance(v, dict):
-                            lines.append(f"  {k}:")
-                            for sk, sv in list(v.items())[:8]:
-                                lines.append(f"    {sk}: {sv}")
+                            lines.append(f"  {k}: ...")
                         else:
                             lines.append(f"  {k}: {v}")
-
                 inv = ipc.get("invincible_node", {})
                 if inv and inv.get("enabled"):
-                    lines.append("")
-                    lines.append("[bold]Invincible Node (GCP)[/bold]")
+                    lines.append("\n[bold]Invincible Node (GCP)[/bold]")
                     lines.append(f"  Instance: {inv.get('instance_name', 'N/A')}")
                     lines.append(f"  Status: {inv.get('status', 'N/A')}")
-                    lines.append(f"  Port: {inv.get('port', 'N/A')}")
-
                 model = snap.model
                 if model and model.get("active"):
-                    lines.append("")
-                    lines.append("[bold]Model Loading[/bold]")
+                    lines.append("\n[bold]Model Loading[/bold]")
                     lines.append(f"  Model: {model.get('model_name', 'N/A')}")
                     lines.append(f"  Progress: {model.get('progress', 0):.0f}%")
-                    lines.append(f"  Phase: {model.get('phase', 'N/A')}")
-
-                modes = ipc.get("startup_modes", {})
-                if modes:
-                    lines.append("")
-                    lines.append("[bold]Startup Modes[/bold]")
-                    lines.append(f"  Desired: {modes.get('desired_mode', 'N/A')}")
-                    lines.append(f"  Effective: {modes.get('effective_mode', 'N/A')}")
-                    heavy = modes.get("can_spawn_heavy", "N/A")
-                    lines.append(f"  Can Spawn Heavy: {heavy}")
-
-            # Filtered real-time log stream
             prime_logs = _filter_logs(snap.captured_logs, _PRIME_KEYWORDS, limit=60)
             if prime_logs:
-                lines.append("")
-                lines.append(f"[bold underline]Prime Log Stream[/bold underline] [dim]({len(prime_logs)} lines)[/dim]")
-                lines.append("")
-                for log_line in prime_logs[-40:]:
-                    lines.append(f"[dim]{log_line}[/dim]")
-
-            if not lines:
-                content.update("[dim]No Prime data available yet. Waiting for startup...[/dim]")
-            else:
-                content.update("\n".join(lines))
+                lines.append(f"\n[bold underline]Prime Log Stream[/bold underline] [dim]({len(prime_logs)} lines)[/dim]\n")
+                for ll in prime_logs[-40:]:
+                    lines.append(f"[dim]{ll}[/dim]")
+            content.update("\n".join(lines) if lines else "[dim]No Prime data yet...[/dim]")
         except Exception:
             pass
 
 
 class ReactorTab(VerticalScroll):
-    """Reactor-Core real-time status — IPC data + filtered log stream."""
-
-    DEFAULT_CSS = """
-    ReactorTab {
-        padding: 1 2;
-    }
-    """
+    DEFAULT_CSS = "ReactorTab { padding: 1 2; }"
 
     def compose(self) -> ComposeResult:
         yield Static("[dim]Waiting for Reactor data...[/dim]", id="reactor-content")
@@ -547,92 +301,46 @@ class ReactorTab(VerticalScroll):
             content = self.query_one("#reactor-content", Static)
             lines: List[str] = []
             ipc = snap.ipc_status
-
             if ipc:
-                lines.append("[bold underline]Reactor Core — Live Status[/bold underline]")
-                lines.append("")
-
+                lines.append("[bold underline]Reactor Core — Live Status[/bold underline]\n")
                 two_tier = ipc.get("two_tier", {})
                 if two_tier:
                     lines.append("[bold]Two-Tier Security[/bold]")
                     lines.append(f"  Enabled: {two_tier.get('enabled', False)}")
-                    watchdog = two_tier.get("watchdog", {})
-                    if watchdog:
-                        lines.append(f"  Watchdog: {watchdog}")
-                    cross_repo = two_tier.get("cross_repo", {})
-                    if cross_repo:
-                        lines.append(f"  Cross-repo: {cross_repo}")
                     lines.append(f"  Runner Wired: {two_tier.get('runner_wired', False)}")
-
                 ecapa = ipc.get("ecapa_policy", {})
                 if ecapa and not ecapa.get("error"):
-                    lines.append("")
-                    lines.append("[bold]ECAPA Policy[/bold]")
+                    lines.append("\n[bold]ECAPA Policy[/bold]")
                     lines.append(f"  Mode: {ecapa.get('mode', 'N/A')}")
                     lines.append(f"  Backend: {ecapa.get('active_backend', 'N/A')}")
                     lines.append(f"  Failures: {ecapa.get('consecutive_failures', 0)}")
-                    lines.append(f"  Successes: {ecapa.get('consecutive_successes', 0)}")
-                    budget = ecapa.get("retry_budget_remaining", 0)
-                    lines.append(f"  Retry Budget: {budget}")
-
                 agi = ipc.get("agi_os", {})
                 if agi:
-                    lines.append("")
-                    lines.append("[bold]AGI OS[/bold]")
+                    lines.append("\n[bold]AGI OS[/bold]")
                     lines.append(f"  Enabled: {agi.get('enabled', False)}")
                     lines.append(f"  Status: {agi.get('status', 'N/A')}")
-                    lines.append(f"  Coordinator: {agi.get('coordinator', False)}")
-                    lines.append(f"  Voice Communicator: {agi.get('voice_communicator', False)}")
-
                 voice = ipc.get("voice_sidecar", {})
                 if voice:
-                    lines.append("")
-                    lines.append("[bold]Voice Sidecar[/bold]")
+                    lines.append("\n[bold]Voice Sidecar[/bold]")
                     lines.append(f"  Enabled: {voice.get('enabled', False)}")
                     lines.append(f"  Transport: {voice.get('transport', 'N/A')}")
-                    pid = voice.get("process_pid")
-                    if pid:
-                        lines.append(f"  PID: {pid}")
-
                 readiness = ipc.get("readiness", {})
                 if readiness:
-                    lines.append("")
-                    lines.append("[bold]Readiness[/bold]")
+                    lines.append("\n[bold]Readiness[/bold]")
                     for k, v in list(readiness.items())[:10]:
                         lines.append(f"  {k}: {v}")
-
-                pressure = ipc.get("memory_pressure_signal", {})
-                if pressure and not pressure.get("error"):
-                    lines.append("")
-                    lines.append("[bold]Memory Pressure Signal[/bold]")
-                    for k, v in list(pressure.items())[:8]:
-                        lines.append(f"  {k}: {v}")
-
-            # Filtered real-time log stream
             reactor_logs = _filter_logs(snap.captured_logs, _REACTOR_KEYWORDS, limit=60)
             if reactor_logs:
-                lines.append("")
-                lines.append(f"[bold underline]Reactor Log Stream[/bold underline] [dim]({len(reactor_logs)} lines)[/dim]")
-                lines.append("")
-                for log_line in reactor_logs[-40:]:
-                    lines.append(f"[dim]{log_line}[/dim]")
-
-            if not lines:
-                content.update("[dim]No Reactor data available yet. Waiting for startup...[/dim]")
-            else:
-                content.update("\n".join(lines))
+                lines.append(f"\n[bold underline]Reactor Log Stream[/bold underline] [dim]({len(reactor_logs)} lines)[/dim]\n")
+                for ll in reactor_logs[-40:]:
+                    lines.append(f"[dim]{ll}[/dim]")
+            content.update("\n".join(lines) if lines else "[dim]No Reactor data yet...[/dim]")
         except Exception:
             pass
 
 
 class EventsTab(VerticalScroll):
-    """Unified log view — structured events + captured supervisor output."""
-
-    DEFAULT_CSS = """
-    EventsTab {
-        padding: 1 2;
-    }
-    """
+    DEFAULT_CSS = "EventsTab { padding: 1 2; }"
 
     def compose(self) -> ComposeResult:
         yield Static("Waiting for events...", id="events-content")
@@ -641,35 +349,19 @@ class EventsTab(VerticalScroll):
         try:
             content = self.query_one("#events-content", Static)
             lines: List[str] = []
-
-            # Structured events from event bus
             if snap.events:
                 for ev in snap.events[-100:]:
-                    ts = ev.get("timestamp", 0)
-                    ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
-                    severity = ev.get("severity", "info")
-                    style = _SEVERITY_STYLE.get(severity, "")
-                    msg = ev.get("message", "")
-                    component = ev.get("component", "")
-
-                    prefix = f"[dim]{ts_str}[/dim]"
-                    sev_tag = f"[{style}]{severity.upper():8s}[/{style}]" if style else f"{severity.upper():8s}"
-                    comp_tag = f"[bold]{component}[/bold]" if component else ""
-
-                    parts = [prefix, sev_tag]
-                    if comp_tag:
-                        parts.append(comp_tag)
-                    parts.append(msg)
-                    lines.append(" ".join(parts))
-
-            # Captured supervisor output (stdout + logging)
+                    ts_str = time.strftime("%H:%M:%S", time.localtime(ev.get("timestamp", 0)))
+                    sev = ev.get("severity", "info")
+                    style = _SEVERITY_STYLE.get(sev, "")
+                    sev_tag = f"[{style}]{sev.upper():8s}[/{style}]" if style else f"{sev.upper():8s}"
+                    comp = f"[bold]{ev.get('component', '')}[/bold] " if ev.get("component") else ""
+                    lines.append(f"[dim]{ts_str}[/dim] {sev_tag} {comp}{ev.get('message', '')}")
             if snap.captured_logs:
                 if lines:
-                    lines.append("")
-                    lines.append("[bold]─── Supervisor Output ───[/bold]")
-                for log_line in snap.captured_logs[-200:]:
-                    lines.append(f"[dim]{log_line}[/dim]")
-
+                    lines.append("\n[bold]─── Supervisor Output ───[/bold]")
+                for ll in snap.captured_logs[-200:]:
+                    lines.append(f"[dim]{ll}[/dim]")
             if lines:
                 content.update("\n".join(lines))
                 self.scroll_end(animate=False)
@@ -680,13 +372,7 @@ class EventsTab(VerticalScroll):
 
 
 class FaultsTab(VerticalScroll):
-    """Filtered view of ERROR/WARNING/CRITICAL events only."""
-
-    DEFAULT_CSS = """
-    FaultsTab {
-        padding: 1 2;
-    }
-    """
+    DEFAULT_CSS = "FaultsTab { padding: 1 2; }"
 
     def compose(self) -> ComposeResult:
         yield Static("[green]No faults detected[/green]", id="faults-content")
@@ -697,26 +383,13 @@ class FaultsTab(VerticalScroll):
             if not snap.faults:
                 content.update("[green]No faults detected[/green]")
                 return
-
             lines: List[str] = []
             for ev in snap.faults:
-                ts = ev.get("timestamp", 0)
-                ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
-                severity = ev.get("severity", "error")
-                style = _SEVERITY_STYLE.get(severity, "bold red")
-                msg = ev.get("message", "")
-                component = ev.get("component", "")
-
-                prefix = f"[dim]{ts_str}[/dim]"
-                sev_tag = f"[{style}]{severity.upper():8s}[/{style}]"
-                comp_tag = f"[bold]{component}[/bold]" if component else ""
-
-                parts = [prefix, sev_tag]
-                if comp_tag:
-                    parts.append(comp_tag)
-                parts.append(msg)
-                lines.append(" ".join(parts))
-
+                ts_str = time.strftime("%H:%M:%S", time.localtime(ev.get("timestamp", 0)))
+                sev = ev.get("severity", "error")
+                style = _SEVERITY_STYLE.get(sev, "bold red")
+                comp = f"[bold]{ev.get('component', '')}[/bold] " if ev.get("component") else ""
+                lines.append(f"[dim]{ts_str}[/dim] [{style}]{sev.upper():8s}[/{style}] {comp}{ev.get('message', '')}")
             content.update("\n".join(lines))
             self.scroll_end(animate=False)
         except Exception:
@@ -727,33 +400,23 @@ class FaultsTab(VerticalScroll):
 # JarvisTuiApp — main Textual application
 # ---------------------------------------------------------------------------
 class JarvisTuiApp(App):
-    """JARVIS Supervisor TUI with 5 interactive tabs."""
+    """JARVIS Supervisor TUI with 5 interactive tabs.
+
+    When used as the main entry point (run_supervisor_tui), the supervisor
+    startup runs as an async worker inside this app's event loop. Textual
+    owns the main thread and has full terminal control.
+    """
 
     TITLE = "JARVIS Supervisor"
-    SUB_TITLE = "Terminal UI"
+    SUB_TITLE = "Enterprise TUI"
 
     DEFAULT_CSS = """
-    Screen {
-        background: $surface;
-    }
-    TabbedContent {
-        height: 1fr;
-    }
-    TabPane {
-        padding: 0;
-    }
-    Header {
-        dock: top;
-    }
-    Footer {
-        dock: bottom;
-    }
-    #elapsed-bar {
-        dock: top;
-        height: 1;
-        background: $primary-background;
-        padding: 0 2;
-    }
+    Screen { background: $surface; }
+    TabbedContent { height: 1fr; }
+    TabPane { padding: 0; }
+    Header { dock: top; }
+    Footer { dock: bottom; }
+    #elapsed-bar { dock: top; height: 1; background: $primary-background; padding: 0 2; }
     """
 
     BINDINGS = [
@@ -769,9 +432,24 @@ class JarvisTuiApp(App):
     _snapshot: reactive[Optional[TuiSnapshot]] = reactive(None)
     _fault_count: reactive[int] = reactive(0)
 
+    def __init__(
+        self,
+        cli_args: Optional["argparse.Namespace"] = None,
+        captured_output: Optional[Deque[str]] = None,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        self._cli_args = cli_args
+        self._captured_output: Deque[str] = captured_output or collections.deque(maxlen=_LOG_LIMIT)
+        self._kernel: Any = None
+        self._event_buf_lock = threading.Lock()
+        self._events: Deque[dict] = collections.deque(maxlen=_EVENT_LIMIT)
+        self._faults: Deque[dict] = collections.deque(maxlen=_FAULT_LIMIT)
+        self._supervisor_exit_code: int = 1
+
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Label("⚡ JARVIS TUI | Elapsed: 0s | Press 1-5 for tabs, q to quit", id="elapsed-bar")
+        yield Label("⚡ JARVIS TUI | Starting supervisor... | Press 1-5 for tabs, q to quit", id="elapsed-bar")
         with TabbedContent(id="tabs"):
             with TabPane("Supervisor", id="tab-supervisor"):
                 yield SupervisorTab()
@@ -785,58 +463,137 @@ class JarvisTuiApp(App):
                 yield FaultsTab()
         yield Footer()
 
-    def update_snapshot(
-        self, snapshot: TuiSnapshot, consumed_event: Optional[threading.Event] = None,
-    ) -> None:
-        """Called from SnapshotPump via call_from_thread."""
+    async def on_mount(self) -> None:
+        """Start the supervisor as an async worker inside Textual's event loop."""
+        if self._cli_args is not None:
+            self.run_worker(self._run_supervisor(), name="supervisor", exclusive=True)
+        self.set_interval(interval=_POLL_MS / 1000.0, callback=self._poll_snapshot)
+
+    async def _run_supervisor(self) -> None:
+        """Run the full supervisor startup inside Textual's event loop."""
+        try:
+            from unified_supervisor import async_main
+            self._supervisor_exit_code = await async_main(self._cli_args)
+        except SystemExit as e:
+            self._supervisor_exit_code = e.code if isinstance(e.code, int) else 1
+        except asyncio.CancelledError:
+            self._supervisor_exit_code = 130
+        except Exception as exc:
+            self._captured_output.append(f"[FATAL] Supervisor error: {exc}")
+            self._supervisor_exit_code = 1
+
+    def _handle_event(self, event: Any) -> None:
+        """Event bus handler — appends to ring buffers."""
+        try:
+            ev_dict = {
+                "type": event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
+                "timestamp": getattr(event, "timestamp", time.time()),
+                "message": getattr(event, "message", ""),
+                "severity": event.severity.value if hasattr(event.severity, "value") else str(getattr(event, "severity", "info")),
+                "phase": getattr(event, "phase", ""),
+                "component": getattr(event, "component", ""),
+            }
+            with self._event_buf_lock:
+                self._events.append(ev_dict)
+                if ev_dict["severity"] in _FAULT_SEVERITIES:
+                    self._faults.append(ev_dict)
+        except Exception:
+            pass
+
+    async def _poll_snapshot(self) -> None:
+        """Periodic snapshot builder — reads dashboard + captured output."""
+        try:
+            from unified_supervisor import get_live_dashboard
+            dashboard = get_live_dashboard()
+        except Exception:
+            dashboard = None
+
+        state: Dict[str, Any] = {}
+        if dashboard is not None:
+            lock = getattr(dashboard, "_lock", None)
+            try:
+                if lock:
+                    lock.acquire()
+                state = dashboard._build_render_state()
+            except Exception:
+                state = {}
+            finally:
+                if lock:
+                    try:
+                        lock.release()
+                    except RuntimeError:
+                        pass
+
+        ipc_data: dict = {}
+        if self._kernel is None:
+            try:
+                from unified_supervisor import JarvisSystemKernel
+                self._kernel = JarvisSystemKernel._instance
+            except Exception:
+                pass
+        if self._kernel and hasattr(self._kernel, "_ipc_status"):
+            try:
+                ipc_data = await self._kernel._ipc_status()
+            except Exception:
+                pass
+
+        # Wire event bus subscription (once)
+        if self._kernel and not getattr(self, "_event_bus_wired", False):
+            eb = getattr(self._kernel, "_event_bus", None)
+            if eb:
+                try:
+                    eb.subscribe(self._handle_event)
+                    self._event_bus_wired = True
+                except Exception:
+                    pass
+
+        captured_snap = tuple(self._captured_output)
+        with self._event_buf_lock:
+            events_snap = tuple(self._events)
+            faults_snap = tuple(self._faults)
+
+        snapshot = TuiSnapshot(
+            groups=tuple(copy.deepcopy(state.get("groups", []))),
+            gcp=copy.deepcopy(state.get("gcp", {})),
+            memory=copy.deepcopy(state.get("memory", {})),
+            model=copy.deepcopy(state.get("model", {})),
+            logs=tuple(state.get("logs", [])),
+            elapsed=state.get("elapsed", 0.0),
+            schema_version=state.get("schema_version", "1.0.0"),
+            events=events_snap,
+            faults=faults_snap,
+            ipc_status=copy.deepcopy(ipc_data),
+            captured_logs=captured_snap[-500:] if len(captured_snap) > 500 else captured_snap,
+        )
         self._snapshot = snapshot
-        if consumed_event is not None:
-            consumed_event.set()
 
     def watch__snapshot(self, snapshot: Optional[TuiSnapshot]) -> None:
         if snapshot is None:
             return
         try:
-            elapsed_label = self.query_one("#elapsed-bar", Label)
+            el = self.query_one("#elapsed-bar", Label)
             mins, secs = divmod(int(snapshot.elapsed), 60)
-            elapsed_label.update(
-                f"⚡ JARVIS TUI | Elapsed: {mins}m {secs:02d}s | "
-                f"Schema: {snapshot.schema_version} | "
-                f"Events: {len(snapshot.events)} | "
-                f"Faults: {len(snapshot.faults)} | "
-                f"Logs: {len(snapshot.captured_logs)}"
+            el.update(
+                f"⚡ JARVIS TUI | {mins}m {secs:02d}s | "
+                f"Events: {len(snapshot.events)} | Faults: {len(snapshot.faults)} | "
+                f"Logs: {len(snapshot.captured_logs)} | Press 1-5, q to quit"
             )
         except Exception:
             pass
-
+        for tab_cls in (SupervisorTab, PrimeTab, ReactorTab, EventsTab, FaultsTab):
+            try:
+                self.query_one(tab_cls).update_from_snapshot(snapshot)
+            except Exception:
+                pass
         try:
-            self.query_one(SupervisorTab).update_from_snapshot(snapshot)
-        except Exception:
-            pass
-        try:
-            self.query_one(PrimeTab).update_from_snapshot(snapshot)
-        except Exception:
-            pass
-        try:
-            self.query_one(ReactorTab).update_from_snapshot(snapshot)
-        except Exception:
-            pass
-        try:
-            self.query_one(EventsTab).update_from_snapshot(snapshot)
-        except Exception:
-            pass
-        try:
-            faults_tab = self.query_one(FaultsTab)
-            faults_tab.update_from_snapshot(snapshot)
             self._fault_count = len(snapshot.faults)
         except Exception:
             pass
 
     def watch__fault_count(self, count: int) -> None:
         try:
-            tabs = self.query_one("#tabs", TabbedContent)
-            faults_pane = tabs.query_one("#tab-faults", TabPane)
-            faults_pane.label = f"Faults ({count})" if count > 0 else "Faults"
+            pane = self.query_one("#tabs", TabbedContent).query_one("#tab-faults", TabPane)
+            pane.label = f"Faults ({count})" if count > 0 else "Faults"
         except Exception:
             pass
 
@@ -861,153 +618,84 @@ class JarvisTuiApp(App):
 
     def _switch_tab(self, tab_id: str) -> None:
         try:
-            tabs = self.query_one("#tabs", TabbedContent)
-            tabs.active = tab_id
+            self.query_one("#tabs", TabbedContent).active = tab_id
         except Exception:
             pass
 
 
 # ---------------------------------------------------------------------------
-# TuiCliRenderer — CliRenderer-compatible for --ui tui
+# TuiCliRenderer — CliRenderer-compatible (fallback/no-op for non-TUI paths)
 # ---------------------------------------------------------------------------
 class TuiCliRenderer:
-    """CliRenderer-compatible renderer for the Textual TUI.
+    """Stub renderer returned by _create_cli_renderer('tui').
 
-    Architecture:
-      1. start() redirects stdout and logging to capture buffers, then
-         launches the Textual app in a daemon thread. Textual renders
-         via stderr (its default), so there's no terminal conflict.
-      2. attach_to_supervisor() creates and starts the SnapshotPump
-         with a valid dashboard getter (fixing the data race in the
-         original implementation where the pump was created before
-         the dashboard was available).
-      3. stop() restores stdout and logging handlers.
+    When the TUI is the main app (run_supervisor_tui), data flows through
+    JarvisTuiApp._poll_snapshot directly — not through this renderer.
+    This class exists only to satisfy the CliRenderer interface contract
+    so the supervisor's event subscription and attach calls don't crash.
     """
 
     def __init__(self, verbosity: str = "ops"):
         self._verbosity = verbosity
-        self._running = False
-        self._app: Optional[JarvisTuiApp] = None
-        self._pump: Optional[SnapshotPump] = None
-        self._thread: Optional[threading.Thread] = None
-        self._supervisor = None
-        self._dashboard_getter: Optional[Callable] = None
-        self._event_bus = None
-        self._supervisor_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._ipc_getter: Optional[Callable] = None
-
-        self._captured_output: Deque[str] = collections.deque(maxlen=_LOG_LIMIT)
-        self._orig_stdout: Any = None
-        self._orig_log_handlers: List[logging.Handler] = []
-        self._tui_log_handler: Optional[_TuiLogHandler] = None
 
     def start(self) -> None:
-        """Redirect output, create and launch the Textual TUI app."""
-        self._running = True
-
-        # Step 1: Capture stdout so supervisor banners/prints go to our buffer.
-        # Textual uses stderr for terminal rendering — no conflict.
-        self._orig_stdout = sys.stdout
-        sys.stdout = _OutputCapture(self._captured_output, self._orig_stdout)
-
-        # Step 2: Replace root logger handlers with our buffer handler.
-        # This prevents log messages from writing to stderr (which would
-        # corrupt Textual's terminal rendering).
-        root_logger = logging.getLogger()
-        self._orig_log_handlers = root_logger.handlers[:]
-        self._tui_log_handler = _TuiLogHandler(self._captured_output)
-        for h in self._orig_log_handlers:
-            root_logger.removeHandler(h)
-        root_logger.addHandler(self._tui_log_handler)
-
-        # Step 3: Create and start Textual app in daemon thread
-        self._app = JarvisTuiApp()
-
-        def _run_tui() -> None:
-            try:
-                self._app.run()
-            except Exception as exc:
-                self._restore_output()
-                sys.stderr.write(f"TUI thread exited: {exc}\n")
-
-        self._thread = threading.Thread(
-            target=_run_tui,
-            name="jarvis-tui-thread",
-            daemon=True,
-        )
-        self._thread.start()
-
-        # Pump is NOT created here — deferred to attach_to_supervisor()
-        # so dashboard_getter is available (fixes data race).
-
-    def attach_to_supervisor(self, supervisor: Any) -> None:
-        """Wire read-only references and start the SnapshotPump.
-
-        Called from unified_supervisor.py after renderer creation.
-        Creates the pump HERE (not in start()) because the dashboard
-        getter and event bus are only available after the supervisor
-        kernel is initialized.
-        """
-        self._supervisor = supervisor
-
-        try:
-            from unified_supervisor import get_live_dashboard
-            self._dashboard_getter = get_live_dashboard
-        except ImportError:
-            self._dashboard_getter = None
-
-        self._event_bus = getattr(supervisor, "_event_bus", None)
-
-        try:
-            self._supervisor_loop = asyncio.get_event_loop()
-        except RuntimeError:
-            self._supervisor_loop = None
-
-        if hasattr(supervisor, "_ipc_status"):
-            self._ipc_getter = supervisor._ipc_status
-
-        # NOW create and start the pump with valid data sources
-        if self._app is not None:
-            self._pump = SnapshotPump(
-                dashboard_getter=self._dashboard_getter or (lambda: None),
-                app=self._app,
-                event_bus=self._event_bus,
-                supervisor_loop=self._supervisor_loop,
-                ipc_getter=self._ipc_getter,
-                captured_output=self._captured_output,
-            )
-            self._pump.start()
+        pass
 
     def stop(self) -> None:
-        """Stop the TUI app and pump, restore output."""
-        self._running = False
-        if self._pump:
-            self._pump.stop()
-        if self._app:
-            try:
-                self._app.call_from_thread(self._app.exit)
-            except Exception:
-                pass
-        if self._thread:
-            self._thread.join(timeout=3.0)
-        self._restore_output()
-
-    def _restore_output(self) -> None:
-        """Restore original stdout and logging handlers."""
-        if self._orig_stdout is not None:
-            sys.stdout = self._orig_stdout
-            self._orig_stdout = None
-        root_logger = logging.getLogger()
-        if self._tui_log_handler and self._tui_log_handler in root_logger.handlers:
-            root_logger.removeHandler(self._tui_log_handler)
-        for h in self._orig_log_handlers:
-            if h not in root_logger.handlers:
-                root_logger.addHandler(h)
-        self._orig_log_handlers = []
+        pass
 
     def handle_event(self, _event: Any) -> None:
-        """No-op — TUI gets data via SnapshotPump, not event handler."""
+        pass
 
     def should_display(self, _event: Any) -> bool:
-        """Returns False — TUI manages its own display."""
         return False
+
+    def attach_to_supervisor(self, _supervisor: Any) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Entry point — called from main() when --ui tui
+# ---------------------------------------------------------------------------
+def run_supervisor_tui(args: "argparse.Namespace") -> int:
+    """Run the JARVIS supervisor inside the Textual TUI.
+
+    Textual owns the main thread and event loop. The supervisor startup
+    runs as an async worker inside the TUI's event loop.
+
+    Returns the supervisor exit code.
+    """
+    captured_output: Deque[str] = collections.deque(maxlen=_LOG_LIMIT)
+
+    # Redirect stdout so supervisor banners/prints go to capture buffer.
+    # Textual uses its own internal console (not sys.stdout) for rendering.
+    orig_stdout = sys.stdout
+    sys.stdout = _OutputCapture(captured_output, orig_stdout)
+
+    # Replace root logger handlers with buffer handler so log messages
+    # go to the TUI instead of cluttering the terminal.
+    root_logger = logging.getLogger()
+    orig_handlers = root_logger.handlers[:]
+    tui_handler = _TuiLogHandler(captured_output)
+    for h in orig_handlers:
+        root_logger.removeHandler(h)
+    root_logger.addHandler(tui_handler)
+
+    exit_code = 1
+    try:
+        app = JarvisTuiApp(cli_args=args, captured_output=captured_output)
+        app.run()
+        exit_code = app._supervisor_exit_code
+    except Exception as exc:
+        sys.stderr.write(f"TUI fatal error: {exc}\n")
+        exit_code = 1
+    finally:
+        # Restore stdout and logging
+        sys.stdout = orig_stdout
+        if tui_handler in root_logger.handlers:
+            root_logger.removeHandler(tui_handler)
+        for h in orig_handlers:
+            if h not in root_logger.handlers:
+                root_logger.addHandler(h)
+
+    return exit_code

@@ -93255,20 +93255,37 @@ def main() -> int:
     parser = create_argument_parser()
     args = parser.parse_args()
 
-    # Run async main
-    exit_code = 1  # Default to failure
-    try:
-        exit_code = asyncio.run(async_main(args))
-    except KeyboardInterrupt:
-        print("\n[Kernel] Interrupted by user")
-        exit_code = 130  # 128 + SIGINT(2)
-    except SystemExit as e:
-        exit_code = e.code if isinstance(e.code, int) else 1
-    except Exception as e:
-        print(f"\n[Kernel] Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        exit_code = 1
+    # v279.1: When --ui tui, Textual IS the main event loop. The supervisor
+    # startup runs as an async worker inside Textual's event loop so Textual
+    # has full terminal control (alternate screen, raw mode, signal handlers).
+    _ui_mode = getattr(args, "ui", "auto")
+    if _ui_mode == "tui" and TEXTUAL_AVAILABLE:
+        try:
+            from backend.core.supervisor_tui import run_supervisor_tui
+            # Apply CLI overrides to config via env vars (same as normal path)
+            apply_cli_to_config(args, SystemKernelConfig())
+            exit_code = run_supervisor_tui(args)
+        except ImportError as _tui_ie:
+            print(f"[Kernel] TUI import failed ({_tui_ie}), falling back to normal startup")
+            exit_code = asyncio.run(async_main(args))
+        except Exception as _tui_err:
+            print(f"[Kernel] TUI failed ({_tui_err}), falling back to normal startup")
+            exit_code = asyncio.run(async_main(args))
+    else:
+        # Normal async main
+        exit_code = 1  # Default to failure
+        try:
+            exit_code = asyncio.run(async_main(args))
+        except KeyboardInterrupt:
+            print("\n[Kernel] Interrupted by user")
+            exit_code = 130  # 128 + SIGINT(2)
+        except SystemExit as e:
+            exit_code = e.code if isinstance(e.code, int) else 1
+        except Exception as e:
+            print(f"\n[Kernel] Fatal error: {e}")
+            import traceback
+            traceback.print_exc()
+            exit_code = 1
 
     # v119.0: Guaranteed process exit with os._exit fallback
     # If non-daemon threads are still alive after cleanup, sys.exit won't work
