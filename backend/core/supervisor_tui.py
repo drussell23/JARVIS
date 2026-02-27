@@ -119,6 +119,96 @@ _FAULT_SEVERITIES = frozenset({"error", "warning", "critical"})
 # Regex to strip ANSI escape codes from captured output
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
+# Monotonic sequence counter — thread-safe under GIL (__next__ is atomic)
+import itertools
+_seq_counter = itertools.count(1)
+
+
+# ---------------------------------------------------------------------------
+# Operational metrics — surfaced in status bar and Faults tab
+# ---------------------------------------------------------------------------
+class _TuiMetrics:
+    """Thread-safe operational metrics for TUI health observability.
+
+    All counters use simple int increments (GIL-atomic).
+    Read from Textual's thread, written from any thread.
+    """
+    __slots__ = (
+        "log_drops_total", "event_drops_total", "fault_drops_total",
+        "snapshot_skipped_lock_total", "handler_reinstalls_total",
+        "ipc_stale_cancels_total", "snapshot_build_ms_last",
+        "snapshot_built_at", "bridge_ul_healthy", "bridge_rc_healthy",
+        "bridge_eb_healthy", "bridge_ipc_healthy",
+    )
+
+    def __init__(self) -> None:
+        self.log_drops_total: int = 0
+        self.event_drops_total: int = 0
+        self.fault_drops_total: int = 0
+        self.snapshot_skipped_lock_total: int = 0
+        self.handler_reinstalls_total: int = 0
+        self.ipc_stale_cancels_total: int = 0
+        self.snapshot_build_ms_last: float = 0.0
+        self.snapshot_built_at: float = 0.0  # time.monotonic()
+        # Bridge health: True = UP, False = DOWN
+        self.bridge_ul_healthy: bool = False
+        self.bridge_rc_healthy: bool = False
+        self.bridge_eb_healthy: bool = False
+        self.bridge_ipc_healthy: bool = False
+
+    def status_line(self) -> str:
+        """One-line health summary for status bar."""
+        def _dot(ok: bool) -> str:
+            return "[green]OK[/green]" if ok else "[red]--[/red]"
+        drops = self.log_drops_total + self.event_drops_total
+        stale_ms = 0
+        if self.snapshot_built_at > 0:
+            stale_ms = int((time.monotonic() - self.snapshot_built_at) * 1000)
+        parts = [
+            f"UL:{_dot(self.bridge_ul_healthy)}",
+            f"RC:{_dot(self.bridge_rc_healthy)}",
+            f"EB:{_dot(self.bridge_eb_healthy)}",
+            f"IPC:{_dot(self.bridge_ipc_healthy)}",
+        ]
+        if drops > 0:
+            parts.append(f"[yellow]drops:{drops}[/yellow]")
+        if self.snapshot_skipped_lock_total > 0:
+            parts.append(f"skip:{self.snapshot_skipped_lock_total}")
+        if stale_ms > 2000:
+            parts.append(f"[yellow]stale:{stale_ms}ms[/yellow]")
+        return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Counted deque — tracks overflow drops
+# ---------------------------------------------------------------------------
+class _CountedDeque:
+    """Deque wrapper that counts dropped items when maxlen is exceeded."""
+
+    __slots__ = ("_deque", "_drops")
+
+    def __init__(self, maxlen: int):
+        self._deque: Deque[str] = collections.deque(maxlen=maxlen)
+        self._drops: int = 0
+
+    def append(self, item: str) -> None:
+        if len(self._deque) == self._deque.maxlen:
+            self._drops += 1
+        self._deque.append(item)
+
+    @property
+    def drops(self) -> int:
+        return self._drops
+
+    def __len__(self) -> int:
+        return len(self._deque)
+
+    def __iter__(self):
+        return iter(self._deque)
+
+    def __bool__(self) -> bool:
+        return bool(self._deque)
+
 # Broad keyword sets — catch real log lines
 _PRIME_KEYWORDS = frozenset({
     "prime", "j-prime", "jprime", "jarvis-prime", "jarvis_prime",
@@ -149,13 +239,11 @@ class _TuiLogHandler(logging.Handler):
     Installed on the root logger at level=INFO. Survives Textual's stdout
     redirect because it writes directly to a deque, not stdout.
 
-    v4: Includes a _marker attribute so we can detect and re-install it
-    if the supervisor's logging setup removes it.
+    v4.1: Source-tagged with monotonic sequence number for causal ordering.
+    Includes identity marker for re-installation detection.
     """
 
-    _TUI_HANDLER_MARKER = "_jarvis_tui_handler"
-
-    def __init__(self, buffer: Deque[str]):
+    def __init__(self, buffer: Any):
         super().__init__(level=logging.INFO)
         self._buffer = buffer
         self._jarvis_tui_handler = True  # Marker for re-installation detection
@@ -166,7 +254,9 @@ class _TuiLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._buffer.append(self.format(record))
+            seq = next(_seq_counter)
+            formatted = self.format(record)
+            self._buffer.append(f"[pylog#{seq}] {formatted}")
         except Exception:
             pass
 
@@ -231,6 +321,7 @@ def _patch_unified_logger(buffer: Deque[str]) -> bool:
             orig_log(level, message, **kwargs)
             # Also capture to TUI buffer (bypasses stdout entirely)
             try:
+                seq = next(_seq_counter)
                 level_name = (
                     level.value[0]
                     if hasattr(level, "value")
@@ -240,7 +331,7 @@ def _patch_unified_logger(buffer: Deque[str]) -> bool:
                 # Strip Rich markup tags for clean display
                 clean = _ANSI_RE.sub("", message)
                 buffer.append(
-                    f"{level_name:8} +{elapsed:>7.0f}ms | {clean}"
+                    f"[ulog#{seq}] {level_name:8} +{elapsed:>7.0f}ms | {clean}"
                 )
             except Exception:
                 pass
@@ -289,7 +380,8 @@ def _patch_rich_console(buffer: Deque[str]) -> bool:
                             # Strip ANSI codes for clean TUI display
                             clean = _ANSI_RE.sub("", stripped)
                             if clean.strip():
-                                self._buf.append(clean)
+                                seq = next(_seq_counter)
+                                self._buf.append(f"[rich#{seq}] {clean}")
                 return len(s) if s else 0
 
             def flush(self) -> None:
@@ -638,7 +730,9 @@ class FaultsTab(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield Static("[green]No faults detected[/green]", id="faults-content")
 
-    def update_from_snapshot(self, snap: TuiSnapshot) -> None:
+    def update_from_snapshot(
+        self, snap: TuiSnapshot, metrics: Optional[_TuiMetrics] = None
+    ) -> None:
         try:
             content = self.query_one("#faults-content", Static)
             # Also include ERROR/WARNING/CRITICAL from captured logs
@@ -649,9 +743,26 @@ class FaultsTab(VerticalScroll):
                     fault_logs.append(ll)
 
             if not snap.faults and not fault_logs:
-                content.update("[green]No faults detected[/green]")
+                if metrics and (metrics.log_drops_total > 0 or metrics.snapshot_skipped_lock_total > 0):
+                    content.update(
+                        f"[green]No faults detected[/green]\n\n"
+                        f"[dim]TUI Health: drops={metrics.log_drops_total} "
+                        f"lock_skips={metrics.snapshot_skipped_lock_total} "
+                        f"reinstalls={metrics.handler_reinstalls_total} "
+                        f"build={metrics.snapshot_build_ms_last:.0f}ms[/dim]"
+                    )
+                else:
+                    content.update("[green]No faults detected[/green]")
                 return
             lines: List[str] = []
+            # TUI health metrics (if any drops/skips)
+            if metrics and (metrics.log_drops_total > 0 or metrics.snapshot_skipped_lock_total > 0):
+                lines.append(
+                    f"[dim]TUI Health: drops={metrics.log_drops_total} "
+                    f"lock_skips={metrics.snapshot_skipped_lock_total} "
+                    f"reinstalls={metrics.handler_reinstalls_total} "
+                    f"build={metrics.snapshot_build_ms_last:.0f}ms[/dim]\n"
+                )
             # Event bus faults
             if snap.faults:
                 lines.append("[bold underline]Event Bus Faults[/bold underline]\n")
@@ -778,6 +889,8 @@ class JarvisTuiApp(App):
         self._unified_logger_patched = False
         self._rich_console_patched = False
         self._handler_check_counter = 0
+        # v4.1: Operational metrics for observability
+        self._metrics = _TuiMetrics()
 
     # ── Compose ──────────────────────────────────────────────────────────
 
@@ -964,6 +1077,8 @@ class JarvisTuiApp(App):
         kernel discovery, event bus wiring) happens here. This NEVER runs
         on Textual's event loop — Textual stays responsive.
         """
+        t0 = time.monotonic()
+        m = self._metrics
         # --- Dashboard state (non-blocking trylock) ---
         state: Dict[str, Any] = self._last_dashboard_state
         try:
@@ -981,7 +1096,9 @@ class JarvisTuiApp(App):
                     if acquired:
                         state = dashboard._build_render_state()
                         self._last_dashboard_state = state
-                else:
+                    else:
+                        m.snapshot_skipped_lock_total += 1
+                if not lock:
                     state = dashboard._build_render_state()
                     self._last_dashboard_state = state
             except Exception:
@@ -1048,7 +1165,19 @@ class JarvisTuiApp(App):
         # --- Re-install TUI log handler if supervisor removed it ---
         self._handler_check_counter += 1
         if self._handler_check_counter % 10 == 0 and self._tui_log_handler:
+            root = logging.getLogger()
+            had_it = any(
+                getattr(h, "_jarvis_tui_handler", False) for h in root.handlers
+            )
             _ensure_tui_handler_installed(self._tui_log_handler)
+            if not had_it:
+                m.handler_reinstalls_total += 1
+
+        # --- Update bridge health in metrics ---
+        m.bridge_ul_healthy = self._unified_logger_patched
+        m.bridge_rc_healthy = self._rich_console_patched
+        m.bridge_eb_healthy = self._event_bus_wired
+        m.bridge_ipc_healthy = self._cached_ipc != {}
 
         # --- Build snapshot (heavy work — deepcopy, tuple conversion) ---
         captured_snap = tuple(self._captured_output)
@@ -1060,6 +1189,10 @@ class JarvisTuiApp(App):
             self._supervisor_thread is not None
             and self._supervisor_thread.is_alive()
         )
+
+        # Track build timing for metrics
+        m.snapshot_build_ms_last = (time.monotonic() - t0) * 1000
+        m.snapshot_built_at = time.monotonic()
 
         return TuiSnapshot(
             groups=tuple(copy.deepcopy(state.get("groups", []))),
@@ -1110,21 +1243,17 @@ class JarvisTuiApp(App):
     def watch__snapshot(self, snapshot: Optional[TuiSnapshot]) -> None:
         if snapshot is None:
             return
-        # Update status bar
+        # Update status bar with metrics
         try:
             el = self.query_one("#elapsed-bar", Label)
             mins, secs = divmod(int(snapshot.elapsed), 60)
             alive = "LIVE" if snapshot.supervisor_alive else "EXITED"
-            bridge = ""
-            if self._unified_logger_patched:
-                bridge += " UL"
-            if self._rich_console_patched:
-                bridge += "+RC"
+            health = self._metrics.status_line()
             el.update(
                 f"JARVIS TUI | {alive} | {mins}m {secs:02d}s | "
-                f"Events: {len(snapshot.events)} | "
-                f"Faults: {len(snapshot.faults)} | "
-                f"Logs: {len(snapshot.captured_logs)}{bridge} | 1-5 tabs, q quit"
+                f"E:{len(snapshot.events)} F:{len(snapshot.faults)} "
+                f"L:{len(snapshot.captured_logs)} | "
+                f"{health} | 1-5 tabs, q quit"
             )
         except Exception:
             pass
@@ -1134,12 +1263,20 @@ class JarvisTuiApp(App):
             active_id = tabs.active
             tab_cls = _TAB_ID_TO_CLS.get(active_id)
             if tab_cls:
-                self.query_one(tab_cls).update_from_snapshot(snapshot)
+                widget = self.query_one(tab_cls)
+                if isinstance(widget, FaultsTab):
+                    widget.update_from_snapshot(snapshot, metrics=self._metrics)
+                else:
+                    widget.update_from_snapshot(snapshot)
         except Exception:
             # Fallback: update all
-            for tab_cls in _TAB_ID_TO_CLS.values():
+            for tab_cls_fb in _TAB_ID_TO_CLS.values():
                 try:
-                    self.query_one(tab_cls).update_from_snapshot(snapshot)
+                    w = self.query_one(tab_cls_fb)
+                    if isinstance(w, FaultsTab):
+                        w.update_from_snapshot(snapshot, metrics=self._metrics)
+                    else:
+                        w.update_from_snapshot(snapshot)
                 except Exception:
                     pass
         try:
