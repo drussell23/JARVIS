@@ -465,21 +465,34 @@ class JarvisTuiApp(App):
 
     async def on_mount(self) -> None:
         """Start the supervisor as an async worker inside Textual's event loop."""
+        self._captured_output.append("[TUI] Textual app mounted — starting supervisor worker...")
         if self._cli_args is not None:
-            self.run_worker(self._run_supervisor(), name="supervisor", exclusive=True)
+            self.run_worker(
+                self._run_supervisor(),
+                name="supervisor",
+                exclusive=True,
+                exit_on_error=False,
+            )
         self.set_interval(interval=_POLL_MS / 1000.0, callback=self._poll_snapshot)
 
     async def _run_supervisor(self) -> None:
         """Run the full supervisor startup inside Textual's event loop."""
+        self._captured_output.append("[TUI] Supervisor worker started — calling async_main()...")
         try:
             from unified_supervisor import async_main
             self._supervisor_exit_code = await async_main(self._cli_args)
+            self._captured_output.append(f"[TUI] async_main() completed with exit code: {self._supervisor_exit_code}")
         except SystemExit as e:
             self._supervisor_exit_code = e.code if isinstance(e.code, int) else 1
+            self._captured_output.append(f"[TUI] SystemExit: code={self._supervisor_exit_code}")
         except asyncio.CancelledError:
             self._supervisor_exit_code = 130
+            self._captured_output.append("[TUI] Supervisor worker cancelled")
         except Exception as exc:
-            self._captured_output.append(f"[FATAL] Supervisor error: {exc}")
+            import traceback
+            self._captured_output.append(f"[FATAL] Supervisor error: {type(exc).__name__}: {exc}")
+            for line in traceback.format_exc().splitlines():
+                self._captured_output.append(f"  {line}")
             self._supervisor_exit_code = 1
 
     def _handle_event(self, event: Any) -> None:
