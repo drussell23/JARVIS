@@ -409,9 +409,16 @@ class AudioBus:
         """Get the singleton if it exists, otherwise None."""
         return cls._instance
 
-    async def start(self, config: Optional[DeviceConfig] = None) -> None:
+    async def start(
+        self,
+        config: Optional[DeviceConfig] = None,
+        progress_callback=None,
+    ) -> None:
         """
         Initialize and start the audio device, AEC, and resamplers.
+
+        v275.6: progress_callback is threaded to FullDuplexDevice.start()
+        for init progress heartbeats.
         """
         if self._running:
             logger.warning("[AudioBus] Already running")
@@ -427,7 +434,7 @@ class AudioBus:
 
         # Initialize audio device (duplex when possible, output-only fallback).
         self._device = FullDuplexDevice(self._config)
-        await self._device.start()
+        await self._device.start(progress_callback=progress_callback)
 
         # Input processing is only enabled when capture is active.
         if self._device.input_enabled:

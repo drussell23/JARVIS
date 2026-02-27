@@ -147,7 +147,7 @@ class FullDuplexDevice:
     def playback_buffer(self) -> PlaybackRingBuffer:
         return self._playback_buffer
 
-    async def start(self) -> None:
+    async def start(self, progress_callback=None) -> None:
         """
         Open the full-duplex stream.
 
@@ -159,6 +159,10 @@ class FullDuplexDevice:
 
         Fix: run the entire synchronous PortAudio initialization in a thread
         executor so the event loop stays responsive and timeouts actually fire.
+
+        v275.6: Added progress_callback(phase: str, detail: str) for init
+        progress heartbeats. Called at each CoreAudio step so callers can
+        distinguish hangs from slow progress on timeout.
         """
         if self._running:
             logger.warning("[FullDuplexDevice] Already running")
@@ -168,19 +172,32 @@ class FullDuplexDevice:
             raise ImportError("sounddevice is not installed")
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._open_stream_sync)
+        await loop.run_in_executor(
+            None, lambda: self._open_stream_sync(progress_callback)
+        )
 
         # These touch asyncio primitives — must stay on event loop thread.
         self._started_event.set()
 
-    def _open_stream_sync(self) -> None:
+    def _open_stream_sync(self, progress_callback=None) -> None:
         """
         Synchronous PortAudio initialization — runs in thread executor.
 
         Handles device validation, profile building, stream creation and start.
         On success, sets self._running = True and populates self._stream.
         On failure, raises RuntimeError with details.
+
+        v275.6: progress_callback(phase, detail) emits heartbeats at each
+        CoreAudio step for timeout classification (hung vs slow).
         """
+        def _pcb(phase, detail):
+            if progress_callback is not None:
+                try:
+                    progress_callback(phase, detail)
+                except Exception:
+                    pass  # never let callback failure abort audio init
+
+        _pcb("device_query", "started")
         try:
             if os.getenv("JARVIS_AUDIO_VALIDATE_DEVICES", "true").lower() in (
                 "1",
@@ -191,6 +208,7 @@ class FullDuplexDevice:
                 self._validate_device_selection()
         except Exception:
             raise
+        _pcb("device_query", "completed")
 
         startup_profiles = self._build_startup_profiles()
         startup_errors: List[str] = []
@@ -204,6 +222,7 @@ class FullDuplexDevice:
             self._mode = mode
             self.config.sample_rate = sample_rate
 
+            _pcb("profile_check", f"profile_{idx}")
             if not self._profile_supported(
                 mode=mode,
                 sample_rate=sample_rate,
@@ -216,10 +235,12 @@ class FullDuplexDevice:
                 continue
 
             try:
+                _pcb("stream_open", f"profile_{idx}")
                 self._stream = self._create_stream(
                     mode=mode,
                     sample_rate=sample_rate,
                 )
+                _pcb("stream_start", f"profile_{idx}")
                 self._stream.start()
                 self._running = True
                 self._startup_silence_frames = max(
@@ -248,6 +269,7 @@ class FullDuplexDevice:
                     f"in={in_device_label}, out={out_device_label}, "
                     f"startup_silence={self.config.startup_silence_ms}ms{fallback_note}"
                 )
+                _pcb("stream_start", "completed")
                 return
             except Exception as e:
                 startup_errors.append(

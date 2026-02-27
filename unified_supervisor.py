@@ -7971,6 +7971,30 @@ class SupervisorEventType(Enum):
     SHUTDOWN_END = "shutdown_end"
     LOG = "log"
 
+
+# =========================================================================
+# v275.6: AudioBus init diagnostic taxonomy
+# =========================================================================
+class AudioInitPhase:
+    """Phases of AudioBus initialization for progress tracking."""
+    IMPORT = "import"
+    DEVICE_QUERY = "device_query"
+    PROFILE_CHECK = "profile_check"
+    STREAM_OPEN = "stream_open"
+    STREAM_START = "stream_start"
+
+
+class AudioInitOutcome:
+    """Outcome classification for AudioBus init attempts."""
+    SUCCESS = "success"
+    TIMEOUT_HUNG = "timeout_hung"           # No progress during timeout
+    TIMEOUT_SLOW = "timeout_slow_progress"  # Progress but too slow
+    DEVICE_ERROR = "device_error"
+    IMPORT_ERROR = "import_error"
+    MEMORY_PRESSURE = "memory_pressure"
+    OSCILLATION_LIMIT = "oscillation_limit"
+
+
 class SupervisorEventSeverity(Enum):
     """Event severity levels."""
     DEBUG = "debug"
@@ -62540,6 +62564,9 @@ class JarvisSystemKernel:
         self._audio_recovery_task: Optional[asyncio.Task] = None
         self._audio_infrastructure_initialized: bool = False
         self._audio_pipeline_handle = None  # v238.1: PipelineHandle from bootstrap
+        # v275.6: Oscillation prevention for AudioBus init/recovery cycles
+        self._audio_init_consecutive_failures: int = 0
+        self._audio_init_permanent_degraded: bool = False
 
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
@@ -66329,33 +66356,39 @@ class JarvisSystemKernel:
         # =====================================================================
         if self._audio_bus_enabled:
             _ab_base_timeout = _get_env_float("JARVIS_AUDIO_BUS_INIT_TIMEOUT", 15.0)
-            # v275.5: Adaptive scaling based on preload duration.
-            # If preload took > 15s, the system is under heavy load —
-            # CoreAudio operations will be proportionally slower.
-            _ab_timeout = _ab_base_timeout
-            if _preload_elapsed > 15.0:
-                # Scale linearly: 15s preload → 1.0x, 30s → 1.5x, 60s → 2.5x
-                _load_factor = 1.0 + (_preload_elapsed - 15.0) / 30.0
-                _ab_timeout = _ab_base_timeout * min(_load_factor, 3.0)
-            # v275.5: CPU-aware scaling (same pattern as recovery loop).
+            # v275.6: Measure event loop lag before AudioBus init.
+            # High lag indicates GIL/memory contention that will slow
+            # CoreAudio C calls proportionally.
+            _ab_loop_lag_ms = 0.0
             try:
-                import psutil as _ab_psutil
-                _ab_cpu = _ab_psutil.cpu_percent(interval=None)
-                if _ab_cpu > 80.0:
-                    _cpu_factor = 1.0 + (_ab_cpu - 80.0) / 20.0  # up to 2x at 100%
-                    _ab_timeout *= _cpu_factor
+                _loop = asyncio.get_running_loop()
+                _lag_future = _loop.create_future()
+                _lag_t0 = time.monotonic()
+                _loop.call_soon(lambda: _lag_future.done() or _lag_future.set_result(time.monotonic()))
+                _lag_t1 = await asyncio.wait_for(_lag_future, timeout=2.0)
+                _ab_loop_lag_ms = (_lag_t1 - _lag_t0) * 1000.0
             except Exception:
                 pass
+
+            # v275.6: Gather system signals + compute timeout via shared policy
+            _ab_context = self._gather_audio_init_context()
+            _ab_context["event_loop_lag_ms"] = _ab_loop_lag_ms
+            _ab_timeout, _ab_reason = self._compute_audio_init_timeout(
+                _ab_base_timeout, _preload_elapsed, _ab_context,
+            )
+
+            # v275.6: Progress heartbeat tracker for timeout classification
+            _ab_progress = []  # [(timestamp, phase, detail)]
+            _ab_progress_lock = threading.Lock()
+            def _ab_progress_cb(phase, detail):
+                with _ab_progress_lock:
+                    _ab_progress.append((time.time(), phase, detail))
+
+            _ab_init_err = None
+            _ab_is_timeout = False
+            _ab_t0 = time.time()
             try:
                 # v266.4: Import AudioBus in thread executor.
-                # The import chain triggers `import sounddevice` which
-                # calls Pa_Initialize() — a synchronous C call into
-                # CoreAudio that enumerates hardware devices. On macOS
-                # this can hang indefinitely (device busy, permission
-                # dialog, CoreAudio stall), freezing the event loop and
-                # defeating asyncio.wait_for() timeouts. Same root-cause
-                # pattern as ECAPA v265.2 and Zone 6 v265.2.
-                #
                 # v275.3+: sounddevice is now pre-loaded, so this import
                 # should be near-instant. Timeout kept as safety net.
                 _loop = asyncio.get_running_loop()
@@ -66375,36 +66408,104 @@ class JarvisSystemKernel:
                 # FullDuplexDevice.start() now runs PortAudio ops in
                 # run_in_executor() internally (v266.4), so wait_for
                 # can actually fire on timeout.
-                await asyncio.wait_for(self._audio_bus.start(), timeout=_ab_timeout)
+                # v275.6: Pass progress callback for heartbeat tracking
+                await asyncio.wait_for(
+                    self._audio_bus.start(progress_callback=_ab_progress_cb),
+                    timeout=_ab_timeout,
+                )
+                _ab_duration = time.time() - _ab_t0
+                self._audio_init_consecutive_failures = 0
                 self._component_status["audio_infrastructure"] = {
                     "status": "running",
                     "message": "AudioBus initialized",
                 }
                 self.logger.info(
-                    "[Kernel] AudioBus started (v267.0, timeout=%.1fs, preload=%.1fs)",
-                    _ab_timeout, _preload_elapsed,
+                    "[Kernel] AudioBus started (v275.6, timeout=%.1fs, "
+                    "preload=%.1fs, reason=%s, duration=%.1fs)",
+                    _ab_timeout, _preload_elapsed, _ab_reason, _ab_duration,
+                )
+                self._emit_event(
+                    SupervisorEventType.COMPONENT_STATUS,
+                    "AudioBus init success",
+                    severity=SupervisorEventSeverity.SUCCESS,
+                    component="audio_infrastructure",
+                    duration_ms=_ab_duration * 1000,
+                    metadata={
+                        "outcome": AudioInitOutcome.SUCCESS,
+                        "timeout": _ab_timeout,
+                        "reason": _ab_reason,
+                        "preload_elapsed": _preload_elapsed,
+                        "progress_steps": len(_ab_progress),
+                    },
                 )
             except asyncio.TimeoutError:
+                _ab_is_timeout = True
+                _ab_outcome = self._classify_audio_init_outcome(
+                    _ab_progress, is_timeout=True,
+                )
+                self._audio_init_consecutive_failures += 1
+                _last_phase = _ab_progress[-1][1] if _ab_progress else "none"
                 self.logger.warning(
-                    "[Kernel] AudioBus init timed out (%.1fs, preload=%.1fs) "
+                    "[Kernel] AudioBus init timed out (%.1fs, preload=%.1fs, "
+                    "reason=%s, outcome=%s, last_phase=%s, steps=%d) "
                     "— scheduling recovery",
-                    _ab_timeout, _preload_elapsed,
+                    _ab_timeout, _preload_elapsed, _ab_reason,
+                    _ab_outcome, _last_phase, len(_ab_progress),
                 )
                 self._audio_bus = None
                 self._component_status["audio_infrastructure"] = {
                     "status": "degraded",
-                    "message": f"AudioBus init timeout ({_ab_timeout:.0f}s) — recovery scheduled",
+                    "message": (
+                        f"AudioBus init timeout ({_ab_timeout:.0f}s, "
+                        f"{_ab_outcome}) — recovery scheduled"
+                    ),
                 }
+                self._emit_event(
+                    SupervisorEventType.COMPONENT_STATUS,
+                    f"AudioBus init timeout ({_ab_outcome})",
+                    severity=SupervisorEventSeverity.WARNING,
+                    component="audio_infrastructure",
+                    duration_ms=_ab_timeout * 1000,
+                    metadata={
+                        "outcome": _ab_outcome,
+                        "timeout": _ab_timeout,
+                        "reason": _ab_reason,
+                        "last_phase": _last_phase,
+                        "progress_steps": len(_ab_progress),
+                        "consecutive_failures": self._audio_init_consecutive_failures,
+                    },
+                )
                 self._schedule_audio_bus_recovery("early_init_timeout")
             except Exception as ab_err:
+                _ab_init_err = ab_err
+                _ab_outcome = self._classify_audio_init_outcome(
+                    _ab_progress, is_timeout=False, error=ab_err,
+                )
+                self._audio_init_consecutive_failures += 1
                 self.logger.warning(
-                    f"[Kernel] AudioBus init failed: {ab_err} — scheduling recovery"
+                    "[Kernel] AudioBus init failed: %s (outcome=%s) "
+                    "— scheduling recovery",
+                    ab_err, _ab_outcome,
                 )
                 self._audio_bus = None
                 self._component_status["audio_infrastructure"] = {
                     "status": "degraded",
-                    "message": f"AudioBus init failed: {ab_err} (recovery scheduled)",
+                    "message": (
+                        f"AudioBus init failed: {ab_err} "
+                        f"({_ab_outcome}, recovery scheduled)"
+                    ),
                 }
+                self._emit_event(
+                    SupervisorEventType.COMPONENT_STATUS,
+                    f"AudioBus init error ({_ab_outcome})",
+                    severity=SupervisorEventSeverity.ERROR,
+                    component="audio_infrastructure",
+                    metadata={
+                        "outcome": _ab_outcome,
+                        "error": str(ab_err),
+                        "consecutive_failures": self._audio_init_consecutive_failures,
+                    },
+                )
                 self._schedule_audio_bus_recovery("early_init_error")
         else:
             self._component_status["audio_infrastructure"] = {
@@ -75553,9 +75654,135 @@ class JarvisSystemKernel:
         )
         self._background_tasks.append(self._audio_health_task)
 
+    def _compute_audio_init_timeout(
+        self,
+        base_timeout: float,
+        preload_elapsed: float,
+        context: Dict[str, Any],
+    ) -> Tuple[float, str]:
+        """Shared policy for AudioBus init/recovery timeout computation.
+
+        v275.6: Unified from inline init + recovery loop to eliminate policy
+        divergence. Returns (effective_timeout, reason_string).
+
+        Factors:
+          - preload_elapsed: Native lib preload duration proxy for system load
+          - cpu_pct: Instantaneous CPU utilization
+          - event_loop_lag_ms: Event loop scheduling latency
+          - memory_tier: MemoryQuantizer tier (CRITICAL/EMERGENCY/CONSTRAINED)
+          - thrash_state: MemoryQuantizer pagein thrash state
+
+        Hard cap: JARVIS_AUDIO_BUS_INIT_MAX_TIMEOUT (default 45s).
+        """
+        factors = []
+        effective = base_timeout
+
+        # 1. Preload-aware scaling
+        if preload_elapsed > 15.0:
+            load_factor = 1.0 + (preload_elapsed - 15.0) / 30.0
+            load_factor = min(load_factor, 3.0)
+            effective *= load_factor
+            factors.append(f"preload={preload_elapsed:.1f}s→{load_factor:.2f}x")
+
+        # 2. CPU scaling
+        cpu_pct = context.get("cpu_pct", 0.0)
+        if cpu_pct > 80.0:
+            cpu_factor = 1.0 + (cpu_pct - 80.0) / 20.0  # up to 2x at 100%
+            effective *= cpu_factor
+            factors.append(f"cpu={cpu_pct:.0f}%→{cpu_factor:.2f}x")
+
+        # 3. Event loop lag scaling
+        lag_ms = context.get("event_loop_lag_ms", 0.0)
+        if lag_ms > 100.0:
+            lag_factor = 1.0 + min((lag_ms - 100.0) / 500.0, 1.0)  # up to 2x
+            effective *= lag_factor
+            factors.append(f"lag={lag_ms:.0f}ms→{lag_factor:.2f}x")
+
+        # 4. Memory pressure scaling
+        thrash_state = context.get("thrash_state", "unknown")
+        memory_tier = context.get("memory_tier")
+        if thrash_state == "emergency":
+            effective *= 2.0
+            factors.append("thrash=emergency→2.0x")
+        elif thrash_state == "thrashing":
+            effective *= 1.5
+            factors.append("thrash=thrashing→1.5x")
+
+        if memory_tier in ("CRITICAL", "EMERGENCY"):
+            effective *= 1.5
+            factors.append(f"tier={memory_tier}→1.5x")
+        elif memory_tier == "CONSTRAINED":
+            effective *= 1.2
+            factors.append(f"tier={memory_tier}→1.2x")
+
+        # 5. Hard cap
+        hard_cap = _get_env_float("JARVIS_AUDIO_BUS_INIT_MAX_TIMEOUT", 45.0)
+        if effective > hard_cap:
+            factors.append(f"capped={effective:.1f}→{hard_cap:.1f}")
+            effective = hard_cap
+
+        reason = "; ".join(factors) if factors else "base"
+        return (effective, reason)
+
+    def _classify_audio_init_outcome(
+        self,
+        progress: list,
+        is_timeout: bool,
+        error: Optional[Exception] = None,
+    ) -> str:
+        """Classify AudioBus init outcome from progress heartbeats.
+
+        v275.6: Used for structured event emission and diagnostic logging.
+        """
+        if not is_timeout and error is None:
+            return AudioInitOutcome.SUCCESS
+        if error is not None and not is_timeout:
+            err_str = str(error).lower()
+            if "import" in err_str or "module" in err_str:
+                return AudioInitOutcome.IMPORT_ERROR
+            return AudioInitOutcome.DEVICE_ERROR
+        # Timeout — classify from progress heartbeats
+        if not progress:
+            return AudioInitOutcome.TIMEOUT_HUNG
+        last_ts = progress[-1][0]
+        if time.time() - last_ts > 5.0:
+            return AudioInitOutcome.TIMEOUT_HUNG
+        return AudioInitOutcome.TIMEOUT_SLOW
+
+    def _gather_audio_init_context(self) -> Dict[str, Any]:
+        """Gather system signals for adaptive timeout computation.
+
+        v275.6: Consolidates CPU, memory, and event loop lag into a
+        context dict consumed by _compute_audio_init_timeout().
+        """
+        ctx: Dict[str, Any] = {}
+        # CPU
+        try:
+            import psutil as _psutil
+            ctx["cpu_pct"] = _psutil.cpu_percent(interval=None)
+        except Exception:
+            ctx["cpu_pct"] = 0.0
+        # MemoryQuantizer
+        try:
+            from backend.core.memory_quantizer import get_memory_quantizer_instance
+            _mq = get_memory_quantizer_instance()
+            if _mq is not None:
+                if hasattr(_mq, "current_tier") and _mq.current_tier is not None:
+                    ctx["memory_tier"] = _mq.current_tier.value if hasattr(_mq.current_tier, "value") else str(_mq.current_tier)
+                ctx["thrash_state"] = getattr(_mq, "_thrash_state", "unknown")
+        except Exception:
+            pass
+        return ctx
+
     def _schedule_audio_bus_recovery(self, reason: str) -> None:
         """Schedule bounded background recovery for AudioBus initialization failures."""
         if not self._audio_bus_enabled:
+            return
+        if self._audio_init_permanent_degraded:
+            self.logger.warning(
+                "[AudioRecovery] Permanently degraded — skipping recovery for '%s'",
+                reason,
+            )
             return
         if self._audio_recovery_task is not None and not self._audio_recovery_task.done():
             return
@@ -75570,13 +75797,23 @@ class JarvisSystemKernel:
         """
         Recover AudioBus after early-init failures without requiring restart.
 
-        This avoids session-long voice degradation from transient startup
-        contention (audio device busy, delayed dependency import, etc.).
+        v275.6: Uses shared _compute_audio_init_timeout() policy, progress
+        heartbeats, oscillation guard, and structured events.
         """
         initial_delay = _get_env_float("JARVIS_AUDIO_RECOVERY_INITIAL_DELAY", 5.0)
         retry_interval = _get_env_float("JARVIS_AUDIO_RECOVERY_RETRY_INTERVAL", 15.0)
         max_attempts = _get_env_int("JARVIS_AUDIO_RECOVERY_MAX_ATTEMPTS", 12)
         start_timeout = _get_env_float("JARVIS_AUDIO_BUS_RECOVERY_TIMEOUT", 12.0)
+        max_consecutive = _get_env_int(
+            "JARVIS_AUDIO_INIT_MAX_CONSECUTIVE_FAILURES", 3,
+        )
+
+        self._emit_event(
+            SupervisorEventType.RECOVERY_START,
+            f"AudioBus recovery starting (reason={initial_reason})",
+            component="audio_infrastructure",
+            metadata={"reason": initial_reason},
+        )
 
         try:
             await asyncio.sleep(initial_delay)
@@ -75587,43 +75824,73 @@ class JarvisSystemKernel:
         while not self._shutdown_event.is_set():
             if max_attempts > 0 and attempts >= max_attempts:
                 break
+            # v275.6: Oscillation guard
+            if self._audio_init_permanent_degraded:
+                self.logger.info(
+                    "[AudioRecovery] Permanently degraded — stopping recovery"
+                )
+                break
             attempts += 1
 
-            # v265.5: CPU-aware timeout + interval scaling — audio device
-            # init and stream open are blocking I/O that slows under load.
-            _effective_timeout = start_timeout
+            # v275.6: Use shared policy for adaptive timeout
+            _rc_context = self._gather_audio_init_context()
+            _effective_timeout, _rc_reason = self._compute_audio_init_timeout(
+                start_timeout, 0.0, _rc_context,
+            )
             _effective_interval = retry_interval
-            try:
-                import psutil as _ab_psutil
-                _ab_cpu = _ab_psutil.cpu_percent(interval=None)
-                if _ab_cpu > 90.0:
-                    _ab_factor = 1.0 + (_ab_cpu - 90.0) / 10.0 * 2.0
-                    _effective_timeout *= _ab_factor
-                    _effective_interval *= _ab_factor
-            except Exception:
-                pass
+            # Scale interval proportionally if timeout was scaled
+            if _effective_timeout > start_timeout:
+                _effective_interval *= (_effective_timeout / start_timeout)
+
+            # v275.6: Progress heartbeat for recovery attempts
+            _rc_progress = []
+            _rc_progress_lock = threading.Lock()
+            def _rc_progress_cb(phase, detail):
+                with _rc_progress_lock:
+                    _rc_progress.append((time.time(), phase, detail))
 
             try:
                 if self._audio_bus is not None and getattr(self._audio_bus, "is_running", False):
+                    self._audio_init_consecutive_failures = 0
                     self._ensure_audio_health_monitor()
                     if self._model_serving is not None:
                         await self._attempt_wire_audio_pipeline(context="recovery")
+                    self._emit_event(
+                        SupervisorEventType.RECOVERY_END,
+                        "AudioBus already running",
+                        severity=SupervisorEventSeverity.SUCCESS,
+                        component="audio_infrastructure",
+                    )
                     return
 
                 if self._audio_bus is None:
                     from backend.audio.audio_bus import AudioBus
-                    # v267.0: Use singleton factory (same fix as early init)
                     self._audio_bus = AudioBus.get_instance()
 
-                await asyncio.wait_for(self._audio_bus.start(), timeout=_effective_timeout)
+                await asyncio.wait_for(
+                    self._audio_bus.start(progress_callback=_rc_progress_cb),
+                    timeout=_effective_timeout,
+                )
+                self._audio_init_consecutive_failures = 0
                 self._component_status["audio_infrastructure"] = {
                     "status": "running",
                     "message": f"AudioBus recovered (attempt {attempts})",
                 }
                 self.logger.info(
-                    "[AudioRecovery] AudioBus recovered after '%s' (attempt %d)",
-                    initial_reason,
-                    attempts,
+                    "[AudioRecovery] AudioBus recovered after '%s' "
+                    "(attempt %d, timeout=%.1fs, reason=%s)",
+                    initial_reason, attempts, _effective_timeout, _rc_reason,
+                )
+                self._emit_event(
+                    SupervisorEventType.RECOVERY_END,
+                    f"AudioBus recovered (attempt {attempts})",
+                    severity=SupervisorEventSeverity.SUCCESS,
+                    component="audio_infrastructure",
+                    metadata={
+                        "outcome": AudioInitOutcome.SUCCESS,
+                        "attempt": attempts,
+                        "reason": initial_reason,
+                    },
                 )
                 self._ensure_audio_health_monitor()
                 if self._model_serving is not None:
@@ -75632,16 +75899,55 @@ class JarvisSystemKernel:
             except asyncio.CancelledError:
                 raise
             except Exception as recovery_err:
+                self._audio_init_consecutive_failures += 1
+                _rc_outcome = self._classify_audio_init_outcome(
+                    _rc_progress,
+                    is_timeout=isinstance(recovery_err, asyncio.TimeoutError),
+                    error=recovery_err,
+                )
                 self._component_status["audio_infrastructure"] = {
                     "status": "degraded",
-                    "message": f"AudioBus recovery attempt {attempts} failed: {recovery_err}",
+                    "message": (
+                        f"AudioBus recovery attempt {attempts} failed: "
+                        f"{recovery_err} ({_rc_outcome})"
+                    ),
                 }
                 self.logger.warning(
-                    "[AudioRecovery] Attempt %d/%s failed: %s",
+                    "[AudioRecovery] Attempt %d/%s failed: %s "
+                    "(outcome=%s, consecutive=%d)",
                     attempts,
                     "∞" if max_attempts <= 0 else str(max_attempts),
-                    recovery_err,
+                    recovery_err, _rc_outcome,
+                    self._audio_init_consecutive_failures,
                 )
+                # v275.6: Oscillation check
+                if self._audio_init_consecutive_failures >= max_consecutive:
+                    self._audio_init_permanent_degraded = True
+                    self._component_status["audio_infrastructure"] = {
+                        "status": "degraded",
+                        "message": (
+                            f"AudioBus permanently degraded after "
+                            f"{self._audio_init_consecutive_failures} "
+                            f"consecutive failures"
+                        ),
+                    }
+                    self.logger.error(
+                        "[AudioRecovery] Oscillation limit reached (%d consecutive "
+                        "failures) — entering permanent degraded mode",
+                        self._audio_init_consecutive_failures,
+                    )
+                    self._emit_event(
+                        SupervisorEventType.COMPONENT_STATUS,
+                        "AudioBus oscillation limit — permanent degraded mode",
+                        severity=SupervisorEventSeverity.ERROR,
+                        component="audio_infrastructure",
+                        metadata={
+                            "outcome": AudioInitOutcome.OSCILLATION_LIMIT,
+                            "consecutive_failures": self._audio_init_consecutive_failures,
+                            "reason": initial_reason,
+                        },
+                    )
+                    return
                 try:
                     await asyncio.sleep(_effective_interval)
                 except asyncio.CancelledError:
@@ -75654,6 +75960,13 @@ class JarvisSystemKernel:
                 f"(reason={initial_reason})"
             ),
         }
+        self._emit_event(
+            SupervisorEventType.RECOVERY_END,
+            f"AudioBus recovery exhausted ({attempts} attempts)",
+            severity=SupervisorEventSeverity.WARNING,
+            component="audio_infrastructure",
+            metadata={"attempts": attempts, "reason": initial_reason},
+        )
 
     async def _attempt_wire_audio_pipeline(self, context: str = "startup") -> bool:
         """
