@@ -75993,6 +75993,11 @@ class JarvisSystemKernel:
                 raise
             except Exception as recovery_err:
                 self._audio_init_consecutive_failures += 1
+                # v278.2: Clean up zombie on timeout — if this is the final
+                # attempt (oscillation limit), the zombie would never be cleaned
+                # up because there's no next iteration to reset the singleton.
+                if isinstance(recovery_err, asyncio.TimeoutError):
+                    await self._stop_zombie_audio_bus()
                 _rc_outcome = self._classify_audio_init_outcome(
                     _rc_progress,
                     is_timeout=isinstance(recovery_err, asyncio.TimeoutError),

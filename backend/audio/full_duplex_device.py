@@ -433,6 +433,7 @@ class FullDuplexDevice:
         SIGSEGV from callbacks accessing freed data structures.
         """
         stream = self._stream
+        self._stream = None  # v278.2: Atomic swap prevents double-close from concurrent callers
         if stream is None:
             return
         self._running = False
@@ -453,7 +454,6 @@ class FullDuplexDevice:
             stream.close()
         except Exception:
             pass
-        self._stream = None
 
     def _validate_device_selection(self) -> None:
         """

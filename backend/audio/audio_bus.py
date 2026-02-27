@@ -457,8 +457,13 @@ class AudioBus:
             logger.warning("[AudioBus] Device start interrupted — cleaning up")
             try:
                 self._device.request_cancel()
-                await self._device.stop()
-            except Exception:
+                # v278.2: Synchronous cleanup — cannot await during CancelledError
+                # propagation (the await would be immediately re-cancelled by the
+                # task's cancelled state, making stop() a no-op for already-started
+                # streams). _safe_close_stream() is bounded at 2s (abort + poll +
+                # close) which is acceptable on the error path.
+                self._device._safe_close_stream()
+            except BaseException:
                 pass
             self._device = None
             raise
