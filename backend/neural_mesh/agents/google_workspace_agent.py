@@ -615,6 +615,7 @@ GOOGLE_WORKSPACE_SCOPES = [
 _AUTH_RETRY_BUDGET_SECONDS = int(os.environ.get("JARVIS_GWS_AUTH_RETRY_BUDGET", "10"))
 _TOKEN_LOCK_TIMEOUT = float(os.environ.get("JARVIS_GWS_TOKEN_LOCK_TIMEOUT", "5.0"))
 _REAUTH_NOTICE_COOLDOWN = float(os.environ.get("JARVIS_GWS_REAUTH_NOTICE_COOLDOWN", "30"))
+_AUTH_NETWORK_TIMEOUT = float(os.environ.get("JARVIS_GWS_AUTH_NETWORK_TIMEOUT", "8.0"))
 _PERMANENT_FAILURE_PATTERNS = frozenset({
     "invalid_grant",
     "Token has been expired or revoked",
@@ -994,6 +995,20 @@ class UnifiedWorkspaceExecutor:
             except Exception as e:
                 logger.warning("Gmail API error: %s", e)
                 self._tier_stats[ExecutionTier.GOOGLE_API]["failures"] += 1
+
+        # Short-circuit: don't waste budget on Computer Use when auth is permanently dead
+        if google_client and getattr(google_client, 'auth_state', None) == AuthState.NEEDS_REAUTH:
+            reason = getattr(google_client, 'auth_failure_reason', None) or "unknown"
+            return ExecutionResult(
+                success=False,
+                tier_used=ExecutionTier.GOOGLE_API,
+                data={
+                    "error_code": "needs_reauth",
+                    "action_required": "Re-run: python3 backend/scripts/google_oauth_setup.py",
+                },
+                error=f"Google auth permanently failed: {reason}. Re-run google_oauth_setup.py",
+                execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+            )
 
         # Tier 3: Computer Use (Visual) - Skip Tier 2 for email (no macOS email bridge)
         # v6.2: First switch to browser using Spatial Awareness, then navigate
@@ -1517,7 +1532,10 @@ class GoogleWorkspaceClient:
                     self._creds.refresh(Request())
                     return True
 
-                success = await loop.run_in_executor(None, do_refresh)
+                success = await asyncio.wait_for(
+                    loop.run_in_executor(None, do_refresh),
+                    timeout=_AUTH_NETWORK_TIMEOUT,
+                )
 
                 if success:
                     logger.info("[GoogleWorkspaceClient] Token refreshed successfully")
@@ -1525,6 +1543,15 @@ class GoogleWorkspaceClient:
                     await self._rebuild_services()
 
                 return success
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[GoogleWorkspaceClient] _refresh_token() timed out after %.1fs "
+                    "(network issue, not permanent auth failure)",
+                    _AUTH_NETWORK_TIMEOUT,
+                )
+                self._auth_transient_fail_total += 1
+                return False
 
             except Exception as e:
                 if self._is_permanent_auth_failure(e):
@@ -1789,13 +1816,26 @@ class GoogleWorkspaceClient:
                 return True
 
             try:
-                # Run OAuth in thread pool (it's blocking)
+                # Run OAuth in thread pool — bounded by network timeout
                 loop = asyncio.get_event_loop()
-                success = await loop.run_in_executor(
-                    None, lambda: self._authenticate_sync(interactive=interactive)
+                success = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: self._authenticate_sync(interactive=interactive)
+                    ),
+                    timeout=_AUTH_NETWORK_TIMEOUT,
                 )
                 self._authenticated = success
                 return success
+
+            except asyncio.TimeoutError:
+                # Network timeout is TRANSIENT — not a revoked token
+                logger.warning(
+                    "[GoogleWorkspaceClient] authenticate() timed out after %.1fs "
+                    "(network issue, not permanent auth failure)",
+                    _AUTH_NETWORK_TIMEOUT,
+                )
+                self._auth_transient_fail_total += 1
+                return False
 
             except Exception as e:
                 logger.exception(f"Authentication failed: {e}")
@@ -2008,7 +2048,12 @@ class GoogleWorkspaceClient:
             Dictionary with email list and metadata
         """
         if not await self._ensure_authenticated():
-            return {"error": "Not authenticated", "emails": []}
+            response: Dict[str, Any] = {"error": "Not authenticated", "emails": []}
+            if self._auth_state == AuthState.NEEDS_REAUTH:
+                response["error"] = f"Google auth permanently failed: {self._last_auth_failure_reason}"
+                response["error_code"] = "needs_reauth"
+                response["action_required"] = "Re-run: python3 backend/scripts/google_oauth_setup.py"
+            return response
 
         cache_key = f"unread:{label}:{limit}"
         cached = self._get_cached(cache_key)
@@ -3112,11 +3157,18 @@ Return ONLY a JSON object with these keys (use null if not found):
                 result["workspace_action"] = "fetch_unread_emails"
                 return result
             else:
-                return {
+                response = {
                     "error": exec_result.error or "All email check methods failed",
                     "workspace_action": "fetch_unread_emails",
                     "emails": [],
                 }
+                # Propagate structured error context from execution result
+                if isinstance(exec_result.data, dict):
+                    if "error_code" in exec_result.data:
+                        response["error_code"] = exec_result.data["error_code"]
+                    if "action_required" in exec_result.data:
+                        response["action_required"] = exec_result.data["action_required"]
+                return response
 
         # Fallback to direct client call if executor not available
         if self._client:
