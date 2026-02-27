@@ -421,12 +421,12 @@ class JarvisTuiApp(App):
 
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
-        Binding("1", "tab_1", "Supervisor", show=False),
-        Binding("2", "tab_2", "Prime", show=False),
-        Binding("3", "tab_3", "Reactor", show=False),
-        Binding("4", "tab_4", "Events", show=False),
-        Binding("5", "tab_5", "Faults", show=False),
-        Binding("r", "refresh", "Refresh"),
+        Binding("1", "tab_1", "① Supervisor", priority=True),
+        Binding("2", "tab_2", "② Prime", priority=True),
+        Binding("3", "tab_3", "③ Reactor", priority=True),
+        Binding("4", "tab_4", "④ Events", priority=True),
+        Binding("5", "tab_5", "⑤ Faults", priority=True),
+        Binding("r", "refresh", "Refresh", priority=True),
     ]
 
     _snapshot: reactive[Optional[TuiSnapshot]] = reactive(None)
@@ -609,6 +609,18 @@ class JarvisTuiApp(App):
             pane.label = f"Faults ({count})" if count > 0 else "Faults"
         except Exception:
             pass
+
+    _TAB_IDS = ("tab-supervisor", "tab-prime", "tab-reactor", "tab-events", "tab-faults")
+    _KEY_TO_TAB = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
+
+    def on_key(self, event: Any) -> None:
+        """Direct key handler — guarantees tab switching even if child widgets
+        would otherwise consume the key event."""
+        idx = self._KEY_TO_TAB.get(event.key)
+        if idx is not None:
+            self._switch_tab(self._TAB_IDS[idx])
+            event.prevent_default()
+            event.stop()
 
     def action_tab_1(self) -> None:
         self._switch_tab("tab-supervisor")
