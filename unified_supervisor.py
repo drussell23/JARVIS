@@ -82074,6 +82074,16 @@ class JarvisSystemKernel:
                 metadata={
                     "icon": "check",
                     "phase": "complete",
+                    # v278.2: Authority markers enable the loading page fast-path.
+                    # The supervisor has already verified frontend is ready (we are
+                    # inside the frontend_started=True branch). Without these, the
+                    # loading page falls through to a slow 5-step verification that
+                    # races with _stop_loading_server() — the server is killed 1s
+                    # after this broadcast, but verification takes 3-10s, causing
+                    # the loading page to freeze at 99% "FINALIZING" forever.
+                    "final": True,
+                    "supervisor_verified": True,
+                    "authority": "unified_supervisor",
                 }
             )
 
@@ -82084,8 +82094,12 @@ class JarvisSystemKernel:
 
             # Step 5: Gracefully stop the loading server (AFTER 100% is sent)
             # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
+            # v278.2: Increased from 1.0s to 3.0s. The loading page fast-path runs
+            # quickBackendCheck() + checkFrontendReady() in parallel (each with 2s
+            # timeout) before redirecting. At 1.0s the server was killed mid-check,
+            # causing the loading page to freeze at 99% "FINALIZING" forever.
             redirect_stabilization_delay = float(
-                os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "1.0")
+                os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "3.0")
             )
             await asyncio.sleep(redirect_stabilization_delay)
             await self._stop_loading_server()
@@ -82137,6 +82151,10 @@ class JarvisSystemKernel:
                     "phase": "complete",
                     "frontend_failed": True,
                     "api_only": True,
+                    # v278.2: Authority markers (same rationale as frontend_started path)
+                    "final": True,
+                    "supervisor_verified": True,
+                    "authority": "unified_supervisor",
                 }
             )
 
@@ -84206,7 +84224,13 @@ class JarvisSystemKernel:
             # report, banner, completion hooks). Prematurely setting 100%
             # starts the ProgressController's post_complete_grace timer,
             # causing a COMPLETION STALL timeout if finalization > 45s.
-            if getattr(self, '_current_startup_phase', '') == "complete":
+            #
+            # v278.2: Also accept "finalizing" — this is the phase set
+            # by _phase_frontend_transition() immediately before the
+            # stage="complete" broadcast. Without this, _current_progress
+            # stays at 99 and any polling consumer (health endpoint,
+            # ProgressController) sees 99% indefinitely.
+            if getattr(self, '_current_startup_phase', '') in ("complete", "finalizing"):
                 self._current_progress = 100
         # else: runtime status (degraded, ready, invincible_node) — don't touch _current_progress
 
