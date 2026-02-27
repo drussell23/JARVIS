@@ -15,6 +15,7 @@ grant the requested permissions. The token is saved automatically.
 import os
 import sys
 import json
+import time
 from pathlib import Path
 
 # Suppress noisy warnings
@@ -23,6 +24,7 @@ warnings.filterwarnings("ignore")
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
@@ -76,11 +78,28 @@ def main():
                 return
             elif creds and creds.expired and creds.refresh_token:
                 print("  Token expired, refreshing...")
-                creds.refresh(Request())
-                _save_token(creds)
-                print("  Token refreshed successfully.")
-                _verify_services(creds)
-                return
+                try:
+                    creds.refresh(Request())
+                    _save_token(creds)
+                    print("  Token refreshed successfully.")
+                    _verify_services(creds)
+                    return
+                except RefreshError as e:
+                    if any(p in str(e) for p in ("invalid_grant", "revoked")):
+                        print("  Token revoked/expired. Backing up stale token and starting fresh...")
+                        backup_path = f"{TOKEN_PATH}.backup.{int(time.time())}"
+                        try:
+                            os.replace(str(TOKEN_PATH), backup_path)
+                            print(f"  Stale token backed up to: {backup_path}")
+                        except OSError as backup_err:
+                            print(f"  Warning: backup failed ({backup_err}), removing stale token")
+                            try:
+                                os.unlink(str(TOKEN_PATH))
+                            except OSError:
+                                pass
+                        creds = None  # Force new interactive flow
+                    else:
+                        raise
             else:
                 print("  Existing token is invalid. Starting fresh OAuth flow...")
                 creds = None

@@ -1683,6 +1683,12 @@ class UnifiedCommandProcessor:
         """
         # Email check
         if intent in ("check_email", "fetch_unread_emails"):
+            # Check for auth/API errors first — never mask as "no unread"
+            if result.get("error"):
+                action_required = result.get("action_required", "")
+                if action_required:
+                    return f"Email check failed: {result['error']}. Action: {action_required}"
+                return f"Email check failed: {result['error']}"
             count = result.get("count", 0)
             total = result.get("total_unread", count)
             if count == 0:
@@ -2380,6 +2386,18 @@ class UnifiedCommandProcessor:
             result_dict = result if isinstance(result, dict) else {"response": str(result)}
             workspace_intent = result_dict.get("workspace_action") or workspace_action
             summary = self._summarize_workspace_result(result_dict, workspace_intent)
+
+            # Auth recovery: propagate errors with success=False
+            if result_dict.get("error"):
+                return {
+                    "success": False,
+                    "response": summary,
+                    "command_type": "WORKSPACE",
+                    "error": result_dict.get("error"),
+                    "error_code": result_dict.get("error_code", "workspace_error"),
+                    "action_required": result_dict.get("action_required"),
+                }
+
             return {
                 "success": True,
                 "response": summary,

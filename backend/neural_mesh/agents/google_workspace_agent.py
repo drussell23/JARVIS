@@ -56,9 +56,12 @@ Version: 3.0.0 (Trinity Integration + Sheets)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date
@@ -136,6 +139,22 @@ class CircuitState:
     last_failure_time: float = 0.0
     state: str = "closed"  # closed, open, half_open
     consecutive_successes: int = 0
+
+
+class AuthState(str, Enum):
+    """Authentication state for Google Workspace client."""
+    UNAUTHENTICATED = "unauthenticated"
+    AUTHENTICATED = "authenticated"
+    NEEDS_REAUTH = "needs_reauth"  # Permanent failure — interactive OAuth required
+
+
+class TokenHealthStatus(str, Enum):
+    """Token file health status (file-parse-only, no network)."""
+    HEALTHY = "healthy"
+    EXPIRED_REFRESHABLE = "expired_refreshable"
+    PERMANENTLY_INVALID = "permanently_invalid"
+    MISSING = "missing"
+    CORRUPT = "corrupt"
 
 
 class PerAPICircuitBreaker:
@@ -441,6 +460,7 @@ def get_parallel_executor() -> ParallelTierExecutor:
 try:
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
+    from google.auth.exceptions import RefreshError
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
@@ -448,8 +468,11 @@ try:
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
     GOOGLE_API_AVAILABLE = True
+    GOOGLE_AUTH_AVAILABLE = True
 except ImportError:
     GOOGLE_API_AVAILABLE = False
+    GOOGLE_AUTH_AVAILABLE = False
+    RefreshError = None
     logger.warning(
         "Google API libraries not available. Install: "
         "pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client"
@@ -587,6 +610,27 @@ GOOGLE_WORKSPACE_SCOPES = [
     # Contacts
     'https://www.googleapis.com/auth/contacts.readonly',
 ]
+
+# Auth recovery constants (env-configurable)
+_AUTH_RETRY_BUDGET_SECONDS = int(os.environ.get("JARVIS_GWS_AUTH_RETRY_BUDGET", "10"))
+_TOKEN_LOCK_TIMEOUT = float(os.environ.get("JARVIS_GWS_TOKEN_LOCK_TIMEOUT", "5.0"))
+_REAUTH_NOTICE_COOLDOWN = float(os.environ.get("JARVIS_GWS_REAUTH_NOTICE_COOLDOWN", "30"))
+_PERMANENT_FAILURE_PATTERNS = frozenset({
+    "invalid_grant",
+    "Token has been expired or revoked",
+    "Token has been revoked",
+    "invalid_client",
+    "unauthorized_client",
+    "access_denied",
+})
+
+# Maps raw error codes to sanitized user-presentable strings
+_AUTH_ERROR_MESSAGES = {
+    "invalid_grant": "OAuth token revoked or expired",
+    "invalid_client": "OAuth client credentials invalid",
+    "unauthorized_client": "OAuth client not authorized for this scope",
+    "access_denied": "Access denied by Google",
+}
 
 
 @dataclass
@@ -923,8 +967,18 @@ class UnifiedWorkspaceExecutor:
         """
         start_time = asyncio.get_event_loop().time()
 
-        # Tier 1: Gmail API
-        if ExecutionTier.GOOGLE_API in self._available_tiers and google_client:
+        # Tier 1: Gmail API — skip if client auth is permanently dead
+        _can_try_api = (
+            ExecutionTier.GOOGLE_API in self._available_tiers
+            and google_client
+            and getattr(google_client, 'can_attempt_google_api', True)
+        )
+        if not _can_try_api and google_client:
+            logger.info(
+                "Skipping Google API tier — auth state: %s",
+                getattr(google_client, 'auth_state', 'unknown'),
+            )
+        if _can_try_api:
             self._tier_stats[ExecutionTier.GOOGLE_API]["attempts"] += 1
             try:
                 result = await google_client.fetch_unread_emails(limit=limit)
@@ -938,7 +992,7 @@ class UnifiedWorkspaceExecutor:
                     )
                 self._tier_stats[ExecutionTier.GOOGLE_API]["failures"] += 1
             except Exception as e:
-                logger.warning(f"Gmail API error: {e}")
+                logger.warning("Gmail API error: %s", e)
                 self._tier_stats[ExecutionTier.GOOGLE_API]["failures"] += 1
 
         # Tier 3: Computer Use (Visual) - Skip Tier 2 for email (no macOS email bridge)
@@ -1353,6 +1407,20 @@ class GoogleWorkspaceClient:
         self._last_token_check = 0.0
         self._token_refresh_task: Optional[asyncio.Task] = None
 
+        # Auth recovery state
+        self._auth_state: AuthState = AuthState.UNAUTHENTICATED
+        self._token_health: TokenHealthStatus = TokenHealthStatus.MISSING
+        self._last_auth_failure_reason: Optional[str] = None
+        self._token_file_lock: threading.Lock = threading.Lock()
+        self._token_mtime: Optional[float] = None
+        self._reauth_notice_cooldown: float = 0.0  # monotonic time of last notice
+
+        # Auth observability counters
+        self._auth_permanent_fail_total: int = 0
+        self._auth_transient_fail_total: int = 0
+        self._auth_autoheal_total: int = 0
+        self._token_backup_fail_total: int = 0
+
     async def _ensure_valid_token(self) -> bool:
         """
         Proactively check and refresh token before expiration.
@@ -1360,14 +1428,44 @@ class GoogleWorkspaceClient:
         v3.1: Called before each API operation to ensure token is valid.
         Refreshes token if it will expire within the buffer period.
 
+        Auth recovery: NEEDS_REAUTH short-circuit with auto-heal detection.
+
         Returns:
             True if token is valid or was successfully refreshed
         """
+        # NEEDS_REAUTH fast-fail with auto-heal check
+        if self._auth_state == AuthState.NEEDS_REAUTH:
+            # Auto-heal: check if token file was replaced externally
+            try:
+                current_mtime = os.path.getmtime(self.config.token_path)
+                if self._token_mtime is not None and current_mtime > self._token_mtime:
+                    new_health = self._check_token_health()
+                    if new_health in (TokenHealthStatus.HEALTHY, TokenHealthStatus.EXPIRED_REFRESHABLE):
+                        logger.info(
+                            "Token file changed on disk (mtime %s->%s) and passes validation "
+                            "— resetting auth state",
+                            self._token_mtime, current_mtime,
+                        )
+                        self.reset_auth_state()
+                        self._token_mtime = current_mtime
+                        self._auth_autoheal_total += 1
+                        # Fall through to normal token check
+                    else:
+                        logger.warning(
+                            "Token file changed but still invalid (%s) — staying in NEEDS_REAUTH",
+                            new_health,
+                        )
+                        self._token_mtime = current_mtime
+                        return False
+                else:
+                    return False
+            except OSError:
+                return False
+
         if not self._creds:
             return False
 
-        import time as time_module
-        current_time = time_module.time()
+        current_time = time.time()
 
         # Check token expiry
         try:
@@ -1383,16 +1481,22 @@ class GoogleWorkspaceClient:
 
                 if time_until_expiry < self._token_refresh_buffer:
                     logger.info(
-                        f"[GoogleWorkspaceClient] Token expires in {time_until_expiry:.0f}s, "
-                        f"proactively refreshing..."
+                        "[GoogleWorkspaceClient] Token expires in %.0fs, "
+                        "proactively refreshing...",
+                        time_until_expiry,
                     )
                     return await self._refresh_token()
 
             return True
 
         except Exception as e:
-            logger.warning(f"Token check failed: {e}")
-            return True  # Proceed anyway, let API call fail if token is bad
+            logger.warning("Token check failed: %s", e)
+            if self._is_permanent_auth_failure(e):
+                self._auth_state = AuthState.NEEDS_REAUTH
+                self._last_auth_failure_reason = self._sanitize_auth_error(e)
+                self._auth_permanent_fail_total += 1
+                return False
+            return False  # Don't proceed with unknown token state
 
     async def _refresh_token(self) -> bool:
         """
@@ -1423,7 +1527,18 @@ class GoogleWorkspaceClient:
                 return success
 
             except Exception as e:
-                logger.error(f"Token refresh failed: {e}")
+                if self._is_permanent_auth_failure(e):
+                    reason = self._sanitize_auth_error(e)
+                    logger.error("[GoogleWorkspaceClient] Permanent failure in token refresh: %s", reason)
+                    with self._token_file_lock:
+                        self._backup_stale_token()
+                    self._auth_state = AuthState.NEEDS_REAUTH
+                    self._last_auth_failure_reason = reason
+                    self._auth_permanent_fail_total += 1
+                    self._clear_all_credentials()
+                else:
+                    logger.error("Token refresh failed (transient): %s", e)
+                    self._auth_transient_fail_total += 1
                 return False
 
     async def _rebuild_services(self) -> None:
@@ -1443,6 +1558,122 @@ class GoogleWorkspaceClient:
         except Exception as e:
             logger.warning(f"Service rebuild failed: {e}")
 
+    # =========================================================================
+    # Auth Recovery — Classifier, Backup, Health Check (Steps 4-6)
+    # =========================================================================
+
+    def _is_permanent_auth_failure(self, exc: Exception) -> bool:
+        """Classify whether an auth exception is permanent (needs re-auth) or transient.
+
+        Classification priority (most reliable first):
+        1. Typed exception: isinstance(exc, RefreshError) with invalid_grant
+        2. Structured error payload: check exc.args for error codes
+        3. Message pattern fallback: _PERMANENT_FAILURE_PATTERNS string matching
+        """
+        # Timeouts, connection errors, 5xx are always transient
+        if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+            return False
+        if isinstance(exc, asyncio.TimeoutError):
+            return False
+
+        # Typed RefreshError check
+        if RefreshError is not None and isinstance(exc, RefreshError):
+            # Check args for structured error payload
+            for arg in exc.args:
+                arg_str = str(arg).lower()
+                if any(p in arg_str for p in _PERMANENT_FAILURE_PATTERNS):
+                    return True
+            # RefreshError without recognized pattern — treat as permanent conservatively
+            return True
+
+        # String pattern fallback for other exception types
+        error_str = str(exc).lower()
+        # 5xx server errors are transient
+        for code in ("500", "502", "503", "504"):
+            if code in error_str:
+                return False
+        return any(p in error_str for p in _PERMANENT_FAILURE_PATTERNS)
+
+    def _sanitize_auth_error(self, exc: Exception) -> str:
+        """Map raw exception to a safe, user-presentable string."""
+        error_str = str(exc).lower()
+        for pattern, message in _AUTH_ERROR_MESSAGES.items():
+            if pattern in error_str:
+                return message
+        return f"Authentication failed ({type(exc).__name__})"
+
+    def _backup_stale_token(self) -> Optional[str]:
+        """Atomically back up a stale token file. Returns backup path or None."""
+        token_path = self.config.token_path
+        if not os.path.exists(token_path):
+            return None
+
+        ts = int(time.time())
+        backup_path = f"{token_path}.backup.{ts}"
+
+        # Handle filename collision
+        counter = 0
+        while os.path.exists(backup_path):
+            counter += 1
+            backup_path = f"{token_path}.backup.{ts}.{counter}"
+
+        try:
+            os.replace(token_path, backup_path)
+            logger.info("[GoogleWorkspaceClient] Stale token backed up to %s", backup_path)
+            return backup_path
+        except OSError as e:
+            logger.warning("[GoogleWorkspaceClient] Token backup failed: %s", e)
+            self._token_backup_fail_total += 1
+            return None
+
+    def _check_token_health(self) -> TokenHealthStatus:
+        """File-parse-only token validation (no network calls).
+
+        Required schema fields: token, refresh_token, client_id, client_secret.
+        Optional: expiry (ISO format).
+        """
+        token_path = self.config.token_path
+        try:
+            with open(token_path, 'r') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return TokenHealthStatus.MISSING
+        except (json.JSONDecodeError, ValueError):
+            return TokenHealthStatus.CORRUPT
+
+        # Required fields
+        if not isinstance(data, dict):
+            return TokenHealthStatus.CORRUPT
+        if not data.get("refresh_token") or not data.get("token"):
+            return TokenHealthStatus.CORRUPT
+
+        # Expiry check
+        expiry_str = data.get("expiry")
+        if expiry_str:
+            try:
+                from datetime import timezone
+                expiry = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                if expiry > now:
+                    return TokenHealthStatus.HEALTHY
+                return TokenHealthStatus.EXPIRED_REFRESHABLE
+            except (ValueError, TypeError):
+                # Unparseable expiry — treat as expired but refreshable
+                return TokenHealthStatus.EXPIRED_REFRESHABLE
+
+        # No expiry field — conservative: assume expired but refreshable
+        return TokenHealthStatus.EXPIRED_REFRESHABLE
+
+    def _clear_all_credentials(self) -> None:
+        """Null out all credential and service objects on permanent failure."""
+        self._creds = None
+        self._gmail_service = None
+        self._calendar_service = None
+        self._people_service = None
+        self._authenticated = False
+
     async def _execute_with_retry(
         self,
         operation: Callable[[], Any],
@@ -1454,7 +1685,19 @@ class GoogleWorkspaceClient:
 
         v3.1: Catches 401 errors and retries with refreshed token.
         Also integrates with per-API circuit breaker.
+
+        Auth recovery:
+        - NEEDS_REAUTH fast-fail at entry (no API call attempted)
+        - Gates on _ensure_valid_token() return value
+        - Classifies auth errors before retrying (permanent = no retry)
         """
+        # Fast-fail: permanent auth death
+        if self._auth_state == AuthState.NEEDS_REAUTH:
+            raise RuntimeError(
+                f"Google auth permanently failed: {self._last_auth_failure_reason}. "
+                f"Re-run: python3 backend/scripts/google_oauth_setup.py"
+            )
+
         circuit_breaker = get_api_circuit_breaker()
 
         # Check circuit breaker
@@ -1464,8 +1707,10 @@ class GoogleWorkspaceClient:
         operation_timeout = timeout or self.config.operation_timeout_seconds
         operation_timeout = max(1.0, float(operation_timeout))
 
-        # Ensure valid token before operation
-        await self._ensure_valid_token()
+        # Ensure valid token before operation — gate on return value
+        token_valid = await self._ensure_valid_token()
+        if not token_valid:
+            raise RuntimeError("Token validation failed — cannot execute API operation")
 
         try:
             # Run operation in thread pool
@@ -1486,11 +1731,27 @@ class GoogleWorkspaceClient:
                 f"{api_name} operation timed out after {operation_timeout:.1f}s"
             ) from e
         except Exception as e:
+            # Classify the error before deciding to retry
+            if self._is_permanent_auth_failure(e):
+                # Permanent — set NEEDS_REAUTH, don't retry, don't penalize circuit breaker
+                reason = self._sanitize_auth_error(e)
+                logger.error("[GoogleWorkspaceClient] Permanent auth failure in API call: %s", reason)
+                with self._token_file_lock:
+                    self._backup_stale_token()
+                self._auth_state = AuthState.NEEDS_REAUTH
+                self._last_auth_failure_reason = reason
+                self._auth_permanent_fail_total += 1
+                self._clear_all_credentials()
+                raise RuntimeError(
+                    f"Google auth permanently failed: {reason}. "
+                    f"Re-run: python3 backend/scripts/google_oauth_setup.py"
+                ) from e
+
             error_str = str(e).lower()
 
-            # Check for auth errors
-            if "401" in error_str or "unauthorized" in error_str or "invalid_grant" in error_str:
-                logger.warning(f"[GoogleWorkspaceClient] Auth error, attempting token refresh...")
+            # Check for transient auth errors (401, etc.)
+            if "401" in error_str or "unauthorized" in error_str:
+                logger.warning("[GoogleWorkspaceClient] Auth error, attempting token refresh...")
 
                 # Refresh token and retry once
                 if await self._refresh_token():
@@ -1505,7 +1766,7 @@ class GoogleWorkspaceClient:
                         await circuit_breaker.record_failure(api_name)
                         raise retry_error
 
-            # Record failure
+            # Record failure (transient)
             await circuit_breaker.record_failure(api_name)
             raise
 
@@ -1541,19 +1802,58 @@ class GoogleWorkspaceClient:
                 return False
 
     def _authenticate_sync(self, interactive: bool = False) -> bool:
-        """Synchronous authentication (run in thread pool)."""
-        try:
-            # Check for existing token
-            if os.path.exists(self.config.token_path):
-                self._creds = Credentials.from_authorized_user_file(
-                    self.config.token_path, GOOGLE_WORKSPACE_SCOPES
-                )
+        """Synchronous authentication (run in thread pool).
 
-            # Refresh or get new credentials
+        Auth recovery architecture:
+        - Catches RefreshError specifically to distinguish permanent vs transient
+        - Backs up stale tokens atomically on permanent failure
+        - Sets NEEDS_REAUTH state to enable fast-fail cascade
+        - Protects token file I/O with threading.Lock
+        """
+        try:
+            # 1. Try loading token from file
+            with self._token_file_lock:
+                if os.path.exists(self.config.token_path):
+                    try:
+                        self._creds = Credentials.from_authorized_user_file(
+                            self.config.token_path, GOOGLE_WORKSPACE_SCOPES
+                        )
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.warning("[GoogleWorkspaceClient] Token file corrupt: %s", e)
+                        self._backup_stale_token()
+                        self._auth_state = AuthState.NEEDS_REAUTH
+                        self._last_auth_failure_reason = "Token file is corrupt"
+                        self._auth_permanent_fail_total += 1
+                        self._clear_all_credentials()
+                        return False
+
+            # 2. Refresh or get new credentials
             if not self._creds or not self._creds.valid:
                 if self._creds and self._creds.expired and self._creds.refresh_token:
                     logger.info("Refreshing Google OAuth token...")
-                    self._creds.refresh(Request())
+                    try:
+                        self._creds.refresh(Request())
+                    except Exception as refresh_exc:
+                        # RefreshError specific catch
+                        if self._is_permanent_auth_failure(refresh_exc):
+                            reason = self._sanitize_auth_error(refresh_exc)
+                            logger.error(
+                                "[GoogleWorkspaceClient] Permanent auth failure during refresh: %s",
+                                reason,
+                            )
+                            with self._token_file_lock:
+                                self._backup_stale_token()
+                            self._auth_state = AuthState.NEEDS_REAUTH
+                            self._last_auth_failure_reason = reason
+                            self._auth_permanent_fail_total += 1
+                            self._clear_all_credentials()
+                            return False
+                        # Transient failure
+                        logger.warning(
+                            "[GoogleWorkspaceClient] Transient refresh failure: %s", refresh_exc
+                        )
+                        self._auth_transient_fail_total += 1
+                        return False
                 else:
                     if not interactive:
                         logger.info(
@@ -1564,7 +1864,8 @@ class GoogleWorkspaceClient:
 
                     if not os.path.exists(self.config.credentials_path):
                         logger.error(
-                            f"Google credentials file not found: {self.config.credentials_path}"
+                            "Google credentials file not found: %s",
+                            self.config.credentials_path,
                         )
                         return False
 
@@ -1574,28 +1875,105 @@ class GoogleWorkspaceClient:
                     )
                     self._creds = flow.run_local_server(port=0)
 
-                # Save token
-                os.makedirs(os.path.dirname(self.config.token_path), exist_ok=True)
-                with open(self.config.token_path, 'w') as token:
-                    token.write(self._creds.to_json())
+                # Save token atomically
+                with self._token_file_lock:
+                    token_dir = os.path.dirname(self.config.token_path)
+                    os.makedirs(token_dir, exist_ok=True)
+                    tmp_path = self.config.token_path + ".tmp"
+                    with open(tmp_path, 'w') as f:
+                        f.write(self._creds.to_json())
+                    os.replace(tmp_path, self.config.token_path)
 
             # Build services
             self._gmail_service = build('gmail', 'v1', credentials=self._creds)
             self._calendar_service = build('calendar', 'v3', credentials=self._creds)
             self._people_service = build('people', 'v1', credentials=self._creds)
 
+            self._auth_state = AuthState.AUTHENTICATED
+            # Record mtime for auto-heal detection
+            try:
+                self._token_mtime = os.path.getmtime(self.config.token_path)
+            except OSError:
+                pass
+
             logger.info("Google Workspace APIs authenticated successfully")
             return True
 
+        except FileNotFoundError:
+            logger.info("[GoogleWorkspaceClient] Token file not found")
+            self._token_health = TokenHealthStatus.MISSING
+            return False
+
         except Exception as e:
-            logger.exception(f"Sync authentication failed: {e}")
+            # Last-resort catch — classify before giving up
+            if self._is_permanent_auth_failure(e):
+                reason = self._sanitize_auth_error(e)
+                logger.error("[GoogleWorkspaceClient] Permanent auth failure: %s", reason)
+                with self._token_file_lock:
+                    self._backup_stale_token()
+                self._auth_state = AuthState.NEEDS_REAUTH
+                self._last_auth_failure_reason = reason
+                self._auth_permanent_fail_total += 1
+                self._clear_all_credentials()
+            else:
+                logger.exception("Sync authentication failed: %s", e)
+                self._auth_transient_fail_total += 1
             return False
 
     async def _ensure_authenticated(self) -> bool:
         """Ensure client is authenticated."""
+        if self._auth_state == AuthState.NEEDS_REAUTH:
+            return False
         if not self._authenticated:
             return await self.authenticate(interactive=False)
         return True
+
+    # =========================================================================
+    # Public Auth State API (Step 12, 17, 20)
+    # =========================================================================
+
+    @property
+    def can_attempt_google_api(self) -> bool:
+        """Whether this client can attempt Google API calls.
+
+        Checks three conditions:
+        1. Google API libraries are available (GOOGLE_API_AVAILABLE)
+        2. Auth state is not permanently failed (not NEEDS_REAUTH)
+        3. Credentials exist (not intentionally disabled)
+        """
+        if not GOOGLE_API_AVAILABLE:
+            return False
+        if self._auth_state == AuthState.NEEDS_REAUTH:
+            return False
+        return True
+
+    @property
+    def auth_state(self) -> AuthState:
+        """Current authentication state."""
+        return self._auth_state
+
+    @property
+    def auth_failure_reason(self) -> Optional[str]:
+        """Sanitized, user-safe description of why auth failed. None if not failed."""
+        return self._last_auth_failure_reason
+
+    def reset_auth_state(self) -> None:
+        """Clear NEEDS_REAUTH state after fresh token is available."""
+        self._auth_state = AuthState.UNAUTHENTICATED
+        self._last_auth_failure_reason = None
+        self._token_health = TokenHealthStatus.MISSING
+        self._creds = None
+        logger.info("[GoogleWorkspaceClient] Auth state reset — will re-authenticate on next request")
+
+    def _emit_reauth_notice(self) -> None:
+        """Emit a NEEDS_REAUTH log warning with monotonic cooldown to avoid spam."""
+        now = time.monotonic()
+        if now - self._reauth_notice_cooldown > _REAUTH_NOTICE_COOLDOWN:
+            logger.warning(
+                "Auth permanently failed: %s. Re-run google_oauth_setup.py",
+                self._last_auth_failure_reason,
+            )
+            self._reauth_notice_cooldown = now
 
     def _get_cached(self, key: str) -> Optional[Any]:
         """Get cached value if not expired."""
@@ -2247,6 +2625,36 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
                 self._handle_workspace_message,
             )
 
+        # Proactive token health check (file-parse only, no network)
+        if self._client and GOOGLE_API_AVAILABLE:
+            health = self._client._check_token_health()
+            self._client._token_health = health
+            try:
+                self._client._token_mtime = os.path.getmtime(self._client.config.token_path)
+            except OSError:
+                pass
+            if health == TokenHealthStatus.MISSING:
+                logger.info(
+                    "[GoogleWorkspaceAgent] No token file found. "
+                    "Run: python3 backend/scripts/google_oauth_setup.py"
+                )
+            elif health == TokenHealthStatus.CORRUPT:
+                logger.warning(
+                    "[GoogleWorkspaceAgent] Token file is corrupt — backing up and marking NEEDS_REAUTH"
+                )
+                self._client._backup_stale_token()
+                self._client._auth_state = AuthState.NEEDS_REAUTH
+                self._client._last_auth_failure_reason = "Token file is corrupt"
+            elif health == TokenHealthStatus.PERMANENTLY_INVALID:
+                logger.warning(
+                    "[GoogleWorkspaceAgent] Token is permanently invalid — marking NEEDS_REAUTH. "
+                    "Run: python3 backend/scripts/google_oauth_setup.py"
+                )
+                self._client._auth_state = AuthState.NEEDS_REAUTH
+                self._client._last_auth_failure_reason = "Token permanently invalid at startup"
+            else:
+                logger.info("[GoogleWorkspaceAgent] Token health: %s", health.value)
+
         logger.info("GoogleWorkspaceAgent initialized with Never-Fail fallbacks")
 
     async def on_start(self) -> None:
@@ -2270,6 +2678,8 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
         """Ensure client is authenticated."""
         if self._client is None:
             self._client = GoogleWorkspaceClient(self.config)
+        if not self._client.can_attempt_google_api:
+            return False
         return await self._client.authenticate(interactive=False)
 
     # =========================================================================
@@ -2565,6 +2975,21 @@ Return ONLY a JSON object with these keys (use null if not found):
                     "workspace_action": action or "unknown",
                 }
 
+        # Auth recovery: instant actionable response when permanently failed
+        if self._client and self._client.auth_state == AuthState.NEEDS_REAUTH:
+            self._client._emit_reauth_notice()
+            return {
+                "success": False,
+                "error": f"Google auth permanently failed: {self._client.auth_failure_reason}",
+                "error_code": "needs_reauth",
+                "action_required": "Re-run: python3 backend/scripts/google_oauth_setup.py",
+                "response": (
+                    "Google authentication needs renewal. Your OAuth token has expired or been revoked. "
+                    "Please run: python3 backend/scripts/google_oauth_setup.py"
+                ),
+                "workspace_action": action or "unknown",
+            }
+
         # v3.0: Resolve entities from visual context if present
         if visual_context and query:
             payload = await self._resolve_entities_from_visual_context(
@@ -2588,8 +3013,9 @@ Return ONLY a JSON object with these keys (use null if not found):
             auth_success = await self._ensure_client()
             if not auth_success:
                 logger.warning(
-                    f"Google API auth failed for {action}, but proceeding "
-                    f"(some operations may fail)"
+                    "Google API auth failed for %s, but proceeding "
+                    "(some operations may fail)",
+                    action,
                 )
 
         # Route to appropriate handler
