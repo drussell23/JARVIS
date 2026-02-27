@@ -2068,9 +2068,9 @@ class JARVISLoadingManager {
             this.elements.subtitle.textContent = 'SYSTEM READY';
         }
 
-        // Brief delay for visual feedback, then redirect
+        // Brief delay for visual feedback, then redirect with readiness params
         setTimeout(() => {
-            const redirectUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+            const redirectUrl = this._buildReadyRedirectUrl();
             console.log(`[JARVIS] Redirecting to ${redirectUrl}`);
             window.location.href = redirectUrl;
         }, 1000);

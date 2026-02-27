@@ -59399,6 +59399,12 @@ class TrinityIntegrator:
             component.state = "starting"
 
             self.logger.info(f"[Trinity]   Process started (PID: {component.pid})")
+
+            # v279.0: Set start_time at SPAWN, not at health success.
+            # This ensures _is_within_startup_grace_period() works for components
+            # whose initial health check times out (start_time would stay 0.0).
+            component.start_time = time.time()
+
             self.logger.info(f"[Trinity]   Waiting for health check at {component.health_url}...")
 
             # v186.0: Broadcast "starting" status immediately after spawn
@@ -59427,7 +59433,7 @@ class TrinityIntegrator:
             healthy = await self._wait_for_health(component, timeout=component_timeout)
             if healthy:
                 component.state = "healthy"
-                component.start_time = time.time()
+                # v279.0: start_time now set at spawn (line ~59404). No longer set here.
                 self.logger.success(f"[Trinity] ✓ {component.name} RUNNING (PID: {component.pid}, Port: {component.port})")
                 
                 # v197.1: Update live dashboard
@@ -60400,6 +60406,12 @@ class TrinityIntegrator:
     ) -> bool:
         """Return True when failed health checks are still expected during startup."""
         if component.start_time <= 0:
+            # v279.0: This should only happen if process was never spawned.
+            # If we reach here for a spawned component, start_time wasn't set properly.
+            self.logger.debug(
+                f"[Trinity] {component.name} has no start_time — "
+                f"grace period cannot apply (state={component.state})"
+            )
             return False
         now_ts = now if now is not None else time.time()
         grace = grace_periods.get(component.name, 120.0)
@@ -60543,7 +60555,13 @@ class TrinityIntegrator:
         self._refresh_restart_budget(component)
         healthy = await self._check_health(component)
         if healthy:
-            if component.state != "healthy":
+            # v279.0: Distinguish late startup completion from runtime recovery
+            if component.state == "failed":
+                self.logger.info(
+                    f"[Trinity] {component.name} completed late startup — "
+                    f"transitioning from 'failed' to 'healthy'"
+                )
+            elif component.state != "healthy":
                 self.logger.info(f"[Trinity] {component.name} recovered to healthy")
             component.state = "healthy"
             return
