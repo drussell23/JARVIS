@@ -918,6 +918,14 @@ except ImportError as _ie:
     JARVIS_THEME_STYLES = {}
     JARVIS_RICH_THEME = None
 
+# TUI (optional — Textual framework)
+TEXTUAL_AVAILABLE = False
+try:
+    import textual  # noqa: F401
+    TEXTUAL_AVAILABLE = True
+except ImportError:
+    pass
+
 # ── v228.1: Centralized Emoji Mappings ─────────────────────────────
 # Enterprise-grade emoji indicators for all CLI components.
 # Used by logger, banners, dashboard, health report, phase headers.
@@ -8603,6 +8611,18 @@ def _create_cli_renderer(
             mode = "rich"
         else:
             mode = "plain"
+
+    if mode == "tui":
+        if TEXTUAL_AVAILABLE:
+            try:
+                from backend.core.supervisor_tui import TuiCliRenderer
+                return TuiCliRenderer(verbosity=verbosity)
+            except Exception as e:
+                logger.warning("TUI init failed (%s), falling back to rich", e)
+                mode = "rich"  # fall through
+        else:
+            logger.warning("textual not installed, falling back to rich")
+            mode = "rich"  # fall through
 
     if mode == "json":
         return JsonCliRenderer(verbosity=verbosity)
@@ -66052,6 +66072,13 @@ class JarvisSystemKernel:
         self._event_bus = _event_bus
         self._cli_renderer = _renderer
 
+        # Wire TUI to supervisor data sources (read-only)
+        if hasattr(_renderer, 'attach_to_supervisor'):
+            try:
+                _renderer.attach_to_supervisor(self)
+            except Exception as _tui_err:
+                self.logger.warning("TUI attach failed: %s", _tui_err)
+
         # v197.3: Connect dashboard to logging system for real-time log display
         try:
             log_handler = get_dashboard_log_handler()
@@ -90074,9 +90101,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     ui_group = parser.add_argument_group("🎨 UI / Display")
     ui_group.add_argument(
         "--ui",
-        choices=["rich", "plain", "json", "auto"],
+        choices=["rich", "plain", "json", "tui", "auto"],
         default="auto",
-        help="CLI rendering mode (default: auto-detect TTY)",
+        help="CLI rendering mode: rich, plain, json, tui (Textual TUI), auto (default: auto-detect TTY)",
     )
     ui_group.add_argument(
         "--verbosity",
