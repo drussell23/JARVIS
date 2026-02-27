@@ -409,6 +409,19 @@ class AudioBus:
         """Get the singleton if it exists, otherwise None."""
         return cls._instance
 
+    @classmethod
+    def reset_singleton(cls) -> Optional["AudioBus"]:
+        """Clear singleton. Returns old instance for caller to stop().
+
+        v278.2: Used after init timeout to ensure recovery creates a fresh
+        instance instead of reusing the zombie singleton whose device may
+        have an orphaned CoreAudio IO thread.
+        """
+        with cls._creation_lock:
+            old = cls._instance
+            cls._instance = None
+            return old
+
     async def start(
         self,
         config: Optional[DeviceConfig] = None,
@@ -433,8 +446,22 @@ class AudioBus:
         )
 
         # Initialize audio device (duplex when possible, output-only fallback).
+        # v278.2: Wrap in try/except to ensure cleanup on CancelledError or
+        # any exception. Without this, asyncio.wait_for() cancels the task
+        # but the executor thread in device.start() completes, launching a
+        # CoreAudio IO thread with callbacks that access freed state → SIGSEGV.
         self._device = FullDuplexDevice(self._config)
-        await self._device.start(progress_callback=progress_callback)
+        try:
+            await self._device.start(progress_callback=progress_callback)
+        except (asyncio.CancelledError, Exception):
+            logger.warning("[AudioBus] Device start interrupted — cleaning up")
+            try:
+                self._device.request_cancel()
+                await self._device.stop()
+            except Exception:
+                pass
+            self._device = None
+            raise
 
         # Input processing is only enabled when capture is active.
         if self._device.input_enabled:
@@ -468,16 +495,26 @@ class AudioBus:
         )
 
     async def stop(self) -> None:
-        """Stop the audio bus and release all resources."""
-        if not self._running:
-            return
+        """Stop the audio bus and release all resources.
 
+        v278.2: Sets _running=False first so callbacks immediately no-op.
+        Calls request_cancel() to short-circuit any in-flight executor.
+        Clears self._device after stop to prevent double-use.
+        """
         self._running = False
-
-        if self._device is not None:
-            if self._device.input_enabled:
-                self._device.remove_capture_callback(self._on_mic_frame)
-            await self._device.stop()
+        device = self._device
+        if device is not None:
+            device.request_cancel()
+            try:
+                if device.input_enabled:
+                    device.remove_capture_callback(self._on_mic_frame)
+            except Exception:
+                pass
+            try:
+                await device.stop()
+            except Exception:
+                pass
+            self._device = None
 
         self._sinks.clear()
         self._local_sink = None

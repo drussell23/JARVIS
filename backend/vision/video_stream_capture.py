@@ -303,16 +303,21 @@ class MacOSVideoCapture:
                 height = CoreVideo.CVPixelBufferGetHeight(image_buffer)
                 width = CoreVideo.CVPixelBufferGetWidth(image_buffer)
                 
-                # Create numpy array from pixel data
-                frame = np.frombuffer(base_address, dtype=np.uint8)
-                frame = frame.reshape((height, bytes_per_row // 4, 4))
-                frame = frame[:, :width, :3]  # Remove alpha channel
-                frame = frame[:, :, ::-1]  # BGRA to RGB
-                
+                # Create numpy VIEW into pixel buffer memory
+                frame_view = np.frombuffer(base_address, dtype=np.uint8)
+                frame_view = frame_view.reshape((height, bytes_per_row // 4, 4))
+                frame_view = frame_view[:, :width, :3]  # Remove alpha channel
+                frame_view = frame_view[:, :, ::-1]  # BGRA to RGB
+                # CRITICAL: Copy BEFORE unlock. np.array(copy=True) creates an
+                # owned contiguous copy. After this, owned_frame is independent
+                # of the CVPixelBuffer memory — safe from use-after-free.
+                # (Same pattern as macos_video_capture_advanced.py:1526)
+                owned_frame = np.array(frame_view, dtype=np.uint8, copy=True)
+
                 CoreVideo.CVPixelBufferUnlockBaseAddress(image_buffer, 0)
-                
-                # Call the callback
-                self.frame_callback(frame)
+
+                # Call the callback with owned copy (buffer memory may be reclaimed)
+                self.frame_callback(owned_frame)
     
     def stop_capture(self):
         """Stop video capture"""

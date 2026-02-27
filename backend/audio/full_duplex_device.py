@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
@@ -130,6 +131,7 @@ class FullDuplexDevice:
         self._output_frame_lock = threading.Lock()
 
         self._running = False
+        self._cancel_requested = threading.Event()  # v278.2: cancellation flag for executor thread
         self._started_event = asyncio.Event()
         self._input_enabled = True
         self._mode = "duplex"
@@ -167,6 +169,8 @@ class FullDuplexDevice:
         if self._running:
             logger.warning("[FullDuplexDevice] Already running")
             return
+
+        self._cancel_requested.clear()  # v278.2: reset for fresh init
 
         if sd is None:
             raise ImportError("sounddevice is not installed")
@@ -235,13 +239,33 @@ class FullDuplexDevice:
                 continue
 
             try:
+                # v278.2: Check cancellation before creating stream
+                if self._cancel_requested.is_set():
+                    self._safe_close_stream()
+                    raise RuntimeError("[FullDuplexDevice] Init cancelled by caller")
+
                 _pcb("stream_open", f"profile_{idx}")
                 self._stream = self._create_stream(
                     mode=mode,
                     sample_rate=sample_rate,
                 )
+
+                # v278.2: Check cancellation before starting stream
+                if self._cancel_requested.is_set():
+                    self._safe_close_stream()
+                    raise RuntimeError("[FullDuplexDevice] Init cancelled by caller")
+
                 _pcb("stream_start", f"profile_{idx}")
                 self._stream.start()
+
+                # v278.2: Check cancellation after stream.start() — if cancel
+                # arrived during the blocking C call, abort immediately to
+                # prevent zombie IO thread with orphaned callbacks.
+                if self._cancel_requested.is_set():
+                    logger.warning("[FullDuplexDevice] Init cancelled after stream started — aborting")
+                    self._safe_close_stream()
+                    raise RuntimeError("[FullDuplexDevice] Init cancelled (post-start cleanup)")
+
                 self._running = True
                 self._startup_silence_frames = max(
                     0,
@@ -401,15 +425,32 @@ class FullDuplexDevice:
         )
 
     def _safe_close_stream(self) -> None:
-        """Best-effort cleanup for partially opened streams."""
-        if self._stream is None:
+        """Best-effort cleanup. Uses abort() + active-polling for IO thread safety.
+
+        v278.2: Uses Pa_AbortStream (immediate) instead of Pa_StopStream (waits
+        for buffers). Polls stream.active with 2s hard cap to confirm the
+        CoreAudio IO thread has fully exited before close(). This prevents
+        SIGSEGV from callbacks accessing freed data structures.
+        """
+        stream = self._stream
+        if stream is None:
             return
+        self._running = False
         try:
-            self._stream.stop()
+            stream.abort()
         except Exception:
             pass
+        # Wait for IO thread to fully exit (bounded 2s)
+        _deadline = time.monotonic() + 2.0
+        while time.monotonic() < _deadline:
+            try:
+                if not stream.active:
+                    break
+            except Exception:
+                break
+            time.sleep(0.005)
         try:
-            self._stream.close()
+            stream.close()
         except Exception:
             pass
         self._stream = None
@@ -537,22 +578,31 @@ class FullDuplexDevice:
         return None
 
     async def stop(self) -> None:
-        """Close the stream and release resources."""
-        if not self._running:
+        """Close the stream and release resources.
+
+        v278.2: Delegates to _safe_close_stream() in executor. The abort+wait
+        inside _safe_close_stream() uses time.sleep for IO thread polling, so
+        it must run off the event loop. Sets _cancel_requested first to
+        short-circuit any in-flight _open_stream_sync() in another executor.
+        """
+        if not self._running and self._stream is None:
             return
-
+        self._cancel_requested.set()
         self._running = False
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception as e:
-                logger.warning(f"[FullDuplexDevice] Error stopping stream: {e}")
-            self._stream = None
-
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._safe_close_stream)
         self._started_event.clear()
         self._startup_silence_frames = 0
         logger.info("[FullDuplexDevice] Stopped")
+
+    def request_cancel(self) -> None:
+        """Signal the executor thread to abort initialization.
+
+        v278.2: Called by AudioBus when asyncio.wait_for() times out or
+        CancelledError propagates. The executor thread checks this flag
+        at 3 points in _open_stream_sync().
+        """
+        self._cancel_requested.set()
 
     def add_capture_callback(self, cb: Callable[[np.ndarray], None]) -> None:
         """Register a callback to receive mic frames (float32, device rate)."""
@@ -608,6 +658,12 @@ class FullDuplexDevice:
         could block, no I/O. The ring buffer read and callback dispatch
         are the only operations.
         """
+        # v278.2: Defensive guard — output silence when device is shutting down.
+        # Prevents accessing freed/GC'd structures after stop() clears state.
+        if not self._running:
+            outdata[:] = 0.0
+            return
+
         if status:
             logger.debug(f"[FullDuplexDevice] Stream status: {status}")
 
@@ -640,6 +696,11 @@ class FullDuplexDevice:
         status: "sd.CallbackFlags",
     ) -> None:
         """sounddevice output-only callback — playback path without mic capture."""
+        # v278.2: Defensive guard — output silence when device is shutting down.
+        if not self._running:
+            outdata[:] = 0.0
+            return
+
         if status:
             logger.debug(f"[FullDuplexDevice] Output stream status: {status}")
 

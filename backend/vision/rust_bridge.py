@@ -92,12 +92,19 @@ class RustImageProcessor:
             # Use ctypes interface
             height, width = image.shape[:2]
             channels = image.shape[2] if len(image.shape) > 2 else 1
-            
-            # Prepare output buffer
+
+            # Validate dtype — Rust expects uint8
+            if image.dtype != np.uint8:
+                image = image.astype(np.uint8)
+
+            # Ensure C-contiguous memory layout for safe ctypes pointer.
+            # Non-contiguous arrays produce undefined behavior with data_as().
+            if not image.flags['C_CONTIGUOUS']:
+                image = np.ascontiguousarray(image)
+
             output_size = width * height * channels
             output_buffer = (ctypes.c_uint8 * output_size)()
-            
-            # Call Rust function
+
             result = self.rust_lib.process_image(
                 image.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                 width,
@@ -105,13 +112,18 @@ class RustImageProcessor:
                 channels,
                 output_buffer
             )
-            
+
             if result == 0:
-                # Success - convert back to numpy
-                output_array = np.frombuffer(output_buffer, dtype=np.uint8)
+                # CRITICAL: np.array(copy=True) creates an OWNED copy.
+                # np.frombuffer() would create a VIEW into the local
+                # output_buffer ctypes array — dangling pointer after
+                # function returns and ctypes array is GC'd.
+                output_array = np.array(
+                    np.frombuffer(output_buffer, dtype=np.uint8),
+                    copy=True
+                )
                 return output_array.reshape((height, width, channels))
             else:
-                # Error - return original
                 logger.error(f"Rust processing failed with code {result}")
                 return image
         else:

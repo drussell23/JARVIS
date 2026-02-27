@@ -16472,8 +16472,8 @@ class ProcessRestartManager:
         if self._shutdown_requested:
             return []
 
-        restarted = []
-
+        # Phase 1: Collect restart candidates under lock (fast — no I/O)
+        to_restart = []
         async with self._lock:
             for name, managed in list(self.processes.items()):
                 proc = managed.process
@@ -16490,9 +16490,16 @@ class ProcessRestartManager:
                         )
                         continue
 
-                    success = await self._handle_unexpected_exit(name, managed)
-                    if success:
-                        restarted.append(name)
+                    to_restart.append((name, managed))
+
+        # Phase 2: Handle restarts outside lock (slow — backoff + restart).
+        # _handle_unexpected_exit does asyncio.sleep(backoff) which can take
+        # up to 30s. Holding self._lock during that blocks all other callers.
+        restarted = []
+        for name, managed in to_restart:
+            success = await self._handle_unexpected_exit(name, managed)
+            if success:
+                restarted.append(name)
 
         return restarted
 
@@ -64623,26 +64630,39 @@ class JarvisSystemKernel:
                 if task is not current_task and not task.done()
             ]
             if remaining_tasks:
-                for task in remaining_tasks:
-                    task.cancel()
-
-                # v263.2: Increased from 2.0s to 5.0s — cancelled health loops
-                # need time to run CancelledError handlers and flush state.
+                # Phase 1: Cooperative drain — give tasks 3s to finish naturally.
+                # This allows native teardown (executor calls like AudioBus,
+                # CoreAudio streams, C++ engine shutdown) to complete without
+                # CancelledError interrupting mid-native-call.
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*remaining_tasks, return_exceptions=True),
-                        timeout=5.0,
+                        timeout=3.0,
                     )
                 except asyncio.TimeoutError:
-                    still_running = [
-                        task.get_name()
-                        for task in remaining_tasks
-                        if not task.done()
-                    ]
-                    if still_running:
-                        self.logger.debug(
-                            f"[Kernel] Tasks still pending after final drain: {still_running[:12]}"
+                    pass
+
+                # Phase 2: Cancel only tasks still running after cooperative drain
+                still_alive = [t for t in remaining_tasks if not t.done()]
+                for task in still_alive:
+                    task.cancel()
+
+                if still_alive:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*still_alive, return_exceptions=True),
+                            timeout=5.0,
                         )
+                    except asyncio.TimeoutError:
+                        still_running = [
+                            task.get_name()
+                            for task in still_alive
+                            if not task.done()
+                        ]
+                        if still_running:
+                            self.logger.debug(
+                                f"[Kernel] Tasks still pending after final drain: {still_running[:12]}"
+                            )
         except Exception as e:
             self.logger.debug(f"[Kernel] Final task drain error: {e}")
 
@@ -66450,11 +66470,13 @@ class JarvisSystemKernel:
                 self.logger.warning(
                     "[Kernel] AudioBus init timed out (%.1fs, preload=%.1fs, "
                     "reason=%s, outcome=%s, last_phase=%s, steps=%d) "
-                    "— scheduling recovery",
+                    "— stopping zombie + scheduling recovery",
                     _ab_timeout, _preload_elapsed, _ab_reason,
                     _ab_outcome, _last_phase, len(_ab_progress),
                 )
-                self._audio_bus = None
+                # v278.2: Explicit zombie cleanup — stop device + reset singleton
+                # instead of bare `self._audio_bus = None` which orphans CoreAudio IO thread.
+                await self._stop_zombie_audio_bus()
                 self._component_status["audio_infrastructure"] = {
                     "status": "degraded",
                     "message": (
@@ -66486,10 +66508,11 @@ class JarvisSystemKernel:
                 self._audio_init_consecutive_failures += 1
                 self.logger.warning(
                     "[Kernel] AudioBus init failed: %s (outcome=%s) "
-                    "— scheduling recovery",
+                    "— stopping zombie + scheduling recovery",
                     ab_err, _ab_outcome,
                 )
-                self._audio_bus = None
+                # v278.2: Explicit zombie cleanup (same as TimeoutError path)
+                await self._stop_zombie_audio_bus()
                 self._component_status["audio_infrastructure"] = {
                     "status": "degraded",
                     "message": (
@@ -75791,6 +75814,50 @@ class JarvisSystemKernel:
             pass
         return ctx
 
+    async def _stop_zombie_audio_bus(self) -> None:
+        """Stop zombie AudioBus and reset singleton after init failure.
+
+        v278.2: When asyncio.wait_for() cancels AudioBus.start(), the thread
+        executor may have already completed stream.start(), launching a
+        CoreAudio IO thread. The supervisor drops self._audio_bus = None
+        without calling stop(), orphaning the IO thread. Its callbacks then
+        access freed/GC'd Python objects → SIGSEGV at NULL+0x4.
+
+        This helper: (1) explicitly stops the bus + device, (2) resets the
+        singleton so recovery creates a fresh instance.
+        """
+        bus = self._audio_bus
+        self._audio_bus = None
+        if bus is not None:
+            try:
+                await asyncio.wait_for(bus.stop(), timeout=5.0)
+            except asyncio.TimeoutError:
+                # stop() timed out — force-cancel the device directly
+                device = getattr(bus, '_device', None)
+                if device is not None:
+                    device.request_cancel()
+                    try:
+                        loop = asyncio.get_running_loop()
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, device._safe_close_stream),
+                            timeout=3.0,
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # Reset singleton so recovery creates a fresh instance
+        try:
+            from backend.audio.audio_bus import AudioBus
+            old = AudioBus.reset_singleton()
+            if old is not None and old is not bus:
+                try:
+                    await asyncio.wait_for(old.stop(), timeout=3.0)
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
     def _schedule_audio_bus_recovery(self, reason: str) -> None:
         """Schedule bounded background recovery for AudioBus initialization failures."""
         if not self._audio_bus_enabled:
@@ -75881,7 +75948,16 @@ class JarvisSystemKernel:
                     return
 
                 if self._audio_bus is None:
+                    # v278.2: Reset singleton before fresh creation to prevent
+                    # recovery from reusing a zombie instance whose device may
+                    # still have an orphaned CoreAudio IO thread.
                     from backend.audio.audio_bus import AudioBus
+                    old_singleton = AudioBus.reset_singleton()
+                    if old_singleton is not None:
+                        try:
+                            await asyncio.wait_for(old_singleton.stop(), timeout=5.0)
+                        except Exception:
+                            pass
                     self._audio_bus = AudioBus.get_instance()
 
                 await asyncio.wait_for(
@@ -76663,6 +76739,9 @@ class JarvisSystemKernel:
                             self.logger.warning(
                                 f"[AudioHealth] AudioBus restart failed: {restart_err}"
                             )
+                            # v278.2: Clean up zombie on timeout to prevent SIGSEGV
+                            if isinstance(restart_err, asyncio.TimeoutError):
+                                await self._stop_zombie_audio_bus()
                             self._component_status["audio_infrastructure"] = {
                                 "status": "degraded",
                                 "message": f"AudioBus restart failed: {restart_err}",
@@ -84751,6 +84830,14 @@ class JarvisSystemKernel:
                     self.logger.info("[Kernel] AudioBus stopped")
                 except Exception as ab_err:
                     self.logger.debug(f"[Kernel] AudioBus stop error: {ab_err}")
+
+            self._audio_bus = None
+            # v278.2: Reset singleton so next startup creates a fresh instance
+            try:
+                from backend.audio.audio_bus import AudioBus
+                AudioBus.reset_singleton()
+            except ImportError:
+                pass
 
             self._audio_infrastructure_initialized = False
 

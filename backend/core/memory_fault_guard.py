@@ -305,30 +305,56 @@ class MemoryFaultGuard:
     
     def _handle_sigbus(self, signum: int, frame: Any) -> None:
         """
-        Handle SIGBUS (bus error) signal.
-        
-        This is called when memory access fails at VM region boundary.
-        We attempt recovery before allowing the crash.
+        Signal-safe SIGBUS handler.
+
+        CRITICAL: Only async-signal-safe operations allowed here.
+        No allocations, no logging, no locks. Same pattern as
+        thread_manager.py:3116 — immediate SIG_DFL + os._exit().
         """
-        self._handle_memory_fault(
-            FaultType.SIGBUS,
-            signum,
-            frame,
-            "SIGBUS: Memory access at reserved VM region boundary"
-        )
-    
+        # FIRST: Reset to default handler. If we crash during handling,
+        # the OS default will terminate cleanly.
+        try:
+            signal.signal(signal.SIGBUS, signal.SIG_DFL)
+        except Exception:
+            pass
+
+        # Release emergency reserve (pre-allocated, no alloc needed)
+        self._emergency_reserve = None
+
+        # Write crash marker using ONLY async-signal-safe operations:
+        # open() + write() + close() are async-signal-safe per POSIX.
+        try:
+            fd = os.open("/tmp/jarvis_sigbus_crash", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.write(fd, f"{signum}\n".encode())
+            os.close(fd)
+        except Exception:
+            pass
+
+        # Terminate immediately — no cleanup, no __del__, no atexit
+        os._exit(128 + signum)
+
     def _handle_sigsegv(self, signum: int, frame: Any) -> None:
         """
-        Handle SIGSEGV (segmentation fault) signal.
-        
-        This indicates invalid memory access, often due to memory exhaustion.
+        Signal-safe SIGSEGV handler.
+
+        CRITICAL: Only async-signal-safe operations allowed here.
+        Same pattern as thread_manager.py:3116.
         """
-        self._handle_memory_fault(
-            FaultType.SIGSEGV,
-            signum,
-            frame,
-            "SIGSEGV: Invalid memory access"
-        )
+        try:
+            signal.signal(signal.SIGSEGV, signal.SIG_DFL)
+        except Exception:
+            pass
+
+        self._emergency_reserve = None
+
+        try:
+            fd = os.open("/tmp/jarvis_sigsegv_crash", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.write(fd, f"{signum}\n".encode())
+            os.close(fd)
+        except Exception:
+            pass
+
+        os._exit(128 + signum)
     
     def _handle_memory_fault(
         self,
@@ -347,9 +373,9 @@ class MemoryFaultGuard:
         4. Write signal file for cross-repo coordination
         5. If recovery fails, allow original handler or exit
         """
-        # Prevent recursive handling
+        # Prevent recursive handling — use os._exit to avoid __del__/atexit
         if self._is_recovering:
-            sys.exit(128 + signum)  # Exit with signal code
+            os._exit(128 + signum)
         
         self._is_recovering = True
         
@@ -394,8 +420,9 @@ class MemoryFaultGuard:
         logger.critical("❌ Recovery failed - triggering graceful shutdown")
         self._trigger_graceful_shutdown()
         
-        # If we get here, exit with signal code
-        sys.exit(128 + signum)
+        # If we get here, exit with signal code — os._exit avoids running
+        # __del__ methods and atexit handlers in potentially corrupted state
+        os._exit(128 + signum)
     
     def _attempt_recovery(self, event: FaultEvent) -> bool:
         """

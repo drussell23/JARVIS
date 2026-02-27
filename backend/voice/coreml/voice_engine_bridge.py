@@ -13,10 +13,12 @@ Integrated with async_pipeline.py for enterprise-grade async processing:
 """
 
 import ctypes
+import contextlib
 import os
 import logging
 import numpy as np
 import asyncio
+import threading
 import time
 from typing import Optional, Tuple, Dict, Any, Callable, List
 from pathlib import Path
@@ -182,6 +184,12 @@ class CoreMLVoiceEngineBridge:
         self.voice_queue = AsyncVoiceQueue(maxsize=100)
         self._setup_event_handlers()
 
+        # Lifecycle state for safe native teardown (prevents use-after-free)
+        self._shutdown = False
+        self._call_count = 0
+        self._call_count_lock = threading.Lock()
+        self._destroy_lock = threading.Lock()
+
         logger.info(f"[CoreML-Bridge] Initialized with VAD: {vad_model_path}")
         logger.info(f"[CoreML-Bridge] Speaker model: {speaker_model_path}")
         logger.info(f"[CoreML-Bridge] VAD threshold: {self.config.vad_threshold:.3f}")
@@ -299,6 +307,50 @@ class CoreMLVoiceEngineBridge:
 
         return config
 
+    # ========================================================================
+    # LIFECYCLE MANAGEMENT — Safe native teardown
+    # ========================================================================
+
+    @contextlib.contextmanager
+    def _native_call_guard(self):
+        """Guard native calls against concurrent destroy (use-after-free prevention)."""
+        with self._call_count_lock:
+            if self._shutdown:
+                raise RuntimeError("CoreML engine is shut down")
+            self._call_count += 1
+        try:
+            yield
+        finally:
+            with self._call_count_lock:
+                self._call_count -= 1
+
+    def shutdown(self):
+        """Explicitly shut down the native engine. Thread-safe."""
+        with self._destroy_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+
+        # Wait for in-flight native calls to drain (up to 5s)
+        deadline = time.monotonic() + 5.0
+        while True:
+            with self._call_count_lock:
+                if self._call_count == 0:
+                    break
+            if time.monotonic() > deadline:
+                logger.warning("[CoreML-Bridge] Draining in-flight calls timed out")
+                break
+            time.sleep(0.05)
+
+        # Destroy native engine
+        if hasattr(self, 'engine') and self.engine:
+            try:
+                self.lib.CoreMLVoiceEngine_destroy(self.engine)
+            except Exception as e:
+                logger.debug(f"[CoreML-Bridge] Destroy error: {e}")
+            self.engine = None
+            logger.debug("[CoreML-Bridge] Destroyed C++ engine")
+
     def detect_voice_activity(self, audio: np.ndarray) -> Tuple[bool, float]:
         """
         Detect voice activity in audio.
@@ -309,20 +361,19 @@ class CoreMLVoiceEngineBridge:
         Returns:
             (has_voice, confidence): Tuple of detection result and confidence
         """
-        # Convert to ctypes array
-        audio_data = audio.astype(np.float32)
-        audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        with self._native_call_guard():
+            audio_data = audio.astype(np.float32)
+            audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        # Call C++ function
-        confidence = ctypes.c_float()
-        result = self.lib.CoreMLVoiceEngine_detect_voice_activity(
-            self.engine,
-            audio_ptr,
-            len(audio_data),
-            ctypes.byref(confidence)
-        )
+            confidence = ctypes.c_float()
+            result = self.lib.CoreMLVoiceEngine_detect_voice_activity(
+                self.engine,
+                audio_ptr,
+                len(audio_data),
+                ctypes.byref(confidence)
+            )
 
-        return bool(result), confidence.value
+            return bool(result), confidence.value
 
     def recognize_speaker(self, audio: np.ndarray) -> Tuple[bool, float]:
         """
@@ -334,18 +385,19 @@ class CoreMLVoiceEngineBridge:
         Returns:
             (is_user, confidence): Tuple of recognition result and confidence
         """
-        audio_data = audio.astype(np.float32)
-        audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        with self._native_call_guard():
+            audio_data = audio.astype(np.float32)
+            audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        confidence = ctypes.c_float()
-        result = self.lib.CoreMLVoiceEngine_recognize_speaker(
-            self.engine,
-            audio_ptr,
-            len(audio_data),
-            ctypes.byref(confidence)
-        )
+            confidence = ctypes.c_float()
+            result = self.lib.CoreMLVoiceEngine_recognize_speaker(
+                self.engine,
+                audio_ptr,
+                len(audio_data),
+                ctypes.byref(confidence)
+            )
 
-        return bool(result), confidence.value
+            return bool(result), confidence.value
 
     def detect_user_voice(self, audio: np.ndarray) -> Tuple[bool, float, float]:
         """
@@ -359,21 +411,22 @@ class CoreMLVoiceEngineBridge:
         Returns:
             (is_user_voice, vad_confidence, speaker_confidence)
         """
-        audio_data = audio.astype(np.float32)
-        audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        with self._native_call_guard():
+            audio_data = audio.astype(np.float32)
+            audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        vad_conf = ctypes.c_float()
-        speaker_conf = ctypes.c_float()
+            vad_conf = ctypes.c_float()
+            speaker_conf = ctypes.c_float()
 
-        result = self.lib.CoreMLVoiceEngine_detect_user_voice(
-            self.engine,
-            audio_ptr,
-            len(audio_data),
-            ctypes.byref(vad_conf),
-            ctypes.byref(speaker_conf)
-        )
+            result = self.lib.CoreMLVoiceEngine_detect_user_voice(
+                self.engine,
+                audio_ptr,
+                len(audio_data),
+                ctypes.byref(vad_conf),
+                ctypes.byref(speaker_conf)
+            )
 
-        return bool(result), vad_conf.value, speaker_conf.value
+            return bool(result), vad_conf.value, speaker_conf.value
 
     def train_speaker_model(self, audio: np.ndarray, is_user: bool):
         """
@@ -383,17 +436,18 @@ class CoreMLVoiceEngineBridge:
             audio: Audio sample of voice
             is_user: True if this is the user's voice, False otherwise
         """
-        audio_data = audio.astype(np.float32)
-        audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        with self._native_call_guard():
+            audio_data = audio.astype(np.float32)
+            audio_ptr = audio_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        self.lib.CoreMLVoiceEngine_train_speaker_model(
-            self.engine,
-            audio_ptr,
-            len(audio_data),
-            is_user
-        )
+            self.lib.CoreMLVoiceEngine_train_speaker_model(
+                self.engine,
+                audio_ptr,
+                len(audio_data),
+                is_user
+            )
 
-        logger.debug(f"[CoreML-Bridge] Trained speaker model - Label: {'USER' if is_user else 'OTHER'}")
+            logger.debug(f"[CoreML-Bridge] Trained speaker model - Label: {'USER' if is_user else 'OTHER'}")
 
     def update_adaptive_thresholds(
         self,
@@ -409,17 +463,19 @@ class CoreMLVoiceEngineBridge:
             vad_confidence: VAD confidence from last detection
             speaker_confidence: Speaker confidence from last detection
         """
-        self.lib.CoreMLVoiceEngine_update_adaptive_thresholds(
-            self.engine,
-            success,
-            vad_confidence,
-            speaker_confidence
-        )
+        with self._native_call_guard():
+            self.lib.CoreMLVoiceEngine_update_adaptive_thresholds(
+                self.engine,
+                success,
+                vad_confidence,
+                speaker_confidence
+            )
 
     def get_metrics(self) -> Dict[str, Any]:
         """Get performance metrics"""
-        avg_latency = self.lib.CoreMLVoiceEngine_get_avg_latency_ms(self.engine)
-        success_rate = self.lib.CoreMLVoiceEngine_get_success_rate(self.engine)
+        with self._native_call_guard():
+            avg_latency = self.lib.CoreMLVoiceEngine_get_avg_latency_ms(self.engine)
+            success_rate = self.lib.CoreMLVoiceEngine_get_success_rate(self.engine)
 
         return {
             'avg_latency_ms': avg_latency,
@@ -680,10 +736,11 @@ class CoreMLVoiceEngineBridge:
             logger.error(f"[CoreML-ASYNC] Task {task.task_id} failed: {e}")
 
     def __del__(self):
-        """Cleanup C++ resources"""
-        if hasattr(self, 'engine') and self.engine:
-            self.lib.CoreMLVoiceEngine_destroy(self.engine)
-            logger.debug("[CoreML-Bridge] Destroyed C++ engine")
+        """Cleanup — delegates to shutdown() for safe teardown with drain."""
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
 
 # ============================================================================
