@@ -207,7 +207,9 @@ class _CountedDeque:
         return iter(self._deque)
 
     def __bool__(self) -> bool:
-        return bool(self._deque)
+        # Always truthy — container exists even when empty
+        # Prevents `captured_output or fallback` from replacing us
+        return True
 
 # Broad keyword sets — catch real log lines
 _PRIME_KEYWORDS = frozenset({
@@ -261,7 +263,7 @@ class _TuiLogHandler(logging.Handler):
             pass
 
 
-def _install_python_logging_bridge(buffer: Deque[str]) -> _TuiLogHandler:
+def _install_python_logging_bridge(buffer: Any) -> _TuiLogHandler:
     """Install _TuiLogHandler on root logger with correct level.
 
     Sets root logger level to INFO so INFO+ records flow through to handlers.
@@ -290,7 +292,7 @@ def _ensure_tui_handler_installed(handler: _TuiLogHandler) -> None:
         root.setLevel(logging.INFO)
 
 
-def _patch_unified_logger(buffer: Deque[str]) -> bool:
+def _patch_unified_logger(buffer: Any) -> bool:
     """Monkey-patch UnifiedLogger._log to also write to TUI buffer.
 
     Called from daemon thread AFTER unified_supervisor is imported.
@@ -349,7 +351,7 @@ def _patch_unified_logger(buffer: Deque[str]) -> bool:
         return False
 
 
-def _patch_rich_console(buffer: Deque[str]) -> bool:
+def _patch_rich_console(buffer: Any) -> bool:
     """Redirect the module-level _rich_console to also write to TUI buffer.
 
     Creates a StringIO tee that captures Rich Console output. This catches
@@ -853,14 +855,15 @@ class JarvisTuiApp(App):
     def __init__(
         self,
         cli_args: Optional["argparse.Namespace"] = None,
-        captured_output: Optional[Deque[str]] = None,
+        captured_output: Any = None,
         tui_log_handler: Optional[_TuiLogHandler] = None,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self._cli_args = cli_args
-        self._captured_output: Deque[str] = (
-            captured_output or collections.deque(maxlen=_LOG_LIMIT)
+        self._captured_output: Any = (
+            captured_output if captured_output is not None
+            else collections.deque(maxlen=_LOG_LIMIT)
         )
         self._tui_log_handler = tui_log_handler
         # Supervisor thread state
@@ -1006,12 +1009,42 @@ class JarvisTuiApp(App):
     # ── Quit with graceful supervisor shutdown ───────────────────────────
 
     def action_quit(self) -> None:
-        """Quit TUI — signal supervisor to shut down, then exit."""
+        """Quit TUI — signal supervisor to shut down, then exit.
+
+        v4.1: Deterministic shutdown flush — drain log/event buffers
+        and emit final metrics before exit.
+        """
         self._captured_output.append("[TUI] Quit requested — shutting down supervisor...")
         self._signal_supervisor_shutdown()
         # Join supervisor thread with timeout (don't block indefinitely)
         if self._supervisor_thread and self._supervisor_thread.is_alive():
             self._supervisor_thread.join(timeout=5.0)
+        # Deterministic shutdown flush: emit final state to stderr
+        try:
+            m = self._metrics
+            log_count = len(self._captured_output) if self._captured_output else 0
+            event_count = len(self._events)
+            fault_count = len(self._faults)
+            sys.stderr.write(
+                f"\n[TUI shutdown] logs={log_count} events={event_count} "
+                f"faults={fault_count} "
+                f"log_drops={m.log_drops_total} "
+                f"lock_skips={m.snapshot_skipped_lock_total} "
+                f"reinstalls={m.handler_reinstalls_total} "
+                f"last_build={m.snapshot_build_ms_last:.1f}ms\n"
+            )
+            # Flush final fault lines to stderr for post-mortem
+            if self._faults:
+                sys.stderr.write(f"[TUI shutdown] Last {min(5, len(self._faults))} faults:\n")
+                for ev in list(self._faults)[-5:]:
+                    sys.stderr.write(
+                        f"  {ev.get('severity', '?'):8s} "
+                        f"{ev.get('component', '?')} — "
+                        f"{ev.get('message', '')}\n"
+                    )
+            sys.stderr.flush()
+        except Exception:
+            pass
         # Shutdown snapshot executor
         self._snapshot_executor.shutdown(wait=False)
         super().action_quit()
@@ -1173,11 +1206,13 @@ class JarvisTuiApp(App):
             if not had_it:
                 m.handler_reinstalls_total += 1
 
-        # --- Update bridge health in metrics ---
+        # --- Update bridge health and drop counts in metrics ---
         m.bridge_ul_healthy = self._unified_logger_patched
         m.bridge_rc_healthy = self._rich_console_patched
         m.bridge_eb_healthy = self._event_bus_wired
         m.bridge_ipc_healthy = self._cached_ipc != {}
+        if hasattr(self._captured_output, "drops"):
+            m.log_drops_total = self._captured_output.drops
 
         # --- Build snapshot (heavy work — deepcopy, tuple conversion) ---
         captured_snap = tuple(self._captured_output)
@@ -1400,7 +1435,7 @@ def run_supervisor_tui(args: "argparse.Namespace") -> int:
 
     Returns the supervisor exit code.
     """
-    captured_output: Deque[str] = collections.deque(maxlen=_LOG_LIMIT)
+    captured_output = _CountedDeque(maxlen=_LOG_LIMIT)
 
     # Bridge 1: Python logging handler on root logger
     # Set root level to INFO so INFO+ records reach our handler.
