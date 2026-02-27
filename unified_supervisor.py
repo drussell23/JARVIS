@@ -6949,7 +6949,9 @@ class LiveProgressDashboard:
         """Listen for tab-switching keypresses (1-5). Daemon thread.
 
         Uses cbreak mode so single keys are delivered immediately without
-        requiring Enter. Restores original terminal settings on exit.
+        requiring Enter. Forces an immediate render on tab change so the
+        user sees feedback within ~100ms instead of waiting up to 5s for
+        the next passthrough render cycle.
         """
         import select as _sel
         import termios as _termios
@@ -6963,8 +6965,9 @@ class LiveProgressDashboard:
                 if _sel.select([fd], [], [], 0.25)[0]:
                     ch = os.read(fd, 1).decode("utf-8", errors="ignore")
                     new_tab = self._TAB_MAP.get(ch)
-                    if new_tab:
+                    if new_tab and new_tab != self._active_tab:
                         self._active_tab = new_tab
+                        self._render_count = self._passthrough_interval  # force immediate render
         except Exception:
             pass
         finally:
