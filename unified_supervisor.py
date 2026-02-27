@@ -981,23 +981,9 @@ _ZONE_EMOJI = {
     "7": "🚀",    # Entry Point — CLI, main()
 }
 
-# 🚦 Component status → emoji mapping (traffic-light semantics)
-_STATUS_EMOJI = {
-    "pending":       "⏳",
-    "starting":      "🔄",
-    "healthy":       "✅",
-    "degraded":      "⚠️ ",
-    "error":         "❌",
-    "stopped":       "⏹️ ",
-    "skipped":       "⏭️ ",
-    "unavailable":   "🚫",
-    "recovering":    "🩺",
-    "initializing":  "🌀",
-    "ready":         "🟢",
-    "warming_up":    "🔥",
-    "shutting_down": "🌙",
-    "recycling":     "♻️ ",
-}
+# 🚦 Component status → emoji mapping — imported from readiness_config (canonical FSM)
+# _STATUS_EMOJI is now STATUS_EMOJI from backend.core.readiness_config
+# See the import block below (~line 1159) for the unified import.
 
 # 📂 Issue category → emoji mapping (problem domain at a glance)
 _CATEGORY_EMOJI = {
@@ -1154,24 +1140,64 @@ except ImportError as _ie:
     _record_import_failure("STARTUP_RESILIENCE_AVAILABLE", "backend.core.resilience.startup", _ie, "CRITICAL", symbols=["StartupResilience"])
     StartupResilience = None  # type: ignore
 
-# v208.0: Unified Readiness Configuration - Status display and dashboard mappings
-# CRITICAL: "skipped" must display as "SKIP" (not "STOP") and map to "skipped" (not "stopped")
+# v208.0: Unified Readiness Configuration — canonical lifecycle FSM
+# v278.0: Single source of truth for all status maps, emoji, styles, transitions
 try:
     from backend.core.readiness_config import (
         DASHBOARD_STATUS_MAP,
         STATUS_DISPLAY_MAP,
+        STATUS_EMOJI as _STATUS_EMOJI,
+        STATUS_RICH_STYLE,
+        STATUS_SCHEMA_VERSION,
+        ALLOWED_WRITE_SOURCES,
+        COMPONENT_REGISTRY,
+        COMPONENT_GROUPS,
+        get_display_name,
+        get_component_group,
         get_readiness_config,
+        normalize_status,
+        validate_transition,
     )
     READINESS_CONFIG_AVAILABLE = True
 except ImportError as _ie:
     READINESS_CONFIG_AVAILABLE = False
-    _record_import_failure("READINESS_CONFIG_AVAILABLE", "backend.core.readiness_config", _ie, "MODERATE", symbols=["DASHBOARD_STATUS_MAP", "STATUS_DISPLAY_MAP", "get_readiness_config"])
+    _record_import_failure("READINESS_CONFIG_AVAILABLE", "backend.core.readiness_config", _ie, "MODERATE", symbols=["STATUS_DISPLAY_MAP", "STATUS_EMOJI", "normalize_status"])
     get_readiness_config = None  # type: ignore
-    # Fallback mappings if readiness_config is unavailable
+    normalize_status = None  # type: ignore
+    validate_transition = None  # type: ignore
+    STATUS_SCHEMA_VERSION = "1.0.0"
+    ALLOWED_WRITE_SOURCES = frozenset({"supervisor", "prime", "reactor", "system"})
+    COMPONENT_REGISTRY = {}  # type: ignore
+    COMPONENT_GROUPS = [  # type: ignore
+        ("trinity", "\U0001f531", "Trinity"),
+        ("services", "\U0001f9e9", "Services"),
+        ("intelligence", "\U0001f9e0", "Intelligence"),
+        ("system", "\U0001f680", "System"),
+    ]
+    get_display_name = lambda k: k.replace("-", " ").replace("_", " ").title()  # type: ignore  # noqa: E731
+    get_component_group = lambda k: "system"  # type: ignore  # noqa: E731
+    # Fallback display maps
+    _STATUS_EMOJI = {
+        "pending": "\u23f3", "starting": "\U0001f504", "healthy": "\u2705",
+        "degraded": "\u26a0\ufe0f ", "error": "\u274c", "stopped": "\u23f9\ufe0f ",
+        "skipped": "\u23ed\ufe0f ", "unavailable": "\U0001f6ab", "recovering": "\U0001fa7a",
+        "initializing": "\U0001f300", "ready": "\U0001f7e2", "warming_up": "\U0001f525",
+        "stopping": "\U0001f319", "recycling": "\u267b\ufe0f ", "running": "\u2699\ufe0f ",
+    }
     STATUS_DISPLAY_MAP = {
-        "pending": "PEND", "starting": "STAR", "healthy": "HEAL",
-        "degraded": "DEGR", "error": "EROR", "stopped": "STOP",
-        "skipped": "SKIP", "unavailable": "UNAV",
+        "pending": "PEND", "starting": "STAR", "healthy": "GOOD",
+        "degraded": "DEGR", "error": "FAIL", "stopped": "STOP",
+        "skipped": "SKIP", "unavailable": "UNAV", "initializing": "INIT",
+        "running": "LIVE", "ready": "REDY", "recovering": "RECV",
+        "stopping": "DOWN", "warming_up": "WARM", "recycling": "RCYL",
+    }
+    STATUS_RICH_STYLE = {
+        "pending": "dim", "starting": "bright_cyan", "healthy": "bold green",
+        "degraded": "bold yellow", "error": "bold red", "stopped": "dim red",
+        "skipped": "dim", "unavailable": "dim red", "initializing": "bright_cyan",
+        "running": "bold bright_blue", "ready": "bold bright_green",
+        "recovering": "bold bright_yellow", "stopping": "dim yellow",
+        "warming_up": "bold bright_yellow", "recycling": "bold cyan",
     }
     DASHBOARD_STATUS_MAP = {
         "pending": "pending", "starting": "starting", "healthy": "healthy",
@@ -7190,26 +7216,54 @@ class LiveProgressDashboard:
         port: int = None,
         ip: str = None,
         detail: str = None,
+        source: str = "supervisor",
     ) -> None:
         """
-        Update component status.
+        Single write gate for all component status updates.
 
         v201.0: Added 'detail' parameter for status messages.
-        Previously 'pid' was sometimes misused for messages.
+        v278.0: Normalization, FSM transition validation, source enforcement,
+                monotonic sequence numbers.  Renderer is READ-ONLY — only
+                supervisor/prime/reactor/system may write.
 
         Args:
-            name: Component name
-            status: Status string (starting, running, error, etc.)
+            name: Component name (dashboard key)
+            status: Raw status string — normalized to canonical value
             pid: Process ID (numeric only)
             port: Port number
             ip: IP address
             detail: Human-readable status detail/message
+            source: Write origin — "supervisor", "prime", "reactor", "system"
         """
+        # Reject renderer-origin writes (renderer is READ-ONLY)
+        if source not in ALLOWED_WRITE_SOURCES:
+            return
+
         with self._lock:
             if name not in self._components:
-                self._components[name] = {"status": "pending"}
+                self._components[name] = {"status": "pending", "seq": 0}
+
             if status is not None:
+                # Normalize raw/legacy status to canonical value
+                if normalize_status is not None:
+                    status = normalize_status(status)
+
+                prev = self._components[name].get("status", "pending")
+
+                # Validate FSM transition (warn but don't block — defensive)
+                if prev != status and validate_transition is not None:
+                    valid, reason = validate_transition(prev, status)
+                    if not valid:
+                        try:
+                            logger.debug(
+                                "Non-canonical transition for %s: %s (allowing)", name, reason
+                            )
+                        except Exception:
+                            pass
+
                 self._components[name]["status"] = status
+                self._components[name]["seq"] = self._components[name].get("seq", 0) + 1
+
             if pid is not None:
                 self._components[name]["pid"] = pid
             if port is not None:
@@ -7252,6 +7306,72 @@ class LiveProgressDashboard:
             if len(self._log_buffer) > self._max_log_lines * 2:
                 self._log_buffer = self._log_buffer[-self._max_log_lines:]
     
+    def _build_render_state(self) -> dict:
+        """Build structured render state consumed by both ANSI and Rich renderers.
+
+        v278.0: Single view-model — format once, render twice.
+        This is a READ-ONLY snapshot; renderers never mutate this data.
+        """
+        elapsed = time.time() - self._start_time
+
+        # Group components by registry
+        groups = []
+        assigned: set = set()
+        for group_key, group_emoji, group_label in COMPONENT_GROUPS:
+            members = []
+            for comp_key, comp_data in self._components.items():
+                if get_component_group(comp_key) == group_key:
+                    status = comp_data.get("status", "pending")
+                    members.append({
+                        "key": comp_key,
+                        "name": get_display_name(comp_key),
+                        "status": status,
+                        "emoji": _STATUS_EMOJI.get(status, "\u23f3"),
+                        "code": STATUS_DISPLAY_MAP.get(status, status[:4].upper()),
+                        "style": STATUS_RICH_STYLE.get(status, "dim"),
+                        "seq": comp_data.get("seq", 0),
+                    })
+                    assigned.add(comp_key)
+            if members:
+                groups.append({
+                    "key": group_key,
+                    "emoji": group_emoji,
+                    "label": group_label,
+                    "members": members,
+                })
+
+        # Unassigned components → "Other"
+        other = []
+        for comp_key, comp_data in self._components.items():
+            if comp_key not in assigned:
+                status = comp_data.get("status", "pending")
+                other.append({
+                    "key": comp_key,
+                    "name": get_display_name(comp_key),
+                    "status": status,
+                    "emoji": _STATUS_EMOJI.get(status, "\u23f3"),
+                    "code": STATUS_DISPLAY_MAP.get(status, status[:4].upper()),
+                    "style": STATUS_RICH_STYLE.get(status, "dim"),
+                    "seq": comp_data.get("seq", 0),
+                })
+        if other:
+            groups.append({
+                "key": "other",
+                "emoji": "\U0001f4e6",  # 📦
+                "label": "Other",
+                "members": other,
+            })
+
+        return {
+            "elapsed": elapsed,
+            "schema_version": STATUS_SCHEMA_VERSION,
+            "groups": groups,
+            "gcp": dict(self._gcp_state),
+            "memory": dict(self._memory),
+            "model": dict(self._model_loading_state),
+            "logs": list(self._log_buffer[-self._max_log_lines:]),
+        }
+
     def set_mode(self, mode: str) -> None:
         """Change display mode at runtime."""
         if mode in ("overlay", "passthrough", "compact"):
@@ -7356,8 +7476,8 @@ class LiveProgressDashboard:
     
     def _render_passthrough(self, final: bool = False) -> None:
         """
-        v228.0: Passthrough mode — Rich-enhanced periodic status block.
-        Prints dashboard periodically, lets logs flow through.
+        v228.0: Passthrough mode — periodic status block.
+        v278.0: Grouped column layout via shared view-model.
         """
         model_loading_active = self._model_loading_state.get("active", False)
         effective_interval = 2 if model_loading_active else self._passthrough_interval
@@ -7365,62 +7485,105 @@ class LiveProgressDashboard:
         if self._render_count % effective_interval != 0 and not final:
             return
 
-        elapsed = time.time() - self._start_time
+        # Build the shared view-model once
+        state = self._build_render_state()
 
         # ── Rich path ──────────────────────────────────────────────
         if RICH_AVAILABLE and _rich_console:
             try:
-                return self._render_passthrough_rich(elapsed, final)
+                return self._render_passthrough_rich(state, final)
             except Exception:
                 pass
 
-        # ── ANSI fallback ──────────────────────────────────────────
-        lines = []
-        lines.append("")
-        lines.append(f"{self.DIM}{'─' * 70}{self.RESET}")
-        lines.append(f"{self.BOLD}JARVIS STATUS{self.RESET} @ {elapsed:.0f}s")
+        # ── ANSI fallback (same view-model) ────────────────────────
+        self._render_passthrough_ansi(state, final)
 
-        comp_parts = []
-        for name, comp in self._components.items():
-            status = comp.get("status", "pending")
-            color = self.STATUS_COLORS.get(status, self.STATUS_COLORS["pending"])
-            short_name = name.replace("jarvis-", "").replace("-", "")[:8]
-            status_code = STATUS_DISPLAY_MAP.get(status, status[:4].upper())
-            comp_parts.append(f"{short_name}:{color}{status_code}{self.RESET}")
-        lines.append(f"  {' | '.join(comp_parts)}")
+    def _render_passthrough_ansi(self, state: dict, final: bool = False) -> None:
+        """v278.0: ANSI grouped column layout consuming the shared view-model."""
+        elapsed = state["elapsed"]
+        gcp = state["gcp"]
+        mem = state["memory"]
+        _COL_W = 22  # Column width per component cell
+        _COLS = 4    # Max components per row
+        _LABEL_W = 18  # Group label column width
 
-        gcp = self._gcp_state
-        progress_bar = self._make_progress_bar(gcp["progress"], width=20)
-        # v229.0: Include deployment mode in ANSI display
+        lines = [""]
+        lines.append(f"{self.DIM}{'━' * 75}{self.RESET}")
+        lines.append(
+            f"  {self.BOLD}⚡ JARVIS STATUS{self.RESET}"
+            f" {self.DIM}│{self.RESET} ⏱ {elapsed:.0f}s"
+        )
+        lines.append(f"{self.DIM}{'━' * 75}{self.RESET}")
+
+        # Grouped component display
+        for group in state["groups"]:
+            members = group["members"]
+            label_str = f"  {group['emoji']} {group['label']}"
+            for row_idx in range(0, len(members), _COLS):
+                chunk = members[row_idx:row_idx + _COLS]
+                cells = []
+                for m in chunk:
+                    color = self.STATUS_COLORS.get(m["status"], self.STATUS_COLORS.get("pending", self.DIM))
+                    cell = f"{m['emoji']} {color}{m['name']}{self.RESET}"
+                    cells.append(cell)
+                row_str = "  ".join(cells)
+                if row_idx == 0:
+                    prefix = label_str.ljust(_LABEL_W)
+                else:
+                    prefix = " " * _LABEL_W
+                lines.append(f"{prefix}{row_str}")
+
+        # GCP progress
+        gcp_pct = gcp.get("progress", 0)
+        gcp_bar = self._make_progress_bar(gcp_pct, width=20)
         gcp_mode = gcp.get("deployment_mode", "")
         gcp_mode_tag = f" [{gcp_mode}]" if gcp_mode else ""
-        lines.append(f"  GCP{gcp_mode_tag}: {progress_bar} {gcp['progress']:.0f}% - {gcp['checkpoint']}")
+        gcp_eta = gcp.get("eta_seconds", 0)
+        gcp_eta_str = f" ETA:{gcp_eta}s" if gcp_eta > 0 and gcp_pct < 100 else ""
+        gcp_checkpoint = gcp.get("checkpoint", "")
+        lines.append(
+            f"  ☁️  GCP{gcp_mode_tag}  {gcp_bar} {gcp_pct:.0f}%"
+            f"  {gcp_checkpoint}{gcp_eta_str}"
+        )
 
-        model_loading_lines = self._get_model_loading_display()
-        if model_loading_lines:
-            lines.extend(model_loading_lines)
+        # Model loading
+        model = state["model"]
+        if model.get("active", False):
+            m_pct = model.get("progress_pct", 0)
+            m_name = (model.get("model_name") or "LLM")[:15]
+            m_bar = self._make_progress_bar(m_pct, width=20)
+            lines.append(f"  🧠 Model {m_name}  {m_bar} {m_pct}%")
 
-        mem = self._memory
-        mem_color = self.GREEN if mem["percent"] < 70 else (self.YELLOW if mem["percent"] < 85 else self.STATUS_COLORS["error"])
-        lines.append(f"  Memory: {mem_color}{mem['percent']:.0f}%{self.RESET} ({mem['used_gb']:.1f}/{mem['total_gb']:.1f} GB)")
+        # Memory
+        mem_pct = mem.get("percent", 0)
+        mem_color = self.GREEN if mem_pct < 70 else (self.YELLOW if mem_pct < 85 else self.STATUS_COLORS.get("error", ""))
+        lines.append(
+            f"  💾 Memory {mem_color}{mem_pct:.0f}%{self.RESET}"
+            f" ({mem.get('used_gb', 0):.1f}/{mem.get('total_gb', 0):.1f} GB)"
+        )
 
-        if self._log_buffer:
+        # Recent logs
+        logs = state.get("logs", [])
+        if logs:
             lines.append(f"  {self.DIM}─ Recent Activity ─{self.RESET}")
-            for log_line in self._log_buffer[-self._max_log_lines:]:
+            for log_line in logs:
                 lines.append(f"  {log_line}")
 
-        lines.append(f"{self.DIM}{'─' * 70}{self.RESET}")
+        lines.append(f"{self.DIM}{'─' * 75}{self.RESET}")
         lines.append("")
 
-        output = "\n".join(lines)
-        sys.stdout.write(output)
+        sys.stdout.write("\n".join(lines))
         sys.stdout.flush()
 
-    def _render_passthrough_rich(self, elapsed: float, final: bool = False) -> None:
-        """v228.1: Rich-rendered passthrough status block with emoji indicators."""
-        gcp = self._gcp_state
-        mem = self._memory
-        model_state = self._model_loading_state
+    def _render_passthrough_rich(self, state: dict, final: bool = False) -> None:
+        """v278.0: Rich grouped column layout consuming the shared view-model."""
+        import re as _re
+        elapsed = state["elapsed"]
+        gcp = state["gcp"]
+        mem = state["memory"]
+        model = state["model"]
+        _COLS = 4    # Max components per row
+        _LABEL_W = 18  # Group label column width
 
         _rich_console.print()
         _rich_console.print(RichRule(
@@ -7431,49 +7594,50 @@ class LiveProgressDashboard:
             characters="━",
         ))
 
-        # Component status line with emoji indicators
-        _status_styles = {
-            "pending": "dim", "starting": "bright_cyan",
-            "healthy": "bold green", "degraded": "bold yellow",
-            "error": "bold red", "stopped": "dim red",
-            "skipped": "dim", "unavailable": "dim red",
-        }
-        comp_parts = []
-        for name, comp in self._components.items():
-            status = comp.get("status", "pending")
-            style = _status_styles.get(status, "dim")
-            emoji = _STATUS_EMOJI.get(status, "⏳")
-            short = name.replace("jarvis-", "").replace("-", "")[:8]
-            code = STATUS_DISPLAY_MAP.get(status, status[:4].upper())
-            comp_parts.append(f"{emoji}[jarvis.component]{short}[/jarvis.component]:[{style}]{code}[/{style}]")
-        _rich_console.print("  " + " [jarvis.separator]│[/jarvis.separator] ".join(comp_parts))
+        # Grouped component display
+        for group in state["groups"]:
+            members = group["members"]
+            label_str = f"  {group['emoji']} {group['label']}"
+            for row_idx in range(0, len(members), _COLS):
+                chunk = members[row_idx:row_idx + _COLS]
+                cells = []
+                for m in chunk:
+                    style = m.get("style", "dim")
+                    cells.append(
+                        f"{m['emoji']} [{style}]{m['name']}[/{style}]"
+                    )
+                row_str = "  ".join(cells)
+                if row_idx == 0:
+                    prefix = label_str.ljust(_LABEL_W)
+                else:
+                    prefix = " " * _LABEL_W
+                _rich_console.print(f"{prefix}{row_str}")
 
-        # GCP progress with gradient bar and deployment mode transparency (v229.0)
-        gcp_pct = gcp["progress"]
+        # GCP progress
+        gcp_pct = gcp.get("progress", 0)
         gcp_bar_filled = int(20 * gcp_pct / 100)
         gcp_bar = "━" * gcp_bar_filled + "╌" * (20 - gcp_bar_filled)
         gcp_pct_style = "jarvis.metric.good" if gcp_pct >= 80 else ("jarvis.metric.warn" if gcp_pct >= 40 else "jarvis.metric")
-        # v229.0: Show deployment mode badge for transparency
         gcp_deploy_mode = gcp.get("deployment_mode", "")
         gcp_mode_badge = ""
         if gcp_deploy_mode == "golden-image":
             gcp_mode_badge = " [jarvis.metric.good]🌟golden[/jarvis.metric.good]"
         elif gcp_deploy_mode == "standard":
             gcp_mode_badge = " [jarvis.metric.warn]📜standard[/jarvis.metric.warn]"
-        # v229.0: Show ETA if available
         gcp_eta = gcp.get("eta_seconds", 0)
         gcp_eta_str = f" ETA:{gcp_eta}s" if gcp_eta > 0 and gcp_pct < 100 else ""
+        gcp_checkpoint = gcp.get("checkpoint", "")
         _rich_console.print(
             f"  [jarvis.label]☁️  GCP[/jarvis.label]{gcp_mode_badge}  "
             f"[jarvis.progress.bar]{gcp_bar}[/jarvis.progress.bar] "
             f"[{gcp_pct_style}]{gcp_pct:.0f}%[/{gcp_pct_style}] "
-            f"[jarvis.dim]{gcp['checkpoint']}{gcp_eta_str}[/jarvis.dim]"
+            f"[jarvis.dim]{gcp_checkpoint}{gcp_eta_str}[/jarvis.dim]"
         )
 
         # Model loading
-        if model_state.get("active", False):
-            m_pct = model_state.get("progress_pct", 0)
-            m_name = (model_state.get("model_name") or "LLM")[:15]
+        if model.get("active", False):
+            m_pct = model.get("progress_pct", 0)
+            m_name = (model.get("model_name") or "LLM")[:15]
             m_bar_filled = int(20 * m_pct / 100)
             m_bar = "━" * m_bar_filled + "╌" * (20 - m_bar_filled)
             m_pct_style = "jarvis.metric.good" if m_pct >= 80 else ("jarvis.metric.warn" if m_pct >= 40 else "jarvis.metric")
@@ -7483,21 +7647,21 @@ class LiveProgressDashboard:
                 f"[{m_pct_style}]{m_pct}%[/{m_pct_style}]"
             )
 
-        # Memory with gradient coloring
-        mem_pct = mem["percent"]
+        # Memory
+        mem_pct = mem.get("percent", 0)
         mem_style = "jarvis.metric.good" if mem_pct < 70 else ("jarvis.metric.warn" if mem_pct < 85 else "jarvis.metric.bad")
         _rich_console.print(
             f"  [jarvis.label]💾 Memory[/jarvis.label] "
             f"[{mem_style}]{mem_pct:.0f}%[/{mem_style}] "
-            f"[jarvis.dim]({mem['used_gb']:.1f}/{mem['total_gb']:.1f} GB)[/jarvis.dim]"
+            f"[jarvis.dim]({mem.get('used_gb', 0):.1f}/{mem.get('total_gb', 0):.1f} GB)[/jarvis.dim]"
         )
 
         # Recent logs
-        if self._log_buffer:
-            import re
+        logs = state.get("logs", [])
+        if logs:
             _rich_console.print(f"  [jarvis.dim]📋 Recent Activity[/jarvis.dim]")
-            for log_line in self._log_buffer[-self._max_log_lines:]:
-                clean = re.sub(r'\033\[[0-9;]*m', '', log_line)
+            for log_line in logs:
+                clean = _re.sub(r'\033\[[0-9;]*m', '', log_line)
                 _rich_console.print(f"  [jarvis.dim]  {clean[:68]}[/jarvis.dim]")
 
         _rich_console.print(RichRule(style="jarvis.dim", characters="─"))
@@ -8340,9 +8504,12 @@ class RichCliRenderer(CliRenderer):
                         )
                         break
             elif event.event_type == SupervisorEventType.COMPONENT_STATUS:
-                if self._dashboard:
-                    status = event.metadata_dict.get("status", "pending")
-                    self._dashboard.update_component(event.component, status)
+                # v278.0: Renderer is READ-ONLY.  Do NOT call update_component()
+                # here.  The dashboard was already updated by the authoritative
+                # write path in _update_component_status().  Writing back from
+                # the event handler caused dual-update races where raw (un-
+                # normalized) status overwrote the canonical value.
+                pass
             # Feed to dashboard log buffer
             if self._dashboard and self._dashboard.enabled:
                 self._dashboard.add_log(
@@ -83246,28 +83413,36 @@ class JarvisSystemKernel:
         }
         dash_name = _DASHBOARD_NAME_MAP.get(component, component)
 
+        # v278.0: Compute normalized status ONCE, used by both dashboard and event.
+        dash_status = normalize_status(status) if normalize_status else status
+
         # v197.1: Update LiveProgressDashboard with component status
-        # v208.0: Use DASHBOARD_STATUS_MAP from readiness_config for consistent mapping
         try:
             dashboard = get_live_dashboard()
             if dashboard.enabled:
-                # Handle internal state aliases, then use unified mapping
-                # Internal states: "running" -> "starting", "complete" -> "healthy"
-                status_alias = {"running": "starting", "complete": "healthy"}
-                normalized_status = status_alias.get(status, status)
-                dash_status = DASHBOARD_STATUS_MAP.get(normalized_status, normalized_status)
-                dashboard.update_component(dash_name, dash_status, message[:60] if message else "")
+                dashboard.update_component(dash_name, dash_status, detail=message[:60] if message else "")
         except Exception:
             pass  # Dashboard updates are non-critical
 
         # v249.0: Emit component status event
         # v251.1: Use dash_name (mapped) so CliRenderer writes the same key
+        # v278.0: Use normalized dash_status (NOT raw status) + schema version + seq
         try:
+            _comp_seq = 0
+            try:
+                _dash = get_live_dashboard()
+                _comp_seq = _dash._components.get(dash_name, {}).get("seq", 0)
+            except Exception:
+                pass
             self._emit_event(
                 SupervisorEventType.COMPONENT_STATUS,
-                message or f"{component} {status}",
+                message or f"{component} {dash_status}",
                 component=dash_name,
-                metadata={"status": status},
+                metadata={
+                    "status": dash_status,
+                    "schema_version": STATUS_SCHEMA_VERSION,
+                    "seq": _comp_seq,
+                },
             )
         except Exception:
             pass
