@@ -2343,7 +2343,9 @@ class ProgressAwareStartupController:
                 # RULE 1.5: Completion finalization watchdog.
                 # If startup has reported complete/100% but task is still running,
                 # bound finalization latency so we don't hang until global timeout.
-                completion_reported = stage == "complete" or progress_pct >= 100.0
+                # v278.1: Stage-driven only. progress_pct >= 100 was a backdoor
+                # that bypassed the semantic phase split (finalizing vs complete).
+                completion_reported = stage == "complete"
                 if completion_reported:
                     if self._completion_seen_at <= 0:
                         self._completion_seen_at = now
@@ -69629,8 +69631,9 @@ class JarvisSystemKernel:
                     except Exception:
                         pass
                 try:
-                    self._current_startup_phase = "complete"
-                    self._current_startup_progress = 100
+                    # v278.1: Set "finalizing" not "complete" — post-frontend work remains
+                    self._current_startup_phase = "finalizing"
+                    self._current_startup_progress = 99
                     await self._safe_broadcast(
                         stage="complete",
                         message="JARVIS startup complete (frontend budget exceeded)",
@@ -69678,8 +69681,9 @@ class JarvisSystemKernel:
                         pass
                 # Emit degraded-complete broadcast so loading page isn't stuck
                 try:
-                    self._current_startup_phase = "complete"
-                    self._current_startup_progress = 100
+                    # v278.1: Set "finalizing" not "complete" — post-frontend work remains
+                    self._current_startup_phase = "finalizing"
+                    self._current_startup_progress = 99
                     await self._safe_broadcast(
                         stage="complete",
                         message="JARVIS startup complete (frontend timed out)",
@@ -69761,6 +69765,7 @@ class JarvisSystemKernel:
             # This ensures FULLY_READY is only marked when components are healthy.
             # =====================================================================
             issue_collector.set_current_phase("Service Verification")
+            self._mark_startup_activity("service_verification")  # v278.1: keep stall detection happy
             # v266.1: Outer timeout guard — _verify_all_services has internal
             # per-service timeouts but the overall call can still hang if
             # network probing stalls at a lower level.
@@ -69821,6 +69826,7 @@ class JarvisSystemKernel:
                         f"(phase={_ssm.phase.value})"
                     )
 
+            self._mark_startup_activity("readiness_evaluation")  # v278.1
             readiness_is_fully_ready = True  # Default to True for fallback
             readiness_message = "System ready (predicate evaluation unavailable)"
             blocking_components: List[str] = []
@@ -69893,8 +69899,8 @@ class JarvisSystemKernel:
             })
 
             # v197.3/v204.0: Stop the startup progress heartbeat
-            self._current_startup_phase = "complete"
-            self._current_startup_progress = 100
+            # v278.1: Phase stays "finalizing" from _phase_frontend_transition —
+            # true "complete" is set just before return 0 (after all finalization).
             try:
                 await self._stop_startup_progress_heartbeat(timeout=2.0)
             except Exception:
@@ -69976,6 +69982,7 @@ class JarvisSystemKernel:
                 except Exception:
                     pass
 
+            self._mark_startup_activity("completion_hooks")  # v278.1
             # v257.0: Completion hooks are optional. Bound their runtime so
             # startup can never hang at 100% waiting on narration/event sinks.
             completion_step_timeout = max(
@@ -70053,6 +70060,16 @@ class JarvisSystemKernel:
                         elapsed_seconds=startup_duration,
                     ),
                 )
+
+            # v278.1: TRUE completion. All post-frontend finalization is done:
+            # service verification, readiness predicate, health report, completion hooks.
+            # NOW the ProgressController and external consumers can see "complete".
+            self._current_startup_phase = "complete"
+            self._current_startup_progress = 100
+            _set_startup_env(
+                "JARVIS_STARTUP_COMPLETE", "true",
+                "all_phases_done", caller="_startup_impl",
+            )
 
             return 0
 
@@ -81749,8 +81766,11 @@ class JarvisSystemKernel:
                 except Exception:
                     pass
 
-            self._current_startup_phase = "complete"
-            self._current_startup_progress = 100
+            # v278.1: Set "finalizing" not "complete" — post-frontend work remains
+            # (service verification, readiness predicate, completion hooks).
+            # The loading server still gets stage="complete" for frontend redirect.
+            self._current_startup_phase = "finalizing"
+            self._current_startup_progress = 99
             await self._safe_broadcast(
                 stage="complete",
                 message="JARVIS startup complete!",
@@ -81761,14 +81781,10 @@ class JarvisSystemKernel:
                 }
             )
 
-            # v271.1: Set JARVIS_STARTUP_COMPLETE AFTER broadcast succeeds
-            # (moved from before redirect). External consumers must not see
-            # "complete" until the loading page has received the 100% signal.
-            _set_startup_env(
-                "JARVIS_STARTUP_COMPLETE", "true",
-                "all_phases_done", caller="_finalize_startup",
-            )
-            self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true (after broadcast)")
+            # v278.1: JARVIS_STARTUP_COMPLETE deferred to _startup_impl just
+            # before return 0 — after service verification, readiness evaluation,
+            # and completion hooks. The frontend redirect gets its signal from the
+            # loading server broadcast above; the env var is for external consumers.
 
             # Step 5: Gracefully stop the loading server (AFTER 100% is sent)
             # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
@@ -81813,8 +81829,9 @@ class JarvisSystemKernel:
                 except Exception:
                     pass
 
-            self._current_startup_phase = "complete"
-            self._current_startup_progress = 100
+            # v278.1: Set "finalizing" not "complete" — post-frontend work remains
+            self._current_startup_phase = "finalizing"
+            self._current_startup_progress = 99
             await self._safe_broadcast(
                 stage="complete",
                 message="JARVIS startup complete (API-only mode)",
@@ -81835,12 +81852,7 @@ class JarvisSystemKernel:
                 metadata={"frontend_started": False, "api_only": True},
             )
 
-            # v271.1: Set JARVIS_STARTUP_COMPLETE AFTER broadcast (same as main path)
-            _set_startup_env(
-                "JARVIS_STARTUP_COMPLETE", "true",
-                "all_phases_done_api_only", caller="_finalize_startup",
-            )
-            self.logger.debug("[Kernel] Set JARVIS_STARTUP_COMPLETE=true (API-only, after broadcast)")
+            # v278.1: JARVIS_STARTUP_COMPLETE deferred to _startup_impl (same as main path)
 
             # Brief stabilization delay for any WebSocket consumers
             await asyncio.sleep(0.5)
@@ -83780,6 +83792,7 @@ class JarvisSystemKernel:
             "ghost_display": "ghost_display",
             "visual_pipeline": "visual_pipeline",
             "frontend": "frontend",
+            "finalizing": "frontend",  # v278.1: Post-frontend finalization; DMS already stopped
         }
 
         if stage in canonical:
@@ -83863,7 +83876,7 @@ class JarvisSystemKernel:
         _STARTUP_STAGES = {
             "loading", "preflight", "resources", "backend", "intelligence",
             "two_tier", "trinity", "enterprise", "agi_os", "ghost_display",
-            "visual_pipeline", "frontend",
+            "visual_pipeline", "frontend", "finalizing",
         }
         current = getattr(self, '_current_progress', 0) or 0
         if stage in _STARTUP_STAGES or is_heartbeat:
