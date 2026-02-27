@@ -6907,7 +6907,13 @@ class LiveProgressDashboard:
         self._start_time = time.time()
         self._last_render = ""
         self._last_status_line = ""  # For compact mode
-        
+
+        # v280.0: Keyboard-switchable detail tabs (Rich CLI enhancement)
+        self._active_tab: str = "logs"
+        self._keyboard_thread: Optional[threading.Thread] = None
+        self._event_buffer: deque = deque(maxlen=200)
+        self._fault_buffer: deque = deque(maxlen=100)
+
     def start(self) -> None:
         """Start the live dashboard."""
         if not self.enabled:
@@ -6915,6 +6921,18 @@ class LiveProgressDashboard:
         self._running = True
         self._start_time = time.time()
         self._task = create_safe_task(self._render_loop())
+
+        # v280.0: Start keyboard listener for tab switching (TTY only)
+        try:
+            if sys.stdin.isatty() and sys.platform != "win32":
+                self._keyboard_thread = threading.Thread(
+                    target=self._keyboard_listener,
+                    name="dashboard-keyboard",
+                    daemon=True,
+                )
+                self._keyboard_thread.start()
+        except Exception:
+            pass
         
     def stop(self) -> None:
         """Stop the live dashboard."""
@@ -6924,7 +6942,52 @@ class LiveProgressDashboard:
         # Clear and show final state
         if self.enabled:
             self._render(final=True)
-    
+
+    _TAB_MAP = {"1": "logs", "0": "logs", "2": "prime", "3": "reactor", "4": "events", "5": "faults"}
+
+    def _keyboard_listener(self) -> None:
+        """Listen for tab-switching keypresses (1-5). Daemon thread.
+
+        Uses cbreak mode so single keys are delivered immediately without
+        requiring Enter. Restores original terminal settings on exit.
+        """
+        import select as _sel
+        import termios as _termios
+        import tty as _tty
+
+        fd = sys.stdin.fileno()
+        old_settings = _termios.tcgetattr(fd)
+        try:
+            _tty.setcbreak(fd)
+            while self._running:
+                if _sel.select([fd], [], [], 0.25)[0]:
+                    ch = os.read(fd, 1).decode("utf-8", errors="ignore")
+                    new_tab = self._TAB_MAP.get(ch)
+                    if new_tab:
+                        self._active_tab = new_tab
+        except Exception:
+            pass
+        finally:
+            try:
+                _termios.tcsetattr(fd, _termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+    def add_event(self, event_type: str, message: str, severity: str = "info",
+                  component: str = "", phase: str = "") -> None:
+        """Record a structured event for the Events/Faults detail tabs."""
+        entry = {
+            "timestamp": time.time(),
+            "type": event_type,
+            "message": message,
+            "severity": severity,
+            "component": component,
+            "phase": phase,
+        }
+        self._event_buffer.append(entry)
+        if severity in ("error", "warning", "critical"):
+            self._fault_buffer.append(entry)
+
     def update_gcp_progress(
         self,
         phase: int = None,
@@ -7583,15 +7646,26 @@ class LiveProgressDashboard:
         sys.stdout.write("\n".join(lines))
         sys.stdout.flush()
 
+    _PRIME_FILTER_KW = frozenset({
+        "prime", "j-prime", "jprime", "jarvis-prime", "jarvis_prime",
+        "llm", "model_load", "model loading", "inference", "prewarm",
+        "trinity_integrator", "trinity integrator",
+    })
+    _REACTOR_FILTER_KW = frozenset({
+        "reactor", "reactor-core", "reactor_core", "training",
+        "nightshift", "night_shift", "scout", "mlforge",
+        "curriculum", "federated", "checkpoint",
+    })
+
     def _render_passthrough_rich(self, state: dict, final: bool = False) -> None:
-        """v278.0: Rich grouped column layout consuming the shared view-model."""
+        """v280.0: Rich CLI with grouped status + keyboard-switchable detail tabs."""
         import re as _re
         elapsed = state["elapsed"]
         gcp = state["gcp"]
         mem = state["memory"]
         model = state["model"]
-        _COLS = 4    # Max components per row
-        _LABEL_W = 18  # Group label column width
+        _COLS = 4
+        _LABEL_W = 18
 
         _rich_console.print()
         _rich_console.print(RichRule(
@@ -7602,7 +7676,6 @@ class LiveProgressDashboard:
             characters="━",
         ))
 
-        # Grouped component display
         for group in state["groups"]:
             members = group["members"]
             label_str = f"  {group['emoji']} {group['label']}"
@@ -7611,17 +7684,11 @@ class LiveProgressDashboard:
                 cells = []
                 for m in chunk:
                     style = m.get("style", "dim")
-                    cells.append(
-                        f"{m['emoji']} [{style}]{m['name']}[/{style}]"
-                    )
+                    cells.append(f"{m['emoji']} [{style}]{m['name']}[/{style}]")
                 row_str = "  ".join(cells)
-                if row_idx == 0:
-                    prefix = label_str.ljust(_LABEL_W)
-                else:
-                    prefix = " " * _LABEL_W
+                prefix = label_str.ljust(_LABEL_W) if row_idx == 0 else " " * _LABEL_W
                 _rich_console.print(f"{prefix}{row_str}")
 
-        # GCP progress
         gcp_pct = gcp.get("progress", 0)
         gcp_bar_filled = int(20 * gcp_pct / 100)
         gcp_bar = "━" * gcp_bar_filled + "╌" * (20 - gcp_bar_filled)
@@ -7642,7 +7709,6 @@ class LiveProgressDashboard:
             f"[jarvis.dim]{gcp_checkpoint}{gcp_eta_str}[/jarvis.dim]"
         )
 
-        # Model loading
         if model.get("active", False):
             m_pct = model.get("progress_pct", 0)
             m_name = (model.get("model_name") or "LLM")[:15]
@@ -7655,7 +7721,6 @@ class LiveProgressDashboard:
                 f"[{m_pct_style}]{m_pct}%[/{m_pct_style}]"
             )
 
-        # Memory
         mem_pct = mem.get("percent", 0)
         mem_style = "jarvis.metric.good" if mem_pct < 70 else ("jarvis.metric.warn" if mem_pct < 85 else "jarvis.metric.bad")
         _rich_console.print(
@@ -7664,13 +7729,87 @@ class LiveProgressDashboard:
             f"[jarvis.dim]({mem.get('used_gb', 0):.1f}/{mem.get('total_gb', 0):.1f} GB)[/jarvis.dim]"
         )
 
-        # Recent logs
-        logs = state.get("logs", [])
-        if logs:
-            _rich_console.print(f"  [jarvis.dim]📋 Recent Activity[/jarvis.dim]")
-            for log_line in logs:
-                clean = _re.sub(r'\033\[[0-9;]*m', '', log_line)
-                _rich_console.print(f"  [jarvis.dim]  {clean[:68]}[/jarvis.dim]")
+        # ── Tab bar ─────────────────────────────────────────────────
+        active = self._active_tab
+        _TAB_DEFS = [
+            ("1", "logs", "Logs"),
+            ("2", "prime", "Prime"),
+            ("3", "reactor", "Reactor"),
+            ("4", "events", "Events"),
+            ("5", "faults", "Faults"),
+        ]
+        tab_parts = []
+        for key, tab_id, label in _TAB_DEFS:
+            if tab_id == active:
+                tab_parts.append(f"[bold bright_green]\\[{key}]{label}[/bold bright_green]")
+            else:
+                tab_parts.append(f"[dim]\\[{key}]{label}[/dim]")
+        _rich_console.print(f"  {' '.join(tab_parts)}")
+
+        # ── Detail pane (based on active tab) ───────────────────────
+        _PANE_LINES = 12
+
+        if active == "logs":
+            logs = state.get("logs", [])
+            if logs:
+                _rich_console.print(f"  [jarvis.dim]📋 Recent Activity[/jarvis.dim]")
+                for log_line in logs[-_PANE_LINES:]:
+                    clean = _re.sub(r'\033\[[0-9;]*m', '', log_line)
+                    _rich_console.print(f"    [jarvis.dim]{clean[:72]}[/jarvis.dim]")
+            else:
+                _rich_console.print(f"  [jarvis.dim]No recent activity[/jarvis.dim]")
+
+        elif active == "prime":
+            _rich_console.print(f"  [bold bright_cyan]🧠 JARVIS Prime[/bold bright_cyan]")
+            logs = state.get("logs", [])
+            filtered = [l for l in logs if any(kw in l.lower() for kw in self._PRIME_FILTER_KW)]
+            if not filtered:
+                filtered = logs[-5:] if logs else []
+            for line in filtered[-_PANE_LINES:]:
+                clean = _re.sub(r'\033\[[0-9;]*m', '', line)
+                _rich_console.print(f"    [bright_cyan]{clean[:72]}[/bright_cyan]")
+            if not filtered:
+                _rich_console.print(f"    [dim]No Prime activity yet[/dim]")
+
+        elif active == "reactor":
+            _rich_console.print(f"  [bold bright_magenta]⚛️  Reactor Core[/bold bright_magenta]")
+            logs = state.get("logs", [])
+            filtered = [l for l in logs if any(kw in l.lower() for kw in self._REACTOR_FILTER_KW)]
+            if not filtered:
+                filtered = logs[-5:] if logs else []
+            for line in filtered[-_PANE_LINES:]:
+                clean = _re.sub(r'\033\[[0-9;]*m', '', line)
+                _rich_console.print(f"    [bright_magenta]{clean[:72]}[/bright_magenta]")
+            if not filtered:
+                _rich_console.print(f"    [dim]No Reactor activity yet[/dim]")
+
+        elif active == "events":
+            _rich_console.print(f"  [bold bright_blue]📡 Events[/bold bright_blue]")
+            events = list(self._event_buffer)
+            if events:
+                for ev in events[-_PANE_LINES:]:
+                    ts = time.strftime("%H:%M:%S", time.localtime(ev.get("timestamp", 0)))
+                    sev = ev.get("severity", "info").upper()
+                    comp = ev.get("component", "")
+                    msg = ev.get("message", "")[:55]
+                    comp_tag = f"[bold]{comp}[/bold] " if comp else ""
+                    _rich_console.print(f"    [dim]{ts}[/dim] {sev:8s} {comp_tag}{msg}")
+            else:
+                _rich_console.print(f"    [dim]No events yet[/dim]")
+
+        elif active == "faults":
+            _rich_console.print(f"  [bold red]⚠️  Faults[/bold red]")
+            faults = list(self._fault_buffer)
+            if faults:
+                for ev in faults[-_PANE_LINES:]:
+                    ts = time.strftime("%H:%M:%S", time.localtime(ev.get("timestamp", 0)))
+                    sev = ev.get("severity", "error").upper()
+                    comp = ev.get("component", "")
+                    msg = ev.get("message", "")[:55]
+                    comp_tag = f"[bold]{comp}[/bold] " if comp else ""
+                    _rich_console.print(f"    [dim]{ts}[/dim] [bold red]{sev:8s}[/bold red] {comp_tag}{msg}")
+            else:
+                _rich_console.print(f"    [green]No faults detected[/green]")
 
         _rich_console.print(RichRule(style="jarvis.dim", characters="─"))
         _rich_console.print()
@@ -8518,10 +8657,17 @@ class RichCliRenderer(CliRenderer):
                 # the event handler caused dual-update races where raw (un-
                 # normalized) status overwrote the canonical value.
                 pass
-            # Feed to dashboard log buffer
+            # Feed to dashboard log buffer + event/fault buffers
             if self._dashboard and self._dashboard.enabled:
                 self._dashboard.add_log(
                     event.message[:80], event.severity.value.upper()
+                )
+                self._dashboard.add_event(
+                    event_type=event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
+                    message=event.message,
+                    severity=event.severity.value if hasattr(event.severity, "value") else str(event.severity),
+                    component=getattr(event, "component", ""),
+                    phase=getattr(event, "phase", ""),
                 )
         except Exception:
             pass
@@ -8611,18 +8757,6 @@ def _create_cli_renderer(
             mode = "rich"
         else:
             mode = "plain"
-
-    if mode == "tui":
-        if TEXTUAL_AVAILABLE:
-            try:
-                from backend.core.supervisor_tui import TuiCliRenderer
-                return TuiCliRenderer(verbosity=verbosity)
-            except Exception as e:
-                logger.warning("TUI init failed (%s), falling back to rich", e)
-                mode = "rich"  # fall through
-        else:
-            logger.warning("textual not installed, falling back to rich")
-            mode = "rich"  # fall through
 
     if mode == "json":
         return JsonCliRenderer(verbosity=verbosity)
@@ -90125,9 +90259,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     ui_group = parser.add_argument_group("🎨 UI / Display")
     ui_group.add_argument(
         "--ui",
-        choices=["rich", "plain", "json", "tui", "auto"],
+        choices=["rich", "plain", "json", "auto"],
         default="auto",
-        help="CLI rendering mode: rich, plain, json, tui (Textual TUI), auto (default: auto-detect TTY)",
+        help="CLI rendering mode: rich, plain, json, auto (default: auto-detect TTY). Tab detail panes (1-5) available in rich mode.",
     )
     ui_group.add_argument(
         "--verbosity",
@@ -93255,37 +93389,20 @@ def main() -> int:
     parser = create_argument_parser()
     args = parser.parse_args()
 
-    # v279.1: When --ui tui, Textual IS the main event loop. The supervisor
-    # startup runs as an async worker inside Textual's event loop so Textual
-    # has full terminal control (alternate screen, raw mode, signal handlers).
-    _ui_mode = getattr(args, "ui", "auto")
-    if _ui_mode == "tui" and TEXTUAL_AVAILABLE:
-        try:
-            from backend.core.supervisor_tui import run_supervisor_tui
-            # Apply CLI overrides to config via env vars (same as normal path)
-            apply_cli_to_config(args, SystemKernelConfig())
-            exit_code = run_supervisor_tui(args)
-        except ImportError as _tui_ie:
-            print(f"[Kernel] TUI import failed ({_tui_ie}), falling back to normal startup")
-            exit_code = asyncio.run(async_main(args))
-        except Exception as _tui_err:
-            print(f"[Kernel] TUI failed ({_tui_err}), falling back to normal startup")
-            exit_code = asyncio.run(async_main(args))
-    else:
-        # Normal async main
-        exit_code = 1  # Default to failure
-        try:
-            exit_code = asyncio.run(async_main(args))
-        except KeyboardInterrupt:
-            print("\n[Kernel] Interrupted by user")
-            exit_code = 130  # 128 + SIGINT(2)
-        except SystemExit as e:
-            exit_code = e.code if isinstance(e.code, int) else 1
-        except Exception as e:
-            print(f"\n[Kernel] Fatal error: {e}")
-            import traceback
-            traceback.print_exc()
-            exit_code = 1
+    # Run async main
+    exit_code = 1  # Default to failure
+    try:
+        exit_code = asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        print("\n[Kernel] Interrupted by user")
+        exit_code = 130  # 128 + SIGINT(2)
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+    except Exception as e:
+        print(f"\n[Kernel] Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        exit_code = 1
 
     # v119.0: Guaranteed process exit with os._exit fallback
     # If non-daemon threads are still alive after cleanup, sys.exit won't work
