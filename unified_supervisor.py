@@ -66597,8 +66597,35 @@ class JarvisSystemKernel:
                 Each is optional — ImportError = not installed, skip silently.
                 """
                 import os as _os
+                import subprocess as _subprocess
+                import sys as _sys
                 _preloaded = []
+
+                def _native_probe(module_name: str, timeout_s: float = 4.0) -> bool:
+                    """Probe native-module import in isolated subprocess."""
+                    try:
+                        _probe = _subprocess.run(
+                            [_sys.executable, "-c", f"import {module_name}"],
+                            stdout=_subprocess.DEVNULL,
+                            stderr=_subprocess.DEVNULL,
+                            timeout=max(1.0, timeout_s),
+                            env={
+                                **_os.environ,
+                                "PYTHONFAULTHANDLER": "1",
+                            },
+                        )
+                        return _probe.returncode == 0
+                    except Exception:
+                        return False
+
+                _probe_timeout = max(
+                    1.0,
+                    float(_os.getenv("JARVIS_NATIVE_PRELOAD_PROBE_TIMEOUT", "4.0")),
+                )
                 _numpy_ok = bool(globals().get("NUMPY_AVAILABLE", False))
+                if _numpy_ok and not _native_probe("numpy", timeout_s=_probe_timeout):
+                    _numpy_ok = False
+                    _preloaded.append("numpy: runtime probe failed, skipping preload tier")
 
                 # ── Tier 1: Foundational (everything depends on these) ──
 
