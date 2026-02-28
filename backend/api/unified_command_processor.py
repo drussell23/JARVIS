@@ -2224,7 +2224,16 @@ class UnifiedCommandProcessor:
         domain = response.domain
 
         # Intent: answer / conversation -- just return the text
+        # v280.5: If domain is workspace, route to workspace handler even for
+        # "answer" intent.  J-Prime sometimes mis-classifies actionable workspace
+        # commands (e.g. "check my email") as answers instead of actions.
         if intent in ("answer", "conversation"):
+            if domain == "workspace":
+                logger.info(
+                    "[v280.5] J-Prime classified workspace command as '%s' — "
+                    "routing to workspace handler anyway", intent,
+                )
+                return await self._handle_workspace_action(command_text, response, deadline=deadline)
             return {
                 "success": True,
                 "response": response.content,
@@ -2534,25 +2543,57 @@ class UnifiedCommandProcessor:
                 agent = self._workspace_agent_singleton
 
             if agent is None:
-                # No workspace agent available — return J-Prime's text response
+                # v280.5: Return success=False so the user gets clear feedback
+                # instead of silently returning J-Prime text as if email was checked.
+                logger.warning("[v280.5] GoogleWorkspaceAgent is None — cannot execute workspace action")
                 return {
-                    "success": True,
-                    "response": getattr(response, 'content', None) or "Workspace features are not currently available.",
+                    "success": False,
+                    "response": "Workspace features are not currently available. The Google Workspace agent failed to initialize.",
                     "command_type": "WORKSPACE",
                     "source": getattr(response, 'source', 'unknown'),
+                    "error": "workspace_agent_unavailable",
                 }
 
             # Build action list from all suggested actions and validate against capabilities.
+            # v280.5: Normalize common LLM action name variants to canonical capability names
+            # before matching.  J-Prime's prompt says to use "fetch_unread_emails" but LLMs
+            # sometimes return "check_email", "read_email", etc.
+            _action_aliases: Dict[str, str] = {
+                "check_email": "fetch_unread_emails",
+                "read_email": "fetch_unread_emails",
+                "read_emails": "fetch_unread_emails",
+                "get_email": "fetch_unread_emails",
+                "get_emails": "fetch_unread_emails",
+                "check_emails": "fetch_unread_emails",
+                "view_email": "fetch_unread_emails",
+                "view_emails": "fetch_unread_emails",
+                "inbox": "fetch_unread_emails",
+                "check_inbox": "fetch_unread_emails",
+                "draft_email": "draft_email_reply",
+                "compose_email": "draft_email_reply",
+                "write_email": "draft_email_reply",
+                "reply_email": "draft_email_reply",
+                "check_calendar": "check_calendar_events",
+                "view_calendar": "check_calendar_events",
+                "calendar": "check_calendar_events",
+                "schedule_event": "create_calendar_event",
+                "add_event": "create_calendar_event",
+                "schedule_meeting": "create_calendar_event",
+                "find_contacts": "get_contacts",
+                "lookup_contact": "get_contacts",
+            }
             workspace_actions: List[str] = []
             agent_capabilities = getattr(agent, 'capabilities', set())
             if hasattr(response, 'suggested_actions') and response.suggested_actions:
                 for candidate in response.suggested_actions:
-                    if candidate in agent_capabilities:
-                        if candidate not in workspace_actions:
-                            workspace_actions.append(candidate)
+                    normalized = _action_aliases.get(candidate, candidate)
+                    if normalized in agent_capabilities:
+                        if normalized not in workspace_actions:
+                            workspace_actions.append(normalized)
                     else:
-                        logger.debug(
-                            f"[v277] suggested_action '{candidate}' not in agent capabilities, skipped"
+                        logger.warning(
+                            "[v280.5] suggested_action '%s' (normalized='%s') not in agent capabilities, skipped",
+                            candidate, normalized,
                         )
             if not workspace_actions:
                 workspace_actions = ["handle_workspace_query"]
@@ -3006,13 +3047,15 @@ class UnifiedCommandProcessor:
                 "error": "deadline_exceeded",
             }
         except Exception as e:
-            logger.error(f"[v266] Workspace action failed: {e}", exc_info=True)
-            # Fallback: return J-Prime's text response
+            logger.error(f"[v280.5] Workspace action failed: {e}", exc_info=True)
+            # v280.5: Return success=False so the error surfaces to the user.
+            # Previously returned success=True which masked all failures.
             return {
-                "success": True,
-                "response": getattr(response, 'content', None) or "I couldn't complete that workspace action.",
+                "success": False,
+                "response": f"I couldn't complete that workspace action: {e}",
                 "command_type": "WORKSPACE",
                 "source": getattr(response, 'source', 'unknown'),
+                "error": "workspace_execution_failed",
             }
 
     async def _handle_vision_action(
