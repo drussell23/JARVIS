@@ -17472,6 +17472,15 @@ CHROME_MACOS_STABILITY_FLAGS: List[str] = [
     # === V8 MEMORY LIMITS ===
     "--js-flags=--max-old-space-size=2048",  # Limit V8 heap to 2GB (SUPPORTED)
     "--js-flags=--expose-gc",           # Allow manual GC (SUPPORTED)
+
+    # === FULLSCREEN (v280.3) ===
+    # v280.3: Root cause fix — Chrome was launched in windowed mode,
+    # then fullscreen toggled via AppleScript 1.5s later.  Fragile:
+    # 1.5s not always enough, macOS window state restoration can
+    # interfere, and the Cmd+Ctrl+F toggle can accidentally EXIT
+    # fullscreen.  --start-fullscreen is a native Chrome flag that
+    # opens directly in fullscreen — no AppleScript timing dependency.
+    "--start-fullscreen",               # Start in fullscreen natively (SUPPORTED)
 ]
 
 # === LINUX-SPECIFIC FLAGS ===
@@ -18457,8 +18466,27 @@ class IntelligentChromeIncognitoManager:
                         result['success'] = success
                         result['action'] = 'created'
                     elif not all_incognito:
-                        _mark_browser_opened()  # v225.1: Cross-process safe
-                        success = await self._launch_fresh_incognito(url)
+                        # v280.3: Root cause fix — Chrome IS running but
+                        # has no incognito window.  Previous code called
+                        # _launch_fresh_incognito() which passes
+                        # kill_existing=True to StabilizedChromeLauncher,
+                        # killing ALL Chrome processes (including healthy
+                        # windows from Phase 0).  The user sees Chrome
+                        # close then reopen.
+                        #
+                        # Fix: Create a new incognito window in the
+                        # EXISTING Chrome process via AppleScript.  Chrome
+                        # was already launched with stability flags, so
+                        # the new window inherits them.  No kill needed.
+                        _mark_browser_opened()
+                        success = await self._create_incognito_window_applescript(url)
+                        if not success:
+                            # AppleScript failed — fall back to full relaunch
+                            self._logger.warning(
+                                "[Chrome] v280.3: AppleScript window creation "
+                                "failed — falling back to full relaunch"
+                            )
+                            success = await self._launch_fresh_incognito(url)
                         result['success'] = success
                         result['action'] = 'created'
                     elif len(all_incognito) == 1:
@@ -18931,24 +18959,16 @@ class IntelligentChromeIncognitoManager:
             self._logger.warning("Non-macOS platform - cannot launch Chrome via AppleScript")
             return False
             
-        # v182.0: AppleScript that creates incognito AND toggles fullscreen
+        # v280.3: AppleScript creates incognito window only.
+        # Fullscreen is handled separately by _ensure_fullscreen()
+        # which uses idempotent AXFullScreen SET (not toggle).
+        # Previous inline keystroke toggle could accidentally EXIT
+        # fullscreen if Chrome remembered being fullscreen.
         applescript = f'''
         tell application "Google Chrome"
             set newWindow to make new window with properties {{mode:"incognito"}}
             set URL of active tab of newWindow to "{url}"
             activate
-        end tell
-
-        -- Wait for window to fully render before fullscreen toggle
-        delay 0.5
-
-        tell application "System Events"
-            tell process "Google Chrome"
-                try
-                    -- Toggle fullscreen mode using keyboard shortcut (Cmd+Ctrl+F)
-                    keystroke "f" using {{command down, control down}}
-                end try
-            end tell
         end tell
 
         return "success"
@@ -19017,6 +19037,64 @@ class IntelligentChromeIncognitoManager:
                     await crash_monitor.attempt_recovery(event)
             except Exception as report_err:
                 self._logger.debug(f"[Browser] Crash report failed: {report_err}")
+            return False
+
+    async def _create_incognito_window_applescript(self, url: str) -> bool:
+        """
+        Create a new incognito window in the EXISTING Chrome process.
+
+        v280.3: Root cause fix for Chrome closing during startup.
+        When Chrome IS running but has no incognito window, the old
+        code called _launch_fresh_incognito() which killed ALL Chrome
+        processes via kill_existing=True, then relaunched.  The user
+        saw Chrome close and reopen.
+
+        This method creates a new incognito window via AppleScript
+        without killing the existing Chrome process.  Chrome was
+        already launched with stability flags (from Phase 0), so the
+        new window inherits those flags.
+
+        After creation, _ensure_fullscreen() is called to enforce
+        fullscreen mode (idempotent SET, not toggle).
+        """
+        if sys.platform != 'darwin':
+            return False
+
+        applescript = f'''
+        tell application "Google Chrome"
+            set newWindow to make new window with properties {{mode:"incognito"}}
+            set URL of active tab of newWindow to "{url}"
+            activate
+        end tell
+
+        return "success"
+        '''
+
+        try:
+            ok, _stdout, err = await self._run_osascript(
+                applescript,
+                timeout=15.0,
+                op_name="create_incognito_window",
+            )
+            if ok:
+                self._logger.info(
+                    "[Chrome] v280.3: Created incognito window in "
+                    "existing Chrome (no kill): %s", url,
+                )
+                # Give Chrome time to render the new window before
+                # applying fullscreen.
+                await asyncio.sleep(1.0)
+                await self._ensure_fullscreen()
+                return True
+            else:
+                self._logger.warning(
+                    "[Chrome] v280.3: AppleScript create failed: %s", err,
+                )
+                return False
+        except Exception as e:
+            self._logger.warning(
+                "[Chrome] v280.3: Create incognito error: %s", e,
+            )
             return False
 
     async def _redirect_incognito_window(
@@ -19093,17 +19171,25 @@ class IntelligentChromeIncognitoManager:
         """
         Ensure Chrome window is fullscreen.
 
-        v182.0: Fixed to actually toggle fullscreen like legacy start_system.py:
-        - Activates Chrome
-        - Checks AXFullScreen attribute to detect current state
-        - Toggles fullscreen using Cmd+Ctrl+F if not already fullscreen
-        - Returns status: ALREADY_FULLSCREEN or TOGGLED_FULLSCREEN
+        v280.3: Root cause rewrite.  Previous implementation used
+        ``keystroke "f" using {command down, control down}`` which is a
+        **TOGGLE** — if Chrome was already fullscreen (macOS remembers
+        window state), the keystroke EXITED fullscreen.  The fallback
+        path toggled UNCONDITIONALLY on any AppleScript error.
+
+        Fix: SET ``AXFullScreen`` attribute to ``true`` directly via
+        System Events.  This is **idempotent**: calling it when Chrome
+        is already fullscreen is a no-op.  Eliminates the entire class
+        of accidental fullscreen-exit bugs.
+
+        Falls back to Cmd+Ctrl+F only when the SET operation genuinely
+        fails AND the window is confirmed NOT fullscreen.
         """
         if sys.platform != 'darwin':
             return False
 
         try:
-            # v182.0: Proper fullscreen detection and toggle
+            # v280.3: Idempotent SET instead of toggle.
             applescript = '''
             tell application "Google Chrome"
                 activate
@@ -19114,20 +19200,41 @@ class IntelligentChromeIncognitoManager:
                 tell process "Google Chrome"
                     try
                         set frontWindow to front window
-                        -- Check AXFullScreen attribute to detect current fullscreen state
                         set isFullscreen to value of attribute "AXFullScreen" of frontWindow
 
                         if isFullscreen then
                             return "ALREADY_FULLSCREEN"
-                        else
-                            -- Not fullscreen - toggle it on using Cmd+Ctrl+F
+                        end if
+
+                        -- v280.3: SET the attribute directly (idempotent).
+                        -- Previous code used keystroke toggle which could
+                        -- accidentally EXIT fullscreen.
+                        try
+                            set value of attribute "AXFullScreen" of frontWindow to true
+                            delay 0.5
+                            -- Verify it took effect
+                            set nowFull to value of attribute "AXFullScreen" of frontWindow
+                            if nowFull then
+                                return "SET_FULLSCREEN"
+                            end if
+                        end try
+
+                        -- Fallback: keystroke only if SET failed AND we
+                        -- confirmed window is NOT fullscreen (safe to toggle ON).
+                        set stillNotFull to value of attribute "AXFullScreen" of frontWindow
+                        if not stillNotFull then
                             keystroke "f" using {command down, control down}
                             return "TOGGLED_FULLSCREEN"
-                    end if
-                    on error
-                        -- Fallback: just try to toggle fullscreen
+                        end if
+
+                        return "ALREADY_FULLSCREEN"
+                    on error errMsg
+                        -- Last resort: only toggle if we have no state info.
+                        -- This is the ONLY path that could theoretically
+                        -- exit fullscreen, and it only fires when AXFullScreen
+                        -- is entirely inaccessible.
                         keystroke "f" using {command down, control down}
-                        return "TOGGLED_FULLSCREEN"
+                        return "FALLBACK_TOGGLED"
                     end try
                 end tell
             end tell
@@ -19144,7 +19251,7 @@ class IntelligentChromeIncognitoManager:
                 self._logger.debug(f"[Chrome] Fullscreen result: {result}")
                 return True
             else:
-                self._logger.warning(f"[Chrome] Fullscreen toggle failed: {stderr.decode()}")
+                self._logger.warning(f"[Chrome] Fullscreen set failed: {stderr.decode()}")
                 return False
         except Exception as e:
             self._logger.warning(f"[Chrome] Fullscreen error: {e}")
