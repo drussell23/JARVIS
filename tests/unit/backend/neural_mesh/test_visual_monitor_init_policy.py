@@ -57,3 +57,14 @@ def test_resolve_parallel_init_policy_respects_runtime_parallelism_override(monk
     assert policy["heavy_parallelism"] == 3
     assert policy["timeouts"]["ferrari_engine"] == pytest.approx(30.0, rel=0.001)
     assert policy["timeouts"]["detector"] == pytest.approx(30.0, rel=0.001)
+
+
+def test_startup_timestamp_overrides_premature_startup_complete(monkeypatch):
+    agent = _make_agent_stub()
+
+    monkeypatch.setenv("JARVIS_STARTUP_COMPLETE", "true")
+    monkeypatch.setenv("JARVIS_STARTUP_TIMESTAMP", "100.0")
+    monkeypatch.setenv("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")
+    monkeypatch.setattr("backend.neural_mesh.agents.visual_monitor_agent.time.time", lambda: 200.0)
+
+    assert agent._is_global_startup_phase() is True

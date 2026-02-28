@@ -986,8 +986,7 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         delayed or temporarily missing.
         """
         startup_complete = (os.getenv("JARVIS_STARTUP_COMPLETE", "") or "").strip().lower()
-        if startup_complete in ("1", "true", "yes", "on"):
-            return False
+        startup_complete_bool = startup_complete in ("1", "true", "yes", "on")
 
         startup_ts_raw = (os.getenv("JARVIS_STARTUP_TIMESTAMP", "") or "").strip()
         if startup_ts_raw:
@@ -997,11 +996,13 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     30.0,
                     float(os.getenv("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")),
                 )
-                if startup_ts > 0 and (time.time() - startup_ts) > startup_window:
+                if startup_ts > 0:
+                    if (time.time() - startup_ts) <= startup_window:
+                        return True
                     return False
             except ValueError:
                 pass
-        return True
+        return not startup_complete_bool
 
     def _get_memory_thrash_state(self) -> str:
         """
