@@ -63,6 +63,7 @@ class MemoryAwareSwiftVisionIntegration:
         self._cleanup_task = None
         self._process_limit_warned = False
         self._critical_memory_warned = False
+        self._last_memory_gate_reason = "unknown"
         
         # Memory management
         self.result_cache: Deque[VisionProcessingResult] = deque(maxlen=self.config['max_cached_results'])
@@ -105,7 +106,12 @@ class MemoryAwareSwiftVisionIntegration:
                 logger.error(f"Failed to initialize Swift vision processor: {e}")
         else:
             if not memory_available:
-                logger.warning("Insufficient memory for Swift vision - using Python fallback")
+                if self._last_memory_gate_reason == "startup_memory_mode_deferred":
+                    logger.info(
+                        "Swift vision deferred by startup memory policy - using Python fallback"
+                    )
+                else:
+                    logger.warning("Insufficient memory for Swift vision - using Python fallback")
             else:
                 logger.info("Swift performance bridge not available - using Python fallback")
         
@@ -191,11 +197,12 @@ class MemoryAwareSwiftVisionIntegration:
         _mem_mode = os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full")
         if _mem_mode in ("minimal", "cloud_only", "cloud_first"):
             if not self._critical_memory_warned:
-                logger.warning(
+                logger.info(
                     "Swift vision deferred: startup memory_mode=%s (OOM bridge decision)",
                     _mem_mode,
                 )
                 self._critical_memory_warned = True
+            self._last_memory_gate_reason = "startup_memory_mode_deferred"
             return False
 
         available_mb = psutil.virtual_memory().available / 1024 / 1024
@@ -212,6 +219,7 @@ class MemoryAwareSwiftVisionIntegration:
             if not self._critical_memory_warned:
                 logger.warning(f"Critical system memory: {available_mb}MB")
                 self._critical_memory_warned = True
+            self._last_memory_gate_reason = "critical_system_memory"
             return False
         self._critical_memory_warned = False
         
@@ -220,8 +228,10 @@ class MemoryAwareSwiftVisionIntegration:
             if not self._process_limit_warned:
                 logger.warning(f"Process memory {process_mb}MB exceeds limit")
                 self._process_limit_warned = True
+            self._last_memory_gate_reason = "process_memory_limit"
             return False
         self._process_limit_warned = False
+        self._last_memory_gate_reason = "ok"
         
         return True
     

@@ -477,7 +477,19 @@ class MultiSpaceWindowDetector:
 
             # Return error info if available
             error = yabai_summary.get("error", "No spaces found")
-            logger.warning(f"[MULTI-SPACE] Async query returned no data: {error}")
+            error_code = str(yabai_summary.get("error_code", ""))
+            timeout_class = str(yabai_summary.get("timeout_classification", "none"))
+            expected_degraded = (
+                error_code.startswith("query_timeout_")
+                and timeout_class in ("startup_budget", "thrash_budget", "thrash_emergency_budget")
+            )
+            _log_fn = logger.info if expected_degraded else logger.warning
+            _log_fn(
+                "[MULTI-SPACE] Async query returned no data: %s (error_code=%s, timeout_class=%s)",
+                error,
+                error_code or "unknown",
+                timeout_class,
+            )
 
             return {
                 "current_space": {"id": 1, "uuid": "", "window_count": 0},
@@ -492,6 +504,8 @@ class MultiSpaceWindowDetector:
                 "total_apps": 0,
                 "timestamp": datetime.now().isoformat(),
                 "error": error,
+                "error_code": error_code or "query_failed",
+                "timeout_classification": timeout_class,
                 "query_method": "fallback",
             }
 

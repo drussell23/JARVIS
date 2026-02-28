@@ -2612,6 +2612,16 @@ class GhostDisplayManager:
         """Activate fallback strategy when Ghost Display unavailable."""
         self._status = GhostDisplayStatus.FALLBACK
 
+        startup_complete = (os.environ.get("JARVIS_STARTUP_COMPLETE", "") or "").strip().lower()
+        startup_phase = startup_complete not in ("1", "true", "yes", "on")
+        startup_memory_mode = (os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "") or "").strip().lower()
+        expected_startup_degrade = startup_phase and startup_memory_mode in (
+            "cloud_first",
+            "cloud_only",
+            "minimal",
+            "sequential",
+        )
+
         # Strategy 1: Find any visible space that's not current
         spaces = yabai_detector.enumerate_all_spaces(include_display_info=True)
         current_space = yabai_detector.get_current_user_space()
@@ -2629,9 +2639,19 @@ class GhostDisplayManager:
         # Strategy 2: Use current space (last resort - will be visible to user)
         if current_space:
             self._fallback_space = current_space
-            logger.warning(
-                f"[GhostManager] ⚠️ FALLBACK: Using current Space {current_space} "
-                f"(windows will be visible to user)"
+            _reason_code = (
+                "startup_policy_degraded"
+                if expected_startup_degrade
+                else "runtime_visibility_risk"
+            )
+            _log_fn = logger.info if expected_startup_degrade else logger.warning
+            _log_fn(
+                "[GhostManager] FALLBACK: Using current Space %s "
+                "(windows visible to user, reason=%s, startup=%s, memory_mode=%s)",
+                current_space,
+                _reason_code,
+                startup_phase,
+                startup_memory_mode or "unknown",
             )
             await self._notify_state_change("status_changed", {"new_status": "fallback"})
             return True
@@ -13469,6 +13489,103 @@ def _is_workspace_cache_valid() -> bool:
     return age < _WORKSPACE_CACHE["ttl_seconds"]
 
 
+def _is_startup_phase_for_workspace_query() -> bool:
+    """
+    Determine whether workspace queries are running in startup phase.
+    """
+    startup_complete_raw = (os.environ.get("JARVIS_STARTUP_COMPLETE", "") or "").strip().lower()
+    startup_complete = startup_complete_raw in ("1", "true", "yes", "on")
+
+    startup_ts_raw = (os.environ.get("JARVIS_STARTUP_TIMESTAMP", "") or "").strip()
+    if startup_ts_raw:
+        try:
+            startup_ts = float(startup_ts_raw)
+            startup_window = max(
+                30.0,
+                float(os.environ.get("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")),
+            )
+            if startup_ts > 0:
+                return (time.time() - startup_ts) <= startup_window
+        except ValueError:
+            pass
+
+    return not startup_complete
+
+
+def _current_thrash_state() -> str:
+    """Get current memory thrash state when quantizer is available."""
+    try:
+        import backend.core.memory_quantizer as _mq_mod
+
+        _mq = getattr(_mq_mod, "_memory_quantizer_instance", None)
+        if _mq is not None:
+            return str(getattr(_mq, "_thrash_state", "unknown") or "unknown").lower()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _resolve_workspace_query_timeout(timeout_seconds: float) -> Dict[str, Any]:
+    """
+    Resolve adaptive timeout policy for workspace query.
+
+    Startup and memory-thrash phases can starve yabai subprocess scheduling.
+    We apply deterministic timeout scaling so query failures are policy-driven,
+    not incidental scheduler artifacts.
+    """
+    base_timeout = max(0.5, float(timeout_seconds))
+    startup_phase = _is_startup_phase_for_workspace_query()
+    thrash_state = _current_thrash_state()
+
+    multiplier = 1.0
+    reason = "standard"
+    if startup_phase:
+        multiplier = max(
+            multiplier,
+            float(os.environ.get("JARVIS_WORKSPACE_QUERY_STARTUP_MULTIPLIER", "2.0")),
+        )
+        reason = "startup_budget"
+
+    if thrash_state == "thrashing":
+        multiplier = max(
+            multiplier,
+            float(os.environ.get("JARVIS_WORKSPACE_QUERY_THRASH_MULTIPLIER", "1.6")),
+        )
+        reason = "thrash_budget"
+    elif thrash_state == "emergency":
+        multiplier = max(
+            multiplier,
+            float(os.environ.get("JARVIS_WORKSPACE_QUERY_EMERGENCY_MULTIPLIER", "2.2")),
+        )
+        reason = "thrash_emergency_budget"
+
+    timeout_cap = max(
+        base_timeout,
+        float(os.environ.get("JARVIS_WORKSPACE_QUERY_TIMEOUT_CAP", "10.0")),
+    )
+    effective_timeout = min(timeout_cap, max(0.5, base_timeout * multiplier))
+
+    return {
+        "effective_timeout_seconds": effective_timeout,
+        "base_timeout_seconds": base_timeout,
+        "timeout_reason": reason,
+        "startup_phase": startup_phase,
+        "thrash_state": thrash_state,
+    }
+
+
+def _workspace_cache_fallback(reason: str, error_code: str) -> Optional[Dict[str, Any]]:
+    """Return a structured stale-cache fallback when available."""
+    if not _WORKSPACE_CACHE["data"]:
+        return None
+    cached = dict(_WORKSPACE_CACHE["data"])
+    cached["cached"] = True
+    cached["query_method"] = "cache_fallback"
+    cached["error"] = reason
+    cached["error_code"] = error_code
+    return cached
+
+
 def _update_workspace_cache(data: Dict[str, Any]) -> None:
     """Update the workspace cache with fresh data."""
     _WORKSPACE_CACHE["data"] = data
@@ -13544,6 +13661,9 @@ async def parallel_workspace_query_async(
     # Get configurable timeout
     if timeout_seconds is None:
         timeout_seconds = float(os.getenv("JARVIS_WORKSPACE_QUERY_TIMEOUT", "3.0"))
+
+    timeout_profile = _resolve_workspace_query_timeout(timeout_seconds)
+    timeout_seconds = float(timeout_profile["effective_timeout_seconds"])
 
     start_time = time.time()
 
@@ -13641,12 +13761,25 @@ async def parallel_workspace_query_async(
         return result
 
     except asyncio.TimeoutError:
-        logger.warning(f"[YABAI] Parallel query timed out after {timeout_seconds}s")
+        timeout_reason = str(timeout_profile.get("timeout_reason", "standard"))
+        log_fn = logger.info if timeout_reason != "standard" else logger.warning
+        log_fn(
+            "[YABAI] Parallel query timed out after %.1fs (reason=%s, startup=%s, thrash=%s)",
+            timeout_seconds,
+            timeout_reason,
+            timeout_profile.get("startup_phase"),
+            timeout_profile.get("thrash_state"),
+        )
         _record_circuit_breaker_failure()
-        if _WORKSPACE_CACHE["data"]:
+        cached = _workspace_cache_fallback("Query timeout", f"query_timeout_{timeout_reason}")
+        if cached:
             logger.debug("[YABAI] Returning stale cache after timeout")
-            return _WORKSPACE_CACHE["data"]
-        return _empty_workspace_result("Query timeout")
+            return cached
+        return _empty_workspace_result(
+            "Query timeout",
+            error_code=f"query_timeout_{timeout_reason}",
+            timeout_classification=timeout_reason,
+        )
 
     except json.JSONDecodeError as e:
         logger.error(f"[YABAI] Failed to parse yabai output: {e}")
@@ -13880,7 +14013,12 @@ def _build_workspace_summary(spaces_data: List[Dict], windows_data: List[Dict]) 
     }
 
 
-def _empty_workspace_result(reason: str) -> Dict[str, Any]:
+def _empty_workspace_result(
+    reason: str,
+    *,
+    error_code: str = "query_failed",
+    timeout_classification: str = "none",
+) -> Dict[str, Any]:
     """Return an empty workspace result with error reason."""
     return {
         "total_spaces": 0,
@@ -13891,6 +14029,8 @@ def _empty_workspace_result(reason: str) -> Dict[str, Any]:
         "primary_activity": "No spaces detected",
         "all_applications": [],
         "error": reason,
+        "error_code": error_code,
+        "timeout_classification": timeout_classification,
         "query_method": "fallback",
         "cached": False,
     }
