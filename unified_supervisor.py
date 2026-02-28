@@ -70892,8 +70892,26 @@ class JarvisSystemKernel:
             # v197.1: Stop live progress dashboard and show final summary
             dashboard = get_live_dashboard()
             if dashboard.enabled:
+                # v280.2: Completion sweep — mark all "running" components as
+                # "healthy" (✅). Root cause: components like ecapa_backend and
+                # enterprise_services are set to "running" (⚙️) when their
+                # initialization STARTS, but never updated to "healthy" when
+                # they FINISH. At this point startup has completed successfully,
+                # so any component still in "running" state is implicitly healthy.
+                # This sweep also catches future components that forget to
+                # set their final status.
+                _sweep_targets = {"running", "starting", "initializing"}
+                try:
+                    for _comp_name, _comp_data in list(dashboard._components.items()):
+                        _comp_status = _comp_data.get("status", "")
+                        if _comp_status in _sweep_targets:
+                            dashboard.update_component(
+                                _comp_name, "healthy",
+                                detail="Startup complete",
+                            )
+                except Exception:
+                    pass  # Dashboard updates are non-critical
                 dashboard.stop()
-                # Update all components to final healthy status
                 update_dashboard_memory()
 
             _total_s = time.perf_counter() - _PROCESS_START_TIME
@@ -72743,8 +72761,11 @@ class JarvisSystemKernel:
                     self.logger.info(
                         f"[Kernel] ECAPA backend: {ecapa_result['selected_backend']}"
                     )
+                    # v280.2: Use "healthy" not "running" — ECAPA selection is
+                    # complete at this point. "running" (⚙️) never transitions
+                    # to "healthy" (✅), leaving the dashboard stuck.
                     self._update_component_status(
-                        "ecapa_backend", "running",
+                        "ecapa_backend", "healthy",
                         f"ECAPA: {ecapa_result['selected_backend']}",
                     )
             except asyncio.TimeoutError:
@@ -81114,7 +81135,10 @@ class JarvisSystemKernel:
                 f"[Zone6] Initializing 5 enterprise services "
                 f"(parallel, base timeout={service_timeout:.1f}s)"
             )
-            self._update_component_status("enterprise_services", "running", "Initializing enterprise services")
+            # v280.2: Use "enterprise" key to match _reconcile_enterprise_component_status().
+            # Previously used "enterprise_services" which was a different dashboard key —
+            # reconcile updated "enterprise" but the initial "enterprise_services" stayed ⚙️.
+            self._update_component_status("enterprise", "running", "Initializing enterprise services")
 
             # Service definitions with display names
             service_specs = [
@@ -83075,8 +83099,8 @@ class JarvisSystemKernel:
                             }
                         if not result.get("success"):
                             self.logger.info(
-                                "[Kernel] v280.0: Fast redirect skipped (%s) after %.1fs budget; "
-                                "scheduling non-destructive background redirect retry",
+                                "[Kernel] v280.2: Fast redirect skipped (%s) after %.1fs budget; "
+                                "scheduling background Chrome recovery",
                                 result.get("error", "unknown"),
                                 _chrome_budget,
                             )
@@ -83084,11 +83108,34 @@ class JarvisSystemKernel:
                                 _chrome_budget,
                                 float(os.environ.get("JARVIS_CHROME_REDIRECT_BACKGROUND_BUDGET", "20.0")),
                             )
+                            # v280.2: Root cause fix — redirect_existing_incognito_with_budget
+                            # can ONLY redirect existing windows. When Chrome dies during
+                            # startup (between Phase 0 and Phase 7), there's no window to
+                            # redirect, so both fast and background retries fail with
+                            # "no_existing_incognito_window". ensure_single_incognito_window
+                            # handles the full lifecycle: find existing → redirect, or
+                            # create new if Chrome died. This is the same function used
+                            # in Phase 0 to open the initial incognito window.
+                            async def _background_chrome_recovery() -> None:
+                                try:
+                                    await asyncio.wait_for(
+                                        chrome_manager.ensure_single_incognito_window(
+                                            frontend_url,
+                                        ),
+                                        timeout=_background_retry_budget,
+                                    )
+                                except asyncio.TimeoutError:
+                                    self.logger.debug(
+                                        "[Kernel] Background Chrome recovery timed out (%.0fs)",
+                                        _background_retry_budget,
+                                    )
+                                except Exception as _chrome_bg_err:
+                                    self.logger.debug(
+                                        "[Kernel] Background Chrome recovery failed: %s",
+                                        _chrome_bg_err,
+                                    )
                             create_safe_task(
-                                chrome_manager.redirect_existing_incognito_with_budget(
-                                    frontend_url,
-                                    budget_seconds=_background_retry_budget,
-                                ),
+                                _background_chrome_recovery(),
                                 name="chrome-redirect-background",
                             )
                         if result.get("success"):
