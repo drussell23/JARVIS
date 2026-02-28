@@ -65002,24 +65002,12 @@ class JarvisSystemKernel:
         except Exception:
             pass
 
-        # v263.2: Explicitly stop known singleton health-loop owners that
-        # may have been skipped when AGI OS stop times out.
+        # v283.0: Explicitly stop singleton health-loop owners before final task drain.
+        # This prevents loop-close warnings:
+        # - "Task was destroyed but it is pending!"
+        # - lingering backend health loops during forced exit paths.
         try:
-            from neural_mesh.registry.agent_registry import AgentRegistry as _AR
-            _ar_inst = _AR._instance if hasattr(_AR, '_instance') else None
-            if _ar_inst and getattr(_ar_inst, '_running', False):
-                await asyncio.wait_for(_ar_inst.stop(), timeout=3.0)
-                self.logger.debug("[Kernel] AgentRegistry stopped (orphan cleanup)")
-        except Exception:
-            pass
-
-        try:
-            from core.hybrid_orchestrator import _global_orchestrator as _go
-            if _go and hasattr(_go, 'client') and _go.client:
-                _hbc = _go.client
-                if getattr(_hbc, 'health_check_task', None) and not _hbc.health_check_task.done():
-                    await asyncio.wait_for(_hbc.stop(), timeout=3.0)
-                    self.logger.debug("[Kernel] HybridBackendClient stopped (orphan cleanup)")
+            await self._stop_orphan_singleton_health_loops(timeout_s=3.0)
         except Exception:
             pass
 
@@ -65223,6 +65211,42 @@ class JarvisSystemKernel:
 
         self._state = KernelState.STOPPED
         self.logger.warning("[Kernel] ⚠️ Emergency shutdown complete")
+
+    async def _stop_orphan_singleton_health_loops(self, timeout_s: float = 3.0) -> None:
+        """Best-effort stop for singleton background health-loop owners."""
+        import importlib
+
+        # AgentRegistry singleton
+        for _mod_name in (
+            "backend.neural_mesh.registry.agent_registry",
+            "neural_mesh.registry.agent_registry",
+        ):
+            try:
+                _mod = importlib.import_module(_mod_name)
+                _AR = getattr(_mod, "AgentRegistry", None)
+                _inst = getattr(_AR, "_instance", None) if _AR else None
+                _task = getattr(_inst, "_health_check_task", None)
+                if _inst and (
+                    getattr(_inst, "_running", False)
+                    or (_task is not None and not _task.done())
+                ):
+                    await asyncio.wait_for(_inst.stop(), timeout=timeout_s)
+                    self.logger.debug("[Kernel] AgentRegistry stopped (singleton cleanup)")
+                break
+            except Exception:
+                continue
+
+        # HybridOrchestrator + HybridBackendClient singleton
+        for _mod_name in ("backend.core.hybrid_orchestrator", "core.hybrid_orchestrator"):
+            try:
+                _mod = importlib.import_module(_mod_name)
+                _stop_orchestrator = getattr(_mod, "stop_orchestrator", None)
+                if callable(_stop_orchestrator):
+                    await asyncio.wait_for(_stop_orchestrator(), timeout=timeout_s)
+                    self.logger.debug("[Kernel] HybridOrchestrator stopped (singleton cleanup)")
+                    break
+            except Exception:
+                continue
 
     async def emergency_shutdown(
         self,
@@ -94178,6 +94202,12 @@ async def async_main(args: argparse.Namespace) -> int:
                     # Continue best-effort cleanup without crashing the process.
                     exit_code = 130
                     kernel.logger.warning("[Kernel] Emergency shutdown cancelled during final cleanup")
+                    try:
+                        await asyncio.shield(
+                            kernel._stop_orphan_singleton_health_loops(timeout_s=2.0)
+                        )
+                    except Exception:
+                        pass
                 except asyncio.TimeoutError:
                     kernel.logger.error(
                         "[Kernel] Emergency shutdown exceeded finally timeout; "
