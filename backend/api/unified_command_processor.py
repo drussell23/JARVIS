@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -319,6 +320,7 @@ class UnifiedCommandProcessor:
             "reflex_hits": 0,
             "reflex_cache_hits": 0,
             "jprime_calls": 0,
+            "jprime_budget_skips": 0,
             "jprime_timeouts": 0,
             "jprime_503_retries": 0,
             "brain_vacuum_activations": 0,
@@ -1625,7 +1627,29 @@ class UnifiedCommandProcessor:
             asyncio.create_task(self._notify_reflex_executed(command_text, reflex))
             return result
 
-        # === Step 2: J-Prime call (the brain) ===
+        # === Step 2: Deadline admission gate for J-Prime ===
+        # Avoid launching multi-backend inference when request budget is already
+        # nearly exhausted; this creates deterministic failover instead of churn.
+        min_jprime_budget = max(
+            0.5,
+            float(os.getenv("JARVIS_JPRIME_MIN_BUDGET_SECONDS", "2.5")),
+        )
+        if deadline is not None:
+            remaining_budget = deadline - time.monotonic()
+            if remaining_budget < min_jprime_budget:
+                self._v242_metrics["jprime_budget_skips"] += 1
+                logger.info(
+                    "[v278] Skipping J-Prime admission: budget %.1fs < %.1fs minimum",
+                    remaining_budget,
+                    min_jprime_budget,
+                )
+                workspace_failover = await self._attempt_workspace_failover(
+                    command_text, deadline=deadline
+                )
+                if workspace_failover is not None:
+                    return workspace_failover
+
+        # === Step 3: J-Prime call (the brain) ===
         logger.info(f"[v242] Sending to J-Prime: '{command_text[:80]}'")
 
         # v242.1: Build lightweight context for J-Prime classification
@@ -1755,7 +1779,16 @@ class UnifiedCommandProcessor:
 
             return result
 
-        # === Step 3: Brain vacuum fallback ===
+        # === Step 4: Workspace failover (deterministic local routing) ===
+        # If the command is clearly a workspace intent, route directly to the
+        # workspace execution path instead of hard-failing on J-Prime outage.
+        workspace_failover = await self._attempt_workspace_failover(
+            command_text, deadline=deadline
+        )
+        if workspace_failover is not None:
+            return workspace_failover
+
+        # === Step 5: Brain vacuum fallback ===
         logger.warning("[v242] J-Prime unreachable and no reflex match. Brain vacuum fallback.")
         return {
             "success": False,
@@ -2117,6 +2150,65 @@ class UnifiedCommandProcessor:
                 )
 
         return None
+
+    async def _attempt_workspace_failover(
+        self, command_text: str, deadline: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Route workspace commands even when J-Prime classification is unavailable.
+
+        Uses the shared workspace detector as the contract authority so this
+        failover path stays consistent with normal routing semantics.
+        """
+        try:
+            from backend.core.workspace_routing_intelligence import get_workspace_detector
+
+            detector = get_workspace_detector()
+            detection = await detector.detect(command_text)
+        except Exception as e:
+            logger.debug("[v242] Workspace failover detector unavailable: %s", e)
+            return None
+
+        if not bool(getattr(detection, "is_workspace_command", False)):
+            return None
+
+        intent_value = getattr(getattr(detection, "intent", None), "value", "unknown")
+        action_map = {
+            "check_email": "fetch_unread_emails",
+            "search_email": "search_email",
+            "draft_email": "draft_email_reply",
+            "send_email": "send_email",
+            "check_calendar": "check_calendar_events",
+            "create_event": "create_calendar_event",
+            "get_contacts": "get_contacts",
+            "create_document": "create_document",
+            "workspace_summary": "workspace_summary",
+        }
+        suggested_action = action_map.get(intent_value, "handle_workspace_query")
+
+        response_stub = SimpleNamespace(
+            intent="action",
+            domain="workspace",
+            confidence=float(getattr(detection, "confidence", 0.0) or 0.0),
+            source="workspace_failover",
+            suggested_actions=[suggested_action],
+            content="",
+            request_id=uuid.uuid4().hex,
+            correlation_id=uuid.uuid4().hex,
+        )
+
+        try:
+            result = await self._handle_workspace_action(
+                command_text,
+                response_stub,
+                deadline=deadline,
+            )
+            if isinstance(result, dict):
+                result.setdefault("source", "workspace_failover")
+            return result
+        except Exception as e:
+            logger.warning("[v242] Workspace failover execution failed: %s", e)
+            return None
 
     async def _execute_action(
         self, response: Any, command_text: str,
