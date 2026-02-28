@@ -977,6 +977,111 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
     # Helper Methods for Non-Blocking Initialization
     # =========================================================================
 
+    def _is_global_startup_phase(self) -> bool:
+        """
+        Determine whether the process is still in startup phase.
+
+        Source of truth is `JARVIS_STARTUP_COMPLETE`; timestamp grace is a
+        secondary safeguard for environments where startup-complete can be
+        delayed or temporarily missing.
+        """
+        startup_complete = (os.getenv("JARVIS_STARTUP_COMPLETE", "") or "").strip().lower()
+        if startup_complete in ("1", "true", "yes", "on"):
+            return False
+
+        startup_ts_raw = (os.getenv("JARVIS_STARTUP_TIMESTAMP", "") or "").strip()
+        if startup_ts_raw:
+            try:
+                startup_ts = float(startup_ts_raw)
+                startup_window = max(
+                    30.0,
+                    float(os.getenv("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")),
+                )
+                if startup_ts > 0 and (time.time() - startup_ts) > startup_window:
+                    return False
+            except ValueError:
+                pass
+        return True
+
+    def _get_memory_thrash_state(self) -> str:
+        """
+        Read memory thrash state from MemoryQuantizer singleton when available.
+        """
+        try:
+            import backend.core.memory_quantizer as _mq_mod
+
+            _mq_inst = getattr(_mq_mod, "_memory_quantizer_instance", None)
+            if _mq_inst is not None:
+                return str(getattr(_mq_inst, "_thrash_state", "unknown") or "unknown").lower()
+        except Exception:
+            pass
+        return "unknown"
+
+    def _resolve_parallel_init_policy(self, base_timeouts: Dict[str, float]) -> Dict[str, Any]:
+        """
+        Resolve startup-aware timeout + concurrency policy for heavy init tasks.
+
+        Root fix: Ferrari and detector are both heavy initializers. When they run
+        concurrently under startup pressure, both can hit identical timeout cliffs.
+        This policy adds deterministic backpressure and dynamic timeout floors.
+        """
+        in_startup = self._is_global_startup_phase()
+        thrash_state = self._get_memory_thrash_state()
+
+        startup_multiplier = max(
+            1.0,
+            float(os.getenv("JARVIS_VISUAL_INIT_STARTUP_TIMEOUT_MULTIPLIER", "1.75")),
+        )
+        thrash_multiplier = max(
+            1.0,
+            float(os.getenv("JARVIS_VISUAL_INIT_THRASH_TIMEOUT_MULTIPLIER", "1.35")),
+        )
+        emergency_multiplier = max(
+            1.0,
+            float(os.getenv("JARVIS_VISUAL_INIT_EMERGENCY_TIMEOUT_MULTIPLIER", "1.75")),
+        )
+
+        heavy_multiplier = 1.0
+        if in_startup:
+            heavy_multiplier = max(heavy_multiplier, startup_multiplier)
+        if thrash_state == "thrashing":
+            heavy_multiplier = max(heavy_multiplier, thrash_multiplier)
+        elif thrash_state == "emergency":
+            heavy_multiplier = max(heavy_multiplier, emergency_multiplier)
+
+        startup_floor = max(
+            1.0,
+            float(os.getenv("JARVIS_VISUAL_HEAVY_INIT_STARTUP_FLOOR_SECONDS", "25.0")),
+        )
+        runtime_floor = max(
+            1.0,
+            float(os.getenv("JARVIS_VISUAL_HEAVY_INIT_RUNTIME_FLOOR_SECONDS", "12.0")),
+        )
+        heavy_floor = startup_floor if in_startup else runtime_floor
+
+        resolved = dict(base_timeouts)
+        for heavy_key in ("ferrari_engine", "detector"):
+            raw = float(resolved.get(heavy_key, 0.0) or 0.0)
+            adjusted = max(raw * heavy_multiplier, heavy_floor)
+            resolved[heavy_key] = adjusted
+
+        # During startup or thrash, serialize heavy initializers to avoid CPU/GPU
+        # starvation and threadpool contention from parallel native model loads.
+        heavy_parallel_default = 1 if (in_startup or thrash_state in ("thrashing", "emergency")) else 2
+        heavy_parallelism = max(
+            1,
+            int(os.getenv("JARVIS_VISUAL_HEAVY_INIT_PARALLELISM", str(heavy_parallel_default))),
+        )
+
+        return {
+            "timeouts": resolved,
+            "in_startup": in_startup,
+            "thrash_state": thrash_state,
+            "heavy_multiplier": heavy_multiplier,
+            "heavy_floor": heavy_floor,
+            "heavy_parallelism": heavy_parallelism,
+        }
+
     # =========================================================================
     # v241.0: Dynamic Ghost Display Resolution Helpers
     # =========================================================================
@@ -1465,12 +1570,36 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
         # ThreadPoolExecutor threads try to access the event loop
 
         # Configurable timeouts from environment (no hardcoding)
-        ferrari_init_timeout = float(os.getenv('JARVIS_FERRARI_INIT_TIMEOUT', '15.0'))  # v78.1: Increased from 5s
-        watcher_mgr_init_timeout = float(os.getenv('JARVIS_WATCHER_MGR_INIT_TIMEOUT', '5.0'))  # v78.1: Increased from 3s
-        detector_init_timeout = float(os.getenv('JARVIS_DETECTOR_INIT_TIMEOUT', '15.0'))  # v78.1: Increased from 5s
-        computer_use_init_timeout = float(os.getenv('JARVIS_COMPUTER_USE_INIT_TIMEOUT', '5.0'))  # v78.1: Increased from 3s
-        agentic_runner_init_timeout = float(os.getenv('JARVIS_AGENTIC_RUNNER_INIT_TIMEOUT', '15.0'))  # v78.1: Increased from 3s
-        spatial_agent_init_timeout = float(os.getenv('JARVIS_SPATIAL_AGENT_INIT_TIMEOUT', '15.0'))  # v78.1: Increased from 5s
+        base_timeouts = {
+            "ferrari_engine": float(os.getenv('JARVIS_FERRARI_INIT_TIMEOUT', '15.0')),
+            "watcher_manager": float(os.getenv('JARVIS_WATCHER_MGR_INIT_TIMEOUT', '5.0')),
+            "detector": float(os.getenv('JARVIS_DETECTOR_INIT_TIMEOUT', '15.0')),
+            "computer_use": float(os.getenv('JARVIS_COMPUTER_USE_INIT_TIMEOUT', '5.0')),
+            "agentic_runner": float(os.getenv('JARVIS_AGENTIC_RUNNER_INIT_TIMEOUT', '15.0')),
+            "spatial_agent": float(os.getenv('JARVIS_SPATIAL_AGENT_INIT_TIMEOUT', '15.0')),
+        }
+        init_policy = self._resolve_parallel_init_policy(base_timeouts)
+        resolved_timeouts = init_policy["timeouts"]
+
+        ferrari_init_timeout = float(resolved_timeouts["ferrari_engine"])
+        watcher_mgr_init_timeout = float(resolved_timeouts["watcher_manager"])
+        detector_init_timeout = float(resolved_timeouts["detector"])
+        computer_use_init_timeout = float(resolved_timeouts["computer_use"])
+        agentic_runner_init_timeout = float(resolved_timeouts["agentic_runner"])
+        spatial_agent_init_timeout = float(resolved_timeouts["spatial_agent"])
+
+        heavy_init_gate = asyncio.Semaphore(int(init_policy["heavy_parallelism"]))
+        logger.info(
+            "[VisualMonitor] Init policy: startup=%s thrash=%s heavy_parallelism=%s "
+            "heavy_multiplier=%.2f heavy_floor=%.1fs (Ferrari %.1fs, Detector %.1fs)",
+            init_policy["in_startup"],
+            init_policy["thrash_state"],
+            init_policy["heavy_parallelism"],
+            float(init_policy["heavy_multiplier"]),
+            float(init_policy["heavy_floor"]),
+            ferrari_init_timeout,
+            detector_init_timeout,
+        )
 
         # v78.1: Smart parallel timeout - max of individual timeouts + 5s buffer
         individual_timeouts = [
@@ -1510,10 +1639,11 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
 
                 # v89.0: Use asyncio.to_thread() instead of loop.run_in_executor()
                 # This properly handles event loop context in thread pools
-                self._fast_capture_engine = await asyncio.wait_for(
-                    asyncio.to_thread(_init_fast_capture),
-                    timeout=ferrari_init_timeout
-                )
+                async with heavy_init_gate:
+                    self._fast_capture_engine = await asyncio.wait_for(
+                        asyncio.to_thread(_init_fast_capture),
+                        timeout=ferrari_init_timeout
+                    )
                 component_status["ferrari_engine"]["success"] = True
                 component_status["ferrari_engine"]["duration"] = time_module.time() - comp_start
                 logger.info("✅ Ferrari Engine Ready")
@@ -1566,10 +1696,11 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     return create_detector()
 
                 # v89.0: Use asyncio.to_thread() for proper event loop handling
-                self._detector = await asyncio.wait_for(
-                    asyncio.to_thread(_init_detector),
-                    timeout=detector_init_timeout
-                )
+                async with heavy_init_gate:
+                    self._detector = await asyncio.wait_for(
+                        asyncio.to_thread(_init_detector),
+                        timeout=detector_init_timeout
+                    )
                 component_status["detector"]["success"] = True
                 component_status["detector"]["duration"] = time_module.time() - comp_start
                 logger.info("✅ OCR Detector Ready")
