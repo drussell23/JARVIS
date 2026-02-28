@@ -35,6 +35,10 @@ _PARTIAL_INTERVAL_MS = int(os.getenv("JARVIS_STT_PARTIAL_INTERVAL_MS", "500"))
 _MAX_BUFFER_SECONDS = float(os.getenv("JARVIS_STT_MAX_BUFFER_SECONDS", "30.0"))
 _VAD_SILENCE_THRESHOLD_MS = int(os.getenv("JARVIS_STT_SILENCE_MS", "600"))
 _LANGUAGE = os.getenv("JARVIS_STT_LANGUAGE", "en")
+# v280.5: Minimum accumulated audio duration (ms) before dispatching to Whisper.
+# Prevents wasting CPU on ambient noise fragments (20ms-120ms) that webrtcvad
+# mode 3 misclassifies as speech.
+_MIN_SPEECH_DURATION_MS = int(os.getenv("JARVIS_STT_MIN_SPEECH_DURATION_MS", "300"))
 
 
 def _startup_asr_admission() -> tuple[bool, str]:
@@ -283,6 +287,18 @@ class StreamingSTTEngine:
             if not self._audio_buffer:
                 return
             audio = np.concatenate(list(self._audio_buffer))
+
+            # v280.5: Reject audio shorter than minimum speech duration.
+            # WebRTC VAD mode 3 misclassifies ambient noise as speech for
+            # single 20ms frames — without this gate, Whisper wastes CPU
+            # processing 20-120ms noise fragments.
+            duration_ms = (len(audio) / self._sample_rate) * 1000
+            if duration_ms < _MIN_SPEECH_DURATION_MS:
+                if not is_partial:
+                    # Still clear buffer on final to prevent stale accumulation
+                    self._audio_buffer.clear()
+                    self._total_frames = 0
+                return
 
             if not is_partial:
                 # Clear buffer for final transcript
