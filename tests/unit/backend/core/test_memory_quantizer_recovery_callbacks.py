@@ -1,5 +1,6 @@
 import pytest
 
+from backend.core import memory_quantizer as mq_mod
 from backend.core.memory_quantizer import MemoryQuantizer, MemoryTier
 
 
@@ -44,3 +45,38 @@ def test_register_unregister_recovery_callback_is_idempotent():
     quantizer.unregister_recovery_callback(_callback)
     quantizer.unregister_recovery_callback(_callback)
     assert quantizer._recovery_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_thrash_emergency_requires_sustained_signal(monkeypatch):
+    quantizer = MemoryQuantizer(config={})
+    states = []
+
+    async def _on_thrash(state):
+        states.append(state)
+
+    quantizer.register_thrash_callback(_on_thrash)
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_WARNING", 500)
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_EMERGENCY", 2000)
+    monkeypatch.setattr(mq_mod, "THRASH_SUSTAINED_SECONDS", 10)
+    monkeypatch.setattr(mq_mod, "THRASH_EMERGENCY_SUSTAINED_SECONDS", 10)
+    monkeypatch.setattr(mq_mod, "THRASH_RECOVERY_SUSTAINED_SECONDS", 5)
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_PANIC_MULTIPLIER", 99.0)
+
+    # First emergency-level sample should only enter "thrashing" (not emergency yet).
+    quantizer._pagein_rate = 2400
+    quantizer._pagein_rate_ema = 2400
+    quantizer._thrash_warning_since = 100.0
+    quantizer._thrash_emergency_since = 100.0
+    monkeypatch.setattr(mq_mod.time, "time", lambda: 105.0)
+    await quantizer._check_thrash_state()
+    assert quantizer._thrash_state == "thrashing"
+    assert states == ["thrashing"]
+
+    # A sustained second sample should escalate to emergency.
+    quantizer._pagein_rate = 2500
+    quantizer._pagein_rate_ema = 2500
+    monkeypatch.setattr(mq_mod.time, "time", lambda: 122.0)
+    await quantizer._check_thrash_state()
+    assert quantizer._thrash_state == "emergency"
+    assert states[-1] == "emergency"

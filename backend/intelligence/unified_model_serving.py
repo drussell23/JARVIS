@@ -118,6 +118,14 @@ PRIME_CLOUD_RUN_URL = os.getenv("JARVIS_PRIME_CLOUD_RUN_URL", "")
 PRIME_MODELS_DIR = Path(os.getenv("JARVIS_PRIME_MODELS_DIR", str(Path.home() / "models")))
 PRIME_DEFAULT_MODEL = os.getenv("JARVIS_PRIME_DEFAULT_MODEL", "prime-7b-chat-v1.Q4_K_M.gguf")
 PRIME_CONTEXT_LENGTH = int(os.getenv("JARVIS_PRIME_CONTEXT_LENGTH", "4096"))
+
+# Thrash cascade escalation controls (memory_quantizer -> model_serving).
+THRASH_GCP_OFFLOAD_COOLDOWN_SECONDS = float(
+    os.getenv("JARVIS_THRASH_GCP_OFFLOAD_COOLDOWN_SECONDS", "180.0")
+)
+THRASH_EMERGENCY_EVENTS_BEFORE_OFFLOAD = int(
+    os.getenv("JARVIS_THRASH_EMERGENCY_EVENTS_BEFORE_OFFLOAD", "2")
+)
 PRIME_TIMEOUT_SECONDS = float(os.getenv("JARVIS_PRIME_TIMEOUT_SECONDS", "60.0"))
 
 # Claude configuration
@@ -2258,6 +2266,8 @@ class UnifiedModelServing:
         self._local_warmup_tasks: Set[asyncio.Task] = set()
         self._local_warmup_sequence: int = 0
         self._unload_in_progress: bool = False
+        self._thrash_last_gcp_offload_at: float = 0.0
+        self._thrash_emergency_event_count: int = 0
 
         # v100.1: Model registry for Trinity Loop hot-swap
         self._registered_models: Dict[str, RegisteredModel] = {}
@@ -3158,23 +3168,40 @@ class UnifiedModelServing:
 
         if new_state == "healthy":
             _local._thrash_downgrade_attempted = False
+            self._thrash_emergency_event_count = 0
             return
 
         if new_state == "emergency":
-            # Skip downgrade, go straight to GCP
+            self._thrash_emergency_event_count += 1
+            min_events = max(1, THRASH_EMERGENCY_EVENTS_BEFORE_OFFLOAD)
+            if self._thrash_emergency_event_count < min_events:
+                self.logger.warning(
+                    "[ThrashCascade] EMERGENCY observed (%s/%s) — waiting for sustained confirmation before GCP offload",
+                    self._thrash_emergency_event_count,
+                    min_events,
+                )
+                return
+            # Skip downgrade, go straight to GCP once emergency is sustained.
             self.logger.critical(
-                "[ThrashCascade] EMERGENCY pagein rate — triggering GCP offload"
+                "[ThrashCascade] EMERGENCY sustained (%s/%s) — triggering GCP offload",
+                self._thrash_emergency_event_count,
+                min_events,
             )
-            await self._trigger_gcp_offload_from_thrash()
+            await self._trigger_gcp_offload_from_thrash(
+                reason="mmap_thrash_emergency"
+            )
             return
 
         if new_state == "thrashing":
+            self._thrash_emergency_event_count = 0
             if _local._thrash_downgrade_attempted:
                 # Already tried downgrade, still thrashing — go to GCP
                 self.logger.warning(
                     "[ThrashCascade] Still thrashing after downgrade — triggering GCP offload"
                 )
-                await self._trigger_gcp_offload_from_thrash()
+                await self._trigger_gcp_offload_from_thrash(
+                    reason="mmap_thrash_post_downgrade"
+                )
                 return
 
             # Step 1: Downgrade one tier
@@ -3204,7 +3231,9 @@ class UnifiedModelServing:
             self.logger.warning(
                 "[ThrashCascade] Already on smallest model — cannot downgrade further"
             )
-            await self._trigger_gcp_offload_from_thrash()
+            await self._trigger_gcp_offload_from_thrash(
+                reason="mmap_thrash_smallest_model"
+            )
             return
 
         next_model = smaller_entries[0]
@@ -3225,14 +3254,18 @@ class UnifiedModelServing:
             success = await _local.load_model(model_name=next_model["filename"])
             if not success:
                 self.logger.error("[ThrashCascade] Downgrade load failed — triggering GCP")
-                await self._trigger_gcp_offload_from_thrash()
+                await self._trigger_gcp_offload_from_thrash(
+                    reason="mmap_thrash_downgrade_load_failed"
+                )
         except Exception as e:
             self.logger.error(f"[ThrashCascade] Downgrade error: {e}")
-            await self._trigger_gcp_offload_from_thrash()
+            await self._trigger_gcp_offload_from_thrash(
+                reason="mmap_thrash_downgrade_exception"
+            )
         finally:
             _local._model_swapping = False
 
-    async def _trigger_gcp_offload_from_thrash(self) -> None:
+    async def _trigger_gcp_offload_from_thrash(self, *, reason: str) -> None:
         """Signal GCP router to enter VM provisioning for thrash recovery.
 
         Sets _model_swapping=True for the duration of the provisioning call,
@@ -3240,6 +3273,21 @@ class UnifiedModelServing:
         flag independently via its own try/finally.
         """
         _local = self._clients.get(ModelProvider.PRIME_LOCAL)
+        now = time.time()
+        cooldown_s = max(0.0, THRASH_GCP_OFFLOAD_COOLDOWN_SECONDS)
+        if (
+            cooldown_s > 0
+            and self._thrash_last_gcp_offload_at > 0
+            and (now - self._thrash_last_gcp_offload_at) < cooldown_s
+        ):
+            remaining = cooldown_s - (now - self._thrash_last_gcp_offload_at)
+            self.logger.info(
+                "[ThrashCascade] Offload suppressed by cooldown (reason=%s, remaining=%.1fs)",
+                reason,
+                max(0.0, remaining),
+            )
+            return
+
         _owns_flag = False
         if _local and isinstance(_local, PrimeLocalClient) and not _local._model_swapping:
             _local._model_swapping = True
@@ -3253,12 +3301,20 @@ class UnifiedModelServing:
             if router and hasattr(router, '_transition_vm_lifecycle'):
                 if router._vm_lifecycle_state == VMLifecycleState.IDLE:
                     router._transition_vm_lifecycle(
-                        VMLifecycleState.TRIGGERING, "mmap_thrash_emergency"
+                        VMLifecycleState.TRIGGERING, reason
                     )
                     router._transition_vm_lifecycle(
                         VMLifecycleState.PROVISIONING, "thrash_bypass"
                     )
-                    await router._trigger_vm_provisioning(reason="mmap_thrash")
+                    await router._trigger_vm_provisioning(reason=reason)
+                    self._thrash_last_gcp_offload_at = time.time()
+                    self._thrash_emergency_event_count = 0
+                else:
+                    self.logger.info(
+                        "[ThrashCascade] Router state=%s; skip duplicate offload trigger (reason=%s)",
+                        router._vm_lifecycle_state,
+                        reason,
+                    )
         except ImportError:
             self.logger.debug("[ThrashCascade] GCP router not available")
         except Exception as e:

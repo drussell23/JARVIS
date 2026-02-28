@@ -61,6 +61,16 @@ THRASH_PAGEIN_HEALTHY = int(os.getenv("THRASH_PAGEIN_HEALTHY", "100"))
 THRASH_PAGEIN_WARNING = int(os.getenv("THRASH_PAGEIN_WARNING", "500"))
 THRASH_PAGEIN_EMERGENCY = int(os.getenv("THRASH_PAGEIN_EMERGENCY", "2000"))
 THRASH_SUSTAINED_SECONDS = int(os.getenv("THRASH_SUSTAINED_SECONDS", "10"))
+THRASH_EMERGENCY_SUSTAINED_SECONDS = int(
+    os.getenv("THRASH_EMERGENCY_SUSTAINED_SECONDS", "10")
+)
+THRASH_RECOVERY_SUSTAINED_SECONDS = int(
+    os.getenv("THRASH_RECOVERY_SUSTAINED_SECONDS", "20")
+)
+THRASH_PAGEIN_PANIC_MULTIPLIER = float(
+    os.getenv("THRASH_PAGEIN_PANIC_MULTIPLIER", "4.0")
+)
+THRASH_PAGEIN_EMA_ALPHA = float(os.getenv("THRASH_PAGEIN_EMA_ALPHA", "0.35"))
 
 
 # ============================================================================
@@ -430,8 +440,11 @@ class MemoryQuantizer:
         self._last_pageins: Optional[int] = None
         self._last_pagein_time: float = 0.0
         self._pagein_rate: float = 0.0  # pageins/sec
+        self._pagein_rate_ema: float = 0.0
         self._thrash_state: str = "healthy"  # healthy, thrashing, emergency
         self._thrash_warning_since: float = 0.0
+        self._thrash_emergency_since: float = 0.0
+        self._thrash_recovery_since: float = 0.0
         self._thrash_callbacks: List[Callable] = []
         self._unload_callbacks: List[Callable] = []
         self._recovery_callbacks: List[Callable] = []
@@ -1154,6 +1167,14 @@ class MemoryQuantizer:
 
                 # v266.0: Mmap thrash detection via vm_stat pageins
                 self._pagein_rate = await self._get_pagein_rate_async()
+                if self._pagein_rate_ema <= 0:
+                    self._pagein_rate_ema = self._pagein_rate
+                else:
+                    alpha = max(0.0, min(1.0, THRASH_PAGEIN_EMA_ALPHA))
+                    self._pagein_rate_ema = (
+                        alpha * self._pagein_rate
+                        + (1.0 - alpha) * self._pagein_rate_ema
+                    )
                 await self._check_thrash_state()
 
                 # Learn patterns for tracked components
@@ -1269,28 +1290,61 @@ class MemoryQuantizer:
 
     async def _check_thrash_state(self) -> None:
         """Check pagein rate and transition thrash state if needed."""
-        rate = self._pagein_rate
+        raw_rate = self._pagein_rate
+        smoothed_rate = max(0.0, self._pagein_rate_ema or raw_rate)
+        rate = max(raw_rate, smoothed_rate)
         now = time.time()
         old_state = self._thrash_state
 
-        if rate >= THRASH_PAGEIN_EMERGENCY:
+        panic_threshold = THRASH_PAGEIN_EMERGENCY * max(1.0, THRASH_PAGEIN_PANIC_MULTIPLIER)
+        if raw_rate >= panic_threshold:
             new_state = "emergency"
+            self._thrash_emergency_since = now
+            self._thrash_warning_since = now
+            self._thrash_recovery_since = 0.0
+        elif rate >= THRASH_PAGEIN_EMERGENCY:
+            if self._thrash_emergency_since == 0.0:
+                self._thrash_emergency_since = now
+            if self._thrash_warning_since == 0.0:
+                self._thrash_warning_since = now
+            self._thrash_recovery_since = 0.0
+            if now - self._thrash_emergency_since >= THRASH_EMERGENCY_SUSTAINED_SECONDS:
+                new_state = "emergency"
+            elif old_state == "emergency":
+                new_state = "emergency"
+            elif now - self._thrash_warning_since >= THRASH_SUSTAINED_SECONDS:
+                new_state = "thrashing"
+            else:
+                return
         elif rate >= THRASH_PAGEIN_WARNING:
+            self._thrash_emergency_since = 0.0
             if self._thrash_warning_since == 0:
                 self._thrash_warning_since = now
+            self._thrash_recovery_since = 0.0
             if now - self._thrash_warning_since >= THRASH_SUSTAINED_SECONDS:
                 new_state = "thrashing"
+            elif old_state in {"thrashing", "emergency"}:
+                # Hold prior degraded state until recovery is sustained.
+                return
             else:
                 return  # Still accumulating sustained readings
         else:
             self._thrash_warning_since = 0.0
+            self._thrash_emergency_since = 0.0
+            if old_state in {"thrashing", "emergency"}:
+                if self._thrash_recovery_since == 0.0:
+                    self._thrash_recovery_since = now
+                    return
+                if now - self._thrash_recovery_since < THRASH_RECOVERY_SUSTAINED_SECONDS:
+                    return
+            self._thrash_recovery_since = 0.0
             new_state = "healthy"
 
         if new_state != old_state:
             self._thrash_state = new_state
             logger.warning(
                 f"[ThrashDetect] State change: {old_state} -> {new_state} "
-                f"(pageins/sec: {rate:.0f})"
+                f"(pageins/sec: raw={raw_rate:.0f}, ema={smoothed_rate:.0f})"
             )
             for callback in self._thrash_callbacks:
                 try:

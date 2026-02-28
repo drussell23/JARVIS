@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import backend.intelligence.unified_model_serving as ums_mod
 from backend.intelligence.unified_model_serving import (
     ModelProvider,
     PrimeLocalClient,
@@ -232,3 +233,48 @@ async def test_recovery_emits_background_warmup_hooks(monkeypatch):
     assert result["ok"] is True
     assert "recovery_start" in phases
     assert "recovery_success" in phases
+
+
+@pytest.mark.asyncio
+async def test_thrash_emergency_requires_multiple_events_before_offload(monkeypatch):
+    serving = UnifiedModelServing()
+    local = PrimeLocalClient()
+    serving._clients[ModelProvider.PRIME_LOCAL] = local
+
+    reasons = []
+
+    async def _trigger(*, reason: str):
+        reasons.append(reason)
+
+    monkeypatch.setattr(
+        ums_mod,
+        "THRASH_EMERGENCY_EVENTS_BEFORE_OFFLOAD",
+        2,
+    )
+    monkeypatch.setattr(serving, "_trigger_gcp_offload_from_thrash", _trigger)
+
+    await serving._handle_thrash_state_change("emergency")
+    assert reasons == []
+    await serving._handle_thrash_state_change("emergency")
+    assert reasons == ["mmap_thrash_emergency"]
+
+
+@pytest.mark.asyncio
+async def test_thrash_offload_respects_cooldown(monkeypatch):
+    serving = UnifiedModelServing()
+    serving._thrash_last_gcp_offload_at = 1000.0
+
+    import backend.core.gcp_hybrid_prime_router as router_mod
+
+    calls = {"router_fetch": 0}
+
+    async def _fake_get_router():
+        calls["router_fetch"] += 1
+        return None
+
+    monkeypatch.setattr(ums_mod, "THRASH_GCP_OFFLOAD_COOLDOWN_SECONDS", 180.0)
+    monkeypatch.setattr(ums_mod.time, "time", lambda: 1050.0)
+    monkeypatch.setattr(router_mod, "get_gcp_hybrid_prime_router", _fake_get_router)
+
+    await serving._trigger_gcp_offload_from_thrash(reason="unit_test_thrash")
+    assert calls["router_fetch"] == 0
