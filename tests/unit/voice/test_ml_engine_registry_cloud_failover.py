@@ -107,3 +107,30 @@ def test_endpoint_failure_backoff_grows_with_streak():
 
     assert second_remaining >= first_remaining
     assert registry._cloud_endpoint_failure_streak[endpoint.rstrip("/")] >= 2
+
+
+@pytest.mark.asyncio
+async def test_verify_cloud_backend_ready_uses_startup_authority_contract_timeout(monkeypatch):
+    registry = _make_registry()
+    registry._cloud_endpoint = "https://jarvis-ml.example.run.app"
+    registry._cloud_endpoint_source = "cloud_run_env|startup_authority"
+
+    captured = {"timeout": None}
+
+    async def _fake_cross_repo_state():
+        return {}
+
+    async def _fake_verify_contract(endpoint=None, timeout=None, force=False):
+        captured["timeout"] = timeout
+        return False, "synthetic timeout"
+
+    monkeypatch.setenv("JARVIS_CLOUD_STRICT_CONTRACT", "true")
+    monkeypatch.setenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0")
+    monkeypatch.setenv("JARVIS_CLOUD_CONTRACT_TIMEOUT_STARTUP_AUTHORITY", "12.0")
+    monkeypatch.setattr(registry, "_read_cross_repo_ecapa_state", _fake_cross_repo_state)
+    monkeypatch.setattr(registry, "_verify_cloud_endpoint_contract", _fake_verify_contract)
+
+    ok, _reason = await registry._verify_cloud_backend_ready(timeout=30.0, retry_count=1)
+
+    assert ok is False
+    assert captured["timeout"] == 12.0

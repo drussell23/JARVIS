@@ -3406,6 +3406,53 @@ class MLEngineRegistry:
 
         return True, "ECAPA contract verified"
 
+    def _effective_contract_probe_timeout(self, timeout_ceiling: Optional[float]) -> float:
+        """
+        Compute context-aware timeout for contract probes.
+
+        Cloud Run endpoints selected during startup authority can still be in
+        cold-start or image-pull windows. A static 4s probe timeout causes
+        deterministic false negatives. This method keeps timeout bounded by the
+        caller's budget while applying source-aware floors.
+        """
+        adaptive_target = max(
+            1.0,
+            float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0")),
+        )
+
+        source = str(self._cloud_endpoint_source or "")
+        backend_kind = self._classify_endpoint_backend(
+            self._cloud_endpoint or "",
+            source,
+        )
+        if "startup_authority" in source and backend_kind == "cloud_run":
+            adaptive_target = max(
+                adaptive_target,
+                float(
+                    os.getenv(
+                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_STARTUP_AUTHORITY",
+                        "12.0",
+                    )
+                ),
+            )
+
+        if self._cloud_prewarm_task is not None and not self._cloud_prewarm_task.done():
+            adaptive_target = max(
+                adaptive_target,
+                float(
+                    os.getenv(
+                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_PREWARM_PENDING",
+                        "15.0",
+                    )
+                ),
+            )
+
+        if timeout_ceiling is None:
+            return adaptive_target
+
+        ceiling = max(1.0, float(timeout_ceiling))
+        return max(1.0, min(adaptive_target, ceiling))
+
     async def _activate_cloud_routing(self) -> bool:
         """
         Activate cloud routing for ML operations.
@@ -3600,7 +3647,7 @@ class MLEngineRegistry:
                 # Continue with our own verification - the other repo might have timed out
 
         contract_ok, contract_reason = await self._verify_cloud_endpoint_contract(
-            timeout=min(timeout, float(os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"))),
+            timeout=self._effective_contract_probe_timeout(timeout),
             force=True,
         )
         if not contract_ok:
