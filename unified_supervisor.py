@@ -85015,6 +85015,29 @@ class JarvisSystemKernel:
         # across all Trinity components simultaneously.
         local_protocol_version = os.environ.get("JARVIS_PROTOCOL_VERSION", "0.0.0")
         timeout_s = _get_env_float("JARVIS_CONTRACT_REQUEST_TIMEOUT_S", 8.0)
+
+        # v280.3: Adaptive timeout for remote endpoints.
+        # Root cause: GCP endpoints (e.g., http://34.45.154.209:8000)
+        # need more than 8s during startup CPU/memory pressure.  J-Prime
+        # responds to inference but the contract gate's cold health check
+        # times out because the session-level aiohttp timeout is too tight
+        # for cross-network round-trips under load.
+        _remote_timeout = _get_env_float("JARVIS_CONTRACT_REMOTE_TIMEOUT_S", 30.0)
+        _has_remote = any(
+            not t.endpoint.startswith(
+                ("http://localhost", "http://127.0.0.1", "http://[::1]")
+            )
+            for t in targets
+        )
+        if _has_remote and _remote_timeout > timeout_s:
+            self.logger.debug(
+                "[Contract] Remote endpoint detected — using extended "
+                "timeout %.0fs (was %.0fs)",
+                _remote_timeout,
+                timeout_s,
+            )
+            timeout_s = _remote_timeout
+
         enforcer = CrossRepoContractEnforcer(
             supervisor_instance_id=self.config.kernel_id,
             local_protocol_version=local_protocol_version,
@@ -85179,6 +85202,60 @@ class JarvisSystemKernel:
 
                 if result.target.required:
                     required_failures.append(name)
+
+        # v280.3: Grace for transient health_timeout when the component
+        # was ALREADY validated as healthy during this startup.
+        #
+        # Root cause: The contract gate runs AFTER Trinity phase.  By
+        # this point, J-Prime health has been confirmed via PrimeClient/
+        # Hollow Client inference (GCP late-arrival fast-forward).  A
+        # cold HTTP health check timing out is transient network, NOT
+        # evidence of J-Prime being unhealthy.  Killing startup over a
+        # redundant health check that contradicts prior validation is a
+        # false positive.
+        #
+        # We only grace health_timeout (transient), NOT schema/version/
+        # handshake failures (which indicate real incompatibility).
+        if required_failures and not runtime:
+            _graced: List[str] = []
+            for _rf_name in list(required_failures):
+                _rf_result = results.get(_rf_name)
+                if not _rf_result or _rf_result.reason != "health_timeout":
+                    continue
+
+                _rf_comp_status = str(
+                    self._component_status.get(_rf_name, {}).get("status", "")
+                ).strip().lower()
+                _already_validated = _rf_comp_status in {
+                    "complete", "ready", "operational", "running",
+                }
+                # For jarvis_prime specifically: invincible node ready
+                # means GCP VM was validated via Hollow Client inference.
+                _gcp_validated = (
+                    _rf_name == "jarvis_prime"
+                    and getattr(self, "_invincible_node_ready", False)
+                )
+
+                if _already_validated or _gcp_validated:
+                    self.logger.warning(
+                        "[Contract] %s health_timeout graced — component "
+                        "already validated as '%s' during this startup "
+                        "(invincible_node=%s). Skipping required failure.",
+                        _rf_name,
+                        _rf_comp_status,
+                        _gcp_validated,
+                    )
+                    required_failures.remove(_rf_name)
+                    _graced.append(_rf_name)
+                    # Downgrade from "error" to "degraded" since we
+                    # graced it — the contract check didn't fully pass
+                    # but the component IS operational.
+                    self._update_component_status(
+                        _rf_name,
+                        "degraded",
+                        f"Contract health_timeout graced "
+                        f"(pre-validated: {_rf_comp_status})",
+                    )
 
         if required_failures and fail_closed:
             raise RuntimeError(
