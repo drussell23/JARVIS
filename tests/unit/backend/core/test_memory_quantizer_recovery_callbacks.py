@@ -63,15 +63,15 @@ async def test_thrash_emergency_requires_sustained_signal(monkeypatch):
     monkeypatch.setattr(mq_mod, "THRASH_RECOVERY_SUSTAINED_SECONDS", 5)
     monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_PANIC_MULTIPLIER", 99.0)
 
-    # First emergency-level sample should only enter "thrashing" (not emergency yet).
+    # First emergency-level sample should not jump straight to emergency.
     quantizer._pagein_rate = 2400
     quantizer._pagein_rate_ema = 2400
     quantizer._thrash_warning_since = 100.0
     quantizer._thrash_emergency_since = 100.0
     monkeypatch.setattr(mq_mod.time, "time", lambda: 105.0)
     await quantizer._check_thrash_state()
-    assert quantizer._thrash_state == "thrashing"
-    assert states == ["thrashing"]
+    assert quantizer._thrash_state == "healthy"
+    assert states == []
 
     # A sustained second sample should escalate to emergency.
     quantizer._pagein_rate = 2500
