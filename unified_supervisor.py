@@ -66142,6 +66142,75 @@ class JarvisSystemKernel:
         except Exception as _bridge_err:
             self.logger.debug(f"[Lifecycle] Bridge {method_name} error: {_bridge_err}")
 
+    def _set_asr_startup_admission(
+        self,
+        admitted: bool,
+        reason: str,
+        *,
+        phase: Optional[str] = None,
+    ) -> None:
+        """Publish authoritative ASR admission state for startup-sensitive callers."""
+        _phase = (phase or getattr(self, "_current_startup_phase", "") or "unknown").strip()
+        _value = "true" if admitted else "false"
+        _set_startup_env(
+            "JARVIS_ASR_ADMISSION_OPEN",
+            _value,
+            f"asr_admission:{_phase}:{reason}",
+            caller="_set_asr_startup_admission",
+        )
+        os.environ["JARVIS_ASR_ADMISSION_REASON"] = reason
+        os.environ["JARVIS_ASR_ADMISSION_PHASE"] = _phase
+        os.environ["JARVIS_ASR_ADMISSION_UPDATED_AT"] = str(time.time())
+
+    def _evaluate_asr_startup_admission(self, context: str) -> Tuple[bool, str]:
+        """
+        Evaluate if heavy ASR initialization is allowed right now.
+
+        Admission is open only when:
+        1) startup phase barrier allows it, and
+        2) heavy spawn memory/mode gate allows it.
+        """
+        if os.getenv("JARVIS_ASR_ADMISSION_FORCE_OPEN", "").lower() in ("1", "true", "yes", "on"):
+            self._set_asr_startup_admission(
+                True,
+                "forced_open",
+                phase=getattr(self, "_current_startup_phase", "unknown"),
+            )
+            return True, "forced_open"
+
+        startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
+        min_progress = max(0, min(100, _get_env_int("JARVIS_ASR_ADMISSION_MIN_PROGRESS", 85)))
+        progress = int(getattr(self, "_current_startup_progress", 0) or 0)
+        phase = str(getattr(self, "_current_startup_phase", "unknown") or "unknown")
+        phase_allowlist = {
+            token.strip().lower()
+            for token in os.getenv(
+                "JARVIS_ASR_ADMISSION_OPEN_PHASES",
+                "enterprise,permissions,ghost_display,agi_os,event_infrastructure,frontend,completion,complete",
+            ).split(",")
+            if token.strip()
+        }
+
+        phase_barrier_open = startup_complete or progress >= min_progress or phase.lower() in phase_allowlist
+        if not phase_barrier_open:
+            reason = f"startup_barrier:{phase}@{progress}<{min_progress} ({context})"
+            self._set_asr_startup_admission(False, reason, phase=phase)
+            return False, reason
+
+        heavy_open, heavy_reason, _mode, _avail = _sync_heavy_spawn_gate(
+            f"asr:{context}",
+            min_available_gb=max(1.0, _get_env_float("JARVIS_ASR_MIN_AVAILABLE_GB", 2.5)),
+            mode=os.environ.get("JARVIS_STARTUP_EFFECTIVE_MODE")
+            or os.environ.get("JARVIS_STARTUP_MEMORY_MODE", "local_full"),
+        )
+        if not heavy_open:
+            reason = f"heavy_spawn_gate_closed:{heavy_reason}"
+            self._set_asr_startup_admission(False, reason, phase=phase)
+            return False, reason
+
+        self._set_asr_startup_admission(True, "admitted", phase=phase)
+        return True, "admitted"
+
     async def _startup_impl(self) -> int:
         """
         Internal startup implementation (wrapped by timeout in startup()).
@@ -66159,6 +66228,17 @@ class JarvisSystemKernel:
         # v258.4: Also publish to Trinity IPC for cross-repo consumers.
         _publish_system_phase_to_trinity("startup", {"started_at": time.time()})
         os.environ["JARVIS_STARTUP_TIMESTAMP"] = str(time.time())
+        _set_startup_env(
+            "JARVIS_STARTUP_COMPLETE",
+            "false",
+            "startup_begin",
+            caller="_startup_impl",
+        )
+        self._set_asr_startup_admission(
+            False,
+            "startup_initialization",
+            phase="startup",
+        )
 
         # GCP Lifecycle V2 bridge: lazy init (no-op when JARVIS_GCP_LIFECYCLE_V2 != true)
         try:
@@ -69698,6 +69778,36 @@ class JarvisSystemKernel:
                         "enterprise_services",
                         error=_enterprise_phase_error or "Enterprise phase failed",
                     )
+            if _enterprise_phase_ok:
+                self._set_asr_startup_admission(
+                    True,
+                    "enterprise_barrier_satisfied",
+                    phase="enterprise",
+                )
+                if self._audio_bus_enabled and self._audio_bus is not None:
+                    _post_enterprise_audio_wire_timeout = _get_env_float(
+                        "JARVIS_AUDIO_POST_ENTERPRISE_WIRE_TIMEOUT",
+                        12.0,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._attempt_wire_audio_pipeline(
+                                context="post-enterprise-admission",
+                            ),
+                            timeout=_post_enterprise_audio_wire_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        self.logger.warning(
+                            "[Kernel] Post-enterprise audio wiring timed out (%.0fs)",
+                            _post_enterprise_audio_wire_timeout,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _pea_err:
+                        self.logger.debug(
+                            "[Kernel] Post-enterprise audio wiring error: %s",
+                            _pea_err,
+                        )
             await self._safe_narrate(self._narrator.narrate_zone_complete(6, success=True), "zone_complete")
 
             self._emit_event(
@@ -70634,6 +70744,11 @@ class JarvisSystemKernel:
             _set_startup_env(
                 "JARVIS_STARTUP_COMPLETE", "true",
                 "all_phases_done", caller="_startup_impl",
+            )
+            self._set_asr_startup_admission(
+                True,
+                "startup_complete",
+                phase="complete",
             )
 
             return 0
@@ -76652,6 +76767,18 @@ class JarvisSystemKernel:
                 context,
             )
             return False
+        _asr_admitted, _asr_reason = self._evaluate_asr_startup_admission(context)
+        if not _asr_admitted:
+            self._component_status["audio_infrastructure"] = {
+                "status": "deferred",
+                "message": f"ASR admission closed ({_asr_reason})",
+            }
+            self.logger.info(
+                "[Kernel] Audio pipeline wiring deferred (%s): %s",
+                context,
+                _asr_reason,
+            )
+            return False
 
         try:
             _wire_start = time.time()
@@ -80685,20 +80812,51 @@ class JarvisSystemKernel:
             self._update_component_status("enterprise_services", "running", "Initializing enterprise services")
 
             # Service definitions with display names
-            services = [
+            service_specs = [
                 ("CloudSQL", "cloud_sql", self._initialize_cloud_sql_proxy),
                 ("VoiceBio", "voice_biometrics", self._initialize_voice_biometrics),
                 ("SemanticCache", "semantic_cache", self._initialize_semantic_voice_cache),
                 ("InfraOrch", "infra_orchestrator", self._initialize_infrastructure_orchestrator),
                 ("WebSocket", "websocket_hub", self._initialize_websocket_hub),  # v116.0: Trinity IPC
             ]
+            service_by_name = {
+                internal_name: (display_name, init_func)
+                for display_name, internal_name, init_func in service_specs
+            }
+            default_required = "cloud_sql,infra_orchestrator,websocket_hub"
+            required_services = {
+                token.strip()
+                for token in os.getenv(
+                    "JARVIS_ENTERPRISE_REQUIRED_SERVICES",
+                    default_required,
+                ).split(",")
+                if token.strip()
+            }
+            required_services = {
+                name for name in required_services if name in service_by_name
+            }
+            if not required_services:
+                required_services = {"infra_orchestrator"}
+            optional_services = [
+                name for _, name, _ in service_specs if name not in required_services
+            ]
+            optional_barrier_timeout = max(
+                1.0,
+                _get_env_float("JARVIS_ENTERPRISE_OPTIONAL_BARRIER_TIMEOUT", 8.0),
+            )
 
             # Log service list
-            self.logger.info("[Zone6] Services: " + ", ".join(s[0] for s in services))
+            self.logger.info("[Zone6] Services: " + ", ".join(s[0] for s in service_specs))
+            self.logger.info(
+                "[Zone6] Barrier policy: required=%s optional=%s optional_wait=%.1fs",
+                ",".join(sorted(required_services)),
+                ",".join(optional_services) if optional_services else "(none)",
+                optional_barrier_timeout,
+            )
 
             # Compute per-service adaptive timeouts with env overrides.
             service_timeouts: Dict[str, float] = {}
-            for display_name, internal_name, _ in services:
+            for display_name, internal_name, _ in service_specs:
                 env_key = f"JARVIS_SERVICE_TIMEOUT_{internal_name.upper()}"
                 requested = max(5.0, _get_env_float(env_key, service_timeout))
                 adaptive = await self._get_adaptive_timeout(requested)
@@ -80707,7 +80865,7 @@ class JarvisSystemKernel:
             self.logger.info(
                 "[Zone6] Timeout budget: " + ", ".join(
                     f"{display_name}={service_timeouts[internal_name]:.1f}s"
-                    for display_name, internal_name, _ in services
+                    for display_name, internal_name, _ in service_specs
                 )
             )
 
@@ -80728,30 +80886,95 @@ class JarvisSystemKernel:
                 _completed_count += 1
                 if self._startup_watchdog:
                     # Progress from 80 (start) to 85 (end) proportionally
-                    _pct = 80 + int(5 * _completed_count / len(services))
+                    _pct = 80 + int(5 * _completed_count / len(service_specs))
                     self._startup_watchdog.update_phase("enterprise", _pct)
                 return result
 
-            coros = [
-                _tracked_service(
-                    display_name,
-                    internal_name,
-                    init_func(),
-                    service_timeouts[internal_name],
+            service_tasks: Dict[str, asyncio.Task] = {}
+            for display_name, internal_name, init_func in service_specs:
+                service_tasks[internal_name] = create_safe_task(
+                    _tracked_service(
+                        display_name,
+                        internal_name,
+                        init_func(),
+                        service_timeouts[internal_name],
+                    ),
+                    name=f"enterprise-{internal_name}",
                 )
-                for display_name, internal_name, init_func in services
-            ]
 
-            # Run all service initializations in parallel with timeouts
-            init_results = await asyncio.gather(*coros, return_exceptions=True)
+            required_task_map = {
+                name: task
+                for name, task in service_tasks.items()
+                if name in required_services
+            }
+            optional_task_map = {
+                name: task
+                for name, task in service_tasks.items()
+                if name not in required_services
+            }
+
+            required_results: Dict[str, Any] = {}
+            if required_task_map:
+                _required_values = await asyncio.gather(
+                    *required_task_map.values(),
+                    return_exceptions=True,
+                )
+                required_results = dict(zip(required_task_map.keys(), _required_values))
+
+            optional_results: Dict[str, Any] = {}
+            optional_pending: Dict[str, asyncio.Task] = {}
+            if optional_task_map:
+                _done, _pending = await asyncio.wait(
+                    set(optional_task_map.values()),
+                    timeout=optional_barrier_timeout,
+                )
+                optional_results = {
+                    name: task.result()
+                    if not task.cancelled() and task.exception() is None
+                    else (
+                        task.exception()
+                        if not task.cancelled()
+                        else RuntimeError("cancelled")
+                    )
+                    for name, task in optional_task_map.items()
+                    if task in _done
+                }
+                optional_pending = {
+                    name: task
+                    for name, task in optional_task_map.items()
+                    if task in _pending
+                }
+                for _task in optional_pending.values():
+                    if _task not in self._background_tasks:
+                        self._background_tasks.append(_task)
+
+            def _resolve_result_for_service(internal_name: str) -> Any:
+                if internal_name in required_results:
+                    return required_results[internal_name]
+                if internal_name in optional_results:
+                    return optional_results[internal_name]
+                return {
+                    "deferred": True,
+                    "optional": True,
+                    "error": (
+                        f"Optional barrier timeout after "
+                        f"{optional_barrier_timeout:.1f}s"
+                    ),
+                }
 
             # Process and log results for each service
             init_status: Dict[str, Any] = {}
-            for (display_name, internal_name, _), result in zip(services, init_results):
+            for display_name, internal_name, _ in service_specs:
+                result = _resolve_result_for_service(internal_name)
                 if isinstance(result, Exception):
                     self.logger.warning(f"[Zone6/{display_name}] ✗ Exception: {result}")
                     init_status[internal_name] = {"error": str(result), "exception": True}
                 elif isinstance(result, dict):
+                    if result.get("deferred") and result.get("optional"):
+                        self.logger.info(
+                            f"[Zone6/{display_name}] ◌ Optional deferred "
+                            f"(background continuation)"
+                        )
                     if result.get("timed_out"):
                         if result.get("background_continuation"):
                             self.logger.warning(
@@ -80769,6 +80992,14 @@ class JarvisSystemKernel:
                 else:
                     self.logger.warning(f"[Zone6/{display_name}] ⚠ Unknown result type")
                     init_status[internal_name] = {"error": "Unknown result", "raw": str(result)[:100]}
+
+            deferred_optional = [
+                name
+                for name, status in init_status.items()
+                if isinstance(status, dict)
+                and status.get("deferred")
+                and status.get("optional")
+            ]
 
             # Calculate summary statistics
             successful = [
@@ -80808,15 +81039,21 @@ class JarvisSystemKernel:
                     f"[Zone6] ⏱️ Await timeout (background continuation): "
                     f"{', '.join(timed_out_background)}"
                 )
+            if deferred_optional:
+                self.logger.info(
+                    "[Zone6] ◌ Optional deferred to background barrier: %s",
+                    ", ".join(deferred_optional),
+                )
             if timed_out_terminal:
                 self.logger.warning(f"[Zone6] ⏱️ Timed out: {', '.join(timed_out_terminal)}")
             if failed:
                 self.logger.warning(f"[Zone6] ⚠ Failed: {', '.join(failed)}")
 
             self.logger.success(
-                f"[Zone6] Enterprise services complete: {len(successful)}/{len(services)} active, "
+                f"[Zone6] Enterprise services complete: {len(successful)}/{len(service_specs)} active, "
                 f"{len(timed_out)} timed out, {len(failed)} failed, "
-                f"{len(timed_out_background)} continuing in background"
+                f"{len(timed_out_background)} continuing in background, "
+                f"{len(deferred_optional)} optional deferred"
             )
 
             # Store results for later reference

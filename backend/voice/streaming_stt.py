@@ -37,6 +37,32 @@ _VAD_SILENCE_THRESHOLD_MS = int(os.getenv("JARVIS_STT_SILENCE_MS", "600"))
 _LANGUAGE = os.getenv("JARVIS_STT_LANGUAGE", "en")
 
 
+def _startup_asr_admission() -> tuple[bool, str]:
+    """
+    Shared startup admission contract for heavy ASR model initialization.
+
+    During supervisor startup, ASR is deferred until admission opens to avoid
+    contention with critical startup phases.
+    """
+    if os.getenv("JARVIS_ASR_ADMISSION_FORCE_OPEN", "").lower() in ("1", "true", "yes", "on"):
+        return True, "forced_open"
+    admission_enabled = os.getenv("JARVIS_ASR_ADMISSION_ENABLED", "true").lower() in (
+        "1", "true", "yes", "on"
+    )
+    if not admission_enabled:
+        return True, "admission_disabled"
+    admission_open = os.getenv("JARVIS_ASR_ADMISSION_OPEN", "").lower() in (
+        "1", "true", "yes", "on"
+    )
+    if admission_open:
+        return True, "admitted"
+    startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
+    if startup_complete:
+        return True, "startup_complete"
+    reason = os.getenv("JARVIS_ASR_ADMISSION_REASON", "startup_barrier")
+    return False, reason
+
+
 @dataclass
 class StreamingTranscriptEvent:
     """A transcript event emitted by the streaming STT engine."""
@@ -89,6 +115,12 @@ class StreamingSTTEngine:
         """Load the faster-whisper model and initialize VAD."""
         if self._running:
             return
+        admitted, admission_reason = _startup_asr_admission()
+        if not admitted:
+            raise RuntimeError(
+                f"ASR admission closed: {admission_reason}. "
+                "Retry after startup barrier opens."
+            )
 
         self._loop = asyncio.get_running_loop()
         self._transcript_queue = asyncio.Queue()

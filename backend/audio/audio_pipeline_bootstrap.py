@@ -34,6 +34,19 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _can_start_streaming_stt_now() -> tuple[bool, str]:
+    """Check startup ASR admission before loading faster-whisper."""
+    if os.getenv("JARVIS_ASR_ADMISSION_FORCE_OPEN", "").lower() in ("1", "true", "yes", "on"):
+        return True, "forced_open"
+    if os.getenv("JARVIS_ASR_ADMISSION_ENABLED", "true").lower() not in ("1", "true", "yes", "on"):
+        return True, "admission_disabled"
+    if os.getenv("JARVIS_ASR_ADMISSION_OPEN", "").lower() in ("1", "true", "yes", "on"):
+        return True, "admitted"
+    if os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true":
+        return True, "startup_complete"
+    return False, os.getenv("JARVIS_ASR_ADMISSION_REASON", "startup_barrier")
+
+
 @dataclass
 class PipelineHandle:
     """Lifecycle handle returned by wire_conversation_pipeline()."""
@@ -118,6 +131,13 @@ async def wire_conversation_pipeline(
 
     # 2. StreamingSTT — register as AudioBus mic consumer
     try:
+        stt_allowed, stt_reason = _can_start_streaming_stt_now()
+        if not stt_allowed:
+            logger.info(
+                "[Bootstrap] StreamingSTT deferred by admission gate: %s",
+                stt_reason,
+            )
+            return handle
         from backend.voice.streaming_stt import StreamingSTTEngine
         handle.streaming_stt = StreamingSTTEngine()
         await asyncio.wait_for(handle.streaming_stt.start(), timeout=stt_timeout)
