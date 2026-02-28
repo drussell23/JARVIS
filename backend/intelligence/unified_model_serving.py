@@ -199,6 +199,11 @@ class ModelRequest:
     require_vision: bool = False
     require_tool_use: bool = False
 
+    # v280.5: Budget control — monotonic deadline propagated from command pipeline.
+    # When set, providers skip if remaining budget < MIN_PROVIDER_BUDGET_S,
+    # and per-provider timeouts are capped to the remaining budget.
+    deadline: Optional[float] = None
+
 
 @dataclass
 class ModelResponse:
@@ -1309,15 +1314,39 @@ class PrimeAPIClient(ModelClient):
             model_name=self._available_models[0] if self._available_models else "prime-api",
         )
 
+        # v280.5: Budget-aware readiness check. Cap wait_for_ready to
+        # remaining budget instead of fixed PRIME_API_WAIT_TIMEOUT (15s).
         if not self._ready:
-            # Try to become ready
-            if not await self.wait_for_ready():
-                response.success = False
-                response.error = "J-Prime API not available"
-                return response
+            if request.deadline is not None:
+                _remaining = request.deadline - time.monotonic()
+                if _remaining < 3.0:
+                    response.success = False
+                    response.error = f"Insufficient budget ({_remaining:.1f}s) for readiness check"
+                    return response
+                _orig_wait = self.wait_timeout
+                self.wait_timeout = min(self.wait_timeout, max(2.0, _remaining - 2.0))
+                try:
+                    if not await self.wait_for_ready():
+                        response.success = False
+                        response.error = "J-Prime API not available"
+                        return response
+                finally:
+                    self.wait_timeout = _orig_wait
+            else:
+                if not await self.wait_for_ready():
+                    response.success = False
+                    response.error = "J-Prime API not available"
+                    return response
 
         try:
             import aiohttp
+
+            # v280.5: Cap per-request timeout to remaining budget
+            _effective_timeout = self.timeout
+            if request.deadline is not None:
+                _remaining = request.deadline - time.monotonic()
+                _effective_timeout = min(self.timeout, max(3.0, _remaining - 1.0))
+
             session = await self._get_session()
 
             # Use first available model or request override
@@ -1351,6 +1380,7 @@ class PrimeAPIClient(ModelClient):
             async with session.post(
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
+                timeout=aiohttp.ClientTimeout(total=_effective_timeout),
             ) as resp:
                 latency = (time.time() - start_time) * 1000
                 response.latency_ms = latency
@@ -3430,10 +3460,28 @@ class UnifiedModelServing:
         except Exception:
             pass
 
+        # v280.5: Minimum remaining budget (seconds) to attempt a provider.
+        # Below this threshold, skip remaining providers and return failure.
+        _MIN_PROVIDER_BUDGET_S = 3.0
+
         last_error = None
         fallback_used = False
 
         for i, provider in enumerate(providers):
+            # v280.5: Budget check — skip provider if insufficient time remaining.
+            # Without this, each provider uses its own fixed timeout (15-30s)
+            # and the cumulative chain can exceed the command pipeline budget.
+            if request.deadline is not None:
+                _remaining = request.deadline - time.monotonic()
+                if _remaining < _MIN_PROVIDER_BUDGET_S:
+                    self.logger.info(
+                        "[v280.5] Budget exhausted (%.1fs left), skipping %s and remaining providers",
+                        _remaining, provider.value,
+                    )
+                    if last_error is None:
+                        last_error = f"Budget exhausted ({_remaining:.1f}s remaining)"
+                    break
+
             # v280.4: Skip local providers during memory emergency
             if _skip_local and provider in (
                 ModelProvider.PRIME_LOCAL,

@@ -1199,6 +1199,7 @@ class JarvisPrimeClient:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     task_type=TaskType.CHAT,
+                    deadline=deadline,  # v280.5: propagate budget to provider chain
                 )
 
                 response = await unified_serving.generate(request)
