@@ -362,6 +362,22 @@ class IntelligenceEngineAdapter(BaseNeuralMeshAgent):
         action = payload.get("action", "")
         input_data = payload.get("input", {})
 
+        # Validate action before handler lookup — empty action is a dispatch bug,
+        # not an adapter responsibility, but handle gracefully as defense-in-depth
+        if not action or not action.strip():
+            logger.error(
+                "intelligence_adapter received empty action for %s — "
+                "this indicates a dispatch bug in orchestrator/coordinator. "
+                "Payload keys: %s",
+                self._engine_type.value,
+                list(payload.keys()),
+            )
+            return {
+                "error": f"Empty action received by {self._engine_type.value}",
+                "available_actions": sorted(self._task_handlers.keys()),
+                "success": False,
+            }
+
         logger.debug(
             "Executing intelligence task: %s on %s",
             action,
@@ -376,7 +392,8 @@ class IntelligenceEngineAdapter(BaseNeuralMeshAgent):
                 handler = self._create_engine_handler(action)
             else:
                 raise ValueError(
-                    f"Unknown action '{action}' for {self._engine_type.value}"
+                    f"Unknown action '{action}' for {self._engine_type.value}. "
+                    f"Available: {sorted(self._task_handlers.keys())}"
                 )
 
         # Execute handler

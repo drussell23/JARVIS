@@ -349,6 +349,21 @@ class VoiceSystemAdapter(BaseNeuralMeshAgent):
         action = payload.get("action", "")
         input_data = payload.get("input", {})
 
+        # Validate action before handler lookup — defense-in-depth
+        if not action or not action.strip():
+            logger.error(
+                "voice_adapter received empty action for %s — "
+                "this indicates a dispatch bug in orchestrator/coordinator. "
+                "Payload keys: %s",
+                self._component_type.value,
+                list(payload.keys()),
+            )
+            return {
+                "error": f"Empty action received by {self._component_type.value}",
+                "available_actions": sorted(self._task_handlers.keys()),
+                "success": False,
+            }
+
         logger.debug(
             "Executing voice task: %s on %s",
             action,
@@ -361,7 +376,8 @@ class VoiceSystemAdapter(BaseNeuralMeshAgent):
                 handler = self._create_component_handler(action)
             else:
                 raise ValueError(
-                    f"Unknown action '{action}' for {self._component_type.value}"
+                    f"Unknown action '{action}' for {self._component_type.value}. "
+                    f"Available: {sorted(self._task_handlers.keys())}"
                 )
 
         try:

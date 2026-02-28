@@ -142,6 +142,19 @@ class CoordinatorAgent(BaseNeuralMeshAgent):
         priority = payload.get("priority", "normal")
         timeout = payload.get("timeout", 30.0)
 
+        # Validate capability BEFORE dispatch — empty capability causes
+        # ValueError in every adapter's execute_task()
+        if not required_capability or not required_capability.strip():
+            logger.error(
+                "delegate_task rejected: empty capability in payload %s",
+                {k: v for k, v in payload.items() if k != "task_payload"},
+            )
+            return {
+                "status": "error",
+                "error": "Cannot delegate task with empty capability — "
+                         "payload must include a non-empty 'capability' field",
+            }
+
         # Find agents with this capability
         if self.registry:
             agents = await self.registry.find_by_capability(required_capability)

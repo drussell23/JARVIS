@@ -405,8 +405,21 @@ class MultiAgentOrchestrator:
         task.started_at = datetime.now()
         task.status = "running"
 
+        # Validate action BEFORE dispatch — empty action causes ValueError in adapters
+        action = task.required_capability
+        if not action or not action.strip():
+            task.status = "failed"
+            task.error = (
+                f"Task '{task.name or task.task_id}' has empty required_capability — "
+                f"cannot dispatch without a valid action"
+            )
+            workflow.failed_tasks.add(task.task_id)
+            self._metrics.tasks_failed += 1
+            logger.error("Task %s rejected: empty required_capability", task.task_id[:8])
+            return None
+
         # Find capable agent
-        agent = await self.registry.get_best_agent(task.required_capability)
+        agent = await self.registry.get_best_agent(action)
 
         if not agent:
             # Try fallback capability
@@ -415,7 +428,7 @@ class MultiAgentOrchestrator:
 
         if not agent:
             task.status = "failed"
-            task.error = f"No agent found for capability: {task.required_capability}"
+            task.error = f"No agent found for capability: {action}"
             workflow.failed_tasks.add(task.task_id)
             self._metrics.tasks_failed += 1
             logger.error(
@@ -430,7 +443,7 @@ class MultiAgentOrchestrator:
         # Prepare task payload
         payload = {
             "task_id": task.task_id,
-            "action": task.required_capability,
+            "action": action,
             "input": task.input_data,
             "context": context or {},
             "workflow_id": workflow.workflow_id,
@@ -666,12 +679,19 @@ class MultiAgentOrchestrator:
         if len(tasks) == 1:
             # Single task - execute directly
             task = tasks[0]
-            agent = await self.registry.get_best_agent(task.required_capability)
+            action = task.required_capability
+            if not action or not action.strip():
+                return {
+                    "status": "error",
+                    "error": f"Task '{task.name or task.task_id}' has empty required_capability",
+                }
+
+            agent = await self.registry.get_best_agent(action)
 
             if not agent:
                 return {
                     "status": "error",
-                    "error": f"No agent found with capability: {task.required_capability}",
+                    "error": f"No agent found with capability: {action}",
                 }
 
             # Send task
@@ -680,7 +700,7 @@ class MultiAgentOrchestrator:
                 to_agent=agent.agent_name,
                 message_type=MessageType.TASK_ASSIGNED,
                 payload={
-                    "action": task.required_capability,
+                    "action": action,
                     **task.input_data,
                 },
                 priority=task.priority,

@@ -600,6 +600,19 @@ class WorkflowTask:
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
+    def __post_init__(self):
+        """Validate required fields after construction."""
+        # required_capability is the action dispatched to adapters.
+        # Empty string causes ValueError in every adapter's execute_task().
+        # Validate at source so the disease never propagates.
+        if not self.required_capability or not self.required_capability.strip():
+            raise ValueError(
+                f"WorkflowTask '{self.name or self.task_id}' has empty "
+                f"required_capability — every task must declare what "
+                f"capability it needs (e.g. 'screen_capture', 'handle_workspace_query'). "
+                f"This is the action dispatched to the assigned agent's adapter."
+            )
+
     def is_ready(self, completed_tasks: Set[str]) -> bool:
         """Check if this task is ready to execute (all dependencies met)."""
         return all(dep in completed_tasks for dep in self.dependencies)
