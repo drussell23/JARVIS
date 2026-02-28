@@ -458,13 +458,25 @@ class ActionExecutor:
         Raises:
             Exception: If security response actions fail
         """
-        app = action.params.get('app', action.target or 'unknown')
-        concern_type = action.params.get(
-            'concern_type',
-            action.params.get('situation_type', 'general'),
-        )
+        app, concern_type, context_resolved = self._resolve_security_alert_context(action)
 
-        logger.warning(f"Security alert: {concern_type} in {app}")
+        high_risk_concerns = {
+            "sensitive_content",
+            "suspicious_login",
+            "unauthorized_access",
+            "credential_exposure",
+            "data_exfiltration",
+            "malware",
+            "account_takeover",
+        }
+        if concern_type in high_risk_concerns:
+            logger.warning(f"Security alert: {concern_type} in {app}")
+        else:
+            # Non-specific alerts are operational signals, not necessarily incidents.
+            logger.info(
+                f"Security event: concern_type={concern_type}, app={app}, "
+                f"context_resolved={context_resolved}"
+            )
         
         if self.dry_run:
             return {
@@ -502,8 +514,73 @@ class ActionExecutor:
             'action_taken': 'logged_alert',
             'concern_type': concern_type,
             'app': app,
+            'context_resolved': context_resolved,
             'rollback_available': False
         }
+
+    def _resolve_security_alert_context(
+        self,
+        action: AutonomousAction,
+    ) -> tuple[str, str, bool]:
+        """Normalize app + concern context for security alerts.
+
+        Prevents weak planner payloads from collapsing into noisy
+        "general in unknown" warnings by extracting canonical fields
+        across multiple producer schemas.
+        """
+        params = action.params or {}
+
+        app_candidates = [
+            params.get("app"),
+            params.get("app_name"),
+            params.get("source_app"),
+            params.get("target_app"),
+            params.get("service"),
+            (params.get("context") or {}).get("app") if isinstance(params.get("context"), dict) else None,
+            action.target,
+        ]
+        app = "system"
+        for candidate in app_candidates:
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+            if not value:
+                continue
+            lowered = value.lower()
+            if lowered in {"unknown", "security", "general", "none", "null"}:
+                continue
+            app = value
+            break
+
+        concern_candidates = [
+            params.get("concern_type"),
+            params.get("alert_type"),
+            params.get("event_type"),
+            params.get("security_type"),
+            params.get("situation_type"),
+            params.get("reason"),
+            action.action_type,
+        ]
+        concern_type = "general"
+        for candidate in concern_candidates:
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip().lower()
+            if not value:
+                continue
+            if value in {"unknown", "none", "null"}:
+                continue
+            concern_type = value
+            break
+
+        alias_map = {
+            "security_alert": "general",
+            "security_concern": "general",
+            "alert": "general",
+        }
+        concern_type = alias_map.get(concern_type, concern_type)
+        context_resolved = app != "system" or concern_type != "general"
+        return app, concern_type, context_resolved
     
     async def _respond_to_message(self, action: AutonomousAction) -> Dict[str, Any]:
         """Prepare intelligent responses to messages (requires user confirmation).
