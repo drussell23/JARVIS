@@ -4349,7 +4349,7 @@ class SystemKernelConfig:
     # Previously defaulted to 8011/8012 (ghost ports never actually used by Trinity).
     # Now reads TRINITY_JPRIME_PORT / TRINITY_REACTOR_PORT with correct defaults.
     prime_api_port: int = field(default_factory=lambda: _get_env_int("TRINITY_JPRIME_PORT", _get_env_int("JARVIS_PRIME_PORT", 8001)))
-    reactor_api_port: int = field(default_factory=lambda: _get_env_int("TRINITY_REACTOR_PORT", _get_env_int("REACTOR_CORE_API_PORT", 8090)))
+    reactor_api_port: int = field(default_factory=lambda: _get_env_int("TRINITY_REACTOR_PORT", _get_env_int("REACTOR_CORE_PORT", _get_env_int("REACTOR_CORE_API_PORT", 8090))))
 
     # ═══════════════════════════════════════════════════════════════════════════
     # DOCKER
@@ -83949,10 +83949,54 @@ class JarvisSystemKernel:
             states[name] = status
         return states
 
+    def _is_contract_target_active(self, status: str, *, runtime: bool) -> bool:
+        """
+        Decide whether a component should participate in contract checks.
+
+        Boot-time checks validate components that reached an operational state.
+        Runtime checks also include degraded components so drift monitor can
+        detect autonomous recovery.
+        """
+        normalized = (status or "").strip().lower()
+        if runtime:
+            return normalized in {"complete", "ready", "operational", "degraded"}
+        return normalized in {"complete", "ready", "operational"}
+
+    def _resolve_cross_repo_contract_endpoint(
+        self,
+        *,
+        component_name: str,
+        fallback_port: int,
+        env_url_keys: Tuple[str, ...],
+    ) -> str:
+        """
+        Resolve the contract-check endpoint from dynamic runtime ownership.
+
+        Priority:
+        1) Explicit endpoint env vars
+        2) Runtime-discovered port via heartbeat/state reconciliation
+        3) Configured fallback port
+        """
+        for key in env_url_keys:
+            raw = (os.environ.get(key, "") or "").strip()
+            if raw:
+                return raw.rstrip("/")
+
+        resolved_port = fallback_port
+        try:
+            discovered = int(self._get_component_port(component_name))
+            if discovered > 0:
+                resolved_port = discovered
+        except Exception:
+            pass
+
+        return f"http://localhost:{resolved_port}"
+
     def _build_cross_repo_contract_targets(
         self,
         *,
         include_inactive: bool = False,
+        runtime: bool = False,
     ) -> List[Any]:
         """
         Build contract targets for active Trinity components.
@@ -83962,14 +84006,6 @@ class JarvisSystemKernel:
         except Exception:
             return []
 
-        def _active(status: str) -> bool:
-            # "running" excluded: means "process spawned, still initializing" —
-            # health endpoint may not exist.  Step 3 reconciliation transitions
-            # stale "running" → "degraded" after grace period so components
-            # participate in validation.  Runtime contract monitor (enabled by
-            # default, checks every 45s) guarantees later coverage.
-            return status in {"complete", "ready", "operational", "degraded"}
-
         targets: List[Any] = []
         require_handshake = _get_env_bool("JARVIS_CONTRACT_REQUIRE_HANDSHAKE", True)
         allow_legacy = _get_env_bool("JARVIS_CONTRACT_ALLOW_LEGACY_HANDSHAKE", True)
@@ -83977,7 +84013,10 @@ class JarvisSystemKernel:
         prime_status = str(
             self._component_status.get("jarvis_prime", {}).get("status", "pending")
         )
-        if self.config.prime_enabled and (include_inactive or _active(prime_status)):
+        if self.config.prime_enabled and (
+            include_inactive
+            or self._is_contract_target_active(prime_status, runtime=runtime)
+        ):
             prime_caps = tuple(
                 c.strip()
                 for c in os.environ.get(
@@ -83986,9 +84025,14 @@ class JarvisSystemKernel:
                 ).split(",")
                 if c.strip()
             )
-            prime_endpoint = (
-                os.environ.get("JARVIS_PRIME_URL")
-                or f"http://localhost:{self.config.prime_api_port}"
+            prime_endpoint = self._resolve_cross_repo_contract_endpoint(
+                component_name="jarvis_prime",
+                fallback_port=self.config.prime_api_port,
+                env_url_keys=(
+                    "JARVIS_PRIME_URL",
+                    "GCP_PRIME_ENDPOINT",
+                    "JARVIS_PRIME_CLOUD_RUN_URL",
+                ),
             )
             targets.append(
                 ContractTarget(
@@ -84010,7 +84054,10 @@ class JarvisSystemKernel:
         reactor_status = str(
             self._component_status.get("reactor_core", {}).get("status", "pending")
         )
-        if self.config.reactor_enabled and (include_inactive or _active(reactor_status)):
+        if self.config.reactor_enabled and (
+            include_inactive
+            or self._is_contract_target_active(reactor_status, runtime=runtime)
+        ):
             reactor_caps = tuple(
                 c.strip()
                 for c in os.environ.get(
@@ -84019,7 +84066,14 @@ class JarvisSystemKernel:
                 ).split(",")
                 if c.strip()
             )
-            reactor_endpoint = f"http://localhost:{self.config.reactor_api_port}"
+            reactor_endpoint = self._resolve_cross_repo_contract_endpoint(
+                component_name="reactor_core",
+                fallback_port=self.config.reactor_api_port,
+                env_url_keys=(
+                    "REACTOR_CORE_URL",
+                    "JARVIS_REACTOR_CORE_URL",
+                ),
+            )
             targets.append(
                 ContractTarget(
                     name="reactor_core",
@@ -84062,7 +84116,10 @@ class JarvisSystemKernel:
         except Exception:
             return True
 
-        targets = self._build_cross_repo_contract_targets(include_inactive=include_inactive)
+        targets = self._build_cross_repo_contract_targets(
+            include_inactive=include_inactive,
+            runtime=runtime,
+        )
         if not targets:
             return True
 
