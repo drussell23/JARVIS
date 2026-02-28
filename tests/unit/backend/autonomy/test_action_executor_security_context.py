@@ -76,3 +76,22 @@ async def test_handle_security_alert_general_unknown_is_not_warning(
     assert result["concern_type"] == "general"
     assert result["context_resolved"] is False
     assert "Security alert: general in unknown" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_handle_security_alert_unresolved_high_risk_is_info(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    executor = _make_executor(monkeypatch)
+    action = _make_action(
+        target="unknown",
+        params={"concern_type": "suspicious_login"},
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = await executor._handle_security_alert(action)
+
+    assert result["success"] is True
+    assert result["context_resolved"] is False
+    assert "Security alert: suspicious_login in unknown" not in caplog.text
