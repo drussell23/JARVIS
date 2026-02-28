@@ -21023,7 +21023,13 @@ echo "=== JARVIS Prime started ==="
                         slim_mode_source = "service_env"
 
                 # Source 4: Check if jarvis-prime specifically requested slim spawn
-                if not is_slim_mode and "j-prime" in definition.name.lower() or "jarvis-prime" in definition.name.lower():
+                if (
+                    not is_slim_mode
+                    and (
+                        "j-prime" in definition.name.lower()
+                        or "jarvis-prime" in definition.name.lower()
+                    )
+                ):
                     # For jarvis-prime on systems with <32GB, default to Slim Mode
                     total_ram_gb = mem.total / (1024 ** 3)
                     if total_ram_gb < 32:

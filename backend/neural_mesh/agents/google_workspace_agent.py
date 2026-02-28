@@ -4004,8 +4004,73 @@ EMAIL BODY:"""
         if not query:
             return {"error": "No query provided", "workspace_action": "handle_workspace_query"}
 
-        # Detect intent
-        intent, confidence, metadata = self._intent_detector.detect(query)
+        # Authority chain for fallback intent detection:
+        # 1) shared workspace routing detector (single source of truth),
+        # 2) local detector as safety fallback if shared detector unavailable/fails.
+        intent = WorkspaceIntent.UNKNOWN
+        confidence = 0.0
+        metadata: Dict[str, Any] = {}
+        execution_mode = "auto"
+        try:
+            from backend.core.workspace_routing_intelligence import (
+                ExecutionMode as SharedExecutionMode,
+                get_workspace_detector,
+            )
+
+            shared_detector = get_workspace_detector()
+            shared_result = await shared_detector.detect(query)
+            shared_intent_value = (
+                shared_result.intent.value
+                if getattr(shared_result, "intent", None) is not None
+                else "unknown"
+            )
+            intent_map = {
+                "check_email": WorkspaceIntent.CHECK_EMAIL,
+                "search_email": WorkspaceIntent.SEARCH_EMAIL,
+                "draft_email": WorkspaceIntent.DRAFT_EMAIL,
+                "send_email": WorkspaceIntent.SEND_EMAIL,
+                "check_calendar": WorkspaceIntent.CHECK_CALENDAR,
+                "create_event": WorkspaceIntent.CREATE_EVENT,
+                "get_contacts": WorkspaceIntent.GET_CONTACTS,
+                "create_document": WorkspaceIntent.CREATE_DOCUMENT,
+                "workspace_summary": WorkspaceIntent.DAILY_BRIEFING,
+            }
+            if getattr(shared_result, "is_workspace_command", False):
+                intent = intent_map.get(shared_intent_value, WorkspaceIntent.UNKNOWN)
+                confidence = float(getattr(shared_result, "confidence", 0.0) or 0.0)
+                entities = dict(getattr(shared_result, "entities", {}) or {})
+                extracted_names: List[str] = []
+                for name_key in ("recipient", "sender", "name"):
+                    name_val = entities.get(name_key)
+                    if isinstance(name_val, str) and name_val.strip():
+                        extracted_names.append(name_val.strip())
+
+                extracted_dates: Dict[str, str] = {}
+                date_entity = entities.get("date")
+                if isinstance(date_entity, str):
+                    date_lower = date_entity.strip().lower()
+                    if date_lower == "today":
+                        extracted_dates["today"] = date_lower
+                    elif date_lower == "tomorrow":
+                        extracted_dates["tomorrow"] = date_lower
+
+                metadata = {
+                    "entities": entities,
+                    "extracted_names": extracted_names,
+                    "extracted_dates": extracted_dates,
+                }
+                shared_mode = getattr(shared_result, "execution_mode", SharedExecutionMode.AUTO)
+                execution_mode = (
+                    shared_mode.value if hasattr(shared_mode, "value") else str(shared_mode)
+                )
+        except Exception as e:
+            logger.debug(
+                "[GoogleWorkspaceAgent] Shared workspace detector unavailable, using local fallback: %s",
+                e,
+            )
+
+        if intent == WorkspaceIntent.UNKNOWN:
+            intent, confidence, metadata = self._intent_detector.detect(query)
 
         logger.info(
             f"Detected workspace intent: {intent.value} (confidence={confidence:.2f})"
@@ -4035,6 +4100,7 @@ EMAIL BODY:"""
                 "detected_recipient": names[0] if names else None,
                 "instructions": "Please provide: to, subject, and body",
                 "workspace_action": "draft_email_reply",
+                "execution_mode": execution_mode,
             }
 
         elif intent == WorkspaceIntent.SEND_EMAIL:

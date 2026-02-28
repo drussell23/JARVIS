@@ -35,6 +35,10 @@ from backend.core.startup_contracts import validate_health_response
 
 logger = logging.getLogger(__name__)
 
+# WorkspaceAction semantic contract constants.
+WORKSPACE_ACTION_CONTRACT_NAME = "workspace_action"
+WORKSPACE_ACTION_CONTRACT_VERSION_V1 = "workspace_action.v1"
+
 
 @dataclass(frozen=True)
 class ContractTarget:
@@ -49,6 +53,9 @@ class ContractTarget:
     required: bool = True
     require_handshake: bool = True
     allow_legacy_handshake: bool = True
+    workspace_action_contract_required: bool = False
+    workspace_action_contract_version: str = WORKSPACE_ACTION_CONTRACT_VERSION_V1
+    workspace_action_schema_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,7 @@ class ContractCheckResult:
     reason: str
     api_version: Optional[str] = None
     schema_violations: Tuple[str, ...] = ()
+    semantic_contract_violations: Tuple[str, ...] = ()
     capabilities: Tuple[str, ...] = ()
     handshake_mode: str = "none"  # native|legacy|none
     checked_at: float = 0.0
@@ -168,6 +176,7 @@ class CrossRepoContractEnforcer:
         self.local_protocol_version = local_protocol_version
         self.request_timeout_s = max(1.0, float(request_timeout_s))
         self._handshake_mgr = HandshakeManager()
+        self._workspace_action_schema_hash_cache: Optional[str] = None
 
     async def check_many(self, targets: Sequence[ContractTarget]) -> Dict[str, ContractCheckResult]:
         timeout = aiohttp.ClientTimeout(total=self.request_timeout_s)
@@ -220,6 +229,7 @@ class CrossRepoContractEnforcer:
         handshake_reason = "handshake_not_required"
         handshake_mode = "none"
         capabilities: Tuple[str, ...] = ()
+        handshake_metadata: Dict[str, Any] = {}
 
         if target.require_handshake:
             (
@@ -228,6 +238,7 @@ class CrossRepoContractEnforcer:
                 handshake_mode,
                 capabilities,
                 handshake_api_version,
+                handshake_metadata,
             ) = await self._perform_handshake(session, target, health_data)
         else:
             handshake_api_version = None
@@ -267,6 +278,25 @@ class CrossRepoContractEnforcer:
                 api_version=api_version,
                 capabilities=capabilities,
                 handshake_mode=handshake_mode,
+                checked_at=checked_at,
+            )
+
+        semantic_contract_violations = tuple(
+            self._validate_semantic_contracts(
+                target=target,
+                health_data=health_data,
+                handshake_metadata=handshake_metadata,
+            )
+        )
+        if semantic_contract_violations:
+            return ContractCheckResult(
+                target=target,
+                ok=False,
+                reason=f"semantic_contract_violation:{'; '.join(semantic_contract_violations[:2])}",
+                api_version=api_version,
+                capabilities=capabilities,
+                handshake_mode=handshake_mode,
+                semantic_contract_violations=semantic_contract_violations,
                 checked_at=checked_at,
             )
 
@@ -322,7 +352,7 @@ class CrossRepoContractEnforcer:
         session: aiohttp.ClientSession,
         target: ContractTarget,
         health_data: Dict[str, Any],
-    ) -> Tuple[bool, str, str, Tuple[str, ...], Optional[str]]:
+    ) -> Tuple[bool, str, str, Tuple[str, ...], Optional[str], Dict[str, Any]]:
         proposal = HandshakeProposal(
             supervisor_epoch=int(time.time()),
             supervisor_instance_id=self.supervisor_instance_id,
@@ -340,7 +370,7 @@ class CrossRepoContractEnforcer:
             async with session.post(url, json=proposal.to_dict()) as resp:
                 if resp.status == 404:
                     if not target.allow_legacy_handshake:
-                        return False, "handshake_endpoint_missing", "none", (), None
+                        return False, "handshake_endpoint_missing", "none", (), None, {}
 
                     legacy = await self._handshake_mgr.synthesize_legacy_response(
                         target.name,
@@ -355,14 +385,18 @@ class CrossRepoContractEnforcer:
                             "legacy",
                             caps,
                             legacy.api_version,
+                            {},
                         )
-                    return True, "legacy_handshake_ok", "legacy", caps, legacy.api_version
+                    return True, "legacy_handshake_ok", "legacy", caps, legacy.api_version, {}
 
                 if resp.status >= 400:
-                    return False, f"handshake_http_{resp.status}", "none", (), None
+                    return False, f"handshake_http_{resp.status}", "none", (), None, {}
 
                 data = await resp.json()
                 response = HandshakeResponse.from_dict(data if isinstance(data, dict) else {})
+                response_metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+                if not isinstance(response_metadata, dict):
+                    response_metadata = {}
                 ok, reason = evaluate_handshake(proposal, response)
                 caps = tuple(response.capabilities)
                 if not ok:
@@ -372,6 +406,7 @@ class CrossRepoContractEnforcer:
                         "native",
                         caps,
                         response.api_version,
+                        response_metadata,
                     )
 
                 # Legacy api version under native handshake can still be rejected
@@ -386,14 +421,146 @@ class CrossRepoContractEnforcer:
                         "native",
                         caps,
                         response.api_version,
+                        response_metadata,
                     )
 
-                return True, "native_handshake_ok", "native", caps, response.api_version
+                return (
+                    True,
+                    "native_handshake_ok",
+                    "native",
+                    caps,
+                    response.api_version,
+                    response_metadata,
+                )
 
         except asyncio.TimeoutError:
-            return False, "handshake_timeout", "none", (), None
+            return False, "handshake_timeout", "none", (), None, {}
         except Exception as e:
-            return False, f"handshake_error:{type(e).__name__}", "none", (), None
+            return False, f"handshake_error:{type(e).__name__}", "none", (), None, {}
+
+    def _workspace_action_schema_hash(self) -> str:
+        """Canonical schema hash for WorkspaceAction v1 semantic contract."""
+        if self._workspace_action_schema_hash_cache:
+            return self._workspace_action_schema_hash_cache
+
+        canonical_schema = {
+            "schema_version": WORKSPACE_ACTION_CONTRACT_VERSION_V1,
+            "required_top_level": [
+                "schema_version",
+                "request_id",
+                "correlation_id",
+                "domain",
+                "query",
+                "plan",
+            ],
+            "plan_required": ["plan_id", "nodes", "on_failure", "max_parallelism"],
+            "node_required": [
+                "node_id",
+                "action",
+                "args",
+                "depends_on",
+                "can_parallelize",
+                "timeout_ms",
+                "side_effect",
+                "requires_confirmation",
+                "idempotency",
+                "output_key",
+            ],
+            "idempotency_required": ["scope", "key"],
+            "domain": "workspace",
+        }
+        serialized = json.dumps(canonical_schema, sort_keys=True, separators=(",", ":"))
+        self._workspace_action_schema_hash_cache = hashlib.sha256(
+            serialized.encode("utf-8")
+        ).hexdigest()
+        return self._workspace_action_schema_hash_cache
+
+    def _extract_semantic_contracts(
+        self,
+        *,
+        health_data: Dict[str, Any],
+        handshake_metadata: Dict[str, Any],
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Extract semantic contracts from handshake metadata and health payload.
+
+        Accepts either:
+        - metadata/health: {"semantic_contracts": {"workspace_action": {...}}}
+        - metadata/health flat keys:
+          workspace_action_contract_version, workspace_action_schema_hash
+        """
+        extracted: Dict[str, Dict[str, str]] = {}
+
+        def _merge(source: Dict[str, Any]) -> None:
+            if not isinstance(source, dict):
+                return
+            contracts = source.get("semantic_contracts")
+            if isinstance(contracts, dict):
+                for name, spec in contracts.items():
+                    if isinstance(spec, dict):
+                        version = str(spec.get("version", "")).strip()
+                        schema_hash = str(spec.get("schema_hash", "")).strip()
+                        if version or schema_hash:
+                            extracted[str(name).strip().lower()] = {
+                                "version": version,
+                                "schema_hash": schema_hash,
+                            }
+
+            # Flat WorkspaceAction keys (compat path).
+            wa_version = str(source.get("workspace_action_contract_version", "")).strip()
+            wa_hash = str(source.get("workspace_action_schema_hash", "")).strip()
+            if wa_version or wa_hash:
+                extracted[WORKSPACE_ACTION_CONTRACT_NAME] = {
+                    "version": wa_version,
+                    "schema_hash": wa_hash,
+                }
+
+        _merge(health_data)
+        _merge(handshake_metadata)
+        return extracted
+
+    def _validate_semantic_contracts(
+        self,
+        *,
+        target: ContractTarget,
+        health_data: Dict[str, Any],
+        handshake_metadata: Dict[str, Any],
+    ) -> List[str]:
+        """Validate semantic contracts (WorkspaceAction v1) at boot/runtime."""
+        violations: List[str] = []
+        contracts = self._extract_semantic_contracts(
+            health_data=health_data,
+            handshake_metadata=handshake_metadata,
+        )
+
+        if not target.workspace_action_contract_required:
+            return violations
+
+        workspace_spec = contracts.get(WORKSPACE_ACTION_CONTRACT_NAME)
+        if not workspace_spec:
+            violations.append("workspace_action:missing")
+            return violations
+
+        expected_version = (target.workspace_action_contract_version or "").strip()
+        actual_version = (workspace_spec.get("version") or "").strip()
+        if expected_version and actual_version != expected_version:
+            violations.append(
+                f"workspace_action:version_mismatch(expected={expected_version},actual={actual_version or 'missing'})"
+            )
+
+        expected_hash = (target.workspace_action_schema_hash or "").strip()
+        if not expected_hash and expected_version == WORKSPACE_ACTION_CONTRACT_VERSION_V1:
+            expected_hash = self._workspace_action_schema_hash()
+        actual_hash = (workspace_spec.get("schema_hash") or "").strip()
+
+        if expected_hash and not actual_hash:
+            violations.append("workspace_action:schema_hash_missing")
+        elif expected_hash and actual_hash != expected_hash:
+            violations.append(
+                f"workspace_action:schema_hash_mismatch(expected={expected_hash[:12]},actual={actual_hash[:12]})"
+            )
+
+        return violations
 
     def _schema_hash(self, schema_key: str) -> str:
         payload = json.dumps({"schema_key": schema_key}, sort_keys=True)

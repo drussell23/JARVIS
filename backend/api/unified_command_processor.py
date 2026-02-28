@@ -331,6 +331,8 @@ class UnifiedCommandProcessor:
         # v242.2: Neural Mesh coordinator reference (lazy-resolved)
         self._neural_mesh_coordinator = None
         self._neural_mesh_lookup_attempted = False
+        self._workspace_agent_singleton = None
+        self._workspace_agent_singleton_lock = asyncio.Lock()
 
         # v277.0: Command idempotency dedupe cache (Disease 4 cure).
         # Bounded in-memory cache keyed by request_id. Covers both WS and
@@ -2422,19 +2424,21 @@ class UnifiedCommandProcessor:
                 agent = coordinator.get_agent("google_workspace_agent")
 
             if agent is None:
-                # Lazy singleton fallback — Disease 3 cure: call on_initialize().
-                # The lazy singleton intentionally lacks a message bus.
-                # on_initialize() checks `if self.message_bus:` before subscribing,
-                # so this is safe. The agent operates in standalone mode (no mesh).
-                if not hasattr(self, '_workspace_agent_singleton'):
-                    try:
-                        from neural_mesh.agents.google_workspace_agent import GoogleWorkspaceAgent
-                        _agent = GoogleWorkspaceAgent()
-                        await _agent.on_initialize()
-                        self._workspace_agent_singleton = _agent
-                    except Exception:
-                        logger.warning("[v266] GoogleWorkspaceAgent initialization failed", exc_info=True)
-                        self._workspace_agent_singleton = None
+                # Lazy singleton fallback with lock to prevent concurrent double-init.
+                if self._workspace_agent_singleton is None:
+                    async with self._workspace_agent_singleton_lock:
+                        if self._workspace_agent_singleton is None:
+                            try:
+                                from neural_mesh.agents.google_workspace_agent import GoogleWorkspaceAgent
+                                _agent = GoogleWorkspaceAgent()
+                                await _agent.on_initialize()
+                                self._workspace_agent_singleton = _agent
+                            except Exception:
+                                logger.warning(
+                                    "[v266] GoogleWorkspaceAgent initialization failed",
+                                    exc_info=True,
+                                )
+                                self._workspace_agent_singleton = None
                 agent = self._workspace_agent_singleton
 
             if agent is None:
