@@ -83076,13 +83076,20 @@ class JarvisSystemKernel:
                         if not result.get("success"):
                             self.logger.info(
                                 "[Kernel] v280.0: Fast redirect skipped (%s) after %.1fs budget; "
-                                "scheduling background browser reconciliation",
+                                "scheduling non-destructive background redirect retry",
                                 result.get("error", "unknown"),
                                 _chrome_budget,
                             )
+                            _background_retry_budget = max(
+                                _chrome_budget,
+                                float(os.environ.get("JARVIS_CHROME_REDIRECT_BACKGROUND_BUDGET", "20.0")),
+                            )
                             create_safe_task(
-                                chrome_manager.ensure_single_incognito_window(frontend_url),
-                                name="chrome-reconcile-background",
+                                chrome_manager.redirect_existing_incognito_with_budget(
+                                    frontend_url,
+                                    budget_seconds=_background_retry_budget,
+                                ),
+                                name="chrome-redirect-background",
                             )
                         if result.get("success"):
                             action = result.get("action", "unknown")
