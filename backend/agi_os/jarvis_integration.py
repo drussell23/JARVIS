@@ -2261,7 +2261,17 @@ class NeuralMeshBridge:
     # ---- Reverse Bridge: EventStream → Bus ----
 
     async def _reverse_handler(self, event: Any) -> None:
-        """Handle EventStream event → translate → broadcast to bus."""
+        """Handle EventStream event → translate → dispatch to bus.
+
+        v277.0: Fixed three architectural bugs:
+        1. is_broadcast flag from _REVERSE_MAP was extracted but NEVER USED —
+           all events were broadcast to ALL agents regardless of the flag.
+        2. No protocol translation: AGI events use 'request_type' in their data,
+           but Neural Mesh agents expect 'action' in TASK_ASSIGNED payloads.
+           Bridge must translate between these two protocols.
+        3. For targeted dispatches (is_broadcast=False), use directed send to
+           coordinator instead of broadcast — prevents spam to ALL agents.
+        """
         try:
             # Loop prevention: skip events originating from forward bridge
             source = getattr(event, 'source', '')
@@ -2303,11 +2313,49 @@ class NeuralMeshBridge:
                 'agi_source': source,
             }
 
-            await self._bus.broadcast(
-                from_agent='agi_os_bridge',
-                message_type=msg_type,
-                payload=payload_with_meta,
-            )
+            # Protocol translation: TASK_ASSIGNED payloads MUST have 'action'.
+            # AGI events use 'request_type' — bridge translates at the boundary.
+            if msg_type == MessageType.TASK_ASSIGNED:
+                if 'action' not in payload_with_meta:
+                    action = payload_with_meta.get('request_type', '')
+                    if not action:
+                        logger.warning(
+                            "Reverse bridge: TASK_ASSIGNED event from '%s' has "
+                            "no 'action' or 'request_type' — skipping dispatch "
+                            "to prevent empty-action errors in all agents. "
+                            "Event: %s, payload keys: %s",
+                            source, evt_type_val, list(payload.keys()),
+                        )
+                        return
+                    payload_with_meta['action'] = action
+
+            # Respect is_broadcast flag from _REVERSE_MAP:
+            # - True: broadcast to all agents subscribed to this message type
+            # - False: targeted to coordinator only (prevents spam to ALL agents)
+            if is_broadcast:
+                await self._bus.broadcast(
+                    from_agent='agi_os_bridge',
+                    message_type=msg_type,
+                    payload=payload_with_meta,
+                )
+            else:
+                # Targeted dispatch — send to coordinator agent only
+                from neural_mesh.data_models import AgentMessage, MessagePriority
+                event_priority = getattr(event, 'priority', None)
+                priority = MessagePriority.HIGH if (
+                    event_priority and hasattr(event_priority, 'value')
+                    and event_priority.value in ('HIGH', 'CRITICAL')
+                ) else MessagePriority.NORMAL
+
+                message = AgentMessage(
+                    from_agent='agi_os_bridge',
+                    to_agent='coordinator',
+                    message_type=msg_type,
+                    payload=payload_with_meta,
+                    priority=priority,
+                )
+                await self._bus.publish(message)
+
             self._stats['reverse'] += 1
 
         except Exception as e:

@@ -893,11 +893,33 @@ class BaseNeuralMeshAgent(ABC):
         self._task_queue_size += 1
 
         try:
+            payload = message.payload
+
+            # Defense-in-depth: Bridged AGI events may use 'request_type' instead
+            # of 'action'. The bridge translates at the boundary (v277.0), but if
+            # a bridged event arrives without 'action', try 'request_type' fallback.
+            if payload.get('bridged') and not payload.get('action'):
+                request_type = payload.get('request_type', '')
+                if request_type:
+                    payload = {**payload, 'action': request_type}
+                else:
+                    # No action and no request_type — cannot execute.
+                    # Log and skip instead of crashing with ValueError.
+                    logger.warning(
+                        "%s: received bridged TASK_ASSIGNED with no 'action' or "
+                        "'request_type' — skipping. Source: %s, keys: %s",
+                        self.agent_name,
+                        payload.get('agi_source', 'unknown'),
+                        list(payload.keys()),
+                    )
+                    self._task_queue_size = max(0, self._task_queue_size - 1)
+                    return
+
             # Execute task
             self._metrics.tasks_received += 1
             start_time = asyncio.get_event_loop().time()
 
-            result = await self.execute_task(message.payload)
+            result = await self.execute_task(payload)
 
             # Calculate metrics
             task_time_ms = (asyncio.get_event_loop().time() - start_time) * 1000
