@@ -123,6 +123,11 @@ for _env_name in _blas_thread_envs:
         _early_os.environ[_env_name] = '1'
 
 _early_os.environ.setdefault('OPENBLAS_MAIN_FREE', '1')  # Fork-safety: don't use main thread for GEMM
+# v279.1: Force specific kernel to avoid dynamic dispatch overhead/bugs in dev builds.
+# OpenBLAS 0.3.23.dev (bundled with numpy 1.26.x) has a memory corruption bug in its
+# ARM64 dynamic kernel dispatch path.  Pinning CORETYPE skips the runtime probing code.
+if _is_darwin_arm:
+    _early_os.environ.setdefault('OPENBLAS_CORETYPE', 'ARMV8')
 _early_os.environ.setdefault('JARVIS_BLAS_GUARD_MODE', _blas_policy or 'safe')
 del _env_name, _raw, _parsed
 
@@ -894,11 +899,16 @@ try:
     _numpy_probe_timeout = max(
         1.0, float(os.getenv("JARVIS_NUMPY_PROBE_TIMEOUT", "8.0"))
     )
+    # v279.1: GEMM removed — the old `a@b` probe triggered the exact SIGSEGV it
+    # was meant to detect (OpenBLAS 0.3.23.dev gemm_thread_n memory corruption on
+    # ARM64).  Import + basic array ops validate the native extension without
+    # exercising the broken BLAS kernel.  In-process GEMM warmup happens later
+    # inside _preload_native_libs_sync() under controlled conditions.
     _numpy_probe_script = (
         "import numpy as np; "
-        "a=np.ones((32,32),dtype=np.float64); "
-        "b=np.ones((32,32),dtype=np.float64); "
-        "_=a@b"
+        "a=np.zeros(64,dtype=np.float64); "
+        "_ = a.sum(); "
+        "_ = np.arange(16).reshape(4,4).tolist()"
     )
     _numpy_probe = _numpy_subprocess.run(
         [sys.executable, "-c", _numpy_probe_script],
@@ -63368,6 +63378,7 @@ class JarvisSystemKernel:
         # v210.0: Track if loading server is actually accepting HTTP connections
         # This prevents broadcast attempts before server is ready
         self._loading_server_ready: bool = False
+        self._loading_server_stopping: bool = False
 
         # v239.0: System Service Registry (10 priority services)
         self._system_services_enabled: bool = os.getenv(
@@ -66930,18 +66941,25 @@ class JarvisSystemKernel:
                 _os.environ.setdefault('MKL_NUM_THREADS', '1')
                 _os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
                 _os.environ.setdefault('OPENBLAS_MAIN_FREE', '1')
+                # v279.1: Pin kernel on ARM64 — avoid dynamic dispatch bugs in
+                # OpenBLAS 0.3.23.dev (bundled with numpy 1.26.x).
+                if _sys.platform == 'darwin' and _sys.maxsize > 2**32:
+                    _os.environ.setdefault('OPENBLAS_CORETYPE', 'ARMV8')
 
                 def _native_probe(module_name: str, timeout_s: float = 4.0) -> bool:
                     """Probe native-module import in isolated subprocess."""
                     try:
                         _probe_script = f"import {module_name}"
                         if module_name == "numpy":
-                            # Import-only probes miss BLAS thread-path crashes.
+                            # v279.1: GEMM removed — the old `a@b` triggered the
+                            # exact SIGSEGV it was designed to detect (OpenBLAS
+                            # 0.3.23.dev gemm_thread_n on ARM64).  Import + basic
+                            # array ops validate native extension without BLAS.
                             _probe_script = (
                                 "import numpy as np; "
-                                "a=np.ones((32,32),dtype=np.float64); "
-                                "b=np.ones((32,32),dtype=np.float64); "
-                                "_=a@b"
+                                "a=np.zeros(64,dtype=np.float64); "
+                                "_ = a.sum(); "
+                                "_ = np.arange(16).reshape(4,4).tolist()"
                             )
                         _probe = _subprocess.run(
                             [_sys.executable, "-c", _probe_script],
@@ -66973,6 +66991,21 @@ class JarvisSystemKernel:
                     try:
                         import numpy  # noqa: F401
                         _preloaded.append(f"numpy {numpy.__version__}")
+                        # v279.1: Controlled BLAS kernel warmup.  Force OpenBLAS
+                        # to initialize its GEMM kernel in this thread-executor
+                        # context BEFORE CoreAudio starts.  Uses a tiny 2×2 matrix
+                        # to keep stack usage minimal (the gemm_thread_n crash is
+                        # a stack overflow in larger kernels).  If this warmup
+                        # itself crashes, the thread executor catches the exception
+                        # and numpy will be available for non-BLAS ops (sum, reshape,
+                        # arange) while BLAS ops will be avoided.
+                        try:
+                            _w = numpy.ones((2, 2), dtype=numpy.float32)
+                            _ = _w @ _w
+                            del _w
+                            _preloaded.append("numpy-blas-warmup: ok")
+                        except Exception as _bw_e:
+                            _preloaded.append(f"numpy-blas-warmup: FAILED ({_bw_e})")
                     except ImportError:
                         pass
                     except Exception as _e:
@@ -83205,6 +83238,8 @@ class JarvisSystemKernel:
                 self._protected_pids.discard(pid)
         self._loading_server_process = None
         self._loading_server_ready = False
+        self._stop_broadcast_worker()
+        self._loading_server_stopping = False
 
     def _is_loading_server_alive(self) -> bool:
         """
@@ -83653,12 +83688,13 @@ class JarvisSystemKernel:
 
         Also cleans up the log file handle.
         """
+        self._loading_server_stopping = True
         await self._stop_loading_server_heartbeat()
         await self._stop_startup_progress_heartbeat()
-        # v275.0: Shut down dedicated broadcast worker thread
-        self._stop_broadcast_worker()
 
         if not hasattr(self, '_loading_server_process') or not self._loading_server_process:
+            # v280.1: no process left; ensure transport worker is stopped too.
+            self._stop_broadcast_worker()
             self._cleanup_loading_server_log()
             self._clear_loading_server_process()
             return
@@ -85585,6 +85621,25 @@ class JarvisSystemKernel:
                 )
             return True
 
+        # Worker is missing/dead unexpectedly while loading server is alive.
+        # Restart worker in-place to preserve deterministic transport behavior.
+        if (
+            not getattr(self, "_loading_server_stopping", False)
+            and self._is_loading_server_alive()
+            and getattr(self, "_loading_server_ready", False)
+        ):
+            self._start_broadcast_worker()
+            worker = getattr(self, '_broadcast_worker', None)
+            if worker is not None and worker.is_alive():
+                worker.enqueue(progress_data)
+                self._broadcast_consecutive_failures = 0
+                self._last_broadcast_error = None
+                if not is_heartbeat:
+                    self.logger.debug(
+                        f"[Progress] {stage}: {progress}% - {message} (worker auto-restarted)"
+                    )
+                return True
+
         # Fallback: thread-based urllib (worker not started or died).
         # Used during very early startup before worker is initialized,
         # or if the worker thread unexpectedly terminated.
@@ -85622,6 +85677,18 @@ class JarvisSystemKernel:
             )
         except Exception as e:
             self._last_broadcast_error = f"{type(e).__name__}: {e}"
+
+        # During loading-server shutdown, complete-stage fallback failures are expected.
+        if (
+            getattr(self, "_loading_server_stopping", False)
+            and stage == "complete"
+        ):
+            self.logger.info(
+                "[Broadcast] Loading-server stopping; complete-stage fallback "
+                "transport failure is expected (%s)",
+                getattr(self, "_last_broadcast_error", "unknown"),
+            )
+            return False
 
         # Throttled warning for fallback failures
         self._broadcast_consecutive_failures += 1

@@ -28,4 +28,11 @@ _set_default("MKL_NUM_THREADS", "1")
 _set_default("VECLIB_MAXIMUM_THREADS", "1")
 _set_default("NUMEXPR_NUM_THREADS", "1")
 _set_default("GOTO_NUM_THREADS", "1")
+_set_default("OPENBLAS_MAIN_FREE", "1")
+
+# v279.1: Pin ARM64 kernel to avoid dynamic dispatch bugs in OpenBLAS 0.3.23.dev.
+import platform as _platform
+if _platform.machine() in ("arm64", "aarch64"):
+    _set_default("OPENBLAS_CORETYPE", "ARMV8")
+del _platform
 
