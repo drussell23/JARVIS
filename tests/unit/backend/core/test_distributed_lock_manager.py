@@ -402,6 +402,30 @@ class TestDLMCleanup:
                 f"Stale lock {name} should have been cleaned"
             )
 
+    def test_cleanup_severity_heartbeat_stale_is_info(self, dlm: DistributedLockManager):
+        """Heartbeat lock cleanup should log as info (expected churn)."""
+        metadata = LockMetadata(
+            acquired_at=time.time() - 40,
+            expires_at=time.time() - 20,
+            owner="jarvis-12345-1.0",
+            token="token",
+            lock_name="heartbeat",
+        )
+        log_fn = dlm._cleanup_log_fn_for_stale_lock(metadata)
+        assert log_fn.__name__ == "info"
+
+    def test_cleanup_severity_old_nonheartbeat_stale_is_warning(self, dlm: DistributedLockManager):
+        """Very old non-heartbeat stale lock should still escalate to warning."""
+        metadata = LockMetadata(
+            acquired_at=time.time() - 400,
+            expires_at=time.time() - 240,
+            owner="jarvis-12345-1.0",
+            token="token",
+            lock_name="vbia_events",
+        )
+        log_fn = dlm._cleanup_log_fn_for_stale_lock(metadata)
+        assert log_fn.__name__ == "warning"
+
     async def test_orphaned_tmp_files_cleaned(
         self, dlm: DistributedLockManager
     ):

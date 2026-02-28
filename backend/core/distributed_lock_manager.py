@@ -152,6 +152,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_csv(name: str, default: str) -> List[str]:
+    """Read comma-separated env var as normalized token list."""
+    raw = os.environ.get(name, default)
+    return [token.strip().lower() for token in str(raw).split(",") if token.strip()]
+
+
 # v3.5: Cleanup budget limits — prevents event loop starvation from
 # blocking syscalls (os.kill, psutil.Process) during initialization.
 DLM_CLEANUP_TEMP_TIMEOUT = _env_float("DLM_CLEANUP_TEMP_TIMEOUT", 5.0)
@@ -160,6 +166,8 @@ DLM_CLEANUP_MAX_FILES = _env_int("DLM_CLEANUP_MAX_FILES", 200)
 DLM_BLOCKING_OP_TIMEOUT = _env_float("DLM_BLOCKING_OP_TIMEOUT", 5.0)
 DLM_REDIS_CONNECT_TIMEOUT = _env_float("DLM_REDIS_CONNECT_TIMEOUT", 5.0)
 DLM_REDIS_SOCKET_TIMEOUT = _env_float("DLM_REDIS_SOCKET_TIMEOUT", 5.0)
+DLM_STALE_LOCK_WARN_AFTER_SECONDS = _env_float("DLM_STALE_LOCK_WARN_AFTER_SECONDS", 120.0)
+DLM_STALE_LOCK_INFO_NAMES = _env_csv("DLM_STALE_LOCK_INFO_NAMES", "heartbeat")
 
 
 async def _run_blocking(func, *args, timeout: float = DLM_BLOCKING_OP_TIMEOUT):
@@ -669,6 +677,8 @@ class DistributedLockManager:
         # v3.2: Keepalive exhaustion tracking
         self._on_keepalive_failed: List[Callable[[str, str], None]] = []
         self._expired_locks: set = set()
+        self._stale_lock_warn_after_s = max(0.0, DLM_STALE_LOCK_WARN_AFTER_SECONDS)
+        self._stale_lock_info_names = set(DLM_STALE_LOCK_INFO_NAMES)
         self._lock_events: Dict[str, asyncio.Event] = {}
         # v240.0: Protect lazy Event creation from TOCTOU race
         self._event_lock = asyncio.Lock()
@@ -1876,7 +1886,7 @@ class DistributedLockManager:
 
                 # Check TTL expiration
                 if metadata.is_stale():
-                    logger.warning(
+                    self._cleanup_log_fn_for_stale_lock(metadata)(
                         f"Cleaning stale lock: {metadata.lock_name} "
                         f"(owner: {metadata.owner}, expired {-metadata.time_remaining():.1f}s ago)"
                     )
@@ -1911,6 +1921,21 @@ class DistributedLockManager:
 
         except Exception as e:
             logger.error(f"Error during stale lock cleanup: {e}", exc_info=True)
+
+    def _cleanup_log_fn_for_stale_lock(self, metadata: LockMetadata):
+        """Choose severity for stale-lock cleanup logs.
+
+        Fast-expiring coordination locks (especially heartbeat leases) are expected
+        to disappear during normal restart churn. Escalate only when a stale lock
+        lingers significantly beyond its TTL and is not in the known noisy set.
+        """
+        lock_name = (metadata.lock_name or "").strip().lower()
+        expired_for_s = max(0.0, -metadata.time_remaining())
+        if lock_name in self._stale_lock_info_names:
+            return logger.info
+        if expired_for_s < self._stale_lock_warn_after_s:
+            return logger.info
+        return logger.warning
 
     # =========================================================================
     # Monitoring & Health
