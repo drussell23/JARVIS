@@ -1002,6 +1002,24 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
                     return False
             except ValueError:
                 pass
+
+        # Fallback heuristic: if startup markers are missing/cleaned up too early
+        # but the process just started, treat it as startup for timeout policy.
+        try:
+            import psutil  # type: ignore
+
+            startup_window = max(
+                30.0,
+                float(os.getenv("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")),
+            )
+            uptime_seconds = max(
+                0.0,
+                time.time() - float(psutil.Process().create_time()),
+            )
+            if uptime_seconds <= startup_window:
+                return True
+        except Exception:
+            pass
         return not startup_complete_bool
 
     def _get_memory_thrash_state(self) -> str:

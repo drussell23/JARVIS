@@ -1,3 +1,6 @@
+import sys
+import types
+
 import pytest
 
 from backend.neural_mesh.agents.visual_monitor_agent import VisualMonitorAgent
@@ -37,6 +40,13 @@ def test_resolve_parallel_init_policy_respects_runtime_parallelism_override(monk
     agent = _make_agent_stub()
 
     monkeypatch.setenv("JARVIS_STARTUP_COMPLETE", "true")
+    monkeypatch.delenv("JARVIS_STARTUP_TIMESTAMP", raising=False)
+    monkeypatch.setenv("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")
+    monkeypatch.setattr("backend.neural_mesh.agents.visual_monitor_agent.time.time", lambda: 1000.0)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: types.SimpleNamespace(create_time=lambda: 0.0)
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
     monkeypatch.setenv("JARVIS_VISUAL_HEAVY_INIT_PARALLELISM", "3")
     monkeypatch.setenv("JARVIS_VISUAL_HEAVY_INIT_RUNTIME_FLOOR_SECONDS", "12.0")
     monkeypatch.setenv("JARVIS_VISUAL_INIT_EMERGENCY_TIMEOUT_MULTIPLIER", "2.0")
@@ -66,5 +76,21 @@ def test_startup_timestamp_overrides_premature_startup_complete(monkeypatch):
     monkeypatch.setenv("JARVIS_STARTUP_TIMESTAMP", "100.0")
     monkeypatch.setenv("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")
     monkeypatch.setattr("backend.neural_mesh.agents.visual_monitor_agent.time.time", lambda: 200.0)
+
+    assert agent._is_global_startup_phase() is True
+
+
+def test_recent_process_uptime_keeps_startup_phase_without_timestamp(monkeypatch):
+    agent = _make_agent_stub()
+
+    monkeypatch.setenv("JARVIS_STARTUP_COMPLETE", "true")
+    monkeypatch.delenv("JARVIS_STARTUP_TIMESTAMP", raising=False)
+    monkeypatch.setenv("JARVIS_GLOBAL_STARTUP_DURATION", "180.0")
+    monkeypatch.setattr("backend.neural_mesh.agents.visual_monitor_agent.time.time", lambda: 150.0)
+
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: types.SimpleNamespace(create_time=lambda: 100.0)
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert agent._is_global_startup_phase() is True
