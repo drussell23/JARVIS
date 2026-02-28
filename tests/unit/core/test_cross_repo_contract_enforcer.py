@@ -202,6 +202,143 @@ async def test_contract_enforcer_blocks_version_outside_window():
         await runner.cleanup()
 
 
+@pytest.mark.asyncio
+async def test_contract_enforcer_requires_workspace_action_semantic_contract():
+    async def health(_request):
+        return web.json_response(
+            {
+                "status": "healthy",
+                "ready_for_inference": True,
+                "protocol_version": "1.1.0",
+                "capabilities": ["inference"],
+                "semantic_contracts": {
+                    "workspace_action": {
+                        "version": "workspace_action.v1",
+                        "schema_hash": "bad_hash_value",
+                    }
+                },
+            }
+        )
+
+    async def handshake(_request):
+        return web.json_response(
+            {
+                "accepted": True,
+                "component_instance_id": "prime-1",
+                "api_version": "1.1.0",
+                "capabilities": ["inference"],
+                "health_schema_hash": "abcd1234",
+                "metadata": {
+                    "semantic_contracts": {
+                        "workspace_action": {
+                            "version": "workspace_action.v1",
+                            "schema_hash": "bad_hash_value",
+                        }
+                    }
+                },
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_post("/lifecycle/handshake", handshake)
+    runner, endpoint = await _start_test_server(app)
+
+    try:
+        enforcer = CrossRepoContractEnforcer(
+            supervisor_instance_id="kernel-test",
+            local_protocol_version="1.2.0",
+            request_timeout_s=3.0,
+        )
+        target = ContractTarget(
+            name="jarvis_prime",
+            endpoint=endpoint,
+            health_schema_key="prime:/health",
+            min_api_version="1.0.0",
+            max_api_version="1.9.9",
+            required_capabilities=("inference",),
+            require_handshake=True,
+            allow_legacy_handshake=False,
+            workspace_action_contract_required=True,
+            workspace_action_contract_version="workspace_action.v1",
+        )
+        result = (await enforcer.check_many([target]))["jarvis_prime"]
+        assert not result.ok
+        assert "semantic_contract_violation" in result.reason
+        assert any("schema_hash_mismatch" in v for v in result.semantic_contract_violations)
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_contract_enforcer_accepts_matching_workspace_action_semantic_contract():
+    enforcer = CrossRepoContractEnforcer(
+        supervisor_instance_id="kernel-test",
+        local_protocol_version="1.2.0",
+        request_timeout_s=3.0,
+    )
+    expected_hash = enforcer._workspace_action_schema_hash()
+
+    async def health(_request):
+        return web.json_response(
+            {
+                "status": "healthy",
+                "ready_for_inference": True,
+                "protocol_version": "1.1.0",
+                "capabilities": ["inference"],
+                "semantic_contracts": {
+                    "workspace_action": {
+                        "version": "workspace_action.v1",
+                        "schema_hash": expected_hash,
+                    }
+                },
+            }
+        )
+
+    async def handshake(_request):
+        return web.json_response(
+            {
+                "accepted": True,
+                "component_instance_id": "prime-1",
+                "api_version": "1.1.0",
+                "capabilities": ["inference"],
+                "health_schema_hash": "abcd1234",
+                "metadata": {
+                    "semantic_contracts": {
+                        "workspace_action": {
+                            "version": "workspace_action.v1",
+                            "schema_hash": expected_hash,
+                        }
+                    }
+                },
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_post("/lifecycle/handshake", handshake)
+    runner, endpoint = await _start_test_server(app)
+
+    try:
+        target = ContractTarget(
+            name="jarvis_prime",
+            endpoint=endpoint,
+            health_schema_key="prime:/health",
+            min_api_version="1.0.0",
+            max_api_version="1.9.9",
+            required_capabilities=("inference",),
+            require_handshake=True,
+            allow_legacy_handshake=False,
+            workspace_action_contract_required=True,
+            workspace_action_contract_version="workspace_action.v1",
+        )
+        result = (await enforcer.check_many([target]))["jarvis_prime"]
+        assert result.ok
+        assert result.reason == "contract_ok"
+    finally:
+        await runner.cleanup()
+
+
 def test_contract_drift_monitor_hysteresis():
     monitor = ContractDriftMonitor(failure_threshold=2, recovery_threshold=2)
     target = ContractTarget(
