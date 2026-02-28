@@ -79736,46 +79736,6 @@ class JarvisSystemKernel:
                             "(cross-repo lock held by peer supervisor)"
                         )
 
-                    # Reconcile: components set to "running" at spawn-intent but
-                    # absent from Trinity results.  We don't know launch fate
-                    # (never spawned / spawned-and-crashed / still initializing),
-                    # so mark "degraded" (not "error") to avoid over-assertion.
-                    _reconcile_grace_s = _get_env_float(
-                        "JARVIS_TRINITY_RECONCILE_GRACE_S", 15.0,
-                    )
-                    for _reconcile_key in ("jarvis_prime", "reactor_core"):
-                        _rec_entry = self._component_status.get(_reconcile_key, {})
-                        _rec_status = _rec_entry.get("status")
-                        if _rec_status != "running":
-                            continue
-                        # Use monotonic timestamp (set in Step 3a) for grace period
-                        _running_since = _rec_entry.get("_running_since_mono", 0.0)
-                        _elapsed = time.monotonic() - _running_since
-                        if _elapsed < _reconcile_grace_s:
-                            self.logger.debug(
-                                "[Trinity] %s: within grace period (%.0fs < %.0fs), "
-                                "deferring reconciliation to runtime monitor",
-                                _reconcile_key.replace("_", "-"),
-                                _elapsed,
-                                _reconcile_grace_s,
-                            )
-                            continue
-                        _rec_name = _reconcile_key.replace("_", "-")
-                        self._update_component_status(
-                            _reconcile_key,
-                            "degraded",
-                            f"No Trinity outcome for {_rec_name} — "
-                            f"endpoint may be unreachable at configured address",
-                        )
-                        self.logger.info(
-                            "[Trinity] %s: no outcome in results — marked degraded "
-                            "(runtime monitor checks every %.0fs)",
-                            _rec_name,
-                            _get_env_float(
-                                "JARVIS_RUNTIME_CONTRACT_MONITOR_INTERVAL_S", 45.0,
-                            ),
-                        )
-
                     # =====================================================================
                     # v180.0: TRINITY AUTO-RESTART WATCHDOG
                     # Start background task to monitor and restart crashed components.
@@ -79862,6 +79822,47 @@ class JarvisSystemKernel:
                     self.logger.warning(f"[Trinity] ⚠️ 0/{total_count} components started")
                     trinity_status = "degraded"
                     trinity_status_message = f"0/{total_count} Trinity components started"
+
+                # Reconcile: components set to "running" at spawn-intent but
+                # absent from Trinity results.  We don't know launch fate
+                # (never spawned / spawned-and-crashed / still initializing),
+                # so mark "degraded" (not "error") to avoid over-assertion.
+                # Runs unconditionally — covers started_count == 0 case too.
+                _reconcile_grace_s = _get_env_float(
+                    "JARVIS_TRINITY_RECONCILE_GRACE_S", 15.0,
+                )
+                for _reconcile_key in ("jarvis_prime", "reactor_core"):
+                    _rec_entry = self._component_status.get(_reconcile_key, {})
+                    _rec_status = _rec_entry.get("status")
+                    if _rec_status != "running":
+                        continue
+                    # Use monotonic timestamp (set in Step 3a) for grace period
+                    _running_since = _rec_entry.get("_running_since_mono", 0.0)
+                    _elapsed = time.monotonic() - _running_since
+                    if _elapsed < _reconcile_grace_s:
+                        self.logger.debug(
+                            "[Trinity] %s: within grace period (%.0fs < %.0fs), "
+                            "deferring reconciliation to runtime monitor",
+                            _reconcile_key.replace("_", "-"),
+                            _elapsed,
+                            _reconcile_grace_s,
+                        )
+                        continue
+                    _rec_name = _reconcile_key.replace("_", "-")
+                    self._update_component_status(
+                        _reconcile_key,
+                        "degraded",
+                        f"No Trinity outcome for {_rec_name} — "
+                        f"endpoint may be unreachable at configured address",
+                    )
+                    self.logger.info(
+                        "[Trinity] %s: no outcome in results — marked degraded "
+                        "(runtime monitor checks every %.0fs)",
+                        _rec_name,
+                        _get_env_float(
+                            "JARVIS_RUNTIME_CONTRACT_MONITOR_INTERVAL_S", 45.0,
+                        ),
+                    )
 
                 # v182.0: Final Trinity status broadcast
                 self._update_component_status(
@@ -84021,6 +84022,15 @@ class JarvisSystemKernel:
                         "degraded",
                         f"Contract drift: {transition.reason}",
                     )
+                    # Update readiness proofs on runtime drift
+                    _rt_readiness = self._component_status.get(
+                        transition.target, {},
+                    ).get("readiness")
+                    if _rt_readiness is not None:
+                        _rt_readiness["service_proof"] = f"fail:{transition.reason}"
+                        _rt_readiness["contract_proof"] = f"fail:{transition.reason}"
+                        _rt_readiness["composite_status"] = "degraded"
+                        _rt_readiness["updated_at"] = datetime.now().isoformat()
                 elif transition.to_state == "healthy":
                     self.logger.info(
                         "[Contract] Runtime restored (%s): %s",
@@ -84034,6 +84044,17 @@ class JarvisSystemKernel:
                             "complete",
                             "Contract compatibility restored",
                         )
+                    # Update readiness proofs on runtime recovery
+                    _rt_readiness = self._component_status.get(
+                        transition.target, {},
+                    ).get("readiness")
+                    if _rt_readiness is not None:
+                        _rt_readiness["service_proof"] = "pass"
+                        _rt_readiness["contract_proof"] = "pass"
+                        _rt_readiness["composite_status"] = self._component_status.get(
+                            transition.target, {},
+                        ).get("status", "unknown")
+                        _rt_readiness["updated_at"] = datetime.now().isoformat()
         else:
             for name, result in results.items():
                 if result.ok:
