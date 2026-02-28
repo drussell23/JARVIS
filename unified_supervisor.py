@@ -77784,6 +77784,24 @@ class JarvisSystemKernel:
                     except Exception:
                         pass  # Health endpoint not available yet
 
+                # v277.0: Propagate health-polled progress to dashboard so the
+                # ProgressController's subsystem_progress_pct stays current.
+                # ROOT CAUSE: _await_trinity polls Prime /health for progress
+                # but never wrote it to dashboard._model_loading_state.  The
+                # ProgressController reads subsystem_pct from the dashboard —
+                # with no data there, subsystem_pct stays 0.0, and the 300s
+                # hard cap fires at 80% once the heartbeat plateaus at 79.
+                if model_loading_active and not _gcp_authoritative:
+                    try:
+                        update_dashboard_model_loading(
+                            active=True,
+                            progress_pct=int(current_progress),
+                            stage=current_phase_name or "trinity_loading",
+                            progress_source="health_endpoint",
+                        )
+                    except Exception:
+                        pass
+
                 # Fallback: use dashboard model-loading data only when HTTP poll failed
                 if not _got_v2_data and current_progress == 0.0:
                     _dashboard = _live_dashboard
