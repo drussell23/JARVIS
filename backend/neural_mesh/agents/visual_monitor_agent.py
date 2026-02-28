@@ -1670,7 +1670,16 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             except asyncio.TimeoutError:
                 component_status["ferrari_engine"]["error"] = f"timeout ({ferrari_init_timeout}s)"
                 component_status["ferrari_engine"]["duration"] = time_module.time() - comp_start
-                logger.warning(f"⚠️ Ferrari Engine timeout after {ferrari_init_timeout}s - using fallback")
+                _reason_code = "startup_budget_cap" if init_policy["in_startup"] else "runtime_timeout"
+                _log_fn = logger.info if init_policy["in_startup"] else logger.warning
+                _log_fn(
+                    "Ferrari Engine timeout after %.1fs - using fallback "
+                    "(reason=%s, startup=%s, thrash=%s)",
+                    ferrari_init_timeout,
+                    _reason_code,
+                    init_policy["in_startup"],
+                    init_policy["thrash_state"],
+                )
                 self._fast_capture_engine = None
             except Exception as e:
                 component_status["ferrari_engine"]["error"] = str(e)
@@ -1727,7 +1736,16 @@ class VisualMonitorAgent(BaseNeuralMeshAgent):
             except asyncio.TimeoutError:
                 component_status["detector"]["error"] = f"timeout ({detector_init_timeout}s)"
                 component_status["detector"]["duration"] = time_module.time() - comp_start
-                logger.warning(f"VisualEventDetector timeout after {detector_init_timeout}s")
+                _reason_code = "startup_budget_cap" if init_policy["in_startup"] else "runtime_timeout"
+                _log_fn = logger.info if init_policy["in_startup"] else logger.warning
+                _log_fn(
+                    "VisualEventDetector timeout after %.1fs "
+                    "(reason=%s, startup=%s, thrash=%s)",
+                    detector_init_timeout,
+                    _reason_code,
+                    init_policy["in_startup"],
+                    init_policy["thrash_state"],
+                )
                 self._detector = None
             except Exception as e:
                 component_status["detector"]["error"] = str(e)
