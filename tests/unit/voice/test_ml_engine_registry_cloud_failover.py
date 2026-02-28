@@ -134,3 +134,40 @@ async def test_verify_cloud_backend_ready_uses_startup_authority_contract_timeou
 
     assert ok is False
     assert captured["timeout"] == 12.0
+
+
+@pytest.mark.asyncio
+async def test_startup_backend_probe_timeout_defaults_to_startup_authority_floor(monkeypatch):
+    registry = _make_registry()
+    registry._cloud_endpoint = None
+    registry._cloud_endpoint_source = "none"
+    registry._memory_gate_blocked = False
+    registry._last_routing_reason = ""
+
+    captured = {"timeout": None}
+
+    async def _fake_discovery():
+        return [("https://jarvis-ml.example.run.app", "cloud_run_env")]
+
+    async def _fake_verify_ready(
+        timeout=None,
+        retry_count=None,
+        test_extraction=None,
+        wait_for_ecapa=None,
+        ecapa_wait_timeout=None,
+    ):
+        captured["timeout"] = timeout
+        return False, "synthetic startup probe fail"
+
+    monkeypatch.delenv("JARVIS_ECAPA_STARTUP_PROBE_TIMEOUT", raising=False)
+    monkeypatch.setenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0")
+    monkeypatch.setenv("JARVIS_CLOUD_CONTRACT_TIMEOUT_STARTUP_AUTHORITY", "12.0")
+    monkeypatch.setattr(registry, "_discover_cloud_endpoint_candidates", _fake_discovery)
+    monkeypatch.setattr(registry, "_verify_cloud_backend_ready", _fake_verify_ready)
+    monkeypatch.setattr(registry, "_cloud_endpoint_probe_allowed", lambda _endpoint: True)
+    monkeypatch.setattr(registry, "_is_local_startup_backend_allowed", lambda: (False, "blocked-for-test"))
+
+    result = await registry.determine_startup_backend(source="test")
+
+    assert result["selected_backend"] is None
+    assert captured["timeout"] == 12.0

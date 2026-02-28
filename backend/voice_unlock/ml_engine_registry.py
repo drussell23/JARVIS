@@ -2847,15 +2847,25 @@ class MLEngineRegistry:
             float(
                 os.getenv(
                     "JARVIS_ECAPA_STARTUP_PROBE_TIMEOUT",
-                    os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"),
+                    os.getenv(
+                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_STARTUP_AUTHORITY",
+                        os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"),
+                    ),
                 )
             ),
         )
         verify_retries = max(
             1, int(os.getenv("JARVIS_ECAPA_STARTUP_PROBE_RETRIES", "1"))
         )
+        default_selection_budget = max(10.0, verify_timeout + 2.0)
         selection_budget = max(
-            2.0, float(os.getenv("JARVIS_ECAPA_STARTUP_TOTAL_BUDGET", "10.0"))
+            2.0,
+            float(
+                os.getenv(
+                    "JARVIS_ECAPA_STARTUP_TOTAL_BUDGET",
+                    str(default_selection_budget),
+                )
+            ),
         )
         selection_started_at = time.monotonic()
 
