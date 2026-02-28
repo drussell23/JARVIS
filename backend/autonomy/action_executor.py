@@ -469,7 +469,7 @@ class ActionExecutor:
             "malware",
             "account_takeover",
         }
-        if concern_type in high_risk_concerns:
+        if concern_type in high_risk_concerns and context_resolved:
             logger.warning(f"Security alert: {concern_type} in {app}")
         else:
             # Non-specific alerts are operational signals, not necessarily incidents.
