@@ -72189,6 +72189,21 @@ class JarvisSystemKernel:
             # covers Python overhead, aiohttp session setup, and env var reads.
             _ecapa_probe_base = float(os.environ.get("ECAPA_PROBE_DEADLINE", "4"))
             _ecapa_outer_timeout = _ecapa_probe_base + 2.0
+            _registry_delegate_enabled = os.environ.get(
+                "JARVIS_ECAPA_DELEGATE_TO_ML_REGISTRY",
+                "true",
+            ).lower() in ("1", "true", "yes")
+            if _registry_delegate_enabled:
+                _registry_init_budget = _get_env_float(
+                    "JARVIS_ECAPA_REGISTRY_INIT_TIMEOUT", 4.0
+                )
+                _registry_select_budget = _get_env_float(
+                    "JARVIS_ECAPA_REGISTRY_SELECT_TIMEOUT", 10.0
+                )
+                _ecapa_outer_timeout = max(
+                    _ecapa_outer_timeout,
+                    _registry_init_budget + _registry_select_budget + 2.0,
+                )
             # v265.5: CPU-aware timeout — ECAPA probes (Docker HTTP, Cloud Run
             # HTTP, local SpeechBrain import) all slow under CPU pressure.
             try:
@@ -86605,6 +86620,97 @@ class JarvisSystemKernel:
                 "failure_category": failure_category,
             }
 
+    async def _select_ecapa_backend_via_registry(
+        self,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Delegate startup ECAPA backend authority to ml_engine_registry.
+
+        v277.0: Registry owns endpoint discovery/contract validation/routing.
+        Supervisor consumes that decision instead of running a parallel control
+        plane. If delegation fails, caller can fall back to legacy probes.
+        """
+        delegate_enabled = os.environ.get(
+            "JARVIS_ECAPA_DELEGATE_TO_ML_REGISTRY",
+            "true",
+        ).lower() in ("1", "true", "yes")
+        if not delegate_enabled:
+            return None
+
+        registry_init_timeout = _get_env_float(
+            "JARVIS_ECAPA_REGISTRY_INIT_TIMEOUT", 4.0
+        )
+        registry_select_timeout = _get_env_float(
+            "JARVIS_ECAPA_REGISTRY_SELECT_TIMEOUT", 10.0
+        )
+
+        try:
+            try:
+                from backend.voice_unlock.ml_engine_registry import get_ml_registry
+            except ImportError:
+                from voice_unlock.ml_engine_registry import get_ml_registry
+
+            registry = await asyncio.wait_for(
+                get_ml_registry(),
+                timeout=registry_init_timeout,
+            )
+            self._ml_engine_registry = registry
+            decision = await asyncio.wait_for(
+                registry.determine_startup_backend(
+                    source="unified_supervisor_startup",
+                ),
+                timeout=registry_select_timeout,
+            )
+
+            backend = decision.get("selected_backend")
+            if backend:
+                self.logger.info(
+                    "[ECAPA] Registry authority selected %s (%s)",
+                    backend,
+                    decision.get("decision_reason", "no reason"),
+                )
+                if (
+                    self._ecapa_reprobe_task is not None
+                    and not self._ecapa_reprobe_task.done()
+                ):
+                    self._ecapa_reprobe_task.cancel()
+                    self._ecapa_reprobe_task = None
+                if (
+                    self._ecapa_cloud_warmup_task is not None
+                    and not self._ecapa_cloud_warmup_task.done()
+                ):
+                    self._ecapa_cloud_warmup_task.cancel()
+                    self._ecapa_cloud_warmup_task = None
+                self._update_component_status(
+                    "ecapa_backend",
+                    "running",
+                    f"ECAPA: {backend} (registry authority)",
+                )
+            else:
+                failure = decision.get("failure_category", "UNREACHABLE")
+                self.logger.warning(
+                    "[ECAPA] Registry authority found no startup backend: %s",
+                    decision.get("decision_reason", failure),
+                )
+                self._update_component_status(
+                    "ecapa_backend",
+                    "degraded",
+                    f"ECAPA degraded: {failure}",
+                )
+            return decision
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "[ECAPA] Registry authority timed out "
+                f"(init={registry_init_timeout:.0f}s, select={registry_select_timeout:.0f}s) "
+                "— falling back to supervisor probes"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"[ECAPA] Registry authority failed ({e}) — "
+                "falling back to supervisor probes"
+            )
+        return None
+
     # =========================================================================
     # v223.0: ECAPA BACKEND ORCHESTRATOR
     # =========================================================================
@@ -86635,6 +86741,10 @@ class JarvisSystemKernel:
         if not self.config.ecapa_enabled:
             result["decision_reason"] = "ECAPA disabled by configuration"
             return result
+
+        delegated = await self._select_ecapa_backend_via_registry()
+        if delegated is not None:
+            return delegated
 
         self.logger.info("[ECAPA] Probing backends concurrently...")
 

@@ -385,6 +385,7 @@ class RouteDecisionReason(Enum):
     SEMANTIC_READINESS_FAILED = "semantic_readiness_failed"
     CROSS_PROCESS_FENCED = "cross_process_fenced"
     HYSTERESIS_DWELL = "hysteresis_dwell"
+    STARTUP_PHASE_GATED = "startup_phase_gated"
     PARITY_MISMATCH = "parity_mismatch"
     PARITY_RESTORED = "parity_restored"
 
@@ -1543,6 +1544,20 @@ class MLEngineRegistry:
         # Prevents "ghost recovered/degraded" from out-of-order telemetry.
         self._state_seq: int = 0
 
+        # v277.0: Cross-repo control-plane lease/epoch for ECAPA state writes.
+        # This prevents split-brain state publication when multiple repos/processes
+        # attempt to write cloud_ecapa_state.json concurrently.
+        self._cross_repo_lease_holder: str = (
+            f"jarvis:{os.getpid()}:{int(time.time() * 1000)}"
+        )
+        self._cross_repo_lease_epoch: int = 0
+        self._cross_repo_epoch_seq: int = 0
+
+        # v277.0: Cached Trinity phase snapshot to avoid file I/O on every
+        # recovery poll. Updated at most once per cache TTL.
+        self._phase_cache_value: str = "unknown"
+        self._phase_cache_at: float = 0.0
+
         # v276.5: Cross-process recovery idempotency. File-based token with
         # PID + timestamp + source. Process checks token before starting
         # recovery — if another process is already recovering (token age
@@ -2682,6 +2697,284 @@ class MLEngineRegistry:
         self._cloud_api_last_error = ""
         self._cloud_api_last_cooldown_log_at = 0.0
 
+    def _apply_ecapa_backend_environment(
+        self,
+        backend: str,
+        endpoint: Optional[str],
+    ) -> None:
+        """
+        Publish canonical ECAPA backend env vars from the single authority.
+
+        v277.0: Moves env publication into MLEngineRegistry to avoid split
+        control planes between unified_supervisor and ml_engine_registry.
+        """
+        normalized_endpoint = (endpoint or "").strip()
+        if backend == "docker":
+            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = normalized_endpoint
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "true"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "docker"
+        elif backend == "cloud_run":
+            os.environ["JARVIS_CLOUD_ML_ENDPOINT"] = normalized_endpoint
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "cloud_run"
+        elif backend == "local":
+            os.environ["JARVIS_DOCKER_ECAPA_ACTIVE"] = "false"
+            os.environ["JARVIS_ECAPA_BACKEND"] = "local"
+
+    def _classify_endpoint_backend(self, endpoint: str, source: str) -> str:
+        """Classify endpoint candidate into docker vs cloud_run backend."""
+        normalized = (endpoint or "").strip().rstrip("/")
+        source_norm = (source or "").lower()
+
+        if "docker" in source_norm:
+            return "docker"
+        if normalized.startswith("http://127.0.0.1:") or normalized.startswith(
+            "http://localhost:"
+        ):
+            _docker_active = os.getenv("JARVIS_DOCKER_ECAPA_ACTIVE", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            _backend_env = os.getenv("JARVIS_ECAPA_BACKEND", "")
+            if _docker_active or _backend_env == "docker":
+                return "docker"
+
+        return "cloud_run"
+
+    def _read_supervisor_system_phase(self) -> str:
+        """
+        Read Trinity-published supervisor phase (startup/runtime/shutdown).
+
+        Uses a short in-memory cache to keep recovery loops inexpensive.
+        """
+        now = time.time()
+        cache_ttl = max(
+            0.1, float(os.getenv("JARVIS_SYSTEM_PHASE_CACHE_TTL", "1.0"))
+        )
+        if (now - self._phase_cache_at) <= cache_ttl:
+            return self._phase_cache_value
+
+        phase = "unknown"
+        phase_file = Path.home() / ".jarvis" / "trinity" / "state" / "system_phase.json"
+        try:
+            if phase_file.exists():
+                import json
+
+                payload = json.loads(phase_file.read_text())
+                phase = str(payload.get("phase", "unknown")).strip().lower() or "unknown"
+        except Exception:
+            phase = "unknown"
+
+        self._phase_cache_value = phase
+        self._phase_cache_at = now
+        return phase
+
+    def _startup_phase_allows_ecapa_recovery(self, source: str) -> bool:
+        """
+        Decide whether ECAPA recovery may run during startup phases.
+
+        v277.0: Prevents deferred recovery from competing with heavy startup
+        phases (notably Two-Tier) under constrained CPU/memory conditions.
+        """
+        allow_during_startup = os.getenv(
+            "JARVIS_ECAPA_RECOVERY_DURING_STARTUP", "false"
+        ).lower() in ("1", "true", "yes")
+        if allow_during_startup:
+            return True
+
+        phase = self._read_supervisor_system_phase()
+        if phase != "startup":
+            return True
+
+        source_norm = (source or "").lower()
+        if source_norm.startswith("deferred_poll_") or source_norm.startswith(
+            "memory_recovery_callback"
+        ):
+            return False
+        return True
+
+    def _is_local_startup_backend_allowed(self) -> Tuple[bool, str]:
+        """Determine whether local backend is admissible at startup."""
+        try:
+            import backend.core.memory_quantizer as _mq_mod
+            from backend.core.memory_quantizer import MemoryTier
+
+            _mq = _mq_mod._memory_quantizer_instance
+            if _mq is not None:
+                _thrash = getattr(_mq, "_thrash_state", "unknown")
+                _tier = getattr(_mq, "current_tier", None)
+                _tier_value = (
+                    _tier.value if hasattr(_tier, "value") else str(_tier or "unknown")
+                )
+                if _thrash == "emergency":
+                    return False, "memory_blocked_local:thrash=emergency"
+                if _tier in (MemoryTier.CRITICAL, MemoryTier.EMERGENCY):
+                    return False, f"memory_blocked_local:tier={_tier_value}"
+                return True, f"memory_ok:thrash={_thrash},tier={_tier_value}"
+        except Exception:
+            pass
+
+        use_cloud, _, reason = MLConfig.check_memory_pressure()
+        return (not use_cloud), f"mlconfig:{reason}"
+
+    async def determine_startup_backend(
+        self,
+        source: str = "unified_supervisor",
+    ) -> Dict[str, Any]:
+        """
+        Select and apply ECAPA backend for startup from a single authority.
+
+        v277.0: Canonical startup backend selector used by unified_supervisor.
+        Eliminates duplicated probe/policy logic across modules.
+        """
+        result: Dict[str, Any] = {
+            "selected_backend": None,
+            "endpoint": None,
+            "decision_reason": "",
+            "failure_category": None,
+            "probes": {},
+        }
+
+        if not MLConfig.ENABLE_ECAPA:
+            result["decision_reason"] = "ECAPA disabled by configuration"
+            result["failure_category"] = "DISABLED"
+            return result
+
+        force_backend = os.getenv("JARVIS_ECAPA_FORCE_BACKEND", "").strip().lower()
+        verify_timeout = max(
+            1.0,
+            float(
+                os.getenv(
+                    "JARVIS_ECAPA_STARTUP_PROBE_TIMEOUT",
+                    os.getenv("JARVIS_CLOUD_CONTRACT_TIMEOUT", "4.0"),
+                )
+            ),
+        )
+        verify_retries = max(
+            1, int(os.getenv("JARVIS_ECAPA_STARTUP_PROBE_RETRIES", "1"))
+        )
+        selection_budget = max(
+            2.0, float(os.getenv("JARVIS_ECAPA_STARTUP_TOTAL_BUDGET", "10.0"))
+        )
+        selection_started_at = time.monotonic()
+
+        candidates = await self._discover_cloud_endpoint_candidates()
+        if force_backend in ("docker", "cloud_run"):
+            preferred: List[Tuple[str, str]] = []
+            deferred: List[Tuple[str, str]] = []
+            for endpoint, cand_source in candidates:
+                target_backend = self._classify_endpoint_backend(endpoint, cand_source)
+                if target_backend == force_backend:
+                    preferred.append((endpoint, cand_source))
+                else:
+                    deferred.append((endpoint, cand_source))
+            candidates = preferred + deferred
+
+        last_failure_reason = "no_cloud_candidate"
+        for endpoint, cand_source in candidates:
+            elapsed = time.monotonic() - selection_started_at
+            if elapsed >= selection_budget:
+                last_failure_reason = (
+                    f"startup_selection_budget_exhausted:{elapsed:.1f}s/{selection_budget:.1f}s"
+                )
+                break
+
+            normalized = endpoint.strip().rstrip("/")
+            if not normalized:
+                continue
+
+            candidate_backend = self._classify_endpoint_backend(normalized, cand_source)
+            probe_key = f"{candidate_backend}:{cand_source}:{normalized}"
+
+            if not self._cloud_endpoint_probe_allowed(normalized):
+                result["probes"][probe_key] = {
+                    "ready": False,
+                    "reason": "endpoint_backoff_active",
+                }
+                continue
+
+            self._set_cloud_endpoint(normalized, f"{cand_source}|startup_authority")
+            self._use_cloud = True
+            self._cloud_verified = False
+            remaining_budget = max(
+                1.0,
+                selection_budget - (time.monotonic() - selection_started_at),
+            )
+            candidate_timeout = min(verify_timeout, remaining_budget)
+
+            ready, verify_msg = await self._verify_cloud_backend_ready(
+                timeout=candidate_timeout,
+                retry_count=verify_retries,
+                test_extraction=False,
+                wait_for_ecapa=False,
+                ecapa_wait_timeout=candidate_timeout,
+            )
+            result["probes"][probe_key] = {"ready": ready, "reason": verify_msg}
+            if ready:
+                self._memory_gate_blocked = False
+                self._last_routing_reason = f"startup_selected:{candidate_backend}"
+                self._apply_ecapa_backend_environment(candidate_backend, normalized)
+                result["selected_backend"] = candidate_backend
+                result["endpoint"] = normalized
+                result["decision_reason"] = (
+                    f"startup authority selected {candidate_backend} "
+                    f"(source={cand_source})"
+                )
+                result["failure_category"] = None
+                return result
+
+            last_failure_reason = verify_msg
+            self._record_cloud_endpoint_failure(
+                normalized,
+                reason=f"Startup verification failed: {verify_msg}",
+            )
+
+        local_allowed, local_reason = self._is_local_startup_backend_allowed()
+        if force_backend == "local" and not local_allowed:
+            result["decision_reason"] = (
+                f"forced local backend rejected by admission gate: {local_reason}"
+            )
+            result["failure_category"] = "MEMORY_BLOCKED"
+            self._set_cloud_endpoint(None, "none")
+            self._use_cloud = False
+            self._cloud_verified = False
+            return result
+
+        if force_backend in ("docker", "cloud_run"):
+            if result["selected_backend"] is None:
+                result["decision_reason"] = (
+                    f"forced backend '{force_backend}' unavailable: {last_failure_reason}"
+                )
+                result["failure_category"] = "UNREACHABLE"
+                self._set_cloud_endpoint(None, "none")
+                self._use_cloud = False
+                self._cloud_verified = False
+                return result
+
+        if local_allowed:
+            self._set_cloud_endpoint(None, "none")
+            self._use_cloud = False
+            self._cloud_verified = False
+            self._memory_gate_blocked = False
+            self._last_routing_reason = "startup_selected:local"
+            self._apply_ecapa_backend_environment("local", None)
+            result["selected_backend"] = "local"
+            result["endpoint"] = None
+            result["decision_reason"] = f"startup authority selected local ({local_reason})"
+            result["failure_category"] = None
+            return result
+
+        self._set_cloud_endpoint(None, "none")
+        self._use_cloud = False
+        self._cloud_verified = False
+        result["decision_reason"] = (
+            "no startup backend available: "
+            f"cloud={last_failure_reason}, local={local_reason}"
+        )
+        result["failure_category"] = "UNREACHABLE"
+        return result
+
     async def _discover_cloud_endpoint_candidates(self) -> List[Tuple[str, str]]:
         """
         Discover candidate cloud endpoints in priority order.
@@ -3178,6 +3471,14 @@ class MLEngineRegistry:
                 if contract_ok:
                     self._set_cloud_endpoint(endpoint, source)
                     self._use_cloud = True
+                    backend_kind = self._classify_endpoint_backend(
+                        self._cloud_endpoint or "",
+                        self._cloud_endpoint_source,
+                    )
+                    self._apply_ecapa_backend_environment(
+                        backend_kind,
+                        self._cloud_endpoint,
+                    )
                     logger.info(
                         f"☁️  Cloud routing activated for ML operations → {self._cloud_endpoint} "
                         f"(source={self._cloud_endpoint_source})"
@@ -3194,6 +3495,7 @@ class MLEngineRegistry:
 
             self._set_cloud_endpoint(None, "none")
             self._use_cloud = False
+            self._apply_ecapa_backend_environment("local", None)
             logger.info("☁️  No ECAPA-compatible cloud endpoint discovered — staying in local mode")
             return False
 
@@ -3599,6 +3901,72 @@ class MLEngineRegistry:
 
         return True, "Cloud backend healthy (extraction test skipped)"
 
+    def _acquire_cross_repo_state_lease(self) -> Optional[Dict[str, Any]]:
+        """
+        Acquire/renew file-based lease for cross-repo ECAPA state publication.
+
+        v277.0: Adds epoch fencing so concurrent writers cannot silently
+        clobber state with stale transitions.
+        """
+        import json
+
+        now = time.time()
+        ttl = max(5.0, float(os.getenv("JARVIS_ECAPA_STATE_LEASE_TTL", "15.0")))
+        cross_repo_dir = Path.home() / ".jarvis" / "cross_repo"
+        cross_repo_dir.mkdir(parents=True, exist_ok=True)
+        lease_file = cross_repo_dir / "cloud_ecapa_state_lease.json"
+
+        try:
+            for _ in range(3):
+                existing: Optional[Dict[str, Any]] = None
+                if lease_file.exists():
+                    try:
+                        existing = json.loads(lease_file.read_text())
+                    except Exception:
+                        existing = None
+
+                existing_holder = str((existing or {}).get("holder", "")).strip()
+                existing_epoch = int((existing or {}).get("epoch", 0) or 0)
+                existing_renewed = float((existing or {}).get("last_renewed", 0.0) or 0.0)
+                lease_expired = (now - existing_renewed) > ttl
+
+                if existing_holder and existing_holder != self._cross_repo_lease_holder and not lease_expired:
+                    return None
+
+                if existing_holder == self._cross_repo_lease_holder:
+                    epoch = max(existing_epoch, self._cross_repo_lease_epoch)
+                    acquired_at = float((existing or {}).get("acquired_at", now) or now)
+                else:
+                    epoch = max(existing_epoch + 1, self._cross_repo_lease_epoch + 1, 1)
+                    acquired_at = now
+
+                lease_payload = {
+                    "holder": self._cross_repo_lease_holder,
+                    "epoch": epoch,
+                    "acquired_at": acquired_at,
+                    "last_renewed": now,
+                    "ttl": ttl,
+                    "source_repo": "jarvis",
+                    "pid": os.getpid(),
+                }
+
+                tmp_file = lease_file.with_suffix(".tmp")
+                tmp_file.write_text(json.dumps(lease_payload, indent=2))
+                tmp_file.rename(lease_file)
+
+                observed = json.loads(lease_file.read_text())
+                if (
+                    str(observed.get("holder", "")).strip() == self._cross_repo_lease_holder
+                    and int(observed.get("epoch", 0) or 0) == epoch
+                ):
+                    self._cross_repo_lease_epoch = epoch
+                    return observed
+
+            return None
+        except Exception as e:
+            logger.debug(f"[v277.0] Failed to acquire ECAPA state lease: {e}")
+            return None
+
     async def _write_cross_repo_ecapa_state(
         self,
         is_ready: bool,
@@ -3619,11 +3987,18 @@ class MLEngineRegistry:
         """
         try:
             import json
-            from pathlib import Path
+
+            lease = self._acquire_cross_repo_state_lease()
+            if lease is None:
+                logger.debug(
+                    "[v277.0] Cross-repo ECAPA state write skipped: lease held by another process"
+                )
+                return
+
+            self._cross_repo_epoch_seq += 1
 
             cross_repo_dir = Path.home() / ".jarvis" / "cross_repo"
             cross_repo_dir.mkdir(parents=True, exist_ok=True)
-
             state_file = cross_repo_dir / "cloud_ecapa_state.json"
 
             state = {
@@ -3640,24 +4015,36 @@ class MLEngineRegistry:
                 "reason": reason,
                 "source_repo": "jarvis",
                 "pid": os.getpid(),
-                "version": "v276.5",
+                "version": "v277.0",
                 # v276.4: Embedding parity tracking
                 "parity": self.get_parity_status(),
                 "routing_reason": self._last_routing_reason,
-                # v276.5: Monotonic state sequence for event ordering
+                # v276.5: local monotonic sequence (retained for compatibility)
                 "state_seq": self._state_seq,
                 "routing_policy": self._routing_policy.value,
+                # v277.0: cross-process ordering
+                "control_plane_holder": lease.get("holder"),
+                "control_plane_epoch": int(lease.get("epoch", 0) or 0),
+                "control_plane_seq": self._cross_repo_epoch_seq,
+                "control_plane_lease_ttl": float(lease.get("ttl", 0.0) or 0.0),
+                "control_plane_last_renewed": float(
+                    lease.get("last_renewed", 0.0) or 0.0
+                ),
             }
 
-            # Atomic write with temp file
             tmp_file = state_file.with_suffix(".tmp")
             tmp_file.write_text(json.dumps(state, indent=2))
             tmp_file.rename(state_file)
 
-            logger.debug(f"[v115.0] Cross-repo ECAPA state written: ready={is_ready}")
+            logger.debug(
+                "[v277.0] Cross-repo ECAPA state written: ready=%s epoch=%s seq=%s",
+                is_ready,
+                state["control_plane_epoch"],
+                state["control_plane_seq"],
+            )
 
         except Exception as e:
-            logger.debug(f"[v115.0] Failed to write cross-repo ECAPA state: {e}")
+            logger.debug(f"[v277.0] Failed to write cross-repo ECAPA state: {e}")
 
     async def _read_cross_repo_ecapa_state(self) -> Optional[Dict[str, Any]]:
         """
@@ -3688,16 +4075,45 @@ class MLEngineRegistry:
                 logger.debug(f"[v115.0] Cross-repo ECAPA state too old ({state_age:.1f}s > {max_age}s)")
                 return None
 
-            # v276.5: Reject stale events — if the file's state_seq is
-            # older than our current seq, another process wrote a state
-            # that predates our latest transition. Ignore it.
-            file_seq = state.get("state_seq", 0)
-            if file_seq < self._state_seq:
-                logger.debug(
-                    f"[v276.5] Cross-repo state has stale seq "
-                    f"({file_seq} < {self._state_seq}) — rejecting"
+            # v277.0: Cross-process staleness check using lease epoch + per-epoch seq.
+            # Legacy writers may not include control_plane_* fields; keep compatibility.
+            file_epoch = int(state.get("control_plane_epoch", 0) or 0)
+            file_cp_seq = int(
+                state.get(
+                    "control_plane_seq",
+                    state.get("state_seq", 0),
                 )
-                return None
+                or 0
+            )
+            source_repo = str(state.get("source_repo", "unknown")).strip().lower()
+
+            if source_repo == "jarvis":
+                if file_epoch and file_epoch < self._cross_repo_lease_epoch:
+                    logger.debug(
+                        "[v277.0] Rejecting stale jarvis ECAPA state epoch "
+                        f"({file_epoch} < {self._cross_repo_lease_epoch})"
+                    )
+                    return None
+                if (
+                    file_epoch
+                    and file_epoch == self._cross_repo_lease_epoch
+                    and file_cp_seq < self._cross_repo_epoch_seq
+                ):
+                    logger.debug(
+                        "[v277.0] Rejecting stale jarvis ECAPA state seq "
+                        f"({file_cp_seq} < {self._cross_repo_epoch_seq})"
+                    )
+                    return None
+
+                # Update local watermark from accepted state.
+                if file_epoch > self._cross_repo_lease_epoch:
+                    self._cross_repo_lease_epoch = file_epoch
+                    self._cross_repo_epoch_seq = file_cp_seq
+                elif file_epoch == self._cross_repo_lease_epoch:
+                    self._cross_repo_epoch_seq = max(
+                        self._cross_repo_epoch_seq,
+                        file_cp_seq,
+                    )
 
             logger.info(f"[v115.0] Found recent cross-repo ECAPA state from {state.get('source_repo', 'unknown')} ({state_age:.1f}s ago)")
             return state
@@ -3794,9 +4210,15 @@ class MLEngineRegistry:
                                     "container instead of loading locally"
                                 )
                                 self._use_cloud = True
-                                self._cloud_endpoint = _docker_url
-                                self._cloud_endpoint_source = "docker_container_fallback"
+                                self._set_cloud_endpoint(
+                                    _docker_url,
+                                    "docker_container_fallback",
+                                )
                                 self._cloud_verified = True
+                                self._apply_ecapa_backend_environment(
+                                    "docker",
+                                    self._cloud_endpoint,
+                                )
                                 return True
             except Exception as _docker_err:
                 logger.debug(
@@ -3813,6 +4235,7 @@ class MLEngineRegistry:
         # Disable cloud mode
         self._use_cloud = False
         self._cloud_verified = False
+        self._apply_ecapa_backend_environment("local", None)
 
         # Check if ECAPA engine is registered
         if "ecapa_tdnn" not in self._engines:
@@ -3945,6 +4368,18 @@ class MLEngineRegistry:
         if self.is_ready:
             self._last_routing_reason = "already_ready"
             return True
+
+        # ── Guard: startup phase contention gate ──
+        # During supervisor startup, defer non-critical ECAPA recovery loops
+        # so they do not contend with heavy integration phases.
+        if not self._startup_phase_allows_ecapa_recovery(source):
+            self._last_routing_reason = "startup_phase_gated"
+            self._record_routing_decision(RouteDecisionReason.STARTUP_PHASE_GATED)
+            logger.info(
+                f"[v277.0] ECAPA recovery gated during startup "
+                f"(source={source}, phase={self._read_supervisor_system_phase()})"
+            )
+            return False
 
         # ── Guard: idempotency lock (non-blocking check) ──
         if self._recovery_lock.locked():
@@ -4870,6 +5305,14 @@ class MLEngineRegistry:
         if new_backend == "cloud":
             self._use_cloud = True
             self._memory_gate_blocked = False
+            backend_kind = self._classify_endpoint_backend(
+                self._cloud_endpoint or "",
+                self._cloud_endpoint_source,
+            )
+            self._apply_ecapa_backend_environment(
+                backend_kind,
+                self._cloud_endpoint,
+            )
             logger.info(
                 f"[v276.5] State reconciled → cloud "
                 f"(source={source}, seq={seq})"
@@ -4878,6 +5321,7 @@ class MLEngineRegistry:
             self._use_cloud = False
             self._cloud_verified = False
             self._memory_gate_blocked = False
+            self._apply_ecapa_backend_environment("local", None)
             logger.info(
                 f"[v276.5] State reconciled → local "
                 f"(source={source}, seq={seq})"
@@ -5088,6 +5532,9 @@ class MLEngineRegistry:
             poll_interval = float(os.getenv(
                 "JARVIS_ECAPA_RECOVERY_POLL_INTERVAL", "30.0"
             ))
+            startup_poll_interval = float(
+                os.getenv("JARVIS_ECAPA_RECOVERY_STARTUP_POLL_INTERVAL", "5.0")
+            )
             max_attempts = int(os.getenv(
                 "JARVIS_ECAPA_RECOVERY_MAX_ATTEMPTS", "20"
             ))
@@ -5099,6 +5546,10 @@ class MLEngineRegistry:
             )
 
             while attempt < max_attempts:
+                if self._read_supervisor_system_phase() == "startup":
+                    await asyncio.sleep(max(1.0, startup_poll_interval))
+                    continue
+
                 await asyncio.sleep(poll_interval)
                 attempt += 1
 
@@ -5169,53 +5620,61 @@ class MLEngineRegistry:
         logger.warning("   Cloud Run service will handle ECAPA embedding extraction")
         logger.warning("=" * 70)
 
-        endpoint_candidate = self._cloud_endpoint
-        if not endpoint_candidate:
-            endpoint_candidate = os.getenv(
-                "JARVIS_CLOUD_ECAPA_ENDPOINT",
-                os.getenv("JARVIS_ML_CLOUD_ENDPOINT", None),
+        candidates = await self._discover_cloud_endpoint_candidates()
+        if not candidates:
+            logger.error("❌ No cloud endpoint candidates available for fallback")
+            logger.error(
+                "   Configure JARVIS_CLOUD_ECAPA_ENDPOINT(S) or JARVIS_ML_CLOUD_ENDPOINT(S)"
             )
-
-        if not endpoint_candidate:
-            region = os.getenv("GCP_REGION", "us-central1")
-            service_name = os.getenv("GCP_ECAPA_SERVICE", "jarvis-ml")
-            logger.warning("   No cloud endpoint configured - checking for Cloud Run URL...")
-
-            cloud_run_urls = [
-                os.getenv("CLOUD_RUN_ECAPA_URL"),
-                f"https://{service_name}-pvalxny6iq-uc.a.run.app",
-                f"https://{service_name}-888774109345.{region}.run.app",
-            ]
-
-            for url in cloud_run_urls:
-                if url:
-                    endpoint_candidate = url
-                    logger.info(f"   Trying cloud endpoint: {url}")
-                    break
-
-        if endpoint_candidate:
-            self._set_cloud_endpoint(endpoint_candidate, "fallback_to_cloud")
-
-        if not self._cloud_endpoint:
-            logger.error("❌ No cloud endpoint available for fallback")
-            logger.error("   Set JARVIS_CLOUD_ECAPA_ENDPOINT environment variable")
             return False
 
-        logger.info(f"   Cloud endpoint: {self._cloud_endpoint}")
+        verify_timeout = float(os.getenv("JARVIS_ECAPA_CLOUD_TIMEOUT", "15.0"))
+        verify_retries = int(os.getenv("JARVIS_ECAPA_CLOUD_RETRIES", "3"))
+        last_error = "no candidate attempted"
 
-        # Enable cloud mode
-        self._use_cloud = True
-        self._cloud_verified = False
+        for endpoint_candidate, endpoint_source in candidates:
+            normalized = endpoint_candidate.strip().rstrip("/")
+            if not normalized:
+                continue
+            if not self._cloud_endpoint_probe_allowed(normalized):
+                logger.debug(
+                    "Skipping fallback candidate %s (source=%s): endpoint backoff active",
+                    normalized,
+                    endpoint_source,
+                )
+                continue
 
-        # Verify the cloud backend is actually ready
-        try:
-            cloud_ready, verify_msg = await self._verify_cloud_backend_ready(
-                timeout=float(os.getenv("JARVIS_ECAPA_CLOUD_TIMEOUT", "15.0")),
-                retry_count=int(os.getenv("JARVIS_ECAPA_CLOUD_RETRIES", "3")),
-                test_extraction=True  # Always test extraction for fallback
+            self._set_cloud_endpoint(
+                normalized,
+                f"{endpoint_source}|fallback_to_cloud",
+            )
+            self._use_cloud = True
+            self._cloud_verified = False
+            logger.info(
+                "   Trying cloud fallback candidate: %s (source=%s)",
+                self._cloud_endpoint,
+                self._cloud_endpoint_source,
             )
 
+            try:
+                cloud_ready, verify_msg = await self._verify_cloud_backend_ready(
+                    timeout=verify_timeout,
+                    retry_count=verify_retries,
+                    test_extraction=True,  # Always test extraction for fallback
+                )
+            except Exception as e:
+                cloud_ready = False
+                verify_msg = f"exception:{type(e).__name__}: {e}"
+
             if cloud_ready:
+                backend_kind = self._classify_endpoint_backend(
+                    self._cloud_endpoint or "",
+                    self._cloud_endpoint_source,
+                )
+                self._apply_ecapa_backend_environment(
+                    backend_kind,
+                    self._cloud_endpoint,
+                )
                 logger.info("=" * 70)
                 logger.info("✅ CLOUD FALLBACK SUCCESS: Cloud ECAPA activated")
                 logger.info("=" * 70)
@@ -5224,24 +5683,29 @@ class MLEngineRegistry:
                 logger.info("   All ECAPA operations will use cloud backend")
                 logger.info("=" * 70)
                 return True
-            else:
-                logger.error("=" * 70)
-                logger.error("❌ CLOUD FALLBACK FAILED: Cloud verification failed")
-                logger.error("=" * 70)
-                logger.error(f"   Reason: {verify_msg}")
-                logger.error("   Voice unlock will not work until ECAPA is available")
-                logger.error("=" * 70)
-                self._use_cloud = False
-                self._cloud_verified = False
-                return False
 
-        except Exception as e:
-            logger.error(f"❌ Cloud fallback exception: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self._use_cloud = False
-            self._cloud_verified = False
-            return False
+            last_error = verify_msg
+            self._record_cloud_endpoint_failure(
+                normalized,
+                reason=f"Fallback verification failed: {verify_msg}",
+            )
+            logger.warning(
+                "⚠️ Cloud fallback candidate failed: %s (source=%s): %s",
+                normalized,
+                endpoint_source,
+                verify_msg,
+            )
+
+        logger.error("=" * 70)
+        logger.error("❌ CLOUD FALLBACK FAILED: Cloud verification failed")
+        logger.error("=" * 70)
+        logger.error(f"   Reason: {last_error}")
+        logger.error("   Voice unlock will not work until ECAPA is available")
+        logger.error("=" * 70)
+        self._set_cloud_endpoint(None, "none")
+        self._use_cloud = False
+        self._cloud_verified = False
+        return False
 
     def get_ecapa_status(self) -> Dict[str, Any]:
         """
@@ -6126,6 +6590,11 @@ class MLEngineRegistry:
         """
         self._set_cloud_endpoint(endpoint, "manual")
         self._use_cloud = True
+        backend_kind = self._classify_endpoint_backend(
+            self._cloud_endpoint or "",
+            self._cloud_endpoint_source,
+        )
+        self._apply_ecapa_backend_environment(backend_kind, self._cloud_endpoint)
         logger.info(f"☁️  Cloud endpoint set to: {self._cloud_endpoint}")
 
     async def switch_to_cloud(self, reason: str = "Manual switch") -> bool:
@@ -6159,6 +6628,8 @@ class MLEngineRegistry:
 
         logger.info(f"🏠 Switching to local ML: {reason}")
         self._use_cloud = False
+        self._cloud_verified = False
+        self._apply_ecapa_backend_environment("local", None)
         return True
 
     async def activate_cloud_routing(self) -> bool:
