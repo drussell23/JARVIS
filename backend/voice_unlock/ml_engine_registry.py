@@ -1141,6 +1141,77 @@ class ECAPATDNNWrapper(MLEngineWrapper):
             logger.warning(f"   [{self.name}] Warmup wrapper failed: {e}")
             return False
 
+    async def extract_speaker_embedding(self, audio_data: Any) -> Optional[Any]:
+        """Extract speaker embedding from audio data.
+
+        Delegates to the underlying SpeechBrain EncoderClassifier via
+        thread-safe engine acquisition.  Audio format handling uses
+        _coerce_audio_to_float32() which supports WAV bytes, raw PCM,
+        numpy arrays, and torch tensors.
+
+        Args:
+            audio_data: Audio in any format accepted by _coerce_audio_to_float32()
+                        (WAV bytes, int16 PCM, float32 bytes, numpy, torch tensor)
+
+        Returns:
+            192-dimensional numpy embedding, or None on failure.
+        """
+        if not self.is_loaded:
+            logger.debug("[%s] Cannot extract — engine not loaded", self.name)
+            return None
+
+        try:
+            import numpy as np
+            import torch
+
+            engine_ref = self.acquire_engine()
+            try:
+                def _extract_sync():
+                    audio_array = _coerce_audio_to_float32(audio_data)
+                    if audio_array is None or len(audio_array) == 0:
+                        raise RuntimeError(
+                            f"Audio conversion failed "
+                            f"(type={type(audio_data).__name__}, "
+                            f"len={len(audio_data) if hasattr(audio_data, '__len__') else '?'})"
+                        )
+                    audio_tensor = torch.tensor(
+                        audio_array, dtype=torch.float32,
+                    ).unsqueeze(0)
+                    with torch.no_grad():
+                        embedding = engine_ref.encode_batch(audio_tensor)
+                    return embedding.squeeze().detach().clone().cpu().numpy().copy()
+
+                embedding = await asyncio.to_thread(_extract_sync)
+            finally:
+                self.release_engine()
+
+            if embedding is not None:
+                if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
+                    logger.warning("[%s] Embedding contains NaN/Inf — rejecting", self.name)
+                    return None
+                emb_norm = float(np.linalg.norm(embedding))
+                if emb_norm < 1e-8:
+                    logger.warning(
+                        "[%s] Embedding near-zero (norm=%.2e) — rejecting",
+                        self.name, emb_norm,
+                    )
+                    return None
+
+            return embedding
+
+        except EngineNotAvailableError:
+            logger.debug("[%s] Engine not available for extraction", self.name)
+            return None
+        except Exception as e:
+            logger.warning(
+                "[%s] Embedding extraction failed: %s "
+                "(input type=%s, len=%s)",
+                self.name, e,
+                type(audio_data).__name__,
+                len(audio_data) if hasattr(audio_data, '__len__') else '?',
+            )
+            return None
+
 
 class SpeechBrainSTTWrapper(MLEngineWrapper):
     """
@@ -4069,8 +4140,12 @@ class MLEngineRegistry:
 
                 try:
                     import struct
+                    import numpy as np
 
-                    # Generate same 1s 16kHz silence WAV as cloud path
+                    # Generate 1s 16kHz low-amplitude noise WAV.
+                    # Silence (all zeros) produces near-zero embeddings that
+                    # fail the standard zero-norm validation in extract_speaker_embedding.
+                    # Matches warmup pattern (np.random.randn * 0.3).
                     _sr = 16000
                     _ns = _sr
                     _wav = bytearray()
@@ -4082,7 +4157,8 @@ class MLEngineRegistry:
                                             _sr * 2, 2, 16))
                     _wav.extend(b'data')
                     _wav.extend(struct.pack('<I', _ds))
-                    _wav.extend(b'\x00' * _ds)
+                    _noise = (np.random.randn(_ns).astype(np.float32) * 0.1 * 32767).astype(np.int16)
+                    _wav.extend(_noise.tobytes())
 
                     test_result = await asyncio.wait_for(
                         ecapa.extract_speaker_embedding(bytes(_wav)),
