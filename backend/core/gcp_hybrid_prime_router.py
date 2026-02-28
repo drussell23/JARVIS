@@ -3326,6 +3326,31 @@ class GCPHybridPrimeRouter:
                 timeout_ms=self._get_timeout_for_tier(force_tier),
             )
 
+        # v280.4: During EMERGENCY memory offload, skip local entirely.
+        # is_cloud_locked() returns True when _emergency_offload_active=True
+        # (set by _memory_pressure_monitor when RAM > EMERGENCY_UNLOAD_RAM_PERCENT).
+        # Routing locally during EMERGENCY thrash worsens the crisis — each
+        # inference allocates KV cache + activations, causing more page faults.
+        if self.is_cloud_locked():
+            self.logger.info(
+                "[v280.4] Emergency offload active — skipping local, "
+                "routing to cloud/GCP"
+            )
+            # Prefer GCP VM if available, else Cloud Claude
+            if self._gcp_controller and self._check_circuit_breaker(RoutingTier.GCP_VM):
+                gcp_decision = await self._check_gcp_availability(estimated_tokens)
+                if gcp_decision:
+                    self._metrics.gcp_requests += 1
+                    return gcp_decision
+            self._metrics.cloud_requests += 1
+            return RoutingDecision(
+                tier=RoutingTier.CLOUD_CLAUDE,
+                reason=RoutingReason.FALLBACK,
+                estimated_cost=self._estimate_claude_cost(estimated_tokens),
+                timeout_ms=CLOUD_API_TIMEOUT_MS,
+                metadata={"emergency_offload": True},
+            )
+
         # v266.0: If local model is being swapped (thrash cascade), use cloud.
         # _model_swapping lives on PrimeLocalClient, not UnifiedModelServing.
         try:

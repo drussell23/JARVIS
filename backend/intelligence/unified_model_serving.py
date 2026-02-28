@@ -3416,10 +3416,35 @@ class UnifiedModelServing:
                 error="No suitable model providers available",
             )
 
+        # v280.4: During memory EMERGENCY, skip PRIME_LOCAL entirely.
+        # Local inference allocates KV cache + activations, worsening the
+        # thrash crisis in a positive feedback loop.
+        _skip_local = False
+        try:
+            import backend.core.memory_quantizer as _mq_gen_mod
+            _mq_gen = _mq_gen_mod._memory_quantizer_instance
+            if _mq_gen is not None:
+                _skip_local = (
+                    getattr(_mq_gen, "_thrash_state", "healthy") == "emergency"
+                )
+        except Exception:
+            pass
+
         last_error = None
         fallback_used = False
 
         for i, provider in enumerate(providers):
+            # v280.4: Skip local providers during memory emergency
+            if _skip_local and provider in (
+                ModelProvider.PRIME_LOCAL,
+            ):
+                self.logger.debug(
+                    "[v280.4] Skipping %s — memory EMERGENCY thrash",
+                    provider.value,
+                )
+                fallback_used = True
+                continue
+
             # Check circuit breaker
             if not self._circuit_breaker.can_execute(provider.value):
                 self.logger.debug(f"Circuit open for {provider.value}, skipping")
@@ -3483,8 +3508,26 @@ class UnifiedModelServing:
             yield "[Error: No suitable model providers available]"
             return
 
+        # v280.4: During memory EMERGENCY, skip PRIME_LOCAL (same as generate()).
+        _skip_local_stream = False
+        try:
+            import backend.core.memory_quantizer as _mq_stream_mod
+            _mq_stream = _mq_stream_mod._memory_quantizer_instance
+            if _mq_stream is not None:
+                _skip_local_stream = (
+                    getattr(_mq_stream, "_thrash_state", "healthy") == "emergency"
+                )
+        except Exception:
+            pass
+
         last_error = None
         for provider in providers:
+            # v280.4: Skip local during memory emergency
+            if _skip_local_stream and provider in (
+                ModelProvider.PRIME_LOCAL,
+            ):
+                continue
+
             if not self._circuit_breaker.can_execute(provider.value):
                 continue
 

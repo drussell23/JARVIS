@@ -359,7 +359,18 @@ class PrimeRouter:
         return self._cloud_client
 
     def _decide_route(self) -> RoutingDecision:
-        """v242.0: GCP-promoted routes to GCP_PRIME (120s timeout, no probe)."""
+        """v280.4: Memory-aware routing — skips local during EMERGENCY thrash."""
+        # v280.4: During memory EMERGENCY, do NOT attempt local inference.
+        # Local inference allocates memory (KV cache, activations) which
+        # triggers more page faults, worsening the crisis in a positive
+        # feedback loop.  Route to GCP_PRIME if promoted, else CLOUD_CLAUDE.
+        if self._is_memory_emergency():
+            if self._gcp_promoted:
+                return RoutingDecision.GCP_PRIME
+            if self._config.enable_cloud_fallback:
+                return RoutingDecision.CLOUD_CLAUDE
+            return RoutingDecision.DEGRADED
+
         prime_available = (
             self._prime_client is not None and
             self._prime_client.is_available
@@ -380,6 +391,40 @@ class PrimeRouter:
         if self._config.prefer_local:
             return RoutingDecision.HYBRID
         return RoutingDecision.LOCAL_PRIME
+
+    # -----------------------------------------------------------------
+    # v280.4: Memory-aware routing gate
+    # -----------------------------------------------------------------
+
+    def _is_memory_emergency(self) -> bool:
+        """Check if system is in EMERGENCY memory thrash.
+
+        Uses cached result for 2 seconds to avoid repeated MemoryQuantizer
+        access on the hot inference path.
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_mem_emergency_last_check", 0.0) < 2.0:
+            return getattr(self, "_mem_emergency_cached", False)
+
+        is_emergency = False
+        try:
+            # Check MemoryQuantizer thrash state (authoritative source)
+            import backend.core.memory_quantizer as _mq_mod
+            _mq = _mq_mod._memory_quantizer_instance
+            if _mq is not None:
+                is_emergency = getattr(_mq, "_thrash_state", "healthy") == "emergency"
+        except Exception:
+            pass
+
+        if not is_emergency:
+            # Fallback: check env var set by GCPHybridPrimeRouter
+            is_emergency = os.environ.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() in (
+                "1", "true",
+            )
+
+        self._mem_emergency_last_check = now
+        self._mem_emergency_cached = is_emergency
+        return is_emergency
 
     # -----------------------------------------------------------------
     # v271.0: Flapping protection
