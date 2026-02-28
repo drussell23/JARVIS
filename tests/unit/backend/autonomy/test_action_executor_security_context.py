@@ -61,8 +61,11 @@ def test_resolve_security_context_uses_alias_fields(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_handle_security_alert_general_unknown_is_not_warning(caplog: pytest.LogCaptureFixture):
-    executor = _make_executor(pytest.MonkeyPatch())
+async def test_handle_security_alert_general_unknown_is_not_warning(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    executor = _make_executor(monkeypatch)
     action = _make_action(target="unknown", params={"concern_type": "general"})
 
     with caplog.at_level(logging.INFO):
