@@ -1,7 +1,12 @@
 import pytest
 
 from backend.core import memory_quantizer as mq_mod
-from backend.core.memory_quantizer import MemoryQuantizer, MemoryTier
+from backend.core.memory_quantizer import (
+    MemoryMetrics,
+    MemoryPressure,
+    MemoryQuantizer,
+    MemoryTier,
+)
 
 
 @pytest.mark.asyncio
@@ -100,3 +105,55 @@ async def test_thrash_does_not_recover_healthy_above_healthy_floor(monkeypatch):
     quantizer._pagein_rate_ema = 322
     await quantizer._check_thrash_state()
     assert quantizer._thrash_state == "thrashing"
+
+
+@pytest.mark.asyncio
+async def test_panic_spike_requires_corroboration_by_default(monkeypatch):
+    quantizer = MemoryQuantizer(config={})
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_WARNING", 500)
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_EMERGENCY", 2000)
+    monkeypatch.setattr(mq_mod, "THRASH_SUSTAINED_SECONDS", 10)
+    monkeypatch.setattr(mq_mod, "THRASH_EMERGENCY_SUSTAINED_SECONDS", 10)
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_PANIC_MULTIPLIER", 4.0)
+    monkeypatch.setattr(mq_mod, "THRASH_PANIC_REQUIRE_CORROBORATION", True)
+    monkeypatch.setattr(mq_mod, "THRASH_PANIC_CORROBORATION_EMA_RATIO", 0.7)
+
+    # Raw panic spike with low EMA and no critical memory/tier should not
+    # immediately force emergency.
+    quantizer._pagein_rate = 9000
+    quantizer._pagein_rate_ema = 200
+    quantizer._thrash_warning_since = 100.0
+    quantizer._thrash_emergency_since = 100.0
+    monkeypatch.setattr(mq_mod.time, "time", lambda: 105.0)
+    await quantizer._check_thrash_state()
+    assert quantizer._thrash_state == "healthy"
+
+    # Sustained emergency-level signal still escalates deterministically.
+    monkeypatch.setattr(mq_mod.time, "time", lambda: 121.0)
+    await quantizer._check_thrash_state()
+    assert quantizer._thrash_state == "emergency"
+
+
+@pytest.mark.asyncio
+async def test_panic_spike_escalates_immediately_with_critical_pressure(monkeypatch):
+    quantizer = MemoryQuantizer(config={})
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_EMERGENCY", 2000)
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_PANIC_MULTIPLIER", 4.0)
+    monkeypatch.setattr(mq_mod, "THRASH_PANIC_REQUIRE_CORROBORATION", True)
+    monkeypatch.setattr(mq_mod, "THRASH_PANIC_CORROBORATION_EMA_RATIO", 0.7)
+    monkeypatch.setattr(mq_mod.time, "time", lambda: 500.0)
+
+    quantizer.current_metrics = MemoryMetrics(
+        timestamp=500.0,
+        process_memory_gb=1.0,
+        system_memory_gb=16.0,
+        system_memory_percent=92.0,
+        system_memory_available_gb=1.2,
+        tier=MemoryTier.CRITICAL,
+        pressure=MemoryPressure.CRITICAL,
+    )
+    quantizer._pagein_rate = 9000
+    quantizer._pagein_rate_ema = 200
+
+    await quantizer._check_thrash_state()
+    assert quantizer._thrash_state == "emergency"

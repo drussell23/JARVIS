@@ -71,6 +71,13 @@ THRASH_PAGEIN_PANIC_MULTIPLIER = float(
     os.getenv("THRASH_PAGEIN_PANIC_MULTIPLIER", "4.0")
 )
 THRASH_PAGEIN_EMA_ALPHA = float(os.getenv("THRASH_PAGEIN_EMA_ALPHA", "0.35"))
+THRASH_PANIC_REQUIRE_CORROBORATION = (
+    os.getenv("THRASH_PANIC_REQUIRE_CORROBORATION", "true").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+THRASH_PANIC_CORROBORATION_EMA_RATIO = float(
+    os.getenv("THRASH_PANIC_CORROBORATION_EMA_RATIO", "0.70")
+)
 
 
 # ============================================================================
@@ -1297,7 +1304,35 @@ class MemoryQuantizer:
         old_state = self._thrash_state
 
         panic_threshold = THRASH_PAGEIN_EMERGENCY * max(1.0, THRASH_PAGEIN_PANIC_MULTIPLIER)
-        if raw_rate >= panic_threshold:
+        panic_candidate = raw_rate >= panic_threshold
+        panic_ema_floor = THRASH_PAGEIN_EMERGENCY * max(
+            0.1,
+            min(1.0, THRASH_PANIC_CORROBORATION_EMA_RATIO),
+        )
+        metrics = self.current_metrics
+        pressure_critical = bool(
+            metrics
+            and getattr(metrics, "pressure", MemoryPressure.UNKNOWN) == MemoryPressure.CRITICAL
+        )
+        tier_critical = bool(
+            metrics
+            and getattr(metrics, "tier", MemoryTier.OPTIMAL) in {MemoryTier.CRITICAL, MemoryTier.EMERGENCY}
+        )
+        panic_confirmed = (
+            panic_candidate
+            and (
+                not THRASH_PANIC_REQUIRE_CORROBORATION
+                or smoothed_rate >= panic_ema_floor
+                or pressure_critical
+                or tier_critical
+            )
+        )
+
+        # Panic path is only immediate when corroborated by a second signal.
+        # This prevents single-sample vm_stat spikes from bypassing sustained
+        # emergency gating while preserving deterministic hard-escalation under
+        # genuine pressure.
+        if panic_confirmed:
             new_state = "emergency"
             self._thrash_emergency_since = now
             self._thrash_warning_since = now
