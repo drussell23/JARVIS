@@ -79547,6 +79547,7 @@ class JarvisSystemKernel:
                             "jarvis_prime", "running",
                             f"Starting J-Prime from {prime_status.get('repo_path', 'unknown')[:30]}..."
                         )
+                        self._component_status["jarvis_prime"]["_running_since_mono"] = time.monotonic()
                     else:
                         self._update_component_status("jarvis_prime", "skipped", "J-Prime not configured")
 
@@ -79555,6 +79556,7 @@ class JarvisSystemKernel:
                             "reactor_core", "running",
                             f"Starting Reactor-Core from {reactor_status.get('repo_path', 'unknown')[:30]}..."
                         )
+                        self._component_status["reactor_core"]["_running_since_mono"] = time.monotonic()
                     else:
                         self._update_component_status("reactor_core", "skipped", "Reactor-Core not configured")
 
@@ -79639,8 +79641,39 @@ class JarvisSystemKernel:
                                 self.logger.error(f"[Trinity]   \u2717 {comp_key}: ERROR (startup failed)")
 
                 # Log start results
-                started_count = sum(1 for v in results.values() if v)
-                total_count = len(results) if results else 0
+                # Separate diagnostic metadata from component results.
+                # Synthetic results from GCP late-arrival (v271.1) mix both
+                # namespaces (_gcp_health_verified alongside jarvis-prime).
+                # Long-term: refactor start_components() to return
+                # {"components": {...}, "diagnostics": {...}}.
+                def _split_trinity_results(
+                    raw: Optional[Dict[str, Any]],
+                ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                    """Split raw Trinity results into component and diagnostic dicts."""
+                    components: Dict[str, Any] = {}
+                    diagnostics: Dict[str, Any] = {}
+                    for k, v in (raw or {}).items():
+                        if k.startswith("_"):
+                            diagnostics[k] = v
+                        else:
+                            components[k] = v
+                    return components, diagnostics
+
+                _component_results, _diagnostic_results = _split_trinity_results(results)
+
+                # Log diagnostics at appropriate level (not component-failure)
+                for _dk, _dv in _diagnostic_results.items():
+                    _diag_label = _dk.lstrip("_").replace("_", " ")
+                    if _dv:
+                        self.logger.debug("[Trinity] diagnostic: %s = OK", _diag_label)
+                    else:
+                        self.logger.info(
+                            "[Trinity] diagnostic: %s = not verified (informational)",
+                            _diag_label,
+                        )
+
+                started_count = sum(1 for v in _component_results.values() if v)
+                total_count = len(_component_results)
                 
                 # v222.0: _trinity_startup_timed_out is already set by either path above
                 # No need to compute it again
@@ -79650,9 +79683,22 @@ class JarvisSystemKernel:
                     f"{started_count}/{max(total_count, 1)} Trinity components ready"
                 )
 
+                # Initialize 3-proof readiness for both Trinity components
+                # before processing results, so the structure is always present.
+                for _init_key in ("jarvis_prime", "reactor_core"):
+                    self._component_status.setdefault(_init_key, {})["readiness"] = {
+                        "process_proof": "unknown",
+                        "service_proof": "pending",
+                        "contract_proof": "pending",
+                        "composite_status": self._component_status.get(
+                            _init_key, {},
+                        ).get("status", "pending"),
+                        "updated_at": datetime.now().isoformat(),
+                    }
+
                 if started_count > 0:
                     self.logger.success(f"[Trinity] 🚀 {started_count}/{total_count} component(s) started")
-                    for component, started in results.items():
+                    for component, started in _component_results.items():
                         if started:
                             self.logger.success(f"[Trinity]   ✓ {component}: RUNNING")
                             # v182.0: Update component status based on results
@@ -79667,11 +79713,67 @@ class JarvisSystemKernel:
                             elif "reactor" in component.lower():
                                 self._update_component_status("reactor_core", "error", "Reactor-Core failed to start")
 
+                        # Update process proof in 3-proof readiness
+                        _proof_key = (
+                            "jarvis_prime" if "prime" in component.lower()
+                            else "reactor_core" if "reactor" in component.lower()
+                            else None
+                        )
+                        if _proof_key:
+                            _readiness = self._component_status.get(
+                                _proof_key, {},
+                            ).get("readiness")
+                            if _readiness is not None:
+                                _readiness["process_proof"] = (
+                                    "confirmed" if started else "failed"
+                                )
+                                _readiness["updated_at"] = datetime.now().isoformat()
+
                     if _trinity_lock_conflict:
                         trinity_status = "degraded"
                         trinity_status_message = (
                             f"{started_count}/{max(total_count, 1)} Trinity components active "
                             "(cross-repo lock held by peer supervisor)"
+                        )
+
+                    # Reconcile: components set to "running" at spawn-intent but
+                    # absent from Trinity results.  We don't know launch fate
+                    # (never spawned / spawned-and-crashed / still initializing),
+                    # so mark "degraded" (not "error") to avoid over-assertion.
+                    _reconcile_grace_s = _get_env_float(
+                        "JARVIS_TRINITY_RECONCILE_GRACE_S", 15.0,
+                    )
+                    for _reconcile_key in ("jarvis_prime", "reactor_core"):
+                        _rec_entry = self._component_status.get(_reconcile_key, {})
+                        _rec_status = _rec_entry.get("status")
+                        if _rec_status != "running":
+                            continue
+                        # Use monotonic timestamp (set in Step 3a) for grace period
+                        _running_since = _rec_entry.get("_running_since_mono", 0.0)
+                        _elapsed = time.monotonic() - _running_since
+                        if _elapsed < _reconcile_grace_s:
+                            self.logger.debug(
+                                "[Trinity] %s: within grace period (%.0fs < %.0fs), "
+                                "deferring reconciliation to runtime monitor",
+                                _reconcile_key.replace("_", "-"),
+                                _elapsed,
+                                _reconcile_grace_s,
+                            )
+                            continue
+                        _rec_name = _reconcile_key.replace("_", "-")
+                        self._update_component_status(
+                            _reconcile_key,
+                            "degraded",
+                            f"No Trinity outcome for {_rec_name} — "
+                            f"endpoint may be unreachable at configured address",
+                        )
+                        self.logger.info(
+                            "[Trinity] %s: no outcome in results — marked degraded "
+                            "(runtime monitor checks every %.0fs)",
+                            _rec_name,
+                            _get_env_float(
+                                "JARVIS_RUNTIME_CONTRACT_MONITOR_INTERVAL_S", 45.0,
+                            ),
                         )
 
                     # =====================================================================
@@ -79689,7 +79791,7 @@ class JarvisSystemKernel:
 
                     # v261.0: If J-Prime was started (by prewarm or Trinity), ensure watcher is running
                     _jprime_started = any(
-                        "prime" in k.lower() and v for k, v in results.items()
+                        "prime" in k.lower() and v for k, v in _component_results.items()
                     )
                     if (_jprime_started and
                             (self._jprime_watcher_task is None or self._jprime_watcher_task.done())):
@@ -79774,7 +79876,7 @@ class JarvisSystemKernel:
 
                 # Voice narration for Trinity components
                 if self._narrator:
-                    for component, connected in results.items():
+                    for component, connected in _component_results.items():
                         try:
                             await self._narrator.narrate_trinity_status(
                                 component=component,
