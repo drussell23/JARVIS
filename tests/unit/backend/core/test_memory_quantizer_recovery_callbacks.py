@@ -80,3 +80,23 @@ async def test_thrash_emergency_requires_sustained_signal(monkeypatch):
     await quantizer._check_thrash_state()
     assert quantizer._thrash_state == "emergency"
     assert states[-1] == "emergency"
+
+
+@pytest.mark.asyncio
+async def test_thrash_does_not_recover_healthy_above_healthy_floor(monkeypatch):
+    quantizer = MemoryQuantizer(config={})
+    quantizer._thrash_state = "thrashing"
+    quantizer._thrash_warning_since = 0.0
+    quantizer._thrash_emergency_since = 0.0
+    quantizer._thrash_recovery_since = 0.0
+
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_HEALTHY", 100)
+    monkeypatch.setattr(mq_mod, "THRASH_PAGEIN_WARNING", 500)
+    monkeypatch.setattr(mq_mod, "THRASH_RECOVERY_SUSTAINED_SECONDS", 5)
+    monkeypatch.setattr(mq_mod.time, "time", lambda: 200.0)
+
+    # Elevated but sub-warning pageins should keep thrashing state.
+    quantizer._pagein_rate = 322
+    quantizer._pagein_rate_ema = 322
+    await quantizer._check_thrash_state()
+    assert quantizer._thrash_state == "thrashing"

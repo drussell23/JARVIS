@@ -1328,6 +1328,18 @@ class MemoryQuantizer:
                 return
             else:
                 return  # Still accumulating sustained readings
+        elif rate > THRASH_PAGEIN_HEALTHY:
+            # Deadband: below warning but still above healthy floor.
+            # Do not claim full recovery while pageins remain elevated.
+            self._thrash_warning_since = 0.0
+            self._thrash_emergency_since = 0.0
+            self._thrash_recovery_since = 0.0
+            if old_state == "emergency":
+                new_state = "thrashing"
+            elif old_state == "thrashing":
+                return
+            else:
+                new_state = "healthy"
         else:
             self._thrash_warning_since = 0.0
             self._thrash_emergency_since = 0.0
@@ -1342,7 +1354,8 @@ class MemoryQuantizer:
 
         if new_state != old_state:
             self._thrash_state = new_state
-            logger.warning(
+            log_fn = logger.warning if new_state in {"thrashing", "emergency"} else logger.info
+            log_fn(
                 f"[ThrashDetect] State change: {old_state} -> {new_state} "
                 f"(pageins/sec: raw={raw_rate:.0f}, ema={smoothed_rate:.0f})"
             )
