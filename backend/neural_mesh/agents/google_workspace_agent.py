@@ -3028,6 +3028,10 @@ Return ONLY a JSON object with these keys (use null if not found):
         visual_context = payload.get("visual_context")
         query = payload.get("query", "")
         deadline = payload.get("deadline_monotonic")
+        request_id = payload.get("request_id")
+        correlation_id = payload.get("correlation_id")
+        node_id = payload.get("node_id")
+        idempotency_key = payload.get("idempotency_key")
 
         logger.debug(f"GoogleWorkspaceAgent executing: {action}")
 
@@ -3040,6 +3044,10 @@ Return ONLY a JSON object with these keys (use null if not found):
                     "error": "deadline_exceeded",
                     "response": "Workspace request timed out before execution.",
                     "workspace_action": action or "unknown",
+                    "request_id": request_id,
+                    "correlation_id": correlation_id,
+                    "node_id": node_id,
+                    "idempotency_key": idempotency_key,
                 }
 
         # Auth recovery: instant actionable response when permanently failed
@@ -3055,6 +3063,10 @@ Return ONLY a JSON object with these keys (use null if not found):
                     "Please run: python3 backend/scripts/google_oauth_setup.py"
                 ),
                 "workspace_action": action or "unknown",
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "node_id": node_id,
+                "idempotency_key": idempotency_key,
             }
 
         # v3.0: Resolve entities from visual context if present
@@ -3087,36 +3099,44 @@ Return ONLY a JSON object with these keys (use null if not found):
 
         # Route to appropriate handler
         if action == "fetch_unread_emails":
-            return await self._fetch_unread_emails(payload)
+            result = await self._fetch_unread_emails(payload)
         elif action == "search_email":
-            return await self._search_email(payload)
+            result = await self._search_email(payload)
         elif action == "draft_email_reply":
             # v10.0: Check for visual execution mode preference
             if execution_mode in ("visual_preferred", "visual_only"):
-                return await self._draft_email_visual(payload)
-            return await self._draft_email(payload)
+                result = await self._draft_email_visual(payload)
+            else:
+                result = await self._draft_email(payload)
         elif action == "send_email":
-            return await self._send_email(payload)
+            result = await self._send_email(payload)
         elif action == "check_calendar_events":
-            return await self._check_calendar(payload)
+            result = await self._check_calendar(payload)
         elif action == "create_calendar_event":
-            return await self._create_event(payload)
+            result = await self._create_event(payload)
         elif action == "create_document":
-            return await self._create_document(payload)
+            result = await self._create_document(payload)
         elif action == "get_contacts":
-            return await self._get_contacts(payload)
+            result = await self._get_contacts(payload)
         elif action == "workspace_summary":
-            return await self._get_workspace_summary(payload)
+            result = await self._get_workspace_summary(payload)
         elif action == "daily_briefing":
-            return await self._get_workspace_summary(payload)
+            result = await self._get_workspace_summary(payload)
         elif action == "handle_workspace_query":
-            return await self._handle_natural_query(payload)
+            result = await self._handle_natural_query(payload)
         elif action == "read_spreadsheet":
-            return await self._read_spreadsheet(payload)
+            result = await self._read_spreadsheet(payload)
         elif action == "write_spreadsheet":
-            return await self._write_spreadsheet(payload)
+            result = await self._write_spreadsheet(payload)
         else:
             raise ValueError(f"Unknown workspace action: {action}")
+
+        if isinstance(result, dict):
+            result.setdefault("request_id", request_id)
+            result.setdefault("correlation_id", correlation_id)
+            result.setdefault("node_id", node_id)
+            result.setdefault("idempotency_key", idempotency_key)
+        return result
 
     async def _fetch_unread_emails(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """

@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +24,26 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+try:
+    from backend.core.idempotency_registry import (
+        check_idempotent,
+        complete_tracked_operation,
+        fail_tracked_operation,
+        start_tracked_operation,
+    )
+except Exception:  # pragma: no cover - fail-open fallback
+    def check_idempotent(*args, **kwargs):
+        return True
+
+    def start_tracked_operation(*args, **kwargs):
+        return uuid.uuid4().hex
+
+    def complete_tracked_operation(*args, **kwargs):
+        return None
+
+    def fail_tracked_operation(*args, **kwargs):
+        return None
 
 # =============================================================================
 # v88.0: ULTRA COORDINATOR INTEGRATION
@@ -2384,18 +2405,7 @@ class UnifiedCommandProcessor:
         self, command_text: str, response: Any,
         deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Route workspace commands to GoogleWorkspaceAgent with direct action dispatch.
-
-        v266.0: Cures 3 root diseases:
-        - Disease 1: Reads response.suggested_actions[0] for direct routing
-          instead of forcing agent to re-classify via keyword waterfall.
-        - Disease 3: Lazy singleton calls on_initialize() for proper lifecycle.
-        - Disease 5: Wraps execute_task() in asyncio.wait_for() for deadline
-          enforcement, preventing zombie API calls.
-
-        Falls back to 'handle_workspace_query' (keyword detector) when
-        suggested_actions is empty (brain vacuum, old J-Prime, etc).
-        """
+        """Route workspace commands through a dependency-aware execution DAG."""
         import time as _time
 
         if deadline:
@@ -2436,15 +2446,14 @@ class UnifiedCommandProcessor:
                     "source": getattr(response, 'source', 'unknown'),
                 }
 
-            # v277.0: Plan-based multi-action dispatch (Disease 5 cure).
-            # Build action plan from ALL suggested_actions, not just [0].
-            # Validates each against agent capabilities (single source of truth).
-            workspace_actions = []
+            # Build action list from all suggested actions and validate against capabilities.
+            workspace_actions: List[str] = []
             agent_capabilities = getattr(agent, 'capabilities', set())
             if hasattr(response, 'suggested_actions') and response.suggested_actions:
                 for candidate in response.suggested_actions:
                     if candidate in agent_capabilities:
-                        workspace_actions.append(candidate)
+                        if candidate not in workspace_actions:
+                            workspace_actions.append(candidate)
                     else:
                         logger.debug(
                             f"[v277] suggested_action '{candidate}' not in agent capabilities, skipped"
@@ -2452,59 +2461,390 @@ class UnifiedCommandProcessor:
             if not workspace_actions:
                 workspace_actions = ["handle_workspace_query"]
 
-            # Enforce caller budget at UCP level and propagate absolute deadline
-            # into workspace agent so inner operations can cooperatively budget.
-            if deadline:
-                remaining = deadline - _time.monotonic()
-            else:
-                try:
-                    remaining = float(os.getenv("JARVIS_WORKSPACE_ACTION_TIMEOUT", "30.0"))
-                except (TypeError, ValueError):
-                    remaining = 30.0
+            request_id = (
+                getattr(response, "request_id", None)
+                or getattr(response, "id", None)
+                or uuid.uuid4().hex
+            )
+            correlation_id = getattr(response, "correlation_id", None) or request_id
 
-            # Execute plan with deadline budget
-            results: List[Tuple[str, dict]] = []
-            for action in workspace_actions:
+            try:
+                default_timeout_s = float(os.getenv("JARVIS_WORKSPACE_ACTION_TIMEOUT", "30.0"))
+            except (TypeError, ValueError):
+                default_timeout_s = 30.0
+            try:
+                max_parallelism = max(1, int(os.getenv("JARVIS_WORKSPACE_MAX_PARALLELISM", "3")))
+            except (TypeError, ValueError):
+                max_parallelism = 3
+            inflight_policy = str(
+                os.getenv("JARVIS_WORKSPACE_INFLIGHT_POLICY", "wait_then_duplicate")
+            ).strip().lower()
+            if inflight_policy not in {"duplicate", "wait_then_duplicate"}:
+                inflight_policy = "wait_then_duplicate"
+            try:
+                inflight_wait_ms = max(
+                    0,
+                    int(os.getenv("JARVIS_WORKSPACE_INFLIGHT_WAIT_MS", "1500")),
+                )
+            except (TypeError, ValueError):
+                inflight_wait_ms = 1500
+            try:
+                inflight_poll_ms = max(
+                    25,
+                    int(os.getenv("JARVIS_WORKSPACE_INFLIGHT_POLL_MS", "100")),
+                )
+            except (TypeError, ValueError):
+                inflight_poll_ms = 100
+
+            side_effect_actions = {
+                "send_email",
+                "create_calendar_event",
+                "create_document",
+                "draft_email_reply",
+            }
+            action_output_key = {
+                "fetch_unread_emails": "emails",
+                "search_email": "search_results",
+                "check_calendar_events": "calendar_events",
+                "workspace_summary": "workspace_summary",
+                "daily_briefing": "workspace_summary",
+                "draft_email_reply": "email_draft",
+                "send_email": "email_send",
+                "create_calendar_event": "calendar_event",
+                "get_contacts": "contacts",
+                "create_document": "document",
+                "handle_workspace_query": "workspace_query",
+            }
+            action_timeout_ms = {
+                "fetch_unread_emails": 6000,
+                "search_email": 6000,
+                "check_calendar_events": 6000,
+                "workspace_summary": 8000,
+                "daily_briefing": 8000,
+                "draft_email_reply": 10000,
+                "send_email": 10000,
+                "create_calendar_event": 10000,
+                "create_document": 15000,
+                "get_contacts": 5000,
+                "handle_workspace_query": 8000,
+            }
+
+            # Build workspace action DAG.
+            plan_nodes: List[Dict[str, Any]] = []
+            first_node_for_action: Dict[str, str] = {}
+            for idx, action in enumerate(workspace_actions):
+                node_id = f"n{idx + 1}"
+                first_node_for_action.setdefault(action, node_id)
+                plan_nodes.append(
+                    {
+                        "node_id": node_id,
+                        "action": action,
+                        "depends_on": [],
+                        "can_parallelize": action not in side_effect_actions,
+                        "timeout_ms": action_timeout_ms.get(action, int(default_timeout_s * 1000)),
+                        "side_effect": action in side_effect_actions,
+                        "output_key": action_output_key.get(action),
+                    }
+                )
+
+            for node in plan_nodes:
+                action = node["action"]
+                if action == "draft_email_reply" and "fetch_unread_emails" in first_node_for_action:
+                    dep = first_node_for_action["fetch_unread_emails"]
+                    if dep != node["node_id"]:
+                        node["depends_on"].append(dep)
+                if action == "send_email" and "draft_email_reply" in first_node_for_action:
+                    dep = first_node_for_action["draft_email_reply"]
+                    if dep != node["node_id"]:
+                        node["depends_on"].append(dep)
+
+            artifacts: Dict[str, Dict[str, Any]] = {}
+            node_outcomes: Dict[str, Dict[str, Any]] = {}
+            pending: Dict[str, Dict[str, Any]] = {n["node_id"]: n for n in plan_nodes}
+            terminal_auth_error: Optional[Dict[str, Any]] = None
+
+            def _node_status_satisfies_dependencies(status: str) -> bool:
+                return status in {"success", "duplicate"}
+
+            async def _execute_workspace_node(node: Dict[str, Any]) -> Dict[str, Any]:
+                node_id = node["node_id"]
+                action = node["action"]
+                started_at = _time.time()
+
                 if deadline:
                     remaining = deadline - _time.monotonic()
-                    if remaining <= 1.0:
-                        results.append((action, {"error": "deadline_exceeded", "skipped": True}))
-                        logger.warning(f"[v277] Skipping action '{action}' — deadline exceeded")
-                        break
+                    if remaining <= 0:
+                        result_dict = {"error": "deadline_exceeded", "skipped": True}
+                        return {
+                            "node_id": node_id,
+                            "action": action,
+                            "status": "timeout",
+                            "started_at": started_at,
+                            "ended_at": _time.time(),
+                            "result": result_dict,
+                        }
+                else:
+                    remaining = default_timeout_s
 
-                timeout = max(remaining if deadline else 30.0, 1.0)
-                task_payload = {
+                per_node_timeout_s = max(1.0, min(node["timeout_ms"] / 1000.0, remaining))
+                idempotency_key = f"{correlation_id}:{node_id}:{action}"
+                operation_token: Optional[str] = None
+
+                if node["side_effect"]:
+                    dedup_resource = correlation_id or command_text[:120]
+                    is_new = check_idempotent(action, dedup_resource, nonce=idempotency_key)
+                    if not is_new:
+                        duplicate_result = {
+                            "workspace_action": action,
+                            "skipped": True,
+                            "duplicate": True,
+                            "error_code": "duplicate_suppressed",
+                            "request_id": request_id,
+                            "correlation_id": correlation_id,
+                            "node_id": node_id,
+                            "idempotency_key": idempotency_key,
+                        }
+                        return {
+                            "node_id": node_id,
+                            "action": action,
+                            "status": "duplicate",
+                            "started_at": started_at,
+                            "ended_at": _time.time(),
+                            "result": duplicate_result,
+                        }
+
+                    operation_token = start_tracked_operation(
+                        action,
+                        f"{correlation_id}:{action}:{node_id}",
+                        timeout_s=per_node_timeout_s,
+                    )
+                    if operation_token is None:
+                        wait_attempted = False
+                        waited_ms = 0
+                        if inflight_policy == "wait_then_duplicate" and inflight_wait_ms > 0:
+                            wait_attempted = True
+                            wait_window_s = min(
+                                per_node_timeout_s,
+                                max(0.0, inflight_wait_ms / 1000.0),
+                            )
+                            started_wait = _time.monotonic()
+                            while (_time.monotonic() - started_wait) < wait_window_s:
+                                if deadline and (deadline - _time.monotonic()) <= 0:
+                                    break
+                                await asyncio.sleep(inflight_poll_ms / 1000.0)
+                                operation_token = start_tracked_operation(
+                                    action,
+                                    f"{correlation_id}:{action}:{node_id}",
+                                    timeout_s=per_node_timeout_s,
+                                )
+                                if operation_token is not None:
+                                    break
+                            waited_ms = int((_time.monotonic() - started_wait) * 1000)
+
+                        if operation_token is not None:
+                            logger.debug(
+                                "[workspace-dag] Re-acquired in-flight token after wait "
+                                "(action=%s, node=%s, waited_ms=%s)",
+                                action,
+                                node_id,
+                                waited_ms,
+                            )
+                        else:
+                            logger.debug(
+                                "[workspace-dag] Duplicate in-flight suppressed "
+                                "(action=%s, node=%s, policy=%s, waited_ms=%s)",
+                                action,
+                                node_id,
+                                inflight_policy,
+                                waited_ms,
+                            )
+                        duplicate_result = {
+                            "workspace_action": action,
+                            "skipped": True,
+                            "duplicate": True,
+                            "error_code": "duplicate_inflight",
+                            "request_id": request_id,
+                            "correlation_id": correlation_id,
+                            "node_id": node_id,
+                            "idempotency_key": idempotency_key,
+                            "inflight_policy": inflight_policy,
+                            "wait_attempted": wait_attempted,
+                            "waited_ms": waited_ms,
+                            "retry_after_ms": inflight_poll_ms,
+                        }
+                        if operation_token is None:
+                            return {
+                                "node_id": node_id,
+                                "action": action,
+                                "status": "duplicate",
+                                "started_at": started_at,
+                                "ended_at": _time.time(),
+                                "result": duplicate_result,
+                            }
+
+                payload = {
                     "action": action,
                     "query": command_text,
                     "deadline_monotonic": deadline,
+                    "request_id": request_id,
+                    "correlation_id": correlation_id,
+                    "node_id": node_id,
+                    "idempotency_key": idempotency_key,
+                    "upstream_outputs": dict(artifacts),
                 }
 
                 try:
-                    result = await asyncio.wait_for(
-                        agent.execute_task(task_payload),
-                        timeout=timeout,
+                    raw_result = await asyncio.wait_for(
+                        agent.execute_task(payload),
+                        timeout=per_node_timeout_s,
                     )
-                    result_dict = result if isinstance(result, dict) else {"response": str(result)}
+                    result_dict = raw_result if isinstance(raw_result, dict) else {
+                        "response": str(raw_result),
+                        "workspace_action": action,
+                    }
+
+                    if operation_token:
+                        complete_tracked_operation(operation_token)
+
+                    status = "failed" if result_dict.get("error") else "success"
+                    return {
+                        "node_id": node_id,
+                        "action": action,
+                        "status": status,
+                        "started_at": started_at,
+                        "ended_at": _time.time(),
+                        "result": result_dict,
+                    }
                 except asyncio.TimeoutError:
-                    result_dict = {"error": "deadline_exceeded", "skipped": True}
-                    logger.warning(f"[v277] Action '{action}' timed out")
+                    if operation_token:
+                        fail_tracked_operation(operation_token)
+                    result_dict = {"error": "deadline_exceeded", "skipped": True, "workspace_action": action}
+                    logger.warning(f"[workspace-dag] Action '{action}' timed out")
+                    return {
+                        "node_id": node_id,
+                        "action": action,
+                        "status": "timeout",
+                        "started_at": started_at,
+                        "ended_at": _time.time(),
+                        "result": result_dict,
+                    }
+                except Exception as exc:
+                    if operation_token:
+                        fail_tracked_operation(operation_token)
+                    logger.warning(f"[workspace-dag] Action '{action}' failed: {exc}")
+                    return {
+                        "node_id": node_id,
+                        "action": action,
+                        "status": "failed",
+                        "started_at": started_at,
+                        "ended_at": _time.time(),
+                        "result": {
+                            "error": str(exc),
+                            "workspace_action": action,
+                        },
+                    }
 
-                results.append((action, result_dict))
+            while pending:
+                ready_nodes = [
+                    node
+                    for node in pending.values()
+                    if all(
+                        dep_id in node_outcomes
+                        and _node_status_satisfies_dependencies(node_outcomes[dep_id]["status"])
+                        for dep_id in node["depends_on"]
+                    )
+                ]
+                ready_nodes.sort(key=lambda n: n["node_id"])
 
-                # Stop on auth failure (affects all subsequent actions)
-                if result_dict.get("error_code") in ("needs_reauth", "auth_missing"):
+                if not ready_nodes:
+                    for node in sorted(pending.values(), key=lambda n: n["node_id"]):
+                        dep_states = {
+                            dep_id: node_outcomes.get(dep_id, {}).get("status", "missing")
+                            for dep_id in node["depends_on"]
+                        }
+                        node_outcomes[node["node_id"]] = {
+                            "node_id": node["node_id"],
+                            "action": node["action"],
+                            "status": "skipped",
+                            "started_at": _time.time(),
+                            "ended_at": _time.time(),
+                            "result": {
+                                "error": "dependency_failed",
+                                "error_code": "dependency_failed",
+                                "dependency_states": dep_states,
+                                "workspace_action": node["action"],
+                            },
+                        }
+                    pending.clear()
                     break
 
-            # Combine results from all executed actions
-            summaries = []
+                batch: List[Dict[str, Any]] = []
+                for node in ready_nodes:
+                    if len(batch) >= max_parallelism:
+                        break
+                    if not node["can_parallelize"] and batch:
+                        continue
+                    batch.append(node)
+                    if not node["can_parallelize"]:
+                        break
+
+                batch_outcomes = await asyncio.gather(
+                    *[_execute_workspace_node(node) for node in batch],
+                    return_exceptions=False,
+                )
+
+                for outcome in batch_outcomes:
+                    node_id = outcome["node_id"]
+                    node_outcomes[node_id] = outcome
+                    pending.pop(node_id, None)
+                    result_dict = outcome.get("result", {}) or {}
+
+                    node = next((n for n in plan_nodes if n["node_id"] == node_id), None)
+                    if (
+                        node
+                        and outcome["status"] in {"success", "duplicate"}
+                        and node.get("output_key")
+                    ):
+                        artifacts[node["output_key"]] = result_dict
+
+                    if result_dict.get("error_code") in ("needs_reauth", "auth_missing"):
+                        terminal_auth_error = result_dict
+
+                if terminal_auth_error:
+                    for node in sorted(pending.values(), key=lambda n: n["node_id"]):
+                        node_outcomes[node["node_id"]] = {
+                            "node_id": node["node_id"],
+                            "action": node["action"],
+                            "status": "skipped",
+                            "started_at": _time.time(),
+                            "ended_at": _time.time(),
+                            "result": {
+                                "error": "cancelled_due_to_auth_failure",
+                                "error_code": "auth_cascade_stop",
+                                "workspace_action": node["action"],
+                            },
+                        }
+                    pending.clear()
+                    break
+
+            summaries: List[str] = []
             has_error = False
-            last_error_dict = None
-            for action, result_dict in results:
+            last_error_dict: Optional[Dict[str, Any]] = None
+            ordered_outcomes = sorted(node_outcomes.values(), key=lambda o: o["node_id"])
+            for outcome in ordered_outcomes:
+                result_dict = outcome.get("result", {}) or {}
+                action = outcome["action"]
+                status = outcome["status"]
                 workspace_intent = result_dict.get("workspace_action") or action
-                summary = self._summarize_workspace_result(result_dict, workspace_intent)
+                if status == "duplicate":
+                    summary = f"Skipped duplicate workspace action: {action}."
+                elif status == "skipped" and result_dict.get("error_code") == "auth_cascade_stop":
+                    summary = f"Skipped {action} because workspace authentication requires reauthorization."
+                else:
+                    summary = self._summarize_workspace_result(result_dict, workspace_intent)
                 if summary:
                     summaries.append(summary)
-                if result_dict.get("error"):
+                if status in {"failed", "timeout"} or result_dict.get("error"):
                     has_error = True
                     last_error_dict = result_dict
 
@@ -2538,7 +2878,28 @@ class UnifiedCommandProcessor:
                 "response": combined,
                 "command_type": "WORKSPACE",
                 "source": getattr(response, 'source', 'unknown'),
-                "actions_executed": [a for a, _ in results],
+                "actions_executed": [o["action"] for o in ordered_outcomes],
+                "workspace_plan": {
+                    "request_id": request_id,
+                    "correlation_id": correlation_id,
+                    "nodes": [
+                        {
+                            "node_id": n["node_id"],
+                            "action": n["action"],
+                            "depends_on": list(n["depends_on"]),
+                            "can_parallelize": n["can_parallelize"],
+                        }
+                        for n in plan_nodes
+                    ],
+                    "results": [
+                        {
+                            "node_id": o["node_id"],
+                            "action": o["action"],
+                            "status": o["status"],
+                        }
+                        for o in ordered_outcomes
+                    ],
+                },
             }
         except asyncio.TimeoutError:
             logger.warning("[v266] Workspace action timed out after deadline")
