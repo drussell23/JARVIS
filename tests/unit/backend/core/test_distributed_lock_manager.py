@@ -402,6 +402,83 @@ class TestDLMCleanup:
                 f"Stale lock {name} should have been cleaned"
             )
 
+    async def test_heartbeat_stale_cleanup_logs_info_not_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Heartbeat stale-lock cleanup is expected churn and should be INFO."""
+        import backend.core.distributed_lock_manager as dlm_mod
+
+        monkeypatch.setattr(dlm_mod, "DLM_STALE_LOCK_WARN_AFTER_SECONDS", 120.0)
+        monkeypatch.setattr(dlm_mod, "DLM_STALE_LOCK_INFO_NAMES", ["heartbeat"])
+
+        lock_dir = tmp_path / "heartbeat_locks"
+        lock_dir.mkdir()
+        config = LockConfig(
+            lock_dir=lock_dir,
+            default_ttl_seconds=2.0,
+            default_timeout_seconds=1.0,
+            cleanup_interval_seconds=60.0,
+            backend=LockBackend.FILE,
+        )
+        manager = DistributedLockManager(config=config)
+        _write_fake_lock(
+            manager.config.lock_dir,
+            "heartbeat",
+            owner=f"jarvis-{os.getpid()}-{time.time():.1f}",
+            ttl=1.0,
+            acquired_offset=-30.0,
+        )
+
+        with caplog.at_level("INFO", logger="backend.core.distributed_lock_manager"):
+            await manager._cleanup_stale_locks()
+
+        assert "Cleaning stale lock: heartbeat" in caplog.text
+        assert not any(
+            rec.levelname == "WARNING" and "Cleaning stale lock: heartbeat" in rec.message
+            for rec in caplog.records
+        )
+
+    async def test_non_heartbeat_old_stale_cleanup_can_warn(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Non-heartbeat stale locks beyond threshold keep warning semantics."""
+        import backend.core.distributed_lock_manager as dlm_mod
+
+        monkeypatch.setattr(dlm_mod, "DLM_STALE_LOCK_WARN_AFTER_SECONDS", 5.0)
+        monkeypatch.setattr(dlm_mod, "DLM_STALE_LOCK_INFO_NAMES", ["heartbeat"])
+
+        lock_dir = tmp_path / "warn_locks"
+        lock_dir.mkdir()
+        config = LockConfig(
+            lock_dir=lock_dir,
+            default_ttl_seconds=2.0,
+            default_timeout_seconds=1.0,
+            cleanup_interval_seconds=60.0,
+            backend=LockBackend.FILE,
+        )
+        manager = DistributedLockManager(config=config)
+        _write_fake_lock(
+            manager.config.lock_dir,
+            "vbia_events",
+            owner=f"jarvis-{os.getpid()}-{time.time():.1f}",
+            ttl=1.0,
+            acquired_offset=-30.0,
+        )
+
+        with caplog.at_level("INFO", logger="backend.core.distributed_lock_manager"):
+            await manager._cleanup_stale_locks()
+
+        assert any(
+            rec.levelname == "WARNING" and "Cleaning stale lock: vbia_events" in rec.message
+            for rec in caplog.records
+        )
+
     def test_cleanup_severity_heartbeat_stale_is_info(self, dlm: DistributedLockManager):
         """Heartbeat lock cleanup should log as info (expected churn)."""
         metadata = LockMetadata(
