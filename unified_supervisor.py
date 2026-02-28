@@ -18480,7 +18480,55 @@ class IntelligentChromeIncognitoManager:
                 self._logger.error(f"❌ Chrome Incognito operation failed: {e}")
                 return result
 
-    async def _quick_find_any_incognito_window(self) -> Optional[int]:
+    async def _run_osascript(
+        self,
+        applescript: str,
+        *,
+        timeout: float,
+        op_name: str,
+    ) -> Tuple[bool, str, str]:
+        """
+        Execute AppleScript with deterministic timeout + process cleanup.
+
+        Root fix for startup hangs:
+        - `osascript` can block indefinitely when Chrome or accessibility prompts
+          are unresponsive.
+        - A cancelled caller must not leave a stuck child process behind.
+        """
+        if sys.platform != "darwin":
+            return False, "", "unsupported_platform"
+
+        process = await asyncio.create_subprocess_exec(
+            "osascript", "-e", applescript,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=max(0.5, float(timeout)),
+            )
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            return False, "", f"{op_name}:timeout"
+        except asyncio.CancelledError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            raise
+
+        out = stdout.decode().strip() if stdout else ""
+        err = stderr.decode().strip() if stderr else ""
+        if process.returncode == 0:
+            return True, out, err
+        return False, out, err or f"{op_name}:returncode:{process.returncode}"
+
+    async def _quick_find_any_incognito_window(self, timeout: float = 10.0) -> Optional[int]:
         """Quick check for any existing incognito window."""
         if sys.platform != 'darwin':
             return None
@@ -18507,13 +18555,13 @@ class IntelligentChromeIncognitoManager:
         '''
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                "osascript", "-e", applescript,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            ok, output, _err = await self._run_osascript(
+                applescript,
+                timeout=timeout,
+                op_name="quick_incognito_scan",
             )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
-            output = stdout.decode().strip() if stdout else ""
+            if not ok:
+                return None
 
             if output.startswith("FOUND|"):
                 try:
@@ -18525,6 +18573,81 @@ class IntelligentChromeIncognitoManager:
         except Exception as e:
             self._logger.warning(f"Quick incognito scan failed: {e}")
             return None
+
+    async def redirect_existing_incognito_with_budget(
+        self,
+        url: str,
+        *,
+        budget_seconds: float = 8.0,
+    ) -> Dict[str, Any]:
+        """
+        Fast deterministic redirect path for startup frontend transition.
+
+        This avoids full window reconciliation (scan/close/reopen) in the critical
+        startup lane. If no existing incognito window is found, caller can choose
+        whether to launch or defer to background reconciliation.
+        """
+        deadline = time.monotonic() + max(1.0, float(budget_seconds))
+
+        def _remaining() -> float:
+            return max(0.2, deadline - time.monotonic())
+
+        try:
+            quick_scan_timeout = min(
+                _remaining(),
+                max(0.5, float(os.getenv("JARVIS_CHROME_REDIRECT_QUICK_SCAN_TIMEOUT", "3.0"))),
+            )
+            window_idx = await self._quick_find_any_incognito_window(timeout=quick_scan_timeout)
+            if window_idx is None:
+                return {
+                    "success": False,
+                    "action": "skipped",
+                    "error": "no_existing_incognito_window",
+                }
+
+            redirect_timeout = min(
+                _remaining(),
+                max(0.5, float(os.getenv("JARVIS_CHROME_REDIRECT_WINDOW_TIMEOUT", "4.0"))),
+            )
+            redirected = await self._redirect_incognito_window(
+                window_idx,
+                url,
+                timeout=redirect_timeout,
+            )
+            if not redirected:
+                return {
+                    "success": False,
+                    "action": "failed",
+                    "error": "redirect_failed",
+                }
+
+            fullscreen_timeout = min(
+                _remaining(),
+                max(0.5, float(os.getenv("JARVIS_CHROME_REDIRECT_FULLSCREEN_TIMEOUT", "2.0"))),
+            )
+            try:
+                await asyncio.wait_for(self._ensure_fullscreen(), timeout=fullscreen_timeout)
+            except Exception:
+                pass
+
+            _mark_browser_opened()
+            return {
+                "success": True,
+                "action": "redirected_existing",
+                "error": None,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "action": "budget_exhausted",
+                "error": f"budget_timeout:{budget_seconds:.1f}s",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "action": "error",
+                "error": str(e),
+            }
 
     async def _scan_all_chrome_windows(self) -> Dict[str, Any]:
         """Scan all Chrome windows and categorize them."""
@@ -18876,7 +18999,12 @@ class IntelligentChromeIncognitoManager:
                 self._logger.debug(f"[Browser] Crash report failed: {report_err}")
             return False
 
-    async def _redirect_incognito_window(self, window_index: int, url: str) -> bool:
+    async def _redirect_incognito_window(
+        self,
+        window_index: int,
+        url: str,
+        timeout: float = 15.0,
+    ) -> bool:
         """Redirect an existing incognito window to a URL."""
         if sys.platform != 'darwin':
             return False
@@ -18890,18 +19018,16 @@ class IntelligentChromeIncognitoManager:
         '''
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                "osascript", "-e", applescript,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            ok, _stdout, err = await self._run_osascript(
+                applescript,
+                timeout=timeout,
+                op_name="redirect_incognito_window",
             )
-            _, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
-
-            if process.returncode == 0:
+            if ok:
                 self._logger.info(f"🔄 Redirected incognito window {window_index} to {url}")
                 return True
             else:
-                self._logger.warning(f"Redirect failed: {stderr.decode()}")
+                self._logger.warning(f"Redirect failed: {err}")
                 return False
         except Exception as e:
             self._logger.warning(f"Error redirecting window: {e}")
@@ -82879,22 +83005,29 @@ class JarvisSystemKernel:
                 else:
                     if sys.platform == "darwin":  # macOS
                         chrome_manager = get_chrome_manager()
-                        # v265.3: AppleScript calls can hang indefinitely
-                        # if Chrome is unresponsive or a system dialog blocks.
-                        _chrome_timeout = float(os.environ.get(
-                            "JARVIS_CHROME_REDIRECT_TIMEOUT", "30.0"
-                        ))
-                        try:
-                            result = await asyncio.wait_for(
+                        # v280.0: Deterministic startup redirect policy.
+                        # Use a strict fast-path budget for redirecting an existing
+                        # incognito window. Full reconciliation (scan/close/reopen)
+                        # runs in background if needed, so startup lane cannot stall.
+                        _chrome_budget = max(
+                            1.0,
+                            float(os.environ.get("JARVIS_CHROME_REDIRECT_PHASE_BUDGET", "8.0")),
+                        )
+                        result = await chrome_manager.redirect_existing_incognito_with_budget(
+                            frontend_url,
+                            budget_seconds=_chrome_budget,
+                        )
+                        if not result.get("success"):
+                            self.logger.info(
+                                "[Kernel] v280.0: Fast redirect skipped (%s) after %.1fs budget; "
+                                "scheduling background browser reconciliation",
+                                result.get("error", "unknown"),
+                                _chrome_budget,
+                            )
+                            create_safe_task(
                                 chrome_manager.ensure_single_incognito_window(frontend_url),
-                                timeout=_chrome_timeout,
+                                name="chrome-reconcile-background",
                             )
-                        except asyncio.TimeoutError:
-                            self.logger.warning(
-                                f"[Kernel] v265.3: Chrome redirect timed out "
-                                f"after {_chrome_timeout:.0f}s (AppleScript hang?)"
-                            )
-                            result = {"success": False, "error": "timeout"}
                         if result.get("success"):
                             action = result.get("action", "unknown")
                             self.logger.success(f"[Kernel] Chrome redirected ({action}) → {frontend_url}")
