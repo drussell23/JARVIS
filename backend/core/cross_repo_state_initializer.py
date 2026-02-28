@@ -356,6 +356,12 @@ class CrossRepoStateInitializer:
         # Replaces in-memory asyncio.Lock with file-based locks that work across processes
         # Prevents deadlock scenarios where crashed processes leave locks hanging
         self._lock_manager: Optional[DistributedLockManager] = None
+        self._lock_manager_init_lock = asyncio.Lock()
+        self._lock_manager_warn_interval_s = max(
+            1.0,
+            _get_env_float("JARVIS_CROSS_REPO_LOCK_WARN_INTERVAL_SECONDS", 30.0),
+        )
+        self._last_lock_manager_warn_at = 0.0
         self._state_write_lock = asyncio.Lock()
         # v256.0: Dedicated state I/O executor prevents startup model-loading tasks
         # from starving critical cross-repo state writes on the default executor.
@@ -439,8 +445,7 @@ class CrossRepoStateInitializer:
             logger.info("[CrossRepoState] Starting initialization...")
 
             # v6.4: Initialize distributed lock manager
-            self._lock_manager = await get_lock_manager()
-            logger.info("[CrossRepoState] Distributed lock manager initialized")
+            await self._ensure_lock_manager_initialized(reason="initialize", required=True)
 
             # Create directory structure
             await self._create_directory_structure()
@@ -494,6 +499,41 @@ class CrossRepoStateInitializer:
             self._jarvis_state.status = StateStatus.ERROR
             self._jarvis_state.errors.append(str(e))
             return False
+
+    async def _ensure_lock_manager_initialized(
+        self,
+        *,
+        reason: str,
+        required: bool = False,
+    ) -> bool:
+        """
+        Ensure lock manager is initialized exactly once across concurrent callers.
+
+        Returns True when lock manager is ready. If required=True and init fails,
+        raises RuntimeError to make initialization failure explicit.
+        """
+        if self._lock_manager is not None:
+            return True
+
+        async with self._lock_manager_init_lock:
+            if self._lock_manager is not None:
+                return True
+            try:
+                self._lock_manager = await get_lock_manager()
+                logger.info("[CrossRepoState] Distributed lock manager initialized")
+                return True
+            except Exception as e:
+                now = time.monotonic()
+                if (now - self._last_lock_manager_warn_at) >= self._lock_manager_warn_interval_s:
+                    logger.warning(
+                        "[CrossRepoState] Distributed lock manager init failed (%s): %s",
+                        reason,
+                        e,
+                    )
+                    self._last_lock_manager_warn_at = now
+                if required:
+                    raise RuntimeError(f"Lock manager init failed ({reason}): {e}") from e
+                return False
 
     async def shutdown(self) -> None:
         """Shutdown the cross-repo state system."""
@@ -620,19 +660,27 @@ class CrossRepoStateInitializer:
         try:
             events_file = self._state_files["vbia_events"]
 
-            # v6.4: Acquire distributed lock for atomic read-modify-write
-            # This lock works across processes (not just coroutines)
-            # v6.5: Guard against None lock manager (graceful degradation)
-            if self._lock_manager is None:
-                logger.warning("[CrossRepoState] Lock manager not initialized, emitting without lock")
-                events = await self._read_json_file(events_file, default=[])
-                events.append(asdict(event))
-                if self.config.event_rotation_enabled and len(events) > self.config.max_events_per_file:
-                    events = events[-self.config.max_events_per_file:]
-                await self._write_json_file(events_file, events)
-                logger.debug(f"[CrossRepoState] Event emitted (unlocked): {event.event_type.value}")
+            has_dlm = await self._ensure_lock_manager_initialized(reason="emit_event", required=False)
+            if has_dlm and self._lock_manager is not None:
+                async with self._lock_manager.acquire(
+                    "vbia_events",
+                    timeout=max(0.5, _get_env_float("JARVIS_VBIA_EVENTS_LOCK_TIMEOUT", 2.0)),
+                    ttl=max(5.0, _get_env_float("JARVIS_CROSS_REPO_LOCK_TTL", 20.0)),
+                    enable_keepalive=False,
+                ) as acquired:
+                    if not acquired:
+                        logger.warning("Could not acquire vbia_events lock, skipping emit")
+                        return
+                    events = await self._read_json_file(events_file, default=[])
+                    events.append(asdict(event))
+                    if self.config.event_rotation_enabled and len(events) > self.config.max_events_per_file:
+                        events = events[-self.config.max_events_per_file:]
+                    await self._write_json_file(events_file, events)
+                logger.debug(f"[CrossRepoState] Event emitted: {event.event_type.value}")
                 return
 
+            # Deterministic fallback: if DLM is unavailable, still use file lock.
+            # Never emit unlocked, to preserve ordering/integrity guarantees.
             async with RobustFileLock("vbia_events", source="jarvis") as acquired:
                 if not acquired:
                     logger.warning("Could not acquire vbia_events lock, skipping emit")
@@ -649,8 +697,10 @@ class CrossRepoStateInitializer:
 
                 # Write back
                 await self._write_json_file(events_file, events)
-
-            logger.debug(f"[CrossRepoState] Event emitted: {event.event_type.value}")
+            logger.info(
+                "[CrossRepoState] Event emitted using file-lock fallback (lock manager unavailable): %s",
+                event.event_type.value,
+            )
 
         except Exception as e:
             logger.error(f"[CrossRepoState] Failed to emit event: {e}")

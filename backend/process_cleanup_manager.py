@@ -5056,7 +5056,7 @@ class ProcessCleanupManager:
                     os.environ["JARVIS_CODE_CLEANUP_HASH"] = current_hash
                     return cleaned
 
-                logger.warning("🔄 Code changes detected! Cleaning up old JARVIS instances...")
+                logger.info("🔄 Code changes detected. Cleaning up old JARVIS instances...")
 
                 # Step 0: Gracefully shutdown ML Learning Engine before killing processes.
                 # Run this in an isolated subprocess so a broken ML dependency
