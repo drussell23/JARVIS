@@ -18508,10 +18508,20 @@ class IntelligentChromeIncognitoManager:
         if sys.platform != "darwin":
             return False, "", "unsupported_platform"
 
-        process = await asyncio.create_subprocess_exec(
-            "osascript", "-e", applescript,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        spawn_timeout = max(
+            0.5,
+            min(
+                max(0.5, float(timeout)),
+                float(os.getenv("JARVIS_OSASCRIPT_SPAWN_TIMEOUT", "2.0")),
+            ),
+        )
+        process = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "osascript", "-e", applescript,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=spawn_timeout,
         )
 
         try:
@@ -83046,10 +83056,23 @@ class JarvisSystemKernel:
                             1.0,
                             float(os.environ.get("JARVIS_CHROME_REDIRECT_PHASE_BUDGET", "8.0")),
                         )
-                        result = await chrome_manager.redirect_existing_incognito_with_budget(
-                            frontend_url,
-                            budget_seconds=_chrome_budget,
-                        )
+                        try:
+                            result = await asyncio.wait_for(
+                                chrome_manager.redirect_existing_incognito_with_budget(
+                                    frontend_url,
+                                    budget_seconds=_chrome_budget,
+                                ),
+                                timeout=_chrome_budget + max(
+                                    1.0,
+                                    float(os.environ.get("JARVIS_CHROME_REDIRECT_GUARD_BUFFER", "2.0")),
+                                ),
+                            )
+                        except asyncio.TimeoutError:
+                            result = {
+                                "success": False,
+                                "action": "guard_timeout",
+                                "error": f"phase_guard_timeout:{_chrome_budget:.1f}s",
+                            }
                         if not result.get("success"):
                             self.logger.info(
                                 "[Kernel] v280.0: Fast redirect skipped (%s) after %.1fs budget; "
