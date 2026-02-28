@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -337,13 +338,34 @@ class CrossRepoContractEnforcer:
         max_api_version: str,
     ) -> Tuple[bool, str]:
         try:
-            local = ProtocolVersion.parse(
-                self.local_protocol_version,
-                min_compat=min_api_version,
-                max_compat=max_api_version,
-            )
             remote = ProtocolVersion.parse(remote_api_version)
-            return local.is_compatible_with(remote)
+            min_v = ProtocolVersion.parse(min_api_version)
+            max_v = ProtocolVersion.parse(max_api_version)
+
+            remote_tuple = remote.as_tuple()
+            min_tuple = min_v.as_tuple()
+            max_tuple = max_v.as_tuple()
+            if remote_tuple < min_tuple or remote_tuple > max_tuple:
+                return (
+                    False,
+                    f"version {remote_api_version} outside [{min_api_version}, {max_api_version}]",
+                )
+
+            # Optional strict mode: require local protocol major to match remote.
+            # Disabled by default because component API versions may be decoupled
+            # from supervisor protocol epochs (e.g., Reactor build-style versions).
+            if os.getenv(
+                "JARVIS_CONTRACT_ENFORCE_LOCAL_PROTOCOL_MAJOR_MATCH",
+                "false",
+            ).strip().lower() in {"1", "true", "yes", "on"}:
+                local = ProtocolVersion.parse(self.local_protocol_version)
+                if local.major != remote.major:
+                    return (
+                        False,
+                        f"major version mismatch: local={local.major}, remote={remote.major}",
+                    )
+
+            return True, "compatible"
         except Exception as e:
             return False, f"version_parse_error:{e}"
 

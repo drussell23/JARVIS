@@ -203,6 +203,59 @@ async def test_contract_enforcer_blocks_version_outside_window():
 
 
 @pytest.mark.asyncio
+async def test_contract_enforcer_accepts_component_version_without_local_major_match():
+    async def health(_request):
+        return web.json_response(
+            {
+                "status": "healthy",
+                "ready_for_inference": True,
+                "protocol_version": "152",
+                "capabilities": ["training"],
+            }
+        )
+
+    async def handshake(_request):
+        return web.json_response(
+            {
+                "accepted": True,
+                "component_instance_id": "reactor-1",
+                "api_version": "152",
+                "capabilities": ["training"],
+                "health_schema_hash": "abcd1234",
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_post("/lifecycle/handshake", handshake)
+    runner, endpoint = await _start_test_server(app)
+
+    try:
+        enforcer = CrossRepoContractEnforcer(
+            supervisor_instance_id="kernel-test",
+            local_protocol_version="0.0.0",
+            request_timeout_s=3.0,
+        )
+        target = ContractTarget(
+            name="reactor_core",
+            endpoint=endpoint,
+            health_schema_key="/health",
+            min_api_version="0.0.0",
+            max_api_version="9999.9999.9999",
+            required_capabilities=("training",),
+            require_handshake=True,
+            allow_legacy_handshake=False,
+            required=False,
+        )
+        result = (await enforcer.check_many([target]))["reactor_core"]
+        assert result.ok
+        assert result.reason == "contract_ok"
+        assert result.api_version == "152"
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_contract_enforcer_requires_workspace_action_semantic_contract():
     async def health(_request):
         return web.json_response(
