@@ -83857,7 +83857,12 @@ class JarvisSystemKernel:
             return []
 
         def _active(status: str) -> bool:
-            return status in {"running", "complete", "ready", "operational", "degraded"}
+            # "running" excluded: means "process spawned, still initializing" —
+            # health endpoint may not exist.  Step 3 reconciliation transitions
+            # stale "running" → "degraded" after grace period so components
+            # participate in validation.  Runtime contract monitor (enabled by
+            # default, checks every 45s) guarantees later coverage.
+            return status in {"complete", "ready", "operational", "degraded"}
 
         targets: List[Any] = []
         require_handshake = _get_env_bool("JARVIS_CONTRACT_REQUIRE_HANDSHAKE", True)
@@ -84038,19 +84043,73 @@ class JarvisSystemKernel:
                         result.api_version or "unknown",
                         result.handshake_mode,
                     )
+                    # Update readiness proofs on success
+                    _readiness_ok = self._component_status.get(name, {}).get("readiness")
+                    if _readiness_ok is not None:
+                        _readiness_ok["service_proof"] = "pass"
+                        _readiness_ok["contract_proof"] = "pass"
+                        _readiness_ok["composite_status"] = self._component_status.get(
+                            name, {},
+                        ).get("status", "unknown")
+                        _readiness_ok["updated_at"] = datetime.now().isoformat()
                     continue
 
-                level = "error" if result.target.required else "warning"
-                if level == "error":
-                    self.logger.error("[Contract] %s incompatible: %s", name, result.reason)
+                # Explicit map: component → disable env var.
+                # Avoids string-munging mismatches (REACTOR_ENABLED vs
+                # REACTOR_CORE_ENABLED).
+                _disable_env_map = {
+                    "reactor_core": "REACTOR_CORE_ENABLED",
+                    "jarvis_prime": "JARVIS_PRIME_ENABLED",
+                }
+                if result.target.required:
+                    self.logger.error(
+                        "[Contract] %s incompatible: %s (endpoint=%s)",
+                        name,
+                        result.reason,
+                        result.target.endpoint,
+                    )
                 else:
-                    self.logger.warning("[Contract] %s incompatible: %s", name, result.reason)
+                    _comp_status = self._component_status.get(
+                        name, {},
+                    ).get("status", "unknown")
+                    _disable_var = _disable_env_map.get(
+                        name, f"{name.upper()}_ENABLED",
+                    )
+                    self.logger.warning(
+                        "[Contract] %s incompatible (optional, status=%s): %s "
+                        "(endpoint=%s). To suppress: set %s=false",
+                        name,
+                        _comp_status,
+                        result.reason,
+                        result.target.endpoint,
+                        _disable_var,
+                    )
 
                 self._update_component_status(
                     name,
                     "error" if result.target.required else "degraded",
                     f"Contract mismatch: {result.reason}",
                 )
+
+                # Update 3-proof readiness: service + contract proofs.
+                # Preserve prior startup state context — don't clobber more
+                # informative status from Trinity results processing.
+                _readiness = self._component_status.get(name, {}).get("readiness")
+                if _readiness is not None:
+                    _readiness["service_proof"] = (
+                        "pass" if result.ok else f"fail:{result.reason}"
+                    )
+                    _readiness["contract_proof"] = (
+                        "pass" if result.ok
+                        else f"fail:{','.join(result.schema_violations)}"
+                        if result.schema_violations
+                        else f"fail:{result.reason}"
+                    )
+                    _readiness["composite_status"] = (
+                        self._component_status.get(name, {}).get("status", "unknown")
+                    )
+                    _readiness["updated_at"] = datetime.now().isoformat()
+
                 if result.target.required:
                     required_failures.append(name)
 
