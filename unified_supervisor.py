@@ -95,12 +95,36 @@ import os as _early_os
 #
 # Setting here ensures ALL child processes inherit single-threaded BLAS mode.
 # =============================================================================
-_early_os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')       # OpenBLAS (numpy)
-_early_os.environ.setdefault('MKL_NUM_THREADS', '1')            # Intel MKL
-_early_os.environ.setdefault('OMP_NUM_THREADS', '1')            # OpenMP
-_early_os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')     # macOS Accelerate
-_early_os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')        # NumExpr
-_early_os.environ.setdefault('OPENBLAS_MAIN_FREE', '1')         # Fork-safety: don't use main thread for GEMM
+_blas_thread_envs = (
+    'OPENBLAS_NUM_THREADS',
+    'MKL_NUM_THREADS',
+    'OMP_NUM_THREADS',
+    'VECLIB_MAXIMUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+    'GOTO_NUM_THREADS',
+)
+_blas_policy = _early_os.environ.get('JARVIS_BLAS_THREAD_POLICY', 'safe').strip().lower()
+_is_darwin_arm = (_early_sys.platform == 'darwin' and _early_sys.maxsize > 2**32)
+_risky_blas_runtime = _is_darwin_arm and _early_sys.version_info < (3, 11)
+
+for _env_name in _blas_thread_envs:
+    _raw = (_early_os.environ.get(_env_name) or '').strip()
+    _parsed = None
+    if _raw:
+        try:
+            _parsed = int(_raw)
+        except ValueError:
+            _parsed = None
+
+    # "safe" policy enforces deterministic single-thread BLAS on known-risk runtimes.
+    if _blas_policy != 'inherit' and _risky_blas_runtime and (_parsed is None or _parsed > 1):
+        _early_os.environ[_env_name] = '1'
+    elif not _raw:
+        _early_os.environ[_env_name] = '1'
+
+_early_os.environ.setdefault('OPENBLAS_MAIN_FREE', '1')  # Fork-safety: don't use main thread for GEMM
+_early_os.environ.setdefault('JARVIS_BLAS_GUARD_MODE', _blas_policy or 'safe')
+del _env_name, _raw, _parsed
 
 # Suppress multiprocessing resource_tracker semaphore warnings
 # This MUST be set BEFORE any multiprocessing imports to affect child processes
@@ -870,8 +894,14 @@ try:
     _numpy_probe_timeout = max(
         1.0, float(os.getenv("JARVIS_NUMPY_PROBE_TIMEOUT", "8.0"))
     )
+    _numpy_probe_script = (
+        "import numpy as np; "
+        "a=np.ones((32,32),dtype=np.float64); "
+        "b=np.ones((32,32),dtype=np.float64); "
+        "_=a@b"
+    )
     _numpy_probe = _numpy_subprocess.run(
-        [sys.executable, "-c", "import numpy"],
+        [sys.executable, "-c", _numpy_probe_script],
         stdout=_numpy_subprocess.DEVNULL,
         stderr=_numpy_subprocess.PIPE,
         text=True,
@@ -66778,8 +66808,17 @@ class JarvisSystemKernel:
                 def _native_probe(module_name: str, timeout_s: float = 4.0) -> bool:
                     """Probe native-module import in isolated subprocess."""
                     try:
+                        _probe_script = f"import {module_name}"
+                        if module_name == "numpy":
+                            # Import-only probes miss BLAS thread-path crashes.
+                            _probe_script = (
+                                "import numpy as np; "
+                                "a=np.ones((32,32),dtype=np.float64); "
+                                "b=np.ones((32,32),dtype=np.float64); "
+                                "_=a@b"
+                            )
                         _probe = _subprocess.run(
-                            [_sys.executable, "-c", f"import {module_name}"],
+                            [_sys.executable, "-c", _probe_script],
                             stdout=_subprocess.DEVNULL,
                             stderr=_subprocess.DEVNULL,
                             timeout=max(1.0, timeout_s),

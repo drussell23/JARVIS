@@ -65,8 +65,11 @@ import os
 import platform
 import signal
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
@@ -753,6 +756,52 @@ class StabilizedChromeLauncher:
     def get_cdp_port(self) -> Optional[int]:
         """Get the active CDP port."""
         return self._cdp_port
+
+    def _get_automation_user_data_dir(self) -> str:
+        """
+        Return deterministic Chrome profile path for automation.
+
+        Using a dedicated profile avoids macOS single-instance handoff to a user
+        Chrome session, which otherwise drops automation flags/remote-debugging.
+        """
+        configured = (os.getenv("BROWSER_AUTOMATION_USER_DATA_DIR", "") or "").strip()
+        profile_dir: Path = (
+            Path(configured).expanduser()
+            if configured
+            else Path(tempfile.gettempdir()) / "jarvis" / "browser" / "automation-profile"
+        )
+        try:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError):
+            profile_dir = Path(tempfile.gettempdir()) / "jarvis" / "browser" / "automation-profile"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+        return str(profile_dir)
+
+    async def _is_cdp_endpoint_ready(self, port: int, timeout_s: float = 3.0) -> bool:
+        """
+        Verify Chrome DevTools endpoint is reachable and usable.
+
+        Importantly, this distinguishes "Chrome process exists" from "automation
+        channel is actually available", which prevents false-positive startup.
+        """
+        if port <= 0:
+            return False
+
+        deadline = time.monotonic() + max(0.5, timeout_s)
+        url = f"http://127.0.0.1:{port}/json/version"
+        while time.monotonic() < deadline:
+            try:
+                def _fetch() -> str:
+                    with urllib.request.urlopen(url, timeout=1.0) as resp:
+                        return resp.read().decode("utf-8", errors="ignore")
+
+                payload = await asyncio.to_thread(_fetch)
+                if "webSocketDebuggerUrl" in payload:
+                    return True
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                pass
+            await asyncio.sleep(0.2)
+        return False
     
     async def _kill_existing_chrome_on_port(self, port: int) -> bool:
         """Kill any existing Chrome process using the CDP port."""
@@ -817,6 +866,7 @@ class StabilizedChromeLauncher:
             cmd = [self._chrome_binary]
             cmd.extend(self._flags)
             cmd.append(f"--remote-debugging-port={self._cdp_port}")
+            cmd.append(f"--user-data-dir={self._get_automation_user_data_dir()}")
             
             if headless:
                 cmd.append("--headless=new")
@@ -848,6 +898,14 @@ class StabilizedChromeLauncher:
                 
                 # Wait a bit for Chrome to start
                 await asyncio.sleep(2.0)
+                cdp_ready_timeout = max(
+                    1.0,
+                    float(os.getenv("BROWSER_CDP_READY_TIMEOUT", "4.0")),
+                )
+                cdp_ready = await self._is_cdp_endpoint_ready(
+                    self._cdp_port,
+                    timeout_s=cdp_ready_timeout,
+                )
 
                 # Check if still running
                 if self._chrome_process.returncode is not None:
@@ -861,28 +919,39 @@ class StabilizedChromeLauncher:
                     # AppleScript, opening a SECOND window (the "double window" bug).
                     if exit_code == 0:
                         chrome_running = await self._is_chrome_process_running()
-                        if chrome_running:
+                        if chrome_running and cdp_ready:
                             logger.info(
                                 "[StabilizedChromeLauncher] Chrome process exited with code 0 "
-                                "(handed off to existing instance). Chrome is running."
+                                "(handoff) and CDP endpoint is reachable."
                             )
                             # Update our tracking — we don't own the process anymore,
-                            # but Chrome IS running and our URL/flags were delivered.
+                            # but Chrome is running and automation channel is active.
                             self._chrome_process = None
                             self._chrome_pid = None
                             return True
-                        else:
-                            logger.warning(
-                                "[StabilizedChromeLauncher] Chrome exited with code 0 "
-                                "but no Chrome process found — genuine launch failure"
-                            )
-                            return False
+
+                        logger.warning(
+                            "[StabilizedChromeLauncher] Chrome exited with code 0 but "
+                            "automation endpoint is unavailable (running=%s, cdp_ready=%s)",
+                            chrome_running,
+                            cdp_ready,
+                        )
+                        return False
 
                     crash_info = get_crash_info(exit_code)
                     logger.error(
                         f"[StabilizedChromeLauncher] Chrome crashed immediately with code {exit_code}: "
                         f"{crash_info.meaning}"
                     )
+                    return False
+
+                if not cdp_ready:
+                    logger.error(
+                        "[StabilizedChromeLauncher] Chrome started but CDP endpoint "
+                        "did not become ready on port %s",
+                        self._cdp_port,
+                    )
+                    await self.shutdown()
                     return False
                 
                 logger.info(
