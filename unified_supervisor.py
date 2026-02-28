@@ -80524,6 +80524,7 @@ class JarvisSystemKernel:
         statuses = self._enterprise_status or {}
         if not statuses:
             return
+        required_services = set(getattr(self, "_enterprise_required_services", set()) or set())
 
         successful = [
             name for name, status in statuses.items()
@@ -80551,31 +80552,53 @@ class JarvisSystemKernel:
             and (status.get("error") or status.get("exception"))
             and not status.get("timed_out")
         ]
+        timed_out_pending_required = [
+            name for name in timed_out_pending
+            if (not required_services) or (name in required_services)
+        ]
+        timed_out_pending_optional = [
+            name for name in timed_out_pending
+            if required_services and (name not in required_services)
+        ]
+        timed_out_terminal_required = [
+            name for name in timed_out_terminal
+            if (not required_services) or (name in required_services)
+        ]
+        failed_required = [
+            name for name in failed
+            if (not required_services) or (name in required_services)
+        ]
 
         total = len(statuses)
-        if timed_out_pending:
+        if timed_out_pending_required:
             self._update_component_status(
                 "enterprise",
                 "running",
                 (
                     f"Enterprise warmup: {len(successful)}/{total} ready, "
-                    f"{len(timed_out_pending)} continuing in background"
+                    f"{len(timed_out_pending_required)} core service(s) continuing in background"
                 ),
             )
-        elif timed_out_terminal or failed:
+        elif timed_out_terminal_required or failed_required:
             self._update_component_status(
                 "enterprise",
                 "degraded",
                 (
                     f"Enterprise degraded: {len(successful)}/{total} ready, "
-                    f"{len(timed_out_terminal)} timed out, {len(failed)} failed"
+                    f"{len(timed_out_terminal_required)} core timed out, "
+                    f"{len(failed_required)} core failed"
                 ),
             )
         else:
+            optional_note = ""
+            if timed_out_pending_optional:
+                optional_note = (
+                    f"; optional continuing: {len(timed_out_pending_optional)}"
+                )
             self._update_component_status(
                 "enterprise",
                 "complete",
-                f"Enterprise: {len(successful)}/{total} active",
+                f"Enterprise core ready: {len(successful)}/{total} active{optional_note}",
             )
 
     def _track_enterprise_service_continuation(
@@ -80671,6 +80694,7 @@ class JarvisSystemKernel:
         timeout_seconds: float = 30.0,
         service_key: Optional[str] = None,
         continue_on_timeout: bool = True,
+        required_service: bool = True,
     ) -> Dict[str, Any]:
         """
         Initialize an enterprise service with timeout protection.
@@ -80722,10 +80746,14 @@ class JarvisSystemKernel:
                 else:
                     if service_task not in self._background_tasks:
                         self._background_tasks.append(service_task)
-                self.logger.warning(
+                _msg = (
                     f"[Zone6/{name}] Budget/cap exceeded after {timeout_seconds}s - "
                     f"continuing in background"
                 )
+                if required_service:
+                    self.logger.warning(_msg)
+                else:
+                    self.logger.info(_msg)
             else:
                 if not service_task.done():
                     service_task.cancel()
@@ -80738,6 +80766,8 @@ class JarvisSystemKernel:
                 "timed_out": True,
                 "elapsed_ms": elapsed,
                 "background_continuation": bool(continue_on_timeout),
+                "required": bool(required_service),
+                "optional": not bool(required_service),
             }
 
         except asyncio.TimeoutError:
@@ -80753,10 +80783,14 @@ class JarvisSystemKernel:
                 else:
                     if service_task not in self._background_tasks:
                         self._background_tasks.append(service_task)
-                self.logger.warning(
+                _msg = (
                     f"[Zone6/{name}] ⏱️ TIMEOUT after {timeout_seconds}s - "
                     f"continuing in background"
                 )
+                if required_service:
+                    self.logger.warning(_msg)
+                else:
+                    self.logger.info(_msg)
             else:
                 if not service_task.done():
                     service_task.cancel()
@@ -80769,6 +80803,8 @@ class JarvisSystemKernel:
                 "timed_out": True,
                 "elapsed_ms": elapsed,
                 "background_continuation": bool(continue_on_timeout),
+                "required": bool(required_service),
+                "optional": not bool(required_service),
             }
 
         except asyncio.CancelledError:
@@ -80837,6 +80873,7 @@ class JarvisSystemKernel:
             }
             if not required_services:
                 required_services = {"infra_orchestrator"}
+            self._enterprise_required_services = set(required_services)
             optional_services = [
                 name for _, name, _ in service_specs if name not in required_services
             ]
@@ -80882,6 +80919,7 @@ class JarvisSystemKernel:
                     timeout,
                     service_key=internal_name,
                     continue_on_timeout=continue_on_timeout,
+                    required_service=(internal_name in required_services),
                 )
                 _completed_count += 1
                 if self._startup_watchdog:
@@ -80977,9 +81015,13 @@ class JarvisSystemKernel:
                         )
                     if result.get("timed_out"):
                         if result.get("background_continuation"):
-                            self.logger.warning(
+                            _timeout_msg = (
                                 f"[Zone6/{display_name}] ⏱️ Await timeout — continuing in background"
                             )
+                            if result.get("optional"):
+                                self.logger.info(_timeout_msg)
+                            else:
+                                self.logger.warning(_timeout_msg)
                         else:
                             self.logger.warning(f"[Zone6/{display_name}] ⏱️ Timed out")
                     elif result.get("initialized") or result.get("enabled") or result.get("running"):
@@ -81020,6 +81062,14 @@ class JarvisSystemKernel:
                 and status.get("timed_out")
                 and status.get("background_continuation")
             ]
+            timed_out_background_required = [
+                name for name in timed_out_background
+                if name in required_services
+            ]
+            timed_out_background_optional = [
+                name for name in timed_out_background
+                if name not in required_services
+            ]
             timed_out_terminal = [
                 name for name, status in init_status.items()
                 if isinstance(status, dict)
@@ -81034,10 +81084,15 @@ class JarvisSystemKernel:
             ]
 
             # Log summary
-            if timed_out_background:
+            if timed_out_background_required:
                 self.logger.warning(
                     f"[Zone6] ⏱️ Await timeout (background continuation): "
-                    f"{', '.join(timed_out_background)}"
+                    f"{', '.join(timed_out_background_required)}"
+                )
+            if timed_out_background_optional:
+                self.logger.info(
+                    f"[Zone6] ◌ Optional background continuation: "
+                    f"{', '.join(timed_out_background_optional)}"
                 )
             if deferred_optional:
                 self.logger.info(
