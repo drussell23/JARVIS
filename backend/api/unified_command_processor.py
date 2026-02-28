@@ -1500,32 +1500,57 @@ class UnifiedCommandProcessor:
         # =========================================================================
         # 🔇 SELF-VOICE SUPPRESSION - Prevent JARVIS echo/hallucinations
         # =========================================================================
-        # If JARVIS is currently speaking, this command is likely JARVIS's own
-        # voice being picked up by the microphone. Silently reject it to prevent
-        # feedback loops where JARVIS processes its own speech as commands.
+        # v277.0: Fixed architectural flaw — suppression was blanket-rejecting ALL
+        # commands when JARVIS was speaking, including TEXT input (typed commands)
+        # and verified-speaker voice input. Text commands can NEVER be echo.
+        # Identified-speaker commands are verified user speech.
+        #
+        # Suppression now only fires when the command could plausibly be echo:
+        #   - audio_data is present (mic capture, not typed text)
+        #   - speaker is NOT identified (could be echo, not verified user)
+        #   - not an explicit barge-in (allow_during_tts_interrupt)
+        #
+        # When user commands arrive during AGI proactive speech, user takes
+        # priority — the command processes and AGI speech should yield.
         # =========================================================================
         try:
             from agi_os.realtime_voice_communicator import get_voice_communicator
             voice_comm = await asyncio.wait_for(get_voice_communicator(), timeout=0.5)
-            if voice_comm and voice_comm.is_speaking and not allow_during_tts_interrupt:
-                logger.warning(
-                    f"[SELF-VOICE-SUPPRESSION] Rejecting command while JARVIS is speaking: "
-                    f"'{command_text[:50]}...'"
-                )
-                self._v242_metrics["self_voice_suppressions"] += 1
-                return {
-                    "success": False,
-                    "response": None,  # Silent -- don't speak or it creates more echo
-                    "type": "self_voice_suppressed",
-                    "message": "Command rejected — JARVIS is currently speaking",
-                    "original_command": command_text,
-                    "suppressed": True,  # v242.2: Explicit flag for callers to detect
-                    "retry_after_ms": 2000,  # Hint: retry after TTS likely done
-                }
-            if voice_comm and voice_comm.is_speaking and allow_during_tts_interrupt:
-                logger.debug(
-                    "[UNIFIED] Bypassing self-voice suppression for confirmed barge-in command"
-                )
+            if voice_comm and voice_comm.is_speaking:
+                if allow_during_tts_interrupt:
+                    logger.debug(
+                        "[UNIFIED] Bypassing self-voice suppression for confirmed barge-in command"
+                    )
+                elif audio_data is None:
+                    # Text input (WebSocket, REST, frontend text box, transcribed text)
+                    # — cannot be JARVIS echo. User commands always take priority.
+                    logger.debug(
+                        "[UNIFIED] Allowing text command during TTS — text input cannot be echo"
+                    )
+                elif speaker_name:
+                    # Speaker identified (voice biometric verified) — this is the user,
+                    # not JARVIS hearing itself. User speech takes priority.
+                    logger.debug(
+                        "[UNIFIED] Allowing identified-speaker command during TTS — "
+                        "speaker '%s' verified, not echo", speaker_name
+                    )
+                else:
+                    # Unidentified audio during active TTS — likely JARVIS echo.
+                    # Suppress to prevent feedback loop.
+                    logger.warning(
+                        "[SELF-VOICE-SUPPRESSION] Rejecting unidentified audio command "
+                        "while JARVIS is speaking: '%s...'", command_text[:50]
+                    )
+                    self._v242_metrics["self_voice_suppressions"] += 1
+                    return {
+                        "success": False,
+                        "response": None,  # Silent -- don't speak or it creates more echo
+                        "type": "self_voice_suppressed",
+                        "message": "Command rejected — likely JARVIS echo during active TTS",
+                        "original_command": command_text,
+                        "suppressed": True,
+                        "retry_after_ms": 2000,
+                    }
         except Exception as e:
             logger.debug(f"[UNIFIED] Self-voice check skipped: {e}")
 

@@ -337,7 +337,7 @@ class EnhancedSimpleContextHandler:
                         # Execute the original command
                         logger.info("[ENHANCED CONTEXT] Executing original command...")
                         result = await self.command_processor.process_command(
-                            command, websocket
+                            command, websocket, speaker_name=speaker_name,
                         )
                         if not isinstance(result, dict):
                             result = {"response": str(result), "status": "error", "success": False}
@@ -378,14 +378,18 @@ class EnhancedSimpleContextHandler:
 
             # No special context handling needed
             self._add_step("No context handling required")
-            return await self.command_processor.process_command(command, websocket)
+            return await self.command_processor.process_command(
+                command, websocket, speaker_name=speaker_name,
+            )
 
         except Exception as e:
             logger.error(f"[ENHANCED CONTEXT] Error: {e}", exc_info=True)
             self._add_step(f"Error occurred: {str(e)}", {"error": True})
 
             # Fallback to standard processing
-            return await self.command_processor.process_command(command, websocket)
+            return await self.command_processor.process_command(
+                command, websocket, speaker_name=speaker_name,
+            )
 
     # ─────────────────────────────────────────────────────────────────────────
     # SPEAKER VERIFICATION
