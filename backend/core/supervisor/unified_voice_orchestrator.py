@@ -873,7 +873,18 @@ class UnifiedVoiceOrchestrator:
 
             # Speak
             if self._is_macos and self.config.enabled:
-                await self._execute_say(message.text)
+                # v279.0: Startup-phase speech bypasses AudioBus entirely.
+                # The PortAudio callback thread needs the Python GIL every
+                # 20ms to read from the ring buffer. During startup, the GIL
+                # is saturated by concurrent heavy imports/init, starving
+                # the callback and causing output buffer underflows = static.
+                # afplay runs as a native macOS process with no GIL dependency,
+                # so it produces clean audio regardless of Python thread load.
+                # CoreAudio's HAL mixer handles coexistence with PortAudio.
+                if message.topic == SpeechTopic.STARTUP:
+                    await self._execute_say_via_afplay(message.text)
+                else:
+                    await self._execute_say(message.text)
 
             # Update metrics
             duration = time.time() - start_time
@@ -1063,6 +1074,59 @@ class UnifiedVoiceOrchestrator:
             logger.debug("[UnifiedVoice] Spoke via final UnifiedTTSEngine fallback")
         except Exception as fallback_err:
             logger.error(f"[UnifiedVoice] Final speech fallback failed: {fallback_err}")
+
+    async def _execute_say_via_afplay(self, text: str) -> None:
+        """Synthesize with `say -o` and play with `afplay` — no Python audio callback.
+
+        v279.0: Dedicated startup playback path that bypasses AudioBus/PortAudio
+        entirely. During startup the GIL is saturated by concurrent init tasks,
+        starving the PortAudio callback thread and causing output buffer underflows
+        (= audible static). afplay is a native macOS process with its own audio
+        pipeline — no GIL, no Python callback, no xruns.
+
+        CoreAudio's HAL mixer handles coexistence with the PortAudio stream that
+        AudioBus may have already opened (multiple CoreAudio clients can output
+        simultaneously — this is how system sounds play alongside music apps).
+        """
+        import tempfile as _tmpmod
+
+        _temp_fd, _temp_path = _tmpmod.mkstemp(
+            suffix=".aiff", prefix="jarvis_startup_"
+        )
+        os.close(_temp_fd)
+        try:
+            cmd = [
+                "say",
+                "-v", self.config.voice,
+                "-r", str(self.config.rate),
+                "-o", _temp_path,
+                text,
+            ]
+            self._current_process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            await self._current_process.wait()
+            self._current_process = None
+
+            _play_proc = await asyncio.create_subprocess_exec(
+                "afplay", _temp_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await _play_proc.wait()
+        except FileNotFoundError:
+            logger.error("[UnifiedVoice] macOS 'say' command not found")
+        except Exception as e:
+            logger.warning("[UnifiedVoice] Startup afplay path failed: %s", e)
+        finally:
+            self._current_process = None
+            try:
+                os.unlink(_temp_path)
+            except OSError:
+                pass
 
     async def _interrupt_current(self) -> None:
         """Interrupt current speech — flush AudioBus if available, else terminate process."""

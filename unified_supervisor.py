@@ -15398,33 +15398,17 @@ class AsyncVoiceNarrator:
                 )
                 await asyncio.wait_for(self._process.communicate(), timeout=30.0)
 
-                # Play through AudioBus if running (safe single-stream path),
-                # otherwise fall back to afplay (safe when AudioBus isn't holding device).
-                _played = False
-                try:
-                    from backend.audio.audio_bus import AudioBus as _ABClass
-                    _bus = _ABClass.get_instance_safe()
-                    if _bus is not None and _bus.is_running:
-                        import soundfile as _sf
-                        import numpy as _np
-                        _data, _sr = _sf.read(_temp_path, dtype="float32")
-                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                        await _bus.play_audio(_data, _sr, wait_for_drain=True)
-                        _played = True
-                except Exception as _bus_err:
-                    _unified_logger.debug(f"[Voice] AudioBus playback failed: {_bus_err}")
-
-                if not _played:
-                    # AudioBus not running — use afplay (opens device directly,
-                    # but safe because AudioBus isn't holding it).
-                    _play_proc = await asyncio.create_subprocess_exec(
-                        "afplay", _temp_path,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await asyncio.wait_for(_play_proc.communicate(), timeout=30.0)
+                # v279.0: ALWAYS use afplay for narrator (startup) speech.
+                # The PortAudio callback thread is GIL-starved during startup
+                # (concurrent heavy imports/init saturate the GIL), causing
+                # output buffer underflows = audible static. afplay is a native
+                # macOS process — no GIL, no Python callback, clean audio.
+                _play_proc = await asyncio.create_subprocess_exec(
+                    "afplay", _temp_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(_play_proc.communicate(), timeout=30.0)
             finally:
                 try:
                     os.unlink(_temp_path)
