@@ -66576,8 +66576,8 @@ class JarvisSystemKernel:
             _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{_rs.memory_available_gb:.2f}", "resource_orchestrator:measured", caller="_startup_impl:phase_resources")
             if _rs.is_cloud_mode:
                 self._update_component_status(
-                    "resources", "cloud_mode",
-                    detail=f"Memory: {_rs.memory_available_gb:.1f}GB",
+                    "resources", "degraded",
+                    detail=f"Cloud mode active (memory pressure): {_rs.memory_available_gb:.1f}GB",
                 )
             for _rec in _rs.recommendations:
                 _unified_logger.info("[ResourceOrchestrator] %s", _rec)
