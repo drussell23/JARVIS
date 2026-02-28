@@ -2059,6 +2059,54 @@ class MLEngineRegistry:
                     logger.error("=" * 70)
                     return self._status
 
+        # =======================================================================
+        # DOCKER ECAPA GATE (Phase 2 already selected Docker as backend)
+        # =======================================================================
+        # _select_ecapa_backend() runs in Phase 2 and probes Docker, Cloud Run,
+        # and Local concurrently.  If Docker was selected, it sets env vars
+        # JARVIS_ECAPA_BACKEND=docker and JARVIS_DOCKER_ECAPA_ACTIVE=true.
+        # Honor that decision here to avoid redundantly loading ~700MB of
+        # PyTorch + SpeechBrain in-process when Docker already handles
+        # ECAPA inference with zero additional memory cost.
+        _docker_ecapa_active = os.getenv(
+            "JARVIS_DOCKER_ECAPA_ACTIVE", "",
+        ).lower() in ("1", "true", "yes")
+        _ecapa_backend_env = os.getenv("JARVIS_ECAPA_BACKEND", "")
+        if _docker_ecapa_active or _ecapa_backend_env == "docker":
+            logger.info("=" * 70)
+            logger.info("🐳 ML ENGINE REGISTRY: DOCKER ECAPA ACTIVE")
+            logger.info("=" * 70)
+            logger.info(f"   Backend selected in Phase 2: {_ecapa_backend_env}")
+            logger.info("   Action: Routing ECAPA to Docker container, "
+                        "skipping local model load (~700MB saved)")
+            logger.info("=" * 70)
+
+            self._use_cloud = True
+            await self._activate_cloud_routing()
+
+            cloud_ready, cloud_reason = await self._verify_cloud_backend_ready(
+                test_extraction=True,
+            )
+
+            if cloud_ready:
+                self._status.prewarm_completed = True
+                self._status.prewarm_end_time = time.time()
+                self._status.is_ready = True
+                self._ready_event.set()
+                self._reconcile_state_after_recovery("cloud", "docker_container")
+                logger.info(
+                    "✅ Docker ECAPA VERIFIED — voice unlock ready "
+                    "(no local model load)"
+                )
+                return self._status
+            else:
+                # Docker was healthy in Phase 2 but failed verification now.
+                # Fall through to memory pressure check / local prewarm.
+                logger.warning(
+                    f"⚠️ Docker ECAPA selected in Phase 2 but verification "
+                    f"failed now: {cloud_reason}. Falling through to local prewarm."
+                )
+
         # Check memory pressure directly if no startup decision
         use_cloud, available_ram, reason = MLConfig.check_memory_pressure()
         self._memory_pressure_at_init = (use_cloud, available_ram, reason)
@@ -2642,6 +2690,19 @@ class MLEngineRegistry:
         local endpoints) and deduplicated to avoid redundant probes.
         """
         candidates: List[Tuple[str, str]] = []
+
+        # 0) Docker ECAPA container (selected by _select_ecapa_backend in Phase 2).
+        # Docker is local (127.0.0.1), zero network hop, pre-baked with model
+        # cache — highest priority because it avoids ~700MB in-process loading.
+        _docker_active = os.getenv(
+            "JARVIS_DOCKER_ECAPA_ACTIVE", "",
+        ).lower() in ("1", "true", "yes")
+        _ecapa_backend_env = os.getenv("JARVIS_ECAPA_BACKEND", "")
+        if _docker_active or _ecapa_backend_env == "docker":
+            _ecapa_port = int(os.getenv("JARVIS_ECAPA_PORT", "8015"))
+            candidates.append(
+                (f"http://127.0.0.1:{_ecapa_port}", "docker_container")
+            )
 
         # 1) MemoryAwareStartup candidate (if available).
         try:
@@ -3707,6 +3768,40 @@ class MLEngineRegistry:
             pass
         except Exception as _e:
             logger.debug(f"[v271.0] MemoryQuantizer check failed (proceeding cautiously): {_e}")
+
+        # Before loading ~700MB locally, probe Docker container — it may
+        # be healthy even though Cloud Run / GCP failed.  Docker is local
+        # (zero network hop) and uses its own memory (Docker VM), so
+        # routing to it avoids the in-process memory cost entirely.
+        _docker_active = os.getenv(
+            "JARVIS_DOCKER_ECAPA_ACTIVE", "",
+        ).lower() in ("1", "true", "yes")
+        _docker_backend = os.getenv("JARVIS_ECAPA_BACKEND", "") == "docker"
+        if _docker_active or _docker_backend:
+            try:
+                _ecapa_port = int(os.getenv("JARVIS_ECAPA_PORT", "8015"))
+                _docker_url = f"http://127.0.0.1:{_ecapa_port}"
+                import aiohttp as _fb_aiohttp
+                async with _fb_aiohttp.ClientSession(
+                    timeout=_fb_aiohttp.ClientTimeout(total=5.0),
+                ) as _fb_sess:
+                    async with _fb_sess.get(f"{_docker_url}/health") as _fb_resp:
+                        if _fb_resp.status == 200:
+                            _fb_data = await _fb_resp.json()
+                            if _fb_data.get("ecapa_ready"):
+                                logger.info(
+                                    "🐳 Docker ECAPA is healthy — routing to "
+                                    "container instead of loading locally"
+                                )
+                                self._use_cloud = True
+                                self._cloud_endpoint = _docker_url
+                                self._cloud_endpoint_source = "docker_container_fallback"
+                                self._cloud_verified = True
+                                return True
+            except Exception as _docker_err:
+                logger.debug(
+                    f"Docker ECAPA probe failed in fallback: {_docker_err}"
+                )
 
         logger.warning("=" * 70)
         logger.warning("🔄 CLOUD FALLBACK: Attempting local ECAPA load")
