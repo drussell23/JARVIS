@@ -94,6 +94,17 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_csv_set(key: str, default: str) -> Set[str]:
+    """Parse comma-separated env var into lowercase token set."""
+    raw = os.environ.get(key, default)
+    items: Set[str] = set()
+    for token in str(raw).split(","):
+        value = token.strip().lower()
+        if value:
+            items.add(value)
+    return items
+
+
 # v2.1.0: Startup grace period for component health assessment.
 # During this window, initialization failures (network not ready, model loading, etc.)
 # are capped at DEGRADED instead of escalating to UNHEALTHY/CRITICAL.
@@ -107,6 +118,9 @@ VBI_COMPONENT_GRACE_PERIOD = _env_float("VBI_COMPONENT_GRACE_PERIOD", 180.0)
 VBI_OVERALL_DEGRADE_STREAK = max(1, _env_int("VBI_OVERALL_DEGRADE_STREAK", 2))
 VBI_OVERALL_RECOVERY_STREAK = max(1, _env_int("VBI_OVERALL_RECOVERY_STREAK", 2))
 VBI_OVERALL_STICKY_SECONDS = max(0.0, _env_float("VBI_OVERALL_STICKY_SECONDS", 15.0))
+# v2.3.0: Optional components (e.g., websocket observability path) should not
+# degrade overall health unless they become truly unhealthy/critical.
+VBI_OPTIONAL_COMPONENTS = _env_csv_set("VBI_OPTIONAL_COMPONENTS", "websocket")
 
 
 # Type variables for generic components
@@ -1374,6 +1388,9 @@ class VBIHealthMonitor:
         self._overall_degrade_streak_required = VBI_OVERALL_DEGRADE_STREAK
         self._overall_recovery_streak_required = VBI_OVERALL_RECOVERY_STREAK
         self._overall_sticky_seconds = VBI_OVERALL_STICKY_SECONDS
+        self._optional_components: Set[ComponentType] = {
+            ct for ct in ComponentType if ct.value in VBI_OPTIONAL_COMPONENTS
+        }
 
         logger.info("[VBIHealthMonitor] Initialized")
 
@@ -1829,7 +1846,15 @@ class VBIHealthMonitor:
         # Non-grouped active components still contribute directly.
         for component, health_state in active.items():
             if component not in grouped_members:
-                effective_levels.append(health_state.health_level)
+                level = health_state.health_level
+                # Optional paths should not degrade overall status for minor issues.
+                # They still contribute when genuinely unhealthy/critical.
+                if (
+                    component in self._optional_components
+                    and level not in {HealthLevel.UNHEALTHY, HealthLevel.CRITICAL}
+                ):
+                    continue
+                effective_levels.append(level)
 
         if not effective_levels:
             return HealthLevel.UNKNOWN, capability_levels

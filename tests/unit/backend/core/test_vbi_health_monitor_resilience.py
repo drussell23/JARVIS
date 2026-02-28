@@ -76,3 +76,45 @@ async def test_overall_health_hysteresis_requires_sustained_state_change():
     second_recovery = await monitor.get_system_health()
     assert first_recovery["overall_health"] == "degraded"
     assert second_recovery["overall_health"] == "healthy"
+
+
+async def test_optional_websocket_degraded_does_not_degrade_overall():
+    from backend.core.vbi_health_monitor import (
+        ComponentType,
+        HealthLevel,
+        VBIHealthMonitor,
+    )
+
+    monitor = VBIHealthMonitor()
+
+    engine = monitor._component_health[ComponentType.VBI_ENGINE]
+    engine.total_operations = 1
+    engine.health_level = HealthLevel.HEALTHY
+
+    websocket = monitor._component_health[ComponentType.WEBSOCKET]
+    websocket.total_operations = 1
+    websocket.health_level = HealthLevel.DEGRADED
+
+    health = await monitor.get_system_health()
+    assert health["overall_health"] == "healthy"
+
+
+async def test_optional_websocket_unhealthy_still_impacts_overall():
+    from backend.core.vbi_health_monitor import (
+        ComponentType,
+        HealthLevel,
+        VBIHealthMonitor,
+    )
+
+    monitor = VBIHealthMonitor()
+
+    engine = monitor._component_health[ComponentType.VBI_ENGINE]
+    engine.total_operations = 1
+    engine.health_level = HealthLevel.HEALTHY
+
+    websocket = monitor._component_health[ComponentType.WEBSOCKET]
+    websocket.total_operations = 1
+    websocket.health_level = HealthLevel.UNHEALTHY
+
+    health = await monitor.get_system_health()
+    assert health["overall_health"] in {"degraded", "unhealthy"}
