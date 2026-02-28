@@ -83031,6 +83031,27 @@ class JarvisSystemKernel:
         except (OSError, ProcessLookupError, TypeError, ValueError):
             return False
 
+    async def _find_process_on_port(self, port: int) -> Optional[int]:
+        """
+        Best-effort lookup for PID listening on a TCP port.
+
+        Kept local to JarvisSystemKernel to avoid cross-class helper drift.
+        Returns None when unavailable or inaccessible.
+        """
+        if port <= 0:
+            return None
+        try:
+            import psutil
+
+            for conn in await asyncio.to_thread(psutil.net_connections, "inet"):
+                laddr = getattr(conn, "laddr", None)
+                status = getattr(conn, "status", "")
+                if laddr and getattr(laddr, "port", None) == port and status == "LISTEN":
+                    return getattr(conn, "pid", None)
+        except Exception:
+            return None
+        return None
+
     async def _is_loading_server_stopped(
         self,
         *,
