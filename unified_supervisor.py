@@ -77,6 +77,31 @@ import sys as _early_sys
 import signal as _early_signal
 import os as _early_os
 
+# =============================================================================
+# CRITICAL: BLAS THREADING GUARDS — MUST SET BEFORE ANY NUMPY/SCIPY/TORCH IMPORT
+# =============================================================================
+# v278.0: Root cause of triple SIGSEGV at libopenblas64_.0.dylib gemm_thread_n+28.
+#
+# Without these guards, OpenBLAS initializes in multi-threaded mode when numpy is
+# imported (default = CPU core count, e.g. 8 on M1). The worker threads
+# (gemm_thread_n) crash with stack overflow / cross-thread stack corruption on
+# macOS ARM64. The guards in backend/main.py only protect the backend SUBPROCESS
+# — the supervisor process itself was unprotected.
+#
+# These env vars MUST be set before:
+#   1. The numpy subprocess probe at module level (line ~848)
+#   2. _preload_native_libs_sync() which loads numpy in-process (line ~66635)
+#   3. Any subprocess.run() / create_subprocess_exec() that inherits os.environ
+#
+# Setting here ensures ALL child processes inherit single-threaded BLAS mode.
+# =============================================================================
+_early_os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')       # OpenBLAS (numpy)
+_early_os.environ.setdefault('MKL_NUM_THREADS', '1')            # Intel MKL
+_early_os.environ.setdefault('OMP_NUM_THREADS', '1')            # OpenMP
+_early_os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')     # macOS Accelerate
+_early_os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')        # NumExpr
+_early_os.environ.setdefault('OPENBLAS_MAIN_FREE', '1')         # Fork-safety: don't use main thread for GEMM
+
 # Suppress multiprocessing resource_tracker semaphore warnings
 # This MUST be set BEFORE any multiprocessing imports to affect child processes
 _existing_warnings = _early_os.environ.get('PYTHONWARNINGS', '')
@@ -66600,6 +66625,14 @@ class JarvisSystemKernel:
                 import subprocess as _subprocess
                 import sys as _sys
                 _preloaded = []
+
+                # v278.0 defense-in-depth: Ensure BLAS single-threading even if
+                # Zone 0 guard was bypassed (e.g., direct function call).
+                _os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+                _os.environ.setdefault('OMP_NUM_THREADS', '1')
+                _os.environ.setdefault('MKL_NUM_THREADS', '1')
+                _os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+                _os.environ.setdefault('OPENBLAS_MAIN_FREE', '1')
 
                 def _native_probe(module_name: str, timeout_s: float = 4.0) -> bool:
                     """Probe native-module import in isolated subprocess."""
