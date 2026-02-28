@@ -142,3 +142,50 @@ async def test_components_phase_defers_optional_when_sequential_budget_tight(mon
         status = coordinator._component_status[name]
         assert status.available is False
         assert status.error == "Deferred: startup sequential budget"
+
+
+def test_determine_health_state_treats_deferred_components_as_non_blocking():
+    coordinator = AGIOSCoordinator()
+    coordinator._component_status = {
+        "voice": ComponentStatus(name="voice", available=True),
+        "approval": ComponentStatus(name="approval", available=True),
+        "events": ComponentStatus(name="events", available=True),
+        "orchestrator": ComponentStatus(name="orchestrator", available=True),
+        "neural_mesh": ComponentStatus(
+            name="neural_mesh",
+            available=False,
+            healthy=False,
+            error="Deferred: low memory",
+        ),
+    }
+
+    assert coordinator._determine_health_state() == AGIOSState.ONLINE
+
+
+async def test_recover_single_component_reinitializes_neural_mesh(monkeypatch):
+    coordinator = AGIOSCoordinator()
+    coordinator._component_status["neural_mesh"] = ComponentStatus(
+        name="neural_mesh",
+        available=False,
+        error="Deferred: low memory",
+    )
+
+    class _UnhealthyMesh:
+        async def health_check(self):
+            return {"status": "unhealthy"}
+
+    coordinator._neural_mesh = _UnhealthyMesh()
+
+    async def _fake_init_neural_mesh() -> None:
+        coordinator._neural_mesh = object()
+        coordinator._component_status["neural_mesh"] = ComponentStatus(
+            name="neural_mesh",
+            available=True,
+            healthy=True,
+        )
+
+    monkeypatch.setattr(coordinator, "_init_neural_mesh", _fake_init_neural_mesh)
+
+    recovered = await coordinator._recover_single_component("neural_mesh")
+    assert recovered is coordinator._neural_mesh
+    assert coordinator._component_status["neural_mesh"].available is True

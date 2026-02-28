@@ -771,6 +771,10 @@ class JarvisPrimeClient:
     - Dynamic memory monitoring with mode switching
     """
 
+    # v278.0: Minimum budget (seconds) required to attempt a backend call.
+    # If remaining deadline budget is below this, skip the backend entirely.
+    _MIN_BACKEND_BUDGET_S: float = 2.0
+
     def __init__(self, config: Optional[JarvisPrimeConfig] = None):
         self.config = config or JarvisPrimeConfig()
 
@@ -856,6 +860,40 @@ class JarvisPrimeClient:
             f"repo_map={'enabled' if self._repo_enricher else 'disabled'}, "
             f"unified_serving={'enabled' if self._use_unified_serving else 'disabled'}"
         )
+
+    # =========================================================================
+    # v278.0: Deadline-aware timeout computation
+    # =========================================================================
+
+    @staticmethod
+    def _compute_effective_timeout(
+        config_timeout_s: float,
+        deadline: Optional[float],
+        headroom_s: float = 1.0,
+    ) -> Optional[float]:
+        """Compute effective timeout bounded by both config and remaining deadline.
+
+        Returns the lesser of the configured backend timeout and the remaining
+        deadline budget (minus headroom), or ``None`` if the deadline has already
+        been exceeded — signalling the caller to skip this backend entirely.
+
+        Args:
+            config_timeout_s: Backend's configured timeout in seconds.
+            deadline: Monotonic deadline timestamp, or None if unconstrained.
+            headroom_s: Safety margin subtracted from remaining budget so the
+                caller has time to handle the result/failure.
+
+        Returns:
+            Effective timeout in seconds, or None when budget is exhausted.
+        """
+        if deadline is None:
+            return config_timeout_s
+
+        remaining = deadline - time.monotonic()
+        if remaining <= JarvisPrimeClient._MIN_BACKEND_BUDGET_S:
+            return None  # Budget exhausted — skip this backend
+
+        return min(config_timeout_s, remaining - headroom_s)
 
     async def _get_http_client(self):
         """Lazy load HTTP client with registry registration."""
@@ -1099,6 +1137,7 @@ class JarvisPrimeClient:
         temperature: float = 0.7,
         messages: Optional[List[ChatMessage]] = None,
         enrich_with_repo_map: bool = True,
+        deadline: Optional[float] = None,
     ) -> CompletionResponse:
         """
         Complete a prompt with automatic routing and fallback.
@@ -1110,6 +1149,9 @@ class JarvisPrimeClient:
             temperature: Sampling temperature
             messages: Optional list of messages (overrides prompt)
             enrich_with_repo_map: Whether to enrich coding questions with repo context
+            deadline: v278.0 — Monotonic deadline timestamp. Each backend
+                attempt uses ``min(config_timeout, remaining_budget - headroom)``
+                so the fallback chain never exhausts the command budget.
 
         Returns:
             CompletionResponse with result
@@ -1214,6 +1256,17 @@ class JarvisPrimeClient:
         _saw_model_swap_503 = False  # v242.1: track 503 for retry signalling
 
         for try_mode in fallback_order:
+            # v278.0: Budget check — bail before starting a backend that
+            # cannot possibly complete within the remaining budget.
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= self._MIN_BACKEND_BUDGET_S:
+                    logger.info(
+                        f"[v278] Budget exhausted ({remaining:.1f}s left), "
+                        f"skipping remaining backends from {try_mode.value} onward"
+                    )
+                    break
+
             cb = self._circuit_breakers[try_mode]
 
             if not cb.allow_request():
@@ -1226,6 +1279,7 @@ class JarvisPrimeClient:
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    deadline=deadline,
                 )
 
                 if response.success:
@@ -1300,6 +1354,7 @@ class JarvisPrimeClient:
         max_tokens: int = 512,
         temperature: float = 0.7,
         context_metadata: Optional[Dict[str, Any]] = None,
+        deadline: Optional[float] = None,
     ) -> StructuredResponse:
         """Send query to J-Prime, get classified + generated response.
 
@@ -1317,6 +1372,8 @@ class JarvisPrimeClient:
             temperature: Sampling temperature for generation.
             context_metadata: Optional dict of context (e.g. active app,
                 time-of-day) forwarded to J-Prime for classification.
+            deadline: v278.0 — Monotonic deadline propagated to complete()
+                and _brain_vacuum_fallback() for budget-aware timeouts.
 
         Returns:
             StructuredResponse with content and routing metadata.
@@ -1367,6 +1424,7 @@ class JarvisPrimeClient:
                 temperature=temperature,
                 messages=[ChatMessage(role="user", content=_enriched_query)],
                 enrich_with_repo_map=False,  # Body handles its own enrichment
+                deadline=deadline,
             )
 
             total_ms = int((time.time() - start_time) * 1000)
@@ -1392,6 +1450,7 @@ class JarvisPrimeClient:
                     query=query,
                     system_prompt=system_prompt,
                     max_tokens=max_tokens,
+                    deadline=deadline,
                 )
 
             # Parse x_jarvis_routing from response metadata.
@@ -1408,6 +1467,7 @@ class JarvisPrimeClient:
                     system_prompt=system_prompt,
                     max_tokens=max_tokens,
                     routing=routing,
+                    deadline=deadline,
                 )
 
             # v242.2: Lazy capability registration on first success
@@ -1443,6 +1503,7 @@ class JarvisPrimeClient:
                 query=query,
                 system_prompt=system_prompt,
                 max_tokens=max_tokens,
+                deadline=deadline,
             )
 
     async def register_capabilities(self) -> bool:
@@ -1491,6 +1552,7 @@ class JarvisPrimeClient:
         system_prompt: Optional[str],
         max_tokens: int,
         routing: Dict[str, Any],
+        deadline: Optional[float] = None,
     ) -> StructuredResponse:
         """Route to Claude/Gemini API when J-Prime signals escalation.
 
@@ -1498,6 +1560,8 @@ class JarvisPrimeClient:
         the local specialist model and flag ``escalate_to_claude``.
         This method honours that signal and calls the API fallback
         directly, bypassing the local/Cloud Run tiers.
+
+        v278.0: Accepts deadline for budget-aware timeouts.
         """
         logger.info(
             f"[v242] Escalation requested: reason={routing.get('escalation_reason', 'unspecified')}"
@@ -1515,6 +1579,7 @@ class JarvisPrimeClient:
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.7,
+                deadline=deadline,
             )
             if not response.success:
                 # Claude failed -- fall back to Gemini as last resort
@@ -1524,6 +1589,7 @@ class JarvisPrimeClient:
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=0.7,
+                    deadline=deadline,
                 )
 
             if response.success:
@@ -1565,6 +1631,7 @@ class JarvisPrimeClient:
         query: str,
         system_prompt: Optional[str],
         max_tokens: int,
+        deadline: Optional[float] = None,
     ) -> StructuredResponse:
         """Fallback when J-Prime is completely unreachable.
 
@@ -1575,7 +1642,23 @@ class JarvisPrimeClient:
         v244.0: Includes classification prompt so commands are properly
         classified (not hardcoded to intent="answer"). This ensures
         "lock my screen" executes as an action, not a text response.
+
+        v278.0: Accepts deadline for budget-aware timeouts. Bails immediately
+        when insufficient budget remains for an API call.
         """
+        # v278.0: Budget gate — if we're already past deadline, return fast
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= self._MIN_BACKEND_BUDGET_S:
+                logger.warning(
+                    f"[v278] Brain vacuum skipped — only {remaining:.1f}s remaining "
+                    f"(need >{self._MIN_BACKEND_BUDGET_S}s)"
+                )
+                return StructuredResponse(
+                    content="I'm having trouble processing that right now — please try again.",
+                    intent="answer",
+                    source="error",
+                )
         # v244.0: Classification prompt — ask the LLM to classify the
         # command AND generate a response in a single call.
         _classification_prefix = (
@@ -1609,6 +1692,7 @@ class JarvisPrimeClient:
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.7,
+                deadline=deadline,
             )
             if not response.success:
                 # Claude failed -- fall back to Gemini as last resort
@@ -1618,6 +1702,7 @@ class JarvisPrimeClient:
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=0.7,
+                    deadline=deadline,
                 )
 
             if response.success:
@@ -1701,16 +1786,20 @@ class JarvisPrimeClient:
         messages: List[ChatMessage],
         max_tokens: int,
         temperature: float,
+        deadline: Optional[float] = None,
     ) -> CompletionResponse:
-        """Execute completion on a specific backend."""
+        """Execute completion on a specific backend.
+
+        v278.0: Propagates deadline to each backend for budget-aware timeouts.
+        """
         if mode == RoutingMode.LOCAL:
-            return await self._complete_local(messages, max_tokens, temperature)
+            return await self._complete_local(messages, max_tokens, temperature, deadline=deadline)
         elif mode == RoutingMode.CLOUD_RUN:
-            return await self._complete_cloud_run(messages, max_tokens, temperature)
+            return await self._complete_cloud_run(messages, max_tokens, temperature, deadline=deadline)
         elif mode == RoutingMode.CLAUDE_API:
-            return await self._complete_claude(messages, max_tokens, temperature)
+            return await self._complete_claude(messages, max_tokens, temperature, deadline=deadline)
         elif mode == RoutingMode.GEMINI_API:
-            return await self._complete_gemini(messages, max_tokens, temperature)
+            return await self._complete_gemini(messages, max_tokens, temperature, deadline=deadline)
         else:
             return CompletionResponse(success=False, error=f"Unknown mode: {mode}")
 
@@ -1719,14 +1808,26 @@ class JarvisPrimeClient:
         messages: List[ChatMessage],
         max_tokens: int,
         temperature: float,
+        deadline: Optional[float] = None,
     ) -> CompletionResponse:
-        """Complete via local JARVIS-Prime."""
+        """Complete via local JARVIS-Prime.
+
+        v278.0: Accepts deadline for budget-aware timeout.
+        """
         client = await self._get_http_client()
         if client is None:
             return CompletionResponse(success=False, error="HTTP client not available", backend="local")
 
         url = f"http://{self.config.local_host}:{self.config.local_port}/v1/chat/completions"
-        timeout = self.config.local_timeout_ms / 1000.0
+        # v278.0: Budget-aware timeout
+        config_timeout = self.config.local_timeout_ms / 1000.0
+        timeout = self._compute_effective_timeout(config_timeout, deadline)
+        if timeout is None:
+            return CompletionResponse(
+                success=False,
+                error="deadline budget exhausted before local call",
+                backend="local",
+            )
 
         payload = {
             "messages": [{"role": m.role, "content": m.content} for m in messages],
@@ -1773,8 +1874,12 @@ class JarvisPrimeClient:
         messages: List[ChatMessage],
         max_tokens: int,
         temperature: float,
+        deadline: Optional[float] = None,
     ) -> CompletionResponse:
-        """Complete via Cloud Run JARVIS-Prime."""
+        """Complete via Cloud Run JARVIS-Prime.
+
+        v278.0: Accepts deadline for budget-aware timeout.
+        """
         if not self.config.cloud_run_url:
             return CompletionResponse(success=False, error="Cloud Run URL not configured", backend="cloud_run")
 
@@ -1783,7 +1888,15 @@ class JarvisPrimeClient:
             return CompletionResponse(success=False, error="HTTP client not available", backend="cloud_run")
 
         url = f"{self.config.cloud_run_url}/v1/chat/completions"
-        timeout = self.config.cloud_timeout_ms / 1000.0
+        # v278.0: Budget-aware timeout
+        config_timeout = self.config.cloud_timeout_ms / 1000.0
+        timeout = self._compute_effective_timeout(config_timeout, deadline)
+        if timeout is None:
+            return CompletionResponse(
+                success=False,
+                error="deadline budget exhausted before Cloud Run call",
+                backend="cloud_run",
+            )
 
         payload = {
             "messages": [{"role": m.role, "content": m.content} for m in messages],
@@ -1853,8 +1966,22 @@ class JarvisPrimeClient:
         messages: List[ChatMessage],
         max_tokens: int,
         temperature: float,
+        deadline: Optional[float] = None,
     ) -> CompletionResponse:
-        """Complete via Gemini API (fallback)."""
+        """Complete via Gemini API (fallback).
+
+        v278.0: Accepts deadline for budget-aware timeout.
+        """
+        # v278.0: Budget check before attempting Gemini
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= self._MIN_BACKEND_BUDGET_S:
+                return CompletionResponse(
+                    success=False,
+                    error="deadline budget exhausted before Gemini call",
+                    backend="gemini",
+                )
+
         if not self.config.gemini_api_key:
             return CompletionResponse(success=False, error="Gemini API key not configured", backend="gemini")
 
@@ -1939,8 +2066,13 @@ class JarvisPrimeClient:
         messages: List[ChatMessage],
         max_tokens: int,
         temperature: float,
+        deadline: Optional[float] = None,
     ) -> CompletionResponse:
-        """Complete via Claude API (preferred fallback over Gemini)."""
+        """Complete via Claude API (preferred fallback over Gemini).
+
+        v278.0: Accepts deadline for budget-aware timeout. The effective
+        timeout is ``min(claude_timeout_ms, remaining_budget - headroom)``.
+        """
         if not self.config.claude_api_key:
             return CompletionResponse(
                 success=False, error="Claude API key not configured", backend="claude_api"
@@ -1953,8 +2085,15 @@ class JarvisPrimeClient:
             )
 
         # Lazy client init (initialized to None in __init__)
+        # v278.0: max_retries=1 — the fallback chain handles retry logic at
+        # a higher level (Claude → Gemini). Allowing the SDK to retry
+        # autonomously with its own backoff schedule burns deadline budget
+        # that should be available for fallback backends.
         if self._claude_client is None:
-            self._claude_client = AsyncAnthropic(api_key=self.config.claude_api_key)
+            self._claude_client = AsyncAnthropic(
+                api_key=self.config.claude_api_key,
+                max_retries=1,
+            )
 
         # Separate system message from conversation messages
         system_prompt = "You are JARVIS, a helpful AI assistant."
@@ -1965,7 +2104,16 @@ class JarvisPrimeClient:
             else:
                 api_messages.append({"role": m.role, "content": m.content})
 
-        timeout = self.config.claude_timeout_ms / 1000.0
+        # v278.0: Budget-aware timeout
+        config_timeout = self.config.claude_timeout_ms / 1000.0
+        timeout = self._compute_effective_timeout(config_timeout, deadline)
+        if timeout is None:
+            return CompletionResponse(
+                success=False,
+                error="deadline budget exhausted before Claude API call",
+                backend="claude_api",
+            )
+
         start = time.time()
         try:
             response = await asyncio.wait_for(

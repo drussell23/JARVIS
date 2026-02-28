@@ -1981,6 +1981,9 @@ class UnifiedCommandProcessor:
         v242.1: On J-Prime failure, attempts brain vacuum fallback via client
         before returning None.
         v242.1: Retries once after 2s on 503 model-swap (source='model_swapping').
+        v278.0: Propagates deadline to classify_and_complete() so the entire
+        inference fallback chain (UMS → Local → Cloud Run → Claude → Gemini)
+        uses budget-proportional timeouts instead of fixed config timeouts.
         """
         self._v242_metrics["jprime_calls"] += 1
         client = None
@@ -1997,11 +2000,14 @@ class UnifiedCommandProcessor:
                 remaining = deadline - _time.monotonic()
                 timeout = max(2.0, remaining - 1.0)
 
+            # v278.0: Pass deadline into classify_and_complete so inner
+            # backends use budget-proportional timeouts.
             response = await asyncio.wait_for(
                 client.classify_and_complete(
                     query=command_text,
                     max_tokens=512,
                     context_metadata=source_context,
+                    deadline=deadline,
                 ),
                 timeout=timeout,
             )
@@ -2033,6 +2039,7 @@ class UnifiedCommandProcessor:
                                 query=command_text,
                                 max_tokens=512,
                                 context_metadata=source_context,
+                                deadline=deadline,
                             ),
                             timeout=retry_timeout,
                         )
@@ -2044,6 +2051,7 @@ class UnifiedCommandProcessor:
                             query=command_text,
                             max_tokens=512,
                             context_metadata=source_context,
+                            deadline=deadline,
                         ),
                         timeout=retry_timeout,
                     )
@@ -2062,16 +2070,28 @@ class UnifiedCommandProcessor:
         except Exception as e:
             logger.warning(f"[v242] J-Prime call failed: {e}")
 
-        # v242.1: J-Prime failed — try brain vacuum fallback via existing client
+        # v278.0: Budget-guarded brain vacuum fallback.
+        # classify_and_complete() already tried brain vacuum internally (v244.0).
+        # This outer attempt only fires on TimeoutError/Exception, when the inner
+        # brain vacuum was never reached. Check remaining budget before attempting.
         if client is not None:
-            try:
-                self._v242_metrics["brain_vacuum_activations"] += 1
-                logger.info("[v242] Attempting brain vacuum fallback via client")
-                return await client._brain_vacuum_fallback(
-                    query=command_text, system_prompt=None, max_tokens=512,
+            _remaining = (deadline - time.monotonic()) if deadline else 5.0
+            if _remaining > 2.0:
+                try:
+                    self._v242_metrics["brain_vacuum_activations"] += 1
+                    logger.info(
+                        f"[v278] Attempting brain vacuum fallback ({_remaining:.1f}s remaining)"
+                    )
+                    return await client._brain_vacuum_fallback(
+                        query=command_text, system_prompt=None, max_tokens=512,
+                        deadline=deadline,
+                    )
+                except Exception as fallback_err:
+                    logger.error(f"[v242] Brain vacuum fallback also failed: {fallback_err}")
+            else:
+                logger.warning(
+                    f"[v278] Skipping brain vacuum — only {_remaining:.1f}s remaining"
                 )
-            except Exception as fallback_err:
-                logger.error(f"[v242] Brain vacuum fallback also failed: {fallback_err}")
 
         return None
 
