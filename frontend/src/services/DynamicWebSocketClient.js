@@ -269,8 +269,16 @@ class DynamicWebSocketClient {
       heartbeatTimeout: 10000,
       connectionTimeout: 10000,
       messageTimeout: 5000,
-      maxQueueSize: 500,
-      queueTTL: 5 * 60 * 1000, // 5 minutes
+      // v277.0: Queue Policy Contract (explicit, not implicit — Disease 6 cure)
+      // - Max size: FIFO eviction when full (oldest dropped)
+      // - TTL: expired on flush, rejected with "Message expired"
+      // - Persistence: IN-MEMORY ONLY (lost on tab reload — by design)
+      //   Tab reload = fresh session. Queued commands from previous session
+      //   context may be stale/dangerous.
+      // - Replay order: FIFO (oldest first)
+      // - Dedup: Server-side via command_id (see unified_command_processor.py)
+      maxQueueSize: parseInt(localStorage.getItem('jarvis_queue_max') || '500', 10),
+      queueTTL: parseInt(localStorage.getItem('jarvis_queue_ttl') || '300000', 10), // 5 min default
       useGlobalLock: true, // Use global lock to prevent duplicate connections
       ...config
     };

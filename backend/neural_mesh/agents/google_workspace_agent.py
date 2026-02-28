@@ -2702,6 +2702,28 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
 
         logger.info("GoogleWorkspaceAgent initialized with Never-Fail fallbacks")
 
+    def get_capability_health(self) -> dict:
+        """Formal capability health contract for /api/system/status.
+
+        Exposes auth state and readiness through a public API contract
+        instead of private attribute introspection. Frontend consumes this
+        to show command-scoped messages (e.g., 'Gmail not authorized').
+
+        v277.0: Disease 1+3 cure — formal contract, not _auth_state probing.
+        """
+        client = getattr(self, "_client", None)
+        auth_state = "unavailable"
+        if client and hasattr(client, "auth_state"):
+            raw = client.auth_state
+            auth_state = raw.value if hasattr(raw, "value") else str(raw)
+
+        return {
+            "initialized": client is not None,
+            "auth_state": auth_state,
+            "ready": auth_state == "authenticated",
+            "capabilities": sorted(self.capabilities) if hasattr(self, "capabilities") else [],
+        }
+
     async def on_start(self) -> None:
         """Called when agent starts."""
         logger.info("GoogleWorkspaceAgent started - ready for workspace operations")

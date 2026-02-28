@@ -653,6 +653,36 @@ const getWakeWordResponse = (context = {}) => {
   return responsePool[Math.floor(Math.random() * responsePool.length)];
 };
 
+/**
+ * v277.0: Contract-driven connection message builder (Disease 3+9 cure).
+ * Uses connectionContext from JarvisConnectionService to show contextual
+ * messages instead of generic "reconnecting..." regardless of state.
+ * Command-scoped: only workspace responses trigger auth messaging.
+ */
+const getConnectionMessage = (result) => {
+  const ctx = result?.connectionContext;
+  // Contract-driven: use system status when available
+  if (ctx?.systemStatus?.system?.phase === 'initializing') {
+    const pct = Math.round(ctx.systemStatus.system.overall_progress || 0);
+    return `JARVIS is starting up (${pct}%) — command queued, will send when ready`;
+  }
+  if (ctx) {
+    switch (ctx.scenario) {
+      case 'temporarily_disconnected': {
+        const secs = ctx.timeSinceLastOnline ? Math.round(ctx.timeSinceLastOnline / 1000) : null;
+        const ago = secs != null ? (secs < 120 ? `${secs}s ago` : `${Math.round(secs / 60)}m ago`) : '';
+        return `Reconnecting to JARVIS${ago ? ` (last seen ${ago})` : ''} — command queued for retry`;
+      }
+      case 'starting_up':
+        return 'JARVIS is starting up — command queued, will send when ready';
+      case 'never_connected':
+      default:
+        return 'JARVIS backend not running — start with: python3 unified_supervisor.py';
+    }
+  }
+  return 'JARVIS backend not reachable — check that the system is running';
+};
+
 const JarvisVoice = () => {
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -2329,6 +2359,16 @@ const JarvisVoice = () => {
             if (!zombieRetryInFlightRef.current) {
               activeRequestIdRef.current = cmdRequestId;
             }
+            break;
+          }
+
+          // v277.0: Command-scoped auth error messaging (Disease 3 cure).
+          // Only workspace responses trigger auth messaging — non-workspace
+          // commands are unaffected even when Gmail auth is missing.
+          if (data.error_code === 'needs_reauth' || data.error_code === 'auth_missing') {
+            const authMsg = `${data.response || 'Authorization required'}\n\nTo fix: ${data.action_required || 'Run the OAuth setup script'}`;
+            setResponse(authMsg);
+            setIsProcessing(false);
             break;
           }
 
@@ -4923,23 +4963,15 @@ const JarvisVoice = () => {
               });
             }, 15000);
           }
-        } else if (result.route === 'queued') {
-          setResponse(
-            result.recovering
-              ? '⚠️ JARVIS backend recovery started — command queued for automatic retry'
-              : '📤 Command queued — reconnecting to JARVIS...'
-          );
+        } else if (result.route === 'queued' || result.route === 'recovering') {
+          // v277.0: Contract-driven message from connection context
+          setResponse(getConnectionMessage(result));
           setIsProcessing(false);
-          // Trigger reconnection
-          connectionService.reconnect();
-        } else if (result.route === 'recovering') {
-          setResponse('⚠️ JARVIS backend recovery started — please try again shortly');
-          setIsProcessing(false);
-          // Trigger reconnection
           connectionService.reconnect();
         } else {
-          // Both WebSocket and REST failed — try direct REST as last resort
-          console.warn('[TEXT-CMD] Connection service failed, attempting direct REST...');
+          // Both WebSocket and REST failed — delegate to connection service
+          // (sendCommandViaDirectREST now delegates to connectionService)
+          console.warn('[TEXT-CMD] Connection service failed, attempting fallback...');
           await sendCommandViaDirectREST(command);
         }
       } catch (error) {
@@ -4955,59 +4987,30 @@ const JarvisVoice = () => {
   };
 
   /**
-   * Last-resort direct REST API call when connection service is unavailable.
-   * Uses the backend's /api/command endpoint directly.
+   * v277.0: Consolidated transport — delegates to connectionService instead of
+   * making direct fetch() calls (Disease 2 cure: single transport authority).
+   * Lock/audio/status endpoints remain direct — they are non-command operational endpoints.
    */
   const sendCommandViaDirectREST = async (command) => {
-    try {
-      // Try to get the API URL from multiple sources
-      const apiUrl = API_URL || configService.getApiUrl() || 'http://localhost:8010';
-      const url = `${apiUrl}/api/command`;
-      
-      console.log(`[TEXT-CMD] Direct REST fallback: ${url}`);
-      
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          command: command,
-          text: command,
-          mode: autonomousMode ? 'autonomous' : 'manual' 
-        }),
-        signal: AbortSignal.timeout(30000)
+    const connectionService = jarvisConnectionServiceRef.current;
+    if (connectionService) {
+      const result = await connectionService.sendCommand(command, {
+        mode: autonomousMode ? 'autonomous' : 'manual'
       });
-
-      if (response.ok) {
-        const data = await response.json();
-        const responseText = data.response || data.result || data.text || 'Command processed.';
-        console.log('[TEXT-CMD] ✅ Direct REST succeeded');
-        setResponse(responseText);
-      } else {
-        console.error(`[TEXT-CMD] REST returned ${response.status}`);
-        setResponse('⚠️ JARVIS is starting up — please try again in a moment');
-      }
-    } catch (error) {
-      console.error('[TEXT-CMD] Direct REST failed:', error);
-      const connectionService = jarvisConnectionServiceRef.current;
-      if (connectionService && typeof connectionService.requestBackendRecovery === 'function') {
-        try {
-          const recovery = await connectionService.requestBackendRecovery('jarvis_voice_direct_rest_failure');
-          if (recovery?.accepted) {
-            setResponse('⚠️ JARVIS backend recovery started — retrying connection...');
-            setTimeout(() => connectionService.reconnect(), 750);
-          } else {
-            setResponse('⚠️ Cannot reach JARVIS backend — recovery endpoint unavailable');
-          }
-        } catch (recoveryError) {
-          console.error('[TEXT-CMD] Recovery request failed:', recoveryError);
-          setResponse('⚠️ Cannot reach JARVIS backend — check that the system is running');
+      if (result.success) {
+        // Response is emitted via the 'message' event from sendCommand/REST path
+        // — it's already handled by the WS message listener. Only set here
+        // if no response was emitted (e.g., WebSocket route returns no data).
+        if (!result.response) {
+          console.log('[TEXT-CMD] ✅ Command sent via connection service');
         }
       } else {
-        setResponse('⚠️ Cannot reach JARVIS backend — check that the system is running');
+        setResponse(getConnectionMessage(result));
       }
-    } finally {
-      setIsProcessing(false);
+    } else {
+      setResponse('⚠️ JARVIS backend not reachable — check that the system is running');
     }
+    setIsProcessing(false);
   };
 
   const activateJarvis = async () => {
@@ -5690,19 +5693,9 @@ const JarvisVoice = () => {
           return;
         }
 
-        if (result.route === 'queued') {
-          setResponse(
-            result.recovering
-              ? '⚠️ JARVIS backend recovery started — command queued for automatic retry'
-              : '📤 Command queued — reconnecting to JARVIS...'
-          );
-          setIsProcessing(false);
-          connectionService.reconnect();
-          return;
-        }
-
-        if (result.route === 'recovering') {
-          setResponse('⚠️ JARVIS backend recovery started — please wait a moment');
+        if (result.route === 'queued' || result.route === 'recovering') {
+          // v277.0: Contract-driven message from connection context
+          setResponse(getConnectionMessage(result));
           setIsProcessing(false);
           connectionService.reconnect();
           return;

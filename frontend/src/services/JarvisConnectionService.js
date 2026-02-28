@@ -102,6 +102,25 @@ class JarvisConnectionService {
       cooldownMs: 8000,
       lastResult: null
     };
+
+    // v277.0: Connection context tracking (Disease 1 cure).
+    // _wasEverOnline persists across tab refresh via localStorage.
+    this._wasEverOnline = false;
+    this._lastOnlineTimestamp = null;
+    this._lastSystemStatus = null;
+    this._lastSystemStatusAt = null;
+    // Restore from localStorage (survives tab refresh)
+    try {
+      const stored = localStorage.getItem('jarvis_last_online_ts');
+      if (stored) {
+        const ts = parseInt(stored, 10);
+        // If was online within last 10 minutes, treat as "was connected"
+        if (Date.now() - ts < 600000) {
+          this._wasEverOnline = true;
+          this._lastOnlineTimestamp = ts;
+        }
+      }
+    } catch (e) { /* localStorage unavailable */ }
     
     // Initialize asynchronously (non-blocking)
     this._initializeAsync();
@@ -704,13 +723,35 @@ class JarvisConnectionService {
   }
 
   async _checkBackendHealth() {
+    // v277.0: Try enriched /api/system/status first (Disease 1 cure),
+    // falls back to /health for backward compat.
+    try {
+      const statusResp = await fetchWithTimeout(
+        `${this.backendUrl}/api/system/status`,
+        { headers: { 'Accept': 'application/json' } },
+        this.healthConfig.timeout
+      );
+      if (statusResp.ok) {
+        this._lastSystemStatus = await statusResp.json();
+        this._lastSystemStatusAt = Date.now();
+        this.consecutiveFailures = 0;
+        return {
+          ok: true,
+          status: this._lastSystemStatus?.system?.phase || 'ready',
+          mode: 'full',
+          systemStatus: this._lastSystemStatus,
+        };
+      }
+    } catch (e) { /* fall through to /health */ }
+
+    // Backward-compatible fallback
     try {
       const response = await fetchWithTimeout(
         `${this.backendUrl}/health`,
         { headers: { 'Accept': 'application/json' } },
         this.healthConfig.timeout
       );
-      
+
       if (response.ok) {
         const data = await response.json();
         return {
@@ -719,7 +760,7 @@ class JarvisConnectionService {
           mode: data.mode || 'full'
         };
       }
-      
+
       return { ok: false, error: `HTTP ${response.status}` };
     } catch (error) {
       return { ok: false, error: error.message };
@@ -894,6 +935,15 @@ class JarvisConnectionService {
       const oldState = this.connectionState;
       this.connectionState = newState;
       console.log(`[JarvisConnection] State: ${oldState} -> ${newState}`);
+
+      // v277.0: Record ONLINE + persist to localStorage (Disease 1 cure)
+      if (newState === ConnectionState.ONLINE) {
+        const now = Date.now();
+        this._wasEverOnline = true;
+        this._lastOnlineTimestamp = now;
+        try { localStorage.setItem('jarvis_last_online_ts', String(now)); } catch (e) {}
+      }
+
       this._emit('stateChange', { oldState, newState, state: newState });
     }
   }
@@ -951,6 +1001,36 @@ class JarvisConnectionService {
     return this.lastError;
   }
 
+  /**
+   * v277.0: Connection context for UX message builder (Disease 1 cure).
+   * Returns scenario + history so frontend can show contextual messages
+   * instead of generic "reconnecting..." regardless of state.
+   */
+  getConnectionContext() {
+    let scenario;
+    if (this._wasEverOnline) {
+      scenario = 'temporarily_disconnected';
+    } else if (this.recoveryState.inProgress || this.connectionState === ConnectionState.CONNECTING) {
+      scenario = 'starting_up';
+    } else {
+      scenario = 'never_connected';
+    }
+    return {
+      scenario,
+      wasEverOnline: this._wasEverOnline,
+      timeSinceLastOnline: this._lastOnlineTimestamp ? Date.now() - this._lastOnlineTimestamp : null,
+      connectionState: this.connectionState,
+      systemStatus: this._lastSystemStatus,
+    };
+  }
+
+  /**
+   * v277.0: Get cached system status from last health check.
+   */
+  getSystemStatus() {
+    return this._lastSystemStatus;
+  }
+
   getWebSocket() {
     if (!this.wsClient) return null;
     for (const [, ws] of this.wsClient.connections) {
@@ -980,8 +1060,13 @@ class JarvisConnectionService {
    * @returns {Promise<{success: boolean, response?: string, route: string}>}
    */
   async sendCommand(command, options = {}) {
+    // v277.0: Generate command_id for idempotency dedupe (Disease 4 cure).
+    // Both WS and REST paths include this — backend deduplicates at
+    // process_command() level covering both transports.
+    const commandId = `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const message = {
       type: 'command',
+      command_id: commandId,
       text: command,
       mode: options.mode || 'manual',
       metadata: { source: 'text_input', timestamp: Date.now(), ...options.metadata },
@@ -1015,7 +1100,7 @@ class JarvisConnectionService {
     const restCooldownExpired = this._lastRestFailure && (Date.now() - this._lastRestFailure > 2000);
     if (this.backendUrl && (this._restAvailable !== false || restCooldownExpired)) {
       try {
-        const result = await this._sendViaREST(command, options);
+        const result = await this._sendViaREST(command, { ...options, commandId });
         return result;
       } catch (restError) {
         console.warn('[JarvisConnection] REST send failed:', restError.message);
@@ -1043,6 +1128,7 @@ class JarvisConnectionService {
         route: 'queued',
         recovering: recovery.accepted === true,
         recovery,
+        connectionContext: this.getConnectionContext(),
         error: recovery.accepted
           ? 'Backend recovery initiated — command queued for retry'
           : 'No connection available — command queued for retry'
@@ -1055,6 +1141,7 @@ class JarvisConnectionService {
         route: 'recovering',
         recovering: true,
         recovery,
+        connectionContext: this.getConnectionContext(),
         error: 'Backend recovery initiated'
       };
     }
@@ -1064,6 +1151,7 @@ class JarvisConnectionService {
       route: 'none',
       recovering: false,
       recovery,
+      connectionContext: this.getConnectionContext(),
       error: 'No connection to JARVIS backend'
     };
   }
@@ -1083,6 +1171,7 @@ class JarvisConnectionService {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           command: command,
+          command_id: options.commandId || null,
           text: command,
           mode: options.mode || 'manual',
           metadata: { source: 'rest_fallback', timestamp: Date.now(), ...options.metadata }
@@ -1239,7 +1328,9 @@ export function useJarvisConnection() {
     send: (msg, opts) => service.send(msg, opts),
     subscribe: (type, handler) => service.subscribe(type, handler),
     reconnect: () => service.reconnect(),
-    
+    getConnectionContext: () => service.getConnectionContext(),
+    getSystemStatus: () => service.getSystemStatus(),
+
     service
   };
 }

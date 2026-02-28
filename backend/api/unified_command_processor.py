@@ -311,6 +311,15 @@ class UnifiedCommandProcessor:
         self._neural_mesh_coordinator = None
         self._neural_mesh_lookup_attempted = False
 
+        # v277.0: Command idempotency dedupe cache (Disease 4 cure).
+        # Bounded in-memory cache keyed by request_id. Covers both WS and
+        # REST paths since both funnel through process_command().
+        # Process-local: if JARVIS moves to multi-process, migrate to
+        # Redis/SQLite WAL with TTL.
+        self._dedup_cache: Dict[str, Tuple[dict, float]] = {}
+        self._dedup_ttl = float(os.getenv("JARVIS_DEDUP_WINDOW_SECONDS", "60"))
+        self._dedup_max = int(os.getenv("JARVIS_DEDUP_CACHE_MAX", "500"))
+
     def _get_neural_mesh_coordinator(self):
         """Lazily resolve the Neural Mesh coordinator singleton.
 
@@ -1442,10 +1451,46 @@ class UnifiedCommandProcessor:
         self, command_text: str, websocket=None, audio_data: bytes = None,
         speaker_name: str = None, deadline: Optional[float] = None,
         source_context: Optional[Dict[str, Any]] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Process any command through unified pipeline with FULL context awareness including voice authentication"""
+        """Process any command through unified pipeline with FULL context awareness including voice authentication.
+        v277.0: Wraps _execute_command_pipeline with idempotency dedupe."""
+        logger.info(f"[UNIFIED] Processing: '{command_text}'"
+                     + (f" [request_id={request_id}]" if request_id else ""))
+
+        # v277.0: Idempotency dedupe (Disease 4 cure).
+        # Covers both WS and REST paths — both funnel here.
+        if request_id:
+            now = time.time()
+            cached = self._dedup_cache.get(request_id)
+            if cached and now - cached[1] < self._dedup_ttl:
+                logger.info(f"[DEDUP] Returning cached result for request_id={request_id}")
+                return {**cached[0], "deduplicated": True}
+
+        # v277.0: Execute pipeline and cache result for dedupe
+        result = await self._execute_command_pipeline(
+            command_text, websocket=websocket, audio_data=audio_data,
+            speaker_name=speaker_name, deadline=deadline,
+            source_context=source_context,
+        )
+
+        # Cache result for idempotency (bounded eviction)
+        if request_id and isinstance(result, dict):
+            self._dedup_cache[request_id] = (result, time.time())
+            if len(self._dedup_cache) > self._dedup_max:
+                oldest = min(self._dedup_cache, key=lambda k: self._dedup_cache[k][1])
+                del self._dedup_cache[oldest]
+
+        return result
+
+    async def _execute_command_pipeline(
+        self, command_text: str, websocket=None, audio_data: bytes = None,
+        speaker_name: str = None, deadline: Optional[float] = None,
+        source_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Inner pipeline extracted from process_command for dedupe wrapping.
+        v277.0: All original process_command logic lives here."""
         _start_time = time.time()
-        logger.info(f"[UNIFIED] Processing with context awareness: '{command_text}'")
 
         source_context = source_context or {}
         allow_during_tts_interrupt = bool(
@@ -2346,19 +2391,21 @@ class UnifiedCommandProcessor:
                     "source": getattr(response, 'source', 'unknown'),
                 }
 
-            # Disease 1 cure: read suggested_actions from J-Prime classification.
-            # Validate against agent's capabilities (single source of truth — Gap 4).
-            workspace_action = "handle_workspace_query"  # fallback to keyword detector
+            # v277.0: Plan-based multi-action dispatch (Disease 5 cure).
+            # Build action plan from ALL suggested_actions, not just [0].
+            # Validates each against agent capabilities (single source of truth).
+            workspace_actions = []
+            agent_capabilities = getattr(agent, 'capabilities', set())
             if hasattr(response, 'suggested_actions') and response.suggested_actions:
-                candidate = response.suggested_actions[0]
-                agent_capabilities = getattr(agent, 'capabilities', set())
-                if candidate in agent_capabilities:
-                    workspace_action = candidate
-                else:
-                    logger.debug(
-                        f"[v266] suggested_action '{candidate}' not in agent capabilities, "
-                        f"falling back to handle_workspace_query"
-                    )
+                for candidate in response.suggested_actions:
+                    if candidate in agent_capabilities:
+                        workspace_actions.append(candidate)
+                    else:
+                        logger.debug(
+                            f"[v277] suggested_action '{candidate}' not in agent capabilities, skipped"
+                        )
+            if not workspace_actions:
+                workspace_actions = ["handle_workspace_query"]
 
             # Enforce caller budget at UCP level and propagate absolute deadline
             # into workspace agent so inner operations can cooperatively budget.
@@ -2370,39 +2417,83 @@ class UnifiedCommandProcessor:
                 except (TypeError, ValueError):
                     remaining = 30.0
 
-            timeout = max(remaining, 1.0)
-            task_payload = {
-                "action": workspace_action,
-                "query": command_text,
-                "deadline_monotonic": deadline,
-            }
+            # Execute plan with deadline budget
+            results: List[Tuple[str, dict]] = []
+            for action in workspace_actions:
+                if deadline:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 1.0:
+                        results.append((action, {"error": "deadline_exceeded", "skipped": True}))
+                        logger.warning(f"[v277] Skipping action '{action}' — deadline exceeded")
+                        break
 
-            result = await asyncio.wait_for(
-                agent.execute_task(task_payload),
-                timeout=timeout,
-            )
+                timeout = max(remaining if deadline else 30.0, 1.0)
+                task_payload = {
+                    "action": action,
+                    "query": command_text,
+                    "deadline_monotonic": deadline,
+                }
 
-            # Disease 2 cure: key summarizer off the executed action, not J-Prime's intent.
-            result_dict = result if isinstance(result, dict) else {"response": str(result)}
-            workspace_intent = result_dict.get("workspace_action") or workspace_action
-            summary = self._summarize_workspace_result(result_dict, workspace_intent)
+                try:
+                    result = await asyncio.wait_for(
+                        agent.execute_task(task_payload),
+                        timeout=timeout,
+                    )
+                    result_dict = result if isinstance(result, dict) else {"response": str(result)}
+                except asyncio.TimeoutError:
+                    result_dict = {"error": "deadline_exceeded", "skipped": True}
+                    logger.warning(f"[v277] Action '{action}' timed out")
 
-            # Auth recovery: propagate errors with success=False
-            if result_dict.get("error"):
+                results.append((action, result_dict))
+
+                # Stop on auth failure (affects all subsequent actions)
+                if result_dict.get("error_code") in ("needs_reauth", "auth_missing"):
+                    break
+
+            # Combine results from all executed actions
+            summaries = []
+            has_error = False
+            last_error_dict = None
+            for action, result_dict in results:
+                workspace_intent = result_dict.get("workspace_action") or action
+                summary = self._summarize_workspace_result(result_dict, workspace_intent)
+                if summary:
+                    summaries.append(summary)
+                if result_dict.get("error"):
+                    has_error = True
+                    last_error_dict = result_dict
+
+            combined = "\n\n".join(summaries) if summaries else "Workspace action completed."
+
+            # Auth recovery: propagate auth errors with success=False + action_required
+            if has_error and last_error_dict:
+                error_code = last_error_dict.get("error_code", "workspace_error")
+                if error_code in ("needs_reauth", "auth_missing"):
+                    return {
+                        "success": False,
+                        "response": combined,
+                        "command_type": "WORKSPACE",
+                        "error": last_error_dict.get("error"),
+                        "error_code": error_code,
+                        "action_required": last_error_dict.get("action_required",
+                            "Run: python3 backend/scripts/google_oauth_setup.py"),
+                        "capability": "google_workspace",
+                    }
                 return {
                     "success": False,
-                    "response": summary,
+                    "response": combined,
                     "command_type": "WORKSPACE",
-                    "error": result_dict.get("error"),
-                    "error_code": result_dict.get("error_code", "workspace_error"),
-                    "action_required": result_dict.get("action_required"),
+                    "error": last_error_dict.get("error"),
+                    "error_code": error_code,
+                    "action_required": last_error_dict.get("action_required"),
                 }
 
             return {
                 "success": True,
-                "response": summary,
+                "response": combined,
                 "command_type": "WORKSPACE",
                 "source": getattr(response, 'source', 'unknown'),
+                "actions_executed": [a for a, _ in results],
             }
         except asyncio.TimeoutError:
             logger.warning("[v266] Workspace action timed out after deadline")

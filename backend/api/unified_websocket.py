@@ -2527,7 +2527,11 @@ class UnifiedWebSocketManager:
                     from api.unified_command_processor import get_unified_processor
 
                     processor = get_unified_processor()
-                    result = await processor.process_command(command_text, websocket=None)
+                    # v277.0: Pass command_id for idempotency dedupe (Disease 4 cure)
+                    _ws_request_id = message.get("command_id") or message.get("requestId")
+                    result = await processor.process_command(
+                        command_text, websocket=None, request_id=_ws_request_id,
+                    )
                     if not isinstance(result, dict):
                         result = {"response": str(result), "status": "error", "success": False}
 

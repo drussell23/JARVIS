@@ -6505,6 +6505,67 @@ async def health_busy():
 
 
 # ============================================================================
+# Contract-Driven System Status (v277.0)
+# Single source of truth for frontend UX decisions.
+# Derives from ReadinessStateManager — no parallel logic.
+# ============================================================================
+
+@app.get("/api/system/status")
+async def system_status():
+    """Contract-driven system status for frontend UX decisions.
+
+    Returns transport readiness (from ReadinessStateManager), component health,
+    and agent capability readiness. Frontend consumes this to distinguish
+    'backend never started' vs 'starting up' vs 'temporarily disconnected'
+    and to surface capability-specific messages (e.g., Gmail auth missing).
+
+    v277.0: Replaces heuristic-based frontend messaging.
+    """
+    import time as _time
+
+    # Derive system state from ReadinessStateManager (single source of truth)
+    try:
+        from core.readiness_state_manager import get_readiness_manager
+        manager = get_readiness_manager("jarvis-body")
+        state = manager.state if manager else None
+    except Exception:
+        manager = None
+        state = None
+
+    system = {
+        "phase": state.phase.value if state else "not_started",
+        "is_ready": state.is_ready if state else False,
+        "is_healthy": state.is_healthy if state else False,
+        "uptime_seconds": round(_time.time() - state.started_at, 1) if state and state.started_at else 0,
+        "overall_progress": round(state.overall_progress_percent, 1) if state else 0,
+    }
+
+    # Component health (derived from RSM component dict)
+    components = {}
+    if state:
+        for name, comp in state.components.items():
+            components[name] = comp.to_dict()
+
+    # Agent capability readiness (via formal contract methods, NOT private attr probing)
+    agents = {}
+    try:
+        coordinator = getattr(app.state, "neural_mesh_coordinator", None)
+        if coordinator:
+            gws = coordinator.get_agent("google_workspace_agent")
+            if gws and hasattr(gws, "get_capability_health"):
+                agents["google_workspace"] = gws.get_capability_health()
+    except Exception:
+        pass
+
+    return {
+        "system": system,
+        "components": components,
+        "agents": agents,
+        "ts": _time.time(),
+    }
+
+
+# ============================================================================
 # Performance Optimizer Stats Endpoint
 # ============================================================================
 
@@ -7915,6 +7976,10 @@ async def process_command(request: dict):
     else:
         command = str(raw_command).strip()
 
+    # v277.0: Extract request_id for idempotency dedupe (Disease 4 cure).
+    # Frontend sends command_id; accept either field name.
+    request_id = request.get("command_id") or request.get("request_id")
+
     # Trigger intelligent preloading (Phase 2) if available
     if hasattr(app.state, "component_manager") and app.state.component_manager:
         mgr = app.state.component_manager
@@ -7951,10 +8016,10 @@ async def process_command(request: dict):
                     context_handler = wrap_with_simple_context(processor)
                     result = await context_handler.process_with_context(command)
                 except ImportError:
-                    result = await processor.process_command(command)
+                    result = await processor.process_command(command, request_id=request_id)
         else:
             # Use standard processor
-            result = await processor.process_command(command)
+            result = await processor.process_command(command, request_id=request_id)
         return result
     except Exception as e:
         logger.error(f"Command processing error: {e}")
