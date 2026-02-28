@@ -958,9 +958,14 @@ class UnifiedWorkspaceExecutor:
         google_client: Optional[Any],
         limit: int = 10,
         allow_visual_fallback: bool = True,
+        deadline: Optional[float] = None,
     ) -> ExecutionResult:
         """
         Check emails using waterfall strategy.
+
+        Args:
+            deadline: v280.5 — Monotonic deadline from command pipeline.
+                Propagated to Google API client for budget-aware timeouts.
 
         Tries:
         1. Gmail API
@@ -982,7 +987,7 @@ class UnifiedWorkspaceExecutor:
         if _can_try_api:
             self._tier_stats[ExecutionTier.GOOGLE_API]["attempts"] += 1
             try:
-                result = await google_client.fetch_unread_emails(limit=limit)
+                result = await google_client.fetch_unread_emails(limit=limit, deadline=deadline)
                 if result and "error" not in result:
                     self._tier_stats[ExecutionTier.GOOGLE_API]["successes"] += 1
                     return ExecutionResult(
@@ -2036,6 +2041,7 @@ class GoogleWorkspaceClient:
         self,
         limit: int = 10,
         label: str = "INBOX",
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Fetch unread emails.
@@ -2043,6 +2049,9 @@ class GoogleWorkspaceClient:
         Args:
             limit: Maximum number of emails to fetch
             label: Label to filter by
+            deadline: v280.5 — Monotonic deadline from command pipeline.
+                When provided, the operation timeout is capped to the
+                remaining budget instead of using the fixed config value.
 
         Returns:
             Dictionary with email list and metadata
@@ -2060,11 +2069,20 @@ class GoogleWorkspaceClient:
         if cached:
             return cached
 
+        # v280.5: Budget-aware timeout — cap to remaining deadline budget
+        import time as _time
+        effective_timeout = self.config.operation_timeout_seconds
+        if isinstance(deadline, (int, float)):
+            remaining = float(deadline) - _time.monotonic()
+            if remaining <= 0:
+                return {"error": "deadline_exceeded", "emails": []}
+            effective_timeout = min(effective_timeout, max(1.0, remaining - 0.5))
+
         try:
             result = await self._execute_with_retry(
                 lambda: self._fetch_unread_sync(limit, label),
                 api_name="gmail",
-                timeout=self.config.operation_timeout_seconds,
+                timeout=effective_timeout,
             )
             self._set_cached(cache_key, result)
             return result
@@ -3036,8 +3054,11 @@ Return ONLY a JSON object with these keys (use null if not found):
         logger.debug(f"GoogleWorkspaceAgent executing: {action}")
 
         # Respect upstream deadline budgets to avoid doing work that cannot finish.
+        # v280.5: Use time.monotonic() to match the clock used by the upstream
+        # pipeline (jarvis_voice_api deadline_monotonic).
         if isinstance(deadline, (int, float)):
-            remaining = float(deadline) - asyncio.get_event_loop().time()
+            import time as _time
+            remaining = float(deadline) - _time.monotonic()
             if remaining <= 0:
                 return {
                     "success": False,
@@ -3148,6 +3169,8 @@ Return ONLY a JSON object with these keys (use null if not found):
         """
         limit = payload.get("limit", self.config.default_email_limit)
         allow_visual_fallback = bool(payload.get("allow_visual_fallback", True))
+        # v280.5: Propagate deadline so internal operations use budget-aware timeouts
+        deadline = payload.get("deadline_monotonic")
 
         self._email_queries += 1
 
@@ -3157,6 +3180,7 @@ Return ONLY a JSON object with these keys (use null if not found):
                 google_client=self._client if self._client else None,
                 limit=limit,
                 allow_visual_fallback=allow_visual_fallback,
+                deadline=deadline,
             )
 
             if exec_result.success:
@@ -3214,7 +3238,7 @@ Return ONLY a JSON object with these keys (use null if not found):
 
         # Fallback to direct client call if executor not available
         if self._client:
-            _result = await self._client.fetch_unread_emails(limit=limit)
+            _result = await self._client.fetch_unread_emails(limit=limit, deadline=deadline)
             if isinstance(_result, dict):
                 _result["workspace_action"] = "fetch_unread_emails"
             return _result
