@@ -2164,6 +2164,42 @@ class AGIOSCoordinator:
         await asyncio.sleep(0.5)
         await self._voice.speak(greeting, mode=VoiceMode.NORMAL)
 
+    @staticmethod
+    def _is_intentionally_deferred_status(status: ComponentStatus) -> bool:
+        """
+        Return True when unavailability is intentional and recoverable later.
+
+        `Skipped:` marks policy/runtime deferrals and `Deferred:` marks
+        resource-gated startup deferrals. Both should be excluded from
+        immediate hard-failure health scoring.
+        """
+        error = str(status.error or "").strip().lower()
+        return error.startswith("skipped:") or error.startswith("deferred:")
+
+    def _has_intentionally_deferred_components(self) -> bool:
+        """Check whether any runtime component is currently deferred."""
+        for name, status in self._component_status.items():
+            if name.startswith("phase_") or status.available:
+                continue
+            if self._is_intentionally_deferred_status(status):
+                return True
+        return False
+
+    def _component_recovery_timeout(self, name: str, base_timeout: float) -> float:
+        """
+        Resolve recovery timeout per component.
+
+        Neural Mesh rehydration performs coordinator+agent+bridge work and
+        needs a longer envelope than lightweight component retries.
+        """
+        timeout = max(0.1, float(base_timeout))
+        if name == "neural_mesh":
+            timeout = max(
+                timeout,
+                _env_float("JARVIS_AGI_OS_NEURAL_MESH_RECOVERY_TIMEOUT", 90.0),
+            )
+        return timeout
+
     def _determine_health_state(self) -> AGIOSState:
         """Determine overall health state.
 
@@ -2185,13 +2221,13 @@ class AGIOSCoordinator:
             if not str(s.name).startswith("phase_")
         ]
 
-        # v258.2: Partition components into active vs intentionally skipped.
-        # Skipped components (error starts with "Skipped:") are excluded from
-        # the health calculation — they were never expected to be available.
+        # Partition components into active vs intentionally deferred.
+        # "Skipped:" and "Deferred:" components are excluded from immediate
+        # health scoring; they are expected to recover asynchronously.
         _skipped = []
         _active = []
         for s in runtime_components:
-            if not s.available and s.error and str(s.error).startswith("Skipped:"):
+            if not s.available and self._is_intentionally_deferred_status(s):
                 _skipped.append(s)
             else:
                 _active.append(s)
@@ -2266,8 +2302,11 @@ class AGIOSCoordinator:
                 # v265.6: Attempt recovery of failed components periodically
                 _ticks_since_recovery += 1
                 if (
-                    self._state in (AGIOSState.DEGRADED, AGIOSState.OFFLINE)
-                    and _ticks_since_recovery >= _recovery_interval_ticks
+                    _ticks_since_recovery >= _recovery_interval_ticks
+                    and (
+                        self._state in (AGIOSState.DEGRADED, AGIOSState.OFFLINE)
+                        or self._has_intentionally_deferred_components()
+                    )
                 ):
                     _ticks_since_recovery = 0
                     await self._attempt_component_recovery()
@@ -2310,7 +2349,7 @@ class AGIOSCoordinator:
             attempts = self._recovery_attempts.get(name, 0)
             if attempts >= self._recovery_max_attempts:
                 continue
-            if status.error and str(status.error).startswith("Skipped:"):
+            if self._is_intentionally_deferred_status(status):
                 skipped_memory[name] = status
             else:
                 failed[name] = status
@@ -2343,7 +2382,9 @@ class AGIOSCoordinator:
                         try:
                             result = await asyncio.wait_for(
                                 self._recover_single_component(name),
-                                timeout=_recovery_timeout,
+                                timeout=self._component_recovery_timeout(
+                                    name, _recovery_timeout
+                                ),
                             )
                             if result is not None:
                                 self._component_status[name] = ComponentStatus(
@@ -2369,7 +2410,7 @@ class AGIOSCoordinator:
             try:
                 result = await asyncio.wait_for(
                     self._recover_single_component(name),
-                    timeout=_recovery_timeout,
+                    timeout=self._component_recovery_timeout(name, _recovery_timeout),
                 )
                 if result is not None:
                     self._component_status[name] = ComponentStatus(
@@ -2388,7 +2429,7 @@ class AGIOSCoordinator:
             try:
                 result = await asyncio.wait_for(
                     self._recover_single_component(name),
-                    timeout=_recovery_timeout,
+                    timeout=self._component_recovery_timeout(name, _recovery_timeout),
                 )
                 if result is not None:
                     self._component_status[name] = ComponentStatus(
@@ -2420,7 +2461,7 @@ class AGIOSCoordinator:
             try:
                 result = await asyncio.wait_for(
                     self._recover_single_component(name),
-                    timeout=_recovery_timeout,
+                    timeout=self._component_recovery_timeout(name, _recovery_timeout),
                 )
                 if result is not None:
                     self._component_status[name] = ComponentStatus(
@@ -2526,12 +2567,49 @@ class AGIOSCoordinator:
 
             # ── Heavy components (limited recovery) ──
             elif name == "neural_mesh":
+                memory_mode = getattr(self, "_memory_mode", "local_full")
+                if memory_mode in {"minimal", "cloud_only"}:
+                    logger.debug(
+                        "[AGI-OS Recovery] neural_mesh recovery gated by memory_mode=%s",
+                        memory_mode,
+                    )
+                    return None
+
                 if self._neural_mesh:
-                    health = await self._neural_mesh.health_check()
-                    if health.get("status") == "healthy":
-                        return self._neural_mesh
-                # Full re-init too heavy for background recovery
-                return None
+                    try:
+                        health = await self._neural_mesh.health_check()
+                        if health.get("status") == "healthy":
+                            return self._neural_mesh
+                    except Exception:
+                        pass
+
+                    stop_method = getattr(self._neural_mesh, "stop", None)
+                    if callable(stop_method):
+                        with contextlib.suppress(Exception):
+                            stop_result = stop_method()
+                            if inspect.isawaitable(stop_result):
+                                await stop_result
+
+                self._neural_mesh = None
+                self._jarvis_bridge = None
+                await self._init_neural_mesh()
+
+                mesh_status = self._component_status.get("neural_mesh")
+                if not mesh_status or not mesh_status.available or not self._neural_mesh:
+                    return None
+
+                if self._event_stream and self._event_bridge is None:
+                    try:
+                        from .jarvis_integration import connect_neural_mesh
+
+                        self._event_bridge = await connect_neural_mesh(self._neural_mesh)
+                    except Exception as bridge_err:
+                        logger.debug(
+                            "[AGI-OS Recovery] neural_mesh event bridge wiring skipped: %s",
+                            bridge_err,
+                        )
+
+                return self._neural_mesh
 
             elif name == "hybrid_orchestrator":
                 from core.hybrid_orchestrator import HybridOrchestrator

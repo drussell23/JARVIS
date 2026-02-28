@@ -74764,8 +74764,15 @@ class JarvisSystemKernel:
                             # v258.2: Include unavailable component names for diagnostics
                             _comp_status = getattr(self._agi_os, '_component_status', {})
                             _unavail = [
-                                n for n, s in _comp_status.items()
-                                if not s.available and not (s.error and str(s.error).startswith("Skipped:"))
+                                n
+                                for n, s in _comp_status.items()
+                                if (
+                                    not getattr(s, "available", False)
+                                    and not (
+                                        str(getattr(s, "error", "") or "").startswith("Skipped:")
+                                        or str(getattr(s, "error", "") or "").startswith("Deferred:")
+                                    )
+                                )
                             ]
                             _detail = f" (unavailable: {', '.join(_unavail)})" if _unavail else ""
                             self._update_component_status(
@@ -82558,6 +82565,29 @@ class JarvisSystemKernel:
         # asyncio.subprocess.Process: .returncode is auto-updated
         return getattr(proc, 'returncode', None) is None
 
+    async def _is_loading_server_stopped(
+        self,
+        *,
+        expected_pid: Optional[int],
+        port: int,
+    ) -> bool:
+        """
+        Confirm loading-server termination with process + port evidence.
+
+        Avoids false "force kill timeout" reports when the subprocess watcher
+        is stale but the OS process is already gone.
+        """
+        if not self._is_loading_server_alive():
+            return True
+
+        if expected_pid and not self._is_process_alive_basic(expected_pid):
+            return True
+
+        listener_pid = await self._find_process_on_port(port)
+        if expected_pid:
+            return listener_pid is None or listener_pid != expected_pid
+        return listener_pid is None
+
     async def _stop_startup_progress_heartbeat(self, timeout: float = 1.0) -> None:
         """Cancel startup progress heartbeat deterministically."""
         task = self._startup_progress_heartbeat_task or self._heartbeat_task
@@ -82938,6 +82968,7 @@ class JarvisSystemKernel:
             return
 
         loading_port = self.config.loading_server_port
+        expected_pid = getattr(self._loading_server_process, "pid", None)
         # v258.2: Fixed endpoint mismatch — loading_server.py only handles
         # POST /api/shutdown (not /api/shutdown/graceful or /api/shutdown/status).
         # Wrong paths caused silent 404 → HTTP shutdown always failed → fallback
@@ -83006,8 +83037,11 @@ class JarvisSystemKernel:
                     if http_shutdown_success:
                         start_time = time.time()
                         while (time.time() - start_time) < max_wait:
-                            # Check if process has exited
-                            if self._loading_server_process.returncode is not None:
+                            # Confirm exit using both subprocess and OS-level evidence.
+                            if await self._is_loading_server_stopped(
+                                expected_pid=expected_pid,
+                                port=loading_port,
+                            ):
                                 self.logger.info("[LoadingServer] Gracefully terminated via HTTP")
                                 self._cleanup_loading_server_log()
                                 self._clear_loading_server_process()
@@ -83026,7 +83060,16 @@ class JarvisSystemKernel:
                             self._clear_loading_server_process()
                             return
                         except asyncio.TimeoutError:
-                            pass
+                            if await self._is_loading_server_stopped(
+                                expected_pid=expected_pid,
+                                port=loading_port,
+                            ):
+                                self.logger.info(
+                                    "[LoadingServer] Gracefully terminated (confirmed by PID/port checks)"
+                                )
+                                self._cleanup_loading_server_log()
+                                self._clear_loading_server_process()
+                                return
 
             except Exception as e:
                 self.logger.debug(f"[LoadingServer] HTTP graceful shutdown failed: {e}")
@@ -83049,6 +83092,14 @@ class JarvisSystemKernel:
             return
 
         if self._loading_server_process.returncode is not None:
+            self._cleanup_loading_server_log()
+            self._clear_loading_server_process()
+            return
+
+        loading_port = self.config.loading_server_port
+        expected_pid = getattr(self._loading_server_process, "pid", None)
+
+        if await self._is_loading_server_stopped(expected_pid=expected_pid, port=loading_port):
             self._cleanup_loading_server_log()
             self._clear_loading_server_process()
             return
@@ -83080,7 +83131,14 @@ class JarvisSystemKernel:
                 self._clear_loading_server_process()
                 return
             except asyncio.TimeoutError:
-                pass
+                if await self._is_loading_server_stopped(
+                    expected_pid=expected_pid,
+                    port=loading_port,
+                ):
+                    self.logger.info("[LoadingServer] Terminated after SIGINT (verified)")
+                    self._cleanup_loading_server_log()
+                    self._clear_loading_server_process()
+                    return
 
             # Try SIGTERM (stop() already in progress from SIGINT — this
             # is a last-resort nudge before SIGKILL)
@@ -83092,7 +83150,14 @@ class JarvisSystemKernel:
                 self._clear_loading_server_process()
                 return
             except asyncio.TimeoutError:
-                pass
+                if await self._is_loading_server_stopped(
+                    expected_pid=expected_pid,
+                    port=loading_port,
+                ):
+                    self.logger.info("[LoadingServer] Terminated after SIGTERM (verified)")
+                    self._cleanup_loading_server_log()
+                    self._clear_loading_server_process()
+                    return
 
             # Force kill as last resort
             self._loading_server_process.kill()
@@ -83103,10 +83168,20 @@ class JarvisSystemKernel:
                     self._loading_server_process.wait(), timeout=5.0
                 )
             except asyncio.TimeoutError:
-                self.logger.warning(
-                    "[LoadingServer] Process did not exit after SIGKILL + 5s"
-                )
-            self.logger.warning("[LoadingServer] Force killed (timeout)")
+                if await self._is_loading_server_stopped(
+                    expected_pid=expected_pid,
+                    port=loading_port,
+                ):
+                    self.logger.info(
+                        "[LoadingServer] Force kill issued; exit verified by PID/port checks"
+                    )
+                else:
+                    self.logger.warning(
+                        "[LoadingServer] Process did not exit after SIGKILL + 5s"
+                    )
+                    self.logger.warning("[LoadingServer] Force killed (timeout)")
+            else:
+                self.logger.warning("[LoadingServer] Force killed")
 
         except ProcessLookupError:
             self.logger.debug("[LoadingServer] Already exited")
