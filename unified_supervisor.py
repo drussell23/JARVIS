@@ -82994,6 +82994,19 @@ class JarvisSystemKernel:
         # asyncio.subprocess.Process: .returncode is auto-updated
         return getattr(proc, 'returncode', None) is None
 
+    def _is_process_alive_basic(self, pid: int) -> bool:
+        """
+        Best-effort PID liveness probe for shutdown/startup guards.
+
+        Kept local to JarvisSystemKernel to avoid cross-class coupling with
+        takeover internals that happen to expose a similarly named helper.
+        """
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, ProcessLookupError, TypeError, ValueError):
+            return False
+
     async def _is_loading_server_stopped(
         self,
         *,
