@@ -58416,6 +58416,8 @@ class TrinityComponent:
     last_restart_attempt: float = 0.0
     # v3.4: Track when component was last started to enforce grace period
     start_time: float = 0.0
+    # v280.0: Runtime health debouncing to prevent false unhealthy flips
+    health_failure_streak: int = 0
 
     @property
     def is_running(self) -> bool:
@@ -60957,10 +60959,24 @@ class TrinityIntegrator:
                 )
             elif component.state != "healthy":
                 self.logger.info(f"[Trinity] {component.name} recovered to healthy")
+            component.health_failure_streak = 0
             component.state = "healthy"
             return
 
         if self._is_within_startup_grace_period(component, grace_periods):
+            return
+
+        runtime_failure_threshold = int(
+            os.getenv("TRINITY_RUNTIME_FAILURE_THRESHOLD", "3")
+        )
+        runtime_failure_threshold = max(1, runtime_failure_threshold)
+        component.health_failure_streak += 1
+        if component.health_failure_streak < runtime_failure_threshold:
+            self.logger.debug(
+                f"[Trinity] {component.name} health failure "
+                f"({component.health_failure_streak}/{runtime_failure_threshold}) "
+                f"- waiting for sustained failures before unhealthy transition"
+            )
             return
 
         await self._handle_unhealthy_component(component)
@@ -61145,6 +61161,27 @@ class TrinityIntegrator:
             if result.state == ComponentReadinessState.DEGRADED:
                 self.logger.debug(
                     f"[Trinity] {component.name} in degraded state: {result.status_message}"
+                )
+                return True
+
+            # v280.0: Runtime liveness for Reactor-Core should not require
+            # startup-grade semantics on every poll. If Reactor responds 200 and
+            # reports healthy/ready while temporarily not training-ready, treat as
+            # operational and avoid churny unhealthy/restart transitions.
+            if (
+                component.name == "reactor-core"
+                and result.http_status == 200
+                and str(result.status_message or "").lower() in {"healthy", "ready"}
+                and result.state in {
+                    ComponentReadinessState.STARTING,
+                    ComponentReadinessState.LOADING,
+                    ComponentReadinessState.UNKNOWN,
+                }
+            ):
+                self.logger.debug(
+                    "[Trinity] reactor-core runtime semantic soft-fail "
+                    f"(state={result.state.value}, training_ready={result.training_ready}) "
+                    "- treating as operational"
                 )
                 return True
 
