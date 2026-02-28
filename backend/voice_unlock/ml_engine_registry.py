@@ -2912,6 +2912,23 @@ class MLEngineRegistry:
                 selection_budget - (time.monotonic() - selection_started_at),
             )
             candidate_timeout = min(verify_timeout, remaining_budget)
+            if candidate_backend == "cloud_run":
+                # Startup authority must allow enough time for Cloud Run cold-start.
+                # This clamps probe timeout upward even if legacy env config set a
+                # too-aggressive global timeout (for example 4s).
+                startup_cloud_floor = max(
+                    1.0,
+                    float(
+                        os.getenv(
+                            "JARVIS_CLOUD_CONTRACT_TIMEOUT_STARTUP_AUTHORITY",
+                            "12.0",
+                        )
+                    ),
+                )
+                candidate_timeout = max(
+                    candidate_timeout,
+                    min(remaining_budget, startup_cloud_floor),
+                )
 
             ready, verify_msg = await self._verify_cloud_backend_ready(
                 timeout=candidate_timeout,
