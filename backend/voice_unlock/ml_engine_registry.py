@@ -3436,7 +3436,8 @@ class MLEngineRegistry:
                 ),
             )
 
-        if self._cloud_prewarm_task is not None and not self._cloud_prewarm_task.done():
+        prewarm_task = getattr(self, "_cloud_prewarm_task", None)
+        if prewarm_task is not None and not prewarm_task.done():
             adaptive_target = max(
                 adaptive_target,
                 float(
