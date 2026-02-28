@@ -51,7 +51,7 @@ class DeviceConfig:
     playback_buffer_seconds: float = 2.0  # Ring buffer capacity
     require_input: bool = False           # Fail startup if no input device
     allow_output_only: bool = True        # Degrade to output-only when no input
-    startup_silence_ms: int = 120         # Silence window to avoid startup pop/click
+    startup_silence_ms: int = 250         # Silence window to avoid startup pop/click/static
 
     def __post_init__(self):
         # Allow env var overrides
@@ -193,6 +193,15 @@ class FullDuplexDevice:
 
         v275.6: progress_callback(phase, detail) emits heartbeats at each
         CoreAudio step for timeout classification (hung vs slow).
+
+        v279.0: Removed redundant _profile_supported() preflight checks.
+        Each sd.check_*_settings() call is a synchronous CoreAudio C call
+        taking 1-3s on macOS. With 4 profiles × 2 checks each, the preflight
+        phase alone consumed 8-12s of the 15s timeout budget — causing the
+        AudioBus init timeout and cascading zombie/recovery/static issues.
+        The stream constructor (_create_stream) already validates settings
+        internally and raises on incompatible profiles, so the preflight
+        checks were purely redundant overhead. Try-first, catch on failure.
         """
         def _pcb(phase, detail):
             if progress_callback is not None:
@@ -226,20 +235,9 @@ class FullDuplexDevice:
             self._mode = mode
             self.config.sample_rate = sample_rate
 
-            _pcb("profile_check", f"profile_{idx}")
-            if not self._profile_supported(
-                mode=mode,
-                sample_rate=sample_rate,
-                input_device=self.config.input_device,
-                output_device=self.config.output_device,
-            ):
-                startup_errors.append(
-                    f"profile#{idx} unsupported (mode={mode}, sr={sample_rate})"
-                )
-                continue
+            _pcb("profile_try", f"profile_{idx}")
 
             try:
-                # v278.2: Check cancellation before creating stream
                 if self._cancel_requested.is_set():
                     self._safe_close_stream()
                     raise RuntimeError("[FullDuplexDevice] Init cancelled by caller")
@@ -250,7 +248,6 @@ class FullDuplexDevice:
                     sample_rate=sample_rate,
                 )
 
-                # v278.2: Check cancellation before starting stream
                 if self._cancel_requested.is_set():
                     self._safe_close_stream()
                     raise RuntimeError("[FullDuplexDevice] Init cancelled by caller")
@@ -258,9 +255,6 @@ class FullDuplexDevice:
                 _pcb("stream_start", f"profile_{idx}")
                 self._stream.start()
 
-                # v278.2: Check cancellation after stream.start() — if cancel
-                # arrived during the blocking C call, abort immediately to
-                # prevent zombie IO thread with orphaned callbacks.
                 if self._cancel_requested.is_set():
                     logger.warning("[FullDuplexDevice] Init cancelled after stream started — aborting")
                     self._safe_close_stream()

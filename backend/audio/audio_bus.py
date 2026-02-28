@@ -390,6 +390,7 @@ class AudioBus:
         # State
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._playback_ready_at: float = 0.0  # monotonic timestamp when playback is safe
 
         # v265.0: Mic gate — when active, no mic frames are dispatched.
         # Used by speech state manager to suppress self-voice during TTS.
@@ -494,9 +495,13 @@ class AudioBus:
         self._sinks["local"] = self._local_sink
 
         self._running = True
+        import time as _time_mod
+        _settle_ms = max(0, int(os.getenv("JARVIS_AUDIO_POST_START_SETTLE_MS", "300")))
+        self._playback_ready_at = _time_mod.monotonic() + (_settle_ms / 1000.0)
         logger.info(
             "[AudioBus] Started — all audio routing through bus "
-            f"(mode={'duplex' if self._device.input_enabled else 'output-only'})"
+            f"(mode={'duplex' if self._device.input_enabled else 'output-only'}, "
+            f"settle={_settle_ms}ms)"
         )
 
     async def stop(self) -> None:
@@ -562,6 +567,18 @@ class AudioBus:
             else:
                 logger.warning(f"[AudioBus] No sink '{sink_id}' and no local sink")
                 return
+
+        # v279.0: Wait for CoreAudio to settle after fresh stream start.
+        # Playing audio immediately after stream.start() produces static
+        # because the CoreAudio IO thread needs time to fully initialize.
+        import time as _time_mod
+        settle_remaining = self._playback_ready_at - _time_mod.monotonic()
+        if settle_remaining > 0:
+            logger.debug(
+                "[AudioBus] Waiting %.0fms for post-start settle",
+                settle_remaining * 1000,
+            )
+            await asyncio.sleep(settle_remaining)
 
         await sink.write(audio, sample_rate)
 

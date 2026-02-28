@@ -76067,8 +76067,14 @@ class JarvisSystemKernel:
         effective = base_timeout
 
         # 1. Preload-aware scaling
-        if preload_elapsed > 15.0:
-            load_factor = 1.0 + (preload_elapsed - 15.0) / 30.0
+        # v279.0: Lowered threshold from 15s to 3s. A 4.4s preload already
+        # indicates elevated system load (GIL/GC pressure from concurrent
+        # native imports). The old 15s threshold never triggered in practice,
+        # leaving the timeout unscaled even when CoreAudio C calls were
+        # visibly slower from system pressure — causing the recurring
+        # "AudioBus init timed out (15.0s, preload=4.4s)" failures.
+        if preload_elapsed > 3.0:
+            load_factor = 1.0 + (preload_elapsed - 3.0) / 12.0
             load_factor = min(load_factor, 3.0)
             effective *= load_factor
             factors.append(f"preload={preload_elapsed:.1f}s→{load_factor:.2f}x")
