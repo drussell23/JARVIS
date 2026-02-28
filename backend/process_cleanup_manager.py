@@ -5058,28 +5058,47 @@ class ProcessCleanupManager:
 
                 logger.warning("🔄 Code changes detected! Cleaning up old JARVIS instances...")
 
-                # Step 0: Gracefully shutdown ML Learning Engine before killing processes
+                # Step 0: Gracefully shutdown ML Learning Engine before killing processes.
+                # Run this in an isolated subprocess so a broken ML dependency
+                # (e.g., native numpy crash) cannot take down the supervisor.
+                _shutdown_timeout = max(
+                    1.0,
+                    float(os.getenv("JARVIS_LEARNING_ENGINE_SHUTDOWN_TIMEOUT", "8.0")),
+                )
                 try:
                     logger.info("🧠 Attempting graceful ML Learning Engine shutdown...")
-                    from voice_unlock.continuous_learning_engine import shutdown_learning_engine
-
-                    # Use asyncio to run async shutdown
-                    import asyncio
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            asyncio.create_task(shutdown_learning_engine())
-                        else:
-                            asyncio.run(shutdown_learning_engine())
+                    _shutdown_cmd = [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import asyncio;"
+                            "from voice_unlock.continuous_learning_engine import shutdown_learning_engine;"
+                            "asyncio.run(shutdown_learning_engine())"
+                        ),
+                    ]
+                    _shutdown_env = os.environ.copy()
+                    _shutdown_env["PYTHONFAULTHANDLER"] = "1"
+                    _shutdown_result = subprocess.run(
+                        _shutdown_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=_shutdown_timeout,
+                        env=_shutdown_env,
+                    )
+                    if _shutdown_result.returncode == 0:
                         logger.info("✅ ML Learning Engine shutdown complete (models saved)")
-                    except RuntimeError:
-                        # No event loop, create one
-                        asyncio.run(shutdown_learning_engine())
-                        logger.info("✅ ML Learning Engine shutdown complete (models saved)")
-                    except Exception as e:
-                        logger.warning(f"ML Learning Engine shutdown warning: {e}")
-                except ImportError:
-                    logger.debug("ML Learning Engine not available")
+                    else:
+                        _stderr = (_shutdown_result.stderr or "").strip()
+                        _tail = _stderr.splitlines()[-1] if _stderr else f"rc={_shutdown_result.returncode}"
+                        logger.warning(
+                            "ML Learning Engine shutdown subprocess failed: %s",
+                            _tail,
+                        )
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        "ML Learning Engine shutdown timed out after %.1fs",
+                        _shutdown_timeout,
+                    )
                 except Exception as e:
                     logger.warning(f"Error during ML Learning Engine shutdown: {e}")
 

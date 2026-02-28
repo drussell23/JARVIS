@@ -207,8 +207,13 @@ def _ensure_venv_python() -> None:
     Ensure we're running with the venv Python.
     Re-executes script with venv Python if necessary.
 
-    Uses site-packages check (not executable path) since venv Python
-    often symlinks to system Python.
+    Uses interpreter-prefix checks first (sys.prefix/base_prefix) and only
+    uses executable/path hints as secondary signals.
+
+    Root cause fixed (v279.0):
+    A prior site-packages substring heuristic could return a false positive
+    ("venv in sys.path") while still running system Python, which produced
+    mixed interpreter/package state and downstream import instability.
     """
     # Skip if explicitly disabled
     if _os.environ.get('JARVIS_SKIP_VENV_CHECK') == '1':
@@ -229,25 +234,50 @@ def _ensure_venv_python() -> None:
     ]
 
     venv_python = None # This is the venv Python executable.
+    venv_roots = set()
     for candidate in venv_candidates: # This is a list of potential venv Python executables.
         if candidate.exists(): # This is a check to see if the candidate exists.
+            try:
+                venv_roots.add(candidate.parent.parent.resolve())
+            except Exception:
+                pass
             venv_python = candidate # This is the venv Python executable.
             break # This is a break statement to exit the loop.
 
     if not venv_python: # This is a check to see if the venv Python executable was found.  
         return  # No venv found, continue with current Python. This is a return statement to exit the function.
 
-    # Check if venv site-packages is in sys.path
-    venv_site_packages = str(script_dir / "venv" / "lib") # This is the venv site-packages directory.
-    venv_in_path = any(venv_site_packages in p for p in _sys.path) # This is a check to see if the venv site-packages is in sys.path.
+    # Primary: prefix-based interpreter identity (robust with symlinked binaries)
+    current_prefix = None
+    base_prefix = None
+    try:
+        current_prefix = _Path(getattr(_sys, "prefix", "")).resolve()
+    except Exception:
+        current_prefix = None
+    try:
+        base_prefix = _Path(getattr(_sys, "base_prefix", getattr(_sys, "prefix", ""))).resolve()
+    except Exception:
+        base_prefix = None
 
-    if venv_in_path: # This is a check to see if the venv site-packages is in sys.path.
-        return  # Already running with venv Python. This is a return statement to exit the function.
+    if current_prefix and base_prefix and current_prefix != base_prefix:
+        if current_prefix in venv_roots:
+            return  # Already running inside the expected project venv.
 
-    # Check if running from venv bin directory
-    current_exe = _Path(_sys.executable) # This is the current executable.
-    if str(script_dir / "venv" / "bin") in str(current_exe): # This is a check to see if the current executable is in the venv bin directory.
-        return  # This is a return statement to exit the function.
+    # Secondary: explicit VIRTUAL_ENV ownership
+    active_virtual_env = None
+    try:
+        raw_virtual_env = _os.environ.get("VIRTUAL_ENV", "")
+        if raw_virtual_env:
+            active_virtual_env = _Path(raw_virtual_env).resolve()
+    except Exception:
+        active_virtual_env = None
+    if active_virtual_env and active_virtual_env in venv_roots:
+        return
+
+    # Tertiary: executable path hint (without resolving symlink target)
+    current_exe = _Path(_sys.executable)
+    if any(str(root / "bin") in str(current_exe) for root in venv_roots):
+        return
 
     # NOT running with venv - need to re-exec
     print(f"[KERNEL] Detected system Python without venv packages") # This is a print statement to print the message.
@@ -255,6 +285,16 @@ def _ensure_venv_python() -> None:
     print(f"[KERNEL] Switching to: {venv_python}") # This is a print statement to print the venv Python executable.
 
     _os.environ['_JARVIS_VENV_REEXEC'] = '1' # This is a setting to indicate that we have re-executed with the venv Python.
+    _os.environ['VIRTUAL_ENV'] = str(venv_python.parent.parent)
+    _os.environ['PYTHONNOUSERSITE'] = '1'
+
+    # Ensure venv executables dominate subprocess resolution.
+    venv_bin = str(venv_python.parent)
+    existing_path = _os.environ.get('PATH', '')
+    if existing_path:
+        _os.environ['PATH'] = f"{venv_bin}{_os.pathsep}{existing_path}"
+    else:
+        _os.environ['PATH'] = venv_bin
 
     # Set PYTHONPATH to include project directories
     pythonpath = _os.pathsep.join([ # This is the PYTHONPATH environment variable.
@@ -800,12 +840,33 @@ except ImportError as _ie:
 
 # numpy - numerical operations
 try:
-    import numpy as np
+    import subprocess as _numpy_subprocess
+
+    _numpy_probe_timeout = max(
+        1.0, float(os.getenv("JARVIS_NUMPY_PROBE_TIMEOUT", "8.0"))
+    )
+    _numpy_probe = _numpy_subprocess.run(
+        [sys.executable, "-c", "import numpy"],
+        stdout=_numpy_subprocess.DEVNULL,
+        stderr=_numpy_subprocess.PIPE,
+        text=True,
+        timeout=_numpy_probe_timeout,
+        env={
+            **os.environ,
+            "PYTHONFAULTHANDLER": "1",
+        },
+    )
+    if _numpy_probe.returncode != 0:
+        _stderr = (_numpy_probe.stderr or "").strip()
+        raise RuntimeError(
+            f"numpy probe failed rc={_numpy_probe.returncode}: {_stderr[:240]}"
+        )
     NUMPY_AVAILABLE = True
-except ImportError as _ie:
+except Exception as _ie:
     NUMPY_AVAILABLE = False
     _record_import_failure("NUMPY_AVAILABLE", "numpy", _ie, "MODERATE", alias="np")
-    np = None
+# Keep numpy unloaded in the main process until a call-site explicitly needs it.
+np = None
 
 # v186.0: rich - enhanced CLI experience
 # v228.0: Extended Rich imports for full UX overhaul
@@ -66537,60 +66598,76 @@ class JarvisSystemKernel:
                 """
                 import os as _os
                 _preloaded = []
+                _numpy_ok = bool(globals().get("NUMPY_AVAILABLE", False))
 
                 # ── Tier 1: Foundational (everything depends on these) ──
 
                 # 1. numpy — BLAS/LAPACK native extensions
-                try:
-                    import numpy  # noqa: F401
-                    _preloaded.append(f"numpy {numpy.__version__}")
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    _preloaded.append(f"numpy: {_e}")
+                if _numpy_ok:
+                    try:
+                        import numpy  # noqa: F401
+                        _preloaded.append(f"numpy {numpy.__version__}")
+                    except ImportError:
+                        pass
+                    except Exception as _e:
+                        _preloaded.append(f"numpy: {_e}")
+                else:
+                    _preloaded.append("numpy: skipped (probe failed)")
 
                 # 2. scipy — Fortran runtime + BLAS wrappers
-                try:
-                    import scipy  # noqa: F401
-                    from scipy import signal as _  # noqa: F401
-                    _preloaded.append(f"scipy {scipy.__version__}")
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    _preloaded.append(f"scipy: {_e}")
+                if _numpy_ok:
+                    try:
+                        import scipy  # noqa: F401
+                        from scipy import signal as _  # noqa: F401
+                        _preloaded.append(f"scipy {scipy.__version__}")
+                    except ImportError:
+                        pass
+                    except Exception as _e:
+                        _preloaded.append(f"scipy: {_e}")
+                else:
+                    _preloaded.append("scipy: skipped (numpy unavailable)")
 
                 # ── Tier 2: ML/DL frameworks (depend on numpy) ──
 
                 # 3. torch — BLAS, LLVM JIT, MPS (Apple Metal)
                 # Heaviest (~5-10s) but primary SIGSEGV source.
-                try:
-                    import torch  # noqa: F401
-                    _preloaded.append(f"torch {torch.__version__}")
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    _preloaded.append(f"torch: {_e}")
+                if _numpy_ok:
+                    try:
+                        import torch  # noqa: F401
+                        _preloaded.append(f"torch {torch.__version__}")
+                    except ImportError:
+                        pass
+                    except Exception as _e:
+                        _preloaded.append(f"torch: {_e}")
+                else:
+                    _preloaded.append("torch: skipped (numpy unavailable)")
 
                 # 4. torchaudio — native audio extensions (depends on torch)
-                try:
-                    import torchaudio  # noqa: F401
-                    _preloaded.append(f"torchaudio {torchaudio.__version__}")
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    _preloaded.append(f"torchaudio: {_e}")
+                if _numpy_ok:
+                    try:
+                        import torchaudio  # noqa: F401
+                        _preloaded.append(f"torchaudio {torchaudio.__version__}")
+                    except ImportError:
+                        pass
+                    except Exception as _e:
+                        _preloaded.append(f"torchaudio: {_e}")
+                else:
+                    _preloaded.append("torchaudio: skipped (numpy unavailable)")
 
                 # 5. numba — LLVM JIT
                 _os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
                 _os.environ.setdefault("NUMBA_NUM_THREADS", "1")
                 _os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
-                try:
-                    import numba  # noqa: F401
-                    _preloaded.append(f"numba {numba.__version__}")
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    _preloaded.append(f"numba: {_e}")
+                if _numpy_ok:
+                    try:
+                        import numba  # noqa: F401
+                        _preloaded.append(f"numba {numba.__version__}")
+                    except ImportError:
+                        pass
+                    except Exception as _e:
+                        _preloaded.append(f"numba: {_e}")
+                else:
+                    _preloaded.append("numba: skipped (numpy unavailable)")
 
                 # ── Tier 3: Audio native extensions ──
                 # These are imported by voice_system in parallel_import_components()
@@ -87905,47 +87982,52 @@ class JarvisSystemKernel:
         # Step 4/6: Embedding extraction test (synthetic audio)
         if not _ensure_budget("Step 4/6"):
             return result
-        audio_bytes = b""
-        try:
-            from voice_unlock.ml_engine_registry import extract_speaker_embedding
-            import numpy as np
-            import io
-            import wave
+        if not NUMPY_AVAILABLE:
+            result["warnings"].append("Embedding extraction skipped: numpy unavailable")
+            self.logger.info("[ECAPA]   Step 4/6: Embedding extraction (skipped — numpy unavailable)")
+            audio_bytes = b""
+        else:
+            audio_bytes = b""
+            try:
+                from voice_unlock.ml_engine_registry import extract_speaker_embedding
+                import numpy as np
+                import io
+                import wave
 
-            # Generate synthetic 16kHz audio (1 second)
-            sample_rate = 16000
-            samples = (np.random.randn(sample_rate) * 0.01).astype(np.float32)
-            buf = io.BytesIO()
-            with wave.open(buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                wf.writeframes((samples * 32767).astype(np.int16).tobytes())
-            audio_bytes = buf.getvalue()
+                # Generate synthetic 16kHz audio (1 second)
+                sample_rate = 16000
+                samples = (np.random.randn(sample_rate) * 0.01).astype(np.float32)
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes((samples * 32767).astype(np.int16).tobytes())
+                audio_bytes = buf.getvalue()
 
-            _step4_timeout = _remaining_budget(
-                _get_env_float("JARVIS_ECAPA_VERIFY_STEP4_TIMEOUT", 15.0)
-            )
-            embedding = await asyncio.wait_for(
-                extract_speaker_embedding(audio_bytes),
-                timeout=_step4_timeout,
-            )
-            if embedding is not None and hasattr(embedding, "shape"):
-                result["embedding_extraction_tested"] = True
-                result["embedding_shape"] = str(embedding.shape)
-                self.logger.info(
-                    f"[ECAPA]   Step 4/6: Embedding extraction ✓ (shape={embedding.shape})"
+                _step4_timeout = _remaining_budget(
+                    _get_env_float("JARVIS_ECAPA_VERIFY_STEP4_TIMEOUT", 15.0)
                 )
-            else:
-                self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (no result)")
-        except asyncio.TimeoutError:
-            result["errors"].append("Embedding extraction: timeout")
-            self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (timeout)")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            result["errors"].append(f"Embedding extraction: {e}")
-            self.logger.info(f"[ECAPA]   Step 4/6: Embedding extraction ✗ ({e})")
+                embedding = await asyncio.wait_for(
+                    extract_speaker_embedding(audio_bytes),
+                    timeout=_step4_timeout,
+                )
+                if embedding is not None and hasattr(embedding, "shape"):
+                    result["embedding_extraction_tested"] = True
+                    result["embedding_shape"] = str(embedding.shape)
+                    self.logger.info(
+                        f"[ECAPA]   Step 4/6: Embedding extraction ✓ (shape={embedding.shape})"
+                    )
+                else:
+                    self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (no result)")
+            except asyncio.TimeoutError:
+                result["errors"].append("Embedding extraction: timeout")
+                self.logger.info("[ECAPA]   Step 4/6: Embedding extraction ✗ (timeout)")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                result["errors"].append(f"Embedding extraction: {e}")
+                self.logger.info(f"[ECAPA]   Step 4/6: Embedding extraction ✗ ({e})")
 
         # Step 5/6: SpeakerVerificationService integration test
         # v3.0: Skip when Cloud SQL is UNAVAILABLE — SVS.initialize() calls
@@ -88183,9 +88265,13 @@ class JarvisSystemKernel:
                 for name, profile in speaker_service.speaker_profiles.items():
                     embedding = profile.get('embedding')
                     if embedding is not None:
-                        import numpy as np
-                        emb_array = np.array(embedding)
-                        emb_dim = emb_array.shape[-1] if emb_array.ndim > 0 else 0
+                        if NUMPY_AVAILABLE:
+                            import numpy as np
+
+                            emb_array = np.array(embedding)
+                            emb_dim = emb_array.shape[-1] if emb_array.ndim > 0 else 0
+                        else:
+                            emb_dim = len(embedding) if hasattr(embedding, "__len__") else 0
                         if emb_dim != result["model_dimension"]:
                             mismatched.append((name, emb_dim))
 
