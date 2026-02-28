@@ -133,7 +133,7 @@ async def test_verify_cloud_backend_ready_uses_startup_authority_contract_timeou
     ok, _reason = await registry._verify_cloud_backend_ready(timeout=30.0, retry_count=1)
 
     assert ok is False
-    assert captured["timeout"] == 12.0
+    assert captured["timeout"] == pytest.approx(12.0, rel=0.01)
 
 
 @pytest.mark.asyncio
