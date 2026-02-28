@@ -1468,6 +1468,10 @@ class MLEngineRegistry:
         self._cloud_endpoint_degraded_until: Dict[str, float] = {}
         self._cloud_endpoint_last_error: Dict[str, str] = {}
         self._cloud_failover_lock = LazyAsyncLock()
+        # v280.4: Persistent session for contract probes — eliminates
+        # per-call DNS+TCP+SSL allocation that triggers page faults
+        # during memory thrash (same disease class as v275.0 broadcast).
+        self._cloud_contract_session: Optional[Any] = None
         self._cloud_embedding_route = self._normalize_cloud_route(
             os.getenv("JARVIS_CLOUD_EMBEDDING_ROUTE", "/api/ml/speaker_embedding"),
             default="/api/ml/speaker_embedding",
@@ -3252,6 +3256,38 @@ class MLEngineRegistry:
 
         ttl = max(5.0, float(os.getenv("JARVIS_CLOUD_CONTRACT_VERIFY_TTL", "180.0")))
         now = time.time()
+
+        # v280.4: During EMERGENCY memory thrash, trust cached contract
+        # verification REGARDLESS of force flag or TTL expiry.  The cloud
+        # endpoint itself hasn't changed — re-probing is unreliable because
+        # the local event loop is starved by uninterruptible page faults.
+        # Forcing a fresh probe under these conditions just guarantees
+        # timeout and kills the only viable ECAPA backend.
+        _thrash_state_for_cache = "healthy"
+        try:
+            import backend.core.memory_quantizer as _mq_cache_mod
+            _mq_cache_inst = _mq_cache_mod._memory_quantizer_instance
+            if _mq_cache_inst is not None:
+                _thrash_state_for_cache = getattr(
+                    _mq_cache_inst, "_thrash_state", "healthy"
+                )
+        except Exception:
+            pass
+
+        if (
+            _thrash_state_for_cache == "emergency"
+            and self._cloud_contract_verified
+            and self._cloud_contract_endpoint == target
+        ):
+            _cache_age = now - self._cloud_contract_last_checked
+            logger.info(
+                "[Contract] EMERGENCY thrash — trusting cached contract "
+                "verification for %s (age=%.0fs, force=%s). "
+                "Re-probing is unreliable under page fault pressure.",
+                target, _cache_age, force,
+            )
+            return True, "Contract verification cached (emergency thrash bypass)"
+
         if (
             not force
             and endpoint is None
@@ -3274,23 +3310,31 @@ class MLEngineRegistry:
                 req_timeout *= _cpu_factor
         except Exception:
             pass
-        # v271.0: Extend timeout under memory thrash. During EMERGENCY
-        # thrash (5000+ pageins/sec), the event loop is severely starved
-        # by constant page faults — even simple HTTP responses can't be
-        # read within normal timeouts. This is MORE impactful than CPU
-        # pressure because page faults are uninterruptible kernel waits.
+        # v280.4: Extend timeout under memory thrash.  During EMERGENCY
+        # thrash the event loop is severely starved by uninterruptible
+        # page faults — even simple HTTP responses can't be read within
+        # normal timeouts.  v271.0 used a fixed 12s floor which was
+        # insufficient at 11837 pageins/sec.  Now: 30s base floor with
+        # linear scaling by pagein severity.
         try:
             import backend.core.memory_quantizer as _mq_mod
             _mq_inst = _mq_mod._memory_quantizer_instance
             if _mq_inst is not None:
                 if _mq_inst._thrash_state == "emergency":
                     _mem_floor = float(os.getenv(
-                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_THRASH_EMERGENCY", "12.0"
+                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_THRASH_EMERGENCY", "30.0"
                     ))
+                    # Scale with pagein severity: at 10000+/sec, add 50%
+                    _pagein_rate = getattr(_mq_inst, "_pagein_rate", 0.0)
+                    if _pagein_rate > 5000:
+                        _severity_factor = 1.0 + min(
+                            1.0, (_pagein_rate - 5000) / 10000
+                        )
+                        _mem_floor *= _severity_factor
                     req_timeout = max(req_timeout, _mem_floor)
                 elif _mq_inst._thrash_state == "thrashing":
                     _mem_floor = float(os.getenv(
-                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_THRASH_WARNING", "8.0"
+                        "JARVIS_CLOUD_CONTRACT_TIMEOUT_THRASH_WARNING", "12.0"
                     ))
                     req_timeout = max(req_timeout, _mem_floor)
         except Exception:
@@ -3325,7 +3369,22 @@ class MLEngineRegistry:
             sock_read=read_timeout,
         )
 
-        async with aiohttp.ClientSession() as session:
+        # v280.4: Reuse persistent session to avoid per-call DNS+TCP+SSL
+        # allocation overhead.  Under memory thrash, session creation
+        # triggers page faults that consume the entire timeout budget.
+        if self._cloud_contract_session is None or self._cloud_contract_session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=5,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+                keepalive_timeout=60,
+            )
+            self._cloud_contract_session = aiohttp.ClientSession(
+                connector=connector,
+            )
+        session = self._cloud_contract_session
+
+        try:
             for attempt in range(1, probe_attempts + 1):
                 try:
                     # Contract requirement 1: /api/ml/health must exist and advertise ECAPA readiness.
@@ -3415,6 +3474,10 @@ class MLEngineRegistry:
                     await asyncio.sleep(min(2.0, probe_backoff * (2 ** (attempt - 1))))
                 else:
                     return _record_contract_failure(last_transient_reason)
+        except Exception as _session_err:
+            return _record_contract_failure(
+                f"session error: {type(_session_err).__name__}: {_session_err}"
+            )
 
         self._cloud_contract_verified = True
         self._cloud_contract_endpoint = target
@@ -5703,8 +5766,70 @@ class MLEngineRegistry:
             )
             return False
 
+        # v280.4: Detect memory emergency for fast-path cloud activation.
+        # During EMERGENCY thrash, full 3-phase verification is unreliable
+        # because the event loop can't process network I/O due to
+        # uninterruptible page faults.  If we have a previously verified
+        # cloud endpoint, activate it directly and schedule deferred
+        # re-verification when memory stabilizes.
+        _is_memory_emergency = False
+        try:
+            import backend.core.memory_quantizer as _mq_fallback_mod
+            _mq_fb = _mq_fallback_mod._memory_quantizer_instance
+            if _mq_fb is not None:
+                _is_memory_emergency = (
+                    getattr(_mq_fb, "_thrash_state", "healthy") == "emergency"
+                )
+        except Exception:
+            pass
+
+        if _is_memory_emergency and self._cloud_contract_verified:
+            _prev_endpoint = self._cloud_contract_endpoint or ""
+            # Check if the previously verified endpoint is in our candidates
+            for _ec, _es in candidates:
+                _en = _ec.strip().rstrip("/")
+                if _en == _prev_endpoint:
+                    logger.warning(
+                        "=" * 70 + "\n"
+                        "   [v280.4] EMERGENCY THRASH FAST-PATH: Activating "
+                        "previously verified cloud endpoint\n"
+                        "   Endpoint: %s (verified %.0fs ago)\n"
+                        "   Skipping full re-verification — event loop is "
+                        "starved by page faults.\n"
+                        "   Deferred re-verification will run when memory "
+                        "stabilizes.\n" + "=" * 70,
+                        _en,
+                        time.time() - self._cloud_contract_last_checked,
+                    )
+                    self._set_cloud_endpoint(
+                        _en,
+                        f"{_es}|emergency_thrash_fast_path",
+                    )
+                    self._use_cloud = True
+                    self._cloud_verified = True
+                    backend_kind = self._classify_endpoint_backend(
+                        _en, self._cloud_endpoint_source,
+                    )
+                    self._apply_ecapa_backend_environment(backend_kind, _en)
+                    return True
+
         verify_timeout = float(os.getenv("JARVIS_ECAPA_CLOUD_TIMEOUT", "15.0"))
         verify_retries = int(os.getenv("JARVIS_ECAPA_CLOUD_RETRIES", "3"))
+
+        # v280.4: During memory emergency, extend timeout and reduce retries
+        # to give the single attempt more time on the starved event loop.
+        if _is_memory_emergency:
+            _emergency_timeout = float(os.getenv(
+                "JARVIS_ECAPA_CLOUD_TIMEOUT_EMERGENCY", "45.0"
+            ))
+            verify_timeout = max(verify_timeout, _emergency_timeout)
+            verify_retries = 1  # Single attempt with long timeout
+            logger.info(
+                "[v280.4] Memory EMERGENCY: cloud verify timeout=%.0fs, "
+                "retries=%d (single long attempt)",
+                verify_timeout, verify_retries,
+            )
+
         last_error = "no candidate attempted"
 
         for endpoint_candidate, endpoint_source in candidates:
@@ -5735,7 +5860,7 @@ class MLEngineRegistry:
                 cloud_ready, verify_msg = await self._verify_cloud_backend_ready(
                     timeout=verify_timeout,
                     retry_count=verify_retries,
-                    test_extraction=True,  # Always test extraction for fallback
+                    test_extraction=not _is_memory_emergency,
                 )
             except Exception as e:
                 cloud_ready = False
