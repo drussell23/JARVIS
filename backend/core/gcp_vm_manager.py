@@ -6242,7 +6242,14 @@ class GCPVMManager:
                 # Continue waiting - operation might still complete
                 await asyncio.sleep(2)
 
-    def check_vm_protection(self, vm_name: str, action: VMAction, reason: str = "") -> Tuple[bool, str]:
+    def check_vm_protection(
+        self,
+        vm_name: str,
+        action: VMAction,
+        reason: str = "",
+        *,
+        log_blocked: bool = True,
+    ) -> Tuple[bool, str]:
         """
         Centralized VM protection check. Single source of truth for all guard logic.
         v266.0: Replaces scattered InvincibleGuard checks in terminate_vm,
@@ -6271,7 +6278,10 @@ class GCPVMManager:
                 f"[InvincibleGuard] BLOCKED {action.value} of persistent VM '{vm_name}' "
                 f"(reason: {reason}). Use GCP Console or gcloud CLI for manual override."
             )
-            logger.warning(msg)
+            if log_blocked:
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
             return True, msg
 
         if action == VMAction.STOP:
@@ -6290,7 +6300,10 @@ class GCPVMManager:
                 f"[InvincibleGuard] BLOCKED STOP of persistent VM '{vm_name}' "
                 f"(reason: {reason}, session_lifecycle={session_lifecycle})"
             )
-            logger.warning(msg)
+            if log_blocked:
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
             return True, msg
 
         return True, f"[InvincibleGuard] Unknown action {action} for '{vm_name}'"
@@ -7284,7 +7297,12 @@ class GCPVMManager:
                     # === STEP 4: INTELLIGENT COST-CUTTING CHECKS ===
 
                     # v153.0 → v266.0: Centralized protection check
-                    _is_protected, _ = self.check_vm_protection(vm_name, VMAction.TERMINATE, "monitoring_loop")
+                    _is_protected, _ = self.check_vm_protection(
+                        vm_name,
+                        VMAction.TERMINATE,
+                        "monitoring_loop",
+                        log_blocked=False,
+                    )
                     if _is_protected:
                         continue
 
