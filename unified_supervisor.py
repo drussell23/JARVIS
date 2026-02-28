@@ -68684,6 +68684,78 @@ class JarvisSystemKernel:
                         except (ImportError, Exception):
                             pass
 
+                        # v279.0: Cloud-first gate — when VBI_CLOUD_FIRST is
+                        # active and cloud ECAPA is reachable, skip local ECAPA
+                        # loading entirely at startup. Loading PyTorch + SpeechBrain
+                        # (~700MB) causes transient pagein storms on 16GB systems
+                        # with heavy baseline memory usage (IDE, browser, Docker).
+                        # Local ECAPA is loaded on-demand if cloud becomes unreachable.
+                        _cloud_first = os.getenv(
+                            "JARVIS_VBI_CLOUD_FIRST", "false",
+                        ).lower() in ("1", "true", "yes")
+                        if _cloud_first:
+                            _cloud_reachable = False
+                            try:
+                                _ml_reg = getattr(self, "_ml_engine_registry", None)
+                                if _ml_reg is None:
+                                    from backend.voice_unlock.ml_engine_registry import (
+                                        get_ml_registry,
+                                    )
+                                    _ml_reg = await get_ml_registry()
+                                _cloud_ep = getattr(_ml_reg, "_cloud_endpoint", None)
+                                if _cloud_ep:
+                                    import aiohttp
+                                    async with aiohttp.ClientSession() as _cs:
+                                        async with _cs.get(
+                                            f"{_cloud_ep.rstrip('/')}/health",
+                                            timeout=aiohttp.ClientTimeout(total=5),
+                                        ) as _cr:
+                                            _cloud_reachable = _cr.status == 200
+                            except Exception:
+                                pass
+
+                            if _cloud_reachable:
+                                self.logger.info(
+                                    "[Kernel] ECAPA: VBI_CLOUD_FIRST=true and cloud "
+                                    "reachable — skipping local model loading to "
+                                    "reduce startup memory pressure (~700MB saved). "
+                                    "Local fallback loads on-demand if cloud fails."
+                                )
+                                return
+                            self.logger.info(
+                                "[Kernel] ECAPA: VBI_CLOUD_FIRST=true but cloud "
+                                "unreachable — proceeding with local loading"
+                            )
+
+                        # v279.0: Memory pressure gate — on 16GB systems, concurrent
+                        # heavy imports during Phase 4 + ECAPA loading cause pagein
+                        # storms (2000+ pageins/sec = emergency thrash cascade).
+                        # Check memory pressure BEFORE allocating ~700MB for
+                        # PyTorch + SpeechBrain.  If already CONSTRAINED+, defer.
+                        _mem_gate_skip = False
+                        try:
+                            from backend.core.memory_quantizer import (
+                                get_memory_quantizer_instance,
+                            )
+                            _mq = get_memory_quantizer_instance()
+                            if _mq is not None:
+                                _tier = getattr(_mq, "current_tier", None)
+                                _tier_val = (
+                                    _tier.value if hasattr(_tier, "value") else str(_tier)
+                                )
+                                if _tier_val in ("CONSTRAINED", "CRITICAL", "EMERGENCY"):
+                                    self.logger.warning(
+                                        "[Kernel] ECAPA: Memory pressure %s — "
+                                        "deferring local model loading to prevent "
+                                        "pagein storm. Voice unlock uses cloud path.",
+                                        _tier_val,
+                                    )
+                                    _mem_gate_skip = True
+                        except Exception:
+                            pass
+                        if _mem_gate_skip:
+                            return
+
                         # CPU backpressure gate: wait for CPU to settle after Phase 4
                         # before starting another heavyweight operation.
                         _bp_threshold = 70.0
