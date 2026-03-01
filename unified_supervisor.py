@@ -70656,13 +70656,19 @@ class JarvisSystemKernel:
                         priority=_BudgetCriticality.NORMAL,
                         request_kind=_BudgetRequestKind.STARTUP,
                     ):
+                        _fe_deadline_mono = time.monotonic() + _fe_outer_timeout
                         await asyncio.wait_for(
-                            self._phase_frontend_transition(),
+                            self._phase_frontend_transition(
+                                phase_deadline_mono=_fe_deadline_mono
+                            ),
                             timeout=_fe_outer_timeout,
                         )
                 else:
+                    _fe_deadline_mono = time.monotonic() + _fe_outer_timeout
                     await asyncio.wait_for(
-                        self._phase_frontend_transition(),
+                        self._phase_frontend_transition(
+                            phase_deadline_mono=_fe_deadline_mono
+                        ),
                         timeout=_fe_outer_timeout,
                     )
             except (BudgetExhaustedError, LocalCapExceededError) if _BUDGET_AVAILABLE else ():
@@ -82969,7 +82975,11 @@ class JarvisSystemKernel:
             self.logger.warning(f"[Frontend] Startup task error ({caller}): {e}")
             return False, False
 
-    async def _phase_frontend_transition(self) -> bool:
+    async def _phase_frontend_transition(
+        self,
+        *,
+        phase_deadline_mono: Optional[float] = None,
+    ) -> bool:
         """
         Phase 7: Transition from loading page to main frontend (v118.0 robust).
 
@@ -82992,6 +83002,16 @@ class JarvisSystemKernel:
 
         frontend_started = False
         frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+
+        def _phase_step_timeout(default_timeout: float, floor: float = 1.0) -> float:
+            """Clamp a step timeout to the remaining phase budget."""
+            timeout = max(0.0, float(default_timeout))
+            if phase_deadline_mono is None:
+                return timeout
+            remaining = max(0.0, phase_deadline_mono - time.monotonic())
+            if remaining <= 0.0:
+                return 0.0
+            return max(float(floor), min(timeout, remaining))
 
         # v260.1: Frontend phase progress milestones (93→99)
         # Previously the entire frontend phase ran at 93% with no updates,
@@ -83017,10 +83037,20 @@ class JarvisSystemKernel:
             
             try:
                 # Wait for warmup task with timeout
-                warmup_timeout = _get_env_float(
+                warmup_timeout = _phase_step_timeout(
+                    _get_env_float(
                     "JARVIS_FRONTEND_WARMUP_WAIT_TIMEOUT",
                     90.0,
+                    ),
+                    floor=1.0,
                 )
+                if warmup_timeout <= 0:
+                    warmup_pending = True
+                    self.logger.info(
+                        "[Kernel] Frontend phase budget exhausted before warmup wait - handing off"
+                    )
+                    frontend_started = False
+                    raise asyncio.TimeoutError("frontend_warmup_budget_exhausted")
                 frontend_started = bool(
                     await shielded_wait_for(
                         warmup_task,
@@ -83038,7 +83068,7 @@ class JarvisSystemKernel:
                 warmup_pending = True
                 self.logger.info(
                     "[Kernel] Frontend warmup still running after %.0fs - handing off to single-flight startup",
-                    warmup_timeout,
+                    warmup_timeout if "warmup_timeout" in locals() else 0.0,
                 )
             except Exception as e:
                 self.logger.warning(f"[Kernel] Frontend warmup error: {e}")
@@ -83057,17 +83087,27 @@ class JarvisSystemKernel:
                 self._update_component_status("frontend", "running", "Starting React frontend...")
                 await self._broadcast_progress(95, "frontend", "Starting React frontend...")
 
-                wait_timeout = _get_env_float("JARVIS_FRONTEND_START_WAIT_TIMEOUT", 120.0)
+                wait_timeout = _phase_step_timeout(
+                    _get_env_float("JARVIS_FRONTEND_START_WAIT_TIMEOUT", 120.0),
+                    floor=1.0,
+                )
                 if warmup_pending:
                     wait_timeout = min(
                         wait_timeout,
                         _get_env_float("JARVIS_FRONTEND_HANDOFF_TIMEOUT", 45.0),
                     )
-
-                frontend_started, startup_pending = await self._wait_for_frontend_start(
-                    timeout=wait_timeout,
-                    caller="phase7",
-                )
+                wait_timeout = _phase_step_timeout(wait_timeout, floor=1.0)
+                if wait_timeout <= 0:
+                    startup_pending = True
+                    self.logger.info(
+                        "[Kernel] Frontend phase budget exhausted before startup wait - continuing in background"
+                    )
+                    frontend_started = False
+                else:
+                    frontend_started, startup_pending = await self._wait_for_frontend_start(
+                        timeout=wait_timeout,
+                        caller="phase7",
+                    )
                 if frontend_started:
                     self._current_startup_progress = 96
                     self.logger.success(f"[Kernel] React frontend ready on port {frontend_port}")
@@ -83096,7 +83136,10 @@ class JarvisSystemKernel:
             # v260.1: Advance progress for Trinity wait step
             self._current_startup_progress = 97
             self.logger.info("[Kernel] Waiting for Trinity components to complete...")
-            trinity_wait_timeout = float(os.environ.get("JARVIS_TRINITY_WAIT_TIMEOUT", "30.0"))
+            trinity_wait_timeout = _phase_step_timeout(
+                float(os.environ.get("JARVIS_TRINITY_WAIT_TIMEOUT", "30.0")),
+                floor=1.0,
+            )
             # v265.5: CPU-aware scaling — Trinity components (frontend build,
             # model loading) all compete for CPU during late startup.
             try:
@@ -83109,6 +83152,11 @@ class JarvisSystemKernel:
             trinity_wait_start = time.time()
 
             while not self._is_trinity_ready():
+                if phase_deadline_mono is not None and time.monotonic() >= phase_deadline_mono:
+                    self.logger.info(
+                        "[Kernel] Frontend phase budget exhausted during Trinity wait - proceeding"
+                    )
+                    break
                 elapsed = time.time() - trinity_wait_start
                 if elapsed > trinity_wait_timeout:
                     self.logger.warning(
@@ -83322,8 +83370,40 @@ class JarvisSystemKernel:
             redirect_stabilization_delay = float(
                 os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "3.0")
             )
-            await asyncio.sleep(redirect_stabilization_delay)
-            await self._stop_loading_server()
+            redirect_stabilization_delay = _phase_step_timeout(
+                redirect_stabilization_delay,
+                floor=0.0,
+            )
+            if redirect_stabilization_delay > 0:
+                await asyncio.sleep(redirect_stabilization_delay)
+
+            _stop_budget = _phase_step_timeout(
+                _get_env_float("JARVIS_LOADING_SERVER_STOP_PHASE_BUDGET", 25.0),
+                floor=1.0,
+            )
+            if _stop_budget <= 0:
+                self.logger.info(
+                    "[Kernel] Frontend phase budget exhausted before loading-server stop; stopping in background"
+                )
+                create_safe_task(
+                    self._stop_loading_server(),
+                    name="loading-server-stop-background",
+                )
+            else:
+                try:
+                    await asyncio.wait_for(
+                        self._stop_loading_server(),
+                        timeout=_stop_budget,
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.info(
+                        "[Kernel] Loading-server stop exceeded phase budget (%.1fs); continuing in background",
+                        _stop_budget,
+                    )
+                    create_safe_task(
+                        self._stop_loading_server(),
+                        name="loading-server-stop-background-timeout",
+                    )
 
             # Voice narration for transition
             if self._narrator:
@@ -83390,8 +83470,37 @@ class JarvisSystemKernel:
             # v278.1: JARVIS_STARTUP_COMPLETE deferred to _startup_impl (same as main path)
 
             # Brief stabilization delay for any WebSocket consumers
-            await asyncio.sleep(0.5)
-            await self._stop_loading_server()
+            _api_only_delay = _phase_step_timeout(0.5, floor=0.0)
+            if _api_only_delay > 0:
+                await asyncio.sleep(_api_only_delay)
+
+            _stop_budget = _phase_step_timeout(
+                _get_env_float("JARVIS_LOADING_SERVER_STOP_PHASE_BUDGET", 25.0),
+                floor=1.0,
+            )
+            if _stop_budget <= 0:
+                self.logger.info(
+                    "[Kernel] Frontend phase budget exhausted before API-only loading-server stop; stopping in background"
+                )
+                create_safe_task(
+                    self._stop_loading_server(),
+                    name="loading-server-stop-background-api-only",
+                )
+            else:
+                try:
+                    await asyncio.wait_for(
+                        self._stop_loading_server(),
+                        timeout=_stop_budget,
+                    )
+                except asyncio.TimeoutError:
+                    self.logger.info(
+                        "[Kernel] API-only loading-server stop exceeded phase budget (%.1fs); continuing in background",
+                        _stop_budget,
+                    )
+                    create_safe_task(
+                        self._stop_loading_server(),
+                        name="loading-server-stop-background-api-only-timeout",
+                    )
 
         # Clear the supervisor loading flag
         os.environ.pop("JARVIS_SUPERVISOR_LOADING", None)
