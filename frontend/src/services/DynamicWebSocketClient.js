@@ -261,6 +261,7 @@ class DynamicWebSocketClient {
     // Configuration
     this.config = {
       autoDiscover: false,
+      autoReconnect: true,
       reconnectStrategy: 'exponential', // 'linear', 'exponential', 'fibonacci'
       maxReconnectAttempts: 10,
       baseReconnectDelay: 1000,
@@ -473,7 +474,7 @@ class DynamicWebSocketClient {
     this._emit('disconnected', { endpoint: url, code: event.code });
 
     // Attempt reconnection unless destroyed or clean close
-    if (!this.isDestroyed && event.code !== 1000) {
+    if (!this.isDestroyed && this.config.autoReconnect !== false && event.code !== 1000) {
       this._scheduleReconnect(url);
     }
   }
@@ -482,6 +483,10 @@ class DynamicWebSocketClient {
    * Schedule reconnection with backoff
    */
   _scheduleReconnect(url) {
+    if (this.reconnectTimers.has(url)) {
+      return;
+    }
+
     const attempts = this.reconnectAttempts.get(url) || 0;
     
     if (attempts >= this.config.maxReconnectAttempts) {

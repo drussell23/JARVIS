@@ -79,7 +79,7 @@ async def test_attempt_audio_bus_start_serializes_concurrent_calls(monkeypatch):
         def __init__(self):
             self.is_running = False
 
-        async def start(self, progress_callback=None):
+        async def start(self, progress_callback=None, profile_strategy="balanced"):
             start_calls.append("start")
             if progress_callback is not None:
                 progress_callback("stream_open", "started")

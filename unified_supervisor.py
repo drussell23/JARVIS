@@ -76866,6 +76866,11 @@ class JarvisSystemKernel:
 
             progress: List[Tuple[float, str, str]] = []
             progress_lock = threading.Lock()
+            profile_strategy = (
+                "startup"
+                if context == "startup"
+                else "recovery" if context == "recovery" else "balanced"
+            )
 
             def _progress_cb(phase, detail):
                 with progress_lock:
@@ -76893,7 +76898,10 @@ class JarvisSystemKernel:
 
                 self._audio_bus = AudioBus.get_instance()
                 await asyncio.wait_for(
-                self._audio_bus.start(progress_callback=_progress_cb),
+                    self._audio_bus.start(
+                        progress_callback=_progress_cb,
+                        profile_strategy=profile_strategy,
+                    ),
                     timeout=effective_timeout,
                 )
                 self._clear_audio_recovery_cooldown()

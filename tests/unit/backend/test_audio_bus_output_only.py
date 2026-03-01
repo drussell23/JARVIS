@@ -24,7 +24,7 @@ async def test_audio_bus_starts_in_output_only_mode_without_mic_registration(mon
         def sample_rate(self):
             return self.config.sample_rate
 
-        async def start(self, progress_callback=None):
+        async def start(self, progress_callback=None, profile_strategy="balanced"):
             self.is_running = True
 
         async def stop(self):

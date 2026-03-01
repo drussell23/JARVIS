@@ -36,12 +36,59 @@ export const ConnectionState = {
  */
 const yieldToEventLoop = () => new Promise(resolve => setTimeout(resolve, 0));
 
+const FETCH_TIMEOUT_ERROR_CODE = 'ERR_FETCH_TIMEOUT';
+const FETCH_ABORT_ERROR_CODE = 'ERR_FETCH_ABORTED';
+
+const createTimeoutError = (url, timeoutMs, cause = null) => {
+  const error = new Error(`Backend health probe timed out after ${timeoutMs}ms`);
+  error.name = 'TimeoutError';
+  error.code = FETCH_TIMEOUT_ERROR_CODE;
+  error.url = url;
+  error.timeoutMs = timeoutMs;
+  if (cause) {
+    error.cause = cause;
+  }
+  return error;
+};
+
+const normalizeFetchError = (error, { url, timeoutMs, timedOut = false } = {}) => {
+  if (timedOut) {
+    return createTimeoutError(url, timeoutMs, error);
+  }
+
+  if (error?.code === FETCH_TIMEOUT_ERROR_CODE || error?.name === 'TimeoutError') {
+    return error;
+  }
+
+  const message = error?.message || '';
+  const isAbortLike =
+    error?.name === 'AbortError' ||
+    error?.code === FETCH_ABORT_ERROR_CODE ||
+    /signal is aborted without reason/i.test(message);
+
+  if (isAbortLike) {
+    const abortError = new Error('Backend health probe was aborted before completion');
+    abortError.name = 'AbortError';
+    abortError.code = FETCH_ABORT_ERROR_CODE;
+    abortError.url = url;
+    abortError.timeoutMs = timeoutMs;
+    abortError.cause = error;
+    return abortError;
+  }
+
+  return error;
+};
+
 /**
  * Create timeout controller for fetch operations
  */
 const fetchWithTimeout = async (url, options = {}, timeoutMs = 5000) => {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort(createTimeoutError(url, timeoutMs));
+  }, timeoutMs);
   
   try {
     const response = await fetch(url, {
@@ -50,11 +97,11 @@ const fetchWithTimeout = async (url, options = {}, timeoutMs = 5000) => {
       mode: 'cors',
       credentials: 'omit'
     });
-    clearTimeout(timeoutId);
     return response;
   } catch (error) {
+    throw normalizeFetchError(error, { url, timeoutMs, timedOut });
+  } finally {
     clearTimeout(timeoutId);
-    throw error;
   }
 };
 
@@ -102,6 +149,20 @@ class JarvisConnectionService {
       cooldownMs: 8000,
       lastResult: null
     };
+
+    // Keep reconnect ownership in this service instead of splitting it across
+    // local health probes, UI calls, and the underlying WebSocket client.
+    this.connectionCoordinator = {
+      activePromise: null,
+      reconnectTimer: null
+    };
+    this.webSocketRetryState = {
+      timer: null,
+      attempt: 0,
+      maxAttempts: 5,
+      inProgress: false
+    };
+    this.isDestroyed = false;
 
     // v277.0: Connection context tracking (Disease 1 cure).
     // _wasEverOnline persists across tab refresh via localStorage.
@@ -629,88 +690,169 @@ class JarvisConnectionService {
   // BACKEND CONNECTION
   // ==========================================================================
 
-  async _connectToBackend() {
-    this._setState(ConnectionState.CONNECTING);
-    
-    try {
-      // Verify backend is healthy
-      const health = await this._checkBackendHealth();
-      if (!health.ok) {
-        throw new Error(`Backend unhealthy: ${health.error}`);
-      }
-      
-      this.backendMode = health.mode || 'full';
-      
-      // Initialize WebSocket — track whether it actually connected
-      const wsConnected = await this._initializeWebSocket();
-      
-      // Start health monitoring
-      this._startHealthMonitoring();
-      
-      // Mark REST as available (health check passed, /api/command is reachable)
-      this._restAvailable = true;
-      
-      if (wsConnected) {
-        // Full connectivity: WebSocket + REST
-        this._setState(ConnectionState.ONLINE);
-        this.consecutiveFailures = 0;
-        console.log(`[JarvisConnection] ✅ Connected (${this.backendMode} mode, WebSocket + REST)`);
-      } else {
-        // Degraded connectivity: REST only, WebSocket failed
-        // Still set ONLINE because we CAN send commands via REST API
-        console.warn('[JarvisConnection] ⚠️ WebSocket failed but backend is healthy — using REST fallback');
-        this._setState(ConnectionState.ONLINE);
-        this.consecutiveFailures = 0;
-        
-        // Schedule background WebSocket retry (don't block the user)
-        this._scheduleWebSocketRetry();
-      }
-      
-      // Save verified state for fast-path on subsequent loads
-      this._saveVerifiedState();
-      
-    } catch (error) {
-      console.error('[JarvisConnection] Connection failed:', error.message);
-      this.lastError = error.message;
-      this._setState(ConnectionState.ERROR);
-      this._scheduleReconnect();
+  _clearReconnectTimer() {
+    if (this.connectionCoordinator.reconnectTimer) {
+      clearTimeout(this.connectionCoordinator.reconnectTimer);
+      this.connectionCoordinator.reconnectTimer = null;
     }
+  }
+
+  _clearWebSocketRetryTimer() {
+    if (this.webSocketRetryState.timer) {
+      clearTimeout(this.webSocketRetryState.timer);
+      this.webSocketRetryState.timer = null;
+    }
+  }
+
+  _resetWebSocketRetryState() {
+    this._clearWebSocketRetryTimer();
+    this.webSocketRetryState.attempt = 0;
+    this.webSocketRetryState.inProgress = false;
+  }
+
+  _buildBackendHealthFailure(health) {
+    const prefix = health.transient ? 'Backend temporarily unavailable' : 'Backend unhealthy';
+    const error = new Error(`${prefix}: ${health.error}`);
+    error.code = health.code || 'ERR_BACKEND_UNHEALTHY';
+    error.transient = health.transient === true;
+    error.source = health.source || 'backend_health';
+    error.details = health;
+    return error;
+  }
+
+  _classifyConnectionFailure(error) {
+    const message = error?.message || 'Unknown connection failure';
+    const timeoutLike =
+      error?.code === FETCH_TIMEOUT_ERROR_CODE ||
+      error?.name === 'TimeoutError';
+    const abortLike =
+      error?.code === FETCH_ABORT_ERROR_CODE ||
+      error?.name === 'AbortError' ||
+      /signal is aborted without reason/i.test(message);
+    const networkLike = /failed to fetch|networkerror|load failed|network request failed/i.test(message);
+    const transient = Boolean(error?.transient || timeoutLike || abortLike || networkLike);
+
+    return {
+      transient,
+      message,
+      reason: transient ? 'transient_connect_failure' : 'backend_connect_failure'
+    };
+  }
+
+  async _connectToBackend() {
+    if (this.connectionCoordinator.activePromise) {
+      return this.connectionCoordinator.activePromise;
+    }
+
+    const run = async () => {
+      this._clearReconnectTimer();
+      this._setState(ConnectionState.CONNECTING);
+      
+      try {
+        // Verify backend is healthy
+        const health = await this._checkBackendHealth();
+        if (!health.ok) {
+          throw this._buildBackendHealthFailure(health);
+        }
+        
+        this.backendMode = health.mode || 'full';
+        
+        // Initialize WebSocket — track whether it actually connected
+        const wsConnected = await this._initializeWebSocket();
+        
+        // Start health monitoring
+        this._startHealthMonitoring();
+        
+        // Mark REST as available (health check passed, /api/command is reachable)
+        this._restAvailable = true;
+        
+        if (wsConnected) {
+          this._resetWebSocketRetryState();
+          // Full connectivity: WebSocket + REST
+          this._setState(ConnectionState.ONLINE);
+          this.consecutiveFailures = 0;
+          console.log(`[JarvisConnection] ✅ Connected (${this.backendMode} mode, WebSocket + REST)`);
+        } else {
+          // Degraded connectivity: REST only, WebSocket failed
+          // Still set ONLINE because we CAN send commands via REST API
+          console.warn('[JarvisConnection] ⚠️ WebSocket failed but backend is healthy — using REST fallback');
+          this._setState(ConnectionState.ONLINE);
+          this.consecutiveFailures = 0;
+          
+          // Schedule background WebSocket retry (don't block the user)
+          this._scheduleWebSocketRetry('connect_rest_only');
+        }
+        
+        // Save verified state for fast-path on subsequent loads
+        this._saveVerifiedState();
+      } catch (error) {
+        const failure = this._classifyConnectionFailure(error);
+        console.error('[JarvisConnection] Connection failed:', failure.message);
+        this.lastError = failure.message;
+
+        if (!failure.transient) {
+          this._setState(ConnectionState.ERROR);
+        }
+
+        this._scheduleReconnect({ reason: failure.reason });
+      }
+    };
+
+    const promise = run().finally(() => {
+      if (this.connectionCoordinator.activePromise === promise) {
+        this.connectionCoordinator.activePromise = null;
+      }
+    });
+
+    this.connectionCoordinator.activePromise = promise;
+    return promise;
   }
 
   /**
    * Retry WebSocket connection in the background without blocking command sending.
    * REST API remains available while we try to establish WebSocket.
    */
-  _scheduleWebSocketRetry() {
-    const maxRetries = 5;
-    let attempt = 0;
-    
-    const retry = async () => {
-      attempt++;
-      if (attempt > maxRetries) {
-        console.log('[JarvisConnection] WebSocket retry exhausted — continuing with REST-only mode');
-        return;
-      }
-      
-      console.log(`[JarvisConnection] WebSocket retry ${attempt}/${maxRetries}...`);
+  _scheduleWebSocketRetry(reason = 'websocket_unavailable') {
+    if (
+      this.isDestroyed ||
+      !this.wsUrl ||
+      this.webSocketRetryState.inProgress ||
+      this.webSocketRetryState.timer ||
+      this.isWebSocketConnected()
+    ) {
+      return;
+    }
+
+    const attempt = this.webSocketRetryState.attempt + 1;
+    if (attempt > this.webSocketRetryState.maxAttempts) {
+      console.log('[JarvisConnection] WebSocket retry exhausted — continuing with REST-only mode');
+      return;
+    }
+
+    this.webSocketRetryState.attempt = attempt;
+    const delay = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
+    console.log(`[JarvisConnection] WebSocket retry ${attempt}/${this.webSocketRetryState.maxAttempts} in ${Math.round(delay / 1000)}s (${reason})`);
+
+    this.webSocketRetryState.timer = setTimeout(async () => {
+      this.webSocketRetryState.timer = null;
+      this.webSocketRetryState.inProgress = true;
+
       try {
         const wsConnected = await this._initializeWebSocket();
         if (wsConnected) {
+          this._resetWebSocketRetryState();
           console.log('[JarvisConnection] ✅ WebSocket reconnected successfully');
           this._emit('wsReconnected', {});
-          return; // Success — stop retrying
+          return;
         }
-      } catch (e) {
-        console.debug('[JarvisConnection] WebSocket retry failed:', e.message);
+      } catch (error) {
+        console.debug('[JarvisConnection] WebSocket retry failed:', error?.message || error);
+      } finally {
+        this.webSocketRetryState.inProgress = false;
       }
-      
-      // Exponential backoff: 2s, 4s, 8s, 16s, 32s
-      const delay = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
-      setTimeout(retry, delay);
-    };
-    
-    // Start first retry after 2 seconds
-    setTimeout(retry, 2000);
+
+      this._scheduleWebSocketRetry(reason);
+    }, delay);
   }
 
   async _quickHealthCheck(url) {
@@ -725,6 +867,7 @@ class JarvisConnectionService {
   async _checkBackendHealth() {
     // v277.0: Try enriched /api/system/status first (Disease 1 cure),
     // falls back to /health for backward compat.
+    let systemStatusError = null;
     try {
       const statusResp = await fetchWithTimeout(
         `${this.backendUrl}/api/system/status`,
@@ -742,7 +885,12 @@ class JarvisConnectionService {
           systemStatus: this._lastSystemStatus,
         };
       }
-    } catch (e) { /* fall through to /health */ }
+    } catch (error) {
+      systemStatusError = normalizeFetchError(error, {
+        url: `${this.backendUrl}/api/system/status`,
+        timeoutMs: this.healthConfig.timeout
+      });
+    }
 
     // Backward-compatible fallback
     try {
@@ -761,9 +909,26 @@ class JarvisConnectionService {
         };
       }
 
-      return { ok: false, error: `HTTP ${response.status}` };
+      return {
+        ok: false,
+        error: `HTTP ${response.status}`,
+        code: 'ERR_BACKEND_HTTP',
+        transient: response.status >= 500,
+        source: 'http'
+      };
     } catch (error) {
-      return { ok: false, error: error.message };
+      const normalized = normalizeFetchError(error, {
+        url: `${this.backendUrl}/health`,
+        timeoutMs: this.healthConfig.timeout
+      });
+
+      return {
+        ok: false,
+        error: normalized.message,
+        code: normalized.code || 'ERR_BACKEND_HEALTH',
+        transient: normalized.code === FETCH_TIMEOUT_ERROR_CODE || normalized.code === FETCH_ABORT_ERROR_CODE,
+        source: systemStatusError?.code ? 'status_then_health_fallback' : 'health'
+      };
     }
   }
 
@@ -780,6 +945,7 @@ class JarvisConnectionService {
     if (!this.wsClient) {
       this.wsClient = new DynamicWebSocketClient({
         autoDiscover: false,
+        autoReconnect: false,
         reconnectStrategy: 'exponential',
         maxReconnectAttempts: 10,
         heartbeatInterval: 30000,
@@ -823,6 +989,7 @@ class JarvisConnectionService {
     try {
       const ws = await this.wsClient.connect(`${this.wsUrl}/ws`);
       if (ws && ws.readyState === WebSocket.OPEN) {
+        this._resetWebSocketRetryState();
         console.log('[JarvisConnection] ✅ WebSocket connected');
         return true;
       }
@@ -856,6 +1023,7 @@ class JarvisConnectionService {
     // Connection events
     this.wsClient.on('connected', (data) => {
       console.log('[JarvisConnection] WebSocket connected:', data.endpoint);
+      this._resetWebSocketRetryState();
       if (this.connectionState !== ConnectionState.ONLINE) {
         this._setState(ConnectionState.ONLINE);
       }
@@ -863,6 +1031,14 @@ class JarvisConnectionService {
     
     this.wsClient.on('disconnected', (data) => {
       console.log('[JarvisConnection] WebSocket disconnected:', data.endpoint);
+      const shouldRetryWebSocket = [
+        ConnectionState.ONLINE,
+        ConnectionState.CONNECTING,
+        ConnectionState.RECONNECTING
+      ].includes(this.connectionState);
+      if (shouldRetryWebSocket) {
+        this._scheduleWebSocketRetry('ws_disconnect');
+      }
     });
   }
 
@@ -877,8 +1053,13 @@ class JarvisConnectionService {
       const health = await this._checkBackendHealth();
       
       if (!health.ok) {
+        if (health.transient && this.isWebSocketConnected()) {
+          console.warn(`[JarvisConnection] Health probe transient while WebSocket is live (${health.error})`);
+          return;
+        }
+
         this.consecutiveFailures++;
-        console.warn(`[JarvisConnection] Health check failed (${this.consecutiveFailures}/${this.healthConfig.maxFailures})`);
+        console.warn(`[JarvisConnection] Health check failed (${this.consecutiveFailures}/${this.healthConfig.maxFailures}): ${health.error}`);
         
         if (this.consecutiveFailures >= this.healthConfig.maxFailures) {
           this._handleConnectionLost();
@@ -906,6 +1087,7 @@ class JarvisConnectionService {
   _handleConnectionLost() {
     console.warn('[JarvisConnection] Connection lost');
     this._stopHealthMonitoring();
+    this._resetWebSocketRetryState();
     this._setState(ConnectionState.OFFLINE);
     this._triggerControlPlaneRecovery('health_monitor_connection_lost').catch((error) => {
       console.debug('[JarvisConnection] Recovery trigger failed:', error?.message || error);
@@ -913,17 +1095,32 @@ class JarvisConnectionService {
     this._scheduleReconnect();
   }
 
-  _scheduleReconnect() {
+  _scheduleReconnect({ reason = 'backend_unreachable', immediate = false, force = false } = {}) {
+    if (this.isDestroyed) {
+      return;
+    }
+
+    if (this.connectionCoordinator.reconnectTimer && !force) {
+      return;
+    }
+
     this._setState(ConnectionState.RECONNECTING);
     
-    const delay = Math.min(
-      5000 * Math.pow(1.5, this.consecutiveFailures),
-      30000
-    );
+    const delay = immediate
+      ? 0
+      : Math.min(
+          5000 * Math.pow(1.5, this.consecutiveFailures),
+          30000
+        );
     
-    console.log(`[JarvisConnection] Reconnecting in ${Math.round(delay / 1000)}s`);
+    console.log(`[JarvisConnection] Reconnecting in ${Math.round(delay / 1000)}s (${reason})`);
     
-    setTimeout(() => this._connectToBackend(), delay);
+    this.connectionCoordinator.reconnectTimer = setTimeout(() => {
+      this.connectionCoordinator.reconnectTimer = null;
+      this._connectToBackend().catch((error) => {
+        console.debug('[JarvisConnection] Scheduled reconnect failed:', error?.message || error);
+      });
+    }, delay);
   }
 
   // ==========================================================================
@@ -1258,13 +1455,18 @@ class JarvisConnectionService {
   async reconnect() {
     console.log('[JarvisConnection] Manual reconnect requested');
     this._stopHealthMonitoring();
+    this._clearReconnectTimer();
+    this._resetWebSocketRetryState();
     this.consecutiveFailures = 0;
     this.discoveryState.attempts = 0;
     await this._discoverBackend();
   }
 
   destroy() {
+    this.isDestroyed = true;
     this._stopHealthMonitoring();
+    this._clearReconnectTimer();
+    this._resetWebSocketRetryState();
     this.wsClient?.destroy();
     this.listeners.clear();
   }

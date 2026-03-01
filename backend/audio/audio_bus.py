@@ -427,6 +427,7 @@ class AudioBus:
         self,
         config: Optional[DeviceConfig] = None,
         progress_callback=None,
+        profile_strategy: str = "balanced",
     ) -> None:
         """
         Initialize and start the audio device, AEC, and resamplers.
@@ -453,7 +454,10 @@ class AudioBus:
         # CoreAudio IO thread with callbacks that access freed state → SIGSEGV.
         self._device = FullDuplexDevice(self._config)
         try:
-            await self._device.start(progress_callback=progress_callback)
+            await self._device.start(
+                progress_callback=progress_callback,
+                profile_strategy=profile_strategy,
+            )
         except (asyncio.CancelledError, Exception):
             logger.warning("[AudioBus] Device start interrupted — cleaning up")
             try:

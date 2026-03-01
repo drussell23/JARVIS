@@ -19,12 +19,14 @@ Architecture:
 
 import asyncio
 import atexit
+import json
 import logging
 import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 import numpy as np
@@ -166,7 +168,11 @@ class FullDuplexDevice:
     def playback_buffer(self) -> PlaybackRingBuffer:
         return self._playback_buffer
 
-    async def start(self, progress_callback=None) -> None:
+    async def start(
+        self,
+        progress_callback=None,
+        profile_strategy: str = "balanced",
+    ) -> None:
         """
         Open the full-duplex stream.
 
@@ -194,13 +200,22 @@ class FullDuplexDevice:
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            _AUDIO_IO_EXECUTOR, lambda: self._open_stream_sync(progress_callback)
+            _AUDIO_IO_EXECUTOR,
+            lambda: self._open_stream_sync(
+                progress_callback,
+                profile_strategy=profile_strategy,
+            ),
         )
 
         # These touch asyncio primitives — must stay on event loop thread.
         self._started_event.set()
 
-    def _open_stream_sync(self, progress_callback=None) -> None:
+    def _open_stream_sync(
+        self,
+        progress_callback=None,
+        *,
+        profile_strategy: str = "balanced",
+    ) -> None:
         """
         Synchronous PortAudio initialization — runs in thread executor.
 
@@ -240,7 +255,7 @@ class FullDuplexDevice:
             raise
         _pcb("device_query", "completed")
 
-        startup_profiles = self._build_startup_profiles()
+        startup_profiles = self._build_startup_profiles(profile_strategy=profile_strategy)
         startup_errors: List[str] = []
 
         for idx, profile in enumerate(startup_profiles, start=1):
@@ -304,6 +319,13 @@ class FullDuplexDevice:
                     f"in={in_device_label}, out={out_device_label}, "
                     f"startup_silence={self.config.startup_silence_ms}ms{fallback_note}"
                 )
+                self._persist_successful_profile(
+                    {
+                        "mode": mode,
+                        "input_enabled": input_enabled,
+                        "sample_rate": sample_rate,
+                    }
+                )
                 _pcb("stream_start", "completed")
                 return
             except Exception as e:
@@ -320,48 +342,161 @@ class FullDuplexDevice:
             f"after {len(startup_profiles)} profile(s): {joined_errors}"
         )
 
-    def _build_startup_profiles(self) -> List[dict]:
+    def _build_startup_profiles(self, *, profile_strategy: str = "balanced") -> List[dict]:
         """
         Build deterministic startup profiles.
 
         Order:
-        1) Preferred mode/sample-rate from config validation.
-        2) Output-only fallback when duplex startup fails.
-        3) Retry with output device default sample-rate.
+        1) Last known-good profile for the resolved device pair.
+        2) Preferred mode/sample-rate from config validation.
+        3) Output-only fallback when duplex startup fails.
+        4) Retry with output device default sample-rate (recovery/balanced only).
         """
         output_default_sr = self._get_output_default_sample_rate()
-        sample_rates: List[int] = []
-        for sr in (self.config.sample_rate, output_default_sr):
-            if sr is None:
-                continue
-            try:
-                val = int(sr)
-            except Exception:
-                continue
-            if val > 0 and val not in sample_rates:
-                sample_rates.append(val)
-
-        if not sample_rates:
-            sample_rates = [int(self.config.sample_rate)]
-
         profiles: List[dict] = []
-        for sr in sample_rates:
-            profiles.append(
-                {
-                    "mode": "duplex" if self._input_enabled else "output-only",
-                    "input_enabled": self._input_enabled,
-                    "sample_rate": sr,
-                }
+        profile_strategy = (profile_strategy or "balanced").lower()
+
+        def _add_profile(mode: str, input_enabled: bool, sample_rate: Optional[int]) -> None:
+            if sample_rate is None:
+                return
+            try:
+                resolved_sr = int(sample_rate)
+            except Exception:
+                return
+            if resolved_sr <= 0:
+                return
+            profile = {
+                "mode": mode,
+                "input_enabled": input_enabled,
+                "sample_rate": resolved_sr,
+            }
+            if profile not in profiles:
+                profiles.append(profile)
+
+        preferred_mode = "duplex" if self._input_enabled else "output-only"
+        preferred_profile = {
+            "mode": preferred_mode,
+            "input_enabled": self._input_enabled,
+            "sample_rate": self.config.sample_rate,
+        }
+        cached_profile = self._load_cached_profile()
+
+        if (
+            cached_profile is not None
+            and str(cached_profile.get("mode")) == preferred_mode
+        ):
+            _add_profile(
+                str(cached_profile.get("mode", preferred_mode)),
+                bool(cached_profile.get("input_enabled", self._input_enabled)),
+                cached_profile.get("sample_rate"),
             )
+
+        _add_profile(
+            preferred_profile["mode"],
+            preferred_profile["input_enabled"],
+            preferred_profile["sample_rate"],
+        )
+
+        if (
+            cached_profile is not None
+            and str(cached_profile.get("mode")) != preferred_mode
+        ):
+            _add_profile(
+                str(cached_profile.get("mode", "duplex")),
+                bool(cached_profile.get("input_enabled", True)),
+                cached_profile.get("sample_rate"),
+            )
+
+        if self.config.allow_output_only and self._input_enabled:
+            _add_profile("output-only", False, self.config.sample_rate)
+
+        if profile_strategy not in ("startup", "fast-startup"):
+            _add_profile(preferred_mode, self._input_enabled, output_default_sr)
             if self.config.allow_output_only:
-                output_only_profile = {
-                    "mode": "output-only",
-                    "input_enabled": False,
-                    "sample_rate": sr,
-                }
-                if output_only_profile not in profiles:
-                    profiles.append(output_only_profile)
+                _add_profile("output-only", False, output_default_sr)
+
+        max_profiles = {
+            "fast-startup": 1,
+            "startup": 2,
+            "balanced": 4,
+            "recovery": 4,
+        }.get(profile_strategy, 4)
+        if len(profiles) > max_profiles:
+            profiles = profiles[:max_profiles]
         return profiles
+
+    def _profile_cache_path(self) -> Path:
+        """Resolve the device-profile cache file path."""
+        path = os.getenv("JARVIS_AUDIO_PROFILE_CACHE_PATH")
+        if path:
+            return Path(path).expanduser()
+        return Path.home() / ".jarvis" / "audio" / "startup_profile.json"
+
+    def _device_signature(self) -> str:
+        """Stable signature for the resolved device pair and channel policy."""
+        input_device = (
+            self.config.input_device
+            if self._input_enabled and self.config.input_device is not None
+            else "none"
+        )
+        output_device = (
+            self.config.output_device
+            if self.config.output_device is not None
+            else "default"
+        )
+        return (
+            f"in={input_device}|out={output_device}|"
+            f"channels={self.config.channels}|dtype={self.config.dtype}"
+        )
+
+    def _load_cached_profile(self) -> Optional[dict]:
+        """Load the last known-good profile for the resolved device pair."""
+        cache_path = self._profile_cache_path()
+        try:
+            payload = json.loads(cache_path.read_text())
+        except Exception:
+            return None
+
+        if payload.get("device_signature") != self._device_signature():
+            return None
+
+        sample_rate = payload.get("sample_rate")
+        mode = str(payload.get("mode", ""))
+        input_enabled = bool(payload.get("input_enabled", mode != "output-only"))
+        if mode not in ("duplex", "output-only"):
+            return None
+        if input_enabled and not self._input_enabled:
+            return None
+        try:
+            sample_rate = int(sample_rate)
+        except Exception:
+            return None
+        if sample_rate <= 0:
+            return None
+        return {
+            "mode": mode,
+            "input_enabled": input_enabled,
+            "sample_rate": sample_rate,
+        }
+
+    def _persist_successful_profile(self, profile: dict) -> None:
+        """Persist the last known-good startup profile for this device pair."""
+        cache_path = self._profile_cache_path()
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "device_signature": self._device_signature(),
+                        "mode": profile.get("mode"),
+                        "input_enabled": bool(profile.get("input_enabled", True)),
+                        "sample_rate": int(profile.get("sample_rate")),
+                        "updated_at": time.time(),
+                    }
+                )
+            )
+        except Exception:
+            logger.debug("[FullDuplexDevice] Failed to persist startup profile", exc_info=True)
 
     def _get_output_default_sample_rate(self) -> Optional[int]:
         """Return output device default sample rate, if available."""

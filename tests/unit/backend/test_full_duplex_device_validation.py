@@ -1,5 +1,6 @@
 """Validation tests for FullDuplexDevice capability negotiation."""
 
+import json
 import types
 
 import pytest
@@ -9,7 +10,7 @@ from backend.audio.full_duplex_device import DeviceConfig, FullDuplexDevice
 
 
 @pytest.fixture(autouse=True)
-def _clear_audio_env(monkeypatch):
+def _clear_audio_env(monkeypatch, tmp_path):
     """Ensure tests run with deterministic audio env defaults."""
     for key in (
         "JARVIS_AUDIO_INPUT_DEVICE",
@@ -18,6 +19,10 @@ def _clear_audio_env(monkeypatch):
         "JARVIS_AUDIO_ALLOW_OUTPUT_ONLY",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(
+        "JARVIS_AUDIO_PROFILE_CACHE_PATH",
+        str(tmp_path / "audio-profile.json"),
+    )
 
 
 def _make_fake_sd(
@@ -135,6 +140,69 @@ def test_validate_device_selection_requires_input_when_configured(monkeypatch):
     device = FullDuplexDevice(cfg)
     with pytest.raises(RuntimeError, match="No valid input device available"):
         device._validate_device_selection()
+
+
+def test_startup_profile_strategy_limits_boot_exploration(monkeypatch):
+    """Early startup should use a bounded profile set, leaving wide search to recovery."""
+    devices = [
+        {"name": "duplex0", "max_input_channels": 1, "max_output_channels": 1, "default_samplerate": 48000},
+        {"name": "duplex1", "max_input_channels": 1, "max_output_channels": 1, "default_samplerate": 48000},
+        {"name": "duplex2", "max_input_channels": 1, "max_output_channels": 1, "default_samplerate": 44100},
+    ]
+    fake_sd = _make_fake_sd(default_device=(1, 2), devices=devices)
+    monkeypatch.setattr(fd_mod, "sd", fake_sd)
+
+    device = FullDuplexDevice(DeviceConfig())
+    device._validate_device_selection()
+
+    startup_profiles = device._build_startup_profiles(profile_strategy="startup")
+    recovery_profiles = device._build_startup_profiles(profile_strategy="recovery")
+
+    assert startup_profiles == [
+        {"mode": "duplex", "input_enabled": True, "sample_rate": 48000},
+        {"mode": "output-only", "input_enabled": False, "sample_rate": 48000},
+    ]
+    assert recovery_profiles == [
+        {"mode": "duplex", "input_enabled": True, "sample_rate": 48000},
+        {"mode": "output-only", "input_enabled": False, "sample_rate": 48000},
+        {"mode": "duplex", "input_enabled": True, "sample_rate": 44100},
+        {"mode": "output-only", "input_enabled": False, "sample_rate": 44100},
+    ]
+
+
+def test_startup_profile_strategy_prefers_cached_profile(monkeypatch, tmp_path):
+    """A matching last known-good profile should be attempted first."""
+    devices = [
+        {"name": "duplex0", "max_input_channels": 1, "max_output_channels": 1, "default_samplerate": 48000},
+        {"name": "duplex1", "max_input_channels": 1, "max_output_channels": 1, "default_samplerate": 48000},
+        {"name": "duplex2", "max_input_channels": 1, "max_output_channels": 1, "default_samplerate": 44100},
+    ]
+    fake_sd = _make_fake_sd(default_device=(1, 2), devices=devices)
+    monkeypatch.setattr(fd_mod, "sd", fake_sd)
+    cache_path = tmp_path / "audio-profile.json"
+    monkeypatch.setenv("JARVIS_AUDIO_PROFILE_CACHE_PATH", str(cache_path))
+
+    device = FullDuplexDevice(DeviceConfig())
+    device._validate_device_selection()
+
+    cache_path.write_text(
+        json.dumps(
+            {
+                "device_signature": device._device_signature(),
+                "mode": "duplex",
+                "input_enabled": True,
+                "sample_rate": 44100,
+            }
+        )
+    )
+
+    startup_profiles = device._build_startup_profiles(profile_strategy="startup")
+
+    assert startup_profiles[0] == {
+        "mode": "duplex",
+        "input_enabled": True,
+        "sample_rate": 44100,
+    }
 
 
 @pytest.mark.asyncio
